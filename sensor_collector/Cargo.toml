@@ -1,0 +1,26 @@
+[package]
+name = "sensor_collector"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sensor_collector"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serialport = { workspace = true }
+tokio-serial = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+flume = { workspace = true }
+image = { workspace = true }
+rand = "0.8"
