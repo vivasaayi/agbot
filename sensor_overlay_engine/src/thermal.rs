@@ -3,8 +3,11 @@ use image::{ImageBuffer, Rgb, RgbImage};
 use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use crate::{OverlayProcessor, SensorOverlay, SensorInput, OverlayType, OverlayData, SpatialBounds};
+use uuid::Uuid;
+use chrono::Utc;
+use std::collections::HashMap;
 
-/// Thermal imaging processor for agricultural monitoring
 #[derive(Debug, Clone)]
 pub struct ThermalProcessor {
     pub config: ThermalConfig,
@@ -258,6 +261,48 @@ impl ThermalProcessor {
         }
 
         anomalies
+    }
+}
+
+impl OverlayProcessor for ThermalProcessor {
+    fn process(&self, _inputs: &[SensorInput]) -> Result<SensorOverlay> {
+        // Create a basic thermal overlay
+        let overlay = SensorOverlay {
+            id: Uuid::new_v4(),
+            overlay_type: OverlayType::Thermal,
+            timestamp: Utc::now(),
+            spatial_bounds: SpatialBounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 100.0,
+                min_z: None,
+                max_z: None,
+            },
+            resolution: (100, 100),
+            data: OverlayData::Heatmap {
+                width: 100,
+                height: 100,
+                intensities: vec![25.0; 10000], // Mock temperature values
+                color_map: "thermal".to_string(),
+            },
+            metadata: HashMap::new(),
+        };
+        Ok(overlay)
+    }
+
+    fn can_process(&self, sensor_type: &str) -> bool {
+        sensor_type == "thermal" || sensor_type == "infrared"
+    }
+
+    fn get_overlay_type(&self) -> OverlayType {
+        OverlayType::Thermal
+    }
+}
+
+impl Default for ThermalProcessor {
+    fn default() -> Self {
+        Self::new(ThermalConfig::default())
     }
 }
 

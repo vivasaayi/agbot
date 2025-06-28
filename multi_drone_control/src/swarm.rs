@@ -7,15 +7,21 @@ use serde::{Deserialize, Serialize};
 use anyhow::Result;
 
 /// Drone swarm management and coordination
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DroneSwarm {
     pub id: Uuid,
     pub name: String,
     pub drones: HashMap<Uuid, DroneInfo>,
     pub formation: FormationType,
     pub leader_id: Option<Uuid>,
+    #[serde(skip, default = "default_broadcast_channel")]
     pub communication_channel: broadcast::Sender<SwarmMessage>,
     pub status: SwarmStatus,
+}
+
+fn default_broadcast_channel() -> broadcast::Sender<SwarmMessage> {
+    let (sender, _) = broadcast::channel(100);
+    sender
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +46,20 @@ pub struct DroneCapabilities {
     pub flight_time_minutes: u32,
     pub sensors: Vec<SensorType>,
     pub special_features: Vec<String>,
+}
+
+impl Default for DroneCapabilities {
+    fn default() -> Self {
+        Self {
+            max_speed: 50.0,
+            max_altitude: 1000.0,
+            max_range_km: 10.0,
+            payload_capacity_kg: 2.0,
+            flight_time_minutes: 30,
+            sensors: vec![SensorType::RGB],
+            special_features: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -254,6 +274,39 @@ impl SwarmController {
 
         tracing::warn!("Emergency land initiated for swarm {}", swarm_id);
         Ok(())
+    }
+}
+
+impl DroneSwarm {
+    pub fn new(name: String, drone_ids: Vec<Uuid>, formation: FormationType) -> Self {
+        let (sender, _receiver) = broadcast::channel(100);
+        let mut drones = HashMap::new();
+        
+        // Create DroneInfo entries for each drone ID
+        for drone_id in drone_ids {
+            let drone_info = DroneInfo {
+                id: drone_id,
+                name: format!("Drone-{}", drone_id),
+                model: "Default".to_string(),
+                capabilities: DroneCapabilities::default(),
+                position: (0.0, 0.0, 0.0),
+                battery_level: 100.0,
+                status: DroneStatus::Idle,
+                last_heartbeat: chrono::Utc::now(),
+                assigned_mission: None,
+            };
+            drones.insert(drone_id, drone_info);
+        }
+        
+        Self {
+            id: Uuid::new_v4(),
+            name,
+            drones,
+            formation,
+            leader_id: None,
+            communication_channel: sender,
+            status: SwarmStatus::Inactive,
+        }
     }
 }
 

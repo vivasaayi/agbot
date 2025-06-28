@@ -4,6 +4,9 @@ use nalgebra::{Point3, Vector3};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use crate::{OverlayProcessor, SensorOverlay, SensorInput, OverlayType, OverlayData, SpatialBounds, RgbColor};
+use uuid::Uuid;
+use chrono::Utc;
 
 /// LiDAR overlay processor for 3D mapping and terrain analysis
 #[derive(Debug, Clone)]
@@ -26,23 +29,6 @@ pub struct HeightColorMapping {
     pub medium_vegetation: [u8; 4], // RGBA for crops
     pub high_vegetation: [u8; 4],  // RGBA for trees
     pub obstacles: [u8; 4],        // RGBA for obstacles
-}
-
-impl Default for LidarConfig {
-    fn default() -> Self {
-        Self {
-            point_cloud_resolution: 0.1, // 10cm resolution
-            height_color_mapping: HeightColorMapping {
-                ground_level: [139, 69, 19, 255],    // Brown
-                low_vegetation: [50, 205, 50, 255],  // Lime green
-                medium_vegetation: [34, 139, 34, 255], // Forest green
-                high_vegetation: [0, 100, 0, 255],   // Dark green
-                obstacles: [255, 0, 0, 255],         // Red
-            },
-            occupancy_grid_resolution: 0.2, // 20cm grid cells
-            max_range: 100.0, // 100m max range
-        }
-    }
 }
 
 impl LidarOverlayProcessor {
@@ -321,6 +307,41 @@ impl LidarOverlayProcessor {
             area_covered_m2: area_covered,
             total_points: heights.len(),
         }
+    }
+}
+
+impl OverlayProcessor for LidarOverlayProcessor {
+    fn process(&self, _inputs: &[SensorInput]) -> Result<SensorOverlay> {
+        // Create a basic LiDAR elevation overlay
+        let overlay = SensorOverlay {
+            id: Uuid::new_v4(),
+            overlay_type: OverlayType::LidarElevation,
+            timestamp: Utc::now(),
+            spatial_bounds: SpatialBounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 100.0,
+                min_z: Some(0.0),
+                max_z: Some(10.0),
+            },
+            resolution: (100, 100),
+            data: OverlayData::PointCloud {
+                points: vec![Point3::new(0.0, 0.0, 0.0); 1000], // Mock points
+                values: vec![5.0; 1000], // Mock elevation values
+                colors: Some(vec![RgbColor { r: 0, g: 255, b: 0 }; 1000]), // Green
+            },
+            metadata: HashMap::new(),
+        };
+        Ok(overlay)
+    }
+
+    fn can_process(&self, sensor_type: &str) -> bool {
+        sensor_type == "lidar" || sensor_type == "point_cloud"
+    }
+
+    fn get_overlay_type(&self) -> OverlayType {
+        OverlayType::LidarElevation
     }
 }
 

@@ -34,7 +34,7 @@ pub struct Drone {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DroneStatus {
     Idle,
     Armed,
@@ -266,7 +266,7 @@ impl SimulationEngine {
                 let mut drones_guard = drones.write().await;
                 let env = environment.read().await;
                 
-                for (id, simulator) in drones_guard.iter_mut() {
+                for (_id, simulator) in drones_guard.iter_mut() {
                     if let Ok(events) = simulator.update(&env).await {
                         for event in events {
                             let _ = event_sender.send(event);
@@ -301,7 +301,7 @@ impl SimulationEngine {
     pub fn subscribe_to_events(&self) -> mpsc::UnboundedReceiver<SimulationEvent> {
         // In a real implementation, this would create a new receiver
         // For now, we'll need to handle this differently
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (_sender, receiver) = mpsc::unbounded_channel();
         receiver
     }
 }
@@ -373,7 +373,7 @@ impl DroneSimulator {
 
         // Check for status changes
         let new_status = self.determine_status();
-        if !matches!(new_status, self.drone.status) {
+        if new_status != self.drone.status {
             let old_status = self.drone.status.clone();
             self.drone.status = new_status.clone();
             

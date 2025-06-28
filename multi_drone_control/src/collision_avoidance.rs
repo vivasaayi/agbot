@@ -128,7 +128,7 @@ impl CollisionAvoidanceSystem {
     pub async fn register_drone(&mut self, drone_id: Uuid, initial_position: Position3D) -> Result<()> {
         let tracking_info = DroneTrackingInfo {
             id: drone_id,
-            position: initial_position,
+            position: initial_position.clone(),
             velocity: Velocity3D {
                 vx: 0.0,
                 vy: 0.0,
@@ -136,7 +136,7 @@ impl CollisionAvoidanceSystem {
                 speed: 0.0,
             },
             heading: 0.0,
-            altitude: initial_position.z as f32,
+            altitude: initial_position.altitude_m,
             last_update: Utc::now(),
             predicted_trajectory: vec![],
             collision_risk_level: RiskLevel::None,
@@ -159,17 +159,23 @@ impl CollisionAvoidanceSystem {
             tracking_info.position = position;
             tracking_info.velocity = velocity;
             tracking_info.heading = heading;
-            tracking_info.altitude = position.z as f32;
+            tracking_info.altitude = tracking_info.position.altitude_m;
             tracking_info.last_update = Utc::now();
-
-            // Update predicted trajectory
-            tracking_info.predicted_trajectory = self.predict_trajectory(&tracking_info).await;
-
-            // Check for collision risks
-            self.assess_collision_risk(drone_id).await?;
         } else {
             return Err(anyhow::anyhow!("Drone not registered: {}", drone_id));
         }
+
+        // Separate the prediction and risk assessment to avoid borrow conflicts
+        if let Some(tracking_info) = self.tracked_drones.get(&drone_id) {
+            let predicted_trajectory = self.predict_trajectory(tracking_info).await;
+            
+            if let Some(tracking_info) = self.tracked_drones.get_mut(&drone_id) {
+                tracking_info.predicted_trajectory = predicted_trajectory;
+            }
+        }
+
+        // Check for collision risks
+        self.assess_collision_risk(drone_id).await?;
 
         Ok(())
     }
@@ -182,9 +188,16 @@ impl CollisionAvoidanceSystem {
         let prediction_steps = self.prediction_horizon.as_secs() as usize;
 
         for _ in 0..prediction_steps {
-            current_pos.x += tracking_info.velocity.vx as f64 * dt;
-            current_pos.y += tracking_info.velocity.vy as f64 * dt;
-            current_pos.z += tracking_info.velocity.vz as f64 * dt;
+            // Convert velocity from m/s to lat/lon changes per second (approximate)
+            // 1 degree of latitude ≈ 111,111 meters
+            // 1 degree of longitude ≈ 111,111 * cos(latitude) meters
+            let lat_change = (tracking_info.velocity.vy as f64 * dt) / 111_111.0;
+            let lon_change = (tracking_info.velocity.vx as f64 * dt) / (111_111.0 * current_pos.latitude.cos());
+            let alt_change = tracking_info.velocity.vz * dt as f32;
+
+            current_pos.latitude += lat_change;
+            current_pos.longitude += lon_change;
+            current_pos.altitude_m += alt_change;
 
             trajectory.push(current_pos.clone());
         }

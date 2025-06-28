@@ -7,7 +7,7 @@ use std::sync::Arc;
 use drone_simulator::{
     SimulationEngine, Drone, DroneCapabilities, 
     flight_controller::FlightCommand,
-    environment::{Environment, EnvironmentConditions},
+    environment::EnvironmentConditions,
 };
 
 #[derive(Parser)]
@@ -24,7 +24,7 @@ enum Commands {
     Simulate {
         #[arg(short, long, default_value = "1")]
         drones: u32,
-        #[arg(short, long, default_value = "60")]
+        #[arg(short = 't', long, default_value = "60")]
         duration_seconds: u64,
         #[arg(long, default_value = "1.0")]
         time_scale: f32,
@@ -76,7 +76,7 @@ async fn run_simulation(num_drones: u32, duration_seconds: u64, time_scale: f32)
     let engine = Arc::new(SimulationEngine::new());
     
     // Set up environment with some weather conditions
-    let conditions = EnvironmentConditions {
+    let _conditions = EnvironmentConditions {
         temperature_celsius: 22.0,
         wind_speed_ms: 8.0,
         visibility_m: 12000.0,

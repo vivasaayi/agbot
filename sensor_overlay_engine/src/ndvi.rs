@@ -3,8 +3,11 @@ use image::{ImageBuffer, Rgb, RgbImage};
 use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use crate::{OverlayProcessor, SensorOverlay, SensorInput, OverlayType, OverlayData, SpatialBounds};
+use uuid::Uuid;
+use chrono::Utc;
+use std::collections::HashMap;
 
-/// NDVI (Normalized Difference Vegetation Index) processor
 #[derive(Debug, Clone)]
 pub struct NdviProcessor {
     pub config: NdviConfig,
@@ -25,23 +28,6 @@ pub struct ColorMapping {
     pub high_vegetation: [u8; 3],
     pub water: [u8; 3],
     pub soil: [u8; 3],
-}
-
-impl Default for NdviConfig {
-    fn default() -> Self {
-        Self {
-            red_band_index: 0,
-            nir_band_index: 1,
-            output_format: "PNG".to_string(),
-            color_mapping: ColorMapping {
-                low_vegetation: [255, 0, 0],    // Red
-                medium_vegetation: [255, 255, 0], // Yellow
-                high_vegetation: [0, 255, 0],   // Green
-                water: [0, 0, 255],             // Blue
-                soil: [139, 69, 19],            // Brown
-            },
-        }
-    }
 }
 
 impl NdviProcessor {
@@ -165,6 +151,44 @@ impl NdviProcessor {
             low_vegetation_percent: low_vegetation,
             total_pixels: valid_values.len(),
         }
+    }
+}
+
+impl OverlayProcessor for NdviProcessor {
+    fn process(&self, inputs: &[SensorInput]) -> Result<SensorOverlay> {
+        // For now, create a basic NDVI overlay
+        // In a real implementation, this would process the multispectral data
+        let overlay = SensorOverlay {
+            id: Uuid::new_v4(),
+            overlay_type: OverlayType::NDVI,
+            timestamp: Utc::now(),
+            spatial_bounds: SpatialBounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 100.0,
+                min_z: None,
+                max_z: None,
+            },
+            resolution: (100, 100),
+            data: OverlayData::Grid {
+                width: 100,
+                height: 100,
+                values: vec![0.5; 10000], // Mock NDVI values
+                min_value: -1.0,
+                max_value: 1.0,
+            },
+            metadata: HashMap::new(),
+        };
+        Ok(overlay)
+    }
+
+    fn can_process(&self, sensor_type: &str) -> bool {
+        sensor_type == "multispectral" || sensor_type == "rgb"
+    }
+
+    fn get_overlay_type(&self) -> OverlayType {
+        OverlayType::NDVI
     }
 }
 

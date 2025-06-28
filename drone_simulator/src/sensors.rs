@@ -90,7 +90,7 @@ impl SensorSuite {
         let now = Utc::now();
 
         // GPS readings
-        if self.should_update(&self.gps.last_update, self.gps.update_rate_hz, now) {
+        if Self::should_update(&self.gps.last_update, self.gps.update_rate_hz, now) {
             if let Some(reading) = self.gps.read(state, environment)? {
                 readings.push(reading);
             }
@@ -98,7 +98,7 @@ impl SensorSuite {
         }
 
         // IMU readings
-        if self.should_update(&self.imu.last_update, self.imu.update_rate_hz, now) {
+        if Self::should_update(&self.imu.last_update, self.imu.update_rate_hz, now) {
             if let Some(reading) = self.imu.read(state, environment)? {
                 readings.push(reading);
             }
@@ -106,7 +106,7 @@ impl SensorSuite {
         }
 
         // Barometer readings
-        if self.should_update(&self.barometer.last_update, self.barometer.update_rate_hz, now) {
+        if Self::should_update(&self.barometer.last_update, self.barometer.update_rate_hz, now) {
             if let Some(reading) = self.barometer.read(state, environment)? {
                 readings.push(reading);
             }
@@ -114,7 +114,7 @@ impl SensorSuite {
         }
 
         // Magnetometer readings
-        if self.should_update(&self.magnetometer.last_update, self.magnetometer.update_rate_hz, now) {
+        if Self::should_update(&self.magnetometer.last_update, self.magnetometer.update_rate_hz, now) {
             if let Some(reading) = self.magnetometer.read(state, environment)? {
                 readings.push(reading);
             }
@@ -123,7 +123,7 @@ impl SensorSuite {
 
         // Camera readings
         if let Some(ref mut camera) = self.camera {
-            if self.should_update(&camera.last_capture, camera.fps, now) {
+            if Self::should_update(&camera.last_capture, camera.fps, now) {
                 if let Some(reading) = camera.capture(state, environment)? {
                     readings.push(reading);
                 }
@@ -133,7 +133,7 @@ impl SensorSuite {
 
         // LiDAR readings
         if let Some(ref mut lidar) = self.lidar {
-            if self.should_update(&lidar.last_scan, lidar.scan_rate_hz, now) {
+            if Self::should_update(&lidar.last_scan, lidar.scan_rate_hz, now) {
                 if let Some(reading) = lidar.scan(state, environment)? {
                     readings.push(reading);
                 }
@@ -143,7 +143,7 @@ impl SensorSuite {
 
         // Multispectral readings
         if let Some(ref mut multispectral) = self.multispectral {
-            if self.should_update(&multispectral.last_capture, multispectral.capture_rate_hz, now) {
+            if Self::should_update(&multispectral.last_capture, multispectral.capture_rate_hz, now) {
                 if let Some(reading) = multispectral.capture(state, environment)? {
                     readings.push(reading);
                 }
@@ -154,7 +154,7 @@ impl SensorSuite {
         Ok(readings)
     }
 
-    fn should_update(&self, last_update: &DateTime<Utc>, rate_hz: f32, now: DateTime<Utc>) -> bool {
+    fn should_update(last_update: &DateTime<Utc>, rate_hz: f32, now: DateTime<Utc>) -> bool {
         let interval_ms = (1000.0 / rate_hz) as i64;
         (now - *last_update).num_milliseconds() >= interval_ms
     }

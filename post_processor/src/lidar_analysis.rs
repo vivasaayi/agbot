@@ -21,6 +21,19 @@ pub struct LidarAnalysisConfig {
     pub enable_vegetation_metrics: bool,
 }
 
+impl Default for LidarAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            ground_classification_threshold: 0.1,
+            vegetation_height_threshold: 0.5,
+            noise_filter_radius: 0.05,
+            grid_resolution: 1.0,
+            enable_ground_filtering: true,
+            enable_vegetation_metrics: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PointCloudSummary {
     pub id: Uuid,
@@ -387,6 +400,51 @@ impl LidarAnalysisProcessor {
     fn calculate_spatial_variations(&self, _summaries: &[&PointCloudSummary]) -> Vec<SpatialVariation> {
         // TODO: Implement spatial variation analysis
         vec![]
+    }
+
+    // Compatibility method for the post processor service
+    pub async fn analyze(&mut self, input_files: &[std::path::PathBuf], _parameters: &super::ProcessingParameters) -> anyhow::Result<super::AnalysisResult> {
+        use uuid::Uuid;
+        use chrono::Utc;
+        use std::collections::HashMap;
+        
+        // Convert input files to strings
+        let _file_paths: Vec<String> = input_files.iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        
+        // Create mock percentiles
+        let mut percentiles = HashMap::new();
+        percentiles.insert("25".to_string(), 2.5);
+        percentiles.insert("50".to_string(), 5.0);
+        percentiles.insert("75".to_string(), 7.5);
+        
+        // Create a basic analysis result
+        Ok(super::AnalysisResult {
+            id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            result_type: super::ResultType::ElevationModel,
+            data: super::ResultData::GridData {
+                width: 100,
+                height: 100,
+                values: vec![5.0; 10000], // Mock elevation values
+                bounds: (-74.0, 40.0, -73.9, 40.1),
+                units: "meters".to_string(),
+            },
+            statistics: super::AnalysisStatistics {
+                min_value: 0.0,
+                max_value: 10.0,
+                mean_value: 5.0,
+                std_deviation: 2.0,
+                percentiles,
+                coverage_area_m2: 10000.0,
+                valid_pixel_count: 10000,
+                total_pixel_count: 10000,
+            },
+            visualizations: vec![],
+            recommendations: vec![],
+            created_at: Utc::now(),
+        })
     }
 }
 

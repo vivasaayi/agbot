@@ -342,6 +342,12 @@ impl MissionAssignmentEngine {
             last_update: Utc::now(),
         }
     }
+
+    pub async fn assign_mission(&mut self, drone_id: Uuid, mission_id: Uuid) -> Result<()> {
+        // TODO: Implement mission assignment logic
+        tracing::info!("Assigning mission {} to drone {}", mission_id, drone_id);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

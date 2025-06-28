@@ -9,6 +9,8 @@ pub mod waypoint;
 pub mod flight_path;
 pub mod mission_optimizer;
 pub mod weather_integration;
+pub mod mavlink_integration;
+pub mod websocket_handler;
 
 pub use waypoint::{Waypoint, WaypointType, Action};
 pub use flight_path::{FlightPath, PathSegment};

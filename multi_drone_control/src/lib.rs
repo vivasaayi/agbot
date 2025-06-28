@@ -11,10 +11,10 @@ pub mod coordination;
 pub mod mission_assignment;
 pub mod collision_avoidance;
 
-pub use swarm::{DroneSwarm, SwarmConfiguration};
-pub use coordination::{CoordinationEngine, CoordinationStrategy};
-pub use mission_assignment::{MissionAssigner, TaskAllocation};
-pub use collision_avoidance::{CollisionAvoidance, SafetyZone};
+pub use swarm::{DroneSwarm, SwarmController};
+pub use coordination::{CoordinationEngine, CoordinationStatus};
+pub use mission_assignment::{MissionAssignmentEngine, DroneAssignment};
+pub use collision_avoidance::{CollisionAvoidanceSystem, AvoidanceManeuver};
 
 /// Multi-drone control system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,9 +88,9 @@ pub enum CoordinatedAction {
 pub struct MultiDroneControlService {
     controller: Arc<RwLock<MultiDroneController>>,
     drone_statuses: Arc<RwLock<HashMap<Uuid, DroneStatus>>>,
-    coordination_engine: Arc<CoordinationEngine>,
-    mission_assigner: Arc<MissionAssigner>,
-    collision_avoidance: Arc<CollisionAvoidance>,
+    coordination_engine: Arc<RwLock<CoordinationEngine>>,
+    mission_assigner: Arc<RwLock<MissionAssignmentEngine>>,
+    collision_avoidance: Arc<RwLock<CollisionAvoidanceSystem>>,
     command_sender: mpsc::UnboundedSender<ControlCommand>,
     command_receiver: Arc<RwLock<mpsc::UnboundedReceiver<ControlCommand>>>,
 }
@@ -121,7 +121,7 @@ impl MultiDroneController {
 
     pub fn list_all_drones(&self) -> Vec<Uuid> {
         self.swarms.values()
-            .flat_map(|swarm| swarm.drone_ids.iter())
+            .flat_map(|swarm| swarm.drones.keys())
             .cloned()
             .collect()
     }
@@ -160,9 +160,11 @@ impl MultiDroneControlService {
         Self {
             controller: Arc::new(RwLock::new(controller)),
             drone_statuses: Arc::new(RwLock::new(HashMap::new())),
-            coordination_engine: Arc::new(CoordinationEngine::new()),
-            mission_assigner: Arc::new(MissionAssigner::new()),
-            collision_avoidance: Arc::new(CollisionAvoidance::new()),
+            coordination_engine: Arc::new(RwLock::new(CoordinationEngine::new())),
+            mission_assigner: Arc::new(RwLock::new(MissionAssignmentEngine::new(
+                mission_assignment::AssignmentAlgorithm::FirstAvailable
+            ))),
+            collision_avoidance: Arc::new(RwLock::new(CollisionAvoidanceSystem::new())),
             command_sender,
             command_receiver: Arc::new(RwLock::new(command_receiver)),
         }
@@ -202,15 +204,25 @@ impl MultiDroneControlService {
     async fn handle_command(&self, command: ControlCommand) -> Result<()> {
         match command {
             ControlCommand::AssignMission { drone_id, mission_id } => {
-                self.mission_assigner.assign_mission(drone_id, mission_id).await?;
+                self.mission_assigner.write().await.assign_mission(drone_id, mission_id).await?;
             }
             ControlCommand::FormSwarm { drone_ids, formation } => {
-                let swarm = DroneSwarm::new("Auto-Swarm".to_string(), drone_ids, formation);
+                let formation_type = match formation {
+                    Formation::Line { .. } => swarm::FormationType::Line,
+                    Formation::Grid { .. } => swarm::FormationType::Grid,
+                    Formation::Circle { .. } => swarm::FormationType::Circle,
+                    Formation::VFormation { .. } => swarm::FormationType::V,
+                    Formation::Custom { positions } => swarm::FormationType::Custom(
+                        positions.into_iter().map(|(x, y, _)| (x as f64, y as f64)).collect()
+                    ),
+                };
+                let swarm = DroneSwarm::new("Auto-Swarm".to_string(), drone_ids, formation_type);
                 let mut controller = self.controller.write().await;
                 controller.add_swarm(swarm);
             }
             ControlCommand::ExecuteCoordinatedAction { swarm_id, action } => {
-                self.coordination_engine.execute_action(swarm_id, action).await?;
+                let action_str = format!("{:?}", action);
+                self.coordination_engine.write().await.execute_action(swarm_id, action_str).await?;
             }
             ControlCommand::EmergencyLand { drone_ids } => {
                 for drone_id in drone_ids {

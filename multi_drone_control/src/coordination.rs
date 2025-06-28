@@ -36,7 +36,6 @@ pub enum DroneOperationStatus {
     Maintenance,
 }
 
-#[derive(Debug, Clone)]
 pub struct CoordinationRule {
     pub id: Uuid,
     pub name: String,
@@ -46,7 +45,32 @@ pub struct CoordinationRule {
     pub enabled: bool,
 }
 
-#[derive(Debug)]
+impl Clone for CoordinationRule {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            priority: self.priority,
+            condition: self.condition.clone(),
+            action: self.action.clone(),
+            enabled: self.enabled,
+        }
+    }
+}
+
+impl std::fmt::Debug for CoordinationRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoordinationRule")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("priority", &self.priority)
+            .field("condition", &format_args!("RuleCondition"))
+            .field("action", &format_args!("RuleAction"))
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
 pub enum RuleCondition {
     ProximityAlert { distance_threshold: f64 },
     BatteryLow { threshold: f32 },
@@ -55,7 +79,51 @@ pub enum RuleCondition {
     Custom(Box<dyn Fn(&[DroneState]) -> bool + Send + Sync>),
 }
 
-#[derive(Debug)]
+impl Clone for RuleCondition {
+    fn clone(&self) -> Self {
+        match self {
+            RuleCondition::ProximityAlert { distance_threshold } => {
+                RuleCondition::ProximityAlert { distance_threshold: *distance_threshold }
+            }
+            RuleCondition::BatteryLow { threshold } => {
+                RuleCondition::BatteryLow { threshold: *threshold }
+            }
+            RuleCondition::CommunicationLoss { timeout_seconds } => {
+                RuleCondition::CommunicationLoss { timeout_seconds: *timeout_seconds }
+            }
+            RuleCondition::WeatherCondition { condition } => {
+                RuleCondition::WeatherCondition { condition: condition.clone() }
+            }
+            RuleCondition::Custom(_) => {
+                // Cannot clone functions, so create a dummy one
+                RuleCondition::Custom(Box::new(|_| false))
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for RuleCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuleCondition::ProximityAlert { distance_threshold } => {
+                f.debug_struct("ProximityAlert").field("distance_threshold", distance_threshold).finish()
+            }
+            RuleCondition::BatteryLow { threshold } => {
+                f.debug_struct("BatteryLow").field("threshold", threshold).finish()
+            }
+            RuleCondition::CommunicationLoss { timeout_seconds } => {
+                f.debug_struct("CommunicationLoss").field("timeout_seconds", timeout_seconds).finish()
+            }
+            RuleCondition::WeatherCondition { condition } => {
+                f.debug_struct("WeatherCondition").field("condition", condition).finish()
+            }
+            RuleCondition::Custom(_) => {
+                f.debug_struct("Custom").field("function", &"<closure>").finish()
+            }
+        }
+    }
+}
+
 pub enum RuleAction {
     ChangeSpeed { factor: f32 },
     ChangeAltitude { delta: f32 },
@@ -64,6 +132,51 @@ pub enum RuleAction {
     FormFormation { formation_type: String },
     SendAlert { message: String },
     Custom(Box<dyn Fn(&mut DroneState) + Send + Sync>),
+}
+
+impl Clone for RuleAction {
+    fn clone(&self) -> Self {
+        match self {
+            RuleAction::ChangeSpeed { factor } => RuleAction::ChangeSpeed { factor: *factor },
+            RuleAction::ChangeAltitude { delta } => RuleAction::ChangeAltitude { delta: *delta },
+            RuleAction::ReturnToBase => RuleAction::ReturnToBase,
+            RuleAction::LandImmediate => RuleAction::LandImmediate,
+            RuleAction::FormFormation { formation_type } => {
+                RuleAction::FormFormation { formation_type: formation_type.clone() }
+            }
+            RuleAction::SendAlert { message } => {
+                RuleAction::SendAlert { message: message.clone() }
+            }
+            RuleAction::Custom(_) => {
+                // Cannot clone functions, so create a dummy one
+                RuleAction::Custom(Box::new(|_| {}))
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for RuleAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuleAction::ChangeSpeed { factor } => {
+                f.debug_struct("ChangeSpeed").field("factor", factor).finish()
+            }
+            RuleAction::ChangeAltitude { delta } => {
+                f.debug_struct("ChangeAltitude").field("delta", delta).finish()
+            }
+            RuleAction::ReturnToBase => f.debug_struct("ReturnToBase").finish(),
+            RuleAction::LandImmediate => f.debug_struct("LandImmediate").finish(),
+            RuleAction::FormFormation { formation_type } => {
+                f.debug_struct("FormFormation").field("formation_type", formation_type).finish()
+            }
+            RuleAction::SendAlert { message } => {
+                f.debug_struct("SendAlert").field("message", message).finish()
+            }
+            RuleAction::Custom(_) => {
+                f.debug_struct("Custom").field("function", &"<closure>").finish()
+            }
+        }
+    }
 }
 
 impl CoordinationEngine {
@@ -242,6 +355,12 @@ impl CoordinationEngine {
             }
         }
         
+        Ok(())
+    }
+
+    pub async fn execute_action(&mut self, _swarm_id: Uuid, _action: String) -> Result<()> {
+        // TODO: Implement action execution logic
+        tracing::info!("Action execution not yet implemented");
         Ok(())
     }
 }

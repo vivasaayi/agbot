@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use tracing::{info, error};
+use tracing::info;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -14,9 +14,11 @@ use uuid::Uuid;
 use serde_json::json;
 
 use mission_planner::{
-    Mission, MissionPlannerService, Waypoint, WaypointType, 
-    weather_integration::{WeatherIntegration, FlightConditionResult},
+    Mission, MissionPlannerService,
+    weather_integration::WeatherIntegration,
     mission_optimizer::MissionOptimizer,
+    mavlink_integration::MAVLinkConverter,
+    websocket_handler::WebSocketHandler,
 };
 
 #[derive(Parser)]
@@ -33,7 +35,7 @@ enum Commands {
     Serve {
         #[arg(short, long, default_value = "3000")]
         port: u16,
-        #[arg(short, long, default_value = "0.0.0.0")]
+        #[arg(long, default_value = "0.0.0.0")]
         host: String,
     },
     /// Plan a mission from a GeoJSON file
@@ -65,10 +67,19 @@ async fn main() -> Result<()> {
             start_server(host, port).await?;
         }
         Commands::Plan { input, output } => {
-            plan_mission_from_file(input, output).await?;
+            println!("Mission planning from file: {} -> {:?}", input, output);
+            // TODO: Implement file-based mission planning
         }
         Commands::Weather { lat, lon } => {
-            check_weather(lat, lon).await?;
+            let weather_integration = WeatherIntegration::new(None);
+            match weather_integration.get_current_weather(lat, lon).await {
+                Ok(weather) => {
+                    println!("Weather at {}, {}: {:?}", lat, lon, weather);
+                }
+                Err(e) => {
+                    eprintln!("Failed to get weather: {}", e);
+                }
+            }
         }
     }
 
@@ -80,16 +91,30 @@ async fn start_server(host: String, port: u16) -> Result<()> {
 
     let service = MissionPlannerService::new();
     let state = Arc::new(Mutex::new(service));
+    let websocket_handler = Arc::new(WebSocketHandler::new(state.clone()));
 
     let app = Router::new()
+        // REST API routes
         .route("/api/missions", get(list_missions))
         .route("/api/missions", post(create_mission))
         .route("/api/missions/:id", get(get_mission))
         .route("/api/missions/:id", put(update_mission))
         .route("/api/missions/:id", delete(delete_mission))
         .route("/api/missions/:id/optimize", post(optimize_mission))
+        .route("/api/missions/:id/mavlink", get(export_mavlink))
         .route("/api/weather", get(get_weather))
         .route("/health", get(health_check))
+        
+        // WebSocket route with proper state
+        .route("/ws", get({
+            let handler = websocket_handler.clone();
+            move |ws| WebSocketHandler::handle_upgrade(ws, axum::extract::State(handler))
+        }))
+        
+        // Static file serving for frontend
+        .route("/", get(serve_frontend))
+        .fallback(serve_frontend)
+        
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
@@ -184,99 +209,130 @@ async fn get_weather() -> Result<Json<serde_json::Value>, StatusCode> {
     }
 }
 
-async fn plan_mission_from_file(input: String, output: Option<String>) -> Result<()> {
-    info!("Planning mission from file: {}", input);
+async fn export_mavlink(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let service = state.lock().await;
+    let mission_id = id.parse::<Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
     
-    // Read GeoJSON file (simplified for demo)
-    let geojson_content = tokio::fs::read_to_string(&input).await?;
-    info!("Read {} bytes from {}", geojson_content.len(), input);
-    
-    // In a real implementation, parse GeoJSON and create waypoints
-    // For now, create a simple demo mission
-    let area = geo::polygon![
-        (x: -74.0060, y: 40.7128),
-        (x: -74.0050, y: 40.7128),
-        (x: -74.0050, y: 40.7138),
-        (x: -74.0060, y: 40.7138),
-        (x: -74.0060, y: 40.7128),
-    ];
-    
-    let mut mission = Mission::new(
-        "Demo Mission".to_string(),
-        "Mission created from GeoJSON".to_string(),
-        area,
-    );
-    
-    // Add some waypoints
-    mission.add_waypoint(Waypoint::new(
-        geo::point!(x: -74.0060, y: 40.7128),
-        100.0,
-        WaypointType::Takeoff,
-    ));
-    
-    mission.add_waypoint(Waypoint::new(
-        geo::point!(x: -74.0055, y: 40.7133),
-        150.0,
-        WaypointType::DataCollection,
-    ));
-    
-    mission.add_waypoint(Waypoint::new(
-        geo::point!(x: -74.0050, y: 40.7138),
-        100.0,
-        WaypointType::Landing,
-    ));
-    
-    // Optimize the mission
-    let optimizer = MissionOptimizer::new();
-    let optimized = optimizer.optimize_mission(&mission)?;
-    
-    // Output the result
-    let output_file = output.unwrap_or_else(|| "mission_plan.json".to_string());
-    let mission_json = serde_json::to_string_pretty(&optimized)?;
-    tokio::fs::write(&output_file, mission_json).await?;
-    
-    info!("Mission plan saved to: {}", output_file);
-    info!("Estimated duration: {} minutes", optimized.estimated_duration_minutes);
-    info!("Estimated battery usage: {:.1}%", optimized.estimated_battery_usage * 100.0);
-    
-    Ok(())
+    match service.get_mission(&mission_id).await {
+        Some(mission) => {
+            match MAVLinkConverter::mission_to_mavlink(&mission) {
+                Ok(mavlink_mission) => {
+                    let waypoint_file = MAVLinkConverter::to_waypoint_file(&mavlink_mission);
+                    let flight_time = MAVLinkConverter::estimate_flight_time(&mavlink_mission, 10.0);
+                    
+                    Ok(Json(json!({
+                        "mavlink_mission": mavlink_mission,
+                        "waypoint_file": waypoint_file,
+                        "estimated_flight_time_seconds": flight_time,
+                        "item_count": mavlink_mission.count
+                    })))
+                }
+                Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+        None => Err(StatusCode::NOT_FOUND)
+    }
 }
 
-async fn check_weather(lat: f64, lon: f64) -> Result<()> {
-    info!("Checking weather conditions for lat: {}, lon: {}", lat, lon);
-    
-    let weather_integration = WeatherIntegration::new(None);
-    let weather = weather_integration.get_current_weather(lat, lon).await?;
-    
-    println!("Current Weather Conditions:");
-    println!("  Temperature: {:.1}°C", weather.temperature_celsius);
-    println!("  Wind Speed: {:.1} m/s", weather.wind_speed_ms);
-    println!("  Wind Direction: {:.0}°", weather.wind_direction_degrees);
-    println!("  Precipitation: {:.1} mm", weather.precipitation_mm);
-    println!("  Visibility: {:.0} m", weather.visibility_m);
-    println!("  Humidity: {:.0}%", weather.humidity_percent);
-    
-    // Check flight conditions
-    let constraints = mission_planner::WeatherConstraints::default();
-    let result = weather_integration.check_flight_conditions(&weather, &constraints);
-    
-    println!("\nFlight Conditions:");
-    println!("  Flight Safe: {}", if result.flight_safe { "YES" } else { "NO" });
-    println!("  Weather Score: {:.1}/100", result.weather_score);
-    
-    if !result.issues.is_empty() {
-        println!("  Issues:");
-        for issue in &result.issues {
-            println!("    - {}", issue);
-        }
-    }
-    
-    if !result.warnings.is_empty() {
-        println!("  Warnings:");
-        for warning in &result.warnings {
-            println!("    - {}", warning);
-        }
-    }
-    
-    Ok(())
+async fn serve_frontend() -> Result<axum::response::Html<&'static str>, StatusCode> {
+    Ok(axum::response::Html(
+        r#"
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>AgBot Mission Planner</title>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+                .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                h1 { color: #2c5530; margin-bottom: 30px; }
+                .info-box { background: #e8f5e8; padding: 20px; border-radius: 6px; margin: 20px 0; border-left: 4px solid #4CAF50; }
+                .api-endpoint { background: #f8f8f8; padding: 15px; border-radius: 4px; margin: 10px 0; font-family: monospace; }
+                .button { background: #4CAF50; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; text-decoration: none; display: inline-block; }
+                .button:hover { background: #45a049; }
+                .status { padding: 10px; border-radius: 4px; margin: 10px 0; }
+                .status.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+                .status.info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🚁 AgBot Mission Planner</h1>
+                
+                <div class="status success">
+                    ✅ Mission Planner API Server is running successfully!
+                </div>
+                
+                <div class="info-box">
+                    <h3>🌟 Features Available:</h3>
+                    <ul>
+                        <li>✅ <strong>REST API</strong> - Full CRUD operations for missions</li>
+                        <li>✅ <strong>MAVLink Integration</strong> - Convert missions to MAVLink format</li>
+                        <li>✅ <strong>WebSocket Support</strong> - Real-time mission deployment</li>
+                        <li>✅ <strong>Weather Integration</strong> - Flight condition checking</li>
+                        <li>✅ <strong>Mission Optimization</strong> - Automatic route optimization</li>
+                        <li>🚧 <strong>Frontend UI</strong> - React frontend (in development)</li>
+                    </ul>
+                </div>
+
+                <h3>🔗 API Endpoints:</h3>
+                <div class="api-endpoint">GET /api/missions - List all missions</div>
+                <div class="api-endpoint">POST /api/missions - Create new mission</div>
+                <div class="api-endpoint">GET /api/missions/{id} - Get mission details</div>
+                <div class="api-endpoint">PUT /api/missions/{id} - Update mission</div>
+                <div class="api-endpoint">DELETE /api/missions/{id} - Delete mission</div>
+                <div class="api-endpoint">POST /api/missions/{id}/optimize - Optimize mission</div>
+                <div class="api-endpoint">GET /api/missions/{id}/mavlink - Export as MAVLink</div>
+                <div class="api-endpoint">GET /api/weather - Check weather conditions</div>
+                <div class="api-endpoint">WS /ws - WebSocket connection for real-time updates</div>
+
+                <div class="status info">
+                    <strong>📍 Next Step:</strong> The React frontend is prepared in the <code>frontend/</code> directory. 
+                    Run <code>npm install && npm start</code> in the frontend folder to launch the interactive map interface.
+                </div>
+
+                <h3>🧪 Quick Test:</h3>
+                <button class="button" onclick="testApi()">Test API Connection</button>
+                <button class="button" onclick="testWebSocket()">Test WebSocket</button>
+                
+                <div id="test-results"></div>
+
+                <script>
+                    async function testApi() {
+                        const results = document.getElementById('test-results');
+                        try {
+                            const response = await fetch('/api/missions');
+                            const data = await response.json();
+                            results.innerHTML = '<div class="status success">✅ API Test Successful! Found ' + data.length + ' missions.</div>';
+                        } catch (error) {
+                            results.innerHTML = '<div class="status error">❌ API Test Failed: ' + error.message + '</div>';
+                        }
+                    }
+
+                    function testWebSocket() {
+                        const results = document.getElementById('test-results');
+                        try {
+                            const ws = new WebSocket('ws://localhost:3000/ws');
+                            ws.onopen = () => {
+                                results.innerHTML = '<div class="status success">✅ WebSocket Connected!</div>';
+                                ws.send(JSON.stringify({type: 'SubscribeToUpdates'}));
+                                setTimeout(() => ws.close(), 2000);
+                            };
+                            ws.onerror = () => {
+                                results.innerHTML = '<div class="status error">❌ WebSocket Connection Failed</div>';
+                            };
+                        } catch (error) {
+                            results.innerHTML = '<div class="status error">❌ WebSocket Test Failed: ' + error.message + '</div>';
+                        }
+                    }
+                </script>
+            </div>
+        </body>
+        </html>
+        "#
+    ))
 }

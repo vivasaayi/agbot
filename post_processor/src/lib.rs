@@ -10,9 +10,9 @@ pub mod lidar_analysis;
 pub mod thermal_analysis;
 pub mod report_generator;
 
-pub use ndvi_analysis::NdviAnalyzer;
-pub use lidar_analysis::LidarAnalyzer;
-pub use thermal_analysis::ThermalAnalyzer;
+pub use ndvi_analysis::{NdviAnalysisProcessor, NdviAnalysisConfig};
+pub use lidar_analysis::{LidarAnalysisProcessor, LidarAnalysisConfig};
+pub use thermal_analysis::{ThermalAnalysisProcessor, ThermalAnalysisConfig};
 pub use report_generator::ReportGenerator;
 
 /// Post-processing pipeline for agricultural drone data
@@ -196,9 +196,9 @@ pub struct PostProcessorService {
     completed_jobs: HashMap<Uuid, ProcessingJob>,
     results_cache: HashMap<Uuid, AnalysisResult>,
     working_directory: PathBuf,
-    ndvi_analyzer: NdviAnalyzer,
-    lidar_analyzer: LidarAnalyzer,
-    thermal_analyzer: ThermalAnalyzer,
+    ndvi_analyzer: NdviAnalysisProcessor,
+    lidar_analyzer: LidarAnalysisProcessor,
+    thermal_analyzer: ThermalAnalysisProcessor,
     report_generator: ReportGenerator,
 }
 
@@ -209,9 +209,9 @@ impl PostProcessorService {
             completed_jobs: HashMap::new(),
             results_cache: HashMap::new(),
             working_directory,
-            ndvi_analyzer: NdviAnalyzer::new(),
-            lidar_analyzer: LidarAnalyzer::new(),
-            thermal_analyzer: ThermalAnalyzer::new(),
+            ndvi_analyzer: NdviAnalysisProcessor::new(NdviAnalysisConfig::default()),
+            lidar_analyzer: LidarAnalysisProcessor::new(LidarAnalysisConfig::default()),
+            thermal_analyzer: ThermalAnalysisProcessor::new(ThermalAnalysisConfig::default()),
             report_generator: ReportGenerator::new(report_generator::ReportConfig {
                 output_formats: vec![report_generator::OutputFormat::PDF, report_generator::OutputFormat::HTML],
                 default_template: "agricultural_comprehensive".to_string(),
@@ -277,7 +277,7 @@ impl PostProcessorService {
         }
     }
 
-    async fn process_job(&self, job: &ProcessingJob) -> Result<AnalysisResult> {
+    async fn process_job(&mut self, job: &ProcessingJob) -> Result<AnalysisResult> {
         match job.job_type {
             JobType::NdviAnalysis => {
                 self.ndvi_analyzer.analyze(&job.input_files, &job.parameters).await

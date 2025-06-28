@@ -1,5 +1,6 @@
 use anyhow::Result;
-use crate::{Mission, FlightPath, PathType, SurveyPattern};
+use crate::{Mission, FlightPath};
+use crate::flight_path::{PathType, SurveyPattern};
 use geo::Point;
 
 pub struct MissionOptimizer {

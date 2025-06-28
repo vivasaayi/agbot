@@ -16,6 +16,30 @@ pub use thermal::ThermalProcessor;
 pub use lidar_overlay::LidarOverlayProcessor;
 pub use composite::CompositeOverlayEngine;
 
+/// Custom serializable RGB color type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RgbColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl From<Rgb<u8>> for RgbColor {
+    fn from(rgb: Rgb<u8>) -> Self {
+        Self {
+            r: rgb.0[0],
+            g: rgb.0[1],
+            b: rgb.0[2],
+        }
+    }
+}
+
+impl Into<Rgb<u8>> for RgbColor {
+    fn into(self) -> Rgb<u8> {
+        Rgb([self.r, self.g, self.b])
+    }
+}
+
 /// Core sensor overlay data structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorOverlay {
@@ -66,7 +90,7 @@ pub enum OverlayData {
     PointCloud {
         points: Vec<Point3<f32>>,
         values: Vec<f32>,
-        colors: Option<Vec<Rgb<u8>>>,
+        colors: Option<Vec<RgbColor>>,
     },
     Heatmap {
         width: u32,
@@ -170,10 +194,56 @@ impl OverlayEngine {
     pub fn new() -> Self {
         let mut processors: HashMap<OverlayType, Box<dyn OverlayProcessor>> = HashMap::new();
         
+        // Create default configurations
+        let ndvi_config = ndvi::NdviConfig {
+            red_band_index: 0,
+            nir_band_index: 1,
+            output_format: "PNG".to_string(),
+            color_mapping: ndvi::ColorMapping {
+                low_vegetation: [255, 0, 0],
+                medium_vegetation: [255, 255, 0],
+                high_vegetation: [0, 255, 0],
+                water: [0, 0, 255],
+                soil: [139, 69, 19],
+            },
+        };
+
+        let thermal_config = thermal::ThermalConfig {
+            temperature_range: thermal::TemperatureRange {
+                min_celsius: -10.0,
+                max_celsius: 50.0,
+            },
+            color_palette: thermal::ThermalColorPalette {
+                cold: [0, 0, 255],
+                cool: [0, 255, 255],
+                moderate: [0, 255, 0],
+                warm: [255, 255, 0],
+                hot: [255, 0, 0],
+            },
+            calibration: thermal::ThermalCalibration {
+                offset: 0.0,
+                scale: 1.0,
+                ambient_temp: 20.0,
+            },
+        };
+
+        let lidar_config = lidar_overlay::LidarConfig {
+            point_cloud_resolution: 0.1,
+            height_color_mapping: lidar_overlay::HeightColorMapping {
+                ground_level: [139, 69, 19, 255],
+                low_vegetation: [50, 205, 50, 255],
+                medium_vegetation: [34, 139, 34, 255],
+                high_vegetation: [0, 100, 0, 255],
+                obstacles: [255, 0, 0, 255],
+            },
+            occupancy_grid_resolution: 0.2,
+            max_range: 100.0,
+        };
+        
         // Register default processors
-        processors.insert(OverlayType::NDVI, Box::new(NdviProcessor::new()));
-        processors.insert(OverlayType::Thermal, Box::new(ThermalProcessor::new()));
-        processors.insert(OverlayType::LidarElevation, Box::new(LidarOverlayProcessor::new()));
+        processors.insert(OverlayType::NDVI, Box::new(NdviProcessor::new(ndvi_config)));
+        processors.insert(OverlayType::Thermal, Box::new(ThermalProcessor::new(thermal_config)));
+        processors.insert(OverlayType::LidarElevation, Box::new(LidarOverlayProcessor::new(lidar_config)));
 
         Self {
             processors,
