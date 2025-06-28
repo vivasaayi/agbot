@@ -40,12 +40,16 @@ tonic = "0.10"
 tonic-build = "0.10"
 prost = "0.12"
 
+# Math/Linear algebra
+nalgebra = { version = "0.32", features = ["serde-serialize"] }
+ndarray = "0.15"
+
 # Image processing
-image = "0.24"
+image = { version = "0.24", features = ["png", "jpeg"] }
 imageproc = "0.23"
 
-# Math/Linear algebra
-nalgebra = "0.32"
+# Web frameworks
+warp = "0.3"
 
 # Serial communication
 serialport = "4.2"

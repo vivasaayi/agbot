@@ -1,5 +1,5 @@
 [package]
-name = "mission_planner"
+name = "sensor_overlay_engine"
 version = "0.1.0"
 edition = "2021"
 
@@ -13,13 +13,12 @@ clap = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-axum = { workspace = true }
-geo = { workspace = true }
-geojson = { workspace = true }
+image = { workspace = true }
+nalgebra = { workspace = true }
 
 # Internal dependencies
 shared = { path = "../shared" }
 
 # Specific dependencies
-reqwest = { version = "0.11", features = ["json"] }
-rand = "0.8"
+ndarray = "0.15"
+colorgrad = "0.6"

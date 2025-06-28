@@ -15,3 +15,4 @@ config = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
+nalgebra = { workspace = true }

@@ -1,5 +1,5 @@
 [package]
-name = "mission_planner"
+name = "multi_drone_control"
 version = "0.1.0"
 edition = "2021"
 
@@ -14,12 +14,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
-geo = { workspace = true }
-geojson = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 # Internal dependencies
 shared = { path = "../shared" }
 
 # Specific dependencies
-reqwest = { version = "0.11", features = ["json"] }
-rand = "0.8"
+futures-util = "0.3"
