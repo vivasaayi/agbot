@@ -1,0 +1,26 @@
+# AgBot Visualizer Configuration
+
+# WebSocket connection URL for live data
+websocket_url = "ws://localhost:8080/ws"
+
+# gRPC endpoint for control commands
+grpc_endpoint = "http://localhost:50051"
+
+# Data directories
+terrain_data_path = "./data/terrain"
+mission_data_path = "./missions"
+
+# Debug options
+enable_inspector = true
+
+[camera]
+initial_position = [0.0, 50.0, 50.0]
+movement_speed = 10.0
+rotation_speed = 2.0
+zoom_speed = 5.0
+
+[rendering]
+show_ndvi_overlay = true
+show_lidar_points = true
+show_sensor_data = true
+terrain_resolution = 512

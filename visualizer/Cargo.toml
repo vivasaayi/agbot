@@ -1,0 +1,47 @@
+[package]
+name = "visualizer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core dependencies
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = "1.3"
+
+# Networking
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+
+# Math and coordinates
+nalgebra = { workspace = true }
+geo = { workspace = true }
+
+# 3D Engine and UI
+bevy = { workspace = true }
+bevy_egui = { workspace = true }
+bevy-inspector-egui = { workspace = true }
+
+# Shared workspace crate
+shared = { path = "../shared" }
+# multi_drone_control = { path = "../multi_drone_control" }
+
+# Time handling
+chrono = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+dotenvy = { workspace = true }
+
+# Async channels
+flume = { workspace = true }
+
+[[bin]]
+name = "visualizer"
+path = "src/main.rs"
