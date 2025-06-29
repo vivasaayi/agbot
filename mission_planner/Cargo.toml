@@ -18,7 +18,7 @@ axum = { workspace = true, features = ["ws"] }
 geo = { workspace = true }
 geojson = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { workspace = true, features = ["trace"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 
@@ -29,3 +29,9 @@ shared = { path = "../shared" }
 reqwest = { version = "0.11", features = ["json"] }
 rand = "0.8"
 mavlink = { workspace = true }
+
+# Database dependencies
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
+
+[dev-dependencies]
+axum-test = "14.0"
