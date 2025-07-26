@@ -7,7 +7,7 @@ members = [
     "data_collector",
     "post_processor",
     "shared",
-    "visualizer",
+    "simulator",
     "lidar_mapper",
 ]
 resolver = "2"
