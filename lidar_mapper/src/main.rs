@@ -11,7 +11,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     info!("Starting LiDAR Mapper");
 
-    let mapper = LidarMapper::new().await?;
+    let mapper = LidarMapper::new(&args).await?;
     mapper.process_directory(&args.input_dir, &args.output_dir).await?;
 
     Ok(())

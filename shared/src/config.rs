@@ -62,6 +62,12 @@ pub struct GpsConfig {
 pub struct ProcessingConfig {
     pub ndvi_output_format: String,
     pub lidar_grid_resolution: f32,
+    // LiDAR processing thresholds
+    pub lidar_obstacle_distance_threshold: f32,
+    pub lidar_quality_threshold: u8,
+    pub lidar_occupancy_threshold: f32,
+    // Flip Y axis when saving images (north-up convention)
+    pub lidar_image_flip_y: bool,
 }
 
 impl AgroConfig {
@@ -140,6 +146,22 @@ impl AgroConfig {
                     .unwrap_or_else(|_| "0.1".to_string())
                     .parse()
                     .unwrap_or(0.1),
+                lidar_obstacle_distance_threshold: std::env::var("LIDAR_OBSTACLE_DISTANCE_THRESHOLD")
+                    .unwrap_or_else(|_| "5.0".to_string())
+                    .parse()
+                    .unwrap_or(5.0),
+                lidar_quality_threshold: std::env::var("LIDAR_QUALITY_THRESHOLD")
+                    .unwrap_or_else(|_| "20".to_string())
+                    .parse()
+                    .unwrap_or(20),
+                lidar_occupancy_threshold: std::env::var("LIDAR_OCCUPANCY_THRESHOLD")
+                    .unwrap_or_else(|_| "0.5".to_string())
+                    .parse()
+                    .unwrap_or(0.5),
+                lidar_image_flip_y: std::env::var("LIDAR_IMAGE_FLIP_Y")
+                    .unwrap_or_else(|_| "false".to_string())
+                    .parse()
+                    .unwrap_or(false),
             },
         };
 

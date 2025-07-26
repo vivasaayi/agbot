@@ -8,6 +8,8 @@ mod communication;
 mod components;
 mod drone_controller;
 mod hud;
+mod lidar_controls;
+mod lidar_simulator;
 mod resources;
 mod systems;
 mod terrain;

@@ -1,13 +1,14 @@
 [workspace]
 members = [
     "mission_planner",
-    "drone_simulator", 
+    "drone_simulator",
     "sensor_overlay_engine",
     "multi_drone_control",
     "data_collector",
     "post_processor",
     "shared",
-    "visualizer"
+    "visualizer",
+    "lidar_mapper",
 ]
 resolver = "2"
 

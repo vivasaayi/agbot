@@ -65,6 +65,45 @@ pub struct LidarPointCloud {
 }
 
 #[derive(Component, Debug)]
+pub struct LidarSensor {
+    pub range: f32,
+    pub angular_resolution: f32,
+    pub scan_frequency: f32,
+    pub last_scan_time: f32,
+    pub is_3d: bool,
+    pub vertical_fov: f32,  // For 3D LiDAR
+    pub vertical_resolution: f32,  // For 3D LiDAR
+}
+
+impl Default for LidarSensor {
+    fn default() -> Self {
+        Self {
+            range: 100.0,  // 100 meter range
+            angular_resolution: 1.0,  // 1 degree per ray
+            scan_frequency: 10.0,  // 10 Hz
+            last_scan_time: 0.0,
+            is_3d: false,  // 2D by default
+            vertical_fov: 30.0,  // +/- 15 degrees
+            vertical_resolution: 2.0,  // 2 degrees vertical resolution
+        }
+    }
+}
+
+#[derive(Component, Debug)]
+pub struct LidarScanData {
+    pub points: Vec<LidarPoint>,
+    pub timestamp: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LidarPoint {
+    pub angle: f32,
+    pub distance: f32,
+    pub position: Vec3,
+    pub quality: u8,
+}
+
+#[derive(Component, Debug)]
 pub struct TerrainTile {
     pub x: i32,
     pub z: i32,
