@@ -70,3 +70,35 @@ impl Default for DataLoadingState {
         }
     }
 }
+
+/// Globe search state
+#[derive(Resource, Debug, Clone)]
+pub struct GlobeSearchState {
+    pub search_query: String,
+    pub show_suggestions: bool,
+    pub is_animating: bool,
+    pub animation_start_time: f32,
+    pub animation_duration: f32,
+    pub start_lat: f64,
+    pub start_lon: f64,
+    pub target_lat: f64,
+    pub target_lon: f64,
+    pub target_zoom: f32,
+}
+
+impl Default for GlobeSearchState {
+    fn default() -> Self {
+        Self {
+            search_query: String::new(),
+            show_suggestions: false,
+            is_animating: false,
+            animation_start_time: 0.0,
+            animation_duration: 2.0, // 2 seconds
+            start_lat: 0.0,
+            start_lon: 0.0,
+            target_lat: 0.0,
+            target_lon: 0.0,
+            target_zoom: 5.0,
+        }
+    }
+}

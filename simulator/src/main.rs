@@ -4,9 +4,12 @@ use tracing::{info, warn};
 
 mod app;
 mod app_state;
+mod earth_textures;
+mod procedural_textures;
 mod globe_view;
 mod globe_ui;
 mod input_handler;
+mod location_database;
 mod main_menu;
 mod map_loader;
 mod camera;
@@ -21,6 +24,9 @@ mod systems;
 mod terrain;
 mod ui;
 
+// New Flight Simulator-style UI system
+mod flight_ui;
+
 use app::VisualizerApp;
 use app_state::{AppMode, SelectedRegion, UIState, DataLoadingState};
 use globe_view::GlobePlugin;
@@ -30,6 +36,7 @@ use main_menu::MainMenuPlugin;
 use map_loader::MapLoaderPlugin;
 use resources::AppConfig;
 use communication::setup_communication_task;
+use flight_ui::FlightUIPlugin;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,8 +68,9 @@ async fn main() -> Result<()> {
         .insert_resource(UIState::default())
         .insert_resource(DataLoadingState::default());
     
-    // Add our new plugins
+    // Add our plugins
     app.add_plugins((
+        FlightUIPlugin,  // New Flight Simulator-style UI system
         MainMenuPlugin,
         InputHandlerPlugin,
         GlobePlugin,
