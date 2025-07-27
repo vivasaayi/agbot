@@ -13,3 +13,4 @@ data/
 missions/
 processed/
 mission_planner/frontend/node_modules
+simulator/assets

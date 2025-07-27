@@ -3,6 +3,12 @@ use bevy::prelude::*;
 use tracing::{info, warn};
 
 mod app;
+mod app_state;
+mod globe_view;
+mod globe_ui;
+mod input_handler;
+mod main_menu;
+mod map_loader;
 mod camera;
 mod communication;
 mod components;
@@ -16,6 +22,12 @@ mod terrain;
 mod ui;
 
 use app::VisualizerApp;
+use app_state::{AppMode, SelectedRegion, UIState, DataLoadingState};
+use globe_view::GlobePlugin;
+use globe_ui::GlobeUIPlugin;
+use input_handler::InputHandlerPlugin;
+use main_menu::MainMenuPlugin;
+use map_loader::MapLoaderPlugin;
 use resources::AppConfig;
 use communication::setup_communication_task;
 
@@ -42,6 +54,21 @@ async fn main() -> Result<()> {
 
     // Configure the app with communication channels
     VisualizerApp::configure(&mut app, config, communication_channels);
+    
+    // Add state management
+    app.init_state::<AppMode>()
+        .insert_resource(SelectedRegion::default())
+        .insert_resource(UIState::default())
+        .insert_resource(DataLoadingState::default());
+    
+    // Add our new plugins
+    app.add_plugins((
+        MainMenuPlugin,
+        InputHandlerPlugin,
+        GlobePlugin,
+        GlobeUIPlugin,
+        MapLoaderPlugin,
+    ));
 
     // Run the app (this blocks until the app exits)
     app.run();
