@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy_egui::EguiPlugin;
 
 use crate::flight_ui::*;
 
@@ -14,8 +15,9 @@ impl Plugin for UISystemPlugin {
             .init_resource::<UITheme>()
             .init_resource::<UIOverlayState>()
             
-            // Add plugins for each UI module (EguiPlugin is added in main app.rs)
+            // Add plugins for each UI module
             .add_plugins((
+                EguiPlugin,
                 MainMenuPlugin,
                 OverlaySystemPlugin,
             ))

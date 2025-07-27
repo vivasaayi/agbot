@@ -12,7 +12,7 @@ use crate::lidar_simulator::LidarSimulatorPlugin;
 use crate::resources::{AppConfig, AppState, DroneRegistry, MissionData, TerrainData};
 use crate::systems::*;
 use crate::terrain::TerrainPlugin;
-use crate::ui::UiPlugin;
+use crate::flight_ui::FlightUIPlugin;
 
 pub struct VisualizerApp;
 
@@ -44,7 +44,7 @@ impl VisualizerApp {
             .add_plugins(LidarControlsPlugin)
             .add_plugins(CommunicationPlugin)
             .add_plugins(HudPlugin)
-            .add_plugins(UiPlugin)
+            .add_plugins(FlightUIPlugin)
             
             // Resources
             .insert_resource(config)

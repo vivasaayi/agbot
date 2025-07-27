@@ -22,7 +22,6 @@ mod lidar_simulator;
 mod resources;
 mod systems;
 mod terrain;
-mod ui;
 
 // New Flight Simulator-style UI system
 mod flight_ui;
@@ -36,7 +35,6 @@ use main_menu::MainMenuPlugin;
 use map_loader::MapLoaderPlugin;
 use resources::AppConfig;
 use communication::setup_communication_task;
-use flight_ui::FlightUIPlugin;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -70,7 +68,6 @@ async fn main() -> Result<()> {
     
     // Add our plugins
     app.add_plugins((
-        FlightUIPlugin,  // New Flight Simulator-style UI system
         MainMenuPlugin,
         InputHandlerPlugin,
         GlobePlugin,

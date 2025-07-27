@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
-use crate::flight_ui::{AppState, UITheme, MenuState};
+use crate::flight_ui::{AppState, UITheme};
 
 pub struct MainMenuPlugin;
 
@@ -38,77 +38,69 @@ fn cleanup_main_menu(
 fn main_menu_ui(
     mut contexts: EguiContexts,
     mut next_app_state: ResMut<NextState<AppState>>,
-    mut next_menu_state: ResMut<NextState<MenuState>>,
     theme: Res<UITheme>,
     mut exit: EventWriter<bevy::app::AppExit>,
 ) {
     let ctx = contexts.ctx_mut();
     
-    // Set custom theme
+    // Set custom theme for clean, modern look
     let mut style = (*ctx.style()).clone();
-    style.visuals.window_fill = egui::Color32::from_rgba_premultiplied(26, 26, 38, 240);
-    style.visuals.panel_fill = egui::Color32::from_rgba_premultiplied(20, 20, 30, 200);
+    style.visuals.window_fill = egui::Color32::from_rgba_premultiplied(12, 12, 25, 250);
+    style.visuals.panel_fill = egui::Color32::from_rgba_premultiplied(8, 8, 20, 200);
     ctx.set_style(style);
 
     // Full screen central panel for main menu
     egui::CentralPanel::default()
-        .frame(egui::Frame::none().fill(egui::Color32::from_rgba_premultiplied(10, 10, 20, 200)))
+        .frame(egui::Frame::none().fill(egui::Color32::from_rgba_premultiplied(5, 5, 15, 255)))
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(50.0);
-                
-                // Title
-                ui.heading(egui::RichText::new("🚁 AGBOT DRONE VISUALIZER")
-                    .size(48.0)
-                    .color(egui::Color32::from_rgb(100, 150, 255)));
-                
-                ui.add_space(20.0);
-                ui.label(egui::RichText::new("Advanced Agricultural Drone Simulation & Control Platform")
-                    .size(16.0)
-                    .color(egui::Color32::LIGHT_GRAY));
-                
                 ui.add_space(80.0);
                 
-                // Main menu buttons
+                // Clean, modern title
+                ui.heading(egui::RichText::new("AgBot Visualizer")
+                    .size(56.0)
+                    .color(egui::Color32::from_rgb(120, 160, 255)));
+                
+                ui.add_space(20.0);
+                ui.label(egui::RichText::new("Advanced Agricultural World Simulation Platform")
+                    .size(18.0)
+                    .color(egui::Color32::LIGHT_GRAY));
+                
+                ui.add_space(120.0);
+                
+                // Main exploration options
                 ui.vertical_centered(|ui| {
-                    let button_size = egui::Vec2::new(300.0, 50.0);
+                    let button_size = egui::Vec2::new(400.0, 60.0);
                     
+                    // 3D World Exploration Button
                     if ui.add_sized(button_size, egui::Button::new(
-                        egui::RichText::new("🌍 WORLD MAP").size(18.0)
-                    )).clicked() {
-                        next_app_state.set(AppState::WorldMap);
+                        egui::RichText::new("🌍 Explore in 3D World")
+                            .size(22.0)
+                            .color(egui::Color32::WHITE)
+                    ).fill(egui::Color32::from_rgb(50, 100, 200))).clicked() {
+                        next_app_state.set(AppState::World3D);
                     }
                     
-                    ui.add_space(15.0);
+                    ui.add_space(20.0);
                     
+                    // 2D World Exploration Button  
                     if ui.add_sized(button_size, egui::Button::new(
-                        egui::RichText::new("🚁 START SIMULATION").size(18.0)
-                    )).clicked() {
-                        next_app_state.set(AppState::LoadingSimulation);
+                        egui::RichText::new("🗺️ Explore in 2D World")
+                            .size(22.0)
+                            .color(egui::Color32::WHITE)
+                    ).fill(egui::Color32::from_rgb(40, 140, 80))).clicked() {
+                        next_app_state.set(AppState::World2D);
                     }
                     
-                    ui.add_space(15.0);
+                    ui.add_space(60.0);
                     
-                    if ui.add_sized(button_size, egui::Button::new(
-                        egui::RichText::new("⚙️ SETTINGS").size(18.0)
-                    )).clicked() {
-                        next_app_state.set(AppState::Settings);
-                    }
-                    
-                    ui.add_space(15.0);
-                    
-                    if ui.add_sized(button_size, egui::Button::new(
-                        egui::RichText::new("📊 MISSION PLANNER").size(18.0)
-                    )).clicked() {
-                        next_menu_state.set(MenuState::MissionBriefing);
-                    }
-                    
-                    ui.add_space(30.0);
-                    
-                    if ui.add_sized(button_size, egui::Button::new(
-                        egui::RichText::new("❌ EXIT").size(18.0)
-                    )).clicked() {
-                        next_menu_state.set(MenuState::ConfirmExit);
+                    // Quit option
+                    if ui.add_sized(egui::Vec2::new(200.0, 40.0), egui::Button::new(
+                        egui::RichText::new("Quit")
+                            .size(16.0)
+                            .color(egui::Color32::LIGHT_GRAY)
+                    ).fill(egui::Color32::from_rgb(60, 60, 60))).clicked() {
+                        exit.send(bevy::app::AppExit::Success);
                     }
                 });
                 
@@ -116,87 +108,10 @@ fn main_menu_ui(
                 
                 // Version info
                 ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("Version 1.0.0 | Build 2025.01")
+                    ui.label(egui::RichText::new("Version 2.0.0 | Sprint 2 Development")
                         .size(12.0)
                         .color(egui::Color32::DARK_GRAY));
                 });
-            });
-        });
-    
-    // Handle modal dialogs
-    handle_main_menu_modals(ctx, &mut next_app_state, &mut next_menu_state, &mut exit);
-}
-
-fn handle_main_menu_modals(
-    ctx: &egui::Context,
-    next_app_state: &mut ResMut<NextState<AppState>>,
-    next_menu_state: &mut ResMut<NextState<MenuState>>,
-    exit: &mut EventWriter<bevy::app::AppExit>,
-) {
-    // Exit confirmation dialog
-    egui::Window::new("Confirm Exit")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(10.0);
-                ui.label("Are you sure you want to exit?");
-                ui.add_space(20.0);
-                
-                ui.horizontal(|ui| {
-                    if ui.button("Yes, Exit").clicked() {
-                        exit.send(bevy::app::AppExit::Success);
-                    }
-                    
-                    ui.add_space(20.0);
-                    
-                    if ui.button("Cancel").clicked() {
-                        next_menu_state.set(MenuState::None);
-                    }
-                });
-                ui.add_space(10.0);
-            });
-        });
-}
-
-/// Splash screen for initial loading
-pub fn splash_screen_ui(
-    mut contexts: EguiContexts,
-    mut next_state: ResMut<NextState<AppState>>,
-    time: Res<Time>,
-) {
-    let ctx = contexts.ctx_mut();
-    
-    egui::CentralPanel::default()
-        .frame(egui::Frame::none().fill(egui::Color32::BLACK))
-        .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(200.0);
-                
-                // Animated logo or loading text
-                let elapsed = time.elapsed_seconds();
-                let dots = match ((elapsed * 2.0) as usize) % 4 {
-                    0 => "",
-                    1 => ".",
-                    2 => "..",
-                    _ => "...",
-                };
-                
-                ui.heading(egui::RichText::new(format!("Loading AgBot{}", dots))
-                    .size(32.0)
-                    .color(egui::Color32::WHITE));
-                
-                ui.add_space(50.0);
-                
-                // Progress bar simulation
-                let progress = (elapsed * 0.3).min(1.0);
-                ui.add(egui::ProgressBar::new(progress).desired_width(300.0));
-                
-                // Auto-transition to main menu after loading
-                if progress >= 1.0 {
-                    next_state.set(AppState::MainMenu);
-                }
             });
         });
 }

@@ -4,13 +4,12 @@ use bevy::prelude::*;
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States)]
 pub enum AppState {
     #[default]
-    Splash,
     MainMenu,
-    WorldMap,
-    LoadingSimulation,
+    World3D,
+    World2D,
+    CitySearch,
+    WorldLoading,
     Simulation,
-    Settings,
-    Paused,
 }
 
 /// Substates for more granular menu control
@@ -34,8 +33,6 @@ pub struct UITheme {
     pub background_color: Color,
     pub text_color: Color,
     pub accent_color: Color,
-    pub warning_color: Color,
-    pub success_color: Color,
 }
 
 impl Default for UITheme {
@@ -43,11 +40,9 @@ impl Default for UITheme {
         Self {
             primary_color: Color::srgb(0.2, 0.4, 0.8),      // Blue
             secondary_color: Color::srgb(0.3, 0.3, 0.3),    // Dark Gray
-            background_color: Color::srgb(0.1, 0.1, 0.15),  // Dark Blue
+            background_color: Color::srgb(0.05, 0.05, 0.1), // Very Dark Blue
             text_color: Color::srgb(0.9, 0.9, 0.9),         // Light Gray
             accent_color: Color::srgb(0.0, 0.8, 0.4),       // Green
-            warning_color: Color::srgb(0.9, 0.6, 0.0),      // Orange
-            success_color: Color::srgb(0.2, 0.8, 0.2),      // Bright Green
         }
     }
 }
@@ -118,18 +113,21 @@ fn handle_escape_key(
                     overlay_state.modal_open = false;
                     overlay_state.active_overlays.clear();
                 } else {
-                    // Open pause menu
-                    next_state.set(AppState::Paused);
+                    // Return to main menu
+                    next_state.set(AppState::MainMenu);
                 }
             }
-            AppState::Paused => {
-                next_state.set(AppState::Simulation);
-            }
-            AppState::Settings => {
+            AppState::World3D => {
                 next_state.set(AppState::MainMenu);
             }
-            AppState::WorldMap => {
+            AppState::World2D => {
                 next_state.set(AppState::MainMenu);
+            }
+            AppState::CitySearch => {
+                next_state.set(AppState::MainMenu);
+            }
+            AppState::WorldLoading => {
+                // Can't escape from loading screen
             }
             _ => {}
         }
