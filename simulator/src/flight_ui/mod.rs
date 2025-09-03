@@ -1,12 +1,10 @@
 // Flight Simulator-style UI system
 pub mod app_state;
-pub mod demo;
 pub mod main_menu;
 pub mod ui_plugin;
 pub mod overlay_system;
 
 pub use app_state::*;
-pub use demo::*;
 pub use main_menu::*;
 pub use ui_plugin::*;
 pub use overlay_system::*;

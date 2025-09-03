@@ -23,36 +23,37 @@ Redesign the main menu to show a clean interface with 2D/3D world exploration op
 
 ### 1. Update App States
 **File:** `src/flight_ui/app_state.rs`
-- [ ] Simplify `AppState` enum
-- [ ] Remove unused states (`Splash`, `LoadingSimulation`, etc.)
-- [ ] Add new world exploration states
+- [x] Simplify `AppState` enum
+- [x] Remove unused states (`Splash`, `LoadingSimulation`, etc.)
+- [x] Add new world exploration states
 
 ### 2. Redesign Main Menu
 **File:** `src/flight_ui/main_menu.rs`
-- [ ] Remove flight simulator theming
-- [ ] Create clean, minimal design
-- [ ] Add "Explore in 3D World" button
-- [ ] Add "Explore in 2D World" button
-- [ ] Remove other complex menu options
+- [x] Remove flight simulator theming
+- [x] Create clean, minimal design
+- [x] Add "Explore in 3D World" button
+- [x] Add "Explore in 2D World" button
+- [x] Remove other complex menu options
 
 ### 3. Update UI Plugin
 **File:** `src/flight_ui/ui_plugin.rs`
-- [ ] Remove splash screen auto-transition
-- [ ] Start directly in MainMenu state
-- [ ] Update state transition handlers
+- [x] Remove splash screen auto-transition
+- [x] Start directly in MainMenu state
+- [x] Update state transition handlers
 
 ### 4. Clean Up Demo
 **File:** `src/flight_ui/demo.rs`
-- [ ] Remove splash screen demo
-- [ ] Simplify main menu demo
-- [ ] Remove flight simulator references
+- [x] Remove splash screen demo
+- [x] Simplify main menu demo
+- [x] Remove flight simulator references
 
 ## Acceptance Criteria
-- [ ] Application starts with blank screen + main menu (no splash)
-- [ ] Main menu shows only two options: 3D/2D world exploration
-- [ ] Clean, minimal design without flight simulator theming
-- [ ] Proper state transitions when buttons are clicked
-- [ ] No compilation errors or warnings
+- [x] Application starts with blank screen + main menu (no splash)
+- [x] Main menu shows only two options: 3D/2D world exploration
+- [x] Clean, minimal design without flight simulator theming
+- [x] Proper state transitions when buttons are clicked
+- [x] No compilation errors or warnings
+- [x] **FIXED**: Resolved egui widget ID conflicts and duplicate UI systems
 
 ## Implementation Notes
 - Keep the underlying egui and Bevy architecture
@@ -66,12 +67,22 @@ Redesign the main menu to show a clean interface with 2D/3D world exploration op
 - None (foundational task)
 
 ## Testing
-- [ ] Manual testing of startup flow
-- [ ] Verify state transitions work correctly
-- [ ] Check UI responsiveness and appearance
+- [x] Manual testing of startup flow
+- [x] Verify state transitions work correctly
+- [x] Check UI responsiveness and appearance
+- [x] **RESOLVED**: Fixed overlapping text and widget ID conflicts
 
 ---
-**Status:** 🔄 Not Started  
-**Assigned:** -  
-**Started:** -  
-**Completed:** -
+**Status:** ✅ **COMPLETED**  
+**Assigned:** GitHub Copilot  
+**Started:** July 27, 2025  
+**Completed:** July 27, 2025
+
+### **SOLUTION SUMMARY:**
+**Fixed egui widget ID conflicts causing overlapping UI elements:**
+1. **Removed duplicate `MainMenuPlugin`** registrations (main.rs + flight_ui)
+2. **Deleted old `main_menu.rs`** with conflicting "Global Simulator" title
+3. **Removed demo module** exports that could cause widget conflicts
+4. **Clean state management** with single UI system
+
+**Result:** Clean main menu without overlapping text, red boxes, or "Second use of widget ID" errors. Application runs smoothly with professional UI as designed.

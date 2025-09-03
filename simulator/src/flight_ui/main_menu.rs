@@ -78,7 +78,7 @@ fn main_menu_ui(
                             .size(22.0)
                             .color(egui::Color32::WHITE)
                     ).fill(egui::Color32::from_rgb(50, 100, 200))).clicked() {
-                        next_app_state.set(AppState::World3D);
+                        next_app_state.set(AppState::CitySearch);
                     }
                     
                     ui.add_space(20.0);

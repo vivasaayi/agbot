@@ -10,7 +10,6 @@ mod globe_view;
 mod globe_ui;
 mod input_handler;
 mod location_database;
-mod main_menu;
 mod map_loader;
 mod camera;
 mod communication;
@@ -23,6 +22,10 @@ mod resources;
 mod systems;
 mod terrain;
 
+// World exploration modules
+mod world_exploration;
+mod city_search;
+
 // New Flight Simulator-style UI system
 mod flight_ui;
 
@@ -31,7 +34,6 @@ use app_state::{AppMode, SelectedRegion, UIState, DataLoadingState};
 use globe_view::GlobePlugin;
 use globe_ui::GlobeUIPlugin;
 use input_handler::InputHandlerPlugin;
-use main_menu::MainMenuPlugin;
 use map_loader::MapLoaderPlugin;
 use resources::AppConfig;
 use communication::setup_communication_task;
@@ -68,11 +70,16 @@ async fn main() -> Result<()> {
     
     // Add our plugins
     app.add_plugins((
-        MainMenuPlugin,
         InputHandlerPlugin,
         GlobePlugin,
         GlobeUIPlugin,
         MapLoaderPlugin,
+        // World exploration plugins
+        world_exploration::World3DPlugin,
+        world_exploration::MarkersPlugin,
+        world_exploration::Camera3DPlugin,
+        city_search::LocationDatabasePlugin,
+        city_search::SearchInterfacePlugin,
     ));
 
     // Run the app (this blocks until the app exits)
