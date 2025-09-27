@@ -125,6 +125,8 @@ pub enum MapFeatureType {
     Farmland,
     Park,
     Water,
+    Forest,
+    Tree,
     Generic,
 }
 

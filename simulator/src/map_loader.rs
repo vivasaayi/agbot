@@ -1,14 +1,18 @@
 use anyhow::Result;
+use bevy::math::primitives::{Cone, Cylinder};
 use bevy::prelude::*;
 use bevy::tasks::{
     futures_lite::future::{block_on, poll_once},
     IoTaskPool, Task,
 };
+use rand::Rng;
+use std::f32::consts::TAU;
 
 use crate::app_state::{AppMode, DataLoadingState, SelectedRegion};
 use crate::components::{MapFeature, MapFeatureType, MapRoot};
 use crate::osm::{
-    fetch_osm_data, lonlat_to_local, LineKind, MapLine, MapPolygon, OsmMapData, PolygonKind,
+    fetch_osm_data, lonlat_to_local, LineKind, MapLine, MapPoint, MapPolygon, OsmMapData,
+    PointKind, PolygonKind,
 };
 
 const FETCH_RADIUS_METERS: f64 = 5_000.0;
@@ -19,7 +23,9 @@ pub struct MapLoaderPlugin;
 impl Plugin for MapLoaderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<OsmFetchTask>()
+            .init_resource::<MapAssets>()
             .add_event::<WorldLoadedEvent>()
+            .add_systems(Startup, initialize_map_assets)
             .add_systems(OnEnter(AppMode::Simulation3D), begin_osm_fetch)
             .add_systems(
                 Update,
@@ -67,6 +73,7 @@ fn poll_osm_fetch(
     mut fetch_task: ResMut<OsmFetchTask>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    map_assets: Res<MapAssets>,
     mut loading_state: ResMut<DataLoadingState>,
     mut map_root_query: Query<Entity, With<MapRoot>>,
     mut world_loaded_events: EventWriter<WorldLoadedEvent>,
@@ -104,6 +111,7 @@ fn poll_osm_fetch(
                     &mut commands,
                     &mut meshes,
                     &mut materials,
+                    &map_assets,
                     map_data.center_lat as f32,
                     map_data.center_lon as f32,
                 );
@@ -113,6 +121,14 @@ fn poll_osm_fetch(
                     &mut commands,
                     &mut meshes,
                     &mut materials,
+                    map_data.center_lat as f32,
+                    map_data.center_lon as f32,
+                );
+                spawn_points(
+                    world_root,
+                    &map_data.points,
+                    &mut commands,
+                    &map_assets,
                     map_data.center_lat as f32,
                     map_data.center_lon as f32,
                 );
@@ -144,6 +160,7 @@ fn spawn_polygons(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    map_assets: &MapAssets,
     center_lat: f32,
     center_lon: f32,
 ) {
@@ -176,6 +193,7 @@ fn spawn_polygons(
             PolygonKind::Farmland => (0.1, Color::srgb(0.6, 0.5, 0.3), MapFeatureType::Farmland),
             PolygonKind::Park => (0.1, Color::srgb(0.3, 0.6, 0.3), MapFeatureType::Park),
             PolygonKind::Water => (0.1, Color::srgb(0.1, 0.3, 0.6), MapFeatureType::Water),
+            PolygonKind::Forest => (0.1, Color::srgb(0.15, 0.35, 0.18), MapFeatureType::Forest),
             PolygonKind::Other(_) => (0.1, Color::srgb(0.5, 0.5, 0.5), MapFeatureType::Generic),
         };
 
@@ -211,6 +229,10 @@ fn spawn_polygons(
             .id();
 
         commands.entity(root).add_child(entity);
+
+        if matches!(&polygon.kind, PolygonKind::Farmland) {
+            spawn_farmland_rows(commands, entity, map_assets, extents);
+        }
     }
 }
 
@@ -297,6 +319,200 @@ fn compute_center_and_extents(points: &[Vec2]) -> Option<(Vec2, Vec2)> {
     let center = (min + max) * 0.5;
     let extents = max - min;
     Some((center, extents.abs()))
+}
+
+fn spawn_points(
+    root: Entity,
+    points: &[MapPoint],
+    commands: &mut Commands,
+    map_assets: &MapAssets,
+    center_lat: f32,
+    center_lon: f32,
+) {
+    let Some(trunk_mesh) = map_assets.tree_trunk_mesh.clone() else {
+        return;
+    };
+    let Some(canopy_mesh) = map_assets.tree_canopy_mesh.clone() else {
+        return;
+    };
+    let Some(trunk_material) = map_assets.tree_trunk_material.clone() else {
+        return;
+    };
+    let Some(canopy_material) = map_assets.tree_canopy_material.clone() else {
+        return;
+    };
+
+    let max_instances = 400usize;
+    let step = if points.len() > max_instances {
+        (points.len() / max_instances).max(1)
+    } else {
+        1
+    };
+
+    let mut rng = rand::thread_rng();
+    const TRUNK_HEIGHT: f32 = 2.5;
+    const CANOPY_HEIGHT: f32 = 3.2;
+
+    for (index, point) in points.iter().enumerate().step_by(step) {
+        if !matches!(point.kind, PointKind::Tree) {
+            continue;
+        }
+
+        let local = lonlat_to_local(center_lat, center_lon, point.coordinate[0], point.coordinate[1]);
+        let yaw = rng.gen::<f32>() * TAU;
+
+        let tree_entity = commands
+            .spawn(SpatialBundle {
+                transform: Transform {
+                    translation: Vec3::new(local.x, 0.0, local.y),
+                    rotation: Quat::from_rotation_y(yaw),
+                    ..default()
+                },
+                ..default()
+            })
+            .insert(MapFeature {
+                feature_type: MapFeatureType::Tree,
+            })
+            .with_children(|builder| {
+                builder.spawn(PbrBundle {
+                    mesh: trunk_mesh.clone(),
+                    material: trunk_material.clone(),
+                    transform: Transform::from_translation(Vec3::new(0.0, TRUNK_HEIGHT * 0.5, 0.0)),
+                    ..default()
+                });
+                builder.spawn(PbrBundle {
+                    mesh: canopy_mesh.clone(),
+                    material: canopy_material.clone(),
+                    transform: Transform::from_translation(Vec3::new(
+                        0.0,
+                        TRUNK_HEIGHT + CANOPY_HEIGHT * 0.5,
+                        0.0,
+                    )),
+                    ..default()
+                });
+            })
+            .id();
+
+        commands.entity(root).add_child(tree_entity);
+
+        // Throttle the tree count even further for extremely dense areas
+        if index > max_instances && step == 1 {
+            break;
+        }
+    }
+}
+
+fn spawn_farmland_rows(
+    commands: &mut Commands,
+    parent: Entity,
+    map_assets: &MapAssets,
+    extents: Vec2,
+) {
+    if extents.x.min(extents.y) < 6.0 {
+        return;
+    }
+
+    let Some(row_mesh) = map_assets.farmland_row_mesh.clone() else {
+        return;
+    };
+    let Some(row_material) = map_assets.farmland_row_material.clone() else {
+        return;
+    };
+
+    let major_is_x = extents.x >= extents.y;
+    let (major_length, minor_length) = if major_is_x {
+        (extents.x, extents.y)
+    } else {
+        (extents.y, extents.x)
+    };
+
+    let target_row_width = 4.0;
+    let mut row_count = (minor_length / target_row_width).floor() as i32;
+    row_count = row_count.clamp(3, 18);
+    if row_count <= 0 {
+        row_count = 3;
+    }
+
+    let row_spacing = minor_length / row_count as f32;
+
+    commands.entity(parent).with_children(|builder| {
+        for i in 0..row_count {
+            let offset = -minor_length / 2.0 + (i as f32 + 0.5) * row_spacing;
+            let (translation, scale) = if major_is_x {
+                (
+                    Vec3::new(0.0, 0.06, offset),
+                    Vec3::new(major_length.max(6.0), 0.2, (row_spacing * 0.6).max(1.0)),
+                )
+            } else {
+                (
+                    Vec3::new(offset, 0.06, 0.0),
+                    Vec3::new((row_spacing * 0.6).max(1.0), 0.2, major_length.max(6.0)),
+                )
+            };
+
+            builder.spawn(PbrBundle {
+                mesh: row_mesh.clone(),
+                material: row_material.clone(),
+                transform: Transform::from_translation(translation).with_scale(scale),
+                ..default()
+            });
+        }
+    });
+}
+
+#[derive(Resource, Default)]
+struct MapAssets {
+    initialized: bool,
+    tree_trunk_mesh: Option<Handle<Mesh>>,
+    tree_canopy_mesh: Option<Handle<Mesh>>,
+    tree_trunk_material: Option<Handle<StandardMaterial>>,
+    tree_canopy_material: Option<Handle<StandardMaterial>>,
+    farmland_row_mesh: Option<Handle<Mesh>>,
+    farmland_row_material: Option<Handle<StandardMaterial>>,
+}
+
+fn initialize_map_assets(
+    mut map_assets: ResMut<MapAssets>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if map_assets.initialized {
+        return;
+    }
+
+    let trunk_mesh = meshes.add(Cylinder::new(0.25, 2.5));
+    let canopy_mesh = meshes.add(Cone {
+        radius: 2.2,
+        height: 3.2,
+    });
+    let row_mesh = meshes.add(Cuboid::new(1.0, 0.1, 1.0));
+
+    let trunk_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.35, 0.2, 0.1),
+        perceptual_roughness: 0.9,
+        reflectance: 0.02,
+        ..default()
+    });
+    let canopy_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.1, 0.45, 0.12),
+        perceptual_roughness: 0.6,
+        metallic: 0.0,
+        ..default()
+    });
+    let row_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.48, 0.36, 0.2),
+        perceptual_roughness: 0.8,
+        reflectance: 0.03,
+        ..default()
+    });
+
+    map_assets.tree_trunk_mesh = Some(trunk_mesh);
+    map_assets.tree_canopy_mesh = Some(canopy_mesh);
+    map_assets.tree_trunk_material = Some(trunk_material);
+    map_assets.tree_canopy_material = Some(canopy_material);
+    map_assets.farmland_row_mesh = Some(row_mesh);
+    map_assets.farmland_row_material = Some(row_material);
+    map_assets.initialized = true;
 }
 
 fn road_width_for(classification: &str) -> f32 {

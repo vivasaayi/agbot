@@ -20,6 +20,7 @@ pub enum PolygonKind {
     Farmland,
     Park,
     Water,
+    Forest,
     Other(String),
 }
 
@@ -27,6 +28,18 @@ pub enum PolygonKind {
 pub struct MapPolygon {
     pub kind: PolygonKind,
     pub coordinates: Vec<[f64; 2]>, // [lon, lat]
+}
+
+#[derive(Debug, Clone)]
+pub enum PointKind {
+    Tree,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct MapPoint {
+    pub kind: PointKind,
+    pub coordinate: [f64; 2],
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +60,7 @@ pub struct OsmMapData {
     pub center_lon: f64,
     pub polygons: Vec<MapPolygon>,
     pub lines: Vec<MapLine>,
+    pub points: Vec<MapPoint>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +73,8 @@ struct Element {
     #[serde(rename = "type")]
     element_type: String,
     id: i64,
+    lat: Option<f64>,
+    lon: Option<f64>,
     tags: Option<HashMap<String, String>>,
     geometry: Option<Vec<Coordinate>>,
 }
@@ -99,9 +115,13 @@ pub async fn fetch_osm_data(lat: f64, lon: f64, radius_m: f64) -> Result<OsmMapD
 
     let mut polygons = Vec::new();
     let mut lines = Vec::new();
+    let mut points = Vec::new();
 
     for element in overpass.elements.into_iter() {
         if element.element_type != "way" {
+            if element.element_type == "node" {
+                handle_point_element(&mut points, &element);
+            }
             continue;
         }
 
@@ -161,7 +181,23 @@ pub async fn fetch_osm_data(lat: f64, lon: f64, radius_m: f64) -> Result<OsmMapD
                         });
                     }
                 }
-                "grass" | "forest" | "recreation_ground" | "village_green" => {
+                "farmyard" => {
+                    if coords.len() >= 3 {
+                        polygons.push(MapPolygon {
+                            kind: PolygonKind::Farmland,
+                            coordinates: coords,
+                        });
+                    }
+                }
+                "forest" | "wood" => {
+                    if coords.len() >= 3 {
+                        polygons.push(MapPolygon {
+                            kind: PolygonKind::Forest,
+                            coordinates: coords,
+                        });
+                    }
+                }
+                "grass" | "recreation_ground" | "village_green" => {
                     if coords.len() >= 3 {
                         polygons.push(MapPolygon {
                             kind: PolygonKind::Park,
@@ -185,6 +221,16 @@ pub async fn fetch_osm_data(lat: f64, lon: f64, radius_m: f64) -> Result<OsmMapD
             if coords.len() >= 3 {
                 polygons.push(MapPolygon {
                     kind: PolygonKind::Water,
+                    coordinates: coords,
+                });
+            }
+            continue;
+        }
+
+        if matches!(tags.get("natural").map(String::as_str), Some("wood" | "forest")) {
+            if coords.len() >= 3 {
+                polygons.push(MapPolygon {
+                    kind: PolygonKind::Forest,
                     coordinates: coords,
                 });
             }
@@ -220,6 +266,7 @@ pub async fn fetch_osm_data(lat: f64, lon: f64, radius_m: f64) -> Result<OsmMapD
         center_lon: lon,
         polygons,
         lines,
+                points,
     })
 }
 
@@ -232,6 +279,10 @@ fn build_overpass_query(lat: f64, lon: f64, radius_m: f64) -> String {
           way["landuse"](around:{radius},{lat},{lon});
           way["natural"="water"](around:{radius},{lat},{lon});
           way["leisure"="park"](around:{radius},{lat},{lon});
+                    way["natural"="wood"](around:{radius},{lat},{lon});
+                    way["landuse"="forest"](around:{radius},{lat},{lon});
+                    node["natural"="tree"](around:{radius},{lat},{lon});
+                    node["natural"="tree_row"](around:{radius},{lat},{lon});
         );
         out geom;"#,
         radius = radius_m,
@@ -275,4 +326,35 @@ pub fn lonlat_to_local(center_lat: f32, center_lon: f32, lon: f64, lat: f64) -> 
         ((lon as f32) - center_lon) * meters_per_degree_lon,
         ((lat as f32) - center_lat) * METERS_PER_DEGREE_LAT,
     )
+}
+
+fn handle_point_element(points: &mut Vec<MapPoint>, element: &Element) {
+    let Some(tags) = element.tags.as_ref() else {
+        return;
+    };
+
+    let Some(lat) = element.lat else { return; };
+    let Some(lon) = element.lon else { return; };
+
+    if matches!(tags.get("natural").map(String::as_str), Some("tree")) {
+        points.push(MapPoint {
+            kind: PointKind::Tree,
+            coordinate: [lon, lat],
+        });
+        return;
+    }
+
+    if matches!(tags.get("natural").map(String::as_str), Some("tree_row")) {
+        points.push(MapPoint {
+            kind: PointKind::Tree,
+            coordinate: [lon, lat],
+        });
+        return;
+    }
+
+    // Keep unknowns for future use if needed
+    points.push(MapPoint {
+        kind: PointKind::Unknown,
+        coordinate: [lon, lat],
+    });
 }
