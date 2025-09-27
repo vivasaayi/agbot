@@ -1,6 +1,6 @@
+use crate::{Mission, Waypoint, WaypointType};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use crate::{Mission, Waypoint, WaypointType};
 
 /// MAVLink message types and conversion utilities
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,7 +129,7 @@ impl MAVLinkConverter {
                             param1: 1.0, // Speed type (1 = ground speed)
                             param2: *speed_ms,
                             param3: -1.0, // Throttle (-1 = no change)
-                            param4: 0.0, // Absolute or relative
+                            param4: 0.0,  // Absolute or relative
                             x: 0.0,
                             y: 0.0,
                             z: 0.0,
@@ -214,7 +214,8 @@ impl MAVLinkConverter {
                 }
                 MAV_CMD_NAV_WAYPOINT => {
                     if let Some((last_x, last_y, last_z)) = last_position {
-                        let distance = ((item.x - last_x).powi(2) + (item.y - last_y).powi(2)).sqrt();
+                        let distance =
+                            ((item.x - last_x).powi(2) + (item.y - last_y).powi(2)).sqrt();
                         let flight_time = distance * 111_320.0 / cruise_speed_ms; // Convert degrees to meters
                         total_time += flight_time;
                         total_time += item.param1; // Add hold time

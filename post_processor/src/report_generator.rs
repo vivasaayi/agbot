@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use uuid::Uuid;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Report generation system for agricultural drone data analysis
 pub struct ReportGenerator {
@@ -189,7 +189,7 @@ pub struct CustomSection {
 pub enum SectionPosition {
     Beginning,
     End,
-    After(String), // After specific section
+    After(String),  // After specific section
     Before(String), // Before specific section
 }
 
@@ -339,7 +339,7 @@ impl ReportGenerator {
                 },
             ],
             styling: ReportStyling {
-                color_primary: "#2E7D32".to_string(), // Green
+                color_primary: "#2E7D32".to_string(),   // Green
                 color_secondary: "#81C784".to_string(), // Light green
                 font_family: "Arial, sans-serif".to_string(),
                 font_size_base: 12,
@@ -361,10 +361,8 @@ impl ReportGenerator {
             updated_at: Utc::now(),
         };
 
-        self.template_cache.insert(
-            agricultural_template.id.clone(),
-            agricultural_template,
-        );
+        self.template_cache
+            .insert(agricultural_template.id.clone(), agricultural_template);
 
         // Create a simple summary template
         let summary_template = ReportTemplate {
@@ -399,7 +397,7 @@ impl ReportGenerator {
                 },
             ],
             styling: ReportStyling {
-                color_primary: "#1976D2".to_string(), // Blue
+                color_primary: "#1976D2".to_string(),   // Blue
                 color_secondary: "#64B5F6".to_string(), // Light blue
                 font_family: "Arial, sans-serif".to_string(),
                 font_size_base: 11,
@@ -421,10 +419,8 @@ impl ReportGenerator {
             updated_at: Utc::now(),
         };
 
-        self.template_cache.insert(
-            summary_template.id.clone(),
-            summary_template,
-        );
+        self.template_cache
+            .insert(summary_template.id.clone(), summary_template);
     }
 
     pub async fn generate_report(&mut self, request: ReportRequest) -> Result<GeneratedReport> {
@@ -434,7 +430,9 @@ impl ReportGenerator {
         self.validate_report_request(&request)?;
 
         // Get template
-        let template = self.template_cache.get(&request.template_id)
+        let template = self
+            .template_cache
+            .get(&request.template_id)
             .ok_or_else(|| anyhow::anyhow!("Template not found: {}", request.template_id))?
             .clone();
 
@@ -442,14 +440,18 @@ impl ReportGenerator {
         let collected_data = self.collect_report_data(&request).await?;
 
         // Generate report content
-        let report_content = self.generate_report_content(&template, &collected_data, &request).await?;
+        let report_content = self
+            .generate_report_content(&template, &collected_data, &request)
+            .await?;
 
         // Generate outputs in requested formats
         let mut file_paths = HashMap::new();
         let mut file_sizes = HashMap::new();
 
         for format in &request.output_formats {
-            let (file_path, file_size) = self.export_report_format(&report_content, format, &request).await?;
+            let (file_path, file_size) = self
+                .export_report_format(&report_content, format, &request)
+                .await?;
             file_paths.insert(format.clone(), file_path);
             file_sizes.insert(format.clone(), file_size);
         }
@@ -467,15 +469,17 @@ impl ReportGenerator {
             metadata: ReportMetadata {
                 total_pages: self.calculate_page_count(&report_content),
                 file_sizes,
-                data_sources_used: template.sections.iter()
+                data_sources_used: template
+                    .sections
+                    .iter()
                     .flat_map(|s| s.data_sources.clone())
                     .collect(),
                 processing_time_ms: processing_time,
                 quality_score: self.calculate_report_quality(&report_content),
-                sections_included: template.sections.iter()
-                    .map(|s| s.title.clone())
-                    .collect(),
-                visualizations_count: template.sections.iter()
+                sections_included: template.sections.iter().map(|s| s.title.clone()).collect(),
+                visualizations_count: template
+                    .sections
+                    .iter()
                     .filter(|s| s.visualization_config.is_some())
                     .count() as u32,
             },
@@ -484,12 +488,18 @@ impl ReportGenerator {
         };
 
         // Handle delivery options
-        self.handle_delivery(&generated_report, &request.delivery_options).await?;
+        self.handle_delivery(&generated_report, &request.delivery_options)
+            .await?;
 
         // Cache the generated report
-        self.generated_reports.insert(generated_report.id, generated_report.clone());
+        self.generated_reports
+            .insert(generated_report.id, generated_report.clone());
 
-        tracing::info!("Generated report {} in {}ms", generated_report.id, processing_time);
+        tracing::info!(
+            "Generated report {} in {}ms",
+            generated_report.id,
+            processing_time
+        );
         Ok(generated_report)
     }
 
@@ -499,11 +509,16 @@ impl ReportGenerator {
         }
 
         if !self.template_cache.contains_key(&request.template_id) {
-            return Err(anyhow::anyhow!("Invalid template ID: {}", request.template_id));
+            return Err(anyhow::anyhow!(
+                "Invalid template ID: {}",
+                request.template_id
+            ));
         }
 
         if request.output_formats.is_empty() {
-            return Err(anyhow::anyhow!("At least one output format must be specified"));
+            return Err(anyhow::anyhow!(
+                "At least one output format must be specified"
+            ));
         }
 
         Ok(())
@@ -520,7 +535,12 @@ impl ReportGenerator {
         })
     }
 
-    async fn generate_report_content(&self, _template: &ReportTemplate, _data: &ReportData, _request: &ReportRequest) -> Result<ReportContent> {
+    async fn generate_report_content(
+        &self,
+        _template: &ReportTemplate,
+        _data: &ReportData,
+        _request: &ReportRequest,
+    ) -> Result<ReportContent> {
         // TODO: Implement report content generation
         // This would process the template and data to create structured content
         Ok(ReportContent {
@@ -530,12 +550,21 @@ impl ReportGenerator {
         })
     }
 
-    async fn export_report_format(&self, _content: &ReportContent, format: &OutputFormat, request: &ReportRequest) -> Result<(String, u64)> {
+    async fn export_report_format(
+        &self,
+        _content: &ReportContent,
+        format: &OutputFormat,
+        request: &ReportRequest,
+    ) -> Result<(String, u64)> {
         // TODO: Implement format-specific export logic
         let file_path = format!("/tmp/report_{}_{:?}.ext", request.id, format);
         let file_size = 1024; // Placeholder
 
-        tracing::info!("Exported report to {} format: {}", format_name(format), file_path);
+        tracing::info!(
+            "Exported report to {} format: {}",
+            format_name(format),
+            file_path
+        );
         Ok((file_path, file_size))
     }
 
@@ -549,11 +578,18 @@ impl ReportGenerator {
         0.9
     }
 
-    async fn handle_delivery(&self, report: &GeneratedReport, delivery_options: &DeliveryOptions) -> Result<()> {
+    async fn handle_delivery(
+        &self,
+        report: &GeneratedReport,
+        delivery_options: &DeliveryOptions,
+    ) -> Result<()> {
         // TODO: Implement email delivery, file storage, etc.
         if !delivery_options.email_recipients.is_empty() {
-            tracing::info!("Would send report {} to {} recipients", 
-                         report.id, delivery_options.email_recipients.len());
+            tracing::info!(
+                "Would send report {} to {} recipients",
+                report.id,
+                delivery_options.email_recipients.len()
+            );
         }
 
         if let Some(storage_location) = &delivery_options.storage_location {
@@ -716,8 +752,10 @@ mod tests {
         };
 
         let generator = ReportGenerator::new(config);
-        
-        assert!(generator.template_cache.contains_key("agricultural_comprehensive"));
+
+        assert!(generator
+            .template_cache
+            .contains_key("agricultural_comprehensive"));
         assert!(generator.template_cache.contains_key("simple_summary"));
     }
 }

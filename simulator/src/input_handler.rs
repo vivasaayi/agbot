@@ -1,5 +1,5 @@
-use bevy::prelude::*;
 use crate::app_state::{AppMode, UIState};
+use bevy::prelude::*;
 
 pub struct InputHandlerPlugin;
 
@@ -19,12 +19,12 @@ fn handle_global_input(
     if keyboard.just_pressed(KeyCode::Tab) {
         ui_state.show_debug_info = !ui_state.show_debug_info;
     }
-    
+
     // Return to main menu
     if keyboard.just_pressed(KeyCode::Escape) && !matches!(current_state.get(), AppMode::MainMenu) {
         next_state.set(AppMode::MainMenu);
     }
-    
+
     // Quick mode switching
     if keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight) {
         if keyboard.just_pressed(KeyCode::Digit1) {
@@ -37,7 +37,7 @@ fn handle_global_input(
             next_state.set(AppMode::Simulation3D);
         }
     }
-    
+
     // Toggle coordinate display
     if keyboard.just_pressed(KeyCode::KeyC) {
         ui_state.show_coordinates = !ui_state.show_coordinates;

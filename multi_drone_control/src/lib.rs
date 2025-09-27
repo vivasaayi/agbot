@@ -1,20 +1,20 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
-use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+use uuid::Uuid;
 
-pub mod swarm;
+pub mod collision_avoidance;
 pub mod coordination;
 pub mod mission_assignment;
-pub mod collision_avoidance;
+pub mod swarm;
 
-pub use swarm::{DroneSwarm, SwarmController};
+pub use collision_avoidance::{AvoidanceManeuver, CollisionAvoidanceSystem};
 pub use coordination::{CoordinationEngine, CoordinationStatus};
-pub use mission_assignment::{MissionAssignmentEngine, DroneAssignment};
-pub use collision_avoidance::{CollisionAvoidanceSystem, AvoidanceManeuver};
+pub use mission_assignment::{DroneAssignment, MissionAssignmentEngine};
+pub use swarm::{DroneSwarm, SwarmController};
 
 /// Multi-drone control system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,29 +59,69 @@ pub struct DroneStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlCommand {
-    AssignMission { drone_id: Uuid, mission_id: Uuid },
-    FormSwarm { drone_ids: Vec<Uuid>, formation: Formation },
-    ExecuteCoordinatedAction { swarm_id: Uuid, action: CoordinatedAction },
-    EmergencyLand { drone_ids: Vec<Uuid> },
-    ReturnToBase { drone_ids: Vec<Uuid> },
-    UpdateConstraints { constraints: GlobalConstraints },
+    AssignMission {
+        drone_id: Uuid,
+        mission_id: Uuid,
+    },
+    FormSwarm {
+        drone_ids: Vec<Uuid>,
+        formation: Formation,
+    },
+    ExecuteCoordinatedAction {
+        swarm_id: Uuid,
+        action: CoordinatedAction,
+    },
+    EmergencyLand {
+        drone_ids: Vec<Uuid>,
+    },
+    ReturnToBase {
+        drone_ids: Vec<Uuid>,
+    },
+    UpdateConstraints {
+        constraints: GlobalConstraints,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Formation {
-    Line { spacing_m: f32, heading_deg: f32 },
-    Grid { rows: u32, cols: u32, spacing_m: f32 },
-    Circle { radius_m: f32, center: (f64, f64) },
-    VFormation { spacing_m: f32, angle_deg: f32 },
-    Custom { positions: Vec<(f32, f32, f32)> },
+    Line {
+        spacing_m: f32,
+        heading_deg: f32,
+    },
+    Grid {
+        rows: u32,
+        cols: u32,
+        spacing_m: f32,
+    },
+    Circle {
+        radius_m: f32,
+        center: (f64, f64),
+    },
+    VFormation {
+        spacing_m: f32,
+        angle_deg: f32,
+    },
+    Custom {
+        positions: Vec<(f32, f32, f32)>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CoordinatedAction {
-    SynchronizedSurvey { area: Vec<(f64, f64)>, overlap_percent: f32 },
-    PatternSearch { search_type: String, area: Vec<(f64, f64)> },
-    CoverageOptimization { target_coverage: f32 },
-    DataCollection { collection_points: Vec<(f64, f64, f32)> },
+    SynchronizedSurvey {
+        area: Vec<(f64, f64)>,
+        overlap_percent: f32,
+    },
+    PatternSearch {
+        search_type: String,
+        area: Vec<(f64, f64)>,
+    },
+    CoverageOptimization {
+        target_coverage: f32,
+    },
+    DataCollection {
+        collection_points: Vec<(f64, f64, f32)>,
+    },
 }
 
 /// Main control service
@@ -120,7 +160,8 @@ impl MultiDroneController {
     }
 
     pub fn list_all_drones(&self) -> Vec<Uuid> {
-        self.swarms.values()
+        self.swarms
+            .values()
             .flat_map(|swarm| swarm.drones.keys())
             .cloned()
             .collect()
@@ -143,11 +184,7 @@ impl Default for GlobalConstraints {
             ],
             no_fly_zones: Vec::new(),
             max_concurrent_drones: 10,
-            emergency_landing_sites: vec![
-                (0.0, 0.0),
-                (500.0, 500.0),
-                (-500.0, -500.0),
-            ],
+            emergency_landing_sites: vec![(0.0, 0.0), (500.0, 500.0), (-500.0, -500.0)],
         }
     }
 }
@@ -162,7 +199,7 @@ impl MultiDroneControlService {
             drone_statuses: Arc::new(RwLock::new(HashMap::new())),
             coordination_engine: Arc::new(RwLock::new(CoordinationEngine::new())),
             mission_assigner: Arc::new(RwLock::new(MissionAssignmentEngine::new(
-                mission_assignment::AssignmentAlgorithm::FirstAvailable
+                mission_assignment::AssignmentAlgorithm::FirstAvailable,
             ))),
             collision_avoidance: Arc::new(RwLock::new(CollisionAvoidanceSystem::new())),
             command_sender,
@@ -171,7 +208,8 @@ impl MultiDroneControlService {
     }
 
     pub async fn send_command(&self, command: ControlCommand) -> Result<()> {
-        self.command_sender.send(command)
+        self.command_sender
+            .send(command)
             .map_err(|e| anyhow::anyhow!("Failed to send command: {}", e))?;
         Ok(())
     }
@@ -193,27 +231,40 @@ impl MultiDroneControlService {
 
     pub async fn process_commands(&self) -> Result<()> {
         let mut receiver = self.command_receiver.write().await;
-        
+
         while let Ok(command) = receiver.try_recv() {
             self.handle_command(command).await?;
         }
-        
+
         Ok(())
     }
 
     async fn handle_command(&self, command: ControlCommand) -> Result<()> {
         match command {
-            ControlCommand::AssignMission { drone_id, mission_id } => {
-                self.mission_assigner.write().await.assign_mission(drone_id, mission_id).await?;
+            ControlCommand::AssignMission {
+                drone_id,
+                mission_id,
+            } => {
+                self.mission_assigner
+                    .write()
+                    .await
+                    .assign_mission(drone_id, mission_id)
+                    .await?;
             }
-            ControlCommand::FormSwarm { drone_ids, formation } => {
+            ControlCommand::FormSwarm {
+                drone_ids,
+                formation,
+            } => {
                 let formation_type = match formation {
                     Formation::Line { .. } => swarm::FormationType::Line,
                     Formation::Grid { .. } => swarm::FormationType::Grid,
                     Formation::Circle { .. } => swarm::FormationType::Circle,
                     Formation::VFormation { .. } => swarm::FormationType::V,
                     Formation::Custom { positions } => swarm::FormationType::Custom(
-                        positions.into_iter().map(|(x, y, _)| (x as f64, y as f64)).collect()
+                        positions
+                            .into_iter()
+                            .map(|(x, y, _)| (x as f64, y as f64))
+                            .collect(),
                     ),
                 };
                 let swarm = DroneSwarm::new("Auto-Swarm".to_string(), drone_ids, formation_type);
@@ -222,7 +273,11 @@ impl MultiDroneControlService {
             }
             ControlCommand::ExecuteCoordinatedAction { swarm_id, action } => {
                 let action_str = format!("{:?}", action);
-                self.coordination_engine.write().await.execute_action(swarm_id, action_str).await?;
+                self.coordination_engine
+                    .write()
+                    .await
+                    .execute_action(swarm_id, action_str)
+                    .await?;
             }
             ControlCommand::EmergencyLand { drone_ids } => {
                 for drone_id in drone_ids {
@@ -241,7 +296,7 @@ impl MultiDroneControlService {
                 controller.update_constraints(constraints);
             }
         }
-        
+
         Ok(())
     }
 
@@ -256,9 +311,10 @@ impl MultiDroneControlService {
                 violations.push(SafetyViolation {
                     drone_id: status.id,
                     violation_type: ViolationType::AltitudeExceeded,
-                    description: format!("Altitude {:.1}m exceeds maximum {:.1}m", 
-                                       status.position.2, 
-                                       controller.global_constraints.max_altitude_m),
+                    description: format!(
+                        "Altitude {:.1}m exceeds maximum {:.1}m",
+                        status.position.2, controller.global_constraints.max_altitude_m
+                    ),
                     severity: Severity::High,
                     timestamp: Utc::now(),
                 });
@@ -292,41 +348,45 @@ impl MultiDroneControlService {
         Ok(violations)
     }
 
-    fn is_within_geofence(&self, position: &(f64, f64, f32), constraints: &GlobalConstraints) -> bool {
+    fn is_within_geofence(
+        &self,
+        position: &(f64, f64, f32),
+        constraints: &GlobalConstraints,
+    ) -> bool {
         // Simple point-in-polygon check (for convex polygons)
         let (x, y, _) = *position;
         let boundary = &constraints.geofence_boundaries;
-        
+
         if boundary.len() < 3 {
             return true; // No geofence defined
         }
 
         let mut inside = false;
         let mut j = boundary.len() - 1;
-        
+
         for i in 0..boundary.len() {
             let (xi, yi) = boundary[i];
             let (xj, yj) = boundary[j];
-            
+
             if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
                 inside = !inside;
             }
             j = i;
         }
-        
+
         inside
     }
 
     fn is_in_no_fly_zone(&self, position: &(f64, f64, f32), zone: &NoFlyZone) -> bool {
         let (x, y, z) = *position;
-        
+
         // Check altitude restriction if present
         if let Some((min_alt, max_alt)) = zone.altitude_restriction {
             if z < min_alt || z > max_alt {
                 return false;
             }
         }
-        
+
         // Check if point is in zone boundary (simple point-in-polygon)
         let boundary = &zone.boundary;
         if boundary.len() < 3 {
@@ -335,17 +395,17 @@ impl MultiDroneControlService {
 
         let mut inside = false;
         let mut j = boundary.len() - 1;
-        
+
         for i in 0..boundary.len() {
             let (xi, yi) = boundary[i];
             let (xj, yj) = boundary[j];
-            
+
             if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
                 inside = !inside;
             }
             j = i;
         }
-        
+
         inside
     }
 }
@@ -398,7 +458,9 @@ mod tests {
     #[tokio::test]
     async fn test_command_sending() {
         let service = MultiDroneControlService::new("Test Service".to_string());
-        let command = ControlCommand::EmergencyLand { drone_ids: vec![Uuid::new_v4()] };
+        let command = ControlCommand::EmergencyLand {
+            drone_ids: vec![Uuid::new_v4()],
+        };
         let result = service.send_command(command).await;
         assert!(result.is_ok());
     }

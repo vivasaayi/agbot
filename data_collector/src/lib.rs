@@ -1,18 +1,18 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
-use chrono::{DateTime, Utc};
 use tokio::fs;
+use uuid::Uuid;
 
-pub mod storage;
 pub mod export;
 pub mod indexing;
+pub mod storage;
 
-pub use storage::{StorageEngine, StorageConfig};
 pub use export::{DataExporter, ExportFormat};
 pub use indexing::{DataIndexer, IndexConfig, SearchQuery};
+pub use storage::{StorageConfig, StorageEngine};
 
 /// Data collection and storage system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,7 +140,7 @@ impl DataCollectorService {
             retention_days: 365,
         };
         let storage = StorageEngine::new(storage_config)?;
-        
+
         let index_config = IndexConfig {
             index_path: data_root.join("index"),
             spatial_resolution: 100.0,
@@ -152,7 +152,7 @@ impl DataCollectorService {
             temporal_bucket_size: chrono::Duration::minutes(5),
         };
         let indexer = DataIndexer::new(index_config);
-        
+
         Ok(Self {
             storage,
             active_sessions: HashMap::new(),
@@ -163,7 +163,11 @@ impl DataCollectorService {
         })
     }
 
-    pub async fn start_session(&mut self, drone_id: Uuid, mission_id: Option<Uuid>) -> Result<Uuid> {
+    pub async fn start_session(
+        &mut self,
+        drone_id: Uuid,
+        mission_id: Option<Uuid>,
+    ) -> Result<Uuid> {
         let session = FlightSession {
             id: Uuid::new_v4(),
             mission_id,
@@ -178,7 +182,7 @@ impl DataCollectorService {
 
         let session_id = session.id;
         self.active_sessions.insert(session_id, session);
-        
+
         // Create session directory
         let session_dir = self.get_session_path(&session_id);
         fs::create_dir_all(&session_dir).await?;
@@ -191,16 +195,16 @@ impl DataCollectorService {
         if let Some(mut session) = self.active_sessions.remove(session_id) {
             session.end_time = Some(Utc::now());
             session.status = SessionStatus::Completed;
-            
+
             // Calculate final summary
             session.summary = self.calculate_session_summary(&session).await?;
-            
+
             // Store session metadata
             self.storage.store_session(&session).await?;
-            
+
             // Update index
             self.indexer.index_session(&session).await?;
-            
+
             tracing::info!("Ended data collection session: {}", session_id);
             Ok(session)
         } else {
@@ -211,15 +215,19 @@ impl DataCollectorService {
     pub async fn collect_data(&mut self, session_id: &Uuid, data: FlightDataRecord) -> Result<()> {
         // Store the data
         let stored_data = self.storage.store_data(&data).await?;
-        
+
         // Update session
         if let Some(session) = self.active_sessions.get_mut(session_id) {
             session.data_records.push(stored_data.id);
             session.summary.record_count += 1;
             session.summary.total_data_size_bytes += stored_data.size_bytes;
-            
+
             // Update data type counts
-            *session.summary.data_types.entry(stored_data.data_type.clone()).or_insert(0) += 1;
+            *session
+                .summary
+                .data_types
+                .entry(stored_data.data_type.clone())
+                .or_insert(0) += 1;
         }
 
         // Update index
@@ -236,19 +244,23 @@ impl DataCollectorService {
         }
     }
 
-    pub async fn list_sessions(&self, drone_id: Option<Uuid>, limit: Option<u32>) -> Result<Vec<FlightSession>> {
+    pub async fn list_sessions(
+        &self,
+        drone_id: Option<Uuid>,
+        limit: Option<u32>,
+    ) -> Result<Vec<FlightSession>> {
         let mut sessions = self.storage.list_sessions(drone_id, limit).await?;
-        
+
         // Add active sessions
         for session in self.active_sessions.values() {
             if drone_id.is_none() || drone_id == Some(session.drone_id) {
                 sessions.push(session.clone());
             }
         }
-        
+
         // Sort by start time (newest first)
         sessions.sort_by(|a, b| b.start_time.cmp(&a.start_time));
-        
+
         Ok(sessions)
     }
 
@@ -256,8 +268,15 @@ impl DataCollectorService {
         self.indexer.search(query).await
     }
 
-    pub async fn export_session(&self, session_id: &Uuid, format: ExportFormat, output_path: &Path) -> Result<()> {
-        let session = self.get_session(session_id).await?
+    pub async fn export_session(
+        &self,
+        session_id: &Uuid,
+        format: ExportFormat,
+        output_path: &Path,
+    ) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
         let export_config = export::ExportConfig {
@@ -266,11 +285,14 @@ impl DataCollectorService {
             compress: false,
         };
         let exporter = DataExporter::new(export_config);
-        
+
         // TODO: Load session data first
         let session_records = Vec::new(); // Placeholder
-        
-        match exporter.export_session(&session, &session_records, output_path).await {
+
+        match exporter
+            .export_session(&session, &session_records, output_path)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => Err(anyhow::anyhow!("Export failed: {}", e)),
         }
@@ -279,10 +301,10 @@ impl DataCollectorService {
     pub async fn cleanup_old_data(&mut self) -> Result<u32> {
         let cutoff_date = Utc::now() - chrono::Duration::days(self.retention_days as i64);
         let removed_count = self.storage.cleanup_before_date(cutoff_date).await?;
-        
+
         // Rebuild index after cleanup
         self.indexer.rebuild().await?;
-        
+
         tracing::info!("Cleaned up {} old data records", removed_count);
         Ok(removed_count as u32)
     }
@@ -297,7 +319,7 @@ impl DataCollectorService {
 
     async fn calculate_session_summary(&self, session: &FlightSession) -> Result<SessionSummary> {
         let mut summary = SessionSummary::default();
-        
+
         // Calculate from stored records
         for record_id in &session.data_records {
             if let Some(record) = self.storage.load_data(record_id).await? {
@@ -313,7 +335,8 @@ impl DataCollectorService {
             summary.flight_duration_seconds = self.calculate_flight_duration(&telemetry_records);
             summary.distance_covered_m = self.calculate_distance_covered(&telemetry_records);
             summary.area_covered_m2 = self.calculate_area_covered(&telemetry_records);
-            summary.battery_consumed_percent = self.calculate_battery_consumption(&telemetry_records);
+            summary.battery_consumed_percent =
+                self.calculate_battery_consumption(&telemetry_records);
         }
 
         Ok(summary)
@@ -385,14 +408,14 @@ mod tests {
     async fn test_session_lifecycle() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
-        
+
         let drone_id = Uuid::new_v4();
         let session_id = service.start_session(drone_id, None).await.unwrap();
-        
+
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         assert_eq!(session.drone_id, drone_id);
         assert!(matches!(session.status, SessionStatus::Active));
-        
+
         let ended_session = service.end_session(&session_id).await.unwrap();
         assert!(matches!(ended_session.status, SessionStatus::Completed));
     }

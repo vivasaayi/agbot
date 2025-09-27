@@ -1,6 +1,6 @@
 use anyhow::Result;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use serde::{Deserialize, Serialize};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 // use uuid::Uuid; // uncomment when needed
 // use chrono::{DateTime, Utc}; // uncomment when needed
 // use nalgebra::{Point3, Vector3}; // uncomment when needed
@@ -15,11 +15,10 @@ pub use types::*;
 /// Initialize logging for the application
 pub fn init_logging() -> Result<()> {
     dotenvy::dotenv().ok();
-    
+
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

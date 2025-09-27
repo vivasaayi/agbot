@@ -36,6 +36,9 @@ bevy = { workspace = true }
 bevy_egui = { workspace = true }
 bevy-inspector-egui = { workspace = true }
 
+# HTTP
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
 # Shared workspace crate
 shared = { path = "../shared" }
 # multi_drone_control = { path = "../multi_drone_control" }

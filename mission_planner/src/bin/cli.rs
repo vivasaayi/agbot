@@ -10,7 +10,11 @@ use mission_planner::{Mission, MissionPlannerService, Waypoint, WaypointType};
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Database URL
-    #[arg(short, long, default_value = "postgres://postgres:password@localhost:5432/agbot")]
+    #[arg(
+        short,
+        long,
+        default_value = "postgres://postgres:password@localhost:5432/agbot"
+    )]
     database_url: String,
 
     #[command(subcommand)]
@@ -95,7 +99,11 @@ async fn main() -> Result<()> {
     let service = MissionPlannerService::new(&cli.database_url).await?;
 
     match cli.command {
-        Commands::Create { name, description, area } => {
+        Commands::Create {
+            name,
+            description,
+            area,
+        } => {
             let area_polygon = if let Some(area_json) = area {
                 serde_json::from_str(&area_json)?
             } else {
@@ -118,7 +126,12 @@ async fn main() -> Result<()> {
             let missions = service.list_missions(Some(limit), Some(offset)).await?;
             println!("Found {} missions:", missions.len());
             for mission in missions {
-                println!("  {} - {} ({})", mission.id, mission.name, mission.created_at.format("%Y-%m-%d %H:%M"));
+                println!(
+                    "  {} - {} ({})",
+                    mission.id,
+                    mission.name,
+                    mission.created_at.format("%Y-%m-%d %H:%M")
+                );
             }
         }
 
@@ -131,7 +144,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Update { id, name, description } => {
+        Commands::Update {
+            id,
+            name,
+            description,
+        } => {
             let mission_id = Uuid::parse_str(&id)?;
             if let Some(mut mission) = service.get_mission(&mission_id).await? {
                 if let Some(new_name) = name {
@@ -141,7 +158,7 @@ async fn main() -> Result<()> {
                     mission.description = new_description;
                 }
                 mission.updated_at = chrono::Utc::now();
-                
+
                 service.update_mission(mission).await?;
                 println!("Mission updated successfully");
             } else {
@@ -159,7 +176,12 @@ async fn main() -> Result<()> {
             let missions = service.search_missions(&query).await?;
             println!("Found {} missions matching '{}':", missions.len(), query);
             for mission in missions {
-                println!("  {} - {} ({})", mission.id, mission.name, mission.created_at.format("%Y-%m-%d %H:%M"));
+                println!(
+                    "  {} - {} ({})",
+                    mission.id,
+                    mission.name,
+                    mission.created_at.format("%Y-%m-%d %H:%M")
+                );
             }
         }
 
@@ -167,8 +189,14 @@ async fn main() -> Result<()> {
             let stats = service.get_mission_stats().await?;
             println!("Mission Statistics:");
             println!("  Total missions: {}", stats.total_missions);
-            println!("  Average duration: {:.1} minutes", stats.average_duration_minutes);
-            println!("  Average battery usage: {:.1}%", stats.average_battery_usage);
+            println!(
+                "  Average duration: {:.1} minutes",
+                stats.average_duration_minutes
+            );
+            println!(
+                "  Average battery usage: {:.1}%",
+                stats.average_battery_usage
+            );
             if let Some(oldest) = stats.oldest_mission {
                 println!("  Oldest mission: {}", oldest.format("%Y-%m-%d %H:%M"));
             }
@@ -177,7 +205,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::AddWaypoint { mission_id, lat, lon, altitude, waypoint_type } => {
+        Commands::AddWaypoint {
+            mission_id,
+            lat,
+            lon,
+            altitude,
+            waypoint_type,
+        } => {
             let mission_id = Uuid::parse_str(&mission_id)?;
             if let Some(mut mission) = service.get_mission(&mission_id).await? {
                 let waypoint_type = match waypoint_type.to_lowercase().as_str() {

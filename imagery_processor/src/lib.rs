@@ -1,12 +1,14 @@
-use std::path::PathBuf;
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use clap::{Parser, Subcommand, Args as ClapArgs, ValueEnum};
 use shared::{config::AgroConfig, AgroResult};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "imagery_processor")]
-#[command(about = "Imagery Processor: indices, thermal, and classification for remote sensing imagery")]
+#[command(
+    about = "Imagery Processor: indices, thermal, and classification for remote sensing imagery"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -218,7 +220,13 @@ pub enum SensorPreset {
 }
 
 impl SensorPreset {
-    pub fn default_bands(self) -> (Option<&'static str>, Option<&'static str>, Option<&'static str>) {
+    pub fn default_bands(
+        self,
+    ) -> (
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    ) {
         match self {
             SensorPreset::Sentinel2 => (Some("B04"), Some("B08"), Some("B05")), // Red, NIR, RE
             SensorPreset::Landsat8 => (Some("B4"), Some("B5"), Some("B6")),     // Red, NIR, RE-ish
@@ -256,10 +264,10 @@ impl Processor {
 }
 
 pub mod pipeline {
-    pub mod indices;
-    pub mod thermal;
     pub mod classify;
+    pub mod indices;
     pub mod masks;
+    pub mod thermal;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

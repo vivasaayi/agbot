@@ -1,8 +1,9 @@
-use bevy::prelude::*;
-use bevy::MinimalPlugins;
 use crate::components::Drone;
-use crate::resources::{MissionData, DroneRegistry};
 use crate::drone_controller::spawn_drone;
+use crate::map_loader::WorldLoadedEvent;
+use crate::osm::{lonlat_to_local, PolygonKind};
+use crate::resources::{DroneRegistry, MissionData};
+use bevy::prelude::*;
 
 #[derive(Resource, Debug, Clone)]
 pub struct WaypointConfig {
@@ -13,7 +14,11 @@ pub struct WaypointConfig {
 
 impl Default for WaypointConfig {
     fn default() -> Self {
-        Self { speed_mps: 8.0, altitude_m: 20.0, pos_tolerance_m: 1.0 }
+        Self {
+            speed_mps: 8.0,
+            altitude_m: 20.0,
+            pos_tolerance_m: 1.0,
+        }
     }
 }
 
@@ -23,7 +28,10 @@ impl Plugin for WaypointAutopilotPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(WaypointConfig::default())
             .add_systems(Startup, spawn_demo_drone_and_waypoints)
-            .add_systems(Update, drive_to_waypoints_system);
+            .add_systems(
+                Update,
+                (align_waypoints_with_world, drive_to_waypoints_system),
+            );
     }
 }
 
@@ -42,7 +50,9 @@ fn drive_to_waypoints_system(
     mut q: Query<(&mut Transform, &Drone)>,
     time: Res<Time>,
 ) {
-    if mission.waypoints.is_empty() { return; }
+    if mission.waypoints.is_empty() {
+        return;
+    }
 
     // Follow a single active waypoint index in MissionData
     let idx = mission.replay_index.min(mission.waypoints.len() - 1);
@@ -66,7 +76,39 @@ fn drive_to_waypoints_system(
         t.translation += dir * step.min(dist);
         // orient toward motion in XZ plane
         let fwd = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
-        if fwd.length_squared() > 0.0 { t.look_to(fwd, Vec3::Y); }
+        if fwd.length_squared() > 0.0 {
+            t.look_to(fwd, Vec3::Y);
+        }
+    }
+}
+
+fn align_waypoints_with_world(
+    mut events: EventReader<WorldLoadedEvent>,
+    mut mission: ResMut<MissionData>,
+    drone_registry: Res<DroneRegistry>,
+    mut transforms: Query<&mut Transform, With<Drone>>,
+) {
+    for event in events.read() {
+        if let Some((center, extents)) = select_primary_field(event) {
+            let half = extents * 0.5;
+            let altitude = 30.0;
+
+            mission.waypoints = vec![
+                Vec3::new(center.x - half.x, altitude, center.y - half.y),
+                Vec3::new(center.x + half.x, altitude, center.y - half.y),
+                Vec3::new(center.x + half.x, altitude, center.y + half.y),
+                Vec3::new(center.x - half.x, altitude, center.y + half.y),
+            ];
+            mission.replay_index = 0;
+
+            if let Some(first) = mission.waypoints.first().copied() {
+                for entity in drone_registry.drones.iter().copied() {
+                    if let Ok(mut transform) = transforms.get_mut(entity) {
+                        transform.translation = first;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -95,10 +137,65 @@ fn spawn_demo_drone_and_waypoints(
     }
 }
 
+fn select_primary_field(event: &WorldLoadedEvent) -> Option<(Vec2, Vec2)> {
+    let center_lat = event.map_data.center_lat as f32;
+    let center_lon = event.map_data.center_lon as f32;
+
+    let mut best: Option<(Vec2, Vec2, f32)> = None;
+
+    for polygon in event.map_data.polygons.iter() {
+        if !matches!(polygon.kind, PolygonKind::Farmland) {
+            continue;
+        }
+
+        let points: Vec<Vec2> = polygon
+            .coordinates
+            .iter()
+            .map(|coord| lonlat_to_local(center_lat, center_lon, coord[0], coord[1]))
+            .collect();
+
+        if let Some((center, extents)) = compute_bounds(&points) {
+            let area = (extents.x * extents.y).abs();
+            if area < 100.0 {
+                continue;
+            }
+
+            match &mut best {
+                Some(existing) if existing.2 >= area => {}
+                _ => best = Some((center, extents, area)),
+            }
+        }
+    }
+
+    if let Some((center, extents, _)) = best {
+        Some((center, extents))
+    } else {
+        None
+    }
+}
+
+fn compute_bounds(points: &[Vec2]) -> Option<(Vec2, Vec2)> {
+    if points.is_empty() {
+        return None;
+    }
+
+    let mut min = points[0];
+    let mut max = points[0];
+    for point in points.iter().skip(1) {
+        min = min.min(*point);
+        max = max.max(*point);
+    }
+
+    let center = (min + max) * 0.5;
+    let extents = (max - min).abs();
+    Some((center, extents))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resources::MissionData;
+    use bevy::MinimalPlugins;
 
     #[test]
     fn test_waypoint_config_default() {
@@ -139,7 +236,7 @@ mod tests {
                 id: "test-drone".to_string(),
                 drone_type: crate::components::DroneType::Quadcopter,
                 status: crate::components::DroneStatus::Flying,
-            }
+            },
         ));
 
         // Run multiple updates to allow sufficient movement
@@ -180,10 +277,10 @@ mod tests {
         ];
         mission.replay_index = 0;
 
-    let mut config = WaypointConfig::default();
-    config.pos_tolerance_m = 1.0; // Larger tolerance
-    config.speed_mps = 5.0; // Faster movement
-    config.altitude_m = 0.0; // Match waypoint altitude so tolerance can be met
+        let mut config = WaypointConfig::default();
+        config.pos_tolerance_m = 1.0; // Larger tolerance
+        config.speed_mps = 5.0; // Faster movement
+        config.altitude_m = 0.0; // Match waypoint altitude so tolerance can be met
 
         let drone_registry = crate::resources::DroneRegistry::default();
 
@@ -198,7 +295,7 @@ mod tests {
                 id: "test-drone".to_string(),
                 drone_type: crate::components::DroneType::Quadcopter,
                 status: crate::components::DroneStatus::Flying,
-            }
+            },
         ));
 
         // Run multiple updates to ensure waypoint advancement
@@ -242,7 +339,7 @@ mod tests {
                 id: "test-drone".to_string(),
                 drone_type: crate::components::DroneType::Quadcopter,
                 status: crate::components::DroneStatus::Flying,
-            }
+            },
         ));
 
         // Run the system
@@ -258,7 +355,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found_oriented_drone, "No drone properly oriented toward waypoint");
+        assert!(
+            found_oriented_drone,
+            "No drone properly oriented toward waypoint"
+        );
     }
 
     #[test]
@@ -286,7 +386,7 @@ mod tests {
                 id: "test-drone".to_string(),
                 drone_type: crate::components::DroneType::Quadcopter,
                 status: crate::components::DroneStatus::Flying,
-            }
+            },
         ));
 
         // Get initial position of our test drone
@@ -312,6 +412,9 @@ mod tests {
             }
         }
 
-        assert_eq!(initial_position, current_position, "Test drone moved when no waypoints present");
+        assert_eq!(
+            initial_position, current_position,
+            "Test drone moved when no waypoints present"
+        );
     }
 }

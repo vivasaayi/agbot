@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use uuid::Uuid;
-use tokio::sync::{broadcast, mpsc, RwLock};
-use std::sync::Arc;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, RwLock};
+use uuid::Uuid;
 
 /// Drone swarm management and coordination
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,12 +107,30 @@ pub enum FormationType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SwarmMessage {
-    HeartBeat { drone_id: Uuid, timestamp: DateTime<Utc> },
-    PositionUpdate { drone_id: Uuid, position: (f64, f64, f32) },
-    MissionUpdate { drone_id: Uuid, mission_id: Uuid, status: String },
-    Emergency { drone_id: Uuid, message: String },
-    FormationChange { formation: FormationType },
-    Command { target: CommandTarget, payload: serde_json::Value },
+    HeartBeat {
+        drone_id: Uuid,
+        timestamp: DateTime<Utc>,
+    },
+    PositionUpdate {
+        drone_id: Uuid,
+        position: (f64, f64, f32),
+    },
+    MissionUpdate {
+        drone_id: Uuid,
+        mission_id: Uuid,
+        status: String,
+    },
+    Emergency {
+        drone_id: Uuid,
+        message: String,
+    },
+    FormationChange {
+        formation: FormationType,
+    },
+    Command {
+        target: CommandTarget,
+        payload: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,7 +152,7 @@ pub struct SwarmController {
 impl SwarmController {
     pub fn new() -> Self {
         let (sender, _receiver) = mpsc::unbounded_channel();
-        
+
         Self {
             swarms: Arc::new(RwLock::new(HashMap::new())),
             message_router: sender,
@@ -146,7 +164,7 @@ impl SwarmController {
     pub async fn create_swarm(&self, name: String, formation: FormationType) -> Result<Uuid> {
         let swarm_id = Uuid::new_v4();
         let (tx, _rx) = broadcast::channel(1000);
-        
+
         let swarm = DroneSwarm {
             id: swarm_id,
             name,
@@ -159,14 +177,15 @@ impl SwarmController {
 
         let mut swarms = self.swarms.write().await;
         swarms.insert(swarm_id, swarm);
-        
+
         tracing::info!("Created swarm: {}", swarm_id);
         Ok(swarm_id)
     }
 
     pub async fn add_drone_to_swarm(&self, swarm_id: Uuid, drone: DroneInfo) -> Result<()> {
         let mut swarms = self.swarms.write().await;
-        let swarm = swarms.get_mut(&swarm_id)
+        let swarm = swarms
+            .get_mut(&swarm_id)
             .ok_or_else(|| anyhow::anyhow!("Swarm not found"))?;
 
         if swarm.drones.len() >= self.max_drones_per_swarm {
@@ -186,7 +205,8 @@ impl SwarmController {
 
     pub async fn remove_drone_from_swarm(&self, swarm_id: Uuid, drone_id: Uuid) -> Result<()> {
         let mut swarms = self.swarms.write().await;
-        let swarm = swarms.get_mut(&swarm_id)
+        let swarm = swarms
+            .get_mut(&swarm_id)
             .ok_or_else(|| anyhow::anyhow!("Swarm not found"))?;
 
         swarm.drones.remove(&drone_id);
@@ -202,21 +222,24 @@ impl SwarmController {
 
     pub async fn get_swarm_status(&self, swarm_id: Uuid) -> Result<SwarmStatus> {
         let swarms = self.swarms.read().await;
-        let swarm = swarms.get(&swarm_id)
+        let swarm = swarms
+            .get(&swarm_id)
             .ok_or_else(|| anyhow::anyhow!("Swarm not found"))?;
         Ok(swarm.status.clone())
     }
 
     pub async fn list_swarms(&self) -> Vec<(Uuid, String, usize)> {
         let swarms = self.swarms.read().await;
-        swarms.values()
+        swarms
+            .values()
             .map(|s| (s.id, s.name.clone(), s.drones.len()))
             .collect()
     }
 
     pub async fn broadcast_to_swarm(&self, swarm_id: Uuid, message: SwarmMessage) -> Result<()> {
         let swarms = self.swarms.read().await;
-        let swarm = swarms.get(&swarm_id)
+        let swarm = swarms
+            .get(&swarm_id)
             .ok_or_else(|| anyhow::anyhow!("Swarm not found"))?;
 
         let _ = swarm.communication_channel.send(message);
@@ -225,14 +248,17 @@ impl SwarmController {
 
     pub async fn get_swarm_health(&self, swarm_id: Uuid) -> Result<SwarmHealth> {
         let swarms = self.swarms.read().await;
-        let swarm = swarms.get(&swarm_id)
+        let swarm = swarms
+            .get(&swarm_id)
             .ok_or_else(|| anyhow::anyhow!("Swarm not found"))?;
 
         let total_drones = swarm.drones.len();
-        let active_drones = swarm.drones.values()
+        let active_drones = swarm
+            .drones
+            .values()
             .filter(|d| matches!(d.status, DroneStatus::InMission | DroneStatus::Idle))
             .count();
-        
+
         let avg_battery = if total_drones > 0 {
             swarm.drones.values().map(|d| d.battery_level).sum::<f32>() / total_drones as f32
         } else {
@@ -266,7 +292,7 @@ impl SwarmController {
         };
 
         self.broadcast_to_swarm(swarm_id, message).await?;
-        
+
         let mut swarms = self.swarms.write().await;
         if let Some(swarm) = swarms.get_mut(&swarm_id) {
             swarm.status = SwarmStatus::Emergency;
@@ -281,7 +307,7 @@ impl DroneSwarm {
     pub fn new(name: String, drone_ids: Vec<Uuid>, formation: FormationType) -> Self {
         let (sender, _receiver) = broadcast::channel(100);
         let mut drones = HashMap::new();
-        
+
         // Create DroneInfo entries for each drone ID
         for drone_id in drone_ids {
             let drone_info = DroneInfo {
@@ -297,7 +323,7 @@ impl DroneSwarm {
             };
             drones.insert(drone_id, drone_info);
         }
-        
+
         Self {
             id: Uuid::new_v4(),
             name,
@@ -327,10 +353,10 @@ mod tests {
     #[tokio::test]
     async fn test_swarm_creation() {
         let controller = SwarmController::new();
-        let swarm_id = controller.create_swarm(
-            "Test Swarm".to_string(),
-            FormationType::Grid
-        ).await.unwrap();
+        let swarm_id = controller
+            .create_swarm("Test Swarm".to_string(), FormationType::Grid)
+            .await
+            .unwrap();
 
         let swarms = controller.list_swarms().await;
         assert_eq!(swarms.len(), 1);
@@ -341,10 +367,10 @@ mod tests {
     #[tokio::test]
     async fn test_drone_management() {
         let controller = SwarmController::new();
-        let swarm_id = controller.create_swarm(
-            "Test Swarm".to_string(),
-            FormationType::Line
-        ).await.unwrap();
+        let swarm_id = controller
+            .create_swarm("Test Swarm".to_string(), FormationType::Line)
+            .await
+            .unwrap();
 
         let drone = DroneInfo {
             id: Uuid::new_v4(),
@@ -366,8 +392,11 @@ mod tests {
             assigned_mission: None,
         };
 
-        controller.add_drone_to_swarm(swarm_id, drone.clone()).await.unwrap();
-        
+        controller
+            .add_drone_to_swarm(swarm_id, drone.clone())
+            .await
+            .unwrap();
+
         let health = controller.get_swarm_health(swarm_id).await.unwrap();
         assert_eq!(health.total_drones, 1);
         assert_eq!(health.active_drones, 1);

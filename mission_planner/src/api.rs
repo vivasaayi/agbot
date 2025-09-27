@@ -27,7 +27,7 @@ impl MissionApi {
     /// Create router with all mission endpoints
     pub fn router(service: Arc<MissionPlannerService>) -> Router {
         let api = Self::new(service.clone());
-        
+
         Router::new()
             .route("/missions", post(create_mission))
             .route("/missions", get(list_missions))
@@ -100,11 +100,7 @@ async fn create_mission(
     State(service): State<Arc<MissionPlannerService>>,
     Json(request): Json<CreateMissionRequest>,
 ) -> Result<Json<CreateMissionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut mission = Mission::new(
-        request.name,
-        request.description,
-        request.area_of_interest,
-    );
+    let mut mission = Mission::new(request.name, request.description, request.area_of_interest);
 
     // Add waypoints if provided
     if let Some(waypoints) = request.waypoints {
@@ -372,9 +368,10 @@ mod tests {
     use geo::{coord, polygon};
 
     async fn setup_test_service() -> Arc<MissionPlannerService> {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:password@localhost:5432/agbot_test".to_string());
-        
+        let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:password@localhost:5432/agbot_test".to_string()
+        });
+
         let service = MissionPlannerService::new(&database_url).await.unwrap();
         Arc::new(service)
     }
@@ -403,10 +400,7 @@ mod tests {
             metadata: None,
         };
 
-        let response = server
-            .post("/missions")
-            .json(&create_request)
-            .await;
+        let response = server.post("/missions").json(&create_request).await;
 
         assert_eq!(response.status_code(), StatusCode::OK);
 
@@ -414,9 +408,7 @@ mod tests {
         let mission_id = create_response.id;
 
         // Test get mission
-        let response = server
-            .get(&format!("/missions/{}", mission_id))
-            .await;
+        let response = server.get(&format!("/missions/{}", mission_id)).await;
 
         assert_eq!(response.status_code(), StatusCode::OK);
 

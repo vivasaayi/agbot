@@ -9,23 +9,14 @@ impl Plugin for UISystemPlugin {
         app
             // Add Bevy states
             .init_state::<AppState>()
-            
             // Add UI resources
             .init_resource::<UITheme>()
             .init_resource::<UIOverlayState>()
-            
             // Add plugins for each UI module (EguiPlugin is added in main app.rs)
-            .add_plugins((
-                MainMenuPlugin,
-                OverlaySystemPlugin,
-            ))
-            
+            .add_plugins((MainMenuPlugin, OverlaySystemPlugin))
             // Add shared systems
             .add_systems(Startup, setup_ui_theme)
-            .add_systems(Update, (
-                handle_escape_key,
-                update_ui_theme,
-            ));
+            .add_systems(Update, (handle_escape_key, update_ui_theme));
     }
 }
 
@@ -43,31 +34,28 @@ fn handle_escape_key(
         match current_app_state.get() {
             AppState::MainMenu => {
                 // Exit application from main menu (handled in main_menu.rs)
-            },
+            }
             AppState::World3D | AppState::World2D => {
                 next_app_state.set(AppState::MainMenu);
-            },
+            }
             AppState::CitySearch => {
                 next_app_state.set(AppState::MainMenu);
-            },
+            }
             AppState::WorldLoading => {
                 // Can't escape from loading screen
-            },
+            }
             AppState::Simulation => {
                 next_app_state.set(AppState::MainMenu);
-            },
+            }
         }
     }
 }
 
-fn update_ui_theme(
-    time: Res<Time>,
-    mut theme: ResMut<UITheme>,
-) {
+fn update_ui_theme(time: Res<Time>, mut theme: ResMut<UITheme>) {
     // Update any animated theme properties here
     // For example, pulsing colors or animated backgrounds
     let elapsed = time.elapsed_seconds();
-    
+
     // Subtle animation for accent colors (optional)
     let pulse = (elapsed * 2.0).sin() * 0.1 + 0.9;
     theme.accent_color = Color::srgb(

@@ -10,27 +10,49 @@ use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{Mission, MissionPlannerService};
 use crate::mavlink_integration::{MAVLinkConverter, MAVLinkMission};
+use crate::{Mission, MissionPlannerService};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WebSocketMessage {
     // Client to Server
-    DeployMission { mission: Mission },
-    DeployMAVLinkMission { data: String },
+    DeployMission {
+        mission: Mission,
+    },
+    DeployMAVLinkMission {
+        data: String,
+    },
     SubscribeToUpdates,
-    GetMissionStatus { mission_id: Uuid },
-    
+    GetMissionStatus {
+        mission_id: Uuid,
+    },
+
     // Server to Client
-    MissionDeployed { mission_id: Uuid, success: bool, error: Option<String> },
-    MissionStatus { mission_id: Uuid, status: String, progress: f32 },
-    DroneTelemetry { drone_id: String, telemetry: DroneTelemettry },
-    SystemStatus { connected_drones: Vec<String>, active_missions: Vec<Uuid> },
-    Error { message: String },
+    MissionDeployed {
+        mission_id: Uuid,
+        success: bool,
+        error: Option<String>,
+    },
+    MissionStatus {
+        mission_id: Uuid,
+        status: String,
+        progress: f32,
+    },
+    DroneTelemetry {
+        drone_id: String,
+        telemetry: DroneTelemettry,
+    },
+    SystemStatus {
+        connected_drones: Vec<String>,
+        active_missions: Vec<Uuid>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +111,7 @@ impl WebSocketHandler {
                                         continue;
                                     }
                                 };
-                                
+
                                 if sender.send(Message::Text(json_msg)).await.is_err() {
                                     break;
                                 }
@@ -182,7 +204,11 @@ impl WebSocketHandler {
         mission: Mission,
         sender: &tokio::sync::mpsc::UnboundedSender<Message>,
     ) -> Result<()> {
-        info!("Deploying mission: {} with {} waypoints", mission.name, mission.waypoints.len());
+        info!(
+            "Deploying mission: {} with {} waypoints",
+            mission.name,
+            mission.waypoints.len()
+        );
 
         // Convert to MAVLink
         let mavlink_mission = MAVLinkConverter::mission_to_mavlink(&mission)?;
@@ -193,7 +219,10 @@ impl WebSocketHandler {
         service.create_mission(mission.clone()).await?;
 
         // TODO: Send to actual drone system
-        info!("MAVLink waypoint file generated ({} items)", mavlink_mission.count);
+        info!(
+            "MAVLink waypoint file generated ({} items)",
+            mavlink_mission.count
+        );
         info!("Mission waypoints:\n{}", waypoint_file);
 
         // Simulate deployment
@@ -223,7 +252,10 @@ impl WebSocketHandler {
         mavlink_data: String,
         sender: &tokio::sync::mpsc::UnboundedSender<Message>,
     ) -> Result<()> {
-        info!("Deploying MAVLink mission data ({} bytes)", mavlink_data.len());
+        info!(
+            "Deploying MAVLink mission data ({} bytes)",
+            mavlink_data.len()
+        );
 
         // TODO: Parse and validate MAVLink data
         // TODO: Send to actual drone system
@@ -239,7 +271,9 @@ impl WebSocketHandler {
         };
 
         let json_msg = serde_json::to_string(&response)?;
-        sender.send(Message::Text(json_msg)).map_err(|e| anyhow::anyhow!("Send error: {}", e))?;
+        sender
+            .send(Message::Text(json_msg))
+            .map_err(|e| anyhow::anyhow!("Send error: {}", e))?;
 
         Ok(())
     }

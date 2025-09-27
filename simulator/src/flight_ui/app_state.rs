@@ -86,15 +86,11 @@ pub struct AppStatePlugin;
 
 impl Plugin for AppStatePlugin {
     fn build(&self, app: &mut App) {
-        app
-            .init_state::<AppState>()
+        app.init_state::<AppState>()
             .init_state::<MenuState>()
             .init_resource::<UITheme>()
             .init_resource::<UIOverlayState>()
-            .add_systems(Update, (
-                handle_escape_key,
-                update_notifications,
-            ));
+            .add_systems(Update, (handle_escape_key, update_notifications));
     }
 }
 
@@ -135,21 +131,24 @@ fn handle_escape_key(
 }
 
 /// Update notification system
-fn update_notifications(
-    time: Res<Time>,
-    mut overlay_state: ResMut<UIOverlayState>,
-) {
+fn update_notifications(time: Res<Time>, mut overlay_state: ResMut<UIOverlayState>) {
     let current_time = time.elapsed_seconds();
-    
+
     // Remove expired notifications
-    overlay_state.notification_queue.retain(|notification| {
-        current_time - notification.timestamp < notification.duration
-    });
+    overlay_state
+        .notification_queue
+        .retain(|notification| current_time - notification.timestamp < notification.duration);
 }
 
 /// Helper function to add notifications
 impl UIOverlayState {
-    pub fn add_notification(&mut self, message: String, level: NotificationLevel, duration: f32, time: &Res<Time>) {
+    pub fn add_notification(
+        &mut self,
+        message: String,
+        level: NotificationLevel,
+        duration: f32,
+        time: &Res<Time>,
+    ) {
         self.notification_queue.push(Notification {
             message,
             level,
@@ -157,7 +156,7 @@ impl UIOverlayState {
             timestamp: time.elapsed_seconds(),
         });
     }
-    
+
     /// Add a simple notification with default settings
     pub fn add_simple_notification(&mut self, message: String) {
         self.notification_queue.push(Notification {
@@ -167,7 +166,7 @@ impl UIOverlayState {
             timestamp: 0.0, // Will be updated by the notification system
         });
     }
-    
+
     /// Add notification with specific level
     pub fn add_notification_with_level(&mut self, message: String, level: NotificationLevel) {
         self.notification_queue.push(Notification {

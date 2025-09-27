@@ -1,6 +1,6 @@
+use crate::{DataType, FlightDataRecord};
 use std::collections::HashMap;
 use uuid::Uuid;
-use crate::{FlightDataRecord, DataType};
 
 #[derive(Debug, Clone)]
 pub struct IndexConfig {
@@ -92,12 +92,7 @@ impl DataIndexer {
         }
     }
 
-    pub fn find_by_location(
-        &self,
-        lat: f64,
-        lon: f64,
-        radius_deg: f64,
-    ) -> Vec<Uuid> {
+    pub fn find_by_location(&self, lat: f64, lon: f64, radius_deg: f64) -> Vec<Uuid> {
         if !self.config.enable_spatial_index {
             return Vec::new();
         }
@@ -177,16 +172,14 @@ impl DataIndexer {
     fn get_spatial_key(&self, payload: &crate::DataPayload) -> SpatialKey {
         let grid_size = self.config.spatial_grid_size;
         match payload {
-            crate::DataPayload::Telemetry { position, .. } => {
-                SpatialKey {
-                    lat_bucket: (position.0 / grid_size).floor() as i64,
-                    lon_bucket: (position.1 / grid_size).floor() as i64,
-                }
-            }
+            crate::DataPayload::Telemetry { position, .. } => SpatialKey {
+                lat_bucket: (position.0 / grid_size).floor() as i64,
+                lon_bucket: (position.1 / grid_size).floor() as i64,
+            },
             _ => SpatialKey {
                 lat_bucket: 0,
                 lon_bucket: 0,
-            }
+            },
         }
     }
 
@@ -211,7 +204,10 @@ impl DataIndexer {
         Ok(())
     }
 
-    pub async fn search(&self, _query: SearchQuery) -> anyhow::Result<Vec<crate::FlightDataRecord>> {
+    pub async fn search(
+        &self,
+        _query: SearchQuery,
+    ) -> anyhow::Result<Vec<crate::FlightDataRecord>> {
         // TODO: Implement search functionality
         Ok(Vec::new())
     }

@@ -1,19 +1,21 @@
+use crate::components::{Drone, DroneModel, DroneStatus, DroneTrail};
+use crate::resources::{AppState, DroneRegistry, MissionData};
 use bevy::prelude::*;
-use crate::components::{Drone, DroneModel, DroneTrail, DroneStatus};
-use crate::resources::{DroneRegistry, MissionData, AppState};
 
 pub struct DroneControllerPlugin;
 
 impl Plugin for DroneControllerPlugin {
     fn build(&self, app: &mut App) {
-        app
-            .add_systems(Update, (
+        app.add_systems(
+            Update,
+            (
                 spawn_drone_models,
                 update_drone_positions,
                 update_drone_trails,
                 animate_drones,
                 update_drone_status_colors,
-            ));
+            ),
+        );
     }
 }
 
@@ -25,22 +27,24 @@ fn spawn_drone_models(
 ) {
     for drone_entity in drone_query.iter() {
         // Add visual model to drone
-        let model_entity = commands.spawn((
-            PbrBundle {
-                mesh: meshes.add(Cuboid::new(2.0, 0.5, 2.0)),
-                material: materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.0, 0.0, 1.0),
+        let model_entity = commands
+            .spawn((
+                PbrBundle {
+                    mesh: meshes.add(Cuboid::new(2.0, 0.5, 2.0)),
+                    material: materials.add(StandardMaterial {
+                        base_color: Color::srgb(0.0, 0.0, 1.0),
+                        ..default()
+                    }),
+                    transform: Transform::from_xyz(0.0, 5.0, 0.0),
                     ..default()
-                }),
-                transform: Transform::from_xyz(0.0, 5.0, 0.0),
-                ..default()
-            },
-            DroneModel,
-        )).id();
-        
+                },
+                DroneModel,
+            ))
+            .id();
+
         // Make the model a child of the drone entity
         commands.entity(drone_entity).push_children(&[model_entity]);
-        
+
         // Add trail component
         commands.entity(drone_entity).insert(DroneTrail::default());
     }
@@ -61,7 +65,7 @@ fn update_drone_positions(
         // 1. Live telemetry data from communication module
         // 2. Replay data when in replay mode
         // 3. Simulation data for testing
-        
+
         if app_state.replay_mode {
             // Update from replay data
             if let Some(data_point) = mission_data.replay_data.get(mission_data.replay_index) {
@@ -75,17 +79,13 @@ fn update_drone_positions(
             let time_sec = time.elapsed_seconds();
             let radius = 20.0;
             let speed = 0.5;
-            
+
             transform.translation.x = (time_sec * speed).cos() * radius;
             transform.translation.z = (time_sec * speed).sin() * radius;
             transform.translation.y = 10.0 + (time_sec * 2.0).sin() * 2.0;
-            
+
             // Face movement direction
-            let forward = Vec3::new(
-                -(time_sec * speed).sin(),
-                0.0,
-                (time_sec * speed).cos(),
-            );
+            let forward = Vec3::new(-(time_sec * speed).sin(), 0.0, (time_sec * speed).cos());
             transform.look_to(forward, Vec3::Y);
         }
     }
@@ -99,7 +99,7 @@ fn update_drone_trails(
     if time.elapsed_seconds() % 0.1 < time.delta_seconds() {
         for (transform, mut trail) in drone_query.iter_mut() {
             trail.points.push(transform.translation);
-            
+
             // Keep trail at max length
             if trail.points.len() > trail.max_points {
                 trail.points.remove(0);
@@ -108,15 +108,12 @@ fn update_drone_trails(
     }
 }
 
-fn animate_drones(
-    mut drone_query: Query<&mut Transform, With<DroneModel>>,
-    time: Res<Time>,
-) {
+fn animate_drones(mut drone_query: Query<&mut Transform, With<DroneModel>>, time: Res<Time>) {
     for mut transform in drone_query.iter_mut() {
         // Add subtle hover animation
         let hover_height = (time.elapsed_seconds() * 2.0).sin() * 0.2;
         transform.translation.y = 5.0 + hover_height;
-        
+
         // Add slight rotation for propeller effect
         transform.rotate_y(time.delta_seconds() * 10.0);
     }
@@ -152,18 +149,20 @@ pub fn spawn_drone(
     id: String,
     position: Vec3,
 ) -> Entity {
-    let drone_entity = commands.spawn((
-        Drone {
-            id,
-            drone_type: crate::components::DroneType::Quadcopter,
-            status: DroneStatus::Idle,
-        },
-        SpatialBundle {
-            transform: Transform::from_translation(position),
-            ..default()
-        },
-    )).id();
-    
+    let drone_entity = commands
+        .spawn((
+            Drone {
+                id,
+                drone_type: crate::components::DroneType::Quadcopter,
+                status: DroneStatus::Idle,
+            },
+            SpatialBundle {
+                transform: Transform::from_translation(position),
+                ..default()
+            },
+        ))
+        .id();
+
     registry.drones.push(drone_entity);
     drone_entity
 }

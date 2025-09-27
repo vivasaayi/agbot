@@ -1,4 +1,4 @@
-use crate::{RuntimeMode, AgroResult};
+use crate::{AgroResult, RuntimeMode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -146,10 +146,12 @@ impl AgroConfig {
                     .unwrap_or_else(|_| "0.1".to_string())
                     .parse()
                     .unwrap_or(0.1),
-                lidar_obstacle_distance_threshold: std::env::var("LIDAR_OBSTACLE_DISTANCE_THRESHOLD")
-                    .unwrap_or_else(|_| "5.0".to_string())
-                    .parse()
-                    .unwrap_or(5.0),
+                lidar_obstacle_distance_threshold: std::env::var(
+                    "LIDAR_OBSTACLE_DISTANCE_THRESHOLD",
+                )
+                .unwrap_or_else(|_| "5.0".to_string())
+                .parse()
+                .unwrap_or(5.0),
                 lidar_quality_threshold: std::env::var("LIDAR_QUALITY_THRESHOLD")
                     .unwrap_or_else(|_| "20".to_string())
                     .parse()

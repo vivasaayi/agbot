@@ -1,7 +1,7 @@
+use crate::Waypoint;
+use geo::Point;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use geo::Point;
-use crate::Waypoint;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlightPath {
@@ -103,18 +103,18 @@ impl FlightPath {
 
     pub fn from_waypoints(name: String, waypoints: &[Waypoint], path_type: PathType) -> Self {
         let mut path = Self::new(name, path_type);
-        
+
         for window in waypoints.windows(2) {
             let start = &window[0];
             let end = &window[1];
-            
+
             let distance = calculate_distance(&start.position, &end.position);
             let bearing = calculate_bearing(&start.position, &end.position);
-            
+
             // Simple time estimation based on average speed
             let avg_speed = 10.0; // m/s
             let time = (distance / avg_speed) as u32;
-            
+
             let segment = PathSegment {
                 start_waypoint_id: start.id,
                 end_waypoint_id: end.id,
@@ -132,10 +132,10 @@ impl FlightPath {
                     profile_type: SpeedProfileType::Constant,
                 },
             };
-            
+
             path.add_segment(segment);
         }
-        
+
         path
     }
 }

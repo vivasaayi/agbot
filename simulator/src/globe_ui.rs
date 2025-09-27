@@ -1,7 +1,7 @@
+use crate::app_state::{AppMode, GlobeSearchState, SelectedRegion, UIState};
+use crate::location_database::LocationDatabase;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
-use crate::app_state::{AppMode, SelectedRegion, UIState, GlobeSearchState};
-use crate::location_database::LocationDatabase;
 
 pub struct GlobeUIPlugin;
 
@@ -9,11 +9,11 @@ impl Plugin for GlobeUIPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(GlobeSearchState::default())
             .insert_resource(LocationDatabase::new())
-            .add_systems(Update, (
-                globe_search_ui,
-                globe_controls_ui,
-                globe_coordinates_ui,
-            ).run_if(in_state(AppMode::Globe)));
+            .add_systems(
+                Update,
+                (globe_search_ui, globe_controls_ui, globe_coordinates_ui)
+                    .run_if(in_state(AppMode::Globe)),
+            );
     }
 }
 
@@ -42,7 +42,7 @@ fn globe_search_ui(
     time: Res<Time>,
 ) {
     let ctx = contexts.ctx_mut();
-    
+
     egui::Window::new("🔍 Location Search")
         .default_pos([10.0, 60.0])
         .default_size([300.0, 300.0])
@@ -140,11 +140,9 @@ fn globe_search_ui(
         });
 }
 
-fn globe_controls_ui(
-    mut contexts: EguiContexts,
-) {
+fn globe_controls_ui(mut contexts: EguiContexts) {
     let ctx = contexts.ctx_mut();
-    
+
     egui::Window::new("🌍 Globe Controls")
         .default_pos([320.0, 60.0])
         .default_size([200.0, 150.0])
@@ -154,9 +152,9 @@ fn globe_controls_ui(
             ui.label("🖱️ Left drag: Rotate globe");
             ui.label("🔄 Mouse wheel: Zoom in/out");
             ui.label("🖱️ Left click: Select location");
-            
+
             ui.separator();
-            
+
             ui.heading("Region Size");
             ui.label("📏 Simulation area:");
             ui.label("• Small: 0.005° (~500m)");
@@ -173,9 +171,9 @@ fn globe_coordinates_ui(
     if !ui_state.show_coordinates {
         return;
     }
-    
+
     let ctx = contexts.ctx_mut();
-    
+
     egui::Window::new("📍 Selected Location")
         .default_pos([10.0, 380.0])
         .default_size([250.0, 240.0])
@@ -183,45 +181,52 @@ fn globe_coordinates_ui(
         .show(ctx, |ui| {
             ui.label(format!("Latitude: {:.6}°", selected_region.center_lat));
             ui.label(format!("Longitude: {:.6}°", selected_region.center_lon));
-            
+
             ui.separator();
-            
+
             // Add coordinate conversion debugging
             ui.colored_label(egui::Color32::YELLOW, "🔍 DEBUG INFO:");
             let lat_rad = selected_region.center_lat.to_radians();
             let lon_rad = selected_region.center_lon.to_radians();
-            
+
             // Show the 3D conversion (same as in globe_view.rs)
             let sphere_x = lat_rad.cos() * lon_rad.sin();
             let sphere_y = lat_rad.sin();
             let sphere_z = -lat_rad.cos() * lon_rad.cos();
-            
-            ui.label(format!("3D Position: ({:.3}, {:.3}, {:.3})", sphere_x, sphere_y, sphere_z));
+
+            ui.label(format!(
+                "3D Position: ({:.3}, {:.3}, {:.3})",
+                sphere_x, sphere_y, sphere_z
+            ));
             ui.label(format!("Lat Radians: {:.3}", lat_rad));
             ui.label(format!("Lon Radians: {:.3}", lon_rad));
-            
+
             ui.separator();
-            
-            ui.label(format!("Region size: {:.4}° × {:.4}°", 
-                selected_region.bounds_width_degrees, 
-                selected_region.bounds_height_degrees));
-            
-            let area_km = selected_region.bounds_width_degrees * selected_region.bounds_height_degrees * 111.32 * 111.32;
+
+            ui.label(format!(
+                "Region size: {:.4}° × {:.4}°",
+                selected_region.bounds_width_degrees, selected_region.bounds_height_degrees
+            ));
+
+            let area_km = selected_region.bounds_width_degrees
+                * selected_region.bounds_height_degrees
+                * 111.32
+                * 111.32;
             ui.label(format!("Area: ~{:.1} km²", area_km));
-            
+
             ui.separator();
-            
+
             // Reverse geocoding placeholder
             ui.label("📍 Location: Unknown");
             ui.small("(Reverse geocoding not implemented)");
-            
+
             ui.separator();
-            
+
             if ui.button("🗺️ View in 2D Map").clicked() {
                 info!("Switching to 2D map view");
                 // TODO: Switch to 2D map view
             }
-            
+
             if ui.button("🏙️ Enter 3D Simulation").clicked() {
                 info!("Switching to 3D simulation");
                 // TODO: Switch to 3D simulation

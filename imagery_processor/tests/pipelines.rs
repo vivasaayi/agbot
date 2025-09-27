@@ -6,7 +6,11 @@ fn ndvi_handles_zero_denominator() {
     let r = 0.0f32;
     let n = 0.0f32;
     let denom = n + r;
-    let v = if denom.abs() > f32::EPSILON { (n - r) / denom } else { 0.0 };
+    let v = if denom.abs() > f32::EPSILON {
+        (n - r) / denom
+    } else {
+        0.0
+    };
     assert_eq!(v, 0.0);
 }
 

@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use uuid::Uuid;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
 use shared::Position3D;
+use std::collections::HashMap;
+use uuid::Uuid;
 
 /// 3D collision avoidance system for multi-drone operations
 pub struct CollisionAvoidanceSystem {
@@ -19,7 +19,7 @@ pub struct DroneTrackingInfo {
     pub id: Uuid,
     pub position: Position3D,
     pub velocity: Velocity3D,
-    pub heading: f32, // degrees
+    pub heading: f32,  // degrees
     pub altitude: f32, // meters
     pub last_update: DateTime<Utc>,
     pub predicted_trajectory: Vec<Position3D>,
@@ -29,9 +29,9 @@ pub struct DroneTrackingInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Velocity3D {
-    pub vx: f32, // m/s
-    pub vy: f32, // m/s
-    pub vz: f32, // m/s
+    pub vx: f32,    // m/s
+    pub vy: f32,    // m/s
+    pub vz: f32,    // m/s
     pub speed: f32, // total speed m/s
 }
 
@@ -108,9 +108,9 @@ impl CollisionAvoidanceSystem {
                 name: "Medium Distance".to_string(),
                 priority: 3,
                 trigger_distance: 50.0,
-                maneuver_type: ManeuverType::HorizontalDeviation { 
-                    angle_deg: 30.0, 
-                    distance: 20.0 
+                maneuver_type: ManeuverType::HorizontalDeviation {
+                    angle_deg: 30.0,
+                    distance: 20.0,
                 },
                 enabled: true,
             },
@@ -125,7 +125,11 @@ impl CollisionAvoidanceSystem {
         ]
     }
 
-    pub async fn register_drone(&mut self, drone_id: Uuid, initial_position: Position3D) -> Result<()> {
+    pub async fn register_drone(
+        &mut self,
+        drone_id: Uuid,
+        initial_position: Position3D,
+    ) -> Result<()> {
         let tracking_info = DroneTrackingInfo {
             id: drone_id,
             position: initial_position.clone(),
@@ -168,7 +172,7 @@ impl CollisionAvoidanceSystem {
         // Separate the prediction and risk assessment to avoid borrow conflicts
         if let Some(tracking_info) = self.tracked_drones.get(&drone_id) {
             let predicted_trajectory = self.predict_trajectory(tracking_info).await;
-            
+
             if let Some(tracking_info) = self.tracked_drones.get_mut(&drone_id) {
                 tracking_info.predicted_trajectory = predicted_trajectory;
             }
@@ -192,7 +196,8 @@ impl CollisionAvoidanceSystem {
             // 1 degree of latitude ≈ 111,111 meters
             // 1 degree of longitude ≈ 111,111 * cos(latitude) meters
             let lat_change = (tracking_info.velocity.vy as f64 * dt) / 111_111.0;
-            let lon_change = (tracking_info.velocity.vx as f64 * dt) / (111_111.0 * current_pos.latitude.cos());
+            let lon_change =
+                (tracking_info.velocity.vx as f64 * dt) / (111_111.0 * current_pos.latitude.cos());
             let alt_change = tracking_info.velocity.vz * dt as f32;
 
             current_pos.latitude += lat_change;
@@ -207,18 +212,18 @@ impl CollisionAvoidanceSystem {
 
     async fn assess_collision_risk(&mut self, drone_id: Uuid) -> Result<()> {
         let drone_ids: Vec<Uuid> = self.tracked_drones.keys().copied().collect();
-        
+
         for other_id in drone_ids {
             if other_id == drone_id {
                 continue;
             }
 
             let risk = self.calculate_collision_risk(drone_id, other_id).await?;
-            
+
             if let Some(tracking_info) = self.tracked_drones.get_mut(&drone_id) {
                 if risk > tracking_info.collision_risk_level {
                     tracking_info.collision_risk_level = risk.clone();
-                    
+
                     // Trigger avoidance maneuver if necessary
                     if risk >= RiskLevel::Medium {
                         self.plan_avoidance_maneuver(drone_id, other_id).await?;
@@ -230,10 +235,18 @@ impl CollisionAvoidanceSystem {
         Ok(())
     }
 
-    async fn calculate_collision_risk(&self, drone1_id: Uuid, drone2_id: Uuid) -> Result<RiskLevel> {
-        let drone1 = self.tracked_drones.get(&drone1_id)
+    async fn calculate_collision_risk(
+        &self,
+        drone1_id: Uuid,
+        drone2_id: Uuid,
+    ) -> Result<RiskLevel> {
+        let drone1 = self
+            .tracked_drones
+            .get(&drone1_id)
             .ok_or_else(|| anyhow::anyhow!("Drone 1 not found"))?;
-        let drone2 = self.tracked_drones.get(&drone2_id)
+        let drone2 = self
+            .tracked_drones
+            .get(&drone2_id)
             .ok_or_else(|| anyhow::anyhow!("Drone 2 not found"))?;
 
         // Calculate current distance
@@ -266,7 +279,11 @@ impl CollisionAvoidanceSystem {
         (horizontal_distance * horizontal_distance + altitude_diff * altitude_diff).sqrt()
     }
 
-    async fn check_trajectory_intersection(&self, drone1: &DroneTrackingInfo, drone2: &DroneTrackingInfo) -> bool {
+    async fn check_trajectory_intersection(
+        &self,
+        drone1: &DroneTrackingInfo,
+        drone2: &DroneTrackingInfo,
+    ) -> bool {
         for (i, pos1) in drone1.predicted_trajectory.iter().enumerate() {
             if let Some(pos2) = drone2.predicted_trajectory.get(i) {
                 let distance = self.calculate_3d_distance(pos1, pos2);
@@ -278,9 +295,15 @@ impl CollisionAvoidanceSystem {
         false
     }
 
-    async fn plan_avoidance_maneuver(&mut self, drone_id: Uuid, _conflicting_drone_id: Uuid) -> Result<()> {
+    async fn plan_avoidance_maneuver(
+        &mut self,
+        drone_id: Uuid,
+        _conflicting_drone_id: Uuid,
+    ) -> Result<()> {
         // Find appropriate avoidance rule
-        let applicable_rule = self.avoidance_rules.iter()
+        let applicable_rule = self
+            .avoidance_rules
+            .iter()
             .filter(|rule| rule.enabled)
             .min_by_key(|rule| rule.priority)
             .cloned();
@@ -308,40 +331,31 @@ impl CollisionAvoidanceSystem {
         if let Some(tracking_info) = self.tracked_drones.get(&drone_id) {
             if let Some(maneuver) = &tracking_info.avoidance_maneuver {
                 let command = match &maneuver.maneuver_type {
-                    ManeuverType::AltitudeChange { delta } => {
-                        AvoidanceCommand::ChangeAltitude {
-                            target_altitude: tracking_info.altitude + delta,
-                            urgency: self.risk_to_urgency(&tracking_info.collision_risk_level),
-                        }
-                    }
-                    ManeuverType::HorizontalDeviation { angle_deg, distance } => {
-                        AvoidanceCommand::HorizontalManeuver {
-                            heading_change: *angle_deg,
-                            distance: *distance,
-                            urgency: self.risk_to_urgency(&tracking_info.collision_risk_level),
-                        }
-                    }
-                    ManeuverType::SpeedReduction { factor } => {
-                        AvoidanceCommand::ChangeSpeed {
-                            speed_factor: *factor,
-                            urgency: self.risk_to_urgency(&tracking_info.collision_risk_level),
-                        }
-                    }
-                    ManeuverType::EmergencyStop => {
-                        AvoidanceCommand::EmergencyStop {
-                            reason: maneuver.reason.clone(),
-                        }
-                    }
-                    ManeuverType::ReturnToBase => {
-                        AvoidanceCommand::ReturnToBase {
-                            reason: maneuver.reason.clone(),
-                        }
-                    }
-                    ManeuverType::Hover => {
-                        AvoidanceCommand::Hover {
-                            duration: maneuver.estimated_duration,
-                        }
-                    }
+                    ManeuverType::AltitudeChange { delta } => AvoidanceCommand::ChangeAltitude {
+                        target_altitude: tracking_info.altitude + delta,
+                        urgency: self.risk_to_urgency(&tracking_info.collision_risk_level),
+                    },
+                    ManeuverType::HorizontalDeviation {
+                        angle_deg,
+                        distance,
+                    } => AvoidanceCommand::HorizontalManeuver {
+                        heading_change: *angle_deg,
+                        distance: *distance,
+                        urgency: self.risk_to_urgency(&tracking_info.collision_risk_level),
+                    },
+                    ManeuverType::SpeedReduction { factor } => AvoidanceCommand::ChangeSpeed {
+                        speed_factor: *factor,
+                        urgency: self.risk_to_urgency(&tracking_info.collision_risk_level),
+                    },
+                    ManeuverType::EmergencyStop => AvoidanceCommand::EmergencyStop {
+                        reason: maneuver.reason.clone(),
+                    },
+                    ManeuverType::ReturnToBase => AvoidanceCommand::ReturnToBase {
+                        reason: maneuver.reason.clone(),
+                    },
+                    ManeuverType::Hover => AvoidanceCommand::Hover {
+                        duration: maneuver.estimated_duration,
+                    },
                 };
 
                 return Ok(Some(command));
@@ -372,11 +386,15 @@ impl CollisionAvoidanceSystem {
 
     pub async fn get_system_status(&self) -> CollisionAvoidanceStatus {
         let total_drones = self.tracked_drones.len();
-        let drones_at_risk = self.tracked_drones.values()
+        let drones_at_risk = self
+            .tracked_drones
+            .values()
             .filter(|d| d.collision_risk_level >= RiskLevel::Medium)
             .count();
-        
-        let active_maneuvers = self.tracked_drones.values()
+
+        let active_maneuvers = self
+            .tracked_drones
+            .values()
             .filter(|d| d.avoidance_maneuver.is_some())
             .count();
 
@@ -384,7 +402,11 @@ impl CollisionAvoidanceSystem {
             total_tracked_drones: total_drones,
             drones_at_risk,
             active_maneuvers,
-            system_health: if drones_at_risk == 0 { 1.0 } else { 1.0 - (drones_at_risk as f32 / total_drones as f32) },
+            system_health: if drones_at_risk == 0 {
+                1.0
+            } else {
+                1.0 - (drones_at_risk as f32 / total_drones as f32)
+            },
             last_update: Utc::now(),
         }
     }
@@ -456,8 +478,14 @@ mod tests {
             altitude_m: 100.0,
         };
 
-        system.register_drone(drone1_id, pos1.clone()).await.unwrap();
-        system.register_drone(drone2_id, pos2.clone()).await.unwrap();
+        system
+            .register_drone(drone1_id, pos1.clone())
+            .await
+            .unwrap();
+        system
+            .register_drone(drone2_id, pos2.clone())
+            .await
+            .unwrap();
 
         let velocity = Velocity3D {
             vx: 5.0,
@@ -466,8 +494,14 @@ mod tests {
             speed: 5.0,
         };
 
-        system.update_drone_state(drone1_id, pos1, velocity.clone(), 0.0).await.unwrap();
-        system.update_drone_state(drone2_id, pos2, velocity, 180.0).await.unwrap();
+        system
+            .update_drone_state(drone1_id, pos1, velocity.clone(), 0.0)
+            .await
+            .unwrap();
+        system
+            .update_drone_state(drone2_id, pos2, velocity, 180.0)
+            .await
+            .unwrap();
 
         let status = system.get_system_status().await;
         assert_eq!(status.total_tracked_drones, 2);
@@ -476,19 +510,19 @@ mod tests {
     #[test]
     fn test_distance_calculation() {
         let system = CollisionAvoidanceSystem::new();
-        
+
         let pos1 = Position3D {
             latitude: 40.7128,
             longitude: -74.0060,
             altitude_m: 0.0,
         };
-        
+
         let pos2 = Position3D {
             latitude: 40.7129,
             longitude: -74.0061,
             altitude_m: 0.0,
         };
-        
+
         let distance = system.calculate_3d_distance(&pos1, &pos2);
         assert!((distance - 5.0).abs() < 0.1); // Should be 5m (3-4-5 triangle)
     }

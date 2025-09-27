@@ -8,7 +8,9 @@ pub const WGS84_B: f64 = WGS84_A * (1.0 - WGS84_F); // semi-minor axis
 pub const WGS84_E2: f64 = 1.0 - (WGS84_B * WGS84_B) / (WGS84_A * WGS84_A); // eccentricity squared
 
 #[inline]
-pub fn deg2rad(d: f64) -> f64 { d.to_radians() }
+pub fn deg2rad(d: f64) -> f64 {
+    d.to_radians()
+}
 
 // Latitude (deg), Longitude (deg), height (m) -> ECEF (m)
 pub fn lla_to_ecef(lat_deg: f64, lon_deg: f64, h_m: f64) -> Vector3<f64> {
@@ -59,7 +61,14 @@ impl LocalFrame {
 
         let r_t = r.transpose(); // ENU -> ECEF
 
-        Self { lat_deg, lon_deg, h_m, origin_ecef, ecef_to_enu: r, enu_to_ecef: r_t }
+        Self {
+            lat_deg,
+            lon_deg,
+            h_m,
+            origin_ecef,
+            ecef_to_enu: r,
+            enu_to_ecef: r_t,
+        }
     }
 
     pub fn ecef_to_enu_vec(&self, p_ecef: Vector3<f64>) -> Vector3<f64> {
@@ -94,7 +103,11 @@ fn log_camera_enu(camera_q: Query<&Transform, With<Camera3d>>) {
 
     if let Ok(t) = camera_q.get_single() {
         // Interpret world units as meters in local ENU for demo purposes
-        let enu = Vector3::new(t.translation.x as f64, t.translation.y as f64, t.translation.z as f64);
+        let enu = Vector3::new(
+            t.translation.x as f64,
+            t.translation.y as f64,
+            t.translation.z as f64,
+        );
         let ecef = origin.enu_to_ecef_vec(enu);
         let enu_rt = origin.ecef_to_enu_vec(ecef);
 
@@ -124,7 +137,10 @@ impl Default for GeoOrigin {
     fn default() -> Self {
         // Sensible default: Palo Alto area
         let frame = LocalFrame::new(37.427_5, -122.169_7, 30.0);
-        Self { frame, meters_per_unit: 1.0 }
+        Self {
+            frame,
+            meters_per_unit: 1.0,
+        }
     }
 }
 

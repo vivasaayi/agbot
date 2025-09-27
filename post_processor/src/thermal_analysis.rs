@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use uuid::Uuid;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Thermal imaging analysis and processing system
 pub struct ThermalAnalysisProcessor {
@@ -239,7 +239,10 @@ impl ThermalAnalysisProcessor {
         }
     }
 
-    pub async fn process_thermal_request(&mut self, request: ThermalAnalysisRequest) -> Result<ThermalAnalysisResult> {
+    pub async fn process_thermal_request(
+        &mut self,
+        request: ThermalAnalysisRequest,
+    ) -> Result<ThermalAnalysisResult> {
         let start_time = std::time::Instant::now();
 
         // Validate input
@@ -280,7 +283,11 @@ impl ThermalAnalysisProcessor {
         // Cache result
         self.thermal_cache.insert(request.id, result.clone());
 
-        tracing::info!("Processed thermal analysis for request {} in {}ms", request.id, processing_time);
+        tracing::info!(
+            "Processed thermal analysis for request {} in {}ms",
+            request.id,
+            processing_time
+        );
         Ok(result)
     }
 
@@ -382,16 +389,20 @@ impl ThermalAnalysisProcessor {
         let min_temperature = sorted_temps[0];
         let max_temperature = sorted_temps[sorted_temps.len() - 1];
 
-        let variance = temperature_map.iter()
+        let variance = temperature_map
+            .iter()
             .map(|t| (t - mean_temperature).powi(2))
-            .sum::<f32>() / temperature_map.len() as f32;
+            .sum::<f32>()
+            / temperature_map.len() as f32;
         let temperature_std_dev = variance.sqrt();
 
-        let hot_pixel_count = temperature_map.iter()
+        let hot_pixel_count = temperature_map
+            .iter()
             .filter(|&&t| t > self.config.thermal_threshold_high)
             .count() as u32;
 
-        let cold_pixel_count = temperature_map.iter()
+        let cold_pixel_count = temperature_map
+            .iter()
             .filter(|&&t| t < self.config.thermal_threshold_low)
             .count() as u32;
 
@@ -412,14 +423,17 @@ impl ThermalAnalysisProcessor {
     fn calculate_temperature_distribution(&self, temperatures: &[f32]) -> Vec<(f32, u32)> {
         let mut distribution = Vec::new();
         let min_temp = temperatures.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let max_temp = temperatures.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        
+        let max_temp = temperatures
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
         let bin_size = (max_temp - min_temp) / 20.0; // 20 bins
-        
+
         for i in 0..20 {
             let bin_start = min_temp + i as f32 * bin_size;
             let bin_end = bin_start + bin_size;
-            let count = temperatures.iter()
+            let count = temperatures
+                .iter()
                 .filter(|&&t| t >= bin_start && t < bin_end)
                 .count() as u32;
             distribution.push((bin_start, count));
@@ -428,7 +442,11 @@ impl ThermalAnalysisProcessor {
         distribution
     }
 
-    fn detect_hotspots(&self, temperature_map: &[f32], request: &ThermalAnalysisRequest) -> Result<Vec<ThermalHotspot>> {
+    fn detect_hotspots(
+        &self,
+        temperature_map: &[f32],
+        request: &ThermalAnalysisRequest,
+    ) -> Result<Vec<ThermalHotspot>> {
         let mut hotspots = Vec::new();
         let threshold = self.config.thermal_threshold_high;
         let width = request.image_width as usize;
@@ -441,7 +459,7 @@ impl ThermalAnalysisProcessor {
                     // Check if this is a local maximum
                     if self.is_local_maximum(temperature_map, x, y, width, height) {
                         let (lat, lon) = self.pixel_to_coordinates(x, y, request)?;
-                        
+
                         let hotspot = ThermalHotspot {
                             id: Uuid::new_v4(),
                             center_location: (lat, lon),
@@ -452,7 +470,7 @@ impl ThermalAnalysisProcessor {
                             confidence_level: 0.8, // TODO: Calculate based on surrounding temperatures
                             hotspot_type: self.classify_hotspot_type(temperature_map[idx]),
                         };
-                        
+
                         hotspots.push(hotspot);
                     }
                 }
@@ -462,17 +480,26 @@ impl ThermalAnalysisProcessor {
         Ok(hotspots)
     }
 
-    fn is_local_maximum(&self, temp_map: &[f32], x: usize, y: usize, width: usize, height: usize) -> bool {
+    fn is_local_maximum(
+        &self,
+        temp_map: &[f32],
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> bool {
         let idx = y * width + x;
         let center_temp = temp_map[idx];
 
         for dy in -1..=1 {
             for dx in -1..=1 {
-                if dx == 0 && dy == 0 { continue; }
-                
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+
                 let nx = x as i32 + dx;
                 let ny = y as i32 + dy;
-                
+
                 if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
                     let neighbor_idx = (ny as usize) * width + (nx as usize);
                     if temp_map[neighbor_idx] > center_temp {
@@ -494,7 +521,12 @@ impl ThermalAnalysisProcessor {
         }
     }
 
-    fn pixel_to_coordinates(&self, x: usize, y: usize, request: &ThermalAnalysisRequest) -> Result<(f64, f64)> {
+    fn pixel_to_coordinates(
+        &self,
+        x: usize,
+        y: usize,
+        request: &ThermalAnalysisRequest,
+    ) -> Result<(f64, f64)> {
         let geo = &request.georeference_info;
         let lat_range = geo.top_left_lat - geo.bottom_right_lat;
         let lon_range = geo.bottom_right_lon - geo.top_left_lon;
@@ -505,17 +537,22 @@ impl ThermalAnalysisProcessor {
         Ok((lat, lon))
     }
 
-    fn analyze_regions(&self, temperature_map: &[f32], request: &ThermalAnalysisRequest) -> Result<Vec<RegionAnalysis>> {
+    fn analyze_regions(
+        &self,
+        temperature_map: &[f32],
+        request: &ThermalAnalysisRequest,
+    ) -> Result<Vec<RegionAnalysis>> {
         let mut analyses = Vec::new();
 
         for region in &request.analysis_parameters.analysis_regions {
-            let region_temps = self.extract_region_temperatures(temperature_map, region, request)?;
-            
+            let region_temps =
+                self.extract_region_temperatures(temperature_map, region, request)?;
+
             if !region_temps.is_empty() {
                 let mean_temp = region_temps.iter().sum::<f32>() / region_temps.len() as f32;
                 let uniformity = self.calculate_temperature_uniformity(&region_temps);
                 let gradient = self.calculate_temperature_gradient(&region_temps);
-                
+
                 let analysis = RegionAnalysis {
                     region_id: region.id,
                     region_name: region.name.clone(),
@@ -523,9 +560,10 @@ impl ThermalAnalysisProcessor {
                     temperature_uniformity: uniformity,
                     temperature_gradient: gradient,
                     thermal_patterns: vec![], // TODO: Implement pattern detection
-                    health_indicators: self.generate_health_indicators(mean_temp, &region.region_type),
+                    health_indicators: self
+                        .generate_health_indicators(mean_temp, &region.region_type),
                 };
-                
+
                 analyses.push(analysis);
             }
         }
@@ -533,7 +571,12 @@ impl ThermalAnalysisProcessor {
         Ok(analyses)
     }
 
-    fn extract_region_temperatures(&self, temperature_map: &[f32], region: &AnalysisRegion, request: &ThermalAnalysisRequest) -> Result<Vec<f32>> {
+    fn extract_region_temperatures(
+        &self,
+        temperature_map: &[f32],
+        region: &AnalysisRegion,
+        request: &ThermalAnalysisRequest,
+    ) -> Result<Vec<f32>> {
         let mut region_temps = Vec::new();
         let width = request.image_width as usize;
 
@@ -591,9 +634,8 @@ impl ThermalAnalysisProcessor {
         }
 
         let mean = temperatures.iter().sum::<f32>() / temperatures.len() as f32;
-        let variance = temperatures.iter()
-            .map(|t| (t - mean).powi(2))
-            .sum::<f32>() / temperatures.len() as f32;
+        let variance = temperatures.iter().map(|t| (t - mean).powi(2)).sum::<f32>()
+            / temperatures.len() as f32;
         let std_dev = variance.sqrt();
 
         // Normalize uniformity score (lower std dev = higher uniformity)
@@ -605,7 +647,11 @@ impl ThermalAnalysisProcessor {
         0.0
     }
 
-    fn generate_health_indicators(&self, mean_temp: f32, region_type: &RegionType) -> Vec<HealthIndicator> {
+    fn generate_health_indicators(
+        &self,
+        mean_temp: f32,
+        region_type: &RegionType,
+    ) -> Vec<HealthIndicator> {
         let mut indicators = Vec::new();
 
         match region_type {
@@ -645,12 +691,20 @@ impl ThermalAnalysisProcessor {
         indicators
     }
 
-    fn detect_anomalies(&self, _temperature_map: &[f32], _request: &ThermalAnalysisRequest) -> Result<Vec<ThermalAnomaly>> {
+    fn detect_anomalies(
+        &self,
+        _temperature_map: &[f32],
+        _request: &ThermalAnalysisRequest,
+    ) -> Result<Vec<ThermalAnomaly>> {
         // TODO: Implement anomaly detection algorithms
         Ok(vec![])
     }
 
-    fn calculate_quality_score(&self, _request: &ThermalAnalysisRequest, _statistics: &ThermalStatistics) -> Result<f32> {
+    fn calculate_quality_score(
+        &self,
+        _request: &ThermalAnalysisRequest,
+        _statistics: &ThermalStatistics,
+    ) -> Result<f32> {
         // TODO: Implement quality scoring based on various factors
         Ok(0.85)
     }
@@ -660,22 +714,27 @@ impl ThermalAnalysisProcessor {
     }
 
     // Compatibility method for the post processor service
-    pub async fn analyze(&mut self, input_files: &[std::path::PathBuf], _parameters: &super::ProcessingParameters) -> anyhow::Result<super::AnalysisResult> {
-        use uuid::Uuid;
+    pub async fn analyze(
+        &mut self,
+        input_files: &[std::path::PathBuf],
+        _parameters: &super::ProcessingParameters,
+    ) -> anyhow::Result<super::AnalysisResult> {
         use chrono::Utc;
         use std::collections::HashMap;
-        
+        use uuid::Uuid;
+
         // Convert input files to strings
-        let _file_paths: Vec<String> = input_files.iter()
+        let _file_paths: Vec<String> = input_files
+            .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
-        
+
         // Create mock percentiles
         let mut percentiles = HashMap::new();
         percentiles.insert("25".to_string(), 22.5);
         percentiles.insert("50".to_string(), 25.0);
         percentiles.insert("75".to_string(), 27.5);
-        
+
         // Create a basic analysis result
         Ok(super::AnalysisResult {
             id: Uuid::new_v4(),

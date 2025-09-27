@@ -100,10 +100,24 @@ pub struct NdviResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WebSocketMessage {
-    Telemetry { data: Telemetry },
-    MissionStatus { mission_id: uuid::Uuid, status: String },
-    LidarUpdate { scan: LidarScan },
-    ImageCaptured { image: MultispectralImage },
-    NdviProcessed { result: NdviResult },
-    SystemStatus { status: String, message: String },
+    Telemetry {
+        data: Telemetry,
+    },
+    MissionStatus {
+        mission_id: uuid::Uuid,
+        status: String,
+    },
+    LidarUpdate {
+        scan: LidarScan,
+    },
+    ImageCaptured {
+        image: MultispectralImage,
+    },
+    NdviProcessed {
+        result: NdviResult,
+    },
+    SystemStatus {
+        status: String,
+        message: String,
+    },
 }

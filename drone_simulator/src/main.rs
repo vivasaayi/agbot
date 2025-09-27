@@ -1,13 +1,12 @@
-use clap::{Parser, Subcommand};
 use anyhow::Result;
-use tracing::{info, error};
-use tokio::time::{interval, Duration};
+use clap::{Parser, Subcommand};
 use std::sync::Arc;
+use tokio::time::{interval, Duration};
+use tracing::{error, info};
 
 use drone_simulator::{
-    SimulationEngine, Drone, DroneCapabilities, 
-    flight_controller::FlightCommand,
-    environment::EnvironmentConditions,
+    environment::EnvironmentConditions, flight_controller::FlightCommand, Drone, DroneCapabilities,
+    SimulationEngine,
 };
 
 #[derive(Parser)]
@@ -48,11 +47,15 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    
+
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Simulate { drones, duration_seconds, time_scale } => {
+        Commands::Simulate {
+            drones,
+            duration_seconds,
+            time_scale,
+        } => {
             run_simulation(drones, duration_seconds, time_scale).await?;
         }
         Commands::TestDrone { name } => {
@@ -70,11 +73,13 @@ async fn main() -> Result<()> {
 }
 
 async fn run_simulation(num_drones: u32, duration_seconds: u64, time_scale: f32) -> Result<()> {
-    info!("Starting simulation with {} drones for {} seconds ({}x speed)", 
-          num_drones, duration_seconds, time_scale);
+    info!(
+        "Starting simulation with {} drones for {} seconds ({}x speed)",
+        num_drones, duration_seconds, time_scale
+    );
 
     let engine = Arc::new(SimulationEngine::new());
-    
+
     // Set up environment with some weather conditions
     let _conditions = EnvironmentConditions {
         temperature_celsius: 22.0,
@@ -82,7 +87,7 @@ async fn run_simulation(num_drones: u32, duration_seconds: u64, time_scale: f32)
         visibility_m: 12000.0,
         ..Default::default()
     };
-    
+
     // Create drones
     let mut drone_ids = Vec::new();
     for i in 0..num_drones {
@@ -91,7 +96,7 @@ async fn run_simulation(num_drones: u32, duration_seconds: u64, time_scale: f32)
             max_altitude_m: 120.0,
             flight_time_minutes: 30,
             has_camera: true,
-            has_lidar: i % 2 == 0, // Every other drone has LiDAR
+            has_lidar: i % 2 == 0,         // Every other drone has LiDAR
             has_multispectral: i % 3 == 0, // Every third drone has multispectral
             ..Default::default()
         };
@@ -122,10 +127,18 @@ async fn run_simulation(num_drones: u32, duration_seconds: u64, time_scale: f32)
         async move {
             // Wait a bit then send takeoff commands
             tokio::time::sleep(Duration::from_secs(2)).await;
-            
+
             for (i, &id) in drone_ids.iter().enumerate() {
                 let altitude = 50.0 + (i as f32 * 10.0);
-                if let Err(e) = engine.send_command(&id, FlightCommand::Takeoff { altitude_m: altitude }).await {
+                if let Err(e) = engine
+                    .send_command(
+                        &id,
+                        FlightCommand::Takeoff {
+                            altitude_m: altitude,
+                        },
+                    )
+                    .await
+                {
                     error!("Failed to send takeoff command to drone {}: {}", id, e);
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -133,13 +146,22 @@ async fn run_simulation(num_drones: u32, duration_seconds: u64, time_scale: f32)
 
             // After takeoff, send some movement commands
             tokio::time::sleep(Duration::from_secs(5)).await;
-            
+
             for (i, &id) in drone_ids.iter().enumerate() {
                 let x = (i as f32 * 20.0) + 100.0;
                 let z = (i as f32 * 15.0) + 50.0;
-                if let Err(e) = engine.send_command(&id, FlightCommand::GoTo { 
-                    x, y: 100.0, z, speed_ms: 8.0 
-                }).await {
+                if let Err(e) = engine
+                    .send_command(
+                        &id,
+                        FlightCommand::GoTo {
+                            x,
+                            y: 100.0,
+                            z,
+                            speed_ms: 8.0,
+                        },
+                    )
+                    .await
+                {
                     error!("Failed to send goto command to drone {}: {}", id, e);
                 }
             }
@@ -157,13 +179,17 @@ async fn run_simulation(num_drones: u32, duration_seconds: u64, time_scale: f32)
         let drones = engine.list_drones().await;
         info!("Simulation status ({}s elapsed):", elapsed);
         for drone in drones {
-            info!("  {}: Position({:.1}, {:.1}, {:.1}) Battery({:.1}%) Status({:?})",
-                  drone.name,
-                  drone.position.x, drone.position.y, drone.position.z,
-                  drone.battery_level * 100.0,
-                  drone.status);
+            info!(
+                "  {}: Position({:.1}, {:.1}, {:.1}) Battery({:.1}%) Status({:?})",
+                drone.name,
+                drone.position.x,
+                drone.position.y,
+                drone.position.z,
+                drone.battery_level * 100.0,
+                drone.status
+            );
         }
-        
+
         let sim_time = engine.get_simulation_time().await;
         info!("  Simulation time: {}", sim_time.format("%H:%M:%S"));
     }
@@ -179,31 +205,72 @@ async fn test_single_drone(name: String) -> Result<()> {
     info!("Testing single drone: {}", name);
 
     let engine = SimulationEngine::new();
-    let drone = Drone::new(name.clone(), "TestQuad".to_string())
-        .with_position(0.0, 0.0, 0.0);
+    let drone = Drone::new(name.clone(), "TestQuad".to_string()).with_position(0.0, 0.0, 0.0);
 
     let id = engine.add_drone(drone).await?;
     engine.start_simulation().await?;
 
     // Test sequence
     info!("Starting test sequence for {}", name);
-    
+
     // Takeoff
-    engine.send_command(&id, FlightCommand::Takeoff { altitude_m: 50.0 }).await?;
+    engine
+        .send_command(&id, FlightCommand::Takeoff { altitude_m: 50.0 })
+        .await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Move around
-    engine.send_command(&id, FlightCommand::GoTo { x: 100.0, y: 50.0, z: 0.0, speed_ms: 10.0 }).await?;
+    engine
+        .send_command(
+            &id,
+            FlightCommand::GoTo {
+                x: 100.0,
+                y: 50.0,
+                z: 0.0,
+                speed_ms: 10.0,
+            },
+        )
+        .await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    engine.send_command(&id, FlightCommand::GoTo { x: 100.0, y: 50.0, z: 100.0, speed_ms: 10.0 }).await?;
+    engine
+        .send_command(
+            &id,
+            FlightCommand::GoTo {
+                x: 100.0,
+                y: 50.0,
+                z: 100.0,
+                speed_ms: 10.0,
+            },
+        )
+        .await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    engine.send_command(&id, FlightCommand::GoTo { x: 0.0, y: 50.0, z: 100.0, speed_ms: 10.0 }).await?;
+    engine
+        .send_command(
+            &id,
+            FlightCommand::GoTo {
+                x: 0.0,
+                y: 50.0,
+                z: 100.0,
+                speed_ms: 10.0,
+            },
+        )
+        .await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Return home and land
-    engine.send_command(&id, FlightCommand::GoTo { x: 0.0, y: 50.0, z: 0.0, speed_ms: 10.0 }).await?;
+    engine
+        .send_command(
+            &id,
+            FlightCommand::GoTo {
+                x: 0.0,
+                y: 50.0,
+                z: 0.0,
+                speed_ms: 10.0,
+            },
+        )
+        .await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     engine.send_command(&id, FlightCommand::Land).await?;
@@ -212,7 +279,10 @@ async fn test_single_drone(name: String) -> Result<()> {
     // Get final status
     if let Some(drone) = engine.get_drone(&id).await {
         info!("Test completed. Final status:");
-        info!("  Position: ({:.1}, {:.1}, {:.1})", drone.position.x, drone.position.y, drone.position.z);
+        info!(
+            "  Position: ({:.1}, {:.1}, {:.1})",
+            drone.position.x, drone.position.y, drone.position.z
+        );
         info!("  Battery: {:.1}%", drone.battery_level * 100.0);
         info!("  Status: {:?}", drone.status);
     }
@@ -228,7 +298,7 @@ async fn run_interactive_mode() -> Result<()> {
     let engine = SimulationEngine::new();
     let drone = Drone::new("InteractiveDrone".to_string(), "UserControlled".to_string());
     let id = engine.add_drone(drone).await?;
-    
+
     engine.start_simulation().await?;
 
     // Simple command loop (in a real implementation, you'd use a proper CLI library)
@@ -247,13 +317,32 @@ async fn run_interactive_mode() -> Result<()> {
         match parts[0].to_lowercase().as_str() {
             "takeoff" => {
                 let altitude = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(50.0);
-                engine.send_command(&id, FlightCommand::Takeoff { altitude_m: altitude }).await?;
+                engine
+                    .send_command(
+                        &id,
+                        FlightCommand::Takeoff {
+                            altitude_m: altitude,
+                        },
+                    )
+                    .await?;
                 println!("Taking off to {}m", altitude);
             }
             "goto" => {
                 if parts.len() >= 4 {
-                    if let (Ok(x), Ok(y), Ok(z)) = (parts[1].parse(), parts[2].parse(), parts[3].parse()) {
-                        engine.send_command(&id, FlightCommand::GoTo { x, y, z, speed_ms: 10.0 }).await?;
+                    if let (Ok(x), Ok(y), Ok(z)) =
+                        (parts[1].parse(), parts[2].parse(), parts[3].parse())
+                    {
+                        engine
+                            .send_command(
+                                &id,
+                                FlightCommand::GoTo {
+                                    x,
+                                    y,
+                                    z,
+                                    speed_ms: 10.0,
+                                },
+                            )
+                            .await?;
                         println!("Going to ({}, {}, {})", x, y, z);
                     }
                 }
@@ -264,14 +353,27 @@ async fn run_interactive_mode() -> Result<()> {
             }
             "hover" => {
                 let duration = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(10.0);
-                engine.send_command(&id, FlightCommand::Hover { duration_seconds: duration }).await?;
+                engine
+                    .send_command(
+                        &id,
+                        FlightCommand::Hover {
+                            duration_seconds: duration,
+                        },
+                    )
+                    .await?;
                 println!("Hovering for {}s", duration);
             }
             "status" => {
                 if let Some(drone) = engine.get_drone(&id).await {
                     println!("Drone Status:");
-                    println!("  Position: ({:.1}, {:.1}, {:.1})", drone.position.x, drone.position.y, drone.position.z);
-                    println!("  Velocity: ({:.1}, {:.1}, {:.1})", drone.velocity.x, drone.velocity.y, drone.velocity.z);
+                    println!(
+                        "  Position: ({:.1}, {:.1}, {:.1})",
+                        drone.position.x, drone.position.y, drone.position.z
+                    );
+                    println!(
+                        "  Velocity: ({:.1}, {:.1}, {:.1})",
+                        drone.velocity.x, drone.velocity.y, drone.velocity.z
+                    );
                     println!("  Battery: {:.1}%", drone.battery_level * 100.0);
                     println!("  Status: {:?}", drone.status);
                 }

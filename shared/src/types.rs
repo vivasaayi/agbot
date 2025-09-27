@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use nalgebra::Vector3;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Common coordinate system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,15 +379,16 @@ impl Validate for Mission {
         if self.waypoints.is_empty() {
             return Err("Mission must have at least one waypoint".to_string());
         }
-        
+
         for waypoint in &self.waypoints {
             waypoint.position.validate()?;
         }
-        
-        if self.flight_parameters.max_speed_ms <= 0.0 || self.flight_parameters.max_speed_ms > 50.0 {
+
+        if self.flight_parameters.max_speed_ms <= 0.0 || self.flight_parameters.max_speed_ms > 50.0
+        {
             return Err("Max speed must be between 0 and 50 m/s".to_string());
         }
-        
+
         Ok(())
     }
 }
@@ -404,7 +405,7 @@ pub mod utils {
         let hours = (seconds / 3600.0) as u32;
         let minutes = ((seconds % 3600.0) / 60.0) as u32;
         let secs = (seconds % 60.0) as u32;
-        
+
         if hours > 0 {
             format!("{}h {}m {}s", hours, minutes, secs)
         } else if minutes > 0 {

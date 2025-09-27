@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentConditions {
@@ -11,7 +11,7 @@ pub struct EnvironmentConditions {
     pub visibility_m: f32,
     pub precipitation_mm: f32,
     pub cloud_cover_percent: f32,
-    pub air_density: f32, // kg/m³
+    pub air_density: f32,      // kg/m³
     pub solar_irradiance: f32, // W/m²
 }
 
@@ -66,7 +66,7 @@ impl Environment {
         // Wind speed typically increases with altitude
         let altitude_factor = (altitude / 100.0).min(2.0); // Cap at 2x at 100m
         let effective_wind_speed = self.conditions.wind_speed_ms * (1.0 + altitude_factor * 0.5);
-        
+
         (effective_wind_speed, self.conditions.wind_direction_rad)
     }
 
@@ -77,22 +77,22 @@ impl Environment {
         } else {
             1.1 // Cap improvement
         };
-        
+
         self.conditions.visibility_m * altitude_factor
     }
 
     pub fn simulate_weather_change(&mut self) {
         let mut rng = rand::thread_rng();
-        
+
         // Small random changes to simulate dynamic weather
         self.conditions.wind_speed_ms += rng.gen_range(-0.5..0.5);
         self.conditions.wind_speed_ms = self.conditions.wind_speed_ms.max(0.0);
-        
+
         self.conditions.wind_direction_rad += rng.gen_range(-0.1..0.1);
-        
+
         self.conditions.visibility_m += rng.gen_range(-100.0..100.0);
         self.conditions.visibility_m = self.conditions.visibility_m.clamp(100.0, 20000.0);
-        
+
         self.conditions.cloud_cover_percent += rng.gen_range(-2.0..2.0);
         self.conditions.cloud_cover_percent = self.conditions.cloud_cover_percent.clamp(0.0, 100.0);
     }
@@ -100,23 +100,23 @@ impl Environment {
     fn generate_terrain(width: usize, height: usize) -> Vec<Vec<f32>> {
         let mut terrain = vec![vec![0.0; height]; width];
         let mut rng = rand::thread_rng();
-        
+
         // Generate simple random terrain
         for i in 0..width {
             for j in 0..height {
                 // Create some hills and valleys
                 let x = i as f32 / width as f32;
                 let y = j as f32 / height as f32;
-                
-                let height_value = 
-                    20.0 * (x * 2.0 * std::f32::consts::PI).sin() * 
-                    (y * 2.0 * std::f32::consts::PI).cos() +
-                    10.0 * rng.gen_range(-1.0..1.0);
-                
+
+                let height_value = 20.0
+                    * (x * 2.0 * std::f32::consts::PI).sin()
+                    * (y * 2.0 * std::f32::consts::PI).cos()
+                    + 10.0 * rng.gen_range(-1.0..1.0);
+
                 terrain[i][j] = height_value.max(0.0);
             }
         }
-        
+
         terrain
     }
 
@@ -145,7 +145,7 @@ impl Default for EnvironmentConditions {
             visibility_m: 10000.0,
             precipitation_mm: 0.0,
             cloud_cover_percent: 25.0,
-            air_density: 1.225, // kg/m³ at sea level
+            air_density: 1.225,       // kg/m³ at sea level
             solar_irradiance: 1000.0, // W/m² clear day
         }
     }

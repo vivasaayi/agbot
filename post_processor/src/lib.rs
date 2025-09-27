@@ -1,19 +1,19 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
-pub mod ndvi_analysis;
 pub mod lidar_analysis;
-pub mod thermal_analysis;
+pub mod ndvi_analysis;
 pub mod report_generator;
+pub mod thermal_analysis;
 
-pub use ndvi_analysis::{NdviAnalysisProcessor, NdviAnalysisConfig};
-pub use lidar_analysis::{LidarAnalysisProcessor, LidarAnalysisConfig};
-pub use thermal_analysis::{ThermalAnalysisProcessor, ThermalAnalysisConfig};
+pub use lidar_analysis::{LidarAnalysisConfig, LidarAnalysisProcessor};
+pub use ndvi_analysis::{NdviAnalysisConfig, NdviAnalysisProcessor};
 pub use report_generator::ReportGenerator;
+pub use thermal_analysis::{ThermalAnalysisConfig, ThermalAnalysisProcessor};
 
 /// Post-processing pipeline for agricultural drone data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,7 +213,10 @@ impl PostProcessorService {
             lidar_analyzer: LidarAnalysisProcessor::new(LidarAnalysisConfig::default()),
             thermal_analyzer: ThermalAnalysisProcessor::new(ThermalAnalysisConfig::default()),
             report_generator: ReportGenerator::new(report_generator::ReportConfig {
-                output_formats: vec![report_generator::OutputFormat::PDF, report_generator::OutputFormat::HTML],
+                output_formats: vec![
+                    report_generator::OutputFormat::PDF,
+                    report_generator::OutputFormat::HTML,
+                ],
                 default_template: "agricultural_comprehensive".to_string(),
                 include_raw_data: true,
                 include_visualizations: true,
@@ -237,11 +240,10 @@ impl PostProcessorService {
 
         let job_id = job.id;
         self.job_queue.push(job);
-        
+
         // Sort by priority and creation time
-        self.job_queue.sort_by(|a, b| {
-            a.created_at.cmp(&b.created_at)
-        });
+        self.job_queue
+            .sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
         tracing::info!("Submitted processing job: {}", job_id);
         Ok(job_id)
@@ -280,26 +282,24 @@ impl PostProcessorService {
     async fn process_job(&mut self, job: &ProcessingJob) -> Result<AnalysisResult> {
         match job.job_type {
             JobType::NdviAnalysis => {
-                self.ndvi_analyzer.analyze(&job.input_files, &job.parameters).await
+                self.ndvi_analyzer
+                    .analyze(&job.input_files, &job.parameters)
+                    .await
             }
             JobType::LidarProcessing => {
-                self.lidar_analyzer.analyze(&job.input_files, &job.parameters).await
+                self.lidar_analyzer
+                    .analyze(&job.input_files, &job.parameters)
+                    .await
             }
             JobType::ThermalAnalysis => {
-                self.thermal_analyzer.analyze(&job.input_files, &job.parameters).await
+                self.thermal_analyzer
+                    .analyze(&job.input_files, &job.parameters)
+                    .await
             }
-            JobType::MultiSpectralAnalysis => {
-                self.process_multispectral(job).await
-            }
-            JobType::CompositeReport => {
-                self.generate_composite_report(job).await
-            }
-            JobType::HealthAssessment => {
-                self.assess_crop_health(job).await
-            }
-            JobType::YieldPrediction => {
-                self.predict_yield(job).await
-            }
+            JobType::MultiSpectralAnalysis => self.process_multispectral(job).await,
+            JobType::CompositeReport => self.generate_composite_report(job).await,
+            JobType::HealthAssessment => self.assess_crop_health(job).await,
+            JobType::YieldPrediction => self.predict_yield(job).await,
         }
     }
 
@@ -321,7 +321,7 @@ impl PostProcessorService {
             recommendations: Vec::new(),
             created_at: Utc::now(),
         };
-        
+
         Ok(result)
     }
 
@@ -330,7 +330,7 @@ impl PostProcessorService {
         let mut analysis_zones = Vec::new();
         let mut visualizations = Vec::new();
         let mut recommendations = Vec::new();
-        
+
         // Create analysis zones based on job parameters
         analysis_zones.push(AnalysisZone {
             id: "composite_analysis".to_string(),
@@ -343,17 +343,21 @@ impl PostProcessorService {
             ]),
             classification: Some("Healthy Vegetation".to_string()),
         });
-        
+
         recommendations.push(Recommendation {
             category: RecommendationCategory::Irrigation,
             priority: Priority::Medium,
             title: "Composite Analysis Complete".to_string(),
-            description: "Multi-sensor data integration has been completed successfully".to_string(),
-            action_items: vec!["Review NDVI results".to_string(), "Check thermal anomalies".to_string()],
+            description: "Multi-sensor data integration has been completed successfully"
+                .to_string(),
+            action_items: vec![
+                "Review NDVI results".to_string(),
+                "Check thermal anomalies".to_string(),
+            ],
             affected_areas: analysis_zones.clone(),
             confidence_score: 0.92,
         });
-        
+
         Ok(AnalysisResult {
             id: Uuid::new_v4(),
             job_id: job.id,
@@ -388,31 +392,34 @@ impl PostProcessorService {
     async fn assess_crop_health(&self, job: &ProcessingJob) -> Result<AnalysisResult> {
         // Combine NDVI, thermal, and multispectral data for health assessment
         let mut health_zones = Vec::new();
-        
+
         // Create sample health zones
         health_zones.push(AnalysisZone {
             id: "zone_1".to_string(),
             boundary: vec![(0.0, 0.0), (50.0, 0.0), (50.0, 50.0), (0.0, 50.0)],
             area_m2: 2500.0,
-            values: [("health_score".to_string(), 0.85), ("stress_level".to_string(), 0.15)]
-                .iter().cloned().collect(),
+            values: [
+                ("health_score".to_string(), 0.85),
+                ("stress_level".to_string(), 0.15),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
             classification: Some("Healthy".to_string()),
         });
 
-        let recommendations = vec![
-            Recommendation {
-                category: RecommendationCategory::Irrigation,
-                priority: Priority::Medium,
-                title: "Increase irrigation in southwestern area".to_string(),
-                description: "NDVI values indicate water stress in zones 3-5".to_string(),
-                action_items: vec![
-                    "Increase irrigation frequency to 3x per week".to_string(),
-                    "Monitor soil moisture levels".to_string(),
-                ],
-                affected_areas: health_zones.clone(),
-                confidence_score: 0.78,
-            }
-        ];
+        let recommendations = vec![Recommendation {
+            category: RecommendationCategory::Irrigation,
+            priority: Priority::Medium,
+            title: "Increase irrigation in southwestern area".to_string(),
+            description: "NDVI values indicate water stress in zones 3-5".to_string(),
+            action_items: vec![
+                "Increase irrigation frequency to 3x per week".to_string(),
+                "Monitor soil moisture levels".to_string(),
+            ],
+            affected_areas: health_zones.clone(),
+            confidence_score: 0.78,
+        }];
 
         let result = AnalysisResult {
             id: Uuid::new_v4(),
@@ -421,7 +428,9 @@ impl PostProcessorService {
             data: ResultData::ZonalData {
                 zones: health_zones,
                 aggregated_values: [("overall_health".to_string(), 0.82)]
-                    .iter().cloned().collect(),
+                    .iter()
+                    .cloned()
+                    .collect(),
             },
             statistics: AnalysisStatistics::default(),
             visualizations: Vec::new(),
@@ -450,8 +459,14 @@ impl PostProcessorService {
                 max_value: 5.8,
                 mean_value: 4.2,
                 std_deviation: 0.8,
-                percentiles: [("25".to_string(), 3.6), ("50".to_string(), 4.2), ("75".to_string(), 4.9)]
-                    .iter().cloned().collect(),
+                percentiles: [
+                    ("25".to_string(), 3.6),
+                    ("50".to_string(), 4.2),
+                    ("75".to_string(), 4.9),
+                ]
+                .iter()
+                .cloned()
+                .collect(),
                 coverage_area_m2: 250000.0,
                 valid_pixel_count: 2500,
                 total_pixel_count: 2500,
@@ -469,7 +484,7 @@ impl PostProcessorService {
         if let Some(job) = self.job_queue.iter().find(|j| j.id == *job_id) {
             return Some(job);
         }
-        
+
         // Check completed jobs
         self.completed_jobs.get(job_id)
     }
@@ -505,9 +520,8 @@ impl PostProcessorService {
         });
 
         // Remove old results
-        self.results_cache.retain(|_, result| {
-            result.created_at > cutoff_date
-        });
+        self.results_cache
+            .retain(|_, result| result.created_at > cutoff_date);
 
         tracing::info!("Cleaned up {} old processing jobs", removed_count);
         Ok(removed_count)
@@ -558,7 +572,7 @@ mod tests {
     async fn test_job_submission() {
         let temp_dir = tempdir().unwrap();
         let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
-        
+
         let job = ProcessingJob {
             id: Uuid::new_v4(),
             job_type: JobType::NdviAnalysis,

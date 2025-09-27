@@ -1,24 +1,24 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use geo::{Point, Polygon};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
-use geo::{Point, Polygon};
 
-pub mod waypoint;
-pub mod flight_path;
-pub mod mission_optimizer;
-pub mod weather_integration;
-pub mod mavlink_integration;
-pub mod websocket_handler;
-pub mod database;
 pub mod api;
+pub mod database;
+pub mod flight_path;
+pub mod mavlink_integration;
+pub mod mission_optimizer;
+pub mod waypoint;
+pub mod weather_integration;
+pub mod websocket_handler;
 
-pub use waypoint::{Waypoint, WaypointType, Action};
+pub use api::MissionApi;
+pub use database::{DatabaseService, MissionStats};
 pub use flight_path::{FlightPath, PathSegment};
 pub use mission_optimizer::MissionOptimizer;
-pub use database::{DatabaseService, MissionStats};
-pub use api::MissionApi;
+pub use waypoint::{Action, Waypoint, WaypointType};
 
 /// Core mission planning structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,13 +77,13 @@ impl Mission {
     pub fn optimize(&mut self) -> Result<()> {
         let optimizer = MissionOptimizer::new();
         let optimized = optimizer.optimize_mission(self)?;
-        
+
         self.waypoints = optimized.waypoints;
         self.flight_paths = optimized.flight_paths;
         self.estimated_duration_minutes = optimized.estimated_duration_minutes;
         self.estimated_battery_usage = optimized.estimated_battery_usage;
         self.updated_at = Utc::now();
-        
+
         Ok(())
     }
 }
@@ -133,7 +133,11 @@ impl MissionPlannerService {
     }
 
     /// List missions with pagination
-    pub async fn list_missions(&self, limit: Option<i64>, offset: Option<i64>) -> Result<Vec<Mission>> {
+    pub async fn list_missions(
+        &self,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<Mission>> {
         self.db.list_missions(limit, offset).await
     }
 
@@ -161,7 +165,7 @@ impl MissionPlannerService {
         waypoints: Vec<Waypoint>,
     ) -> Result<Uuid> {
         let mut mission = Mission::new(name, description, area);
-        
+
         // Add waypoints
         for waypoint in waypoints {
             mission.add_waypoint(waypoint);
@@ -189,13 +193,13 @@ mod tests {
             (x: 0.0, y: 1.0),
             (x: 0.0, y: 0.0),
         ];
-        
+
         let mission = Mission::new(
             "Test Mission".to_string(),
             "A test mission".to_string(),
             area,
         );
-        
+
         assert_eq!(mission.name, "Test Mission");
         assert_eq!(mission.description, "A test mission");
         assert!(mission.waypoints.is_empty());
@@ -205,11 +209,12 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires PostgreSQL database
     async fn test_mission_service() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:password@localhost:5432/agbot_test".to_string());
-        
+        let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:password@localhost:5432/agbot_test".to_string()
+        });
+
         let service = MissionPlannerService::new(&database_url).await.unwrap();
-        
+
         let area = polygon![
             (x: 0.0, y: 0.0),
             (x: 1.0, y: 0.0),
@@ -217,16 +222,16 @@ mod tests {
             (x: 0.0, y: 1.0),
             (x: 0.0, y: 0.0),
         ];
-        
+
         let mission = Mission::new(
             "Test Mission".to_string(),
             "A test mission".to_string(),
             area,
         );
-        
+
         let id = service.create_mission(mission).await.unwrap();
         let retrieved = service.get_mission(&id).await.unwrap().unwrap();
-        
+
         assert_eq!(retrieved.name, "Test Mission");
     }
 }

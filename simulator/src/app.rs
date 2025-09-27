@@ -4,23 +4,29 @@ use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use bevy_rapier3d::prelude::*;
 
 use crate::camera::CameraPlugin;
-use crate::communication::{CommunicationPlugin, CommunicationChannels};
+use crate::communication::{CommunicationChannels, CommunicationPlugin};
 use crate::drone_controller::DroneControllerPlugin;
+use crate::map_loader::MapLoaderPlugin;
 // use crate::hud::HudPlugin;
+use crate::ground_vehicle::GroundVehiclePlugin;
 use crate::lidar_controls::LidarControlsPlugin;
 use crate::lidar_simulator::LidarSimulatorPlugin;
 use crate::resources::{AppConfig, AppState, DroneRegistry, MissionData, TerrainData};
 use crate::systems::*;
 use crate::terrain::TerrainPlugin;
 // use crate::flight_ui::FlightUIPlugin;
-use crate::overlays::ndvi::NdviOverlayPlugin;
 use crate::autopilot::waypoint::WaypointAutopilotPlugin;
 use crate::geodesy::{GeoOrigin, NavigateToGeo};
+use crate::overlays::ndvi::NdviOverlayPlugin;
 
 pub struct VisualizerApp;
 
 impl VisualizerApp {
-    pub fn configure(app: &mut App, config: AppConfig, communication_channels: CommunicationChannels) {
+    pub fn configure(
+        app: &mut App,
+        config: AppConfig,
+        communication_channels: CommunicationChannels,
+    ) {
         app
             // Bevy plugins
             .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -32,17 +38,17 @@ impl VisualizerApp {
                 }),
                 ..default()
             }))
-            
             // External plugins
             .add_plugins(EguiPlugin)
             .add_plugins(WorldInspectorPlugin::new())
             .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
             .add_plugins(RapierDebugRenderPlugin::default())
-            
             // Custom plugins
             .add_plugins(CameraPlugin)
             .add_plugins(TerrainPlugin)
+            .add_plugins(MapLoaderPlugin)
             .add_plugins(DroneControllerPlugin)
+            .add_plugins(GroundVehiclePlugin)
             .add_plugins(LidarSimulatorPlugin)
             .add_plugins(LidarControlsPlugin)
             .add_plugins(CommunicationPlugin)
@@ -50,7 +56,6 @@ impl VisualizerApp {
             // .add_plugins(FlightUIPlugin)     // Disabled to reduce UI clutter
             .add_plugins(NdviOverlayPlugin)
             .add_plugins(WaypointAutopilotPlugin)
-            
             // Resources
             .insert_resource(config)
             .insert_resource(communication_channels)
@@ -61,14 +66,12 @@ impl VisualizerApp {
             // Geodesy resources/events are initialized by the plugin, but we can set scale if needed
             .insert_resource(GeoOrigin::default())
             .add_event::<NavigateToGeo>()
-            
             // Systems
             .add_systems(Startup, setup_scene)
-            .add_systems(Update, (
-                handle_keyboard_input,
-                update_time,
-                update_app_state,
-            ));
+            .add_systems(
+                Update,
+                (handle_keyboard_input, update_time, update_app_state),
+            );
     }
 }
 
@@ -91,8 +94,7 @@ fn setup_scene(
             shadows_enabled: true,
             ..default()
         },
-        transform: Transform::from_xyz(10.0, 100.0, 10.0)
-            .looking_at(Vec3::ZERO, Vec3::Y),
+        transform: Transform::from_xyz(10.0, 100.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
         ..default()
     });
 
@@ -120,12 +122,12 @@ fn spawn_test_obstacles(
     materials: &mut ResMut<Assets<StandardMaterial>>,
 ) {
     use std::f32::consts::PI;
-    
+
     // Spawn some cubes as obstacles
     for i in 0..5 {
         let x = (i as f32 - 2.0) * 10.0;
         let height = 2.0 + i as f32;
-        
+
         commands.spawn((
             PbrBundle {
                 mesh: meshes.add(Cuboid::new(2.0, height, 2.0)),
@@ -140,14 +142,14 @@ fn spawn_test_obstacles(
             Collider::cuboid(1.0, height / 2.0, 1.0),
         ));
     }
-    
+
     // Add some trees (cylinders)
     for i in 0..3 {
         let angle = i as f32 * 2.0 * PI / 3.0;
         let radius = 25.0;
         let x = angle.cos() * radius;
         let z = angle.sin() * radius;
-        
+
         commands.spawn((
             PbrBundle {
                 mesh: meshes.add(Cylinder::new(1.0, 8.0)),

@@ -1,18 +1,11 @@
 use anyhow::Result;
-use axum::{
-    Router,
-    routing::get,
-    response::Json,
-};
+use axum::{response::Json, routing::get, Router};
 use std::sync::Arc;
 use tower::ServiceBuilder;
-use tower_http::{
-    cors::CorsLayer,
-    trace::TraceLayer,
-};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use mission_planner::{MissionPlannerService, MissionApi};
+use mission_planner::{MissionApi, MissionPlannerService};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,7 +35,7 @@ async fn main() -> Result<()> {
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
-                .layer(CorsLayer::permissive())
+                .layer(CorsLayer::permissive()),
         );
 
     // Start the server
@@ -51,9 +44,12 @@ async fn main() -> Result<()> {
         .parse::<u16>()?;
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    
+
     tracing::info!("Mission Planner API server starting on port {}", port);
-    tracing::info!("Health check available at: http://localhost:{}/health", port);
+    tracing::info!(
+        "Health check available at: http://localhost:{}/health",
+        port
+    );
     tracing::info!("API documentation:");
     tracing::info!("  POST   /api/v1/missions          - Create mission");
     tracing::info!("  GET    /api/v1/missions          - List missions");

@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use uuid::Uuid;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
 use shared::{GeoCoordinate, Mission};
+use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Multi-drone coordination system
 pub struct CoordinationEngine {
@@ -82,18 +82,20 @@ pub enum RuleCondition {
 impl Clone for RuleCondition {
     fn clone(&self) -> Self {
         match self {
-            RuleCondition::ProximityAlert { distance_threshold } => {
-                RuleCondition::ProximityAlert { distance_threshold: *distance_threshold }
-            }
-            RuleCondition::BatteryLow { threshold } => {
-                RuleCondition::BatteryLow { threshold: *threshold }
-            }
+            RuleCondition::ProximityAlert { distance_threshold } => RuleCondition::ProximityAlert {
+                distance_threshold: *distance_threshold,
+            },
+            RuleCondition::BatteryLow { threshold } => RuleCondition::BatteryLow {
+                threshold: *threshold,
+            },
             RuleCondition::CommunicationLoss { timeout_seconds } => {
-                RuleCondition::CommunicationLoss { timeout_seconds: *timeout_seconds }
+                RuleCondition::CommunicationLoss {
+                    timeout_seconds: *timeout_seconds,
+                }
             }
-            RuleCondition::WeatherCondition { condition } => {
-                RuleCondition::WeatherCondition { condition: condition.clone() }
-            }
+            RuleCondition::WeatherCondition { condition } => RuleCondition::WeatherCondition {
+                condition: condition.clone(),
+            },
             RuleCondition::Custom(_) => {
                 // Cannot clone functions, so create a dummy one
                 RuleCondition::Custom(Box::new(|_| false))
@@ -105,21 +107,26 @@ impl Clone for RuleCondition {
 impl std::fmt::Debug for RuleCondition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RuleCondition::ProximityAlert { distance_threshold } => {
-                f.debug_struct("ProximityAlert").field("distance_threshold", distance_threshold).finish()
-            }
-            RuleCondition::BatteryLow { threshold } => {
-                f.debug_struct("BatteryLow").field("threshold", threshold).finish()
-            }
-            RuleCondition::CommunicationLoss { timeout_seconds } => {
-                f.debug_struct("CommunicationLoss").field("timeout_seconds", timeout_seconds).finish()
-            }
-            RuleCondition::WeatherCondition { condition } => {
-                f.debug_struct("WeatherCondition").field("condition", condition).finish()
-            }
-            RuleCondition::Custom(_) => {
-                f.debug_struct("Custom").field("function", &"<closure>").finish()
-            }
+            RuleCondition::ProximityAlert { distance_threshold } => f
+                .debug_struct("ProximityAlert")
+                .field("distance_threshold", distance_threshold)
+                .finish(),
+            RuleCondition::BatteryLow { threshold } => f
+                .debug_struct("BatteryLow")
+                .field("threshold", threshold)
+                .finish(),
+            RuleCondition::CommunicationLoss { timeout_seconds } => f
+                .debug_struct("CommunicationLoss")
+                .field("timeout_seconds", timeout_seconds)
+                .finish(),
+            RuleCondition::WeatherCondition { condition } => f
+                .debug_struct("WeatherCondition")
+                .field("condition", condition)
+                .finish(),
+            RuleCondition::Custom(_) => f
+                .debug_struct("Custom")
+                .field("function", &"<closure>")
+                .finish(),
         }
     }
 }
@@ -141,12 +148,12 @@ impl Clone for RuleAction {
             RuleAction::ChangeAltitude { delta } => RuleAction::ChangeAltitude { delta: *delta },
             RuleAction::ReturnToBase => RuleAction::ReturnToBase,
             RuleAction::LandImmediate => RuleAction::LandImmediate,
-            RuleAction::FormFormation { formation_type } => {
-                RuleAction::FormFormation { formation_type: formation_type.clone() }
-            }
-            RuleAction::SendAlert { message } => {
-                RuleAction::SendAlert { message: message.clone() }
-            }
+            RuleAction::FormFormation { formation_type } => RuleAction::FormFormation {
+                formation_type: formation_type.clone(),
+            },
+            RuleAction::SendAlert { message } => RuleAction::SendAlert {
+                message: message.clone(),
+            },
             RuleAction::Custom(_) => {
                 // Cannot clone functions, so create a dummy one
                 RuleAction::Custom(Box::new(|_| {}))
@@ -158,23 +165,28 @@ impl Clone for RuleAction {
 impl std::fmt::Debug for RuleAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RuleAction::ChangeSpeed { factor } => {
-                f.debug_struct("ChangeSpeed").field("factor", factor).finish()
-            }
-            RuleAction::ChangeAltitude { delta } => {
-                f.debug_struct("ChangeAltitude").field("delta", delta).finish()
-            }
+            RuleAction::ChangeSpeed { factor } => f
+                .debug_struct("ChangeSpeed")
+                .field("factor", factor)
+                .finish(),
+            RuleAction::ChangeAltitude { delta } => f
+                .debug_struct("ChangeAltitude")
+                .field("delta", delta)
+                .finish(),
             RuleAction::ReturnToBase => f.debug_struct("ReturnToBase").finish(),
             RuleAction::LandImmediate => f.debug_struct("LandImmediate").finish(),
-            RuleAction::FormFormation { formation_type } => {
-                f.debug_struct("FormFormation").field("formation_type", formation_type).finish()
-            }
-            RuleAction::SendAlert { message } => {
-                f.debug_struct("SendAlert").field("message", message).finish()
-            }
-            RuleAction::Custom(_) => {
-                f.debug_struct("Custom").field("function", &"<closure>").finish()
-            }
+            RuleAction::FormFormation { formation_type } => f
+                .debug_struct("FormFormation")
+                .field("formation_type", formation_type)
+                .finish(),
+            RuleAction::SendAlert { message } => f
+                .debug_struct("SendAlert")
+                .field("message", message)
+                .finish(),
+            RuleAction::Custom(_) => f
+                .debug_struct("Custom")
+                .field("function", &"<closure>")
+                .finish(),
         }
     }
 }
@@ -195,7 +207,9 @@ impl CoordinationEngine {
                 id: Uuid::new_v4(),
                 name: "Collision Avoidance".to_string(),
                 priority: 1,
-                condition: RuleCondition::ProximityAlert { distance_threshold: 50.0 },
+                condition: RuleCondition::ProximityAlert {
+                    distance_threshold: 50.0,
+                },
                 action: RuleAction::ChangeAltitude { delta: 10.0 },
                 enabled: true,
             },
@@ -211,14 +225,20 @@ impl CoordinationEngine {
                 id: Uuid::new_v4(),
                 name: "Communication Loss".to_string(),
                 priority: 1,
-                condition: RuleCondition::CommunicationLoss { timeout_seconds: 30 },
+                condition: RuleCondition::CommunicationLoss {
+                    timeout_seconds: 30,
+                },
                 action: RuleAction::LandImmediate,
                 enabled: true,
             },
         ]
     }
 
-    pub async fn register_drone(&mut self, drone_id: Uuid, initial_state: DroneState) -> Result<()> {
+    pub async fn register_drone(
+        &mut self,
+        drone_id: Uuid,
+        initial_state: DroneState,
+    ) -> Result<()> {
         self.active_drones.insert(drone_id, initial_state);
         tracing::info!("Registered drone {} for coordination", drone_id);
         Ok(())
@@ -233,7 +253,7 @@ impl CoordinationEngine {
     pub async fn update_drone_state(&mut self, drone_id: Uuid, state: DroneState) -> Result<()> {
         if let Some(existing_state) = self.active_drones.get_mut(&drone_id) {
             *existing_state = state;
-            
+
             // Check coordination rules
             self.evaluate_rules(drone_id).await?;
         } else {
@@ -244,7 +264,7 @@ impl CoordinationEngine {
 
     pub async fn evaluate_rules(&self, _drone_id: Uuid) -> Result<()> {
         let states: Vec<&DroneState> = self.active_drones.values().collect();
-        
+
         for rule in &self.coordination_rules {
             if !rule.enabled {
                 continue;
@@ -299,8 +319,8 @@ impl CoordinationEngine {
         let delta_lat = (pos2.latitude - pos1.latitude).to_radians();
         let delta_lon = (pos2.longitude - pos1.longitude).to_radians();
 
-        let a = (delta_lat / 2.0).sin().powi(2) +
-            lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
+        let a = (delta_lat / 2.0).sin().powi(2)
+            + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
         let c = 2.0_f64 * a.sqrt().atan2((1.0 - a).sqrt());
 
         6371000.0 * c // Earth radius in meters
@@ -308,14 +328,18 @@ impl CoordinationEngine {
 
     pub async fn get_coordination_status(&self) -> CoordinationStatus {
         let total_drones = self.active_drones.len();
-        let active_drones = self.active_drones.values()
+        let active_drones = self
+            .active_drones
+            .values()
             .filter(|s| !matches!(s.status, DroneOperationStatus::Maintenance))
             .count();
 
         let coordination_quality = if total_drones > 0 {
-            self.active_drones.values()
+            self.active_drones
+                .values()
                 .map(|s| s.communication_quality)
-                .sum::<f32>() / total_drones as f32
+                .sum::<f32>()
+                / total_drones as f32
         } else {
             1.0
         };
@@ -335,10 +359,14 @@ impl CoordinationEngine {
         Ok(())
     }
 
-    pub async fn handle_emergency(&mut self, drone_id: Uuid, emergency_type: EmergencyType) -> Result<()> {
+    pub async fn handle_emergency(
+        &mut self,
+        drone_id: Uuid,
+        emergency_type: EmergencyType,
+    ) -> Result<()> {
         if let Some(state) = self.active_drones.get_mut(&drone_id) {
             state.status = DroneOperationStatus::Emergency;
-            
+
             match emergency_type {
                 EmergencyType::BatteryDepleted => {
                     tracing::error!("Battery depleted for drone {}", drone_id);
@@ -354,7 +382,7 @@ impl CoordinationEngine {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -389,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn test_coordination_engine() {
         let mut engine = CoordinationEngine::new();
-        
+
         let drone_id = Uuid::new_v4();
         let state = DroneState {
             id: drone_id,
@@ -408,7 +436,7 @@ mod tests {
         };
 
         engine.register_drone(drone_id, state).await.unwrap();
-        
+
         let status = engine.get_coordination_status().await;
         assert_eq!(status.total_drones, 1);
         assert_eq!(status.active_drones, 1);
@@ -417,19 +445,19 @@ mod tests {
     #[test]
     fn test_distance_calculation() {
         let engine = CoordinationEngine::new();
-        
+
         let pos1 = GeoCoordinate {
             latitude: 40.7128,
             longitude: -74.0060,
             altitude_m: 100.0,
         };
-        
+
         let pos2 = GeoCoordinate {
             latitude: 40.7129,
             longitude: -74.0061,
             altitude_m: 100.0,
         };
-        
+
         let distance = engine.calculate_distance(&pos1, &pos2);
         assert!(distance > 0.0);
         assert!(distance < 200.0); // Should be less than 200m for this small difference

@@ -1,12 +1,14 @@
+use crate::{
+    OverlayData, OverlayProcessor, OverlayType, SensorInput, SensorOverlay, SpatialBounds,
+};
 use anyhow::Result;
+use chrono::Utc;
 use image::{ImageBuffer, Rgb, RgbImage};
 use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use crate::{OverlayProcessor, SensorOverlay, SensorInput, OverlayType, OverlayData, SpatialBounds};
-use uuid::Uuid;
-use chrono::Utc;
 use std::collections::HashMap;
+use std::path::Path;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct ThermalProcessor {
@@ -28,11 +30,11 @@ pub struct TemperatureRange {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThermalColorPalette {
-    pub cold: [u8; 3],      // Blue
-    pub cool: [u8; 3],      // Cyan
-    pub moderate: [u8; 3],  // Green
-    pub warm: [u8; 3],      // Yellow
-    pub hot: [u8; 3],       // Red
+    pub cold: [u8; 3],     // Blue
+    pub cool: [u8; 3],     // Cyan
+    pub moderate: [u8; 3], // Green
+    pub warm: [u8; 3],     // Yellow
+    pub hot: [u8; 3],      // Red
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,11 +52,11 @@ impl Default for ThermalConfig {
                 max_celsius: 50.0,
             },
             color_palette: ThermalColorPalette {
-                cold: [0, 0, 255],      // Blue
-                cool: [0, 255, 255],    // Cyan
-                moderate: [0, 255, 0],  // Green
-                warm: [255, 255, 0],    // Yellow
-                hot: [255, 0, 0],       // Red
+                cold: [0, 0, 255],     // Blue
+                cool: [0, 255, 255],   // Cyan
+                moderate: [0, 255, 0], // Green
+                warm: [255, 255, 0],   // Yellow
+                hot: [255, 0, 0],      // Red
             },
             calibration: ThermalCalibration {
                 offset: 0.0,
@@ -75,7 +77,8 @@ impl ThermalProcessor {
         let temperatures: Vec<f32> = raw_values
             .iter()
             .map(|&raw| {
-                let temp = (raw as f32 * self.config.calibration.scale) + self.config.calibration.offset;
+                let temp =
+                    (raw as f32 * self.config.calibration.scale) + self.config.calibration.offset;
                 temp - self.config.calibration.ambient_temp
             })
             .collect();
@@ -84,7 +87,12 @@ impl ThermalProcessor {
     }
 
     /// Generate thermal visualization image
-    pub fn generate_thermal_image(&self, temperatures: &[f32], width: u32, height: u32) -> Result<RgbImage> {
+    pub fn generate_thermal_image(
+        &self,
+        temperatures: &[f32],
+        width: u32,
+        height: u32,
+    ) -> Result<RgbImage> {
         let mut image = ImageBuffer::new(width, height);
 
         for (i, &temp) in temperatures.iter().enumerate() {
@@ -105,8 +113,9 @@ impl ThermalProcessor {
     /// Map temperature to color using thermal palette
     fn temperature_to_color(&self, temperature: f32) -> [u8; 3] {
         let normalized = (temperature - self.config.temperature_range.min_celsius)
-            / (self.config.temperature_range.max_celsius - self.config.temperature_range.min_celsius);
-        
+            / (self.config.temperature_range.max_celsius
+                - self.config.temperature_range.min_celsius);
+
         let clamped = normalized.clamp(0.0, 1.0);
 
         // Interpolate between colors based on temperature
@@ -152,12 +161,9 @@ impl ThermalProcessor {
         output_path: &Path,
     ) -> Result<ThermalOverlayResult> {
         let temperatures = self.raw_to_temperature(&scan_data.raw_thermal_data)?;
-        
-        let thermal_image = self.generate_thermal_image(
-            &temperatures,
-            scan_data.width,
-            scan_data.height,
-        )?;
+
+        let thermal_image =
+            self.generate_thermal_image(&temperatures, scan_data.width, scan_data.height)?;
 
         // Save thermal image
         thermal_image.save(output_path)?;
@@ -200,7 +206,8 @@ impl ThermalProcessor {
         let variance = temperatures
             .iter()
             .map(|&temp| (temp - mean).powi(2))
-            .sum::<f32>() / temperatures.len() as f32;
+            .sum::<f32>()
+            / temperatures.len() as f32;
         let std_dev = variance.sqrt();
 
         ThermalStatistics {
@@ -209,16 +216,26 @@ impl ThermalProcessor {
             min,
             max,
             std_dev,
-            hot_spots: temperatures.iter().filter(|&&t| t > mean + 2.0 * std_dev).count(),
-            cold_spots: temperatures.iter().filter(|&&t| t < mean - 2.0 * std_dev).count(),
+            hot_spots: temperatures
+                .iter()
+                .filter(|&&t| t > mean + 2.0 * std_dev)
+                .count(),
+            cold_spots: temperatures
+                .iter()
+                .filter(|&&t| t < mean - 2.0 * std_dev)
+                .count(),
             total_pixels: temperatures.len(),
         }
     }
 
     /// Detect thermal anomalies that might indicate crop stress or irrigation issues
-    fn detect_thermal_anomalies(&self, temperatures: &[f32], coordinates: &[Point3<f64>]) -> Vec<ThermalAnomaly> {
+    fn detect_thermal_anomalies(
+        &self,
+        temperatures: &[f32],
+        coordinates: &[Point3<f64>],
+    ) -> Vec<ThermalAnomaly> {
         let mut anomalies = Vec::new();
-        
+
         if temperatures.is_empty() {
             return anomalies;
         }
@@ -227,7 +244,8 @@ impl ThermalProcessor {
         let variance = temperatures
             .iter()
             .map(|&temp| (temp - mean).powi(2))
-            .sum::<f32>() / temperatures.len() as f32;
+            .sum::<f32>()
+            / temperatures.len() as f32;
         let std_dev = variance.sqrt();
 
         for (i, &temp) in temperatures.iter().enumerate() {
@@ -249,14 +267,21 @@ impl ThermalProcessor {
                 ThermalAnomalyType::ColdSpot
             };
 
-            let location = coordinates.get(i).cloned().unwrap_or(Point3::new(0.0, 0.0, 0.0));
+            let location = coordinates
+                .get(i)
+                .cloned()
+                .unwrap_or(Point3::new(0.0, 0.0, 0.0));
 
             anomalies.push(ThermalAnomaly {
                 anomaly_type,
                 severity,
                 temperature: temp,
                 location,
-                confidence: if severity == AnomalySeverity::High { 0.9 } else { 0.7 },
+                confidence: if severity == AnomalySeverity::High {
+                    0.9
+                } else {
+                    0.7
+                },
             });
         }
 
@@ -366,7 +391,7 @@ mod tests {
     fn test_raw_to_temperature_conversion() {
         let processor = ThermalProcessor::new(ThermalConfig::default());
         let raw_data = vec![1000, 1500, 2000];
-        
+
         let temperatures = processor.raw_to_temperature(&raw_data).unwrap();
         assert_eq!(temperatures.len(), 3);
     }
@@ -374,11 +399,11 @@ mod tests {
     #[test]
     fn test_temperature_to_color_mapping() {
         let processor = ThermalProcessor::new(ThermalConfig::default());
-        
+
         // Test cold temperature
         let cold_color = processor.temperature_to_color(-5.0);
         assert_eq!(cold_color, [0, 0, 255]); // Should be blue
-        
+
         // Test hot temperature
         let hot_color = processor.temperature_to_color(45.0);
         assert_eq!(hot_color, [255, 0, 0]); // Should be red
@@ -388,7 +413,7 @@ mod tests {
     fn test_thermal_statistics() {
         let processor = ThermalProcessor::new(ThermalConfig::default());
         let temperatures = vec![10.0, 15.0, 20.0, 25.0, 30.0];
-        
+
         let stats = processor.calculate_thermal_statistics(&temperatures);
         assert_eq!(stats.mean, 20.0);
         assert_eq!(stats.median, 20.0);

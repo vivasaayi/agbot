@@ -1,8 +1,8 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageType {
@@ -90,9 +90,10 @@ impl CommunicationModule {
             return Err(anyhow::anyhow!("Signal too weak to send message"));
         }
 
-        self.outbound_sender.send(message)
+        self.outbound_sender
+            .send(message)
             .map_err(|e| anyhow::anyhow!("Failed to send message: {}", e))?;
-        
+
         Ok(())
     }
 
@@ -131,7 +132,12 @@ impl CommunicationModule {
         self.send_message(MessageType::Status(status_msg)).await
     }
 
-    pub async fn send_emergency(&self, emergency_type: String, description: String, position: (f32, f32, f32)) -> Result<()> {
+    pub async fn send_emergency(
+        &self,
+        emergency_type: String,
+        description: String,
+        position: (f32, f32, f32),
+    ) -> Result<()> {
         let emergency = EmergencyMessage {
             drone_id: self.drone_id,
             emergency_type,
@@ -145,7 +151,7 @@ impl CommunicationModule {
 
     pub async fn update(&mut self) -> Result<()> {
         let now = Utc::now();
-        
+
         // Send heartbeat if needed
         if (now - self.last_heartbeat).num_milliseconds() > self.heartbeat_interval_ms as i64 {
             self.send_heartbeat().await?;
@@ -174,7 +180,7 @@ impl CommunicationModule {
         // In reality, this would depend on distance, obstacles, interference, etc.
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        
+
         // Add some random variation
         let variation = rng.gen_range(-0.05..0.05);
         self.signal_strength = (self.signal_strength + variation).clamp(0.0, 1.0);
@@ -213,14 +219,11 @@ mod tests {
     async fn test_send_telemetry() {
         let drone_id = Uuid::new_v4();
         let comm = CommunicationModule::new(drone_id);
-        
-        let result = comm.send_telemetry(
-            (0.0, 0.0, 100.0),
-            (1.0, 0.0, 0.0),
-            (0.0, 0.0, 0.0),
-            0.8,
-        ).await;
-        
+
+        let result = comm
+            .send_telemetry((0.0, 0.0, 100.0), (1.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.8)
+            .await;
+
         assert!(result.is_ok());
     }
 }

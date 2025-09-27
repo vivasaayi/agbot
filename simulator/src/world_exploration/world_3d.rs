@@ -1,24 +1,24 @@
-use bevy::prelude::*;
-use bevy_egui::{egui, EguiContexts};
+use crate::app_state::AppMode;
 use crate::flight_ui::AppState;
 use crate::globe_view::GlobeState;
-use crate::app_state::AppMode;
+use bevy::prelude::*;
+use bevy_egui::{egui, EguiContexts};
 
 pub struct World3DPlugin;
 
 impl Plugin for World3DPlugin {
     fn build(&self, app: &mut App) {
-        app
-            .add_systems(OnEnter(AppState::CitySearch), setup_city_search_with_globe)
+        app.add_systems(OnEnter(AppState::CitySearch), setup_city_search_with_globe)
             .add_systems(OnEnter(AppState::World3D), setup_3d_world)
             .add_systems(OnExit(AppState::World3D), cleanup_3d_world)
-            .add_systems(Update, (
-                handle_3d_ui,
-                handle_3d_input,
-            ).run_if(in_state(AppState::World3D)))
-            .add_systems(Update, (
-                handle_city_search_ui,
-            ).run_if(in_state(AppState::CitySearch)));
+            .add_systems(
+                Update,
+                (handle_3d_ui, handle_3d_input).run_if(in_state(AppState::World3D)),
+            )
+            .add_systems(
+                Update,
+                (handle_city_search_ui,).run_if(in_state(AppState::CitySearch)),
+            );
     }
 }
 
@@ -41,15 +41,12 @@ pub struct WorldLocation {
     pub country: String,
 }
 
-fn setup_city_search_with_globe(
-    mut commands: Commands,
-    mut app_mode: ResMut<NextState<AppMode>>,
-) {
+fn setup_city_search_with_globe(mut commands: Commands, mut app_mode: ResMut<NextState<AppMode>>) {
     info!("Entering City Search mode - showing globe");
-    
+
     // Switch to Globe mode to show the globe
     app_mode.set(AppMode::Globe);
-    
+
     // Initialize World3D state for city search
     commands.insert_resource(World3DState::default());
 }
@@ -57,35 +54,33 @@ fn setup_city_search_with_globe(
 fn setup_3d_world(
     mut commands: Commands,
     globe_state: Option<ResMut<GlobeState>>,
+    mut app_mode: ResMut<NextState<AppMode>>,
 ) {
     info!("Entering 3D World Exploration mode");
-    
+
     // Initialize World3D state
     commands.insert_resource(World3DState::default());
-    
+
     // Configure globe for exploration mode if available
     if let Some(mut globe_state) = globe_state {
         globe_state.goto_location = false;
     }
-    
+
+    // Switch render pipeline to the simulation world so the OSM loader kicks in
+    app_mode.set(AppMode::Simulation3D);
+
     // Add world 3D entity marker
-    commands.spawn((
-        World3DEntity,
-        Name::new("World3D"),
-    ));
+    commands.spawn((World3DEntity, Name::new("World3D")));
 }
 
-fn cleanup_3d_world(
-    mut commands: Commands,
-    world_3d_entities: Query<Entity, With<World3DEntity>>,
-) {
+fn cleanup_3d_world(mut commands: Commands, world_3d_entities: Query<Entity, With<World3DEntity>>) {
     info!("Cleaning up 3D World Exploration mode");
-    
+
     // Remove all world 3D entities
     for entity in world_3d_entities.iter() {
         commands.entity(entity).despawn_recursive();
     }
-    
+
     // Remove World3D state
     commands.remove_resource::<World3DState>();
 }
@@ -97,7 +92,7 @@ fn handle_city_search_ui(
     mut app_mode: ResMut<NextState<AppMode>>,
 ) {
     let ctx = contexts.ctx_mut();
-    
+
     // Top panel with city search and load button
     egui::TopBottomPanel::top("city_search_panel").show(ctx, |ui| {
         ui.horizontal(|ui| {
@@ -106,16 +101,18 @@ fn handle_city_search_ui(
                 next_app_state.set(AppState::MainMenu);
                 app_mode.set(AppMode::MainMenu);
             }
-            
+
             ui.separator();
-            
+
             // City search bar
             ui.label("🔍 Search for a city:");
-            ui.add(egui::TextEdit::singleline(&mut world_state.search_query)
-                .hint_text("Type city name..."));
-            
+            ui.add(
+                egui::TextEdit::singleline(&mut world_state.search_query)
+                    .hint_text("Type city name..."),
+            );
+
             ui.separator();
-            
+
             // Load Location button (only show if city selected)
             if world_state.show_load_button {
                 if ui.button("📍 Load Location").clicked() {
@@ -125,7 +122,7 @@ fn handle_city_search_ui(
                 }
             }
         });
-        
+
         // Show selected location info
         if let Some(ref location) = world_state.selected_location {
             ui.horizontal(|ui| {
@@ -133,7 +130,7 @@ fn handle_city_search_ui(
                 ui.label(format!("{}, {}", location.name, location.country));
             });
         }
-        
+
         // Keyboard shortcuts info
         ui.horizontal(|ui| {
             ui.label("⌨️ Cmd+F: Focus search | 🖱️ Click on globe to select cities");
@@ -147,7 +144,7 @@ fn handle_3d_ui(
     mut next_app_state: ResMut<NextState<AppState>>,
 ) {
     let ctx = contexts.ctx_mut();
-    
+
     // Top panel with search and navigation
     egui::TopBottomPanel::top("world_3d_panel").show(ctx, |ui| {
         ui.horizontal(|ui| {
@@ -155,9 +152,9 @@ fn handle_3d_ui(
             if ui.button("🠔 Back to Menu").clicked() {
                 next_app_state.set(AppState::MainMenu);
             }
-            
+
             ui.separator();
-            
+
             // Current location info
             if let Some(ref location) = world_state.selected_location {
                 ui.label("📍 Current Location:");
@@ -167,7 +164,7 @@ fn handle_3d_ui(
             }
         });
     });
-    
+
     // Controls help panel
     egui::Window::new("Controls")
         .resizable(false)
@@ -192,7 +189,7 @@ fn handle_3d_input(
         // Reset globe camera to default position
         // We'll implement this when we integrate with globe_view.rs
     }
-    
+
     // Handle WASD for camera movement
     let mut movement = Vec3::ZERO;
     if keyboard_input.pressed(KeyCode::KeyW) {
@@ -207,7 +204,7 @@ fn handle_3d_input(
     if keyboard_input.pressed(KeyCode::KeyD) {
         movement.x += 0.1;
     }
-    
+
     // Apply movement to globe state
     if movement != Vec3::ZERO {
         // We'll implement camera movement when we integrate with globe_view.rs

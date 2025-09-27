@@ -1,22 +1,21 @@
 use anyhow::Result;
 use bevy::prelude::*;
 use flume::{Receiver, Sender};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures_util::{SinkExt, StreamExt};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
-use crate::resources::{AppConfig, AppState};
-use crate::drone_controller::spawn_drone;
 use crate::components::DroneStatus;
+use crate::drone_controller::spawn_drone;
+use crate::resources::{AppConfig, AppState};
 use shared::schemas::{Telemetry, WebSocketMessage};
 
 pub struct CommunicationPlugin;
 
 impl Plugin for CommunicationPlugin {
     fn build(&self, app: &mut App) {
-        app
-            .add_systems(Update, process_incoming_messages);
+        app.add_systems(Update, process_incoming_messages);
     }
 }
 
@@ -29,18 +28,20 @@ pub struct CommunicationChannels {
 // Setup function to be called from main before Bevy starts
 pub async fn setup_communication_task(config: &AppConfig) -> CommunicationChannels {
     info!("Setting up communication channels...");
-    
+
     let (incoming_sender, incoming_receiver) = flume::unbounded();
     let (outgoing_sender, outgoing_receiver) = flume::unbounded();
-    
+
     // Spawn the communication task
     let websocket_url = config.websocket_url.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_communication_loop(websocket_url, incoming_sender, outgoing_receiver).await {
+        if let Err(e) =
+            run_communication_loop(websocket_url, incoming_sender, outgoing_receiver).await
+        {
             error!("Communication loop failed: {}", e);
         }
     });
-    
+
     CommunicationChannels {
         incoming_receiver,
         outgoing_sender,
@@ -50,11 +51,17 @@ pub async fn setup_communication_task(config: &AppConfig) -> CommunicationChanne
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IncomingMessage {
     Telemetry(Telemetry),
-    MissionStatus { mission_id: uuid::Uuid, status: String },
+    MissionStatus {
+        mission_id: uuid::Uuid,
+        status: String,
+    },
     LidarUpdate(shared::schemas::LidarScan),
     ImageCaptured(shared::schemas::MultispectralImage),
     NdviProcessed(shared::schemas::NdviResult),
-    SystemStatus { status: String, message: String },
+    SystemStatus {
+        status: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,19 +84,19 @@ async fn run_communication_loop(
     outgoing_receiver: Receiver<OutgoingMessage>,
 ) -> Result<()> {
     info!("Attempting to connect to WebSocket at {}", websocket_url);
-    
+
     loop {
         match connect_async(&websocket_url).await {
             Ok((ws_stream, _)) => {
                 info!("Connected to WebSocket successfully");
-                
+
                 let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-                
+
                 // Send subscription message
                 let subscribe_msg = OutgoingMessage::SubscribeToUpdates;
                 let msg_json = serde_json::to_string(&subscribe_msg)?;
                 ws_sender.send(Message::Text(msg_json)).await?;
-                
+
                 // Handle incoming and outgoing messages
                 loop {
                     tokio::select! {
@@ -133,7 +140,7 @@ async fn run_communication_loop(
                                 _ => {}
                             }
                         }
-                        
+
                         // Handle outgoing messages
                         msg = outgoing_receiver.recv_async() => {
                             match msg {
@@ -168,7 +175,9 @@ fn process_incoming_messages(
     mut mission_data: ResMut<crate::resources::MissionData>,
     mut drone_query: Query<(&mut Transform, &mut crate::components::Drone)>,
 ) {
-    let Some(channels) = channels else { return; };
+    let Some(channels) = channels else {
+        return;
+    };
 
     // Process all available messages
     while let Ok(message) = channels.incoming_receiver.try_recv() {
@@ -232,8 +241,10 @@ fn process_incoming_messages(
 
             IncomingMessage::NdviProcessed(result) => {
                 // Handle NDVI processing results
-                info!("NDVI processed: mean={:.3}, vegetation={:.1}%",
-                      result.mean_ndvi, result.vegetation_percentage);
+                info!(
+                    "NDVI processed: mean={:.3}, vegetation={:.1}%",
+                    result.mean_ndvi, result.vegetation_percentage
+                );
             }
 
             IncomingMessage::SystemStatus { status, message } => {

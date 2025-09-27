@@ -1,6 +1,6 @@
-use anyhow::Result;
-use crate::{Mission, FlightPath};
 use crate::flight_path::{PathType, SurveyPattern};
+use crate::{FlightPath, Mission};
+use anyhow::Result;
 use geo::Point;
 
 pub struct MissionOptimizer {
@@ -23,19 +23,19 @@ impl MissionOptimizer {
 
     pub fn optimize_mission(&self, mission: &Mission) -> Result<Mission> {
         let mut optimized = mission.clone();
-        
+
         // Optimize waypoint order using a simple nearest neighbor approach
         self.optimize_waypoint_order(&mut optimized)?;
-        
+
         // Generate optimized flight paths
         self.generate_flight_paths(&mut optimized)?;
-        
+
         // Calculate time and battery estimates
         self.calculate_estimates(&mut optimized)?;
-        
+
         // Check if mission fits within constraints
         self.validate_constraints(&optimized)?;
-        
+
         Ok(optimized)
     }
 
@@ -47,14 +47,14 @@ impl MissionOptimizer {
         // Simple nearest neighbor TSP approximation
         let mut optimized_waypoints = Vec::new();
         let mut remaining: Vec<_> = (1..mission.waypoints.len()).collect();
-        
+
         // Start with first waypoint (usually takeoff)
         optimized_waypoints.push(mission.waypoints[0].clone());
         let mut current_idx = 0;
-        
+
         while !remaining.is_empty() {
             let current_pos = &mission.waypoints[current_idx].position;
-            
+
             // Find nearest remaining waypoint
             let (nearest_idx, nearest_pos) = remaining
                 .iter()
@@ -66,19 +66,19 @@ impl MissionOptimizer {
                 })
                 .map(|(idx, &wp_idx)| (idx, wp_idx))
                 .unwrap();
-            
+
             optimized_waypoints.push(mission.waypoints[nearest_pos].clone());
             current_idx = nearest_pos;
             remaining.remove(nearest_idx);
         }
-        
+
         mission.waypoints = optimized_waypoints;
         Ok(())
     }
 
     fn generate_flight_paths(&self, mission: &mut Mission) -> Result<()> {
         mission.flight_paths.clear();
-        
+
         if mission.waypoints.is_empty() {
             return Ok(());
         }
@@ -128,7 +128,8 @@ impl MissionOptimizer {
         let distance_consumption = total_distance_m / 10000.0; // 10% per 10km
         let action_consumption = mission.waypoints.len() as f32 * 0.02; // 2% per waypoint with actions
 
-        mission.estimated_battery_usage = base_consumption + distance_consumption + action_consumption;
+        mission.estimated_battery_usage =
+            base_consumption + distance_consumption + action_consumption;
         mission.estimated_battery_usage = mission.estimated_battery_usage.min(1.0); // Cap at 100%
 
         Ok(())
@@ -161,19 +162,23 @@ impl MissionOptimizer {
         // Check if this is a survey mission based on waypoint density and area coverage
         let area_km2 = calculate_polygon_area(&mission.area_of_interest);
         let waypoint_density = mission.waypoints.len() as f64 / area_km2.max(0.01);
-        
+
         // If we have many waypoints relative to area, it's likely a survey
         waypoint_density > 5.0
     }
 
     fn estimate_action_time(&self, action: &crate::waypoint::Action) -> u32 {
         use crate::waypoint::Action;
-        
+
         match action {
             Action::TakePhoto { .. } => 2,
-            Action::StartVideo { duration_seconds, .. } => *duration_seconds,
+            Action::StartVideo {
+                duration_seconds, ..
+            } => *duration_seconds,
             Action::StopVideo { .. } => 1,
-            Action::CollectLidar { duration_seconds, .. } => *duration_seconds,
+            Action::CollectLidar {
+                duration_seconds, ..
+            } => *duration_seconds,
             Action::CollectMultispectral { .. } => 5,
             Action::Hover { duration_seconds } => *duration_seconds,
             Action::SetSpeed { .. } => 1,
@@ -204,7 +209,7 @@ fn calculate_polygon_area(polygon: &geo::Polygon<f64>) -> f64 {
 mod tests {
     use super::*;
     use crate::{Mission, Waypoint, WaypointType};
-    use geo::{coord, polygon, point};
+    use geo::{coord, point, polygon};
 
     #[test]
     fn test_optimizer_basic() {
@@ -215,13 +220,13 @@ mod tests {
             (x: 0.0, y: 1.0),
             (x: 0.0, y: 0.0),
         ];
-        
+
         let mut mission = Mission::new(
             "Test Mission".to_string(),
             "A test mission".to_string(),
             area,
         );
-        
+
         // Add some waypoints
         mission.add_waypoint(Waypoint::new(
             point!(x: 0.0, y: 0.0),
@@ -238,10 +243,10 @@ mod tests {
             100.0,
             WaypointType::Landing,
         ));
-        
+
         let optimizer = MissionOptimizer::new();
         let optimized = optimizer.optimize_mission(&mission).unwrap();
-        
+
         assert!(!optimized.flight_paths.is_empty());
         assert!(optimized.estimated_duration_minutes > 0);
         assert!(optimized.estimated_battery_usage > 0.0);

@@ -5,7 +5,7 @@ use serde_json;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::{Mission, Waypoint, FlightPath};
+use crate::{FlightPath, Mission, Waypoint};
 
 /// Database service for mission storage using PostgreSQL
 pub struct DatabaseService {
@@ -86,13 +86,17 @@ impl DatabaseService {
         .await?;
 
         // Create indexes for better performance
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_waypoints_mission_id ON waypoints(mission_id);")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_waypoints_mission_id ON waypoints(mission_id);",
+        )
+        .execute(&self.pool)
+        .await?;
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_flight_paths_mission_id ON flight_paths(mission_id);")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_flight_paths_mission_id ON flight_paths(mission_id);",
+        )
+        .execute(&self.pool)
+        .await?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_missions_created_at ON missions(created_at);")
             .execute(&self.pool)
@@ -180,12 +184,10 @@ impl DatabaseService {
     /// Get a mission by ID
     pub async fn get_mission(&self, id: &Uuid) -> Result<Option<Mission>> {
         // Get mission basic info
-        let mission_row = sqlx::query(
-            "SELECT * FROM missions WHERE id = $1"
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let mission_row = sqlx::query("SELECT * FROM missions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         let mission_row = match mission_row {
             Some(row) => row,
@@ -193,12 +195,11 @@ impl DatabaseService {
         };
 
         // Get waypoints
-        let waypoint_rows = sqlx::query(
-            "SELECT * FROM waypoints WHERE mission_id = $1 ORDER BY sequence_order"
-        )
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await?;
+        let waypoint_rows =
+            sqlx::query("SELECT * FROM waypoints WHERE mission_id = $1 ORDER BY sequence_order")
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?;
 
         let waypoints: Result<Vec<Waypoint>, anyhow::Error> = waypoint_rows
             .iter()
@@ -217,12 +218,10 @@ impl DatabaseService {
             .collect();
 
         // Get flight paths
-        let flight_path_rows = sqlx::query(
-            "SELECT * FROM flight_paths WHERE mission_id = $1"
-        )
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await?;
+        let flight_path_rows = sqlx::query("SELECT * FROM flight_paths WHERE mission_id = $1")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
 
         let flight_paths: Result<Vec<FlightPath>, anyhow::Error> = flight_path_rows
             .iter()
@@ -232,7 +231,8 @@ impl DatabaseService {
                     name: row.get("name"),
                     segments: serde_json::from_value(row.get("segments"))?,
                     total_distance_m: row.get("total_distance_m"),
-                    estimated_duration_seconds: row.get::<i32, _>("estimated_duration_seconds") as u32,
+                    estimated_duration_seconds: row.get::<i32, _>("estimated_duration_seconds")
+                        as u32,
                     path_type: serde_json::from_value(row.get("path_type"))?,
                 })
             })
@@ -247,7 +247,8 @@ impl DatabaseService {
             area_of_interest: serde_json::from_value(mission_row.get("area_of_interest"))?,
             waypoints: waypoints?,
             flight_paths: flight_paths?,
-            estimated_duration_minutes: mission_row.get::<i32, _>("estimated_duration_minutes") as u32,
+            estimated_duration_minutes: mission_row.get::<i32, _>("estimated_duration_minutes")
+                as u32,
             estimated_battery_usage: mission_row.get("estimated_battery_usage"),
             weather_constraints: serde_json::from_value(mission_row.get("weather_constraints"))?,
             metadata: serde_json::from_value(mission_row.get("metadata"))?,
@@ -356,22 +357,21 @@ impl DatabaseService {
         let limit = limit.unwrap_or(100);
         let offset = offset.unwrap_or(0);
 
-        let mission_rows = sqlx::query(
-            "SELECT * FROM missions ORDER BY created_at DESC LIMIT $1 OFFSET $2"
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+        let mission_rows =
+            sqlx::query("SELECT * FROM missions ORDER BY created_at DESC LIMIT $1 OFFSET $2")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?;
 
         let mut missions = Vec::new();
 
         for row in mission_rows {
             let mission_id: Uuid = row.get("id");
-            
+
             // Get waypoints for this mission
             let waypoint_rows = sqlx::query(
-                "SELECT * FROM waypoints WHERE mission_id = $1 ORDER BY sequence_order"
+                "SELECT * FROM waypoints WHERE mission_id = $1 ORDER BY sequence_order",
             )
             .bind(mission_id)
             .fetch_all(&self.pool)
@@ -384,7 +384,9 @@ impl DatabaseService {
                         id: row.get("id"),
                         position: serde_json::from_value(row.get("position"))?,
                         altitude_m: row.get("altitude_m"),
-                        waypoint_type: serde_json::from_str(&row.get::<String, _>("waypoint_type"))?,
+                        waypoint_type: serde_json::from_str(
+                            &row.get::<String, _>("waypoint_type"),
+                        )?,
                         actions: serde_json::from_value(row.get("actions"))?,
                         arrival_time: row.get("arrival_time"),
                         speed_ms: row.get("speed_ms"),
@@ -394,12 +396,10 @@ impl DatabaseService {
                 .collect();
 
             // Get flight paths for this mission
-            let flight_path_rows = sqlx::query(
-                "SELECT * FROM flight_paths WHERE mission_id = $1"
-            )
-            .bind(mission_id)
-            .fetch_all(&self.pool)
-            .await?;
+            let flight_path_rows = sqlx::query("SELECT * FROM flight_paths WHERE mission_id = $1")
+                .bind(mission_id)
+                .fetch_all(&self.pool)
+                .await?;
 
             let flight_paths: Result<Vec<FlightPath>, anyhow::Error> = flight_path_rows
                 .iter()
@@ -409,7 +409,8 @@ impl DatabaseService {
                         name: row.get("name"),
                         segments: serde_json::from_value(row.get("segments"))?,
                         total_distance_m: row.get("total_distance_m"),
-                        estimated_duration_seconds: row.get::<i32, _>("estimated_duration_seconds") as u32,
+                        estimated_duration_seconds: row.get::<i32, _>("estimated_duration_seconds")
+                            as u32,
                         path_type: serde_json::from_value(row.get("path_type"))?,
                     })
                 })
@@ -454,13 +455,13 @@ impl DatabaseService {
     /// Search missions by name or description
     pub async fn search_missions(&self, query: &str) -> Result<Vec<Mission>> {
         let pattern = format!("%{}%", query);
-        
+
         let mission_rows = sqlx::query(
             r#"
             SELECT * FROM missions 
             WHERE name ILIKE $1 OR description ILIKE $1
             ORDER BY created_at DESC
-            "#
+            "#,
         )
         .bind(&pattern)
         .fetch_all(&self.pool)
@@ -470,10 +471,10 @@ impl DatabaseService {
 
         for row in mission_rows {
             let mission_id: Uuid = row.get("id");
-            
+
             // Get waypoints for this mission
             let waypoint_rows = sqlx::query(
-                "SELECT * FROM waypoints WHERE mission_id = $1 ORDER BY sequence_order"
+                "SELECT * FROM waypoints WHERE mission_id = $1 ORDER BY sequence_order",
             )
             .bind(mission_id)
             .fetch_all(&self.pool)
@@ -486,7 +487,9 @@ impl DatabaseService {
                         id: row.get("id"),
                         position: serde_json::from_value(row.get("position"))?,
                         altitude_m: row.get("altitude_m"),
-                        waypoint_type: serde_json::from_str(&row.get::<String, _>("waypoint_type"))?,
+                        waypoint_type: serde_json::from_str(
+                            &row.get::<String, _>("waypoint_type"),
+                        )?,
                         actions: serde_json::from_value(row.get("actions"))?,
                         arrival_time: row.get("arrival_time"),
                         speed_ms: row.get("speed_ms"),
@@ -496,12 +499,10 @@ impl DatabaseService {
                 .collect();
 
             // Get flight paths for this mission
-            let flight_path_rows = sqlx::query(
-                "SELECT * FROM flight_paths WHERE mission_id = $1"
-            )
-            .bind(mission_id)
-            .fetch_all(&self.pool)
-            .await?;
+            let flight_path_rows = sqlx::query("SELECT * FROM flight_paths WHERE mission_id = $1")
+                .bind(mission_id)
+                .fetch_all(&self.pool)
+                .await?;
 
             let flight_paths: Result<Vec<FlightPath>, anyhow::Error> = flight_path_rows
                 .iter()
@@ -511,7 +512,8 @@ impl DatabaseService {
                         name: row.get("name"),
                         segments: serde_json::from_value(row.get("segments"))?,
                         total_distance_m: row.get("total_distance_m"),
-                        estimated_duration_seconds: row.get::<i32, _>("estimated_duration_seconds") as u32,
+                        estimated_duration_seconds: row.get::<i32, _>("estimated_duration_seconds")
+                            as u32,
                         path_type: serde_json::from_value(row.get("path_type"))?,
                     })
                 })
@@ -549,15 +551,18 @@ impl DatabaseService {
                 MIN(created_at) as oldest_mission,
                 MAX(created_at) as newest_mission
             FROM missions
-            "#
+            "#,
         )
         .fetch_one(&self.pool)
         .await?;
 
         Ok(MissionStats {
             total_missions: row.get::<i64, _>("total_missions") as u64,
-            average_duration_minutes: row.get::<Option<f64>, _>("avg_duration").unwrap_or(0.0) as f32,
-            average_battery_usage: row.get::<Option<f64>, _>("avg_battery_usage").unwrap_or(0.0) as f32,
+            average_duration_minutes: row.get::<Option<f64>, _>("avg_duration").unwrap_or(0.0)
+                as f32,
+            average_battery_usage: row
+                .get::<Option<f64>, _>("avg_battery_usage")
+                .unwrap_or(0.0) as f32,
             oldest_mission: row.get("oldest_mission"),
             newest_mission: row.get("newest_mission"),
         })
@@ -579,9 +584,10 @@ mod tests {
     use geo::{coord, polygon};
 
     async fn setup_test_db() -> DatabaseService {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:password@localhost:5432/agbot_test".to_string());
-        
+        let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:password@localhost:5432/agbot_test".to_string()
+        });
+
         let service = DatabaseService::connect(&database_url).await.unwrap();
         service.initialize().await.unwrap();
         service

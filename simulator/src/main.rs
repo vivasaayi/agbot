@@ -4,45 +4,51 @@ use tracing::{info, warn};
 
 mod app;
 mod app_state;
-mod earth_textures;
-mod procedural_textures;
-mod globe_view;
-mod globe_ui;
-mod input_handler;
-mod location_database;
-mod map_loader;
 mod camera;
 mod communication;
 mod components;
 mod drone_controller;
+mod earth_textures;
+mod globe_ui;
+mod globe_view;
 mod hud;
+mod input_handler;
 mod lidar_controls;
 mod lidar_simulator;
+mod location_database;
+mod map_loader;
+mod osm;
+mod procedural_textures;
 mod resources;
 mod systems;
 mod terrain;
-mod overlays { pub mod ndvi; }
+mod overlays {
+    pub mod ndvi;
+}
 mod geodesy;
-mod autopilot { pub mod waypoint; }
+mod autopilot {
+    pub mod waypoint;
+}
+mod ground_vehicle;
 
 // World exploration modules
-mod world_exploration;
 mod city_search;
+mod world_exploration;
 
 // New Flight Simulator-style UI system
 mod flight_ui;
 
 use app::VisualizerApp;
-use app_state::{AppMode, SelectedRegion, UIState, DataLoadingState, GlobeSearchState};
+use app_state::{AppMode, DataLoadingState, GlobeSearchState, SelectedRegion, UIState};
 // use globe_view::GlobePlugin;
 // use globe_ui::GlobeUIPlugin;
 // use input_handler::InputHandlerPlugin;
 // use map_loader::MapLoaderPlugin;
-use resources::AppConfig;
 use communication::setup_communication_task;
+use flight_ui::FlightUIPlugin;
 use geodesy::GeodesyPlugin;
 use globe_view::GlobePlugin;
-use flight_ui::FlightUIPlugin;
+use resources::AppConfig;
 use world_exploration::World3DPlugin;
 
 #[tokio::main]
@@ -68,7 +74,7 @@ async fn main() -> Result<()> {
 
     // Configure the app with communication channels
     VisualizerApp::configure(&mut app, config, communication_channels);
-    
+
     // Add state management
     app.init_state::<AppMode>()
         .insert_resource(SelectedRegion::default())
@@ -76,12 +82,12 @@ async fn main() -> Result<()> {
         .insert_resource(DataLoadingState::default())
         // Needed by globe_view::handle_search_animation
         .insert_resource(GlobeSearchState::default());
-    
+
     // Add back minimal world view plugins
     app.add_plugins((
-        FlightUIPlugin,          // initializes flight UI states
-        GlobePlugin,             // globe view and interactions
-        World3DPlugin,           // city search + world loader flow
+        FlightUIPlugin, // initializes flight UI states
+        GlobePlugin,    // globe view and interactions
+        World3DPlugin,  // city search + world loader flow
     ));
 
     // Start in City Search with Globe visible

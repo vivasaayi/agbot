@@ -1,16 +1,17 @@
 use anyhow::Result;
 use clap::{Arg, Command};
 use sensor_overlay_engine::{
-    CompositeOverlayEngine, 
-    NdviProcessor, ThermalProcessor, LidarOverlayProcessor,
-    ndvi::{NdviConfig, FieldScanData, ColorMapping},
-    thermal::{ThermalConfig, ThermalScanData, TemperatureRange, ThermalColorPalette, ThermalCalibration},
-    lidar_overlay::{LidarConfig, PointCloudData, HeightColorMapping},
     composite::{CompositeConfig, CompositeScanData},
+    lidar_overlay::{HeightColorMapping, LidarConfig, PointCloudData},
+    ndvi::{ColorMapping, FieldScanData, NdviConfig},
+    thermal::{
+        TemperatureRange, ThermalCalibration, ThermalColorPalette, ThermalConfig, ThermalScanData,
+    },
+    CompositeOverlayEngine, LidarOverlayProcessor, NdviProcessor, ThermalProcessor,
 };
 use std::path::PathBuf;
 use tokio;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,7 +30,7 @@ async fn main() -> Result<()> {
                         .short('i')
                         .value_name("DIR")
                         .help("Input directory containing sensor data")
-                        .required(true)
+                        .required(true),
                 )
                 .arg(
                     Arg::new("output-dir")
@@ -37,7 +38,7 @@ async fn main() -> Result<()> {
                         .short('o')
                         .value_name("DIR")
                         .help("Output directory for processed overlays")
-                        .required(true)
+                        .required(true),
                 )
                 .arg(
                     Arg::new("overlay-types")
@@ -45,15 +46,15 @@ async fn main() -> Result<()> {
                         .short('t')
                         .value_name("TYPES")
                         .help("Comma-separated list of overlay types (ndvi,thermal,lidar)")
-                        .default_value("ndvi,thermal,lidar")
+                        .default_value("ndvi,thermal,lidar"),
                 )
                 .arg(
                     Arg::new("config")
                         .long("config")
                         .short('c')
                         .value_name("FILE")
-                        .help("Configuration file path")
-                )
+                        .help("Configuration file path"),
+                ),
         )
         .get_matches();
 
@@ -90,7 +91,7 @@ async fn process_sensor_data(
 
     // Load configuration
     let config = load_config(config_file).await?;
-    
+
     // Parse overlay types
     let requested_types: Vec<&str> = overlay_types.split(',').collect();
     info!("Requested overlay types: {:?}", requested_types);
@@ -145,16 +146,12 @@ async fn process_sensor_data(
     let thermal_processor = ThermalProcessor::new(thermal_config);
     let lidar_processor = LidarOverlayProcessor::new(lidar_config);
 
-    let composite_engine = CompositeOverlayEngine::new(
-        config,
-        ndvi_processor,
-        thermal_processor,
-        lidar_processor,
-    );
+    let composite_engine =
+        CompositeOverlayEngine::new(config, ndvi_processor, thermal_processor, lidar_processor);
 
     // Scan for sensor data files
     let scan_data = load_sensor_data(&input_dir).await?;
-    
+
     if scan_data.is_empty() {
         warn!("No sensor data found in input directory");
         return Ok(());
@@ -167,10 +164,16 @@ async fn process_sensor_data(
         let scan_output_dir = output_dir.join(format!("scan_{:03}", index));
         tokio::fs::create_dir_all(&scan_output_dir).await?;
 
-        match composite_engine.process_field_scan(data, &scan_output_dir).await {
+        match composite_engine
+            .process_field_scan(data, &scan_output_dir)
+            .await
+        {
             Ok(result) => {
-                info!("Successfully processed scan {}: {:?}", index, result.composite_image_path);
-                
+                info!(
+                    "Successfully processed scan {}: {:?}",
+                    index, result.composite_image_path
+                );
+
                 // Print analysis results
                 print_analysis_results(&result.analysis);
             }
@@ -204,7 +207,7 @@ async fn load_sensor_data(input_dir: &PathBuf) -> Result<Vec<CompositeScanData>>
     // and parse them into the appropriate data structures
 
     let mut dir_entries = tokio::fs::read_dir(input_dir).await?;
-    
+
     while let Some(entry) = dir_entries.next_entry().await? {
         if entry.file_type().await?.is_file() {
             // Create mock scan data for demonstration
@@ -271,27 +274,27 @@ fn create_mock_lidar_data() -> PointCloudData {
 
 fn print_analysis_results(analysis: &sensor_overlay_engine::composite::CompositeAnalysis) {
     println!("\n=== Analysis Results ===");
-    
+
     if let Some(health_score) = analysis.vegetation_health_score {
         println!("Vegetation Health Score: {:.1}%", health_score);
     }
-    
+
     if let Some(coverage) = analysis.vegetation_coverage {
         println!("Vegetation Coverage: {:.1}%", coverage);
     }
-    
+
     if let Some(anomalies) = analysis.temperature_anomalies {
         println!("Temperature Anomalies: {}", anomalies);
     }
-    
+
     if let Some(stress) = analysis.stress_indicators {
         println!("Stress Indicators: {:.1}%", stress);
     }
-    
+
     if let Some(complexity) = analysis.terrain_complexity {
         println!("Terrain Complexity: {:.1}%", complexity);
     }
-    
+
     if let Some(obstacles) = analysis.obstacle_count {
         println!("Obstacles Detected: {}", obstacles);
     }

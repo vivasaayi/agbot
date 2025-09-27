@@ -1,6 +1,6 @@
 use bevy::prelude::*;
-use serde::{Deserialize, Serialize};
 use config::{Config, ConfigError, File};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
@@ -57,17 +57,17 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
         let config_path = "visualizer_config.toml";
-        
+
         let mut settings = Config::builder();
-        
+
         // Add default values
         settings = settings.add_source(Config::try_from(&AppConfig::default())?);
-        
+
         // Try to load from file if it exists
         if Path::new(config_path).exists() {
             settings = settings.add_source(File::with_name(config_path));
         }
-        
+
         // Build and deserialize
         settings.build()?.try_deserialize()
     }

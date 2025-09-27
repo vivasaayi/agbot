@@ -1,7 +1,7 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use reqwest;
 use crate::WeatherConstraints;
+use anyhow::Result;
+use reqwest;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeatherData {
@@ -58,11 +58,9 @@ impl WeatherIntegration {
 
     pub async fn get_forecast(&self, lat: f64, lon: f64, hours: u8) -> Result<WeatherForecast> {
         let current = self.get_current_weather(lat, lon).await?;
-        
+
         // Generate hourly forecast
-        let hourly = (0..hours)
-            .map(|_| self.generate_mock_weather())
-            .collect();
+        let hourly = (0..hours).map(|_| self.generate_mock_weather()).collect();
 
         // Check for weather alerts
         let alerts = self.check_weather_alerts(&current);
@@ -124,7 +122,7 @@ impl WeatherIntegration {
         }
 
         let flight_safe = issues.is_empty();
-        
+
         FlightConditionResult {
             flight_safe,
             issues,
@@ -179,7 +177,11 @@ impl WeatherIntegration {
         alerts
     }
 
-    fn calculate_weather_score(&self, weather: &WeatherData, constraints: &WeatherConstraints) -> f32 {
+    fn calculate_weather_score(
+        &self,
+        weather: &WeatherData,
+        constraints: &WeatherConstraints,
+    ) -> f32 {
         let mut score = 100.0;
 
         // Wind penalty
@@ -199,8 +201,11 @@ impl WeatherIntegration {
         }
 
         // Temperature penalty
-        let temp_center = (constraints.temperature_range_celsius.0 + constraints.temperature_range_celsius.1) / 2.0;
-        let temp_range = constraints.temperature_range_celsius.1 - constraints.temperature_range_celsius.0;
+        let temp_center = (constraints.temperature_range_celsius.0
+            + constraints.temperature_range_celsius.1)
+            / 2.0;
+        let temp_range =
+            constraints.temperature_range_celsius.1 - constraints.temperature_range_celsius.0;
         let temp_deviation = (weather.temperature_celsius - temp_center).abs() / (temp_range / 2.0);
         score -= temp_deviation * 10.0;
 
@@ -224,7 +229,7 @@ mod tests {
     fn test_weather_check() {
         let integration = WeatherIntegration::new(None);
         let constraints = WeatherConstraints::default();
-        
+
         let good_weather = WeatherData {
             temperature_celsius: 20.0,
             humidity_percent: 50.0,
@@ -246,7 +251,7 @@ mod tests {
     fn test_bad_weather() {
         let integration = WeatherIntegration::new(None);
         let constraints = WeatherConstraints::default();
-        
+
         let bad_weather = WeatherData {
             temperature_celsius: 20.0,
             humidity_percent: 50.0,

@@ -71,20 +71,20 @@ pub struct LidarSensor {
     pub scan_frequency: f32,
     pub last_scan_time: f32,
     pub is_3d: bool,
-    pub vertical_fov: f32,  // For 3D LiDAR
-    pub vertical_resolution: f32,  // For 3D LiDAR
+    pub vertical_fov: f32,        // For 3D LiDAR
+    pub vertical_resolution: f32, // For 3D LiDAR
 }
 
 impl Default for LidarSensor {
     fn default() -> Self {
         Self {
-            range: 100.0,  // 100 meter range
-            angular_resolution: 1.0,  // 1 degree per ray
-            scan_frequency: 10.0,  // 10 Hz
+            range: 100.0,            // 100 meter range
+            angular_resolution: 1.0, // 1 degree per ray
+            scan_frequency: 10.0,    // 10 Hz
             last_scan_time: 0.0,
-            is_3d: false,  // 2D by default
-            vertical_fov: 30.0,  // +/- 15 degrees
-            vertical_resolution: 2.0,  // 2 degrees vertical resolution
+            is_3d: false,             // 2D by default
+            vertical_fov: 30.0,       // +/- 15 degrees
+            vertical_resolution: 2.0, // 2 degrees vertical resolution
         }
     }
 }
@@ -108,6 +108,44 @@ pub struct TerrainTile {
     pub x: i32,
     pub z: i32,
     pub loaded: bool,
+}
+
+#[derive(Component, Debug)]
+pub struct MapRoot;
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct MapFeature {
+    pub feature_type: MapFeatureType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapFeatureType {
+    Building,
+    Road,
+    Farmland,
+    Park,
+    Water,
+    Generic,
+}
+
+#[derive(Component, Debug)]
+pub struct Tractor {
+    pub speed: f32,
+    pub waypoints: Vec<Vec3>,
+    pub current_index: usize,
+}
+
+impl Tractor {
+    pub fn advance_waypoint(&mut self) {
+        if self.waypoints.is_empty() {
+            return;
+        }
+        self.current_index = (self.current_index + 1) % self.waypoints.len();
+    }
+
+    pub fn current_target(&self) -> Option<Vec3> {
+        self.waypoints.get(self.current_index).copied()
+    }
 }
 
 #[derive(Component, Debug)]

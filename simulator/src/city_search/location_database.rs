@@ -1,5 +1,5 @@
-use bevy::prelude::*;
 use crate::world_exploration::WorldLocation;
+use bevy::prelude::*;
 
 pub struct LocationDatabasePlugin;
 
@@ -28,43 +28,45 @@ impl CityDatabase {
         if query.is_empty() {
             return Vec::new();
         }
-        
+
         let query_lower = query.to_lowercase();
-        let mut results: Vec<WorldLocation> = self.cities
+        let mut results: Vec<WorldLocation> = self
+            .cities
             .iter()
             .filter(|city| {
-                city.name.to_lowercase().contains(&query_lower) ||
-                city.country.to_lowercase().contains(&query_lower)
+                city.name.to_lowercase().contains(&query_lower)
+                    || city.country.to_lowercase().contains(&query_lower)
             })
             .cloned()
             .collect();
-        
+
         // Sort by relevance (exact matches first, then partial matches)
         results.sort_by(|a, b| {
             let a_exact = a.name.to_lowercase() == query_lower;
             let b_exact = b.name.to_lowercase() == query_lower;
-            
+
             match (a_exact, b_exact) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
                 _ => a.name.cmp(&b.name),
             }
         });
-        
+
         // Limit results to top 10
         results.truncate(10);
         results
     }
-    
+
     /// Get autocomplete suggestions
     pub fn get_suggestions(&self, query: &str) -> Vec<String> {
         let results = self.search_cities(query);
         results.into_iter().map(|city| city.name).collect()
     }
-    
+
     /// Find exact city by name
     pub fn find_city(&self, name: &str) -> Option<WorldLocation> {
-        self.cities.iter()
+        self.cities
+            .iter()
             .find(|city| city.name.to_lowercase() == name.to_lowercase())
             .cloned()
     }
