@@ -1,6 +1,9 @@
 use bevy::prelude::*;
 use crate::components::{TerrainTile, SensorOverlay};
-use crate::resources::{TerrainData, AppConfig};
+use crate::resources::AppConfig;
+use crate::app_state::AppMode;
+
+pub mod streamer;
 
 pub struct TerrainPlugin;
 
@@ -9,10 +12,11 @@ impl Plugin for TerrainPlugin {
         app
             .add_systems(Startup, setup_terrain)
             .add_systems(Update, (
-                load_terrain_tiles,
-                update_terrain_lod,
+                streamer::terrain_streamer_system,
+                streamer::update_terrain_lod,
                 render_ndvi_overlay,
-            ));
+                handle_terrain_click,
+            ).run_if(not(in_state(AppMode::Globe))));
     }
 }
 
@@ -58,24 +62,7 @@ fn setup_terrain(
     }
 }
 
-fn load_terrain_tiles(
-    // Implementation for dynamic terrain loading based on camera position
-    _camera_query: Query<&Transform, With<Camera3d>>,
-    _terrain_query: Query<&TerrainTile>,
-    _config: Res<AppConfig>,
-) {
-    // TODO: Implement dynamic terrain tile loading
-    // This would load/unload terrain tiles based on camera position
-}
-
-fn update_terrain_lod(
-    // Implementation for level-of-detail updates
-    _camera_query: Query<&Transform, With<Camera3d>>,
-    _terrain_query: Query<&TerrainTile>,
-) {
-    // TODO: Implement LOD system for terrain
-    // Adjust mesh detail based on distance from camera
-}
+// LOD now handled in streamer module
 
 fn render_ndvi_overlay(
     mut terrain_query: Query<(&mut Handle<StandardMaterial>, &SensorOverlay), With<TerrainTile>>,
@@ -93,6 +80,42 @@ fn render_ndvi_overlay(
                 let ndvi = overlay.ndvi_value;
                 material.base_color = Color::srgb(1.0 - ndvi, ndvi, 0.0);
             }
+        }
+    }
+}
+
+fn handle_terrain_click(
+    mouse_button_input: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    camera_q: Query<(&Camera, &GlobalTransform)>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if !mouse_button_input.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let Ok((camera, camera_transform)) = camera_q.get_single() else { return; };
+    let Ok(window) = windows.get_single() else { return; };
+
+    if let Some(cursor_pos) = window.cursor_position() {
+        // Convert screen coordinates to world coordinates
+        if let Some(ray) = camera.viewport_to_world(camera_transform, cursor_pos) {
+        let distance = -ray.origin.y / ray.direction.y; // Assuming ground at y=0
+        let world_pos = ray.origin + ray.direction * distance;
+            info!("Clicked at world position: ({:.2}, {:.2}, {:.2})", world_pos.x, world_pos.y, world_pos.z);
+
+            // For now, just spawn a marker cube at the click position
+            commands.spawn(PbrBundle {
+                mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+                material: materials.add(StandardMaterial {
+                    base_color: Color::srgb(1.0, 0.0, 0.0),
+                    ..default()
+                }),
+                transform: Transform::from_translation(world_pos),
+                ..default()
+            });
         }
     }
 }

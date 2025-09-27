@@ -1,9 +1,9 @@
 use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-use chrono::{DateTime, Utc};
-use nalgebra::{Point3, Vector3};
+// use uuid::Uuid; // uncomment when needed
+// use chrono::{DateTime, Utc}; // uncomment when needed
+// use nalgebra::{Point3, Vector3}; // uncomment when needed
 
 pub mod config;
 pub mod error;

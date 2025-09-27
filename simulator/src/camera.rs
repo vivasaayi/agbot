@@ -24,6 +24,7 @@ fn setup_camera(
     
     commands.spawn((
         Camera3dBundle {
+            camera: Camera { order: 0, ..default() },
             transform: Transform::from_translation(camera_pos)
                 .looking_at(Vec3::ZERO, Vec3::Y),
             ..default()

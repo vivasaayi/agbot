@@ -6,9 +6,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
 use tracing::{info, warn, error};
 
-use crate::resources::{AppConfig, AppState, TimestampedData};
+use crate::resources::{AppConfig, AppState};
 use crate::drone_controller::spawn_drone;
 use crate::components::DroneStatus;
+use shared::schemas::{Telemetry, WebSocketMessage};
 
 pub struct CommunicationPlugin;
 
@@ -48,10 +49,12 @@ pub async fn setup_communication_task(config: &AppConfig) -> CommunicationChanne
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IncomingMessage {
-    DroneUpdate(DroneUpdateMessage),
-    MissionUpdate(MissionUpdateMessage),
-    SystemStatus(SystemStatusMessage),
-    ReplayData(Vec<TimestampedData>),
+    Telemetry(Telemetry),
+    MissionStatus { mission_id: uuid::Uuid, status: String },
+    LidarUpdate(shared::schemas::LidarScan),
+    ImageCaptured(shared::schemas::MultispectralImage),
+    NdviProcessed(shared::schemas::NdviResult),
+    SystemStatus { status: String, message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,33 +63,6 @@ pub enum OutgoingMessage {
     RequestMissionData(String),
     RequestReplayData { start_time: f64, end_time: f64 },
     SetViewMode(ViewMode),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DroneUpdateMessage {
-    pub drone_id: String,
-    pub position: [f32; 3],
-    pub rotation: [f32; 4],
-    pub status: String,
-    pub battery_level: f32,
-    pub altitude: f32,
-    pub speed: f32,
-    pub timestamp: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MissionUpdateMessage {
-    pub mission_id: String,
-    pub waypoints: Vec<[f32; 3]>,
-    pub current_waypoint: usize,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemStatusMessage {
-    pub connected_drones: Vec<String>,
-    pub active_missions: Vec<String>,
-    pub system_health: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,14 +97,24 @@ async fn run_communication_loop(
                         msg = ws_receiver.next() => {
                             match msg {
                                 Some(Ok(Message::Text(text))) => {
-                                    match serde_json::from_str::<IncomingMessage>(&text) {
-                                        Ok(parsed_msg) => {
-                                            if let Err(e) = incoming_sender.send(parsed_msg) {
+                                    match serde_json::from_str::<WebSocketMessage>(&text) {
+                                        Ok(ws_msg) => {
+                                            // Convert WebSocketMessage to IncomingMessage
+                                            let incoming_msg = match ws_msg {
+                                                WebSocketMessage::Telemetry { data } => IncomingMessage::Telemetry(data),
+                                                WebSocketMessage::MissionStatus { mission_id, status } => IncomingMessage::MissionStatus { mission_id, status },
+                                                WebSocketMessage::LidarUpdate { scan } => IncomingMessage::LidarUpdate(scan),
+                                                WebSocketMessage::ImageCaptured { image } => IncomingMessage::ImageCaptured(image),
+                                                WebSocketMessage::NdviProcessed { result } => IncomingMessage::NdviProcessed(result),
+                                                WebSocketMessage::SystemStatus { status, message } => IncomingMessage::SystemStatus { status, message },
+                                            };
+
+                                            if let Err(e) = incoming_sender.send(incoming_msg) {
                                                 warn!("Failed to send incoming message: {}", e);
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("Failed to parse incoming message: {}", e);
+                                            warn!("Failed to parse incoming WebSocket message: {}", e);
                                         }
                                     }
                                 }
@@ -183,62 +169,75 @@ fn process_incoming_messages(
     mut drone_query: Query<(&mut Transform, &mut crate::components::Drone)>,
 ) {
     let Some(channels) = channels else { return; };
-    
+
     // Process all available messages
     while let Ok(message) = channels.incoming_receiver.try_recv() {
         match message {
-            IncomingMessage::DroneUpdate(update) => {
-                let drone_id = update.drone_id.clone();
-                let position = Vec3::from_array(update.position);
-                let rotation = Quat::from_array(update.rotation);
-                
+            IncomingMessage::Telemetry(telemetry) => {
+                // For now, we'll use a generated drone ID based on telemetry
+                // In a real implementation, this would come from the telemetry data
+                let drone_id = "drone_1".to_string();
+
+                // Convert GPS coordinates to local ENU coordinates
+                // This is a simplified conversion - in practice you'd use proper geodesy
+                let position = Vec3::new(
+                    telemetry.position.longitude as f32,
+                    telemetry.altitude_relative,
+                    telemetry.position.latitude as f32,
+                );
+
+                // Create rotation from heading
+                let rotation = Quat::from_rotation_y(telemetry.heading.to_radians() as f32);
+
                 // Find existing drone or create new one
                 let mut found = false;
                 for (mut transform, mut drone) in drone_query.iter_mut() {
                     if drone.id == drone_id {
                         transform.translation = position;
                         transform.rotation = rotation;
-                        
-                        drone.status = match update.status.as_str() {
-                            "idle" => DroneStatus::Idle,
-                            "flying" => DroneStatus::Flying,
-                            "mission" => DroneStatus::Mission,
-                            "returning" => DroneStatus::Returning,
-                            "landing" => DroneStatus::Landing,
-                            "error" => DroneStatus::Error,
-                            _ => DroneStatus::Idle,
+
+                        drone.status = if telemetry.armed {
+                            DroneStatus::Flying
+                        } else {
+                            DroneStatus::Idle
                         };
-                        
+
                         found = true;
                         break;
                     }
                 }
-                
+
                 if !found {
                     // Spawn new drone
                     spawn_drone(&mut commands, &mut drone_registry, drone_id, position);
                 }
-                
+
                 app_state.connected = true;
             }
-            
-            IncomingMessage::MissionUpdate(update) => {
-                mission_data.current_mission = Some(update.mission_id);
-                mission_data.waypoints = update.waypoints.into_iter()
-                    .map(Vec3::from_array)
-                    .collect();
+
+            IncomingMessage::MissionStatus { mission_id, status } => {
+                mission_data.current_mission = Some(mission_id.to_string());
+                info!("Mission {} status: {}", mission_id, status);
             }
-            
-            IncomingMessage::SystemStatus(status) => {
-                info!("System status: {} drones connected, {} active missions", 
-                      status.connected_drones.len(), 
-                      status.active_missions.len());
+
+            IncomingMessage::LidarUpdate(scan) => {
+                // Handle LiDAR scan updates
+                info!("Received LiDAR scan with {} points", scan.points.len());
             }
-            
-            IncomingMessage::ReplayData(data) => {
-                mission_data.replay_data = data;
-                mission_data.replay_index = 0;
-                info!("Loaded {} data points for replay", mission_data.replay_data.len());
+
+            IncomingMessage::ImageCaptured(image) => {
+                // Handle captured image updates
+                info!("Received multispectral image: {}", image.image_id);
+            }
+
+            IncomingMessage::NdviProcessed(result) => {
+                // Handle NDVI processing results
+                info!("NDVI processed: mean={:.3}, vegetation={:.1}%",
+                      result.mean_ndvi, result.vegetation_percentage);
+            }
+
+            IncomingMessage::SystemStatus { status, message } => {
+                info!("System status: {} - {}", status, message);
             }
         }
     }

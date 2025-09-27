@@ -1,10 +1,10 @@
 [package]
-name = "ndvi_processor"
+name = "imagery_processor"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "ndvi_processor"
+name = "imagery_processor"
 path = "src/main.rs"
 
 [dependencies]
@@ -21,3 +21,13 @@ uuid = { workspace = true }
 walkdir = { workspace = true }
 image = { workspace = true }
 imageproc = { workspace = true }
+rand = { workspace = true }
+
+[features]
+default = []
+# Enable GDAL-based GeoTIFF output when available
+gdal-io = ["gdal"]
+
+[dependencies.gdal]
+version = "0.16"
+optional = true

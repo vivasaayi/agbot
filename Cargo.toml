@@ -9,6 +9,7 @@ members = [
     "shared",
     "simulator",
     "lidar_mapper",
+    "imagery_processor",
 ]
 resolver = "2"
 

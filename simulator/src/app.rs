@@ -6,13 +6,16 @@ use bevy_rapier3d::prelude::*;
 use crate::camera::CameraPlugin;
 use crate::communication::{CommunicationPlugin, CommunicationChannels};
 use crate::drone_controller::DroneControllerPlugin;
-use crate::hud::HudPlugin;
+// use crate::hud::HudPlugin;
 use crate::lidar_controls::LidarControlsPlugin;
 use crate::lidar_simulator::LidarSimulatorPlugin;
 use crate::resources::{AppConfig, AppState, DroneRegistry, MissionData, TerrainData};
 use crate::systems::*;
 use crate::terrain::TerrainPlugin;
-use crate::flight_ui::FlightUIPlugin;
+// use crate::flight_ui::FlightUIPlugin;
+use crate::overlays::ndvi::NdviOverlayPlugin;
+use crate::autopilot::waypoint::WaypointAutopilotPlugin;
+use crate::geodesy::{GeoOrigin, NavigateToGeo};
 
 pub struct VisualizerApp;
 
@@ -43,8 +46,10 @@ impl VisualizerApp {
             .add_plugins(LidarSimulatorPlugin)
             .add_plugins(LidarControlsPlugin)
             .add_plugins(CommunicationPlugin)
-            .add_plugins(HudPlugin)
-            .add_plugins(FlightUIPlugin)
+            // .add_plugins(HudPlugin)          // Disabled to reduce UI clutter
+            // .add_plugins(FlightUIPlugin)     // Disabled to reduce UI clutter
+            .add_plugins(NdviOverlayPlugin)
+            .add_plugins(WaypointAutopilotPlugin)
             
             // Resources
             .insert_resource(config)
@@ -53,6 +58,9 @@ impl VisualizerApp {
             .insert_resource(DroneRegistry::default())
             .insert_resource(MissionData::default())
             .insert_resource(TerrainData::default())
+            // Geodesy resources/events are initialized by the plugin, but we can set scale if needed
+            .insert_resource(GeoOrigin::default())
+            .add_event::<NavigateToGeo>()
             
             // Systems
             .add_systems(Startup, setup_scene)

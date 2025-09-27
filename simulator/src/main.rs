@@ -21,6 +21,9 @@ mod lidar_simulator;
 mod resources;
 mod systems;
 mod terrain;
+mod overlays { pub mod ndvi; }
+mod geodesy;
+mod autopilot { pub mod waypoint; }
 
 // World exploration modules
 mod world_exploration;
@@ -30,13 +33,17 @@ mod city_search;
 mod flight_ui;
 
 use app::VisualizerApp;
-use app_state::{AppMode, SelectedRegion, UIState, DataLoadingState};
-use globe_view::GlobePlugin;
-use globe_ui::GlobeUIPlugin;
-use input_handler::InputHandlerPlugin;
-use map_loader::MapLoaderPlugin;
+use app_state::{AppMode, SelectedRegion, UIState, DataLoadingState, GlobeSearchState};
+// use globe_view::GlobePlugin;
+// use globe_ui::GlobeUIPlugin;
+// use input_handler::InputHandlerPlugin;
+// use map_loader::MapLoaderPlugin;
 use resources::AppConfig;
 use communication::setup_communication_task;
+use geodesy::GeodesyPlugin;
+use globe_view::GlobePlugin;
+use flight_ui::FlightUIPlugin;
+use world_exploration::World3DPlugin;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,21 +73,29 @@ async fn main() -> Result<()> {
     app.init_state::<AppMode>()
         .insert_resource(SelectedRegion::default())
         .insert_resource(UIState::default())
-        .insert_resource(DataLoadingState::default());
+        .insert_resource(DataLoadingState::default())
+        // Needed by globe_view::handle_search_animation
+        .insert_resource(GlobeSearchState::default());
     
-    // Add our plugins
+    // Add back minimal world view plugins
     app.add_plugins((
-        InputHandlerPlugin,
-        GlobePlugin,
-        GlobeUIPlugin,
-        MapLoaderPlugin,
-        // World exploration plugins
-        world_exploration::World3DPlugin,
-        world_exploration::MarkersPlugin,
-        world_exploration::Camera3DPlugin,
-        city_search::LocationDatabasePlugin,
-        city_search::SearchInterfacePlugin,
+        FlightUIPlugin,          // initializes flight UI states
+        GlobePlugin,             // globe view and interactions
+        World3DPlugin,           // city search + world loader flow
     ));
+
+    // Start in City Search with Globe visible
+    fn set_initial_view_states(
+        mut next_ui: ResMut<NextState<flight_ui::AppState>>,
+        mut next_mode: ResMut<NextState<AppMode>>,
+    ) {
+        next_ui.set(flight_ui::AppState::CitySearch);
+        next_mode.set(AppMode::Globe);
+    }
+    app.add_systems(Startup, set_initial_view_states);
+
+    // Geodesy logs and helpers
+    app.add_plugins(GeodesyPlugin);
 
     // Run the app (this blocks until the app exits)
     app.run();

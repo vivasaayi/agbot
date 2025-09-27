@@ -145,6 +145,7 @@ fn setup_globe(
     // Create globe camera with better positioning
     commands.spawn((
         Camera3dBundle {
+            camera: Camera { order: 1, ..default() }, // ensure higher priority than default scene camera
             transform: Transform::from_xyz(0.0, 0.0, 5.0)
                 .looking_at(Vec3::ZERO, Vec3::Y),
             ..default()
