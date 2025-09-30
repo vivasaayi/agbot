@@ -12,11 +12,18 @@ use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::Face;
 
+#[derive(Event, Debug, Clone, Copy)]
+pub struct GlobeLocationSelected {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
 pub struct GlobePlugin;
 
 impl Plugin for GlobePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, load_earth_textures) // Only load real textures initially
+        app.add_event::<GlobeLocationSelected>()
+            .add_systems(Startup, load_earth_textures) // Only load real textures initially
             .add_systems(OnEnter(AppMode::Globe), setup_globe)
             .add_systems(OnExit(AppMode::Globe), cleanup_globe)
             .add_systems(
@@ -326,6 +333,9 @@ fn handle_globe_click(
     mouse_button: Res<ButtonInput<MouseButton>>,
     globe_state: Res<GlobeState>,
     mut selected_region: ResMut<SelectedRegion>,
+    mut search_state: ResMut<GlobeSearchState>,
+    time: Res<Time>,
+    mut selection_events: EventWriter<GlobeLocationSelected>,
     camera_query: Query<(&Camera, &GlobalTransform), With<GlobeCamera>>,
     windows: Query<&Window>,
     globe_query: Query<&GlobalTransform, (With<Globe>, Without<GlobeCamera>)>,
@@ -357,11 +367,27 @@ fn handle_globe_click(
                                     let lat = (normalized.y).asin().to_degrees();
                                     let lon = normalized.z.atan2(normalized.x).to_degrees();
 
-                                    // Update selected region
+                                    // Start a smooth animation toward the clicked location (MSFS-like feel)
+                                    let prev_lat = selected_region.center_lat;
+                                    let prev_lon = selected_region.center_lon;
+                                    search_state.start_lat = prev_lat;
+                                    search_state.start_lon = prev_lon;
+                                    search_state.target_lat = lat as f64;
+                                    search_state.target_lon = lon as f64;
+                                    search_state.target_zoom = 2.5; // zoom closer when clicking
+                                    search_state.animation_start_time = time.elapsed_seconds();
+                                    search_state.is_animating = true;
+
+                                    // Update selected region immediately so marker appears
                                     selected_region.center_lat = lat as f64;
                                     selected_region.center_lon = lon as f64;
 
                                     info!("Selected location: {:.4}°N, {:.4}°E", lat, lon);
+
+                                    selection_events.send(GlobeLocationSelected {
+                                        latitude: lat as f64,
+                                        longitude: lon as f64,
+                                    });
                                 }
                             }
                         }
@@ -635,8 +661,6 @@ fn create_coordinate_grid(
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
 ) {
-    use std::f32::consts::PI;
-
     // Create material for grid lines
     let grid_material = materials.add(StandardMaterial {
         base_color: Color::srgba(1.0, 1.0, 0.0, 0.7), // Semi-transparent yellow

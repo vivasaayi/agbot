@@ -1,10 +1,8 @@
 use anyhow::Result;
 use bevy::math::primitives::{Cone, Cylinder};
 use bevy::prelude::*;
-use bevy::tasks::{
-    futures_lite::future::{block_on, poll_once},
-    IoTaskPool, Task,
-};
+use bevy::tasks::futures_lite::future::{block_on, poll_once};
+use tokio::{runtime::Handle as TokioHandle, task::JoinHandle};
 use rand::Rng;
 use std::f32::consts::TAU;
 
@@ -23,20 +21,23 @@ pub struct MapLoaderPlugin;
 impl Plugin for MapLoaderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<OsmFetchTask>()
+            .init_resource::<PendingMapData>()
             .init_resource::<MapAssets>()
             .add_event::<WorldLoadedEvent>()
+            .add_event::<StartWorldLoad>()
             .add_systems(Startup, initialize_map_assets)
-            .add_systems(OnEnter(AppMode::Simulation3D), begin_osm_fetch)
-            .add_systems(
-                Update,
-                poll_osm_fetch.run_if(in_state(AppMode::Simulation3D)),
-            );
+            // Allow starting a fetch while still in Globe mode for a smoother MSFS-like transition
+            .add_systems(Update, begin_osm_fetch_on_event)
+            // Poll the async task regardless of AppMode; we only spawn geometry later
+            .add_systems(Update, poll_osm_fetch)
+            // When we finally enter Simulation3D, build the world from any pending data
+            .add_systems(OnEnter(AppMode::Simulation3D), spawn_pending_world);
     }
 }
 
 #[derive(Resource, Default)]
 struct OsmFetchTask {
-    task: Option<Task<Result<OsmMapData>>>,
+    task: Option<JoinHandle<Result<OsmMapData>>>,
 }
 
 #[derive(Event, Clone, Debug)]
@@ -44,11 +45,28 @@ pub struct WorldLoadedEvent {
     pub map_data: OsmMapData,
 }
 
+/// Event to request world loading for a given lat/lon while still on the globe
+#[derive(Event, Clone, Debug)]
+pub struct StartWorldLoad {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+/// Resource to hold fetched map data until we switch into Simulation3D
+#[derive(Resource, Default)]
+struct PendingMapData(Option<OsmMapData>);
+
+/// Resource wrapping the Tokio runtime handle so we can spawn from Bevy systems
+#[derive(Resource, Clone)]
+pub struct TokioRuntimeHandle(pub TokioHandle);
+
+// Backward-compatible entry point when entering Simulation3D without explicit event
 fn begin_osm_fetch(
     mut commands: Commands,
     mut fetch_task: ResMut<OsmFetchTask>,
     selected_region: Res<SelectedRegion>,
     mut loading_state: ResMut<DataLoadingState>,
+    rt: Res<TokioRuntimeHandle>,
 ) {
     let lat = selected_region.center_lat;
     let lon = selected_region.center_lon;
@@ -57,12 +75,43 @@ fn begin_osm_fetch(
     loading_state.progress = 0.1;
     loading_state.status_message = format!("Loading world data around ({:.4}, {:.4})", lat, lon);
 
-    let task_pool = IoTaskPool::get();
-    fetch_task.task =
-        Some(task_pool.spawn(async move { fetch_osm_data(lat, lon, FETCH_RADIUS_METERS).await }));
+    fetch_task.task = Some(rt.0.spawn(async move {
+        fetch_osm_data(lat, lon, FETCH_RADIUS_METERS).await
+    }));
 
     // Remove any leftover world geometry while we fetch fresh data
     commands.insert_resource(PendingMapCleanup);
+}
+
+// Preferred path: start fetch when a StartWorldLoad event is received (works in Globe mode)
+fn begin_osm_fetch_on_event(
+    mut commands: Commands,
+    mut fetch_task: ResMut<OsmFetchTask>,
+    mut loading_state: ResMut<DataLoadingState>,
+    mut events: EventReader<StartWorldLoad>,
+    rt: Res<TokioRuntimeHandle>,
+) {
+    let mut started = false;
+    for ev in events.read() {
+        // only start the most recent request; replaces any in-flight task
+        fetch_task.task = Some(rt.0.spawn(fetch_osm_data(
+            ev.latitude,
+            ev.longitude,
+            FETCH_RADIUS_METERS,
+        )));
+        loading_state.is_loading = true;
+        loading_state.progress = 0.1;
+        loading_state.status_message = format!(
+            "Loading world data around ({:.4}, {:.4})",
+            ev.latitude, ev.longitude
+        );
+        commands.insert_resource(PendingMapCleanup);
+        started = true;
+    }
+
+    if started {
+        info!("Started OSM fetch from StartWorldLoad event");
+    }
 }
 
 #[derive(Resource)]
@@ -78,12 +127,13 @@ fn poll_osm_fetch(
     mut map_root_query: Query<Entity, With<MapRoot>>,
     mut world_loaded_events: EventWriter<WorldLoadedEvent>,
     pending_cleanup: Option<ResMut<PendingMapCleanup>>,
+    mut pending_map: ResMut<PendingMapData>,
 ) {
     let Some(task) = fetch_task.task.as_mut() else {
         return;
     };
 
-    if let Some(result) = block_on(poll_once(task)) {
+    if let Some(join_result) = block_on(poll_once(task)) {
         fetch_task.task = None;
 
         // Ensure map roots are cleared exactly once when fetch completes
@@ -98,40 +148,13 @@ fn poll_osm_fetch(
             commands.remove_resource::<PendingMapCleanup>();
         }
 
-        match result {
-            Ok(map_data) => {
+        match join_result {
+            Ok(Ok(map_data)) => {
                 loading_state.status_message = "Generating terrain and world assets".to_string();
                 loading_state.progress = 0.6;
 
-                let world_root = commands.spawn((SpatialBundle::default(), MapRoot)).id();
-
-                spawn_polygons(
-                    world_root,
-                    &map_data.polygons,
-                    &mut commands,
-                    &mut meshes,
-                    &mut materials,
-                    &map_assets,
-                    map_data.center_lat as f32,
-                    map_data.center_lon as f32,
-                );
-                spawn_lines(
-                    world_root,
-                    &map_data.lines,
-                    &mut commands,
-                    &mut meshes,
-                    &mut materials,
-                    map_data.center_lat as f32,
-                    map_data.center_lon as f32,
-                );
-                spawn_points(
-                    world_root,
-                    &map_data.points,
-                    &mut commands,
-                    &map_assets,
-                    map_data.center_lat as f32,
-                    map_data.center_lon as f32,
-                );
+                // Hold onto the data; actual spawning happens after we switch to Simulation3D
+                pending_map.0 = Some(map_data.clone());
 
                 loading_state.status_message = "World ready".to_string();
                 loading_state.progress = 1.0;
@@ -139,9 +162,15 @@ fn poll_osm_fetch(
 
                 world_loaded_events.send(WorldLoadedEvent { map_data });
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 error!("Failed to load OSM data: {err:#}");
                 loading_state.status_message = format!("Failed to load world: {err}");
+                loading_state.progress = 0.0;
+                loading_state.is_loading = false;
+            }
+            Err(join_err) => {
+                error!("OSM fetch task join error: {join_err:#}");
+                loading_state.status_message = format!("Loader crashed: {join_err}");
                 loading_state.progress = 0.0;
                 loading_state.is_loading = false;
             }
@@ -152,6 +181,57 @@ fn poll_osm_fetch(
             loading_state.progress += 0.02f32.min(0.5 - loading_state.progress);
         }
     }
+}
+
+// Spawn any pending world data into the scene when entering Simulation3D
+fn spawn_pending_world(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    map_assets: Res<MapAssets>,
+    mut pending_map: ResMut<PendingMapData>,
+    mut map_root_query: Query<Entity, With<MapRoot>>,
+) {
+    let Some(map_data) = pending_map.0.take() else {
+        return;
+    };
+
+    // Ensure an empty scene tree under MapRoot
+    for entity in map_root_query.iter_mut() {
+        commands.entity(entity).despawn_recursive();
+    }
+
+    let world_root = commands.spawn((SpatialBundle::default(), MapRoot)).id();
+
+    spawn_polygons(
+        world_root,
+        &map_data.polygons,
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &map_assets,
+        map_data.center_lat as f32,
+        map_data.center_lon as f32,
+    );
+    spawn_lines(
+        world_root,
+        &map_data.lines,
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        map_data.center_lat as f32,
+        map_data.center_lon as f32,
+    );
+    spawn_points(
+        world_root,
+        &map_data.points,
+        &mut commands,
+        &map_assets,
+        map_data.center_lat as f32,
+        map_data.center_lon as f32,
+    );
+
+    info!("Spawned pending world into Simulation3D");
 }
 
 fn spawn_polygons(

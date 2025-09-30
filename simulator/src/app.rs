@@ -3,6 +3,7 @@ use bevy_egui::EguiPlugin;
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use bevy_rapier3d::prelude::*;
 
+use crate::app_state::AppMode;
 use crate::camera::CameraPlugin;
 use crate::communication::{CommunicationChannels, CommunicationPlugin};
 use crate::drone_controller::DroneControllerPlugin;
@@ -29,7 +30,10 @@ impl VisualizerApp {
     ) {
         app
             // Bevy plugins
-            .add_plugins(DefaultPlugins.set(WindowPlugin {
+            .add_plugins(DefaultPlugins
+                .build()
+                .disable::<bevy::log::LogPlugin>()
+                .set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "AgBot Drone Visualizer".into(),
                     resolution: (1920.0, 1080.0).into(),
@@ -67,7 +71,8 @@ impl VisualizerApp {
             .insert_resource(GeoOrigin::default())
             .add_event::<NavigateToGeo>()
             // Systems
-            .add_systems(Startup, setup_scene)
+            .add_systems(OnEnter(AppMode::Simulation3D), setup_simulation_scene)
+            .add_systems(OnExit(AppMode::Simulation3D), cleanup_simulation_scene)
             .add_systems(
                 Update,
                 (handle_keyboard_input, update_time, update_app_state),
@@ -75,49 +80,66 @@ impl VisualizerApp {
     }
 }
 
-fn setup_scene(
+#[derive(Component)]
+struct SimulationEnvironmentRoot;
+
+fn setup_simulation_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Add ambient light
     commands.insert_resource(AmbientLight {
         color: Color::WHITE,
-        brightness: 0.3,
+        brightness: 0.6,
     });
 
-    // Add directional light (sun)
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
-            color: Color::WHITE,
-            illuminance: 10000.0,
-            shadows_enabled: true,
-            ..default()
-        },
-        transform: Transform::from_xyz(10.0, 100.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
-        ..default()
-    });
+    let root = commands
+        .spawn((
+            Name::new("SimulationEnvironment"),
+            SimulationEnvironmentRoot,
+        ))
+        .id();
 
-    // Add ground plane with physics collider
-    commands.spawn((
-        PbrBundle {
-            mesh: meshes.add(Plane3d::default().mesh().size(1000.0, 1000.0)),
-            material: materials.add(StandardMaterial {
-                base_color: Color::srgb(0.3, 0.5, 0.3),
+    // Add ambient light
+    let sun = commands
+        .spawn(DirectionalLightBundle {
+            directional_light: DirectionalLight {
+                color: Color::WHITE,
+                illuminance: 12000.0,
+                shadows_enabled: true,
                 ..default()
-            }),
+            },
+            transform: Transform::from_xyz(30.0, 120.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
             ..default()
-        },
-        RigidBody::Fixed,
-        Collider::cuboid(500.0, 0.1, 500.0),
-    ));
+        })
+        .id();
+    commands.entity(root).add_child(sun);
+
+    let ground = commands
+        .spawn((
+            PbrBundle {
+                mesh: meshes.add(Plane3d::default().mesh().size(1000.0, 1000.0)),
+                material: materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.32, 0.47, 0.28),
+                    perceptual_roughness: 0.9,
+                    ..default()
+                }),
+                transform: Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
+                ..default()
+            },
+            RigidBody::Fixed,
+            Collider::cuboid(500.0, 0.1, 500.0),
+        ))
+        .id();
+    commands.entity(root).add_child(ground);
 
     // Add some test obstacles for LiDAR to detect
-    spawn_test_obstacles(&mut commands, &mut meshes, &mut materials);
+    spawn_test_obstacles(&mut commands, root, &mut meshes, &mut materials);
 }
 
 fn spawn_test_obstacles(
     commands: &mut Commands,
+    root: Entity,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
 ) {
@@ -128,7 +150,7 @@ fn spawn_test_obstacles(
         let x = (i as f32 - 2.0) * 10.0;
         let height = 2.0 + i as f32;
 
-        commands.spawn((
+        let cube = commands.spawn((
             PbrBundle {
                 mesh: meshes.add(Cuboid::new(2.0, height, 2.0)),
                 material: materials.add(StandardMaterial {
@@ -140,7 +162,8 @@ fn spawn_test_obstacles(
             },
             RigidBody::Fixed,
             Collider::cuboid(1.0, height / 2.0, 1.0),
-        ));
+        )).id();
+        commands.entity(root).add_child(cube);
     }
 
     // Add some trees (cylinders)
@@ -150,7 +173,7 @@ fn spawn_test_obstacles(
         let x = angle.cos() * radius;
         let z = angle.sin() * radius;
 
-        commands.spawn((
+        let tree = commands.spawn((
             PbrBundle {
                 mesh: meshes.add(Cylinder::new(1.0, 8.0)),
                 material: materials.add(StandardMaterial {
@@ -162,6 +185,16 @@ fn spawn_test_obstacles(
             },
             RigidBody::Fixed,
             Collider::cylinder(4.0, 1.0),
-        ));
+        )).id();
+        commands.entity(root).add_child(tree);
+    }
+}
+
+fn cleanup_simulation_scene(
+    mut commands: Commands,
+    roots: Query<Entity, With<SimulationEnvironmentRoot>>,
+) {
+    for entity in roots.iter() {
+        commands.entity(entity).despawn_recursive();
     }
 }

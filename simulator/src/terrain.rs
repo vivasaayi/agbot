@@ -9,18 +9,23 @@ pub struct TerrainPlugin;
 
 impl Plugin for TerrainPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_terrain).add_systems(
-            Update,
-            (
-                streamer::terrain_streamer_system,
-                streamer::update_terrain_lod,
-                render_ndvi_overlay,
-                handle_terrain_click,
-            )
-                .run_if(not(in_state(AppMode::Globe))),
-        );
+        app.add_systems(OnEnter(AppMode::Simulation3D), setup_terrain)
+            .add_systems(OnExit(AppMode::Simulation3D), cleanup_terrain)
+            .add_systems(
+                Update,
+                (
+                    streamer::terrain_streamer_system,
+                    streamer::update_terrain_lod,
+                    render_ndvi_overlay,
+                    handle_terrain_click,
+                )
+                    .run_if(in_state(AppMode::Simulation3D)),
+            );
     }
 }
+
+#[derive(Component)]
+struct TerrainRoot;
 
 fn setup_terrain(
     mut commands: Commands,
@@ -29,6 +34,10 @@ fn setup_terrain(
     _config: Res<AppConfig>,
 ) {
     info!("Setting up terrain system...");
+
+    let root = commands
+        .spawn((TerrainRoot, Name::new("TerrainRoot")))
+        .id();
 
     // Create initial terrain tiles
     let tile_size = 100.0;
@@ -40,7 +49,7 @@ fn setup_terrain(
             let world_x = x as f32 * tile_size;
             let world_z = z as f32 * tile_size;
 
-            commands.spawn((
+            let tile = commands.spawn((
                 PbrBundle {
                     mesh: meshes.add(Plane3d::default().mesh().size(tile_size, tile_size)),
                     material: materials.add(StandardMaterial {
@@ -55,8 +64,15 @@ fn setup_terrain(
                     ndvi_value: 0.5 + (x + z) as f32 * 0.1 % 0.5,
                     visible: false,
                 },
-            ));
+            )).id();
+            commands.entity(root).add_child(tile);
         }
+    }
+}
+
+fn cleanup_terrain(mut commands: Commands, query: Query<Entity, With<TerrainRoot>>) {
+    for entity in query.iter() {
+        commands.entity(entity).despawn_recursive();
     }
 }
 

@@ -1,6 +1,7 @@
-use crate::app_state::AppMode;
+use crate::app_state::{AppMode, DataLoadingState};
 use crate::flight_ui::AppState;
-use crate::globe_view::GlobeState;
+use crate::globe_view::{GlobeLocationSelected, GlobeState};
+use crate::map_loader::{StartWorldLoad, WorldLoadedEvent};
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
@@ -17,7 +18,13 @@ impl Plugin for World3DPlugin {
             )
             .add_systems(
                 Update,
-                (handle_city_search_ui,).run_if(in_state(AppState::CitySearch)),
+                (handle_city_search_ui, process_globe_selection)
+                    .run_if(in_state(AppState::CitySearch)),
+            )
+            .add_systems(
+                Update,
+                (world_loading_ui, handle_world_loaded_transition)
+                    .run_if(in_state(AppState::WorldLoading)),
             );
     }
 }
@@ -25,7 +32,7 @@ impl Plugin for World3DPlugin {
 #[derive(Component)]
 struct World3DEntity;
 
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone)]
 pub struct World3DState {
     pub search_query: String,
     pub selected_location: Option<WorldLocation>,
@@ -53,13 +60,16 @@ fn setup_city_search_with_globe(mut commands: Commands, mut app_mode: ResMut<Nex
 
 fn setup_3d_world(
     mut commands: Commands,
+    existing_state: Option<Res<World3DState>>,
     globe_state: Option<ResMut<GlobeState>>,
     mut app_mode: ResMut<NextState<AppMode>>,
 ) {
     info!("Entering 3D World Exploration mode");
 
-    // Initialize World3D state
-    commands.insert_resource(World3DState::default());
+    // Preserve previously selected target if available
+    let mut state = existing_state.map(|s| s.clone()).unwrap_or_default();
+    state.show_load_button = false;
+    commands.insert_resource(state);
 
     // Configure globe for exploration mode if available
     if let Some(mut globe_state) = globe_state {
@@ -113,14 +123,7 @@ fn handle_city_search_ui(
 
             ui.separator();
 
-            // Load Location button (only show if city selected)
-            if world_state.show_load_button {
-                if ui.button("📍 Load Location").clicked() {
-                    info!("Loading 3D world for selected location");
-                    app_mode.set(AppMode::MainMenu); // Exit globe mode
-                    next_app_state.set(AppState::World3D); // Enter 3D world
-                }
-            }
+            ui.label("�️ Click anywhere on the globe to load a detailed terrain view.");
         });
 
         // Show selected location info
@@ -142,6 +145,7 @@ fn handle_3d_ui(
     mut contexts: EguiContexts,
     mut world_state: ResMut<World3DState>,
     mut next_app_state: ResMut<NextState<AppState>>,
+    mut app_mode: ResMut<NextState<AppMode>>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -151,6 +155,7 @@ fn handle_3d_ui(
             // Back to Menu button
             if ui.button("🠔 Back to Menu").clicked() {
                 next_app_state.set(AppState::MainMenu);
+                app_mode.set(AppMode::MainMenu);
             }
 
             ui.separator();
@@ -209,5 +214,118 @@ fn handle_3d_input(
     if movement != Vec3::ZERO {
         // We'll implement camera movement when we integrate with globe_view.rs
         info!("Camera movement: {:?}", movement);
+    }
+}
+
+fn process_globe_selection(
+    mut events: EventReader<GlobeLocationSelected>,
+    mut world_state: Option<ResMut<World3DState>>,
+    mut next_app_state: ResMut<NextState<AppState>>,
+    mut next_mode: ResMut<NextState<AppMode>>,
+    mut loading_state: ResMut<DataLoadingState>,
+    mut start_load: EventWriter<StartWorldLoad>,
+) {
+    let Some(mut state) = world_state else {
+        // Drain events to keep reader in sync even if state unavailable
+        for _ in events.read() {}
+        return;
+    };
+
+    let mut selection_triggered = false;
+
+    for event in events.read() {
+        selection_triggered = true;
+        state.selected_location = Some(WorldLocation {
+            name: format!("Lat {:+.2}°, Lon {:+.2}°", event.latitude, event.longitude),
+            latitude: event.latitude,
+            longitude: event.longitude,
+            country: "Custom selection".to_string(),
+        });
+    state.show_load_button = true;
+        state.camera_target = None;
+
+        loading_state.is_loading = true;
+        loading_state.progress = 0.0;
+        loading_state.status_message = format!(
+            "Fetching terrain around {:+.2}°, {:+.2}°",
+            event.latitude, event.longitude
+        );
+
+        // Kick off background world loading while we remain in Globe mode
+        start_load.send(StartWorldLoad {
+            latitude: event.latitude,
+            longitude: event.longitude,
+        });
+    }
+
+    if selection_triggered {
+        // Show loading screen, but stay in Globe mode until data is ready for a smoother flow
+        next_app_state.set(AppState::WorldLoading);
+        // AppMode remains Globe; we'll switch to Simulation3D after we receive WorldLoadedEvent
+    }
+}
+
+fn world_loading_ui(
+    mut contexts: EguiContexts,
+    world_state: Option<Res<World3DState>>,
+    loading_state: Res<DataLoadingState>,
+) {
+    let ctx = contexts.ctx_mut();
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(120.0);
+            ui.heading("Preparing detailed terrain...");
+            ui.add_space(20.0);
+
+            if let Some(state) = world_state {
+                if state.show_load_button {
+                    ui.label("🌍 Loading your selected destination...");
+                }
+
+                if let Some(location) = &state.selected_location {
+                    ui.label(format!(
+                        "📍 {:+.2}° lat, {:+.2}° lon",
+                        location.latitude, location.longitude
+                    ));
+                    if !location.name.is_empty() {
+                        ui.label(&location.name);
+                    }
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.add(egui::ProgressBar::new(loading_state.progress.clamp(0.0, 1.0))
+                .desired_width(300.0)
+                .text(loading_state.status_message.clone()));
+
+            ui.add_space(30.0);
+            ui.label("Tip: you can always return to the globe to pick another destination.");
+        });
+    });
+}
+
+fn handle_world_loaded_transition(
+    mut events: EventReader<WorldLoadedEvent>,
+    mut loading_state: ResMut<DataLoadingState>,
+    mut next_app_state: ResMut<NextState<AppState>>,
+    mut world_state: Option<ResMut<World3DState>>,
+    mut next_mode: ResMut<NextState<AppMode>>,
+) {
+    let mut world_ready = false;
+    for _event in events.read() {
+        world_ready = true;
+    }
+
+    if world_ready {
+        loading_state.is_loading = false;
+        loading_state.progress = 1.0;
+        loading_state.status_message = "World ready".to_string();
+        if let Some(mut state) = world_state {
+            state.show_load_button = false;
+        }
+        // Now transition render pipeline to Simulation3D and show the 3D view
+        next_mode.set(AppMode::Simulation3D);
+        next_app_state.set(AppState::World3D);
     }
 }

@@ -10,6 +10,8 @@ members = [
     "simulator",
     "lidar_mapper",
     "imagery_processor",
+    "geo_hub",
+    "geo_viewer",
 ]
 resolver = "2"
 

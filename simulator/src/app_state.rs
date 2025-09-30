@@ -21,12 +21,11 @@ pub struct SelectedRegion {
 
 impl Default for SelectedRegion {
     fn default() -> Self {
-        // Default to Rome area (from your current GeoJSON)
         Self {
-            center_lat: 41.8992,
-            center_lon: 12.4784,
-            bounds_width_degrees: 0.01,
-            bounds_height_degrees: 0.01,
+            center_lat: 0.0,
+            center_lon: 0.0,
+            bounds_width_degrees: 0.0,
+            bounds_height_degrees: 0.0,
         }
     }
 }
