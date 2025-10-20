@@ -227,7 +227,10 @@ pub async fn fetch_osm_data(lat: f64, lon: f64, radius_m: f64) -> Result<OsmMapD
             continue;
         }
 
-        if matches!(tags.get("natural").map(String::as_str), Some("wood" | "forest")) {
+        if matches!(
+            tags.get("natural").map(String::as_str),
+            Some("wood" | "forest")
+        ) {
             if coords.len() >= 3 {
                 polygons.push(MapPolygon {
                     kind: PolygonKind::Forest,
@@ -266,7 +269,7 @@ pub async fn fetch_osm_data(lat: f64, lon: f64, radius_m: f64) -> Result<OsmMapD
         center_lon: lon,
         polygons,
         lines,
-                points,
+        points,
     })
 }
 
@@ -333,8 +336,12 @@ fn handle_point_element(points: &mut Vec<MapPoint>, element: &Element) {
         return;
     };
 
-    let Some(lat) = element.lat else { return; };
-    let Some(lon) = element.lon else { return; };
+    let Some(lat) = element.lat else {
+        return;
+    };
+    let Some(lon) = element.lon else {
+        return;
+    };
 
     if matches!(tags.get("natural").map(String::as_str), Some("tree")) {
         points.push(MapPoint {

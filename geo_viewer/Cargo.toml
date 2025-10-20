@@ -1,0 +1,14 @@
+[package]
+name = "geo_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+bevy = { workspace = true }
+bevy_egui = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+image = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
+futures-lite = "2.3"

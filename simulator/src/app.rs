@@ -30,18 +30,20 @@ impl VisualizerApp {
     ) {
         app
             // Bevy plugins
-            .add_plugins(DefaultPlugins
-                .build()
-                .disable::<bevy::log::LogPlugin>()
-                .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "AgBot Drone Visualizer".into(),
-                    resolution: (1920.0, 1080.0).into(),
-                    resizable: true,
-                    ..default()
-                }),
-                ..default()
-            }))
+            .add_plugins(
+                DefaultPlugins
+                    .build()
+                    .disable::<bevy::log::LogPlugin>()
+                    .set(WindowPlugin {
+                        primary_window: Some(Window {
+                            title: "AgBot Drone Visualizer".into(),
+                            resolution: (1920.0, 1080.0).into(),
+                            resizable: true,
+                            ..default()
+                        }),
+                        ..default()
+                    }),
+            )
             // External plugins
             .add_plugins(EguiPlugin)
             .add_plugins(WorldInspectorPlugin::new())
@@ -150,19 +152,21 @@ fn spawn_test_obstacles(
         let x = (i as f32 - 2.0) * 10.0;
         let height = 2.0 + i as f32;
 
-        let cube = commands.spawn((
-            PbrBundle {
-                mesh: meshes.add(Cuboid::new(2.0, height, 2.0)),
-                material: materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.8, 0.4, 0.2),
+        let cube = commands
+            .spawn((
+                PbrBundle {
+                    mesh: meshes.add(Cuboid::new(2.0, height, 2.0)),
+                    material: materials.add(StandardMaterial {
+                        base_color: Color::srgb(0.8, 0.4, 0.2),
+                        ..default()
+                    }),
+                    transform: Transform::from_xyz(x, height / 2.0, 15.0),
                     ..default()
-                }),
-                transform: Transform::from_xyz(x, height / 2.0, 15.0),
-                ..default()
-            },
-            RigidBody::Fixed,
-            Collider::cuboid(1.0, height / 2.0, 1.0),
-        )).id();
+                },
+                RigidBody::Fixed,
+                Collider::cuboid(1.0, height / 2.0, 1.0),
+            ))
+            .id();
         commands.entity(root).add_child(cube);
     }
 
@@ -173,19 +177,21 @@ fn spawn_test_obstacles(
         let x = angle.cos() * radius;
         let z = angle.sin() * radius;
 
-        let tree = commands.spawn((
-            PbrBundle {
-                mesh: meshes.add(Cylinder::new(1.0, 8.0)),
-                material: materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.4, 0.8, 0.2),
+        let tree = commands
+            .spawn((
+                PbrBundle {
+                    mesh: meshes.add(Cylinder::new(1.0, 8.0)),
+                    material: materials.add(StandardMaterial {
+                        base_color: Color::srgb(0.4, 0.8, 0.2),
+                        ..default()
+                    }),
+                    transform: Transform::from_xyz(x, 4.0, z),
                     ..default()
-                }),
-                transform: Transform::from_xyz(x, 4.0, z),
-                ..default()
-            },
-            RigidBody::Fixed,
-            Collider::cylinder(4.0, 1.0),
-        )).id();
+                },
+                RigidBody::Fixed,
+                Collider::cylinder(4.0, 1.0),
+            ))
+            .id();
         commands.entity(root).add_child(tree);
     }
 }

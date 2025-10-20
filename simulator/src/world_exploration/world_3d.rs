@@ -241,7 +241,7 @@ fn process_globe_selection(
             longitude: event.longitude,
             country: "Custom selection".to_string(),
         });
-    state.show_load_button = true;
+        state.show_load_button = true;
         state.camera_target = None;
 
         loading_state.is_loading = true;
@@ -295,9 +295,11 @@ fn world_loading_ui(
             }
 
             ui.add_space(10.0);
-            ui.add(egui::ProgressBar::new(loading_state.progress.clamp(0.0, 1.0))
-                .desired_width(300.0)
-                .text(loading_state.status_message.clone()));
+            ui.add(
+                egui::ProgressBar::new(loading_state.progress.clamp(0.0, 1.0))
+                    .desired_width(300.0)
+                    .text(loading_state.status_message.clone()),
+            );
 
             ui.add_space(30.0);
             ui.label("Tip: you can always return to the globe to pick another destination.");
