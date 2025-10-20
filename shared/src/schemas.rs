@@ -96,6 +96,58 @@ pub struct NdviResult {
     pub vegetation_percentage: f32,
 }
 
+/// Bounding box for area of interest
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BBox {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+}
+
+/// Area of Interest definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AOI {
+    pub id: String,
+    pub bbox: BBox,
+    pub name: Option<String>,
+}
+
+/// NDWI processing result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NdwiResult {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub source_images: Vec<uuid::Uuid>,
+    pub output_path: String,
+    pub water_mask_path: String,
+    pub geojson_path: String,
+    pub total_water_area: f64, // m²
+    pub water_bodies_count: usize,
+    pub min_ndwi: f32,
+    pub max_ndwi: f32,
+    pub mean_ndwi: f32,
+}
+
+/// Water body monitoring alert
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaterAlert {
+    pub aoi_id: String,
+    pub prev_area: f64,
+    pub curr_area: f64,
+    pub drop_pct: f64,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub next_rain_days: Option<u32>,
+    pub alert_level: AlertLevel,
+}
+
+/// Alert severity levels
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AlertLevel {
+    Info,
+    Warning,
+    Critical,
+}
+
 /// WebSocket message types for ground station communication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -105,5 +157,7 @@ pub enum WebSocketMessage {
     LidarUpdate { scan: LidarScan },
     ImageCaptured { image: MultispectralImage },
     NdviProcessed { result: NdviResult },
+    NdwiProcessed { result: NdwiResult },
+    WaterAlert { alert: WaterAlert },
     SystemStatus { status: String, message: String },
 }
