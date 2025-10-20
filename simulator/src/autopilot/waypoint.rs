@@ -217,10 +217,7 @@ mod tests {
 
         // Add required resources
         let mut mission = MissionData::default();
-        mission.waypoints = vec![
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(10.0, 0.0, 0.0),
-        ];
+        mission.waypoints = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0)];
         mission.replay_index = 0;
 
         let drone_registry = crate::resources::DroneRegistry::default();
@@ -320,10 +317,7 @@ mod tests {
 
         // Add required resources
         let mut mission = MissionData::default();
-        mission.waypoints = vec![
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(10.0, 0.0, 0.0),
-        ];
+        mission.waypoints = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0)];
         mission.replay_index = 0;
 
         let drone_registry = crate::resources::DroneRegistry::default();

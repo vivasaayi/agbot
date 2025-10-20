@@ -48,10 +48,10 @@ use communication::setup_communication_task;
 use flight_ui::FlightUIPlugin;
 use geodesy::GeodesyPlugin;
 use globe_view::GlobePlugin;
-use resources::AppConfig;
-use world_exploration::World3DPlugin;
 use map_loader::MapLoaderPlugin;
 use map_loader::TokioRuntimeHandle;
+use resources::AppConfig;
+use world_exploration::World3DPlugin;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -81,11 +81,11 @@ async fn main() -> Result<()> {
     app.init_state::<AppMode>()
         .insert_resource(SelectedRegion::default())
         .insert_resource(UIState::default())
-    .insert_resource(DataLoadingState::default())
+        .insert_resource(DataLoadingState::default())
         // Needed by globe_view::handle_search_animation
-    .insert_resource(GlobeSearchState::default())
-    // Tokio runtime handle so systems can spawn async tasks onto the existing runtime
-    .insert_resource(TokioRuntimeHandle(tokio::runtime::Handle::current()));
+        .insert_resource(GlobeSearchState::default())
+        // Tokio runtime handle so systems can spawn async tasks onto the existing runtime
+        .insert_resource(TokioRuntimeHandle(tokio::runtime::Handle::current()));
 
     // Add back minimal world view plugins
     app.add_plugins((

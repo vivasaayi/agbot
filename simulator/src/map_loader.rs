@@ -2,9 +2,9 @@ use anyhow::Result;
 use bevy::math::primitives::{Cone, Cylinder};
 use bevy::prelude::*;
 use bevy::tasks::futures_lite::future::{block_on, poll_once};
-use tokio::{runtime::Handle as TokioHandle, task::JoinHandle};
 use rand::Rng;
 use std::f32::consts::TAU;
+use tokio::{runtime::Handle as TokioHandle, task::JoinHandle};
 
 use crate::app_state::{AppMode, DataLoadingState, SelectedRegion};
 use crate::components::{MapFeature, MapFeatureType, MapRoot};
@@ -75,9 +75,8 @@ fn begin_osm_fetch(
     loading_state.progress = 0.1;
     loading_state.status_message = format!("Loading world data around ({:.4}, {:.4})", lat, lon);
 
-    fetch_task.task = Some(rt.0.spawn(async move {
-        fetch_osm_data(lat, lon, FETCH_RADIUS_METERS).await
-    }));
+    fetch_task.task =
+        Some(rt.0.spawn(async move { fetch_osm_data(lat, lon, FETCH_RADIUS_METERS).await }));
 
     // Remove any leftover world geometry while we fetch fresh data
     commands.insert_resource(PendingMapCleanup);
@@ -438,7 +437,12 @@ fn spawn_points(
             continue;
         }
 
-        let local = lonlat_to_local(center_lat, center_lon, point.coordinate[0], point.coordinate[1]);
+        let local = lonlat_to_local(
+            center_lat,
+            center_lon,
+            point.coordinate[0],
+            point.coordinate[1],
+        );
         let yaw = rng.gen::<f32>() * TAU;
 
         let tree_entity = commands

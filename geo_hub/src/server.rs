@@ -1,0 +1,79 @@
+use crate::{config::HubConfig, routes, state::AppState};
+use anyhow::Result;
+use axum::{routing::get, Router};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::net::TcpListener;
+use tracing::{info, warn};
+
+async fn health_handler() -> &'static str {
+    "ok"
+}
+
+async fn ready_handler() -> &'static str {
+    "ready"
+}
+
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
+        .route("/api/scenes", get(routes::list_scenes))
+        .route(
+            "/api/scenes/:scene_id/products/:kind",
+            get(routes::stream_product),
+        )
+        .with_state(state)
+}
+
+/// Start the geo_hub HTTP server using configuration and resources.
+pub async fn serve(config: HubConfig, pool: crate::db::DbPool) -> Result<()> {
+    let addr: SocketAddr = config.bind_address.parse()?;
+    let shared_config = Arc::new(config);
+    let state = AppState {
+        pool: pool.clone(),
+        config: Arc::clone(&shared_config),
+    };
+
+    let router = build_router(state);
+
+    let listener = TcpListener::bind(addr).await?;
+    info!(%addr, "geo_hub listening");
+
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
+
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(%err, "failed to install Ctrl+C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            sigterm.recv().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    // Give upstream tasks a short window to finish
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    info!("shutdown signal received");
+}

@@ -35,9 +35,7 @@ fn setup_terrain(
 ) {
     info!("Setting up terrain system...");
 
-    let root = commands
-        .spawn((TerrainRoot, Name::new("TerrainRoot")))
-        .id();
+    let root = commands.spawn((TerrainRoot, Name::new("TerrainRoot"))).id();
 
     // Create initial terrain tiles
     let tile_size = 100.0;
@@ -49,22 +47,24 @@ fn setup_terrain(
             let world_x = x as f32 * tile_size;
             let world_z = z as f32 * tile_size;
 
-            let tile = commands.spawn((
-                PbrBundle {
-                    mesh: meshes.add(Plane3d::default().mesh().size(tile_size, tile_size)),
-                    material: materials.add(StandardMaterial {
-                        base_color: Color::srgb(0.2 + (x + z) as f32 * 0.05 % 0.3, 0.6, 0.2),
+            let tile = commands
+                .spawn((
+                    PbrBundle {
+                        mesh: meshes.add(Plane3d::default().mesh().size(tile_size, tile_size)),
+                        material: materials.add(StandardMaterial {
+                            base_color: Color::srgb(0.2 + (x + z) as f32 * 0.05 % 0.3, 0.6, 0.2),
+                            ..default()
+                        }),
+                        transform: Transform::from_xyz(world_x, 0.0, world_z),
                         ..default()
-                    }),
-                    transform: Transform::from_xyz(world_x, 0.0, world_z),
-                    ..default()
-                },
-                TerrainTile { x, z, loaded: true },
-                SensorOverlay {
-                    ndvi_value: 0.5 + (x + z) as f32 * 0.1 % 0.5,
-                    visible: false,
-                },
-            )).id();
+                    },
+                    TerrainTile { x, z, loaded: true },
+                    SensorOverlay {
+                        ndvi_value: 0.5 + (x + z) as f32 * 0.1 % 0.5,
+                        visible: false,
+                    },
+                ))
+                .id();
             commands.entity(root).add_child(tile);
         }
     }
