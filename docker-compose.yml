@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: agbot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agbot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./mission_planner/scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - agbot-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agbot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-test:
+    image: postgres:15-alpine
+    container_name: agbot-postgres-test
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agbot_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+      - ./mission_planner/scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - agbot-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agbot_test"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: agbot-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@agbot.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "8080:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - agbot-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    driver: local
+  postgres_test_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+networks:
+  agbot-network:
+    driver: bridge

@@ -1,20 +1,38 @@
+use crate::{physics::PhysicsState, Drone};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use nalgebra::Vector3;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use crate::{Drone, physics::PhysicsState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FlightCommand {
-    Takeoff { altitude_m: f32 },
+    Takeoff {
+        altitude_m: f32,
+    },
     Land,
-    GoTo { x: f32, y: f32, z: f32, speed_ms: f32 },
-    Hover { duration_seconds: f32 },
-    SetSpeed { speed_ms: f32 },
-    SetHeading { heading_degrees: f32 },
+    GoTo {
+        x: f32,
+        y: f32,
+        z: f32,
+        speed_ms: f32,
+    },
+    Hover {
+        duration_seconds: f32,
+    },
+    SetSpeed {
+        speed_ms: f32,
+    },
+    SetHeading {
+        heading_degrees: f32,
+    },
     Emergency,
     ReturnToHome,
-    OrbitPoint { x: f32, y: f32, radius_m: f32, speed_ms: f32 },
+    OrbitPoint {
+        x: f32,
+        y: f32,
+        radius_m: f32,
+        speed_ms: f32,
+    },
 }
 
 pub struct FlightController {
@@ -39,7 +57,7 @@ pub struct PidController {
 impl FlightController {
     pub fn new(drone: &Drone) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
-        
+
         Self {
             drone_id: drone.id,
             command_receiver: receiver,
@@ -53,7 +71,8 @@ impl FlightController {
     }
 
     pub async fn send_command(&self, command: FlightCommand) -> Result<()> {
-        self.command_sender.send(command)
+        self.command_sender
+            .send(command)
             .map_err(|e| anyhow::anyhow!("Failed to send command: {}", e))?;
         Ok(())
     }
@@ -75,40 +94,27 @@ impl FlightController {
     fn process_command(&mut self, command: FlightCommand, state: &PhysicsState) -> Result<()> {
         match &command {
             FlightCommand::Takeoff { altitude_m } => {
-                self.target_position = Vector3::new(
-                    state.position.x,
-                    *altitude_m,
-                    state.position.z,
-                );
+                self.target_position =
+                    Vector3::new(state.position.x, *altitude_m, state.position.z);
             }
             FlightCommand::Land => {
-                self.target_position = Vector3::new(
-                    state.position.x,
-                    0.0,
-                    state.position.z,
-                );
+                self.target_position = Vector3::new(state.position.x, 0.0, state.position.z);
             }
             FlightCommand::GoTo { x, y, z, speed_ms } => {
                 self.target_position = Vector3::new(*x, *y, *z);
                 self.target_speed = *speed_ms;
             }
             FlightCommand::Hover { .. } => {
-                self.target_position = Vector3::new(
-                    state.position.x,
-                    state.position.y,
-                    state.position.z,
-                );
+                self.target_position =
+                    Vector3::new(state.position.x, state.position.y, state.position.z);
             }
             FlightCommand::SetSpeed { speed_ms } => {
                 self.target_speed = *speed_ms;
             }
             FlightCommand::Emergency => {
                 // Immediate stop and hover
-                self.target_position = Vector3::new(
-                    state.position.x,
-                    state.position.y,
-                    state.position.z,
-                );
+                self.target_position =
+                    Vector3::new(state.position.x, state.position.y, state.position.z);
                 self.target_speed = 0.0;
             }
             _ => {
@@ -120,7 +126,12 @@ impl FlightController {
         Ok(())
     }
 
-    fn execute_command(&mut self, _command: &FlightCommand, dt: f32, state: &PhysicsState) -> Result<()> {
+    fn execute_command(
+        &mut self,
+        _command: &FlightCommand,
+        dt: f32,
+        state: &PhysicsState,
+    ) -> Result<()> {
         // Calculate position error
         let current_pos = Vector3::new(state.position.x, state.position.y, state.position.z);
         let position_error = self.target_position - current_pos;

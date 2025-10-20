@@ -1,9 +1,9 @@
+use crate::{environment::Environment, physics::PhysicsState, DroneCapabilities};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
-use nalgebra::{Vector3, Point3};
+use nalgebra::{Point3, Vector3};
 use rand::Rng;
-use crate::{DroneCapabilities, environment::Environment, physics::PhysicsState};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorReading {
@@ -79,18 +79,34 @@ impl SensorSuite {
             imu: ImuSensor::new(),
             barometer: BarometerSensor::new(),
             magnetometer: MagnetometerSensor::new(),
-            camera: if capabilities.has_camera { Some(CameraSensor::new()) } else { None },
-            lidar: if capabilities.has_lidar { Some(LidarSensor::new()) } else { None },
-            multispectral: if capabilities.has_multispectral { Some(MultispectralSensor::new()) } else { None },
+            camera: if capabilities.has_camera {
+                Some(CameraSensor::new())
+            } else {
+                None
+            },
+            lidar: if capabilities.has_lidar {
+                Some(LidarSensor::new())
+            } else {
+                None
+            },
+            multispectral: if capabilities.has_multispectral {
+                Some(MultispectralSensor::new())
+            } else {
+                None
+            },
         }
     }
 
-    pub fn update(&mut self, state: &PhysicsState, environment: &Environment) -> Result<Vec<SensorReading>> {
+    pub fn update(
+        &mut self,
+        state: &PhysicsState,
+        environment: &Environment,
+    ) -> Result<Vec<SensorReading>> {
         let mut readings = Vec::new();
         let now = Utc::now();
 
         // GPS readings
-        if self.should_update(&self.gps.last_update, self.gps.update_rate_hz, now) {
+        if Self::should_update(&self.gps.last_update, self.gps.update_rate_hz, now) {
             if let Some(reading) = self.gps.read(state, environment)? {
                 readings.push(reading);
             }
@@ -98,7 +114,7 @@ impl SensorSuite {
         }
 
         // IMU readings
-        if self.should_update(&self.imu.last_update, self.imu.update_rate_hz, now) {
+        if Self::should_update(&self.imu.last_update, self.imu.update_rate_hz, now) {
             if let Some(reading) = self.imu.read(state, environment)? {
                 readings.push(reading);
             }
@@ -106,7 +122,11 @@ impl SensorSuite {
         }
 
         // Barometer readings
-        if self.should_update(&self.barometer.last_update, self.barometer.update_rate_hz, now) {
+        if Self::should_update(
+            &self.barometer.last_update,
+            self.barometer.update_rate_hz,
+            now,
+        ) {
             if let Some(reading) = self.barometer.read(state, environment)? {
                 readings.push(reading);
             }
@@ -114,7 +134,11 @@ impl SensorSuite {
         }
 
         // Magnetometer readings
-        if self.should_update(&self.magnetometer.last_update, self.magnetometer.update_rate_hz, now) {
+        if Self::should_update(
+            &self.magnetometer.last_update,
+            self.magnetometer.update_rate_hz,
+            now,
+        ) {
             if let Some(reading) = self.magnetometer.read(state, environment)? {
                 readings.push(reading);
             }
@@ -123,7 +147,7 @@ impl SensorSuite {
 
         // Camera readings
         if let Some(ref mut camera) = self.camera {
-            if self.should_update(&camera.last_capture, camera.fps, now) {
+            if Self::should_update(&camera.last_capture, camera.fps, now) {
                 if let Some(reading) = camera.capture(state, environment)? {
                     readings.push(reading);
                 }
@@ -133,7 +157,7 @@ impl SensorSuite {
 
         // LiDAR readings
         if let Some(ref mut lidar) = self.lidar {
-            if self.should_update(&lidar.last_scan, lidar.scan_rate_hz, now) {
+            if Self::should_update(&lidar.last_scan, lidar.scan_rate_hz, now) {
                 if let Some(reading) = lidar.scan(state, environment)? {
                     readings.push(reading);
                 }
@@ -143,7 +167,11 @@ impl SensorSuite {
 
         // Multispectral readings
         if let Some(ref mut multispectral) = self.multispectral {
-            if self.should_update(&multispectral.last_capture, multispectral.capture_rate_hz, now) {
+            if Self::should_update(
+                &multispectral.last_capture,
+                multispectral.capture_rate_hz,
+                now,
+            ) {
                 if let Some(reading) = multispectral.capture(state, environment)? {
                     readings.push(reading);
                 }
@@ -154,7 +182,7 @@ impl SensorSuite {
         Ok(readings)
     }
 
-    fn should_update(&self, last_update: &DateTime<Utc>, rate_hz: f32, now: DateTime<Utc>) -> bool {
+    fn should_update(last_update: &DateTime<Utc>, rate_hz: f32, now: DateTime<Utc>) -> bool {
         let interval_ms = (1000.0 / rate_hz) as i64;
         (now - *last_update).num_milliseconds() >= interval_ms
     }
@@ -169,9 +197,13 @@ impl GpsSensor {
         }
     }
 
-    pub fn read(&self, state: &PhysicsState, _environment: &Environment) -> Result<Option<SensorReading>> {
+    pub fn read(
+        &self,
+        state: &PhysicsState,
+        _environment: &Environment,
+    ) -> Result<Option<SensorReading>> {
         let mut rng = rand::thread_rng();
-        
+
         // Add GPS noise
         let noise_x = rng.gen_range(-self.accuracy_m..self.accuracy_m);
         let noise_y = rng.gen_range(-self.accuracy_m..self.accuracy_m);
@@ -211,7 +243,11 @@ impl ImuSensor {
         }
     }
 
-    pub fn read(&self, state: &PhysicsState, _environment: &Environment) -> Result<Option<SensorReading>> {
+    pub fn read(
+        &self,
+        state: &PhysicsState,
+        _environment: &Environment,
+    ) -> Result<Option<SensorReading>> {
         let mut rng = rand::thread_rng();
 
         // Add noise to acceleration and angular velocity
@@ -264,7 +300,11 @@ impl BarometerSensor {
         }
     }
 
-    pub fn read(&self, state: &PhysicsState, environment: &Environment) -> Result<Option<SensorReading>> {
+    pub fn read(
+        &self,
+        state: &PhysicsState,
+        environment: &Environment,
+    ) -> Result<Option<SensorReading>> {
         let mut rng = rand::thread_rng();
         let conditions = environment.get_conditions();
 
@@ -298,7 +338,11 @@ impl MagnetometerSensor {
         }
     }
 
-    pub fn read(&self, state: &PhysicsState, _environment: &Environment) -> Result<Option<SensorReading>> {
+    pub fn read(
+        &self,
+        state: &PhysicsState,
+        _environment: &Environment,
+    ) -> Result<Option<SensorReading>> {
         let mut rng = rand::thread_rng();
 
         let heading_noise = rng.gen_range(-self.heading_accuracy_deg..self.heading_accuracy_deg);
@@ -333,9 +377,13 @@ impl CameraSensor {
         }
     }
 
-    pub fn capture(&self, state: &PhysicsState, environment: &Environment) -> Result<Option<SensorReading>> {
+    pub fn capture(
+        &self,
+        state: &PhysicsState,
+        environment: &Environment,
+    ) -> Result<Option<SensorReading>> {
         let conditions = environment.get_conditions();
-        
+
         // Simulate image capture metadata
         let data = serde_json::json!({
             "image_id": uuid::Uuid::new_v4(),
@@ -384,16 +432,20 @@ impl LidarSensor {
         }
     }
 
-    pub fn scan(&self, state: &PhysicsState, _environment: &Environment) -> Result<Option<SensorReading>> {
+    pub fn scan(
+        &self,
+        state: &PhysicsState,
+        _environment: &Environment,
+    ) -> Result<Option<SensorReading>> {
         let mut rng = rand::thread_rng();
-        
+
         // Generate simulated point cloud
         let mut points = Vec::new();
         for _ in 0..self.points_per_scan {
             let distance = rng.gen_range(1.0..self.range_m);
             let angle = rng.gen_range(0.0..2.0 * std::f32::consts::PI);
             let elevation = rng.gen_range(-0.5..0.5);
-            
+
             points.push(serde_json::json!({
                 "x": distance * angle.cos(),
                 "y": distance * elevation,
@@ -426,17 +478,26 @@ impl LidarSensor {
 impl MultispectralSensor {
     pub fn new() -> Self {
         Self {
-            bands: vec!["Red".to_string(), "Green".to_string(), "Blue".to_string(), "NIR".to_string()],
+            bands: vec![
+                "Red".to_string(),
+                "Green".to_string(),
+                "Blue".to_string(),
+                "NIR".to_string(),
+            ],
             resolution: (640, 480),
             capture_rate_hz: 5.0,
             last_capture: Utc::now() - chrono::Duration::milliseconds(200),
         }
     }
 
-    pub fn capture(&self, state: &PhysicsState, environment: &Environment) -> Result<Option<SensorReading>> {
+    pub fn capture(
+        &self,
+        state: &PhysicsState,
+        environment: &Environment,
+    ) -> Result<Option<SensorReading>> {
         let mut rng = rand::thread_rng();
         let conditions = environment.get_conditions();
-        
+
         // Simulate multispectral data for each band
         let mut band_data = Vec::new();
         for band in &self.bands {

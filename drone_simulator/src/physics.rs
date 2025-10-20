@@ -1,7 +1,7 @@
+use crate::{environment::Environment, Drone};
 use anyhow::Result;
+use nalgebra::{Point3, Vector3};
 use serde::{Deserialize, Serialize};
-use nalgebra::{Vector3, Point3};
-use crate::{Drone, environment::Environment};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhysicsState {
@@ -16,9 +16,9 @@ pub struct PhysicsState {
 
 pub struct DronePhysics {
     pub state: PhysicsState,
-    pub mass: f32,           // kg
+    pub mass: f32, // kg
     pub drag_coefficient: f32,
-    pub max_thrust: f32,     // Newtons
+    pub max_thrust: f32,       // Newtons
     pub inertia: Vector3<f32>, // Moment of inertia
 }
 
@@ -34,9 +34,9 @@ impl DronePhysics {
                 forces: Vector3::zeros(),
                 torques: Vector3::zeros(),
             },
-            mass: 2.5,           // 2.5 kg typical drone
+            mass: 2.5, // 2.5 kg typical drone
             drag_coefficient: 0.1,
-            max_thrust: 30.0,    // 30N max thrust
+            max_thrust: 30.0,                     // 30N max thrust
             inertia: Vector3::new(0.1, 0.1, 0.2), // kg⋅m²
         }
     }
@@ -80,7 +80,7 @@ impl DronePhysics {
             self.state.torques.y / self.inertia.y,
             self.state.torques.z / self.inertia.z,
         );
-        
+
         self.state.angular_velocity += angular_acc * dt;
         self.state.orientation += self.state.angular_velocity * dt;
 
@@ -100,10 +100,11 @@ impl DronePhysics {
 
         // Wind force based on relative velocity
         let relative_velocity = wind_velocity - self.state.velocity;
-        let force_magnitude = 0.5 * conditions.air_density * 
-                             self.drag_coefficient * 
-                             relative_velocity.magnitude_squared();
-        
+        let force_magnitude = 0.5
+            * conditions.air_density
+            * self.drag_coefficient
+            * relative_velocity.magnitude_squared();
+
         if relative_velocity.magnitude() > 0.0 {
             relative_velocity.normalize() * force_magnitude
         } else {
@@ -159,7 +160,7 @@ mod tests {
         let drone = Drone::new("Test".to_string(), "Quad".to_string());
         let mut physics = DronePhysics::new(&drone);
         let environment = Environment::new();
-        
+
         let state = physics.update(0.1, &environment).unwrap();
         // Should have some acceleration due to gravity
         assert!(state.acceleration.y < 0.0);

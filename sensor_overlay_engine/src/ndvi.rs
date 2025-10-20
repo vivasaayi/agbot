@@ -1,10 +1,15 @@
+use crate::{
+    OverlayData, OverlayProcessor, OverlayType, SensorInput, SensorOverlay, SpatialBounds,
+};
 use anyhow::Result;
+use chrono::Utc;
 use image::{ImageBuffer, Rgb, RgbImage};
 use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+use uuid::Uuid;
 
-/// NDVI (Normalized Difference Vegetation Index) processor
 #[derive(Debug, Clone)]
 pub struct NdviProcessor {
     pub config: NdviConfig,
@@ -27,23 +32,6 @@ pub struct ColorMapping {
     pub soil: [u8; 3],
 }
 
-impl Default for NdviConfig {
-    fn default() -> Self {
-        Self {
-            red_band_index: 0,
-            nir_band_index: 1,
-            output_format: "PNG".to_string(),
-            color_mapping: ColorMapping {
-                low_vegetation: [255, 0, 0],    // Red
-                medium_vegetation: [255, 255, 0], // Yellow
-                high_vegetation: [0, 255, 0],   // Green
-                water: [0, 0, 255],             // Blue
-                soil: [139, 69, 19],            // Brown
-            },
-        }
-    }
-}
-
 impl NdviProcessor {
     pub fn new(config: NdviConfig) -> Self {
         Self { config }
@@ -52,7 +40,9 @@ impl NdviProcessor {
     /// Calculate NDVI from multispectral image data
     pub fn calculate_ndvi(&self, red_band: &[f32], nir_band: &[f32]) -> Result<Vec<f32>> {
         if red_band.len() != nir_band.len() {
-            return Err(anyhow::anyhow!("Red and NIR bands must have the same length"));
+            return Err(anyhow::anyhow!(
+                "Red and NIR bands must have the same length"
+            ));
         }
 
         let ndvi_values: Vec<f32> = red_band
@@ -71,7 +61,12 @@ impl NdviProcessor {
     }
 
     /// Generate a colored NDVI visualization
-    pub fn generate_visualization(&self, ndvi_values: &[f32], width: u32, height: u32) -> Result<RgbImage> {
+    pub fn generate_visualization(
+        &self,
+        ndvi_values: &[f32],
+        width: u32,
+        height: u32,
+    ) -> Result<RgbImage> {
         let mut image = ImageBuffer::new(width, height);
 
         for (i, &ndvi) in ndvi_values.iter().enumerate() {
@@ -107,12 +102,9 @@ impl NdviProcessor {
         output_path: &Path,
     ) -> Result<NdviOverlayResult> {
         let ndvi_values = self.calculate_ndvi(&scan_data.red_band, &scan_data.nir_band)?;
-        
-        let visualization = self.generate_visualization(
-            &ndvi_values,
-            scan_data.width,
-            scan_data.height,
-        )?;
+
+        let visualization =
+            self.generate_visualization(&ndvi_values, scan_data.width, scan_data.height)?;
 
         // Save visualization
         visualization.save(output_path)?;
@@ -130,8 +122,12 @@ impl NdviProcessor {
 
     /// Calculate NDVI statistics for the processed area
     fn calculate_statistics(&self, ndvi_values: &[f32]) -> NdviStatistics {
-        let valid_values: Vec<f32> = ndvi_values.iter().filter(|&&v| v.is_finite()).copied().collect();
-        
+        let valid_values: Vec<f32> = ndvi_values
+            .iter()
+            .filter(|&&v| v.is_finite())
+            .copied()
+            .collect();
+
         if valid_values.is_empty() {
             return NdviStatistics::default();
         }
@@ -139,7 +135,7 @@ impl NdviProcessor {
         let mean = valid_values.iter().sum::<f32>() / valid_values.len() as f32;
         let mut sorted = valid_values.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        
+
         let median = if sorted.len() % 2 == 0 {
             (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
         } else {
@@ -151,9 +147,20 @@ impl NdviProcessor {
 
         // Calculate vegetation coverage percentages
         let total_pixels = valid_values.len() as f32;
-        let high_vegetation = valid_values.iter().filter(|&&v| v >= 0.6).count() as f32 / total_pixels * 100.0;
-        let medium_vegetation = valid_values.iter().filter(|&&v| v >= 0.4 && v < 0.6).count() as f32 / total_pixels * 100.0;
-        let low_vegetation = valid_values.iter().filter(|&&v| v >= 0.2 && v < 0.4).count() as f32 / total_pixels * 100.0;
+        let high_vegetation =
+            valid_values.iter().filter(|&&v| v >= 0.6).count() as f32 / total_pixels * 100.0;
+        let medium_vegetation = valid_values
+            .iter()
+            .filter(|&&v| v >= 0.4 && v < 0.6)
+            .count() as f32
+            / total_pixels
+            * 100.0;
+        let low_vegetation = valid_values
+            .iter()
+            .filter(|&&v| v >= 0.2 && v < 0.4)
+            .count() as f32
+            / total_pixels
+            * 100.0;
 
         NdviStatistics {
             mean,
@@ -165,6 +172,44 @@ impl NdviProcessor {
             low_vegetation_percent: low_vegetation,
             total_pixels: valid_values.len(),
         }
+    }
+}
+
+impl OverlayProcessor for NdviProcessor {
+    fn process(&self, inputs: &[SensorInput]) -> Result<SensorOverlay> {
+        // For now, create a basic NDVI overlay
+        // In a real implementation, this would process the multispectral data
+        let overlay = SensorOverlay {
+            id: Uuid::new_v4(),
+            overlay_type: OverlayType::NDVI,
+            timestamp: Utc::now(),
+            spatial_bounds: SpatialBounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 100.0,
+                min_z: None,
+                max_z: None,
+            },
+            resolution: (100, 100),
+            data: OverlayData::Grid {
+                width: 100,
+                height: 100,
+                values: vec![0.5; 10000], // Mock NDVI values
+                min_value: -1.0,
+                max_value: 1.0,
+            },
+            metadata: HashMap::new(),
+        };
+        Ok(overlay)
+    }
+
+    fn can_process(&self, sensor_type: &str) -> bool {
+        sensor_type == "multispectral" || sensor_type == "rgb"
+    }
+
+    fn get_overlay_type(&self) -> OverlayType {
+        OverlayType::NDVI
     }
 }
 
@@ -207,7 +252,7 @@ mod tests {
         let processor = NdviProcessor::new(NdviConfig::default());
         let red = vec![0.1, 0.2, 0.3];
         let nir = vec![0.3, 0.4, 0.5];
-        
+
         let ndvi = processor.calculate_ndvi(&red, &nir).unwrap();
         assert_eq!(ndvi.len(), 3);
         assert!((ndvi[0] - 0.5).abs() < 0.001); // (0.3-0.1)/(0.3+0.1) = 0.5
@@ -216,11 +261,11 @@ mod tests {
     #[test]
     fn test_color_mapping() {
         let processor = NdviProcessor::new(NdviConfig::default());
-        
+
         // Test water (negative NDVI)
         let water_color = processor.map_ndvi_to_color(-0.2);
         assert_eq!(water_color, [0, 0, 255]);
-        
+
         // Test high vegetation
         let veg_color = processor.map_ndvi_to_color(0.8);
         assert_eq!(veg_color, [0, 255, 0]);

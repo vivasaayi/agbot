@@ -1,23 +1,23 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use nalgebra::{Point3, Vector3};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
-use chrono::{DateTime, Utc};
-use nalgebra::{Vector3, Point3};
-use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+use uuid::Uuid;
 
-pub mod physics;
-pub mod sensors;
-pub mod flight_controller;
 pub mod communication;
 pub mod environment;
+pub mod flight_controller;
+pub mod physics;
+pub mod sensors;
 
-pub use physics::{DronePhysics, PhysicsState};
-pub use sensors::{SensorSuite, SensorReading};
-pub use flight_controller::{FlightController, FlightCommand};
 pub use communication::{CommunicationModule, MessageType};
 pub use environment::{Environment, EnvironmentConditions};
+pub use flight_controller::{FlightCommand, FlightController};
+pub use physics::{DronePhysics, PhysicsState};
+pub use sensors::{SensorReading, SensorSuite};
 
 /// Core drone simulation structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +34,7 @@ pub struct Drone {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DroneStatus {
     Idle,
     Armed,
@@ -182,7 +182,7 @@ impl Default for DroneCapabilities {
 impl SimulationEngine {
     pub fn new() -> Self {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
-        
+
         Self {
             drones: Arc::new(RwLock::new(HashMap::new())),
             environment: Arc::new(RwLock::new(Environment::new())),
@@ -197,10 +197,10 @@ impl SimulationEngine {
     pub async fn add_drone(&self, drone: Drone) -> Result<Uuid> {
         let id = drone.id;
         let simulator = DroneSimulator::new(drone)?;
-        
+
         let mut drones = self.drones.write().await;
         drones.insert(id, simulator);
-        
+
         Ok(id)
     }
 
@@ -221,8 +221,11 @@ impl SimulationEngine {
     pub async fn send_command(&self, drone_id: &Uuid, command: FlightCommand) -> Result<()> {
         let drones = self.drones.read().await;
         if let Some(simulator) = drones.get(drone_id) {
-            simulator.flight_controller.send_command(command.clone()).await?;
-            
+            simulator
+                .flight_controller
+                .send_command(command.clone())
+                .await?;
+
             // Send event
             let event = SimulationEvent::FlightCommandReceived {
                 drone_id: *drone_id,
@@ -230,7 +233,7 @@ impl SimulationEngine {
                 timestamp: Utc::now(),
             };
             let _ = self.event_sender.send(event);
-            
+
             Ok(())
         } else {
             Err(anyhow::anyhow!("Drone not found"))
@@ -240,7 +243,7 @@ impl SimulationEngine {
     pub async fn start_simulation(&self) -> Result<()> {
         let mut running = self.running.write().await;
         *running = true;
-        
+
         // Start the main simulation loop
         let drones = self.drones.clone();
         let environment = self.environment.clone();
@@ -248,25 +251,25 @@ impl SimulationEngine {
         let time_scale = self.time_scale.clone();
         let simulation_time = self.simulation_time.clone();
         let running_flag = self.running.clone();
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50)); // 20 Hz
-            
+
             while *running_flag.read().await {
                 interval.tick().await;
-                
+
                 // Update simulation time
                 {
                     let mut sim_time = simulation_time.write().await;
                     let scale = *time_scale.read().await;
                     *sim_time = *sim_time + chrono::Duration::milliseconds((50.0 * scale) as i64);
                 }
-                
+
                 // Update all drones
                 let mut drones_guard = drones.write().await;
                 let env = environment.read().await;
-                
-                for (id, simulator) in drones_guard.iter_mut() {
+
+                for (_id, simulator) in drones_guard.iter_mut() {
                     if let Ok(events) = simulator.update(&env).await {
                         for event in events {
                             let _ = event_sender.send(event);
@@ -275,7 +278,7 @@ impl SimulationEngine {
                 }
             }
         });
-        
+
         Ok(())
     }
 
@@ -301,7 +304,7 @@ impl SimulationEngine {
     pub fn subscribe_to_events(&self) -> mpsc::UnboundedReceiver<SimulationEvent> {
         // In a real implementation, this would create a new receiver
         // For now, we'll need to handle this differently
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (_sender, receiver) = mpsc::unbounded_channel();
         receiver
     }
 }
@@ -328,7 +331,7 @@ impl DroneSimulator {
         // Update physics
         let old_position = self.drone.position;
         let physics_state = self.physics.update(dt, environment)?;
-        
+
         // Update drone state from physics
         self.drone.position = physics_state.position;
         self.drone.velocity = physics_state.velocity;
@@ -373,10 +376,10 @@ impl DroneSimulator {
 
         // Check for status changes
         let new_status = self.determine_status();
-        if !matches!(new_status, self.drone.status) {
+        if new_status != self.drone.status {
             let old_status = self.drone.status.clone();
             self.drone.status = new_status.clone();
-            
+
             events.push(SimulationEvent::StatusChanged {
                 drone_id: self.drone.id,
                 old_status,
@@ -401,12 +404,15 @@ impl DroneSimulator {
     fn calculate_battery_drain(&self, dt: f32) -> f32 {
         // Simplified battery model
         let base_drain = 0.0001 * dt; // Base systems
-        let flight_drain = if matches!(self.drone.status, DroneStatus::Flying | DroneStatus::Hovering) {
+        let flight_drain = if matches!(
+            self.drone.status,
+            DroneStatus::Flying | DroneStatus::Hovering
+        ) {
             0.0005 * dt * self.drone.velocity.magnitude()
         } else {
             0.0
         };
-        
+
         base_drain + flight_drain
     }
 
@@ -460,7 +466,7 @@ mod tests {
         let engine = SimulationEngine::new();
         let drone = Drone::new("Test Drone".to_string(), "Quadcopter".to_string());
         let id = drone.id;
-        
+
         engine.add_drone(drone).await.unwrap();
         let retrieved = engine.get_drone(&id).await.unwrap();
         assert_eq!(retrieved.name, "Test Drone");

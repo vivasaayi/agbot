@@ -1,15 +1,17 @@
 use anyhow::Result;
 use clap::{Arg, Command};
 use sensor_overlay_engine::{
-    CompositeOverlayEngine, CompositeConfig, CompositeScanData,
-    NdviProcessor, ThermalProcessor, LidarOverlayProcessor,
-    ndvi::{NdviConfig, FieldScanData},
-    thermal::{ThermalConfig, ThermalScanData},
-    lidar_overlay::{LidarConfig, PointCloudData},
+    composite::{CompositeConfig, CompositeScanData},
+    lidar_overlay::{HeightColorMapping, LidarConfig, PointCloudData},
+    ndvi::{ColorMapping, FieldScanData, NdviConfig},
+    thermal::{
+        TemperatureRange, ThermalCalibration, ThermalColorPalette, ThermalConfig, ThermalScanData,
+    },
+    CompositeOverlayEngine, LidarOverlayProcessor, NdviProcessor, ThermalProcessor,
 };
 use std::path::PathBuf;
 use tokio;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,7 +30,7 @@ async fn main() -> Result<()> {
                         .short('i')
                         .value_name("DIR")
                         .help("Input directory containing sensor data")
-                        .required(true)
+                        .required(true),
                 )
                 .arg(
                     Arg::new("output-dir")
@@ -36,7 +38,7 @@ async fn main() -> Result<()> {
                         .short('o')
                         .value_name("DIR")
                         .help("Output directory for processed overlays")
-                        .required(true)
+                        .required(true),
                 )
                 .arg(
                     Arg::new("overlay-types")
@@ -44,34 +46,15 @@ async fn main() -> Result<()> {
                         .short('t')
                         .value_name("TYPES")
                         .help("Comma-separated list of overlay types (ndvi,thermal,lidar)")
-                        .default_value("ndvi,thermal,lidar")
+                        .default_value("ndvi,thermal,lidar"),
                 )
                 .arg(
                     Arg::new("config")
                         .long("config")
                         .short('c')
                         .value_name("FILE")
-                        .help("Configuration file path")
-                )
-        )
-        .subcommand(
-            Command::new("server")
-                .about("Start overlay processing server")
-                .arg(
-                    Arg::new("port")
-                        .long("port")
-                        .short('p')
-                        .value_name("PORT")
-                        .help("Server port")
-                        .default_value("3003")
-                )
-                .arg(
-                    Arg::new("host")
-                        .long("host")
-                        .value_name("HOST")
-                        .help("Server host")
-                        .default_value("0.0.0.0")
-                )
+                        .help("Configuration file path"),
+                ),
         )
         .get_matches();
 
@@ -83,12 +66,6 @@ async fn main() -> Result<()> {
             let config_file = sub_matches.get_one::<String>("config");
 
             process_sensor_data(input_dir, output_dir, overlay_types, config_file).await?;
-        }
-        Some(("server", sub_matches)) => {
-            let port = sub_matches.get_one::<String>("port").unwrap().parse::<u16>()?;
-            let host = sub_matches.get_one::<String>("host").unwrap();
-
-            start_overlay_server(host, port).await?;
         }
         _ => {
             eprintln!("No subcommand provided. Use --help for usage information.");
@@ -114,26 +91,67 @@ async fn process_sensor_data(
 
     // Load configuration
     let config = load_config(config_file).await?;
-    
+
     // Parse overlay types
     let requested_types: Vec<&str> = overlay_types.split(',').collect();
     info!("Requested overlay types: {:?}", requested_types);
 
-    // Initialize processors
-    let ndvi_processor = NdviProcessor::new(NdviConfig::default());
-    let thermal_processor = ThermalProcessor::new(ThermalConfig::default());
-    let lidar_processor = LidarOverlayProcessor::new(LidarConfig::default());
+    // Initialize processors with concrete configurations
+    let ndvi_config = NdviConfig {
+        red_band_index: 0,
+        nir_band_index: 1,
+        output_format: "PNG".to_string(),
+        color_mapping: ColorMapping {
+            low_vegetation: [255, 0, 0],
+            medium_vegetation: [255, 255, 0],
+            high_vegetation: [0, 255, 0],
+            water: [0, 0, 255],
+            soil: [139, 69, 19],
+        },
+    };
 
-    let composite_engine = CompositeOverlayEngine::new(
-        config,
-        ndvi_processor,
-        thermal_processor,
-        lidar_processor,
-    );
+    let thermal_config = ThermalConfig {
+        temperature_range: TemperatureRange {
+            min_celsius: -10.0,
+            max_celsius: 50.0,
+        },
+        color_palette: ThermalColorPalette {
+            cold: [0, 0, 255],
+            cool: [0, 255, 255],
+            moderate: [0, 255, 0],
+            warm: [255, 255, 0],
+            hot: [255, 0, 0],
+        },
+        calibration: ThermalCalibration {
+            offset: 0.0,
+            scale: 1.0,
+            ambient_temp: 20.0,
+        },
+    };
+
+    let lidar_config = LidarConfig {
+        point_cloud_resolution: 0.1,
+        height_color_mapping: HeightColorMapping {
+            ground_level: [139, 69, 19, 255],
+            low_vegetation: [50, 205, 50, 255],
+            medium_vegetation: [34, 139, 34, 255],
+            high_vegetation: [0, 100, 0, 255],
+            obstacles: [255, 0, 0, 255],
+        },
+        occupancy_grid_resolution: 0.2,
+        max_range: 100.0,
+    };
+
+    let ndvi_processor = NdviProcessor::new(ndvi_config);
+    let thermal_processor = ThermalProcessor::new(thermal_config);
+    let lidar_processor = LidarOverlayProcessor::new(lidar_config);
+
+    let composite_engine =
+        CompositeOverlayEngine::new(config, ndvi_processor, thermal_processor, lidar_processor);
 
     // Scan for sensor data files
     let scan_data = load_sensor_data(&input_dir).await?;
-    
+
     if scan_data.is_empty() {
         warn!("No sensor data found in input directory");
         return Ok(());
@@ -146,10 +164,16 @@ async fn process_sensor_data(
         let scan_output_dir = output_dir.join(format!("scan_{:03}", index));
         tokio::fs::create_dir_all(&scan_output_dir).await?;
 
-        match composite_engine.process_field_scan(data, &scan_output_dir).await {
+        match composite_engine
+            .process_field_scan(data, &scan_output_dir)
+            .await
+        {
             Ok(result) => {
-                info!("Successfully processed scan {}: {:?}", index, result.composite_image_path);
-                
+                info!(
+                    "Successfully processed scan {}: {:?}",
+                    index, result.composite_image_path
+                );
+
                 // Print analysis results
                 print_analysis_results(&result.analysis);
             }
@@ -161,88 +185,6 @@ async fn process_sensor_data(
 
     info!("Sensor overlay processing completed");
     Ok(())
-}
-
-async fn start_overlay_server(host: &str, port: u16) -> Result<()> {
-    info!("Starting sensor overlay server on {}:{}", host, port);
-
-    // Create HTTP server using warp or axum
-    use warp::Filter;
-
-    let health = warp::path("health")
-        .and(warp::get())
-        .map(|| "OK");
-
-    let process_route = warp::path("process")
-        .and(warp::post())
-        .and(warp::body::json())
-        .and_then(handle_process_request);
-
-    let routes = health
-        .or(process_route)
-        .with(warp::cors().allow_any_origin());
-
-    info!("Server listening on http://{}:{}", host, port);
-    warp::serve(routes)
-        .run((host.parse::<std::net::IpAddr>()?, port))
-        .await;
-
-    Ok(())
-}
-
-async fn handle_process_request(
-    request: ProcessRequest,
-) -> Result<impl warp::Reply, warp::Rejection> {
-    info!("Received process request: {:?}", request);
-    
-    // Convert request to scan data (simplified)
-    let scan_data = CompositeScanData {
-        ndvi_data: None, // Would load from request data
-        thermal_data: None,
-        lidar_data: None,
-        rgb_image: None,
-        gps_reference: nalgebra::Point3::new(0.0, 0.0, 0.0),
-        timestamp: chrono::Utc::now(),
-    };
-
-    // Initialize processors
-    let config = CompositeConfig::default();
-    let ndvi_processor = NdviProcessor::new(NdviConfig::default());
-    let thermal_processor = ThermalProcessor::new(ThermalConfig::default());
-    let lidar_processor = LidarOverlayProcessor::new(LidarConfig::default());
-
-    let composite_engine = CompositeOverlayEngine::new(
-        config,
-        ndvi_processor,
-        thermal_processor,
-        lidar_processor,
-    );
-
-    // Create temporary output directory
-    let output_dir = std::env::temp_dir().join(format!("overlay_{}", uuid::Uuid::new_v4()));
-    tokio::fs::create_dir_all(&output_dir).await.map_err(|_| warp::reject::reject())?;
-
-    // Process the scan
-    match composite_engine.process_field_scan(&scan_data, &output_dir).await {
-        Ok(result) => {
-            let response = ProcessResponse {
-                success: true,
-                message: "Processing completed successfully".to_string(),
-                output_path: result.composite_image_path.to_string_lossy().to_string(),
-                analysis: Some(result.analysis),
-            };
-            Ok(warp::reply::json(&response))
-        }
-        Err(e) => {
-            let response = ProcessResponse {
-                success: false,
-                message: format!("Processing failed: {}", e),
-                output_path: String::new(),
-                analysis: None,
-            };
-            Ok(warp::reply::json(&response))
-        }
-    }
 }
 
 async fn load_config(config_file: Option<&String>) -> Result<CompositeConfig> {
@@ -265,7 +207,7 @@ async fn load_sensor_data(input_dir: &PathBuf) -> Result<Vec<CompositeScanData>>
     // and parse them into the appropriate data structures
 
     let mut dir_entries = tokio::fs::read_dir(input_dir).await?;
-    
+
     while let Some(entry) = dir_entries.next_entry().await? {
         if entry.file_type().await?.is_file() {
             // Create mock scan data for demonstration
@@ -332,27 +274,27 @@ fn create_mock_lidar_data() -> PointCloudData {
 
 fn print_analysis_results(analysis: &sensor_overlay_engine::composite::CompositeAnalysis) {
     println!("\n=== Analysis Results ===");
-    
+
     if let Some(health_score) = analysis.vegetation_health_score {
         println!("Vegetation Health Score: {:.1}%", health_score);
     }
-    
+
     if let Some(coverage) = analysis.vegetation_coverage {
         println!("Vegetation Coverage: {:.1}%", coverage);
     }
-    
+
     if let Some(anomalies) = analysis.temperature_anomalies {
         println!("Temperature Anomalies: {}", anomalies);
     }
-    
+
     if let Some(stress) = analysis.stress_indicators {
         println!("Stress Indicators: {:.1}%", stress);
     }
-    
+
     if let Some(complexity) = analysis.terrain_complexity {
         println!("Terrain Complexity: {:.1}%", complexity);
     }
-    
+
     if let Some(obstacles) = analysis.obstacle_count {
         println!("Obstacles Detected: {}", obstacles);
     }
@@ -364,20 +306,4 @@ fn print_analysis_results(analysis: &sensor_overlay_engine::composite::Composite
         }
     }
     println!("========================\n");
-}
-
-// Request/Response types for the HTTP API
-#[derive(Debug, serde::Deserialize)]
-struct ProcessRequest {
-    data_type: String,
-    data_path: String,
-    overlay_types: Vec<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct ProcessResponse {
-    success: bool,
-    message: String,
-    output_path: String,
-    analysis: Option<sensor_overlay_engine::composite::CompositeAnalysis>,
 }

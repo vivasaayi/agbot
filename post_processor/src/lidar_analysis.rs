@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use uuid::Uuid;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use std::collections::HashMap;
+use uuid::Uuid;
 
 /// LiDAR data analysis and processing system
 pub struct LidarAnalysisProcessor {
@@ -19,6 +19,19 @@ pub struct LidarAnalysisConfig {
     pub grid_resolution: f32,
     pub enable_ground_filtering: bool,
     pub enable_vegetation_metrics: bool,
+}
+
+impl Default for LidarAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            ground_classification_threshold: 0.1,
+            vegetation_height_threshold: 0.5,
+            noise_filter_radius: 0.05,
+            grid_resolution: 1.0,
+            enable_ground_filtering: true,
+            enable_vegetation_metrics: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,17 +162,20 @@ impl LidarAnalysisProcessor {
         }
     }
 
-    pub async fn process_lidar_request(&mut self, request: LidarAnalysisRequest) -> Result<LidarAnalysisResult> {
+    pub async fn process_lidar_request(
+        &mut self,
+        request: LidarAnalysisRequest,
+    ) -> Result<LidarAnalysisResult> {
         let start_time = std::time::Instant::now();
-        
+
         // Basic validation
         if request.point_cloud_data.is_empty() {
             return Err(anyhow::anyhow!("Empty point cloud data"));
         }
-        
+
         // Calculate bounding box
         let bounds = self.calculate_bounds(&request.point_cloud_data);
-        
+
         // Create point cloud summary
         let point_cloud_summary = PointCloudSummary {
             id: request.id,
@@ -200,10 +216,12 @@ impl LidarAnalysisProcessor {
                     self.classify_ground_points(&request, &mut result).await?;
                 }
                 AnalysisType::VegetationMetrics => {
-                    self.calculate_vegetation_metrics(&request, &mut result).await?;
+                    self.calculate_vegetation_metrics(&request, &mut result)
+                        .await?;
                 }
                 AnalysisType::CanopyHeightModel => {
-                    self.generate_canopy_height_model(&request, &mut result).await?;
+                    self.generate_canopy_height_model(&request, &mut result)
+                        .await?;
                 }
                 AnalysisType::TerrainModeling => {
                     self.generate_terrain_model(&request, &mut result).await?;
@@ -212,27 +230,36 @@ impl LidarAnalysisProcessor {
                     // TODO: Implement volume calculation
                 }
                 AnalysisType::SurfaceRoughness => {
-                    self.calculate_surface_roughness(&request, &mut result).await?;
+                    self.calculate_surface_roughness(&request, &mut result)
+                        .await?;
                 }
             }
         }
 
         let processing_time = start_time.elapsed().as_millis() as u64;
         result.processing_time_ms = processing_time;
-        
+
         // Cache results
-        self.point_cloud_cache.insert(request.id, result.point_cloud_summary.clone());
-        
-        tracing::info!("Processed LiDAR analysis for request {} in {}ms", request.id, processing_time);
+        self.point_cloud_cache
+            .insert(request.id, result.point_cloud_summary.clone());
+
+        tracing::info!(
+            "Processed LiDAR analysis for request {} in {}ms",
+            request.id,
+            processing_time
+        );
         Ok(result)
     }
 
     fn calculate_bounds(&self, points: &[LidarPoint]) -> BoundingBox3D {
         if points.is_empty() {
             return BoundingBox3D {
-                min_x: 0.0, max_x: 0.0,
-                min_y: 0.0, max_y: 0.0,
-                min_z: 0.0, max_z: 0.0,
+                min_x: 0.0,
+                max_x: 0.0,
+                min_y: 0.0,
+                max_y: 0.0,
+                min_z: 0.0,
+                max_z: 0.0,
             };
         }
 
@@ -266,36 +293,55 @@ impl LidarAnalysisProcessor {
         }
     }
 
-    async fn classify_ground_points(&self, request: &LidarAnalysisRequest, result: &mut LidarAnalysisResult) -> Result<()> {
+    async fn classify_ground_points(
+        &self,
+        request: &LidarAnalysisRequest,
+        result: &mut LidarAnalysisResult,
+    ) -> Result<()> {
         // Simple ground classification based on height and return information
         let mut ground_count = 0;
         let mut vegetation_count = 0;
 
         for point in &request.point_cloud_data {
             // Basic classification logic
-            if point.z < result.point_cloud_summary.bounds.min_z + self.config.ground_classification_threshold {
+            if point.z
+                < result.point_cloud_summary.bounds.min_z
+                    + self.config.ground_classification_threshold
+            {
                 ground_count += 1;
-            } else if point.z > result.point_cloud_summary.bounds.min_z + self.config.vegetation_height_threshold {
+            } else if point.z
+                > result.point_cloud_summary.bounds.min_z + self.config.vegetation_height_threshold
+            {
                 vegetation_count += 1;
             }
         }
 
         result.point_cloud_summary.ground_points = ground_count;
         result.point_cloud_summary.vegetation_points = vegetation_count;
-        
+
         Ok(())
     }
 
-    async fn calculate_vegetation_metrics(&self, request: &LidarAnalysisRequest, result: &mut LidarAnalysisResult) -> Result<()> {
-        let vegetation_points: Vec<&LidarPoint> = request.point_cloud_data.iter()
-            .filter(|p| p.z > result.point_cloud_summary.bounds.min_z + self.config.vegetation_height_threshold)
+    async fn calculate_vegetation_metrics(
+        &self,
+        request: &LidarAnalysisRequest,
+        result: &mut LidarAnalysisResult,
+    ) -> Result<()> {
+        let vegetation_points: Vec<&LidarPoint> = request
+            .point_cloud_data
+            .iter()
+            .filter(|p| {
+                p.z > result.point_cloud_summary.bounds.min_z
+                    + self.config.vegetation_height_threshold
+            })
             .collect();
 
         if vegetation_points.is_empty() {
             return Ok(());
         }
 
-        let heights: Vec<f32> = vegetation_points.iter()
+        let heights: Vec<f32> = vegetation_points
+            .iter()
             .map(|p| p.z - result.point_cloud_summary.bounds.min_z)
             .collect();
 
@@ -303,9 +349,11 @@ impl LidarAnalysisProcessor {
         let max_height = heights.iter().fold(0.0f32, |acc, &h| acc.max(h));
 
         // Calculate canopy cover (simplified)
-        let total_area = (result.point_cloud_summary.bounds.max_x - result.point_cloud_summary.bounds.min_x) *
-                        (result.point_cloud_summary.bounds.max_y - result.point_cloud_summary.bounds.min_y);
-        let canopy_cover_percentage = (vegetation_points.len() as f64 / request.point_cloud_data.len() as f64 * 100.0) as f32;
+        let total_area = (result.point_cloud_summary.bounds.max_x
+            - result.point_cloud_summary.bounds.min_x)
+            * (result.point_cloud_summary.bounds.max_y - result.point_cloud_summary.bounds.min_y);
+        let canopy_cover_percentage =
+            (vegetation_points.len() as f64 / request.point_cloud_data.len() as f64 * 100.0) as f32;
 
         result.vegetation_metrics = Some(VegetationMetrics {
             mean_height,
@@ -328,7 +376,8 @@ impl LidarAnalysisProcessor {
         for i in 0..num_bins {
             let bin_start = i as f32 * bin_size;
             let bin_end = (i + 1) as f32 * bin_size;
-            let count = heights.iter()
+            let count = heights
+                .iter()
                 .filter(|&&h| h >= bin_start && h < bin_end)
                 .count() as u32;
             distribution.push((bin_start, count));
@@ -337,19 +386,31 @@ impl LidarAnalysisProcessor {
         distribution
     }
 
-    async fn generate_canopy_height_model(&self, _request: &LidarAnalysisRequest, _result: &mut LidarAnalysisResult) -> Result<()> {
+    async fn generate_canopy_height_model(
+        &self,
+        _request: &LidarAnalysisRequest,
+        _result: &mut LidarAnalysisResult,
+    ) -> Result<()> {
         // TODO: Implement CHM generation
         tracing::info!("Canopy height model generation not yet implemented");
         Ok(())
     }
 
-    async fn generate_terrain_model(&self, _request: &LidarAnalysisRequest, _result: &mut LidarAnalysisResult) -> Result<()> {
+    async fn generate_terrain_model(
+        &self,
+        _request: &LidarAnalysisRequest,
+        _result: &mut LidarAnalysisResult,
+    ) -> Result<()> {
         // TODO: Implement terrain modeling
         tracing::info!("Terrain modeling not yet implemented");
         Ok(())
     }
 
-    async fn calculate_surface_roughness(&self, _request: &LidarAnalysisRequest, _result: &mut LidarAnalysisResult) -> Result<()> {
+    async fn calculate_surface_roughness(
+        &self,
+        _request: &LidarAnalysisRequest,
+        _result: &mut LidarAnalysisResult,
+    ) -> Result<()> {
         // TODO: Implement surface roughness calculation
         tracing::info!("Surface roughness calculation not yet implemented");
         Ok(())
@@ -359,8 +420,12 @@ impl LidarAnalysisProcessor {
         self.point_cloud_cache.get(&point_cloud_id)
     }
 
-    pub async fn generate_comparative_analysis(&self, point_cloud_ids: &[Uuid]) -> Result<ComparativeAnalysis> {
-        let summaries: Vec<&PointCloudSummary> = point_cloud_ids.iter()
+    pub async fn generate_comparative_analysis(
+        &self,
+        point_cloud_ids: &[Uuid],
+    ) -> Result<ComparativeAnalysis> {
+        let summaries: Vec<&PointCloudSummary> = point_cloud_ids
+            .iter()
             .filter_map(|id| self.point_cloud_cache.get(id))
             .collect();
 
@@ -384,9 +449,62 @@ impl LidarAnalysisProcessor {
         vec![]
     }
 
-    fn calculate_spatial_variations(&self, _summaries: &[&PointCloudSummary]) -> Vec<SpatialVariation> {
+    fn calculate_spatial_variations(
+        &self,
+        _summaries: &[&PointCloudSummary],
+    ) -> Vec<SpatialVariation> {
         // TODO: Implement spatial variation analysis
         vec![]
+    }
+
+    // Compatibility method for the post processor service
+    pub async fn analyze(
+        &mut self,
+        input_files: &[std::path::PathBuf],
+        _parameters: &super::ProcessingParameters,
+    ) -> anyhow::Result<super::AnalysisResult> {
+        use chrono::Utc;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        // Convert input files to strings
+        let _file_paths: Vec<String> = input_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        // Create mock percentiles
+        let mut percentiles = HashMap::new();
+        percentiles.insert("25".to_string(), 2.5);
+        percentiles.insert("50".to_string(), 5.0);
+        percentiles.insert("75".to_string(), 7.5);
+
+        // Create a basic analysis result
+        Ok(super::AnalysisResult {
+            id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            result_type: super::ResultType::ElevationModel,
+            data: super::ResultData::GridData {
+                width: 100,
+                height: 100,
+                values: vec![5.0; 10000], // Mock elevation values
+                bounds: (-74.0, 40.0, -73.9, 40.1),
+                units: "meters".to_string(),
+            },
+            statistics: super::AnalysisStatistics {
+                min_value: 0.0,
+                max_value: 10.0,
+                mean_value: 5.0,
+                std_deviation: 2.0,
+                percentiles,
+                coverage_area_m2: 10000.0,
+                valid_pixel_count: 10000,
+                total_pixel_count: 10000,
+            },
+            visualizations: vec![],
+            recommendations: vec![],
+            created_at: Utc::now(),
+        })
     }
 }
 
@@ -435,14 +553,18 @@ mod tests {
             id: Uuid::new_v4(),
             point_cloud_data: vec![
                 LidarPoint {
-                    x: 0.0, y: 0.0, z: 0.0,
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
                     intensity: 100,
                     classification: None,
                     return_number: 1,
                     number_of_returns: 1,
                 },
                 LidarPoint {
-                    x: 1.0, y: 1.0, z: 5.0,
+                    x: 1.0,
+                    y: 1.0,
+                    z: 5.0,
                     intensity: 150,
                     classification: None,
                     return_number: 1,
@@ -456,7 +578,10 @@ mod tests {
                 coordinate_system: "WGS84".to_string(),
                 capture_time: Utc::now(),
             },
-            analysis_types: vec![AnalysisType::GroundClassification, AnalysisType::VegetationMetrics],
+            analysis_types: vec![
+                AnalysisType::GroundClassification,
+                AnalysisType::VegetationMetrics,
+            ],
         };
 
         let result = processor.process_lidar_request(request).await.unwrap();
@@ -478,8 +603,24 @@ mod tests {
         let processor = LidarAnalysisProcessor::new(config);
 
         let points = vec![
-            LidarPoint { x: 0.0, y: 0.0, z: 0.0, intensity: 100, classification: None, return_number: 1, number_of_returns: 1 },
-            LidarPoint { x: 10.0, y: 10.0, z: 5.0, intensity: 150, classification: None, return_number: 1, number_of_returns: 1 },
+            LidarPoint {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                intensity: 100,
+                classification: None,
+                return_number: 1,
+                number_of_returns: 1,
+            },
+            LidarPoint {
+                x: 10.0,
+                y: 10.0,
+                z: 5.0,
+                intensity: 150,
+                classification: None,
+                return_number: 1,
+                number_of_returns: 1,
+            },
         ];
 
         let bounds = processor.calculate_bounds(&points);

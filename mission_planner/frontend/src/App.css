@@ -1,0 +1,20 @@
+.App {
+  text-align: center;
+}
+
+.App-header {
+  background-color: #282c34;
+  padding: 20px;
+  color: white;
+}
+
+.App-title {
+  font-size: 2rem;
+  margin: 0;
+}
+
+.map-wrapper {
+  position: relative;
+  height: calc(100vh - 80px);
+  width: 100%;
+}

@@ -1,20 +1,44 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use image::{ImageBuffer, Rgb, RgbImage};
 use nalgebra::{Point3, Vector3};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use uuid::Uuid;
 
+pub mod composite;
+pub mod lidar_overlay;
 pub mod ndvi;
 pub mod thermal;
-pub mod lidar_overlay;
-pub mod composite;
 
+pub use composite::CompositeOverlayEngine;
+pub use lidar_overlay::LidarOverlayProcessor;
 pub use ndvi::NdviProcessor;
 pub use thermal::ThermalProcessor;
-pub use lidar_overlay::LidarOverlayProcessor;
-pub use composite::CompositeOverlayEngine;
+
+/// Custom serializable RGB color type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RgbColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl From<Rgb<u8>> for RgbColor {
+    fn from(rgb: Rgb<u8>) -> Self {
+        Self {
+            r: rgb.0[0],
+            g: rgb.0[1],
+            b: rgb.0[2],
+        }
+    }
+}
+
+impl Into<Rgb<u8>> for RgbColor {
+    fn into(self) -> Rgb<u8> {
+        Rgb([self.r, self.g, self.b])
+    }
+}
 
 /// Core sensor overlay data structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +90,7 @@ pub enum OverlayData {
     PointCloud {
         points: Vec<Point3<f32>>,
         values: Vec<f32>,
-        colors: Option<Vec<Rgb<u8>>>,
+        colors: Option<Vec<RgbColor>>,
     },
     Heatmap {
         width: u32,
@@ -169,11 +193,63 @@ pub struct ProcessingJob {
 impl OverlayEngine {
     pub fn new() -> Self {
         let mut processors: HashMap<OverlayType, Box<dyn OverlayProcessor>> = HashMap::new();
-        
+
+        // Create default configurations
+        let ndvi_config = ndvi::NdviConfig {
+            red_band_index: 0,
+            nir_band_index: 1,
+            output_format: "PNG".to_string(),
+            color_mapping: ndvi::ColorMapping {
+                low_vegetation: [255, 0, 0],
+                medium_vegetation: [255, 255, 0],
+                high_vegetation: [0, 255, 0],
+                water: [0, 0, 255],
+                soil: [139, 69, 19],
+            },
+        };
+
+        let thermal_config = thermal::ThermalConfig {
+            temperature_range: thermal::TemperatureRange {
+                min_celsius: -10.0,
+                max_celsius: 50.0,
+            },
+            color_palette: thermal::ThermalColorPalette {
+                cold: [0, 0, 255],
+                cool: [0, 255, 255],
+                moderate: [0, 255, 0],
+                warm: [255, 255, 0],
+                hot: [255, 0, 0],
+            },
+            calibration: thermal::ThermalCalibration {
+                offset: 0.0,
+                scale: 1.0,
+                ambient_temp: 20.0,
+            },
+        };
+
+        let lidar_config = lidar_overlay::LidarConfig {
+            point_cloud_resolution: 0.1,
+            height_color_mapping: lidar_overlay::HeightColorMapping {
+                ground_level: [139, 69, 19, 255],
+                low_vegetation: [50, 205, 50, 255],
+                medium_vegetation: [34, 139, 34, 255],
+                high_vegetation: [0, 100, 0, 255],
+                obstacles: [255, 0, 0, 255],
+            },
+            occupancy_grid_resolution: 0.2,
+            max_range: 100.0,
+        };
+
         // Register default processors
-        processors.insert(OverlayType::NDVI, Box::new(NdviProcessor::new()));
-        processors.insert(OverlayType::Thermal, Box::new(ThermalProcessor::new()));
-        processors.insert(OverlayType::LidarElevation, Box::new(LidarOverlayProcessor::new()));
+        processors.insert(OverlayType::NDVI, Box::new(NdviProcessor::new(ndvi_config)));
+        processors.insert(
+            OverlayType::Thermal,
+            Box::new(ThermalProcessor::new(thermal_config)),
+        );
+        processors.insert(
+            OverlayType::LidarElevation,
+            Box::new(LidarOverlayProcessor::new(lidar_config)),
+        );
 
         Self {
             processors,
@@ -187,7 +263,11 @@ impl OverlayEngine {
         self.processors.insert(overlay_type, processor);
     }
 
-    pub async fn submit_job(&mut self, overlay_type: OverlayType, inputs: Vec<SensorInput>) -> Result<Uuid> {
+    pub async fn submit_job(
+        &mut self,
+        overlay_type: OverlayType,
+        inputs: Vec<SensorInput>,
+    ) -> Result<Uuid> {
         let job = ProcessingJob {
             id: Uuid::new_v4(),
             overlay_type,
@@ -198,7 +278,8 @@ impl OverlayEngine {
 
         let job_id = job.id;
         self.processing_queue.push(job);
-        self.processing_queue.sort_by(|a, b| b.priority.cmp(&a.priority));
+        self.processing_queue
+            .sort_by(|a, b| b.priority.cmp(&a.priority));
 
         Ok(job_id)
     }
@@ -210,7 +291,10 @@ impl OverlayEngine {
                 self.output_cache.insert(job.id, overlay.clone());
                 Ok(Some(overlay))
             } else {
-                Err(anyhow::anyhow!("No processor available for overlay type: {:?}", job.overlay_type))
+                Err(anyhow::anyhow!(
+                    "No processor available for overlay type: {:?}",
+                    job.overlay_type
+                ))
             }
         } else {
             Ok(None)
@@ -219,13 +303,13 @@ impl OverlayEngine {
 
     pub async fn process_all_pending(&mut self) -> Result<Vec<SensorOverlay>> {
         let mut results = Vec::new();
-        
+
         while !self.processing_queue.is_empty() {
             if let Some(overlay) = self.process_next_job().await? {
                 results.push(overlay);
             }
         }
-        
+
         Ok(results)
     }
 
@@ -283,7 +367,12 @@ impl Default for OverlayEngine {
 pub mod utils {
     use super::*;
 
-    pub fn create_heatmap_image(values: &[f32], width: u32, height: u32, color_map: &str) -> Result<RgbImage> {
+    pub fn create_heatmap_image(
+        values: &[f32],
+        width: u32,
+        height: u32,
+        color_map: &str,
+    ) -> Result<RgbImage> {
         if values.len() != (width * height) as usize {
             return Err(anyhow::anyhow!("Values length doesn't match dimensions"));
         }
@@ -293,11 +382,11 @@ pub mod utils {
         let range = max_val - min_val;
 
         let mut img = ImageBuffer::new(width, height);
-        
+
         for (i, &value) in values.iter().enumerate() {
             let x = (i as u32) % width;
             let y = (i as u32) / width;
-            
+
             let normalized = if range > 0.0 {
                 (value - min_val) / range
             } else {
@@ -323,25 +412,53 @@ pub mod utils {
         let r = (0.267004 + t * (0.282623 - 0.267004)) * 255.0;
         let g = (0.004874 + t * (0.940015 - 0.004874)) * 255.0;
         let b = (0.329415 + t * (0.644450 - 0.329415)) * 255.0;
-        
+
         Rgb([r as u8, g as u8, b as u8])
     }
 
     fn jet_colormap(t: f32) -> Rgb<u8> {
         let t = t.clamp(0.0, 1.0);
-        let r = if t < 0.35 { 0.0 } else if t < 0.66 { (t - 0.35) / 0.31 } else { 1.0 };
-        let g = if t < 0.125 { 0.0 } else if t < 0.375 { (t - 0.125) / 0.25 } else if t < 0.64 { 1.0 } else { 1.0 - (t - 0.64) / 0.36 };
-        let b = if t < 0.11 { 0.5 + t / 0.22 } else if t < 0.34 { 1.0 } else if t < 0.65 { 1.0 - (t - 0.34) / 0.31 } else { 0.0 };
-        
+        let r = if t < 0.35 {
+            0.0
+        } else if t < 0.66 {
+            (t - 0.35) / 0.31
+        } else {
+            1.0
+        };
+        let g = if t < 0.125 {
+            0.0
+        } else if t < 0.375 {
+            (t - 0.125) / 0.25
+        } else if t < 0.64 {
+            1.0
+        } else {
+            1.0 - (t - 0.64) / 0.36
+        };
+        let b = if t < 0.11 {
+            0.5 + t / 0.22
+        } else if t < 0.34 {
+            1.0
+        } else if t < 0.65 {
+            1.0 - (t - 0.34) / 0.31
+        } else {
+            0.0
+        };
+
         Rgb([(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8])
     }
 
     fn hot_colormap(t: f32) -> Rgb<u8> {
         let t = t.clamp(0.0, 1.0);
         let r = if t < 0.33 { t / 0.33 } else { 1.0 };
-        let g = if t < 0.33 { 0.0 } else if t < 0.66 { (t - 0.33) / 0.33 } else { 1.0 };
+        let g = if t < 0.33 {
+            0.0
+        } else if t < 0.66 {
+            (t - 0.33) / 0.33
+        } else {
+            1.0
+        };
         let b = if t < 0.66 { 0.0 } else { (t - 0.66) / 0.34 };
-        
+
         Rgb([(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8])
     }
 
@@ -350,22 +467,26 @@ pub mod utils {
         Rgb([intensity, intensity, intensity])
     }
 
-    pub fn interpolate_grid(points: &[(f64, f64, f32)], bounds: &SpatialBounds, resolution: (u32, u32)) -> Vec<f32> {
+    pub fn interpolate_grid(
+        points: &[(f64, f64, f32)],
+        bounds: &SpatialBounds,
+        resolution: (u32, u32),
+    ) -> Vec<f32> {
         let (width, height) = resolution;
         let mut grid = vec![0.0f32; (width * height) as usize];
-        
+
         let dx = (bounds.max_x - bounds.min_x) / width as f64;
         let dy = (bounds.max_y - bounds.min_y) / height as f64;
-        
+
         for y in 0..height {
             for x in 0..width {
                 let world_x = bounds.min_x + x as f64 * dx;
                 let world_y = bounds.min_y + y as f64 * dy;
-                
+
                 // Simple inverse distance weighting
                 let mut weighted_sum = 0.0f32;
                 let mut weight_sum = 0.0f32;
-                
+
                 for &(px, py, value) in points {
                     let distance = ((world_x - px).powi(2) + (world_y - py).powi(2)).sqrt();
                     if distance < 1e-6 {
@@ -378,12 +499,16 @@ pub mod utils {
                         weight_sum += weight;
                     }
                 }
-                
+
                 let idx = (y * width + x) as usize;
-                grid[idx] = if weight_sum > 0.0 { weighted_sum / weight_sum } else { 0.0 };
+                grid[idx] = if weight_sum > 0.0 {
+                    weighted_sum / weight_sum
+                } else {
+                    0.0
+                };
             }
         }
-        
+
         grid
     }
 }
@@ -404,7 +529,7 @@ mod tests {
     async fn test_overlay_engine() {
         let mut engine = OverlayEngine::new();
         assert_eq!(engine.get_queue_length(), 0);
-        
+
         let inputs = vec![];
         let _job_id = engine.submit_job(OverlayType::NDVI, inputs).await.unwrap();
         assert_eq!(engine.get_queue_length(), 1);

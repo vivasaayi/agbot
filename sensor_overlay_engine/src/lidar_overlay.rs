@@ -1,9 +1,14 @@
+use crate::{
+    OverlayData, OverlayProcessor, OverlayType, RgbColor, SensorInput, SensorOverlay, SpatialBounds,
+};
 use anyhow::Result;
+use chrono::Utc;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use nalgebra::{Point3, Vector3};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use uuid::Uuid;
 
 /// LiDAR overlay processor for 3D mapping and terrain analysis
 #[derive(Debug, Clone)]
@@ -21,28 +26,11 @@ pub struct LidarConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeightColorMapping {
-    pub ground_level: [u8; 4],     // RGBA for ground
-    pub low_vegetation: [u8; 4],   // RGBA for low plants
+    pub ground_level: [u8; 4],      // RGBA for ground
+    pub low_vegetation: [u8; 4],    // RGBA for low plants
     pub medium_vegetation: [u8; 4], // RGBA for crops
-    pub high_vegetation: [u8; 4],  // RGBA for trees
-    pub obstacles: [u8; 4],        // RGBA for obstacles
-}
-
-impl Default for LidarConfig {
-    fn default() -> Self {
-        Self {
-            point_cloud_resolution: 0.1, // 10cm resolution
-            height_color_mapping: HeightColorMapping {
-                ground_level: [139, 69, 19, 255],    // Brown
-                low_vegetation: [50, 205, 50, 255],  // Lime green
-                medium_vegetation: [34, 139, 34, 255], // Forest green
-                high_vegetation: [0, 100, 0, 255],   // Dark green
-                obstacles: [255, 0, 0, 255],         // Red
-            },
-            occupancy_grid_resolution: 0.2, // 20cm grid cells
-            max_range: 100.0, // 100m max range
-        }
-    }
+    pub high_vegetation: [u8; 4],   // RGBA for trees
+    pub obstacles: [u8; 4],         // RGBA for obstacles
 }
 
 impl LidarOverlayProcessor {
@@ -58,19 +46,19 @@ impl LidarOverlayProcessor {
     ) -> Result<LidarOverlayResult> {
         // Convert point cloud to grid
         let height_map = self.create_height_map(&point_cloud.points)?;
-        
+
         // Generate visualization
         let overlay_image = self.generate_height_overlay(&height_map)?;
-        
+
         // Save overlay image
         overlay_image.save(output_path)?;
 
         // Create occupancy grid
         let occupancy_grid = self.create_occupancy_grid(&point_cloud.points)?;
-        
+
         // Detect obstacles and features
         let features = self.extract_terrain_features(&height_map, &point_cloud.points);
-        
+
         // Calculate terrain statistics
         let stats = self.calculate_terrain_statistics(&height_map);
 
@@ -93,7 +81,7 @@ impl LidarOverlayProcessor {
         for point in points {
             let grid_x = (point.x / resolution).round() as i32;
             let grid_y = (point.y / resolution).round() as i32;
-            
+
             grid.entry((grid_x, grid_y))
                 .or_insert_with(Vec::new)
                 .push(point.z);
@@ -114,7 +102,12 @@ impl LidarOverlayProcessor {
 
         Ok(HeightMap {
             data: height_data,
-            bounds: GridBounds { min_x, max_x, min_y, max_y },
+            bounds: GridBounds {
+                min_x,
+                max_x,
+                min_y,
+                max_y,
+            },
             resolution,
         })
     }
@@ -123,7 +116,7 @@ impl LidarOverlayProcessor {
     fn generate_height_overlay(&self, height_map: &HeightMap) -> Result<RgbaImage> {
         let width = (height_map.bounds.max_x - height_map.bounds.min_x + 1) as u32;
         let height = (height_map.bounds.max_y - height_map.bounds.min_y + 1) as u32;
-        
+
         let mut image = ImageBuffer::new(width, height);
 
         // Find height range for normalization
@@ -148,7 +141,7 @@ impl LidarOverlayProcessor {
     fn height_to_color(&self, height: f32, min_height: f32, max_height: f32) -> [u8; 4] {
         let relative_height = height - min_height;
         let height_range = max_height - min_height;
-        
+
         if height_range == 0.0 {
             return self.config.height_color_mapping.ground_level;
         }
@@ -172,7 +165,7 @@ impl LidarOverlayProcessor {
         for point in points {
             let grid_x = (point.x / resolution).round() as i32;
             let grid_y = (point.y / resolution).round() as i32;
-            
+
             // Mark cell as occupied (255 = occupied, 0 = free)
             grid.insert((grid_x, grid_y), 255);
         }
@@ -184,21 +177,30 @@ impl LidarOverlayProcessor {
 
         Ok(OccupancyGrid {
             data: grid,
-            bounds: GridBounds { min_x, max_x, min_y, max_y },
+            bounds: GridBounds {
+                min_x,
+                max_x,
+                min_y,
+                max_y,
+            },
             resolution,
         })
     }
 
     /// Extract terrain features like rows, obstacles, and boundaries
-    fn extract_terrain_features(&self, height_map: &HeightMap, points: &[Point3<f32>]) -> Vec<TerrainFeature> {
+    fn extract_terrain_features(
+        &self,
+        height_map: &HeightMap,
+        points: &[Point3<f32>],
+    ) -> Vec<TerrainFeature> {
         let mut features = Vec::new();
 
         // Detect crop rows using height variation analysis
         features.extend(self.detect_crop_rows(height_map));
-        
+
         // Detect obstacles using height thresholds
         features.extend(self.detect_obstacles(height_map));
-        
+
         // Detect field boundaries
         features.extend(self.detect_field_boundaries(points));
 
@@ -208,15 +210,20 @@ impl LidarOverlayProcessor {
     /// Detect crop rows based on height patterns
     fn detect_crop_rows(&self, height_map: &HeightMap) -> Vec<TerrainFeature> {
         let mut features = Vec::new();
-        
+
         // Simple row detection based on height variation patterns
         // This is a simplified implementation - real row detection would be more sophisticated
         for ((x, y), &height) in &height_map.data {
             // Look for regular patterns in height that might indicate crop rows
-            if height > 0.2 && height < 2.0 { // Typical crop height range
+            if height > 0.2 && height < 2.0 {
+                // Typical crop height range
                 features.push(TerrainFeature {
                     feature_type: TerrainFeatureType::CropRow,
-                    location: Point3::new(*x as f32 * height_map.resolution, *y as f32 * height_map.resolution, height),
+                    location: Point3::new(
+                        *x as f32 * height_map.resolution,
+                        *y as f32 * height_map.resolution,
+                        height,
+                    ),
                     confidence: 0.7,
                     metadata: format!("Height: {:.2}m", height),
                 });
@@ -229,7 +236,7 @@ impl LidarOverlayProcessor {
     /// Detect obstacles based on height thresholds
     fn detect_obstacles(&self, height_map: &HeightMap) -> Vec<TerrainFeature> {
         let mut features = Vec::new();
-        
+
         let heights: Vec<f32> = height_map.data.values().cloned().collect();
         if heights.is_empty() {
             return features;
@@ -242,9 +249,16 @@ impl LidarOverlayProcessor {
             if height > obstacle_threshold {
                 features.push(TerrainFeature {
                     feature_type: TerrainFeatureType::Obstacle,
-                    location: Point3::new(*x as f32 * height_map.resolution, *y as f32 * height_map.resolution, height),
+                    location: Point3::new(
+                        *x as f32 * height_map.resolution,
+                        *y as f32 * height_map.resolution,
+                        height,
+                    ),
                     confidence: 0.9,
-                    metadata: format!("Height: {:.2}m above threshold", height - obstacle_threshold),
+                    metadata: format!(
+                        "Height: {:.2}m above threshold",
+                        height - obstacle_threshold
+                    ),
                 });
             }
         }
@@ -255,16 +269,28 @@ impl LidarOverlayProcessor {
     /// Detect field boundaries
     fn detect_field_boundaries(&self, points: &[Point3<f32>]) -> Vec<TerrainFeature> {
         let mut features = Vec::new();
-        
+
         if points.is_empty() {
             return features;
         }
 
         // Find the convex hull points as potential boundary markers
-        let min_x = points.iter().map(|p| p.x).fold(f32::INFINITY, |a, b| a.min(b));
-        let max_x = points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, |a, b| a.max(b));
-        let min_y = points.iter().map(|p| p.y).fold(f32::INFINITY, |a, b| a.min(b));
-        let max_y = points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, |a, b| a.max(b));
+        let min_x = points
+            .iter()
+            .map(|p| p.x)
+            .fold(f32::INFINITY, |a, b| a.min(b));
+        let max_x = points
+            .iter()
+            .map(|p| p.x)
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+        let min_y = points
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::INFINITY, |a, b| a.min(b));
+        let max_y = points
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
 
         // Add corner points as boundary markers
         let boundary_points = vec![
@@ -289,7 +315,7 @@ impl LidarOverlayProcessor {
     /// Calculate terrain statistics
     fn calculate_terrain_statistics(&self, height_map: &HeightMap) -> TerrainStatistics {
         let heights: Vec<f32> = height_map.data.values().cloned().collect();
-        
+
         if heights.is_empty() {
             return TerrainStatistics::default();
         }
@@ -299,7 +325,9 @@ impl LidarOverlayProcessor {
         sorted_heights.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let median = if sorted_heights.len() % 2 == 0 {
-            (sorted_heights[sorted_heights.len() / 2 - 1] + sorted_heights[sorted_heights.len() / 2]) / 2.0
+            (sorted_heights[sorted_heights.len() / 2 - 1]
+                + sorted_heights[sorted_heights.len() / 2])
+                / 2.0
         } else {
             sorted_heights[sorted_heights.len() / 2]
         };
@@ -307,7 +335,8 @@ impl LidarOverlayProcessor {
         let min = sorted_heights[0];
         let max = sorted_heights[sorted_heights.len() - 1];
 
-        let variance = heights.iter().map(|&h| (h - mean).powi(2)).sum::<f32>() / heights.len() as f32;
+        let variance =
+            heights.iter().map(|&h| (h - mean).powi(2)).sum::<f32>() / heights.len() as f32;
         let std_dev = variance.sqrt();
 
         let area_covered = heights.len() as f32 * height_map.resolution.powi(2);
@@ -321,6 +350,41 @@ impl LidarOverlayProcessor {
             area_covered_m2: area_covered,
             total_points: heights.len(),
         }
+    }
+}
+
+impl OverlayProcessor for LidarOverlayProcessor {
+    fn process(&self, _inputs: &[SensorInput]) -> Result<SensorOverlay> {
+        // Create a basic LiDAR elevation overlay
+        let overlay = SensorOverlay {
+            id: Uuid::new_v4(),
+            overlay_type: OverlayType::LidarElevation,
+            timestamp: Utc::now(),
+            spatial_bounds: SpatialBounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 100.0,
+                min_z: Some(0.0),
+                max_z: Some(10.0),
+            },
+            resolution: (100, 100),
+            data: OverlayData::PointCloud {
+                points: vec![Point3::new(0.0, 0.0, 0.0); 1000], // Mock points
+                values: vec![5.0; 1000],                        // Mock elevation values
+                colors: Some(vec![RgbColor { r: 0, g: 255, b: 0 }; 1000]), // Green
+            },
+            metadata: HashMap::new(),
+        };
+        Ok(overlay)
+    }
+
+    fn can_process(&self, sensor_type: &str) -> bool {
+        sensor_type == "lidar" || sensor_type == "point_cloud"
+    }
+
+    fn get_overlay_type(&self) -> OverlayType {
+        OverlayType::LidarElevation
     }
 }
 
@@ -406,7 +470,7 @@ mod tests {
             Point3::new(0.1, 0.0, 1.1),
             Point3::new(0.0, 0.1, 0.9),
         ];
-        
+
         let height_map = processor.create_height_map(&points).unwrap();
         assert!(!height_map.data.is_empty());
     }
@@ -415,7 +479,7 @@ mod tests {
     fn test_occupancy_grid_creation() {
         let processor = LidarOverlayProcessor::new(LidarConfig::default());
         let points = vec![Point3::new(1.0, 1.0, 1.0), Point3::new(2.0, 2.0, 2.0)];
-        
+
         let grid = processor.create_occupancy_grid(&points).unwrap();
         assert!(!grid.data.is_empty());
     }
@@ -423,11 +487,11 @@ mod tests {
     #[test]
     fn test_height_to_color_mapping() {
         let processor = LidarOverlayProcessor::new(LidarConfig::default());
-        
+
         // Test ground level
         let ground_color = processor.height_to_color(0.05, 0.0, 10.0);
         assert_eq!(ground_color, [139, 69, 19, 255]);
-        
+
         // Test high vegetation
         let tree_color = processor.height_to_color(9.5, 0.0, 10.0);
         assert_eq!(tree_color, [255, 0, 0, 255]); // Should be obstacles color
