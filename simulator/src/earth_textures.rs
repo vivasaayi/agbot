@@ -8,6 +8,8 @@ pub struct EarthTextures {
     pub nightmap: Option<Handle<Image>>,
     pub clouds: Option<Handle<Image>>,
     pub loading_complete: bool,
+    /// Flag to track if textures have been applied to avoid spam
+    pub textures_applied: bool,
 }
 
 impl Default for EarthTextures {
@@ -19,6 +21,7 @@ impl Default for EarthTextures {
             nightmap: None,
             clouds: None,
             loading_complete: false,
+            textures_applied: false,
         }
     }
 }
@@ -34,6 +37,7 @@ pub fn load_earth_textures(mut commands: Commands, asset_server: Res<AssetServer
         nightmap: None,  // Will try to load but expect it might fail
         clouds: None,    // Will try to load but expect it might fail
         loading_complete: false,
+        textures_applied: false,
     };
 
     commands.insert_resource(earth_textures);
@@ -58,11 +62,12 @@ pub fn check_texture_loading(
 }
 
 pub fn update_earth_material_with_textures(
-    earth_textures: Res<EarthTextures>,
+    mut earth_textures: ResMut<EarthTextures>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     globe_query: Query<&Handle<StandardMaterial>, With<crate::globe_view::Globe>>,
 ) {
-    if !earth_textures.loading_complete {
+    // Skip if not loaded or already applied
+    if !earth_textures.loading_complete || earth_textures.textures_applied {
         return;
     }
 
@@ -98,6 +103,9 @@ pub fn update_earth_material_with_textures(
             }
 
             info!("Earth material updated with realistic textures!");
+            
+            // Mark as applied to prevent repeated updates
+            earth_textures.textures_applied = true;
         }
     }
 }

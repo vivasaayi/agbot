@@ -85,10 +85,22 @@ async fn run_communication_loop(
 ) -> Result<()> {
     info!("Attempting to connect to WebSocket at {}", websocket_url);
 
+    // Exponential backoff configuration
+    const INITIAL_BACKOFF_SECS: u64 = 1;
+    const MAX_BACKOFF_SECS: u64 = 60;
+    const BACKOFF_MULTIPLIER: u64 = 2;
+    
+    let mut backoff_secs = INITIAL_BACKOFF_SECS;
+    let mut consecutive_failures = 0u32;
+
     loop {
         match connect_async(&websocket_url).await {
             Ok((ws_stream, _)) => {
                 info!("Connected to WebSocket successfully");
+                
+                // Reset backoff on successful connection
+                backoff_secs = INITIAL_BACKOFF_SECS;
+                consecutive_failures = 0;
 
                 let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
@@ -125,12 +137,19 @@ async fn run_communication_loop(
                                         }
                                     }
                                 }
+                                Some(Ok(Message::Ping(data))) => {
+                                    // Respond to ping with pong to keep connection alive
+                                    if let Err(e) = ws_sender.send(Message::Pong(data)).await {
+                                        warn!("Failed to send pong: {}", e);
+                                        break;
+                                    }
+                                }
                                 Some(Ok(Message::Close(_))) => {
                                     info!("WebSocket connection closed by server");
                                     break;
                                 }
                                 Some(Err(e)) => {
-                                    error!("WebSocket error: {}", e);
+                                    warn!("WebSocket error: {} - will reconnect", e);
                                     break;
                                 }
                                 None => {
@@ -158,12 +177,34 @@ async fn run_communication_loop(
                         }
                     }
                 }
+                
+                // Connection dropped, apply backoff before reconnecting
+                info!("Connection lost, reconnecting in {} seconds...", backoff_secs);
             }
             Err(e) => {
-                error!("Failed to connect to WebSocket: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                consecutive_failures += 1;
+                
+                // Log with appropriate severity based on failure count
+                if consecutive_failures <= 3 {
+                    warn!(
+                        "Failed to connect to WebSocket (attempt {}): {} - retrying in {}s",
+                        consecutive_failures, e, backoff_secs
+                    );
+                } else if consecutive_failures % 10 == 0 {
+                    // Only log every 10th failure after initial attempts to reduce spam
+                    warn!(
+                        "WebSocket still unreachable after {} attempts - is the server running?",
+                        consecutive_failures
+                    );
+                }
             }
         }
+        
+        // Wait with exponential backoff
+        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+        
+        // Increase backoff for next attempt, capped at max
+        backoff_secs = (backoff_secs * BACKOFF_MULTIPLIER).min(MAX_BACKOFF_SECS);
     }
 }
 

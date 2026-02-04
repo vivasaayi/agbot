@@ -27,6 +27,7 @@ pub fn create_placeholder_earth_textures(
         nightmap: Some(nightmap),
         clouds: None,           // Skip clouds for now
         loading_complete: true, // Mark as complete since they're procedural
+        textures_applied: false,
     };
 
     commands.insert_resource(earth_textures);

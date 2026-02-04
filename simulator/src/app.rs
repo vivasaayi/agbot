@@ -9,6 +9,7 @@ use crate::communication::{CommunicationChannels, CommunicationPlugin};
 use crate::drone_controller::DroneControllerPlugin;
 use crate::map_loader::MapLoaderPlugin;
 // use crate::hud::HudPlugin;
+use crate::gis::GisPlugin;
 use crate::ground_vehicle::GroundVehiclePlugin;
 use crate::lidar_controls::LidarControlsPlugin;
 use crate::lidar_simulator::LidarSimulatorPlugin;
@@ -62,6 +63,8 @@ impl VisualizerApp {
             // .add_plugins(FlightUIPlugin)     // Disabled to reduce UI clutter
             .add_plugins(NdviOverlayPlugin)
             .add_plugins(WaypointAutopilotPlugin)
+            // GIS - Real world terrain loading
+            .add_plugins(GisPlugin)
             // Resources
             .insert_resource(config)
             .insert_resource(communication_channels)

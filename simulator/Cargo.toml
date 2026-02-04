@@ -54,6 +54,12 @@ dotenvy = { workspace = true }
 # Async channels
 flume = { workspace = true }
 
+# GIS / Image processing
+png = "0.17"
+jpeg-decoder = "0.3"
+dirs = "5.0"
+futures-lite = "2.0"
+
 [[bin]]
 name = "visualizer"
 path = "src/main.rs"

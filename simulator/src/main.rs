@@ -31,6 +31,9 @@ mod autopilot {
 }
 mod ground_vehicle;
 
+// GIS - Real world terrain data
+mod gis;
+
 // World exploration modules
 mod city_search;
 mod world_exploration;
