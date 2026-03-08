@@ -13,6 +13,7 @@ use axum::{
 };
 use serde::Serialize;
 use sqlx::Row;
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path as FsPath, PathBuf};
 use tokio::fs::File;
@@ -24,6 +25,22 @@ pub struct SceneSummary {
     pub scene_id: String,
     pub sensor: String,
     pub acquired_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SceneDetail {
+    pub scene_id: String,
+    pub sensor: Option<String>,
+    pub acquired_at: Option<String>,
+    pub available_products: Vec<ProductSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProductSummary {
+    pub kind: String,
+    pub filename: String,
+    pub content_type: String,
+    pub url_path: String,
 }
 
 pub async fn list_scenes(State(state): State<AppState>) -> AppResult<Json<Vec<SceneSummary>>> {
@@ -43,6 +60,36 @@ pub async fn list_scenes(State(state): State<AppState>) -> AppResult<Json<Vec<Sc
         .collect();
 
     Ok(Json(scenes))
+}
+
+pub async fn get_scene(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SceneDetail>> {
+    let scene_row =
+        sqlx::query("SELECT scene_id, sensor, acquired_at FROM scenes WHERE scene_id = ?1")
+            .bind(&scene_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(Error::from)?;
+
+    let scene_dir = state.config.data_root.join("scenes").join(&scene_id);
+    let has_scene_dir = fs::try_exists(&scene_dir)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    if scene_row.is_none() && !has_scene_dir {
+        return Err(AppError::NotFound);
+    }
+
+    let available_products = collect_scene_products(&state, &scene_id).await?;
+
+    Ok(Json(SceneDetail {
+        scene_id,
+        sensor: scene_row.as_ref().map(|row| row.get("sensor")),
+        acquired_at: scene_row.as_ref().map(|row| row.get("acquired_at")),
+        available_products,
+    }))
 }
 
 pub async fn stream_product(
@@ -108,29 +155,74 @@ async fn find_product_file_on_disk(
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?;
 
-    let mut selected: Option<PathBuf> = None;
-    while let Some(entry) = entries
-        .next_entry()
+    select_preferred_product_path(&mut entries).await
+}
+
+async fn collect_scene_products(
+    state: &AppState,
+    scene_id: &str,
+) -> AppResult<Vec<ProductSummary>> {
+    let mut products = BTreeMap::new();
+    let scene_products_dir = state
+        .config
+        .data_root
+        .join("scenes")
+        .join(scene_id)
+        .join("products");
+
+    if fs::try_exists(&scene_products_dir)
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?
     {
-        if !is_supported_product_file(&entry).await? {
-            continue;
-        }
+        let mut kind_dirs = fs::read_dir(&scene_products_dir)
+            .await
+            .map_err(|err| AppError::Anyhow(err.into()))?;
 
-        let path = entry.path();
-        match &selected {
-            None => selected = Some(path),
-            Some(current) => {
-                // Prefer PNG when available because geo_viewer expects image bytes for direct display.
-                if is_png(&path) && !is_png(current) {
-                    selected = Some(path);
-                }
+        while let Some(entry) = kind_dirs
+            .next_entry()
+            .await
+            .map_err(|err| AppError::Anyhow(err.into()))?
+        {
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|err| AppError::Anyhow(err.into()))?;
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let kind = entry.file_name().to_string_lossy().to_string();
+            let mut entries = fs::read_dir(entry.path())
+                .await
+                .map_err(|err| AppError::Anyhow(err.into()))?;
+
+            if let Some(path) = select_preferred_product_path(&mut entries).await? {
+                products.insert(kind.clone(), build_product_summary(scene_id, &kind, &path));
             }
         }
     }
 
-    Ok(selected)
+    let rows = sqlx::query("SELECT kind, path FROM products WHERE scene_id = ?1")
+        .bind(scene_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?;
+
+    for row in rows {
+        let kind: String = row.get("kind");
+        let path = PathBuf::from(row.get::<String, _>("path"));
+        let exists = fs::try_exists(&path)
+            .await
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+        if !exists {
+            continue;
+        }
+        products
+            .entry(kind.clone())
+            .or_insert_with(|| build_product_summary(scene_id, &kind, &path));
+    }
+
+    Ok(products.into_values().collect())
 }
 
 async fn is_supported_product_file(entry: &DirEntry) -> AppResult<bool> {
@@ -181,9 +273,48 @@ fn is_png(path: &FsPath) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
 }
 
+async fn select_preferred_product_path(entries: &mut fs::ReadDir) -> AppResult<Option<PathBuf>> {
+    let mut selected: Option<PathBuf> = None;
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?
+    {
+        if !is_supported_product_file(&entry).await? {
+            continue;
+        }
+
+        let path = entry.path();
+        match &selected {
+            None => selected = Some(path),
+            Some(current) => {
+                if is_png(&path) && !is_png(current) {
+                    selected = Some(path);
+                }
+            }
+        }
+    }
+
+    Ok(selected)
+}
+
+fn build_product_summary(scene_id: &str, kind: &str, path: &FsPath) -> ProductSummary {
+    ProductSummary {
+        kind: kind.to_string(),
+        filename: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        content_type: content_type_for_path(path).to_string(),
+        url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{content_type_for_path, is_missing_scene_error, is_png};
+    use super::{build_product_summary, content_type_for_path, is_missing_scene_error, is_png};
     use std::path::Path;
 
     #[test]
@@ -208,5 +339,13 @@ mod tests {
     fn row_not_found_errors_are_detected() {
         let err = anyhow::Error::new(sqlx::Error::RowNotFound);
         assert!(is_missing_scene_error(&err));
+    }
+
+    #[test]
+    fn product_summary_contains_expected_url_and_filename() {
+        let summary = build_product_summary("scene-1", "ndvi", Path::new("/tmp/output.png"));
+        assert_eq!(summary.filename, "output.png");
+        assert_eq!(summary.content_type, "image/png");
+        assert_eq!(summary.url_path, "/api/scenes/scene-1/products/ndvi");
     }
 }

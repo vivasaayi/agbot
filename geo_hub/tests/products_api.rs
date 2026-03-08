@@ -4,8 +4,8 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use geo_hub::state::AppState;
-use image::{GrayImage, Luma};
 use geo_hub::{db, server, HubConfig};
+use image::{GrayImage, Luma};
 use serde_json::json;
 use std::{path::Path, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
@@ -81,15 +81,66 @@ async fn missing_scene_returns_not_found() -> Result<()> {
 }
 
 #[tokio::test]
+async fn scene_manifest_lists_available_products_from_disk() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let app = ctx.app;
+
+    let scene_id = "manifest_scene";
+    let product_path = tmp
+        .path()
+        .join("data")
+        .join("scenes")
+        .join(scene_id)
+        .join("products")
+        .join("ndvi")
+        .join("sample.png");
+    std::fs::create_dir_all(product_path.parent().expect("product parent exists"))?;
+    std::fs::write(&product_path, TEST_PNG_BYTES)?;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json.get("scene_id").and_then(|v| v.as_str()),
+        Some(scene_id)
+    );
+
+    let products = json
+        .get("available_products")
+        .and_then(|v| v.as_array())
+        .expect("products array should exist");
+    assert_eq!(products.len(), 1);
+    assert_eq!(
+        products[0].get("kind").and_then(|v| v.as_str()),
+        Some("ndvi")
+    );
+    assert_eq!(
+        products[0].get("url_path").and_then(|v| v.as_str()),
+        Some(format!("/api/scenes/{scene_id}/products/ndvi").as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn generates_ndvi_via_db_fallback_and_persists_product_row() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
 
     let scene_id = "scene_from_db";
-    let scene_dir = ctx
-        .data_root
-        .join("scenes")
-        .join(scene_id);
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
     std::fs::create_dir_all(&scene_dir)?;
 
     let b4_path = scene_dir.join("B4.png");
@@ -157,10 +208,7 @@ async fn generates_ndvi_via_db_fallback_and_persists_product_row() -> Result<()>
         "unexpected status {status}; body: {}",
         String::from_utf8_lossy(&body)
     );
-    assert_eq!(
-        content_type.as_deref(),
-        Some("image/png")
-    );
+    assert_eq!(content_type.as_deref(), Some("image/png"));
     assert!(body.len() > 8);
     assert_eq!(&body.as_ref()[..8], b"\x89PNG\r\n\x1a\n");
 

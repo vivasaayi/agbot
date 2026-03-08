@@ -18,6 +18,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
         .route("/api/scenes", get(routes::list_scenes))
+        .route("/api/scenes/:scene_id", get(routes::get_scene))
         .route(
             "/api/scenes/:scene_id/products/:kind",
             get(routes::stream_product),

@@ -12,6 +12,7 @@ use bevy::{
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use futures_lite::future;
 use image::{self, DynamicImage};
+use serde::Deserialize;
 use tracing::info;
 
 const APP_TITLE: &str = "Geo Viewer";
@@ -32,10 +33,37 @@ struct TileConfig {
 }
 
 #[derive(Resource, Default)]
+struct ManifestFetchTask(Option<Task<anyhow::Result<SceneManifest>>>);
+
+#[derive(Resource, Default)]
 struct TileFetchTask(Option<Task<anyhow::Result<FetchedTile>>>);
 
 struct FetchedTile {
     image: DynamicImage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SceneManifest {
+    scene_id: String,
+    sensor: Option<String>,
+    acquired_at: Option<String>,
+    available_products: Vec<SceneProduct>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SceneProduct {
+    kind: String,
+    filename: String,
+    content_type: String,
+    url_path: String,
+}
+
+#[derive(Resource, Default)]
+struct SceneManifestState {
+    scene_id: Option<String>,
+    sensor: Option<String>,
+    acquired_at: Option<String>,
+    products: Vec<SceneProduct>,
 }
 
 #[derive(Resource)]
@@ -110,6 +138,8 @@ fn main() -> Result<()> {
             scene_id: scene_id_env,
             product_kind: DEFAULT_PRODUCT_KIND.to_string(),
         })
+        .insert_resource(ManifestFetchTask::default())
+        .insert_resource(SceneManifestState::default())
         .insert_resource(TileFetchTask::default())
         .insert_resource(TileRenderState {
             entity: None,
@@ -118,7 +148,10 @@ fn main() -> Result<()> {
             status: initial_status,
         })
         .add_systems(Startup, setup)
-        .add_systems(Update, (render_ui, poll_tile_fetch, apply_zoom))
+        .add_systems(
+            Update,
+            (render_ui, poll_manifest_fetch, poll_tile_fetch, apply_zoom),
+        )
         .run();
 
     Ok(())
@@ -127,15 +160,18 @@ fn main() -> Result<()> {
 fn setup(
     mut commands: Commands,
     config: Res<TileConfig>,
+    mut manifest_task: ResMut<ManifestFetchTask>,
+    mut manifest_state: ResMut<SceneManifestState>,
     mut fetch_task: ResMut<TileFetchTask>,
     mut tile_state: ResMut<TileRenderState>,
 ) {
     commands.spawn(Camera2dBundle::default());
 
     if config.scene_id.is_some() {
-        if let Err(err) = start_tile_fetch(&mut fetch_task, &mut tile_state, &config) {
+        if let Err(err) = start_manifest_fetch(&mut manifest_task, &mut manifest_state, &config) {
             tile_state.status = TileStatus::Error(err.to_string());
         }
+        fetch_task.0 = None;
     }
 }
 
@@ -144,17 +180,34 @@ fn render_ui(
     mut contexts: EguiContexts,
     mut viewer_state: ResMut<ViewerState>,
     mut config: ResMut<TileConfig>,
+    mut manifest_state: ResMut<SceneManifestState>,
+    mut manifest_task: ResMut<ManifestFetchTask>,
     mut tile_state: ResMut<TileRenderState>,
     mut fetch_task: ResMut<TileFetchTask>,
 ) {
     egui::SidePanel::left("layers_panel").show(contexts.ctx_mut(), |ui| {
         ui.heading("Layers");
         ui.separator();
-        ui.radio_value(
-            &mut viewer_state.selected_layer,
-            0,
-            "NDVI (computed by geo_hub)",
-        );
+        if manifest_state.products.is_empty() {
+            ui.label("No layers loaded");
+        } else {
+            for (idx, product) in manifest_state.products.iter().enumerate() {
+                let label = format!(
+                    "{} ({}, {})",
+                    product.kind.to_uppercase(),
+                    product.filename,
+                    product.content_type
+                );
+                let response = ui.radio_value(&mut viewer_state.selected_layer, idx, label);
+                if response.changed() {
+                    config.product_kind = product.kind.clone();
+                    if let Err(err) = start_tile_fetch(&mut fetch_task, &mut tile_state, &config) {
+                        tile_state.status = TileStatus::Error(err.to_string());
+                    }
+                }
+                response.on_hover_text(product.url_path.clone());
+            }
+        }
         ui.add_space(8.0);
 
         ui.heading("Scene");
@@ -164,7 +217,7 @@ fn render_ui(
         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             load_requested = true;
         }
-        if ui.button("Load NDVI").clicked() {
+        if ui.button("Load Scene").clicked() {
             load_requested = true;
         }
 
@@ -172,21 +225,29 @@ fn render_ui(
             let trimmed = viewer_state.scene_id_input.trim().to_string();
             if trimmed.is_empty() {
                 config.scene_id = None;
+                config.product_kind = DEFAULT_PRODUCT_KIND.to_string();
                 tile_state.status = TileStatus::MissingScene;
                 if let Some(entity) = tile_state.entity.take() {
                     commands.entity(entity).despawn_recursive();
                 }
                 tile_state.handle = None;
                 tile_state.dimensions = Vec2::ZERO;
+                clear_manifest_state(&mut manifest_state);
                 fetch_task.0 = None;
+                manifest_task.0 = None;
             } else {
                 config.scene_id = Some(trimmed.clone());
+                viewer_state.selected_layer = 0;
+                config.product_kind = DEFAULT_PRODUCT_KIND.to_string();
                 if let Some(entity) = tile_state.entity.take() {
                     commands.entity(entity).despawn_recursive();
                 }
                 tile_state.handle = None;
                 tile_state.dimensions = Vec2::ZERO;
-                if let Err(err) = start_tile_fetch(&mut fetch_task, &mut tile_state, &config) {
+                fetch_task.0 = None;
+                if let Err(err) =
+                    start_manifest_fetch(&mut manifest_task, &mut manifest_state, &config)
+                {
                     tile_state.status = TileStatus::Error(err.to_string());
                 }
             }
@@ -212,12 +273,35 @@ fn render_ui(
         .scene_id
         .clone()
         .unwrap_or_else(|| "(none)".to_string());
+    let active_layer = if manifest_state.products.is_empty() {
+        "(none)".to_string()
+    } else {
+        manifest_state
+            .products
+            .get(viewer_state.selected_layer)
+            .map(|p| p.kind.to_uppercase())
+            .unwrap_or_else(|| "(invalid)".to_string())
+    };
+    let sensor = manifest_state
+        .sensor
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let acquired_at = manifest_state
+        .acquired_at
+        .clone()
+        .unwrap_or_else(|| "n/a".to_string());
 
     egui::TopBottomPanel::top("status_bar").show(contexts.ctx_mut(), |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("Hub: {}", base_url));
             ui.separator();
             ui.label(format!("Scene: {}", active_scene));
+            ui.separator();
+            ui.label(format!("Layer: {}", active_layer));
+            ui.separator();
+            ui.label(format!("Sensor: {}", sensor));
+            ui.separator();
+            ui.label(format!("Acquired: {}", acquired_at));
             ui.separator();
             ui.label(status_message);
             if !dimension_text.is_empty() {
@@ -226,6 +310,56 @@ fn render_ui(
             }
         });
     });
+}
+
+fn poll_manifest_fetch(
+    mut manifest_task: ResMut<ManifestFetchTask>,
+    mut manifest_state: ResMut<SceneManifestState>,
+    mut config: ResMut<TileConfig>,
+    mut viewer_state: ResMut<ViewerState>,
+    mut fetch_task: ResMut<TileFetchTask>,
+    mut tile_state: ResMut<TileRenderState>,
+) {
+    if let Some(mut task) = manifest_task.0.take() {
+        if let Some(result) = future::block_on(future::poll_once(&mut task)) {
+            match result {
+                Ok(manifest) => {
+                    let products = manifest.available_products;
+                    manifest_state.scene_id = Some(manifest.scene_id);
+                    manifest_state.sensor = manifest.sensor;
+                    manifest_state.acquired_at = manifest.acquired_at;
+                    manifest_state.products = products;
+
+                    if manifest_state.products.is_empty() {
+                        tile_state.status =
+                            TileStatus::Error("Scene has no available products".to_string());
+                        return;
+                    }
+
+                    let selected_idx = manifest_state
+                        .products
+                        .iter()
+                        .position(|product| product.kind == config.product_kind)
+                        .unwrap_or(0);
+                    viewer_state.selected_layer = selected_idx;
+                    config.product_kind = manifest_state.products[selected_idx].kind.clone();
+
+                    if let Err(err) = start_tile_fetch(&mut fetch_task, &mut tile_state, &config) {
+                        tile_state.status = TileStatus::Error(err.to_string());
+                    }
+                }
+                Err(err) => {
+                    manifest_state.scene_id = config.scene_id.clone();
+                    manifest_state.sensor = None;
+                    manifest_state.acquired_at = None;
+                    manifest_state.products.clear();
+                    tile_state.status = TileStatus::Error(err.to_string());
+                }
+            }
+        } else {
+            manifest_task.0 = Some(task);
+        }
+    }
 }
 
 fn poll_tile_fetch(
@@ -338,4 +472,50 @@ fn start_tile_fetch(
     }));
 
     Ok(())
+}
+
+fn start_manifest_fetch(
+    manifest_task: &mut ManifestFetchTask,
+    manifest_state: &mut SceneManifestState,
+    config: &TileConfig,
+) -> Result<()> {
+    let scene_id = match &config.scene_id {
+        Some(id) => id.clone(),
+        None => {
+            manifest_state.scene_id = None;
+            manifest_state.sensor = None;
+            manifest_state.acquired_at = None;
+            manifest_state.products.clear();
+            return Ok(());
+        }
+    };
+
+    manifest_state.scene_id = Some(scene_id.clone());
+    manifest_state.sensor = None;
+    manifest_state.acquired_at = None;
+    manifest_state.products.clear();
+
+    let base_url = config.base_url.clone();
+    let url = format!("{}/api/scenes/{}", base_url, scene_id);
+
+    manifest_task.0 = Some(IoTaskPool::get().spawn(async move {
+        let response =
+            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+        if !response.status().is_success() {
+            anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
+        }
+        let bytes = response.bytes().context("failed to read manifest body")?;
+        let manifest = serde_json::from_slice::<SceneManifest>(&bytes)
+            .context("failed to decode scene manifest")?;
+        Ok(manifest)
+    }));
+
+    Ok(())
+}
+
+fn clear_manifest_state(manifest_state: &mut SceneManifestState) {
+    manifest_state.scene_id = None;
+    manifest_state.sensor = None;
+    manifest_state.acquired_at = None;
+    manifest_state.products.clear();
 }
