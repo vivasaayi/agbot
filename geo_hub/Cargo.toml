@@ -22,3 +22,8 @@ shared = { path = "../shared" }
 imagery_processor = { path = "../imagery_processor" }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+tower = { workspace = true, features = ["util"] }
+image = { workspace = true }

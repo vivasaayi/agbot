@@ -89,7 +89,7 @@ async fn run_communication_loop(
     const INITIAL_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
     const BACKOFF_MULTIPLIER: u64 = 2;
-    
+
     let mut backoff_secs = INITIAL_BACKOFF_SECS;
     let mut consecutive_failures = 0u32;
 
@@ -97,7 +97,7 @@ async fn run_communication_loop(
         match connect_async(&websocket_url).await {
             Ok((ws_stream, _)) => {
                 info!("Connected to WebSocket successfully");
-                
+
                 // Reset backoff on successful connection
                 backoff_secs = INITIAL_BACKOFF_SECS;
                 consecutive_failures = 0;
@@ -177,13 +177,16 @@ async fn run_communication_loop(
                         }
                     }
                 }
-                
+
                 // Connection dropped, apply backoff before reconnecting
-                info!("Connection lost, reconnecting in {} seconds...", backoff_secs);
+                info!(
+                    "Connection lost, reconnecting in {} seconds...",
+                    backoff_secs
+                );
             }
             Err(e) => {
                 consecutive_failures += 1;
-                
+
                 // Log with appropriate severity based on failure count
                 if consecutive_failures <= 3 {
                     warn!(
@@ -199,10 +202,10 @@ async fn run_communication_loop(
                 }
             }
         }
-        
+
         // Wait with exponential backoff
         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-        
+
         // Increase backoff for next attempt, capped at max
         backoff_secs = (backoff_secs * BACKOFF_MULTIPLIER).min(MAX_BACKOFF_SECS);
     }

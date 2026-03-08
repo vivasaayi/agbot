@@ -46,7 +46,11 @@ impl WeatherIntegration {
     pub fn new(api_key: Option<String>) -> Self {
         Self {
             api_key,
-            client: reqwest::Client::new(),
+            // Avoid environment/system proxy discovery so tests remain deterministic.
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("weather client should build"),
         }
     }
 

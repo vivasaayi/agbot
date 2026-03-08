@@ -6,20 +6,17 @@
 
 use bevy::prelude::*;
 
-use crate::gis::LoadRealWorldEvent;
-use crate::gis::terrain_mesh::{TerrainMeshConfig, TerrainOverlay, RealTerrain};
-use crate::gis::ndvi::NdviConfig;
 use crate::gis::cdl::CdlConfig;
+use crate::gis::ndvi::NdviConfig;
 use crate::gis::osm::OsmConfig;
+use crate::gis::terrain_mesh::{RealTerrain, TerrainMeshConfig, TerrainOverlay};
+use crate::gis::LoadRealWorldEvent;
 
 pub struct RealWorldDemoPlugin;
 
 impl Plugin for RealWorldDemoPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (
-            demo_keyboard_handler,
-            overlay_toggle_handler,
-        ));
+        app.add_systems(Update, (demo_keyboard_handler, overlay_toggle_handler));
     }
 }
 
@@ -61,14 +58,21 @@ fn overlay_toggle_handler(
     if keyboard.just_pressed(KeyCode::KeyN) {
         terrain_config.show_ndvi = !terrain_config.show_ndvi;
         ndvi_config.enabled = terrain_config.show_ndvi;
-        
-        info!("NDVI overlay: {}", if terrain_config.show_ndvi { "ON" } else { "OFF" });
-        
+
+        info!(
+            "NDVI overlay: {}",
+            if terrain_config.show_ndvi {
+                "ON"
+            } else {
+                "OFF"
+            }
+        );
+
         // Update terrain overlay mode
         for mut terrain in terrain_query.iter_mut() {
             if terrain_config.show_ndvi {
                 terrain.active_overlay = TerrainOverlay::BlendedNdvi;
-                
+
                 // Switch material texture to NDVI
                 for mat_handle in material_query.iter() {
                     if let Some(material) = materials.get_mut(mat_handle) {
@@ -79,7 +83,7 @@ fn overlay_toggle_handler(
                 }
             } else {
                 terrain.active_overlay = TerrainOverlay::None;
-                
+
                 // Switch back to base texture
                 for mat_handle in material_query.iter() {
                     if let Some(material) = materials.get_mut(mat_handle) {
@@ -91,19 +95,22 @@ fn overlay_toggle_handler(
             }
         }
     }
-    
+
     // Toggle CDL overlay with C key
     if keyboard.just_pressed(KeyCode::KeyC) {
         terrain_config.show_cdl = !terrain_config.show_cdl;
         cdl_config.enabled = terrain_config.show_cdl;
-        
-        info!("CDL overlay: {}", if terrain_config.show_cdl { "ON" } else { "OFF" });
-        
+
+        info!(
+            "CDL overlay: {}",
+            if terrain_config.show_cdl { "ON" } else { "OFF" }
+        );
+
         // Update terrain overlay mode
         for mut terrain in terrain_query.iter_mut() {
             if terrain_config.show_cdl {
                 terrain.active_overlay = TerrainOverlay::Cdl;
-                
+
                 // Switch material texture to CDL
                 for mat_handle in material_query.iter() {
                     if let Some(material) = materials.get_mut(mat_handle) {
@@ -114,7 +121,7 @@ fn overlay_toggle_handler(
                 }
             } else {
                 terrain.active_overlay = TerrainOverlay::None;
-                
+
                 // Switch back to base texture
                 for mat_handle in material_query.iter() {
                     if let Some(material) = materials.get_mut(mat_handle) {
@@ -126,15 +133,18 @@ fn overlay_toggle_handler(
             }
         }
     }
-    
+
     // Toggle OSM features with O key
     if keyboard.just_pressed(KeyCode::KeyO) {
         terrain_config.show_osm = !terrain_config.show_osm;
         osm_config.enabled = terrain_config.show_osm;
-        
-        info!("OSM features: {}", if terrain_config.show_osm { "ON" } else { "OFF" });
+
+        info!(
+            "OSM features: {}",
+            if terrain_config.show_osm { "ON" } else { "OFF" }
+        );
     }
-    
+
     // Adjust overlay opacity with [ and ] keys
     if keyboard.just_pressed(KeyCode::BracketLeft) {
         terrain_config.overlay_opacity = (terrain_config.overlay_opacity - 0.1).max(0.0);
@@ -156,7 +166,7 @@ pub fn real_world_location_ui(
     load_events: &mut EventWriter<LoadRealWorldEvent>,
 ) {
     ui.heading("🌍 Load Real World Location");
-    
+
     ui.horizontal(|ui| {
         if ui.button("Nebraska Farm").clicked() {
             load_events.send(LoadRealWorldEvent::nebraska_farm());
@@ -165,7 +175,7 @@ pub fn real_world_location_ui(
             load_events.send(LoadRealWorldEvent::iowa_cornbelt());
         }
     });
-    
+
     ui.horizontal(|ui| {
         if ui.button("California Valley").clicked() {
             load_events.send(LoadRealWorldEvent::california_valley());
@@ -174,7 +184,7 @@ pub fn real_world_location_ui(
             load_events.send(LoadRealWorldEvent::new(36.677, -121.655, 3000.0));
         }
     });
-    
+
     ui.separator();
     ui.label("Shortcuts: 1=Nebraska, 2=Iowa, 3=California, 4=Salinas (also F5-F8)");
 }
@@ -188,41 +198,50 @@ pub fn overlay_controls_ui(
     osm_config: &mut OsmConfig,
 ) {
     ui.heading("🗺️ Overlay Controls");
-    
+
     // NDVI toggle
     let mut show_ndvi = terrain_config.show_ndvi;
-    if ui.checkbox(&mut show_ndvi, "🌿 NDVI Vegetation Index").changed() {
+    if ui
+        .checkbox(&mut show_ndvi, "🌿 NDVI Vegetation Index")
+        .changed()
+    {
         terrain_config.show_ndvi = show_ndvi;
         ndvi_config.enabled = show_ndvi;
     }
-    
+
     // CDL toggle
     let mut show_cdl = terrain_config.show_cdl;
-    if ui.checkbox(&mut show_cdl, "🌾 Crop Classification (CDL)").changed() {
+    if ui
+        .checkbox(&mut show_cdl, "🌾 Crop Classification (CDL)")
+        .changed()
+    {
         terrain_config.show_cdl = show_cdl;
         cdl_config.enabled = show_cdl;
     }
-    
+
     // OSM toggle
     let mut show_osm = terrain_config.show_osm;
     if ui.checkbox(&mut show_osm, "🏠 OSM Features").changed() {
         terrain_config.show_osm = show_osm;
         osm_config.enabled = show_osm;
     }
-    
+
     ui.separator();
-    
+
     // Opacity slider
     ui.horizontal(|ui| {
         ui.label("Opacity:");
         let mut opacity = terrain_config.overlay_opacity;
-        if ui.add(bevy_egui::egui::Slider::new(&mut opacity, 0.0..=1.0)).changed() {
+        if ui
+            .add(bevy_egui::egui::Slider::new(&mut opacity, 0.0..=1.0))
+            .changed()
+        {
             terrain_config.overlay_opacity = opacity;
             ndvi_config.opacity = opacity;
             cdl_config.opacity = opacity;
         }
     });
-    
+
     // NDVI color scheme
     if terrain_config.show_ndvi {
         ui.horizontal(|ui| {
@@ -234,13 +253,25 @@ pub fn overlay_controls_ui(
                     super::ndvi::NdviColorScheme::StressDetection => "Stress Detection",
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut ndvi_config.color_scheme, super::ndvi::NdviColorScheme::Agriculture, "Agriculture");
-                    ui.selectable_value(&mut ndvi_config.color_scheme, super::ndvi::NdviColorScheme::Scientific, "Scientific");
-                    ui.selectable_value(&mut ndvi_config.color_scheme, super::ndvi::NdviColorScheme::StressDetection, "Stress Detection");
+                    ui.selectable_value(
+                        &mut ndvi_config.color_scheme,
+                        super::ndvi::NdviColorScheme::Agriculture,
+                        "Agriculture",
+                    );
+                    ui.selectable_value(
+                        &mut ndvi_config.color_scheme,
+                        super::ndvi::NdviColorScheme::Scientific,
+                        "Scientific",
+                    );
+                    ui.selectable_value(
+                        &mut ndvi_config.color_scheme,
+                        super::ndvi::NdviColorScheme::StressDetection,
+                        "Stress Detection",
+                    );
                 });
         });
     }
-    
+
     ui.separator();
     ui.label("Shortcuts: N=NDVI, C=CDL, O=OSM, [/]=opacity");
 }

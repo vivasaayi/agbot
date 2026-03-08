@@ -1,0 +1,209 @@
+use anyhow::Result;
+use axum::http::StatusCode;
+use axum_test::TestServer;
+use geo::{point, polygon};
+use mission_planner::{
+    api::{CreateMissionRequest, UpdateMissionRequest},
+    DatabaseService, Mission, MissionApi, MissionPlannerService, Waypoint, WaypointType,
+};
+use std::{collections::HashMap, env, sync::Arc};
+
+const DEFAULT_TEST_DATABASE_URL: &str = "postgres://postgres:password@localhost:5432/agbot_test";
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL and a running PostgreSQL instance"]
+async fn db_service_crud_search_and_stats_roundtrip() -> Result<()> {
+    let db_url = test_database_url();
+    let service = MissionPlannerService::new(&db_url).await?;
+
+    let mut mission = sample_mission("Coverage Alpha", "Initial mission");
+    mission.estimated_duration_minutes = 18;
+    mission.estimated_battery_usage = 0.42;
+    let id = service.create_mission(mission.clone()).await?;
+
+    let fetched = service
+        .get_mission(&id)
+        .await?
+        .expect("mission should exist");
+    assert_eq!(fetched.name, "Coverage Alpha");
+    assert_eq!(fetched.waypoints.len(), 2);
+    assert_eq!(fetched.metadata.get("owner"), Some(&"qa".to_string()));
+
+    mission.name = "Coverage Beta".to_string();
+    mission.description = "Updated mission".to_string();
+    mission.updated_at = chrono::Utc::now();
+    mission
+        .metadata
+        .insert("priority".to_string(), "high".to_string());
+    service.update_mission(mission.clone()).await?;
+
+    let updated = service
+        .get_mission(&mission.id)
+        .await?
+        .expect("updated mission should exist");
+    assert_eq!(updated.name, "Coverage Beta");
+    assert_eq!(updated.description, "Updated mission");
+    assert_eq!(updated.metadata.get("priority"), Some(&"high".to_string()));
+
+    let listed = service.list_missions(Some(50), Some(0)).await?;
+    assert!(listed.iter().any(|m| m.id == id));
+
+    let found = service.search_missions("beta").await?;
+    assert!(found.iter().any(|m| m.id == id));
+
+    let stats = service.get_mission_stats().await?;
+    assert!(stats.total_missions >= 1);
+    assert!(stats.average_duration_minutes > 0.0);
+    assert!(stats.average_battery_usage >= 0.0);
+
+    service.delete_mission(&id).await?;
+    assert!(service.get_mission(&id).await?.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL and a running PostgreSQL instance"]
+async fn api_crud_search_stats_flow() -> Result<()> {
+    let db_url = test_database_url();
+    let db = DatabaseService::connect(&db_url).await?;
+    db.initialize().await?;
+    let service = Arc::new(MissionPlannerService::with_database(db));
+    let server = TestServer::new(MissionApi::router(service))?;
+
+    let mut metadata = HashMap::new();
+    metadata.insert("source".to_string(), "integration-test".to_string());
+    let create_request = CreateMissionRequest {
+        name: "API Mission".to_string(),
+        description: "Created via API".to_string(),
+        area_of_interest: polygon![
+            (x: 0.0, y: 0.0),
+            (x: 0.2, y: 0.0),
+            (x: 0.2, y: 0.2),
+            (x: 0.0, y: 0.2),
+            (x: 0.0, y: 0.0),
+        ],
+        waypoints: Some(vec![
+            Waypoint::new(point!(x: 0.0, y: 0.0), 100.0, WaypointType::Takeoff),
+            Waypoint::new(point!(x: 0.1, y: 0.1), 120.0, WaypointType::Navigation),
+        ]),
+        metadata: Some(metadata),
+    };
+
+    let create_resp = server.post("/missions").json(&create_request).await;
+    assert_eq!(create_resp.status_code(), StatusCode::OK);
+    let create_json: serde_json::Value = create_resp.json();
+    let mission_id = create_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing id in create response"))?
+        .to_string();
+
+    let get_resp = server.get(&format!("/missions/{mission_id}")).await;
+    assert_eq!(get_resp.status_code(), StatusCode::OK);
+    let get_json: serde_json::Value = get_resp.json();
+    assert_eq!(
+        get_json.pointer("/mission/name").and_then(|v| v.as_str()),
+        Some("API Mission")
+    );
+
+    let update_request = UpdateMissionRequest {
+        name: Some("API Mission Updated".to_string()),
+        description: Some("Updated via API".to_string()),
+        area_of_interest: None,
+        waypoints: None,
+        metadata: Some(HashMap::from([(
+            "source".to_string(),
+            "api-update".to_string(),
+        )])),
+    };
+    let update_resp = server
+        .put(&format!("/missions/{mission_id}"))
+        .json(&update_request)
+        .await;
+    assert_eq!(update_resp.status_code(), StatusCode::OK);
+    let update_json: serde_json::Value = update_resp.json();
+    assert_eq!(
+        update_json
+            .pointer("/mission/name")
+            .and_then(|v| v.as_str()),
+        Some("API Mission Updated")
+    );
+
+    let list_resp = server.get("/missions?limit=10&offset=0").await;
+    assert_eq!(list_resp.status_code(), StatusCode::OK);
+    let list_json: serde_json::Value = list_resp.json();
+    let listed = list_json
+        .get("missions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("missions array missing in list response"))?;
+    assert!(listed.iter().any(|m| {
+        m.get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id == mission_id)
+    }));
+
+    let search_resp = server.get("/missions/search?q=updated").await;
+    assert_eq!(search_resp.status_code(), StatusCode::OK);
+    let search_json: serde_json::Value = search_resp.json();
+    let searched = search_json
+        .get("missions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("missions array missing in search response"))?;
+    assert!(searched.iter().any(|m| {
+        m.get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id == mission_id)
+    }));
+
+    let stats_resp = server.get("/missions/stats").await;
+    assert_eq!(stats_resp.status_code(), StatusCode::OK);
+    let stats_json: serde_json::Value = stats_resp.json();
+    assert!(
+        stats_json
+            .get("total_missions")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            >= 1
+    );
+
+    let delete_resp = server.delete(&format!("/missions/{mission_id}")).await;
+    assert_eq!(delete_resp.status_code(), StatusCode::NO_CONTENT);
+
+    let missing_resp = server.get(&format!("/missions/{mission_id}")).await;
+    assert_eq!(missing_resp.status_code(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+fn sample_mission(name: &str, description: &str) -> Mission {
+    let mut mission = Mission::new(
+        name.to_string(),
+        description.to_string(),
+        polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ],
+    );
+    mission.add_waypoint(Waypoint::new(
+        point!(x: 0.0, y: 0.0),
+        100.0,
+        WaypointType::Takeoff,
+    ));
+    mission.add_waypoint(Waypoint::new(
+        point!(x: 0.5, y: 0.5),
+        120.0,
+        WaypointType::Survey,
+    ));
+    mission
+        .metadata
+        .insert("owner".to_string(), "qa".to_string());
+    mission
+}
+
+fn test_database_url() -> String {
+    env::var("TEST_DATABASE_URL").unwrap_or_else(|_| DEFAULT_TEST_DATABASE_URL.to_string())
+}

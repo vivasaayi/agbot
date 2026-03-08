@@ -29,10 +29,7 @@ impl Plugin for RealWorldLoaderPlugin {
         app.add_event::<LoadRealWorldEvent>()
             .add_event::<RealWorldLoadedEvent>()
             .init_resource::<RealWorldLoaderState>()
-            .add_systems(Update, (
-                handle_load_request,
-                poll_loading_task,
-            ));
+            .add_systems(Update, (handle_load_request, poll_loading_task));
     }
 }
 
@@ -63,20 +60,25 @@ impl LoadRealWorldEvent {
         } else {
             14
         };
-        
-        Self { latitude: lat, longitude: lon, radius_m, zoom }
+
+        Self {
+            latitude: lat,
+            longitude: lon,
+            radius_m,
+            zoom,
+        }
     }
-    
+
     /// Nebraska farm location (for testing)
     pub fn nebraska_farm() -> Self {
         Self::new(41.1621, -101.3542, 2000.0)
     }
-    
+
     /// Iowa corn belt
     pub fn iowa_cornbelt() -> Self {
         Self::new(41.878, -93.098, 2000.0)
     }
-    
+
     /// California Central Valley
     pub fn california_valley() -> Self {
         Self::new(36.778, -119.418, 2000.0)
@@ -112,53 +114,54 @@ fn handle_load_request(
     let Some(event) = events.read().last() else {
         return;
     };
-    
+
     let Some(rt) = rt_handle else {
         error!("No Tokio runtime available for async loading");
         return;
     };
-    
+
     info!(
         "Starting real world load: ({:.4}, {:.4}) radius {:.0}m, zoom {}",
         event.latitude, event.longitude, event.radius_m, event.zoom
     );
-    
+
     let bounds = GeoBounds::from_center(event.latitude, event.longitude, event.radius_m);
     let zoom = event.zoom;
-    
+
     loading_state.is_loading = true;
     loading_state.progress = 0.1;
     loading_state.status_message = format!(
         "Loading terrain for ({:.4}, {:.4})...",
         event.latitude, event.longitude
     );
-    
+
     state.pending_bounds = Some(bounds);
-    
+
     // Spawn async loading task
     state.loading_task = Some(rt.0.spawn(async move {
         let mut cache = TileCache::default();
-        
+
         // Ensure cache directory exists
         if let Err(e) = std::fs::create_dir_all(&cache.cache_dir) {
             tracing::warn!("Failed to create cache dir: {}", e);
         }
-        
+
         // Fetch elevation
         tracing::info!("Fetching elevation data...");
         let elevation_tiles = fetch_elevation_for_bounds(bounds, zoom, &mut cache).await?;
         tracing::info!("Fetched {} elevation tiles", elevation_tiles.len());
-        
+
         // Fetch imagery
         tracing::info!("Fetching satellite imagery...");
         let imagery_tiles = fetch_imagery_for_bounds(
-            bounds, 
+            bounds,
             zoom + 1, // Slightly higher zoom for imagery
-            ImagerySource::EsriWorldImagery, 
-            &mut cache
-        ).await?;
+            ImagerySource::EsriWorldImagery,
+            &mut cache,
+        )
+        .await?;
         tracing::info!("Fetched {} imagery tiles", imagery_tiles.len());
-        
+
         Ok(LoadedWorldData {
             bounds,
             elevation_tiles,
@@ -176,7 +179,7 @@ fn poll_loading_task(
     let Some(task) = state.loading_task.as_mut() else {
         return;
     };
-    
+
     // Check if task is complete
     if !task.is_finished() {
         // Update progress animation
@@ -185,10 +188,10 @@ fn poll_loading_task(
         }
         return;
     }
-    
+
     // Task complete, get result
     let task = state.loading_task.take().unwrap();
-    
+
     match futures_lite::future::block_on(task) {
         Ok(Ok(data)) => {
             info!(
@@ -196,10 +199,10 @@ fn poll_loading_task(
                 data.elevation_tiles.len(),
                 data.imagery_tiles.len()
             );
-            
+
             loading_state.status_message = "Building terrain mesh...".to_string();
             loading_state.progress = 0.95;
-            
+
             // Calculate elevation range
             let mut min_elev = f32::MAX;
             let mut max_elev = f32::MIN;
@@ -207,19 +210,19 @@ fn poll_loading_task(
                 min_elev = min_elev.min(tile.min_elevation);
                 max_elev = max_elev.max(tile.max_elevation);
             }
-            
+
             // Trigger terrain spawning
             spawn_terrain_events.send(SpawnRealTerrainEvent {
                 bounds: data.bounds,
                 elevation_tiles: data.elevation_tiles,
                 imagery_tiles: data.imagery_tiles,
             });
-            
+
             loaded_events.send(RealWorldLoadedEvent {
                 bounds: data.bounds,
                 elevation_range: (min_elev, max_elev),
             });
-            
+
             loading_state.is_loading = false;
             loading_state.progress = 1.0;
             loading_state.status_message = "Terrain ready".to_string();
@@ -235,6 +238,6 @@ fn poll_loading_task(
             loading_state.status_message = format!("Task crashed: {}", e);
         }
     }
-    
+
     state.pending_bounds = None;
 }

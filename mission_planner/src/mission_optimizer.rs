@@ -215,9 +215,9 @@ mod tests {
     fn test_optimizer_basic() {
         let area = polygon![
             (x: 0.0, y: 0.0),
-            (x: 1.0, y: 0.0),
-            (x: 1.0, y: 1.0),
-            (x: 0.0, y: 1.0),
+            (x: 0.01, y: 0.0),
+            (x: 0.01, y: 0.01),
+            (x: 0.0, y: 0.01),
             (x: 0.0, y: 0.0),
         ];
 
@@ -234,12 +234,12 @@ mod tests {
             WaypointType::Takeoff,
         ));
         mission.add_waypoint(Waypoint::new(
-            point!(x: 0.5, y: 0.5),
+            point!(x: 0.005, y: 0.005),
             150.0,
             WaypointType::DataCollection,
         ));
         mission.add_waypoint(Waypoint::new(
-            point!(x: 1.0, y: 1.0),
+            point!(x: 0.01, y: 0.01),
             100.0,
             WaypointType::Landing,
         ));

@@ -8,11 +8,14 @@
 
 use anyhow::{anyhow, Context, Result};
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::render_asset::RenderAssetUsages;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use std::collections::HashMap;
 
-use super::{tile_cache::{TileCache, TileType}, GeoBounds, TileCoord};
+use super::{
+    tile_cache::{TileCache, TileType},
+    GeoBounds, TileCoord,
+};
 
 /// CDL configuration
 #[derive(Resource, Clone)]
@@ -53,7 +56,7 @@ pub enum CropType {
     Tobacco = 11,
     SweetCorn = 12,
     PopCorn = 13,
-    
+
     // Small Grains
     Barley = 21,
     DurumWheat = 22,
@@ -62,7 +65,7 @@ pub enum CropType {
     Oats = 28,
     Millet = 29,
     Rye = 30,
-    
+
     // Specialty Crops
     Canola = 31,
     Flaxseed = 32,
@@ -73,21 +76,21 @@ pub enum CropType {
     Sugarbeets = 41,
     DryBeans = 42,
     Potatoes = 43,
-    
+
     // Vegetables
     Tomatoes = 54,
     Onions = 49,
     Cucumbers = 50,
     Lettuce = 227,
     Peppers = 216,
-    
+
     // Fruits & Nuts
     Grapes = 69,
     Citrus = 72,
     Almonds = 75,
     Walnuts = 76,
     Pecans = 77,
-    
+
     // Pasture & Forest
     GrasslandPasture = 176,
     Shrubland = 152,
@@ -95,7 +98,7 @@ pub enum CropType {
     EvergreenForest = 142,
     MixedForest = 143,
     Wetlands = 190,
-    
+
     // Developed & Other
     DevelopedOpen = 121,
     DevelopedLow = 122,
@@ -103,7 +106,7 @@ pub enum CropType {
     DevelopedHigh = 124,
     Barren = 131,
     Water = 111,
-    
+
     // Fallback
     Unknown = 0,
 }
@@ -163,7 +166,7 @@ impl CropType {
             _ => Self::Unknown,
         }
     }
-    
+
     /// Get the display name for this crop type
     pub fn name(&self) -> &'static str {
         match self {
@@ -218,64 +221,64 @@ impl CropType {
             Self::Unknown => "Unknown",
         }
     }
-    
+
     /// Get the standard CDL color for this crop type (RGB)
     pub fn color(&self) -> (u8, u8, u8) {
         match self {
             // Row crops - yellows and oranges
-            Self::Corn => (255, 211, 0),           // Yellow
-            Self::Soybeans => (38, 115, 0),        // Dark green
-            Self::Cotton => (255, 165, 226),       // Pink
-            Self::Rice => (0, 168, 228),           // Blue
-            Self::Sorghum => (255, 109, 9),        // Orange
-            Self::Sunflower => (255, 255, 0),      // Bright yellow
-            
+            Self::Corn => (255, 211, 0),      // Yellow
+            Self::Soybeans => (38, 115, 0),   // Dark green
+            Self::Cotton => (255, 165, 226),  // Pink
+            Self::Rice => (0, 168, 228),      // Blue
+            Self::Sorghum => (255, 109, 9),   // Orange
+            Self::Sunflower => (255, 255, 0), // Bright yellow
+
             // Wheat - tans and browns
-            Self::WinterWheat => (166, 112, 0),    // Brown
-            Self::SpringWheat => (210, 166, 92),   // Light brown
-            Self::DurumWheat => (176, 137, 51),    // Tan
-            Self::Barley => (255, 221, 165),       // Light tan
-            Self::Oats => (209, 255, 115),         // Light green
-            
+            Self::WinterWheat => (166, 112, 0),  // Brown
+            Self::SpringWheat => (210, 166, 92), // Light brown
+            Self::DurumWheat => (176, 137, 51),  // Tan
+            Self::Barley => (255, 221, 165),     // Light tan
+            Self::Oats => (209, 255, 115),       // Light green
+
             // Legumes and forage
-            Self::Alfalfa => (0, 175, 75),         // Green
-            Self::OtherHay => (215, 215, 158),     // Pale green
-            Self::DryBeans => (255, 190, 190),     // Light pink
-            Self::Potatoes => (112, 68, 137),      // Purple
-            
+            Self::Alfalfa => (0, 175, 75),     // Green
+            Self::OtherHay => (215, 215, 158), // Pale green
+            Self::DryBeans => (255, 190, 190), // Light pink
+            Self::Potatoes => (112, 68, 137),  // Purple
+
             // Vegetables
-            Self::Tomatoes => (255, 0, 0),         // Red
-            Self::Onions => (190, 120, 130),       // Pink-brown
-            Self::Cucumbers => (0, 200, 100),      // Green
-            Self::Lettuce => (150, 255, 150),      // Light green
-            Self::Peppers => (255, 80, 80),        // Red-orange
-            
+            Self::Tomatoes => (255, 0, 0),    // Red
+            Self::Onions => (190, 120, 130),  // Pink-brown
+            Self::Cucumbers => (0, 200, 100), // Green
+            Self::Lettuce => (150, 255, 150), // Light green
+            Self::Peppers => (255, 80, 80),   // Red-orange
+
             // Fruits and nuts
-            Self::Grapes => (111, 0, 138),         // Purple
-            Self::Citrus => (255, 170, 0),         // Orange
-            Self::Almonds => (166, 82, 41),        // Brown
-            Self::Walnuts => (139, 90, 43),        // Dark brown
-            Self::Pecans => (160, 82, 45),         // Sienna
-            
+            Self::Grapes => (111, 0, 138),  // Purple
+            Self::Citrus => (255, 170, 0),  // Orange
+            Self::Almonds => (166, 82, 41), // Brown
+            Self::Walnuts => (139, 90, 43), // Dark brown
+            Self::Pecans => (160, 82, 45),  // Sienna
+
             // Natural vegetation
             Self::GrasslandPasture => (227, 227, 194), // Pale yellow-green
-            Self::Shrubland => (204, 191, 138),    // Tan
-            Self::DeciduousForest => (109, 163, 73), // Forest green
-            Self::EvergreenForest => (27, 120, 55),  // Dark green
-            Self::MixedForest => (71, 140, 65),    // Green
-            Self::Wetlands => (126, 196, 193),     // Cyan
-            
+            Self::Shrubland => (204, 191, 138),        // Tan
+            Self::DeciduousForest => (109, 163, 73),   // Forest green
+            Self::EvergreenForest => (27, 120, 55),    // Dark green
+            Self::MixedForest => (71, 140, 65),        // Green
+            Self::Wetlands => (126, 196, 193),         // Cyan
+
             // Developed areas
             Self::DevelopedOpen => (222, 166, 149), // Light red
-            Self::DevelopedLow => (217, 146, 130), // Medium red
-            Self::DevelopedMed => (211, 127, 112), // Darker red
-            Self::DevelopedHigh => (173, 83, 77),  // Dark red
-            
+            Self::DevelopedLow => (217, 146, 130),  // Medium red
+            Self::DevelopedMed => (211, 127, 112),  // Darker red
+            Self::DevelopedHigh => (173, 83, 77),   // Dark red
+
             // Other
-            Self::Water => (76, 112, 163),         // Blue
-            Self::Barren => (179, 174, 163),       // Gray
-            Self::Unknown => (128, 128, 128),      // Gray
-            
+            Self::Water => (76, 112, 163),    // Blue
+            Self::Barren => (179, 174, 163),  // Gray
+            Self::Unknown => (128, 128, 128), // Gray
+
             // Fill in remaining
             _ => (200, 200, 200),
         }
@@ -332,23 +335,29 @@ pub async fn fetch_cdl_for_bounds(
          BBOX={},{},{},{}&\
          WIDTH={resolution}&HEIGHT={resolution}&\
          FORMAT=image/png",
-        bounds.min_lon, bounds.min_lat, bounds.max_lon, bounds.max_lat,
+        bounds.min_lon,
+        bounds.min_lat,
+        bounds.max_lon,
+        bounds.max_lat,
         year = year
     );
-    
+
     tracing::info!("Fetching CDL data from: {}", url);
-    
+
     let client = reqwest::Client::builder()
         .user_agent("AgBot-GIS/0.1")
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    
+
     let response = client.get(&url).send().await?;
-    
+
     if !response.status().is_success() {
-        return Err(anyhow!("Failed to fetch CDL data: HTTP {}", response.status()));
+        return Err(anyhow!(
+            "Failed to fetch CDL data: HTTP {}",
+            response.status()
+        ));
     }
-    
+
     let bytes = response.bytes().await?;
     decode_cdl_png(&bytes, bounds, resolution)
 }
@@ -356,16 +365,20 @@ pub async fn fetch_cdl_for_bounds(
 /// Decode CDL PNG response
 fn decode_cdl_png(data: &[u8], bounds: GeoBounds, resolution: u32) -> Result<CdlData> {
     use std::io::Cursor;
-    
+
     let decoder = png::Decoder::new(Cursor::new(data));
-    let mut reader = decoder.read_info().context("Failed to read CDL PNG header")?;
-    
+    let mut reader = decoder
+        .read_info()
+        .context("Failed to read CDL PNG header")?;
+
     let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).context("Failed to decode CDL PNG")?;
-    
+    let info = reader
+        .next_frame(&mut buf)
+        .context("Failed to decode CDL PNG")?;
+
     let width = info.width;
     let height = info.height;
-    
+
     // CDL typically returns indexed PNG with palette
     // For simplicity, we'll extract the dominant channel as the class value
     let values: Vec<u8> = match info.color_type {
@@ -383,15 +396,16 @@ fn decode_cdl_png(data: &[u8], bounds: GeoBounds, resolution: u32) -> Result<Cdl
         png::ColorType::Grayscale => buf[..(width * height) as usize].to_vec(),
         _ => return Err(anyhow!("Unsupported CDL color type: {:?}", info.color_type)),
     };
-    
+
     // Convert to crop types
-    let crop_types: Vec<CropType> = values.iter()
+    let crop_types: Vec<CropType> = values
+        .iter()
         .map(|&v| CropType::from_cdl_value(v))
         .collect();
-    
+
     // Compute statistics
     let stats = compute_cdl_stats(&crop_types);
-    
+
     Ok(CdlData {
         crop_types,
         width,
@@ -405,61 +419,75 @@ fn decode_cdl_png(data: &[u8], bounds: GeoBounds, resolution: u32) -> Result<Cdl
 fn rgb_to_cdl_class(r: u8, g: u8, b: u8) -> u8 {
     // Use color distance to find nearest CDL class
     let crops = [
-        CropType::Corn, CropType::Soybeans, CropType::WinterWheat,
-        CropType::Alfalfa, CropType::Cotton, CropType::Rice,
-        CropType::GrasslandPasture, CropType::DeciduousForest,
-        CropType::Water, CropType::DevelopedLow, CropType::Barren,
+        CropType::Corn,
+        CropType::Soybeans,
+        CropType::WinterWheat,
+        CropType::Alfalfa,
+        CropType::Cotton,
+        CropType::Rice,
+        CropType::GrasslandPasture,
+        CropType::DeciduousForest,
+        CropType::Water,
+        CropType::DevelopedLow,
+        CropType::Barren,
     ];
-    
+
     let mut best_match = CropType::Unknown;
     let mut best_dist = f32::MAX;
-    
+
     for crop in crops {
         let (cr, cg, cb) = crop.color();
-        let dist = ((r as f32 - cr as f32).powi(2) +
-                   (g as f32 - cg as f32).powi(2) +
-                   (b as f32 - cb as f32).powi(2)).sqrt();
+        let dist = ((r as f32 - cr as f32).powi(2)
+            + (g as f32 - cg as f32).powi(2)
+            + (b as f32 - cb as f32).powi(2))
+        .sqrt();
         if dist < best_dist {
             best_dist = dist;
             best_match = crop;
         }
     }
-    
+
     best_match as u8
 }
 
 /// Compute CDL statistics
 fn compute_cdl_stats(crop_types: &[CropType]) -> CdlStats {
     let mut counts: HashMap<CropType, u32> = HashMap::new();
-    
+
     for &crop in crop_types {
         *counts.entry(crop).or_insert(0) += 1;
     }
-    
+
     let total = crop_types.len() as f32;
     let mut percentages: HashMap<CropType, f32> = HashMap::new();
     let mut dominant_crop = None;
     let mut max_count = 0u32;
     let mut ag_count = 0u32;
-    
+
     for (&crop, &count) in &counts {
         let pct = (count as f32 / total) * 100.0;
         percentages.insert(crop, pct);
-        
+
         if count > max_count {
             max_count = count;
             dominant_crop = Some(crop);
         }
-        
+
         // Count agricultural land (crops, not forest/water/developed)
         match crop {
-            CropType::Water | CropType::DevelopedOpen | CropType::DevelopedLow |
-            CropType::DevelopedMed | CropType::DevelopedHigh | CropType::Barren |
-            CropType::DeciduousForest | CropType::EvergreenForest | CropType::MixedForest => {}
+            CropType::Water
+            | CropType::DevelopedOpen
+            | CropType::DevelopedLow
+            | CropType::DevelopedMed
+            | CropType::DevelopedHigh
+            | CropType::Barren
+            | CropType::DeciduousForest
+            | CropType::EvergreenForest
+            | CropType::MixedForest => {}
             _ => ag_count += count,
         }
     }
-    
+
     CdlStats {
         crop_percentages: percentages,
         dominant_crop,
@@ -471,12 +499,12 @@ fn compute_cdl_stats(crop_types: &[CropType]) -> CdlStats {
 pub fn cdl_to_texture(cdl: &CdlData, config: &CdlConfig) -> Image {
     let mut pixels = Vec::with_capacity((cdl.width * cdl.height * 4) as usize);
     let alpha = (config.opacity * 255.0) as u8;
-    
+
     for crop in &cdl.crop_types {
         let (r, g, b) = crop.color();
         pixels.extend_from_slice(&[r, g, b, alpha]);
     }
-    
+
     Image::new(
         Extent3d {
             width: cdl.width,
@@ -491,28 +519,25 @@ pub fn cdl_to_texture(cdl: &CdlData, config: &CdlConfig) -> Image {
 }
 
 /// Create a legend texture for CDL crop types
-pub fn create_cdl_legend(
-    crops: &[CropType],
-    cell_size: u32,
-) -> (Image, Vec<(CropType, u32, u32)>) {
+pub fn create_cdl_legend(crops: &[CropType], cell_size: u32) -> (Image, Vec<(CropType, u32, u32)>) {
     let num_crops = crops.len() as u32;
     let width = cell_size;
     let height = cell_size * num_crops;
-    
+
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);
     let mut positions = Vec::new();
-    
+
     for (i, &crop) in crops.iter().enumerate() {
         let (r, g, b) = crop.color();
         positions.push((crop, 0, i as u32 * cell_size));
-        
+
         for _ in 0..cell_size {
             for _ in 0..cell_size {
                 pixels.extend_from_slice(&[r, g, b, 255]);
             }
         }
     }
-    
+
     let image = Image::new(
         Extent3d {
             width,
@@ -524,6 +549,6 @@ pub fn create_cdl_legend(
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     );
-    
+
     (image, positions)
 }

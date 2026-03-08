@@ -41,7 +41,7 @@ impl MissionApi {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMissionRequest {
     pub name: String,
     pub description: String,
@@ -50,7 +50,7 @@ pub struct CreateMissionRequest {
     pub metadata: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateMissionRequest {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -70,12 +70,12 @@ pub struct SearchQuery {
     pub q: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MissionResponse {
     pub mission: Mission,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MissionListResponse {
     pub missions: Vec<Mission>,
     pub total: usize,
@@ -83,13 +83,13 @@ pub struct MissionListResponse {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMissionResponse {
     pub id: Uuid,
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
     pub message: String,
@@ -363,7 +363,6 @@ async fn get_mission_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Method;
     use axum_test::TestServer;
     use geo::{coord, polygon};
 
@@ -420,10 +419,7 @@ mod tests {
         assert_eq!(response.status_code(), StatusCode::OK);
 
         // Test delete mission
-        let response = server
-            .method(Method::DELETE)
-            .uri(&format!("/missions/{}", mission_id))
-            .await;
+        let response = server.delete(&format!("/missions/{}", mission_id)).await;
 
         assert_eq!(response.status_code(), StatusCode::NO_CONTENT);
     }

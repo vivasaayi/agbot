@@ -13,7 +13,7 @@ async fn ready_handler() -> &'static str {
     "ready"
 }
 
-fn build_router(state: AppState) -> Router {
+pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))

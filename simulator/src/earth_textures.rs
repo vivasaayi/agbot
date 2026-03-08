@@ -103,7 +103,7 @@ pub fn update_earth_material_with_textures(
             }
 
             info!("Earth material updated with realistic textures!");
-            
+
             // Mark as applied to prevent repeated updates
             earth_textures.textures_applied = true;
         }

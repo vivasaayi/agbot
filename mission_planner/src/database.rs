@@ -569,7 +569,7 @@ impl DatabaseService {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionStats {
     pub total_missions: u64,
     pub average_duration_minutes: f32,
