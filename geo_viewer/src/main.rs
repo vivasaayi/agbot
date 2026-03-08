@@ -13,6 +13,7 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use futures_lite::future;
 use image::{self, DynamicImage};
 use serde::Deserialize;
+use shared::schemas::GpsCoords;
 use tracing::info;
 
 const APP_TITLE: &str = "Geo Viewer";
@@ -47,6 +48,11 @@ struct SceneManifest {
     scene_id: String,
     sensor: Option<String>,
     acquired_at: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    bands: Vec<String>,
+    gps_position: Option<GpsCoords>,
+    data_path: Option<String>,
     available_products: Vec<SceneProduct>,
 }
 
@@ -63,6 +69,11 @@ struct SceneManifestState {
     scene_id: Option<String>,
     sensor: Option<String>,
     acquired_at: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    bands: Vec<String>,
+    gps_position: Option<GpsCoords>,
+    data_path: Option<String>,
     products: Vec<SceneProduct>,
 }
 
@@ -290,6 +301,15 @@ fn render_ui(
         .acquired_at
         .clone()
         .unwrap_or_else(|| "n/a".to_string());
+    let source_dimensions = match (manifest_state.width, manifest_state.height) {
+        (Some(width), Some(height)) => format!("{}x{}", width, height),
+        _ => "n/a".to_string(),
+    };
+    let gps_text = manifest_state
+        .gps_position
+        .as_ref()
+        .map(|gps| format!("{:.5}, {:.5}", gps.latitude, gps.longitude))
+        .unwrap_or_else(|| "n/a".to_string());
 
     egui::TopBottomPanel::top("status_bar").show(contexts.ctx_mut(), |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -302,6 +322,12 @@ fn render_ui(
             ui.label(format!("Sensor: {}", sensor));
             ui.separator();
             ui.label(format!("Acquired: {}", acquired_at));
+            ui.separator();
+            ui.label(format!("Source: {}", source_dimensions));
+            ui.separator();
+            ui.label(format!("Bands: {}", manifest_state.bands.len()));
+            ui.separator();
+            ui.label(format!("GPS: {}", gps_text));
             ui.separator();
             ui.label(status_message);
             if !dimension_text.is_empty() {
@@ -328,6 +354,11 @@ fn poll_manifest_fetch(
                     manifest_state.scene_id = Some(manifest.scene_id);
                     manifest_state.sensor = manifest.sensor;
                     manifest_state.acquired_at = manifest.acquired_at;
+                    manifest_state.width = manifest.width;
+                    manifest_state.height = manifest.height;
+                    manifest_state.bands = manifest.bands;
+                    manifest_state.gps_position = manifest.gps_position;
+                    manifest_state.data_path = manifest.data_path;
                     manifest_state.products = products;
 
                     if manifest_state.products.is_empty() {
@@ -352,6 +383,11 @@ fn poll_manifest_fetch(
                     manifest_state.scene_id = config.scene_id.clone();
                     manifest_state.sensor = None;
                     manifest_state.acquired_at = None;
+                    manifest_state.width = None;
+                    manifest_state.height = None;
+                    manifest_state.bands.clear();
+                    manifest_state.gps_position = None;
+                    manifest_state.data_path = None;
                     manifest_state.products.clear();
                     tile_state.status = TileStatus::Error(err.to_string());
                 }
@@ -485,6 +521,11 @@ fn start_manifest_fetch(
             manifest_state.scene_id = None;
             manifest_state.sensor = None;
             manifest_state.acquired_at = None;
+            manifest_state.width = None;
+            manifest_state.height = None;
+            manifest_state.bands.clear();
+            manifest_state.gps_position = None;
+            manifest_state.data_path = None;
             manifest_state.products.clear();
             return Ok(());
         }
@@ -493,6 +534,11 @@ fn start_manifest_fetch(
     manifest_state.scene_id = Some(scene_id.clone());
     manifest_state.sensor = None;
     manifest_state.acquired_at = None;
+    manifest_state.width = None;
+    manifest_state.height = None;
+    manifest_state.bands.clear();
+    manifest_state.gps_position = None;
+    manifest_state.data_path = None;
     manifest_state.products.clear();
 
     let base_url = config.base_url.clone();
@@ -517,5 +563,10 @@ fn clear_manifest_state(manifest_state: &mut SceneManifestState) {
     manifest_state.scene_id = None;
     manifest_state.sensor = None;
     manifest_state.acquired_at = None;
+    manifest_state.width = None;
+    manifest_state.height = None;
+    manifest_state.bands.clear();
+    manifest_state.gps_position = None;
+    manifest_state.data_path = None;
     manifest_state.products.clear();
 }

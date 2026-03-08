@@ -87,16 +87,33 @@ async fn scene_manifest_lists_available_products_from_disk() -> Result<()> {
     let app = ctx.app;
 
     let scene_id = "manifest_scene";
-    let product_path = tmp
-        .path()
-        .join("data")
-        .join("scenes")
-        .join(scene_id)
-        .join("products")
-        .join("ndvi")
-        .join("sample.png");
+    let scene_dir = tmp.path().join("data").join("scenes").join(scene_id);
+    let product_path = scene_dir.join("products").join("ndvi").join("sample.png");
     std::fs::create_dir_all(product_path.parent().expect("product parent exists"))?;
     std::fs::write(&product_path, TEST_PNG_BYTES)?;
+    let metadata_json = json!({
+        "metadata": {
+            "timestamp": "2025-02-01T00:00:00Z",
+            "gps_position": {
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "altitude": 12.0
+            },
+            "bands": ["B4", "B5", "B6"],
+            "exposure_time": 1.0,
+            "gain": 1.0,
+            "width": 512,
+            "height": 256
+        },
+        "file_paths": {
+            "B4": "B4.png",
+            "B5": "B5.png",
+            "B6": "B6.png"
+        },
+        "image_id": Uuid::new_v4()
+    })
+    .to_string();
+    std::fs::write(scene_dir.join("metadata_ingested.json"), metadata_json)?;
 
     let response = app
         .oneshot(
@@ -122,6 +139,19 @@ async fn scene_manifest_lists_available_products_from_disk() -> Result<()> {
         .and_then(|v| v.as_array())
         .expect("products array should exist");
     assert_eq!(products.len(), 1);
+    assert_eq!(json.get("width").and_then(|v| v.as_u64()), Some(512));
+    assert_eq!(json.get("height").and_then(|v| v.as_u64()), Some(256));
+    assert_eq!(
+        json.get("bands")
+            .and_then(|v| v.as_array())
+            .map(|bands| bands.len()),
+        Some(3)
+    );
+    assert_eq!(
+        json.pointer("/gps_position/latitude")
+            .and_then(|v| v.as_f64()),
+        Some(40.7128)
+    );
     assert_eq!(
         products[0].get("kind").and_then(|v| v.as_str()),
         Some("ndvi")

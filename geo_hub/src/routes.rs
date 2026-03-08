@@ -12,6 +12,7 @@ use axum::{
     Json,
 };
 use serde::Serialize;
+use shared::schemas::{GpsCoords, MultispectralImage};
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -32,6 +33,11 @@ pub struct SceneDetail {
     pub scene_id: String,
     pub sensor: Option<String>,
     pub acquired_at: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub bands: Vec<String>,
+    pub gps_position: Option<GpsCoords>,
+    pub data_path: Option<String>,
     pub available_products: Vec<ProductSummary>,
 }
 
@@ -66,8 +72,9 @@ pub async fn get_scene(
     Path(scene_id): Path<String>,
     State(state): State<AppState>,
 ) -> AppResult<Json<SceneDetail>> {
-    let scene_row =
-        sqlx::query("SELECT scene_id, sensor, acquired_at FROM scenes WHERE scene_id = ?1")
+    let scene_row = sqlx::query(
+        "SELECT scene_id, sensor, acquired_at, data_path, metadata_json FROM scenes WHERE scene_id = ?1",
+    )
             .bind(&scene_id)
             .fetch_optional(&state.pool)
             .await
@@ -82,12 +89,23 @@ pub async fn get_scene(
         return Err(AppError::NotFound);
     }
 
+    let metadata = load_scene_metadata(scene_row.as_ref(), &scene_dir).await?;
     let available_products = collect_scene_products(&state, &scene_id).await?;
 
     Ok(Json(SceneDetail {
         scene_id,
         sensor: scene_row.as_ref().map(|row| row.get("sensor")),
         acquired_at: scene_row.as_ref().map(|row| row.get("acquired_at")),
+        width: metadata.as_ref().map(|image| image.metadata.width),
+        height: metadata.as_ref().map(|image| image.metadata.height),
+        bands: metadata
+            .as_ref()
+            .map(|image| image.metadata.bands.clone())
+            .unwrap_or_default(),
+        gps_position: metadata
+            .as_ref()
+            .and_then(|image| image.metadata.gps_position.clone()),
+        data_path: scene_row.as_ref().map(|row| row.get("data_path")),
         available_products,
     }))
 }
@@ -310,6 +328,59 @@ fn build_product_summary(scene_id: &str, kind: &str, path: &FsPath) -> ProductSu
         content_type: content_type_for_path(path).to_string(),
         url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
     }
+}
+
+async fn load_scene_metadata(
+    scene_row: Option<&sqlx::sqlite::SqliteRow>,
+    scene_dir: &FsPath,
+) -> AppResult<Option<MultispectralImage>> {
+    if let Some(row) = scene_row {
+        let metadata_json: String = row.get("metadata_json");
+        let image = serde_json::from_str::<MultispectralImage>(&metadata_json).map_err(|err| {
+            AppError::Anyhow(
+                anyhow::Error::new(err)
+                    .context("failed to decode scene metadata_json from database"),
+            )
+        })?;
+        return Ok(Some(image));
+    }
+
+    let mut entries = match fs::read_dir(scene_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(AppError::Anyhow(err.into())),
+    };
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?
+    {
+        let path = entry.path();
+        let is_metadata = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "metadata_ingested.json" || name.starts_with("metadata_"))
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        if !is_metadata {
+            continue;
+        }
+
+        let metadata_json = fs::read_to_string(&path)
+            .await
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+        let image = serde_json::from_str::<MultispectralImage>(&metadata_json).map_err(|err| {
+            AppError::Anyhow(anyhow::Error::new(err).context(format!(
+                "failed to decode scene metadata at {}",
+                path.display()
+            )))
+        })?;
+        return Ok(Some(image));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
