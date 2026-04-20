@@ -1,6 +1,9 @@
 use crate::{config::HubConfig, routes, state::AppState};
 use anyhow::Result;
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post, put},
+    Router,
+};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -17,8 +20,37 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
+        .route(
+            "/api/fields",
+            get(routes::list_fields).post(routes::create_field),
+        )
+        .route(
+            "/api/fields/export/geojson",
+            get(routes::export_fields_geojson),
+        )
+        .route(
+            "/api/fields/import/geojson",
+            post(routes::import_fields_geojson),
+        )
+        .route("/api/fields/:field_id", get(routes::get_field))
+        .route(
+            "/api/fields/:field_id/scenes",
+            get(routes::list_field_scenes),
+        )
         .route("/api/scenes", get(routes::list_scenes))
         .route("/api/scenes/:scene_id", get(routes::get_scene))
+        .route(
+            "/api/scenes/:scene_id/annotations",
+            get(routes::list_scene_annotations).post(routes::create_scene_annotation),
+        )
+        .route(
+            "/api/scenes/:scene_id/annotations/:annotation_id",
+            put(routes::update_scene_annotation).delete(routes::delete_scene_annotation),
+        )
+        .route(
+            "/api/scenes/:scene_id/field/:field_id",
+            put(routes::link_scene_to_field),
+        )
         .route(
             "/api/scenes/:scene_id/products/:kind",
             get(routes::stream_product),

@@ -8,11 +8,17 @@ use axum::response::{IntoResponse, Response};
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderValue},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     Json,
 };
-use serde::Serialize;
-use shared::schemas::{GpsCoords, MultispectralImage};
+use geojson::{
+    feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
+};
+use serde::{Deserialize, Serialize};
+use shared::schemas::{
+    bounds_from_points, AnnotationGeometry, AnnotationRecord, FieldBoundary, FieldRecord, GeoPoint,
+    GpsCoords, MultispectralImage,
+};
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -20,6 +26,7 @@ use std::path::{Path as FsPath, PathBuf};
 use tokio::fs::File;
 use tokio::fs::{self, DirEntry};
 use tokio_util::io::ReaderStream;
+use uuid::Uuid;
 
 #[derive(Debug, Serialize)]
 pub struct SceneSummary {
@@ -38,6 +45,8 @@ pub struct SceneDetail {
     pub bands: Vec<String>,
     pub gps_position: Option<GpsCoords>,
     pub data_path: Option<String>,
+    pub field: Option<FieldRecord>,
+    pub geospatial: SceneGeospatialMetadata,
     pub available_products: Vec<ProductSummary>,
 }
 
@@ -47,6 +56,337 @@ pub struct ProductSummary {
     pub filename: String,
     pub content_type: String,
     pub url_path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SceneGeospatialMetadata {
+    pub georeferenced: bool,
+    pub crs: Option<String>,
+    pub center: Option<GpsCoords>,
+    pub extent: Option<SceneExtent>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SceneExtent {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateFieldRequest {
+    pub field_id: Option<String>,
+    pub name: String,
+    pub crop: Option<String>,
+    pub season: Option<String>,
+    pub notes: Option<String>,
+    pub boundary: FieldBoundary,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateAnnotationRequest {
+    pub annotation_id: Option<String>,
+    pub label: String,
+    pub note: Option<String>,
+    pub severity: Option<String>,
+    pub geometry: AnnotationGeometry,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateAnnotationRequest {
+    pub label: String,
+    pub note: Option<String>,
+    pub severity: Option<String>,
+    pub geometry: AnnotationGeometry,
+}
+
+pub async fn import_fields_geojson(
+    State(state): State<AppState>,
+    Json(payload): Json<GeoJson>,
+) -> AppResult<Json<Vec<FieldRecord>>> {
+    let fields = fields_from_geojson(payload)?;
+
+    for field in &fields {
+        sqlx::query(
+            r#"
+            INSERT INTO fields (field_id, name, crop, season, notes, boundary_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+            ON CONFLICT(field_id) DO UPDATE SET
+                name = excluded.name,
+                crop = excluded.crop,
+                season = excluded.season,
+                notes = excluded.notes,
+                boundary_json = excluded.boundary_json
+            "#,
+        )
+        .bind(&field.field_id)
+        .bind(&field.name)
+        .bind(&field.crop)
+        .bind(&field.season)
+        .bind(&field.notes)
+        .bind(serde_json::to_string(&field.boundary).map_err(|err| AppError::Anyhow(err.into()))?)
+        .execute(&state.pool)
+        .await
+        .map_err(Error::from)?;
+    }
+
+    Ok(Json(fields))
+}
+
+pub async fn list_fields(State(state): State<AppState>) -> AppResult<Json<Vec<FieldRecord>>> {
+    let rows = sqlx::query(
+        "SELECT field_id, name, crop, season, notes, boundary_json FROM fields ORDER BY name ASC",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut fields = Vec::with_capacity(rows.len());
+    for row in rows {
+        fields.push(decode_field_record(&row)?);
+    }
+
+    Ok(Json(fields))
+}
+
+pub async fn export_fields_geojson(State(state): State<AppState>) -> AppResult<Json<GeoJson>> {
+    let rows = sqlx::query(
+        "SELECT field_id, name, crop, season, notes, boundary_json FROM fields ORDER BY name ASC",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut fields = Vec::with_capacity(rows.len());
+    for row in rows {
+        fields.push(decode_field_record(&row)?);
+    }
+
+    Ok(Json(geojson_from_fields(fields)))
+}
+
+pub async fn list_scene_annotations(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<AnnotationRecord>>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT annotation_id, scene_id, field_id, label, note, severity, geometry_json, created_at, updated_at
+        FROM annotations
+        WHERE scene_id = ?1
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(&scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut annotations = Vec::with_capacity(rows.len());
+    for row in rows {
+        annotations.push(decode_annotation_record(&row)?);
+    }
+
+    Ok(Json(annotations))
+}
+
+pub async fn create_scene_annotation(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CreateAnnotationRequest>,
+) -> AppResult<Json<AnnotationRecord>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let annotation = build_annotation_record(&state, &scene_id, request).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO annotations (
+            annotation_id, scene_id, field_id, label, note, severity, geometry_json, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&annotation.annotation_id)
+    .bind(&annotation.scene_id)
+    .bind(&annotation.field_id)
+    .bind(&annotation.label)
+    .bind(&annotation.note)
+    .bind(&annotation.severity)
+    .bind(
+        serde_json::to_string(&annotation.geometry).map_err(|err| AppError::Anyhow(err.into()))?,
+    )
+    .bind(&annotation.created_at)
+    .bind(&annotation.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(annotation))
+}
+
+pub async fn update_scene_annotation(
+    Path((scene_id, annotation_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateAnnotationRequest>,
+) -> AppResult<Json<AnnotationRecord>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let existing = load_annotation(&state, &scene_id, &annotation_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    validate_annotation_geometry(&request.geometry)?;
+
+    let label = normalize_annotation_label(request.label)?;
+    let updated = AnnotationRecord {
+        annotation_id: annotation_id.clone(),
+        scene_id: scene_id.clone(),
+        field_id: load_scene_field_id(&state, &scene_id).await?,
+        label,
+        note: normalize_optional_text(request.note),
+        severity: normalize_optional_text(request.severity),
+        geometry: request.geometry,
+        created_at: existing.created_at,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let result = sqlx::query(
+        r#"
+        UPDATE annotations
+        SET field_id = ?1, label = ?2, note = ?3, severity = ?4, geometry_json = ?5, updated_at = ?6
+        WHERE annotation_id = ?7 AND scene_id = ?8
+        "#,
+    )
+    .bind(&updated.field_id)
+    .bind(&updated.label)
+    .bind(&updated.note)
+    .bind(&updated.severity)
+    .bind(serde_json::to_string(&updated.geometry).map_err(|err| AppError::Anyhow(err.into()))?)
+    .bind(&updated.updated_at)
+    .bind(&updated.annotation_id)
+    .bind(&updated.scene_id)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(updated))
+}
+
+pub async fn delete_scene_annotation(
+    Path((scene_id, annotation_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<StatusCode> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let result = sqlx::query("DELETE FROM annotations WHERE annotation_id = ?1 AND scene_id = ?2")
+        .bind(&annotation_id)
+        .bind(&scene_id)
+        .execute(&state.pool)
+        .await
+        .map_err(Error::from)?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn create_field(
+    State(state): State<AppState>,
+    Json(request): Json<CreateFieldRequest>,
+) -> AppResult<Json<FieldRecord>> {
+    let field = build_field_record(request)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO fields (field_id, name, crop, season, notes, boundary_json, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+        "#,
+    )
+    .bind(&field.field_id)
+    .bind(&field.name)
+    .bind(&field.crop)
+    .bind(&field.season)
+    .bind(&field.notes)
+    .bind(serde_json::to_string(&field.boundary).map_err(|err| AppError::Anyhow(err.into()))?)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(field))
+}
+
+pub async fn get_field(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<FieldRecord>> {
+    let field = load_field(&state, &field_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(field))
+}
+
+pub async fn list_field_scenes(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SceneSummary>>> {
+    if load_field(&state, &field_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let rows = sqlx::query(
+        "SELECT scene_id, sensor, acquired_at FROM scenes WHERE field_id = ?1 ORDER BY acquired_at DESC",
+    )
+    .bind(&field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let scenes = rows
+        .into_iter()
+        .map(|row| SceneSummary {
+            scene_id: row.get("scene_id"),
+            sensor: row.get("sensor"),
+            acquired_at: row.get("acquired_at"),
+        })
+        .collect();
+
+    Ok(Json(scenes))
+}
+
+pub async fn link_scene_to_field(
+    Path((scene_id, field_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SceneDetail>> {
+    if load_field(&state, &field_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let updated = sqlx::query("UPDATE scenes SET field_id = ?1 WHERE scene_id = ?2")
+        .bind(&field_id)
+        .bind(&scene_id)
+        .execute(&state.pool)
+        .await
+        .map_err(Error::from)?;
+    if updated.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    get_scene(Path(scene_id), State(state)).await
 }
 
 pub async fn list_scenes(State(state): State<AppState>) -> AppResult<Json<Vec<SceneSummary>>> {
@@ -73,7 +413,7 @@ pub async fn get_scene(
     State(state): State<AppState>,
 ) -> AppResult<Json<SceneDetail>> {
     let scene_row = sqlx::query(
-        "SELECT scene_id, sensor, acquired_at, data_path, metadata_json FROM scenes WHERE scene_id = ?1",
+        "SELECT scene_id, sensor, acquired_at, data_path, metadata_json, field_id FROM scenes WHERE scene_id = ?1",
     )
             .bind(&scene_id)
             .fetch_optional(&state.pool)
@@ -90,6 +430,7 @@ pub async fn get_scene(
     }
 
     let metadata = load_scene_metadata(scene_row.as_ref(), &scene_dir).await?;
+    let field = load_scene_field(&state, scene_row.as_ref()).await?;
     let available_products = collect_scene_products(&state, &scene_id).await?;
 
     Ok(Json(SceneDetail {
@@ -106,6 +447,8 @@ pub async fn get_scene(
             .as_ref()
             .and_then(|image| image.metadata.gps_position.clone()),
         data_path: scene_row.as_ref().map(|row| row.get("data_path")),
+        field,
+        geospatial: build_geospatial_metadata(metadata.as_ref()),
         available_products,
     }))
 }
@@ -330,6 +673,454 @@ fn build_product_summary(scene_id: &str, kind: &str, path: &FsPath) -> ProductSu
     }
 }
 
+fn build_geospatial_metadata(metadata: Option<&MultispectralImage>) -> SceneGeospatialMetadata {
+    let spatial_ref = metadata.and_then(|image| image.metadata.spatial_ref.as_ref());
+    let extent = spatial_ref.and_then(|spatial| {
+        spatial.bbox.as_ref().map(|bbox| SceneExtent {
+            min_lon: bbox.min_lon,
+            min_lat: bbox.min_lat,
+            max_lon: bbox.max_lon,
+            max_lat: bbox.max_lat,
+        })
+    });
+    let center = extent.as_ref().map(|bbox| GpsCoords {
+        latitude: (bbox.min_lat + bbox.max_lat) / 2.0,
+        longitude: (bbox.min_lon + bbox.max_lon) / 2.0,
+        altitude: metadata
+            .and_then(|image| image.metadata.gps_position.as_ref())
+            .map(|gps| gps.altitude)
+            .unwrap_or(0.0),
+    });
+
+    SceneGeospatialMetadata {
+        georeferenced: spatial_ref.is_some_and(|spatial| spatial.georeferenced),
+        crs: spatial_ref.and_then(|spatial| spatial.crs.clone()),
+        center: center.or_else(|| metadata.and_then(|image| image.metadata.gps_position.clone())),
+        extent,
+    }
+}
+
+fn build_field_record(request: CreateFieldRequest) -> AppResult<FieldRecord> {
+    let field_id = request
+        .field_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let name = request.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("field name is required".to_string()));
+    }
+    if request.boundary.coordinates.len() < 3 {
+        return Err(AppError::BadRequest(
+            "field boundary must contain at least three coordinates".to_string(),
+        ));
+    }
+    if request.boundary.coordinates.iter().any(|point| {
+        !point.longitude.is_finite()
+            || !point.latitude.is_finite()
+            || point.longitude < -180.0
+            || point.longitude > 180.0
+            || point.latitude < -90.0
+            || point.latitude > 90.0
+    }) {
+        return Err(AppError::BadRequest(
+            "field boundary contains invalid geographic coordinates".to_string(),
+        ));
+    }
+
+    let extent = bounds_from_points(&request.boundary.coordinates).ok_or_else(|| {
+        AppError::BadRequest("field boundary must contain valid coordinates".to_string())
+    })?;
+
+    Ok(FieldRecord {
+        field_id,
+        name,
+        crop: request.crop,
+        season: request.season,
+        notes: request.notes,
+        boundary: request.boundary,
+        extent,
+    })
+}
+
+async fn build_annotation_record(
+    state: &AppState,
+    scene_id: &str,
+    request: CreateAnnotationRequest,
+) -> AppResult<AnnotationRecord> {
+    let annotation_id = request
+        .annotation_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let label = normalize_annotation_label(request.label)?;
+    validate_annotation_geometry(&request.geometry)?;
+    let field_id = load_scene_field_id(state, scene_id).await?;
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    Ok(AnnotationRecord {
+        annotation_id,
+        scene_id: scene_id.to_string(),
+        field_id,
+        label,
+        note: normalize_optional_text(request.note),
+        severity: normalize_optional_text(request.severity),
+        geometry: request.geometry,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    })
+}
+
+fn normalize_annotation_label(label: String) -> AppResult<String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err(AppError::BadRequest(
+            "annotation label is required".to_string(),
+        ));
+    }
+    Ok(label)
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
+fn fields_from_geojson(geojson: GeoJson) -> AppResult<Vec<FieldRecord>> {
+    match geojson {
+        GeoJson::FeatureCollection(collection) => collection
+            .features
+            .into_iter()
+            .enumerate()
+            .map(|(index, feature)| build_field_from_feature(feature, index))
+            .collect(),
+        GeoJson::Feature(feature) => Ok(vec![build_field_from_feature(feature, 0)?]),
+        GeoJson::Geometry(geometry) => Ok(vec![build_field_from_geometry(geometry, None, 0)?]),
+    }
+}
+
+fn geojson_from_fields(fields: Vec<FieldRecord>) -> GeoJson {
+    GeoJson::FeatureCollection(FeatureCollection {
+        bbox: None,
+        foreign_members: None,
+        features: fields.into_iter().map(feature_from_field).collect(),
+    })
+}
+
+fn feature_from_field(field: FieldRecord) -> Feature {
+    let mut ring: Vec<Vec<f64>> = field
+        .boundary
+        .coordinates
+        .iter()
+        .map(|point| vec![point.longitude, point.latitude])
+        .collect();
+    if let Some(first) = ring.first().cloned() {
+        ring.push(first);
+    }
+
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "field_id".to_string(),
+        serde_json::Value::String(field.field_id.clone()),
+    );
+    properties.insert("name".to_string(), serde_json::Value::String(field.name));
+    if let Some(crop) = field.crop {
+        properties.insert("crop".to_string(), serde_json::Value::String(crop));
+    }
+    if let Some(season) = field.season {
+        properties.insert("season".to_string(), serde_json::Value::String(season));
+    }
+    if let Some(notes) = field.notes {
+        properties.insert("notes".to_string(), serde_json::Value::String(notes));
+    }
+
+    Feature {
+        bbox: None,
+        geometry: Some(Geometry::new(GeoJsonValue::Polygon(vec![ring]))),
+        id: Some(GeoJsonId::String(field.field_id)),
+        properties: Some(properties),
+        foreign_members: None,
+    }
+}
+
+fn validate_annotation_geometry(geometry: &AnnotationGeometry) -> AppResult<()> {
+    match geometry {
+        AnnotationGeometry::Point { coordinate } => {
+            validate_geo_point(coordinate)?;
+        }
+        AnnotationGeometry::Polygon { coordinates } => {
+            if coordinates.len() < 3 {
+                return Err(AppError::BadRequest(
+                    "polygon annotation must contain at least three coordinates".to_string(),
+                ));
+            }
+            for coordinate in coordinates {
+                validate_geo_point(coordinate)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_geo_point(point: &GeoPoint) -> AppResult<()> {
+    if !point.longitude.is_finite()
+        || !point.latitude.is_finite()
+        || point.longitude < -180.0
+        || point.longitude > 180.0
+        || point.latitude < -90.0
+        || point.latitude > 90.0
+    {
+        return Err(AppError::BadRequest(
+            "annotation geometry contains invalid geographic coordinates".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn build_field_from_feature(feature: geojson::Feature, index: usize) -> AppResult<FieldRecord> {
+    let geojson::Feature {
+        geometry,
+        id,
+        properties,
+        ..
+    } = feature;
+    let geometry = geometry
+        .ok_or_else(|| AppError::BadRequest("GeoJSON feature is missing geometry".to_string()))?;
+    let properties = properties.unwrap_or_default();
+
+    let field_id = property_string(&properties, "field_id")
+        .or_else(|| property_string(&properties, "id"))
+        .or_else(|| id.as_ref().and_then(geojson_id_to_string));
+    let name = property_string(&properties, "name")
+        .or_else(|| property_string(&properties, "field_name"))
+        .unwrap_or_else(|| format!("Imported Field {}", index + 1));
+
+    build_field_from_geometry(
+        geometry,
+        Some(CreateFieldRequest {
+            field_id,
+            name,
+            crop: property_string(&properties, "crop"),
+            season: property_string(&properties, "season"),
+            notes: property_string(&properties, "notes"),
+            boundary: FieldBoundary {
+                coordinates: Vec::new(),
+            },
+        }),
+        index,
+    )
+}
+
+fn build_field_from_geometry(
+    geometry: Geometry,
+    template: Option<CreateFieldRequest>,
+    index: usize,
+) -> AppResult<FieldRecord> {
+    let boundary = boundary_from_geometry(geometry)?;
+    let template = template.unwrap_or(CreateFieldRequest {
+        field_id: None,
+        name: format!("Imported Field {}", index + 1),
+        crop: None,
+        season: None,
+        notes: None,
+        boundary: FieldBoundary {
+            coordinates: Vec::new(),
+        },
+    });
+
+    build_field_record(CreateFieldRequest {
+        field_id: template.field_id,
+        name: template.name,
+        crop: template.crop,
+        season: template.season,
+        notes: template.notes,
+        boundary,
+    })
+}
+
+fn boundary_from_geometry(geometry: Geometry) -> AppResult<FieldBoundary> {
+    match geometry.value {
+        GeoJsonValue::Polygon(rings) => {
+            let exterior = rings.into_iter().next().ok_or_else(|| {
+                AppError::BadRequest(
+                    "GeoJSON polygon does not contain an exterior ring".to_string(),
+                )
+            })?;
+            boundary_from_ring(exterior)
+        }
+        GeoJsonValue::MultiPolygon(polygons) => {
+            let exterior = polygons
+                .into_iter()
+                .max_by_key(|polygon| polygon.first().map_or(0, Vec::len))
+                .and_then(|polygon| polygon.into_iter().next())
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "GeoJSON multipolygon does not contain a usable exterior ring".to_string(),
+                    )
+                })?;
+            boundary_from_ring(exterior)
+        }
+        _ => Err(AppError::BadRequest(
+            "only Polygon and MultiPolygon GeoJSON geometries are supported".to_string(),
+        )),
+    }
+}
+
+fn boundary_from_ring(ring: Vec<Vec<f64>>) -> AppResult<FieldBoundary> {
+    let mut coordinates = Vec::with_capacity(ring.len());
+    for position in ring {
+        if position.len() < 2 {
+            return Err(AppError::BadRequest(
+                "GeoJSON polygon coordinates must contain longitude and latitude".to_string(),
+            ));
+        }
+        coordinates.push(GeoPoint {
+            longitude: position[0],
+            latitude: position[1],
+        });
+    }
+
+    if coordinates.len() >= 2 && coordinates.first() == coordinates.last() {
+        coordinates.pop();
+    }
+
+    Ok(FieldBoundary { coordinates })
+}
+
+fn property_string(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    properties.get(key).and_then(|value| match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    })
+}
+
+fn geojson_id_to_string(id: &GeoJsonId) -> Option<String> {
+    match id {
+        GeoJsonId::String(text) => Some(text.clone()),
+        GeoJsonId::Number(number) => Some(number.to_string()),
+    }
+}
+
+fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> {
+    let boundary_json: String = row.get("boundary_json");
+    let boundary = serde_json::from_str::<FieldBoundary>(&boundary_json).map_err(|err| {
+        AppError::Anyhow(anyhow::Error::new(err).context("failed to decode field boundary_json"))
+    })?;
+    let extent = bounds_from_points(&boundary.coordinates).ok_or_else(|| {
+        AppError::Anyhow(anyhow::anyhow!(
+            "field boundary does not contain any coordinates"
+        ))
+    })?;
+
+    Ok(FieldRecord {
+        field_id: row.get("field_id"),
+        name: row.get("name"),
+        crop: row.get("crop"),
+        season: row.get("season"),
+        notes: row.get("notes"),
+        boundary,
+        extent,
+    })
+}
+
+fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<AnnotationRecord> {
+    let geometry_json: String = row.get("geometry_json");
+    let geometry = serde_json::from_str::<AnnotationGeometry>(&geometry_json).map_err(|err| {
+        AppError::Anyhow(anyhow::Error::new(err).context("failed to decode annotation geometry"))
+    })?;
+
+    Ok(AnnotationRecord {
+        annotation_id: row.get("annotation_id"),
+        scene_id: row.get("scene_id"),
+        field_id: row.get("field_id"),
+        label: row.get("label"),
+        note: row.get("note"),
+        severity: row.get("severity"),
+        geometry,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+async fn load_field(state: &AppState, field_id: &str) -> AppResult<Option<FieldRecord>> {
+    let row = sqlx::query(
+        "SELECT field_id, name, crop, season, notes, boundary_json FROM fields WHERE field_id = ?1",
+    )
+    .bind(field_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_field_record(&row)).transpose()
+}
+
+async fn load_scene_field(
+    state: &AppState,
+    scene_row: Option<&sqlx::sqlite::SqliteRow>,
+) -> AppResult<Option<FieldRecord>> {
+    let Some(field_id) = scene_row.and_then(|row| row.get::<Option<String>, _>("field_id")) else {
+        return Ok(None);
+    };
+
+    load_field(state, &field_id).await
+}
+
+async fn load_annotation(
+    state: &AppState,
+    scene_id: &str,
+    annotation_id: &str,
+) -> AppResult<Option<AnnotationRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT annotation_id, scene_id, field_id, label, note, severity, geometry_json, created_at, updated_at
+        FROM annotations
+        WHERE scene_id = ?1 AND annotation_id = ?2
+        "#,
+    )
+    .bind(scene_id)
+    .bind(annotation_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_annotation_record(&row)).transpose()
+}
+
+async fn load_scene_field_id(state: &AppState, scene_id: &str) -> AppResult<Option<String>> {
+    Ok(
+        sqlx::query("SELECT field_id FROM scenes WHERE scene_id = ?1")
+            .bind(scene_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(Error::from)?
+            .and_then(|row| row.get::<Option<String>, _>("field_id")),
+    )
+}
+
+async fn scene_exists(state: &AppState, scene_id: &str) -> AppResult<bool> {
+    let scene_in_db = sqlx::query("SELECT 1 FROM scenes WHERE scene_id = ?1 LIMIT 1")
+        .bind(scene_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(Error::from)?
+        .is_some();
+    if scene_in_db {
+        return Ok(true);
+    }
+
+    let scene_dir = state.config.data_root.join("scenes").join(scene_id);
+    fs::try_exists(scene_dir)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))
+}
+
 async fn load_scene_metadata(
     scene_row: Option<&sqlx::sqlite::SqliteRow>,
     scene_dir: &FsPath,
@@ -385,8 +1176,16 @@ async fn load_scene_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_product_summary, content_type_for_path, is_missing_scene_error, is_png};
+    use super::{
+        build_field_record, build_geospatial_metadata, build_product_summary,
+        content_type_for_path, is_missing_scene_error, is_png, AppError, CreateFieldRequest,
+    };
+    use shared::schemas::{
+        FieldBoundary, GeoBounds, GeoPoint, GpsCoords, ImageMetadata, MultispectralImage,
+        RasterSpatialRef,
+    };
     use std::path::Path;
+    use uuid::Uuid;
 
     #[test]
     fn content_type_detection_works() {
@@ -418,5 +1217,201 @@ mod tests {
         assert_eq!(summary.filename, "output.png");
         assert_eq!(summary.content_type, "image/png");
         assert_eq!(summary.url_path, "/api/scenes/scene-1/products/ndvi");
+    }
+
+    #[test]
+    fn geospatial_metadata_uses_available_center_but_not_fake_extent() {
+        let image = MultispectralImage {
+            image_id: Uuid::nil(),
+            metadata: ImageMetadata {
+                timestamp: "2025-01-01T00:00:00Z"
+                    .parse()
+                    .expect("timestamp should parse"),
+                gps_position: Some(GpsCoords {
+                    latitude: 40.7128,
+                    longitude: -74.0060,
+                    altitude: 12.0,
+                }),
+                bands: vec!["B4".to_string(), "B5".to_string()],
+                exposure_time: 1.0,
+                gain: 1.0,
+                width: 512,
+                height: 256,
+                spatial_ref: None,
+            },
+            file_paths: Default::default(),
+        };
+
+        let geospatial = build_geospatial_metadata(Some(&image));
+
+        assert!(!geospatial.georeferenced);
+        assert_eq!(geospatial.crs, None);
+        assert_eq!(
+            geospatial.center.as_ref().map(|gps| gps.latitude),
+            Some(40.7128)
+        );
+        assert_eq!(geospatial.extent, None);
+    }
+
+    #[test]
+    fn geospatial_metadata_defaults_when_no_metadata_exists() {
+        let geospatial = build_geospatial_metadata(None);
+
+        assert!(!geospatial.georeferenced);
+        assert_eq!(geospatial.crs, None);
+        assert!(geospatial.center.is_none());
+        assert_eq!(geospatial.extent, None);
+    }
+
+    #[test]
+    fn geospatial_metadata_prefers_bbox_when_available() {
+        let image = MultispectralImage {
+            image_id: Uuid::nil(),
+            metadata: ImageMetadata {
+                timestamp: "2025-01-01T00:00:00Z"
+                    .parse()
+                    .expect("timestamp should parse"),
+                gps_position: Some(GpsCoords {
+                    latitude: 1.0,
+                    longitude: 2.0,
+                    altitude: 3.0,
+                }),
+                bands: vec!["B4".to_string(), "B5".to_string()],
+                exposure_time: 1.0,
+                gain: 1.0,
+                width: 512,
+                height: 256,
+                spatial_ref: Some(RasterSpatialRef {
+                    georeferenced: true,
+                    crs: Some("EPSG:4326".to_string()),
+                    bbox: Some(GeoBounds {
+                        min_lon: -74.1,
+                        min_lat: 40.6,
+                        max_lon: -73.9,
+                        max_lat: 40.8,
+                    }),
+                    geo_transform: Some([-74.1, 0.0001, 0.0, 40.8, 0.0, -0.0001]),
+                }),
+            },
+            file_paths: Default::default(),
+        };
+
+        let geospatial = build_geospatial_metadata(Some(&image));
+
+        assert!(geospatial.georeferenced);
+        assert_eq!(geospatial.crs.as_deref(), Some("EPSG:4326"));
+        assert_eq!(
+            geospatial.center.as_ref().map(|gps| gps.latitude),
+            Some(40.7)
+        );
+        assert_eq!(
+            geospatial.center.as_ref().map(|gps| gps.longitude),
+            Some(-74.0)
+        );
+        assert_eq!(
+            geospatial.extent,
+            Some(super::SceneExtent {
+                min_lon: -74.1,
+                min_lat: 40.6,
+                max_lon: -73.9,
+                max_lat: 40.8,
+            })
+        );
+    }
+
+    #[test]
+    fn build_field_record_computes_extent_from_boundary() {
+        let field = build_field_record(CreateFieldRequest {
+            field_id: Some("north-80".to_string()),
+            name: "North 80".to_string(),
+            crop: Some("corn".to_string()),
+            season: Some("2026".to_string()),
+            notes: Some("test field".to_string()),
+            boundary: FieldBoundary {
+                coordinates: vec![
+                    GeoPoint {
+                        longitude: -96.7,
+                        latitude: 41.1,
+                    },
+                    GeoPoint {
+                        longitude: -96.2,
+                        latitude: 41.1,
+                    },
+                    GeoPoint {
+                        longitude: -96.2,
+                        latitude: 41.4,
+                    },
+                ],
+            },
+        })
+        .expect("field should build");
+
+        assert_eq!(field.field_id, "north-80");
+        assert_eq!(field.name, "North 80");
+        assert_eq!(
+            field.extent,
+            GeoBounds {
+                min_lon: -96.7,
+                min_lat: 41.1,
+                max_lon: -96.2,
+                max_lat: 41.4,
+            }
+        );
+    }
+
+    #[test]
+    fn build_field_record_rejects_short_boundary() {
+        let err = build_field_record(CreateFieldRequest {
+            field_id: None,
+            name: "Short boundary".to_string(),
+            crop: None,
+            season: None,
+            notes: None,
+            boundary: FieldBoundary {
+                coordinates: vec![
+                    GeoPoint {
+                        longitude: -96.7,
+                        latitude: 41.1,
+                    },
+                    GeoPoint {
+                        longitude: -96.2,
+                        latitude: 41.1,
+                    },
+                ],
+            },
+        })
+        .expect_err("boundary should be rejected");
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn build_field_record_rejects_invalid_coordinate_ranges() {
+        let err = build_field_record(CreateFieldRequest {
+            field_id: None,
+            name: "Bad coordinates".to_string(),
+            crop: None,
+            season: None,
+            notes: None,
+            boundary: FieldBoundary {
+                coordinates: vec![
+                    GeoPoint {
+                        longitude: -96.7,
+                        latitude: 41.1,
+                    },
+                    GeoPoint {
+                        longitude: 200.0,
+                        latitude: 41.1,
+                    },
+                    GeoPoint {
+                        longitude: -96.2,
+                        latitude: 41.4,
+                    },
+                ],
+            },
+        })
+        .expect_err("invalid coordinates should be rejected");
+
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 }

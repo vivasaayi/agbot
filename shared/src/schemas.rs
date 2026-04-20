@@ -2,11 +2,73 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// GPS coordinates
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpsCoords {
     pub latitude: f64,
     pub longitude: f64,
     pub altitude: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeoBounds {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeoPoint {
+    pub longitude: f64,
+    pub latitude: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldBoundary {
+    pub coordinates: Vec<GeoPoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldRecord {
+    pub field_id: String,
+    pub name: String,
+    pub crop: Option<String>,
+    pub season: Option<String>,
+    pub notes: Option<String>,
+    pub boundary: FieldBoundary,
+    pub extent: GeoBounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnnotationGeometry {
+    Point { coordinate: GeoPoint },
+    Polygon { coordinates: Vec<GeoPoint> },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnnotationRecord {
+    pub annotation_id: String,
+    pub scene_id: String,
+    pub field_id: Option<String>,
+    pub label: String,
+    pub note: Option<String>,
+    pub severity: Option<String>,
+    pub geometry: AnnotationGeometry,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RasterSpatialRef {
+    #[serde(default)]
+    pub georeferenced: bool,
+    #[serde(default)]
+    pub crs: Option<String>,
+    #[serde(default)]
+    pub bbox: Option<GeoBounds>,
+    #[serde(default)]
+    pub geo_transform: Option<[f64; 6]>,
 }
 
 /// Telemetry data from flight controller
@@ -74,6 +136,8 @@ pub struct ImageMetadata {
     pub gain: f32,
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub spatial_ref: Option<RasterSpatialRef>,
 }
 
 /// Captured multispectral image
@@ -120,4 +184,203 @@ pub enum WebSocketMessage {
         status: String,
         message: String,
     },
+}
+
+pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
+    let mut iter = points.iter();
+    let first = iter.next()?;
+
+    let mut min_lon = first.longitude;
+    let mut max_lon = first.longitude;
+    let mut min_lat = first.latitude;
+    let mut max_lat = first.latitude;
+
+    for point in iter {
+        min_lon = min_lon.min(point.longitude);
+        max_lon = max_lon.max(point.longitude);
+        min_lat = min_lat.min(point.latitude);
+        max_lat = max_lat.max(point.latitude);
+    }
+
+    Some(GeoBounds {
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bounds_from_points, AnnotationGeometry, AnnotationRecord, FieldBoundary, FieldRecord,
+        GeoBounds, GeoPoint, MultispectralImage, RasterSpatialRef,
+    };
+
+    #[test]
+    fn multispectral_image_deserializes_without_spatial_ref() {
+        let payload = serde_json::json!({
+            "metadata": {
+                "timestamp": "2025-01-01T00:00:00Z",
+                "gps_position": null,
+                "bands": ["B4", "B5"],
+                "exposure_time": 1.0,
+                "gain": 1.0,
+                "width": 64,
+                "height": 32
+            },
+            "file_paths": {
+                "B4": "B4.tif",
+                "B5": "B5.tif"
+            },
+            "image_id": "00000000-0000-0000-0000-000000000000"
+        });
+
+        let image: MultispectralImage =
+            serde_json::from_value(payload).expect("legacy metadata should deserialize");
+
+        assert_eq!(image.metadata.spatial_ref, None);
+    }
+
+    #[test]
+    fn multispectral_image_deserializes_with_spatial_ref() {
+        let payload = serde_json::json!({
+            "metadata": {
+                "timestamp": "2025-01-01T00:00:00Z",
+                "gps_position": null,
+                "bands": ["B4", "B5"],
+                "exposure_time": 1.0,
+                "gain": 1.0,
+                "width": 64,
+                "height": 32,
+                "spatial_ref": {
+                    "georeferenced": true,
+                    "crs": "EPSG:4326",
+                    "bbox": {
+                        "min_lon": -74.1,
+                        "min_lat": 40.6,
+                        "max_lon": -73.9,
+                        "max_lat": 40.8
+                    },
+                    "geo_transform": [-74.1, 0.0001, 0.0, 40.8, 0.0, -0.0001]
+                }
+            },
+            "file_paths": {
+                "B4": "B4.tif",
+                "B5": "B5.tif"
+            },
+            "image_id": "00000000-0000-0000-0000-000000000000"
+        });
+
+        let image: MultispectralImage =
+            serde_json::from_value(payload).expect("spatial metadata should deserialize");
+
+        assert_eq!(
+            image.metadata.spatial_ref,
+            Some(RasterSpatialRef {
+                georeferenced: true,
+                crs: Some("EPSG:4326".to_string()),
+                bbox: Some(super::GeoBounds {
+                    min_lon: -74.1,
+                    min_lat: 40.6,
+                    max_lon: -73.9,
+                    max_lat: 40.8,
+                }),
+                geo_transform: Some([-74.1, 0.0001, 0.0, 40.8, 0.0, -0.0001]),
+            })
+        );
+    }
+
+    #[test]
+    fn bounds_from_points_computes_expected_bbox() {
+        let bounds = bounds_from_points(&[
+            GeoPoint {
+                longitude: -96.5,
+                latitude: 41.2,
+            },
+            GeoPoint {
+                longitude: -96.2,
+                latitude: 41.4,
+            },
+            GeoPoint {
+                longitude: -96.7,
+                latitude: 41.1,
+            },
+        ])
+        .expect("bounds should exist");
+
+        assert_eq!(
+            bounds,
+            GeoBounds {
+                min_lon: -96.7,
+                min_lat: 41.1,
+                max_lon: -96.2,
+                max_lat: 41.4,
+            }
+        );
+    }
+
+    #[test]
+    fn field_record_round_trips_through_json() {
+        let field = FieldRecord {
+            field_id: "field-1".to_string(),
+            name: "North 80".to_string(),
+            crop: Some("corn".to_string()),
+            season: Some("2026".to_string()),
+            notes: Some("pivot irrigation".to_string()),
+            boundary: FieldBoundary {
+                coordinates: vec![
+                    GeoPoint {
+                        longitude: -96.5,
+                        latitude: 41.2,
+                    },
+                    GeoPoint {
+                        longitude: -96.2,
+                        latitude: 41.2,
+                    },
+                    GeoPoint {
+                        longitude: -96.2,
+                        latitude: 41.4,
+                    },
+                ],
+            },
+            extent: GeoBounds {
+                min_lon: -96.5,
+                min_lat: 41.2,
+                max_lon: -96.2,
+                max_lat: 41.4,
+            },
+        };
+
+        let value = serde_json::to_value(&field).expect("field should serialize");
+        let decoded: FieldRecord = serde_json::from_value(value).expect("field should deserialize");
+
+        assert_eq!(decoded, field);
+    }
+
+    #[test]
+    fn annotation_record_round_trips_through_json() {
+        let annotation = AnnotationRecord {
+            annotation_id: "ann-1".to_string(),
+            scene_id: "scene-1".to_string(),
+            field_id: Some("field-1".to_string()),
+            label: "Water stress".to_string(),
+            note: Some("Observed near pivot edge".to_string()),
+            severity: Some("high".to_string()),
+            geometry: AnnotationGeometry::Point {
+                coordinate: GeoPoint {
+                    longitude: -96.4,
+                    latitude: 41.2,
+                },
+            },
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+
+        let value = serde_json::to_value(&annotation).expect("annotation should serialize");
+        let decoded: AnnotationRecord =
+            serde_json::from_value(value).expect("annotation should deserialize");
+
+        assert_eq!(decoded, annotation);
+    }
 }

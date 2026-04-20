@@ -10,6 +10,8 @@ pub enum AppError {
     Anyhow(#[from] anyhow::Error),
     #[error("not found")]
     NotFound,
+    #[error("{0}")]
+    BadRequest(String),
 }
 
 impl IntoResponse for AppError {
@@ -20,6 +22,7 @@ impl IntoResponse for AppError {
                 (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
             }
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
         }
     }
 }
