@@ -39,22 +39,22 @@ These items are already done and form the starting point for the next execution 
 
 These are the next items to finish so the GIS surface feels like a usable application instead of a prototype.
 
-19. `[ ]` Split `geo_viewer` into plugins: `ui`, `network`, `map`, `annotations`
-20. `[ ]` Move annotation sidebar logic out of `main.rs` into dedicated modules
-21. `[ ]` Add on-map polygon vertex markers for draft polygons
-22. `[ ]` Add on-map polygon vertex markers for selected saved polygons
-23. `[ ]` Add vertex insertion for polygon drafts
-24. `[ ]` Add vertex removal for polygon drafts
-25. `[ ]` Add direct vertex drag editing for selected polygons
-26. `[ ]` Add keyboard cancel for current draft annotation
-27. `[ ]` Add keyboard undo for last polygon vertex
-28. `[ ]` Add annotation hover/highlight behavior on the map
-29. `[ ]` Add annotation labels on the map surface
-30. `[ ]` Add selected annotation detail panel in `geo_viewer`
-31. `[ ]` Add annotation severity color legend in `geo_viewer`
-32. `[ ]` Add annotation filter controls by severity and label
-33. `[ ]` Add annotation visibility toggle by geometry type
-34. `[ ]` Add viewer-side tests for annotation draft helpers and map state transitions
+19. `[x]` Split `geo_viewer` into plugins: `ui`, `network`, `map`, `annotations`
+20. `[x]` Move annotation sidebar logic out of `main.rs` into dedicated modules
+21. `[x]` Add on-map polygon vertex markers for draft polygons
+22. `[x]` Add on-map polygon vertex markers for selected saved polygons
+23. `[x]` Add vertex insertion for polygon drafts
+24. `[x]` Add vertex removal for polygon drafts
+25. `[x]` Add direct vertex drag editing for selected polygons
+26. `[x]` Add keyboard cancel for current draft annotation
+27. `[x]` Add keyboard undo for last polygon vertex
+28. `[x]` Add annotation hover/highlight behavior on the map
+29. `[x]` Add annotation labels on the map surface
+30. `[x]` Add selected annotation detail panel in `geo_viewer`
+31. `[x]` Add annotation severity color legend in `geo_viewer`
+32. `[x]` Add annotation filter controls by severity and label
+33. `[x]` Add annotation visibility toggle by geometry type
+34. `[x]` Add viewer-side tests for annotation draft helpers and map state transitions
 
 Exit criteria for Phase 1:
 - Advisor can create and edit annotations primarily from the map surface.
@@ -64,13 +64,13 @@ Exit criteria for Phase 1:
 
 This is the main technical gap before the GIS stack is credible for large scenes.
 
-35. `[ ]` Define tile endpoint contract in `geo_hub`
-36. `[ ]` Decide initial tiling strategy: precomputed cache vs on-demand crop
-37. `[ ]` Add product tile endpoint in `geo_hub` for one product kind
-38. `[ ]` Add disk cache layout for tiles in `geo_hub`
-39. `[ ]` Add tile cache invalidation rules for regenerated products
-40. `[ ]` Add tile endpoint error-path tests in `geo_hub`
-41. `[ ]` Add `geo_viewer` tile source abstraction
+35. `[x]` Define tile endpoint contract in `geo_hub`
+36. `[x]` Decide initial tiling strategy: precomputed cache vs on-demand crop
+37. `[x]` Add product tile endpoint in `geo_hub` for one product kind
+38. `[x]` Add disk cache layout for tiles in `geo_hub`
+39. `[x]` Add tile cache invalidation rules for regenerated products
+40. `[x]` Add tile endpoint error-path tests in `geo_hub`
+41. `[x]` Add `geo_viewer` tile source abstraction
 42. `[ ]` Replace single full-image sprite fetch with single-zoom tile rendering
 43. `[ ]` Add visible tile grid calculation from camera extent
 44. `[ ]` Add tile loading and unloading as the camera moves

@@ -59,6 +59,97 @@ async fn serves_file_backed_product_without_scene_row() -> Result<()> {
 }
 
 #[tokio::test]
+async fn serves_png_tile_and_writes_tile_cache() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let app = ctx.app;
+
+    let scene_id = "tile_scene";
+    let product_path = tmp
+        .path()
+        .join("data")
+        .join("scenes")
+        .join(scene_id)
+        .join("products")
+        .join("ndvi")
+        .join("sample.png");
+    std::fs::create_dir_all(product_path.parent().expect("product parent exists"))?;
+    write_gray_png(&product_path, 180)?;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/products/ndvi/tiles/0/0/0.png"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png")
+    );
+
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    let tile_cache_dir = ctx
+        .data_root
+        .join("scenes")
+        .join(scene_id)
+        .join("tile_cache")
+        .join("ndvi");
+    assert!(tile_cache_dir.exists());
+    assert!(std::fs::read_dir(&tile_cache_dir)?.next().is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tile_request_outside_zoom_grid_returns_not_found() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let app = ctx.app;
+
+    let scene_id = "tile_scene_oob";
+    let product_path = tmp
+        .path()
+        .join("data")
+        .join("scenes")
+        .join(scene_id)
+        .join("products")
+        .join("ndvi")
+        .join("sample.png");
+    std::fs::create_dir_all(product_path.parent().expect("product parent exists"))?;
+    write_gray_png(&product_path, 80)?;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/products/ndvi/tiles/0/1/0.png"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn missing_scene_returns_not_found() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -847,6 +938,12 @@ async fn scene_manifest_lists_available_products_from_disk() -> Result<()> {
     assert_eq!(
         products[0].get("url_path").and_then(|v| v.as_str()),
         Some(format!("/api/scenes/{scene_id}/products/ndvi").as_str())
+    );
+    assert_eq!(
+        products[0]
+            .get("tile_url_template")
+            .and_then(|v| v.as_str()),
+        Some(format!("/api/scenes/{scene_id}/products/ndvi/tiles/{{z}}/{{x}}/{{y}}.png").as_str())
     );
 
     Ok(())

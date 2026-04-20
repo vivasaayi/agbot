@@ -55,6 +55,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/scenes/:scene_id/products/:kind",
             get(routes::stream_product),
         )
+        .route(
+            "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
+            get(routes::stream_product_tile),
+        )
         .with_state(state)
 }
 

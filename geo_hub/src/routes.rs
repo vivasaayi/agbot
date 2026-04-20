@@ -14,6 +14,7 @@ use axum::{
 use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
 };
+use image::{imageops::FilterType, DynamicImage, ImageFormat};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     bounds_from_points, AnnotationGeometry, AnnotationRecord, FieldBoundary, FieldRecord, GeoPoint,
@@ -21,12 +22,16 @@ use shared::schemas::{
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
+use std::io::Cursor;
 use std::io::ErrorKind;
 use std::path::{Path as FsPath, PathBuf};
+use std::time::SystemTime;
 use tokio::fs::File;
 use tokio::fs::{self, DirEntry};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
+
+const TILE_SIZE: u32 = 256;
 
 #[derive(Debug, Serialize)]
 pub struct SceneSummary {
@@ -56,6 +61,7 @@ pub struct ProductSummary {
     pub filename: String,
     pub content_type: String,
     pub url_path: String,
+    pub tile_url_template: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -457,16 +463,7 @@ pub async fn stream_product(
     Path((scene_id, kind)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> AppResult<Response> {
-    let product_path =
-        if let Some(path) = find_product_file_on_disk(&state, &scene_id, &kind).await? {
-            path
-        } else {
-            match ingest::ensure_product(&state.pool, &scene_id, &kind).await {
-                Ok(path) => path,
-                Err(err) if is_missing_scene_error(&err) => return Err(AppError::NotFound),
-                Err(err) => return Err(AppError::Anyhow(err)),
-            }
-        };
+    let product_path = resolve_product_path(&state, &scene_id, &kind).await?;
 
     let file = File::open(&product_path)
         .await
@@ -490,6 +487,70 @@ pub async fn stream_product(
     }
 
     Ok((headers, body).into_response())
+}
+
+pub async fn stream_product_tile(
+    Path((scene_id, kind, z, x, y_segment)): Path<(String, String, u8, u32, String)>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let y = y_segment
+        .strip_suffix(".png")
+        .ok_or_else(|| AppError::BadRequest("tile requests must end with .png".to_string()))?
+        .parse::<u32>()
+        .map_err(|_| AppError::BadRequest("invalid tile y coordinate".to_string()))?;
+    let product_path = resolve_product_path(&state, &scene_id, &kind).await?;
+    let tile_path = tile_cache_path(&state, &scene_id, &kind, &product_path, z, x, y).await?;
+
+    if !fs::try_exists(&tile_path)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?
+    {
+        let source_path = product_path.clone();
+        let tile_bytes =
+            tokio::task::spawn_blocking(move || generate_tile_bytes(&source_path, z, x, y))
+                .await
+                .map_err(|err| AppError::Anyhow(err.into()))??;
+
+        if let Some(parent) = tile_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|err| AppError::Anyhow(err.into()))?;
+        }
+        fs::write(&tile_path, tile_bytes)
+            .await
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+
+    let file = File::open(&tile_path)
+        .await
+        .map_err(|error| match error.kind() {
+            ErrorKind::NotFound => AppError::NotFound,
+            _ => AppError::Anyhow(error.into()),
+        })?;
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+
+    Ok((headers, body).into_response())
+}
+
+async fn resolve_product_path(state: &AppState, scene_id: &str, kind: &str) -> AppResult<PathBuf> {
+    if let Some(path) = find_product_file_on_disk(state, scene_id, kind).await? {
+        return Ok(path);
+    }
+
+    match ingest::ensure_product(&state.pool, scene_id, kind).await {
+        Ok(path) => Ok(path),
+        Err(err) if is_missing_scene_error(&err) => Err(AppError::NotFound),
+        Err(err) => Err(AppError::Anyhow(err)),
+    }
 }
 
 async fn find_product_file_on_disk(
@@ -517,6 +578,80 @@ async fn find_product_file_on_disk(
         .map_err(|err| AppError::Anyhow(err.into()))?;
 
     select_preferred_product_path(&mut entries).await
+}
+
+async fn tile_cache_path(
+    state: &AppState,
+    scene_id: &str,
+    kind: &str,
+    product_path: &FsPath,
+    z: u8,
+    x: u32,
+    y: u32,
+) -> AppResult<PathBuf> {
+    // On-demand tiles are cached under a source fingerprint so regenerated products
+    // naturally miss the old cache path without needing synchronous cleanup work.
+    let fingerprint = product_cache_fingerprint(product_path).await?;
+    Ok(state
+        .config
+        .data_root
+        .join("scenes")
+        .join(scene_id)
+        .join("tile_cache")
+        .join(kind)
+        .join(fingerprint)
+        .join(z.to_string())
+        .join(x.to_string())
+        .join(format!("{y}.png")))
+}
+
+async fn product_cache_fingerprint(path: &FsPath) -> AppResult<String> {
+    let metadata = fs::metadata(path)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let modified_epoch = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+
+    Ok(format!("{}-{}", metadata.len(), modified_epoch))
+}
+
+fn generate_tile_bytes(product_path: &FsPath, z: u8, x: u32, y: u32) -> AppResult<Vec<u8>> {
+    let tiles_per_axis = 1_u32
+        .checked_shl(z as u32)
+        .ok_or_else(|| AppError::BadRequest("unsupported zoom level".to_string()))?;
+    if x >= tiles_per_axis || y >= tiles_per_axis {
+        return Err(AppError::NotFound);
+    }
+
+    let image = image::open(product_path).map_err(|err| AppError::Anyhow(err.into()))?;
+    let rgba = image.to_rgba8();
+    let source_width = rgba.width().max(1);
+    let source_height = rgba.height().max(1);
+
+    let x0 = (((x as f64) / (tiles_per_axis as f64)) * source_width as f64).floor() as u32;
+    let y0 = (((y as f64) / (tiles_per_axis as f64)) * source_height as f64).floor() as u32;
+    let x1 = ((((x + 1) as f64) / (tiles_per_axis as f64)) * source_width as f64).ceil() as u32;
+    let y1 = ((((y + 1) as f64) / (tiles_per_axis as f64)) * source_height as f64).ceil() as u32;
+
+    let crop_width = x1
+        .saturating_sub(x0)
+        .clamp(1, source_width.saturating_sub(x0).max(1));
+    let crop_height = y1
+        .saturating_sub(y0)
+        .clamp(1, source_height.saturating_sub(y0).max(1));
+
+    let cropped = image::imageops::crop_imm(&rgba, x0, y0, crop_width, crop_height).to_image();
+    let resized = image::imageops::resize(&cropped, TILE_SIZE, TILE_SIZE, FilterType::Triangle);
+    let tile = DynamicImage::ImageRgba8(resized);
+
+    let mut cursor = Cursor::new(Vec::new());
+    tile.write_to(&mut cursor, ImageFormat::Png)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    Ok(cursor.into_inner())
 }
 
 async fn collect_scene_products(
@@ -670,6 +805,9 @@ fn build_product_summary(scene_id: &str, kind: &str, path: &FsPath) -> ProductSu
             .to_string(),
         content_type: content_type_for_path(path).to_string(),
         url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
+        tile_url_template: format!(
+            "/api/scenes/{scene_id}/products/{kind}/tiles/{{z}}/{{x}}/{{y}}.png"
+        ),
     }
 }
 
