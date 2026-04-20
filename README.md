@@ -106,6 +106,25 @@ cargo run --bin ground_station_ui
 - API Endpoint: http://localhost:3000
 - WebSocket: ws://localhost:8080
 
+## GIS Regression Commands
+
+Use the GIS-specific targets when working on `geo_hub`, `geo_viewer`, or shared geospatial contracts:
+
+```bash
+# Full fast GIS regression suite
+just gis-test
+
+# Acceptance-only GIS workflow checks
+just gis-acceptance
+
+# Individual crates when narrowing a failure
+cargo test -p shared --lib
+cargo test -p geo_hub --tests --lib
+cargo test -p geo_viewer
+```
+
+The acceptance suite exercises the advisor workflow from boundary import through layer serving, annotations, recommendations, reports, and exports.
+
 ### 4. Production Deployment
 
 ```bash

@@ -18,8 +18,22 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS farms (
+            farm_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS fields (
             field_id TEXT PRIMARY KEY,
+            farm_id TEXT,
             name TEXT NOT NULL,
             crop TEXT,
             season TEXT,
@@ -46,6 +60,14 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         "#,
     )
     .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "fields",
+        "farm_id",
+        "ALTER TABLE fields ADD COLUMN farm_id TEXT",
+    )
     .await?;
 
     ensure_column(
@@ -136,6 +158,14 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             recommendation_count INTEGER NOT NULL,
             created_at TEXT NOT NULL
         );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_fields_farm_id ON fields(farm_id);
         "#,
     )
     .execute(pool)

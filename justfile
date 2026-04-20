@@ -16,6 +16,8 @@ help:
     @echo "  build     - Build all workspace members"
     @echo "  check     - Check code without building"
     @echo "  test      - Run tests"
+    @echo "  gis-test  - Run fast GIS regression suite"
+    @echo "  gis-acceptance - Run GIS acceptance tests"
     @echo "  fmt       - Format code"
     @echo "  clippy    - Run clippy linter"
     @echo ""
@@ -62,6 +64,18 @@ check:
 test:
     @echo "🧪 Running tests..."
     cargo test
+
+# Fast GIS regression suite
+gis-test:
+    @echo "🗺️ Running GIS regression suite..."
+    cargo test -p shared --lib
+    cargo test -p geo_hub --tests --lib
+    cargo test -p geo_viewer
+
+# GIS acceptance workflow checks
+gis-acceptance:
+    @echo "🧭 Running GIS acceptance tests..."
+    cargo test -p geo_hub acceptance_
 
 # Format code
 fmt:

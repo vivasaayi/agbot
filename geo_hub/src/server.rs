@@ -21,6 +21,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
         .route(
+            "/api/farms",
+            get(routes::list_farms).post(routes::create_farm),
+        )
+        .route(
+            "/api/farms/:farm_id",
+            get(routes::get_farm)
+                .put(routes::update_farm)
+                .delete(routes::delete_farm),
+        )
+        .route("/api/farms/:farm_id/fields", get(routes::list_farm_fields))
+        .route(
+            "/api/farms/:farm_id/fields/history",
+            get(routes::list_farm_field_history),
+        )
+        .route(
             "/api/fields",
             get(routes::list_fields).post(routes::create_field),
         )
@@ -32,7 +47,15 @@ pub fn build_router(state: AppState) -> Router {
             "/api/fields/import/geojson",
             post(routes::import_fields_geojson),
         )
+        .route(
+            "/api/fields/import/shapefile",
+            post(routes::import_fields_shapefile),
+        )
         .route("/api/fields/:field_id", get(routes::get_field))
+        .route(
+            "/api/fields/:field_id/farm/:farm_id",
+            put(routes::link_field_to_farm),
+        )
         .route(
             "/api/fields/:field_id/scenes",
             get(routes::list_field_scenes),

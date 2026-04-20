@@ -5,7 +5,8 @@ use crate::plugins::annotations::{
     start_annotation_delete, start_annotation_fetch, start_annotation_update,
 };
 use crate::plugins::network::{
-    clear_loaded_tiles, clear_manifest_state, start_field_list_fetch, start_field_scenes_fetch,
+    clear_loaded_tiles, clear_manifest_state, start_farm_field_history_fetch,
+    start_farm_list_fetch, start_field_import, start_field_list_fetch, start_field_scenes_fetch,
     start_manifest_fetch,
 };
 use crate::plugins::recommendations::{
@@ -17,11 +18,12 @@ use crate::plugins::recommendations::{
 use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
     AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask, AnnotationOverlayState,
-    AnnotationUpdateTask, CursorMapState, DraftMode, FieldCatalogState, FieldListFetchTask,
-    FieldScenesFetchTask, ManifestFetchTask, MapViewState, RecommendationCreateTask,
-    RecommendationDeleteTask, RecommendationFetchTask, RecommendationOverlayState,
-    RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask, ReportOverlayState,
-    SceneManifestState, TileConfig, TileFetchTasks, TileRenderState, TileStatus, ViewerState,
+    AnnotationUpdateTask, CursorMapState, DraftMode, FarmFieldHistoryFetchTask, FarmListFetchTask,
+    FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask, FieldScenesFetchTask,
+    ManifestFetchTask, MapViewState, RecommendationCreateTask, RecommendationDeleteTask,
+    RecommendationFetchTask, RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask,
+    ReportGenerateTask, ReportOverlayState, SceneManifestState, ShapefileImportRequest, TileConfig,
+    TileFetchTasks, TileRenderState, TileStatus, ViewerState,
 };
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -39,8 +41,18 @@ impl Plugin for ViewerUiPlugin {
 #[derive(SystemParam)]
 struct CatalogUiState<'w, 's> {
     field_catalog: ResMut<'w, FieldCatalogState>,
+    farm_list_task: ResMut<'w, FarmListFetchTask>,
+    farm_field_history_task: ResMut<'w, FarmFieldHistoryFetchTask>,
     field_list_task: ResMut<'w, FieldListFetchTask>,
     field_scenes_task: ResMut<'w, FieldScenesFetchTask>,
+    #[system_param(ignore)]
+    marker: std::marker::PhantomData<&'s ()>,
+}
+
+#[derive(SystemParam)]
+struct FieldImportUiState<'w, 's> {
+    field_import_state: ResMut<'w, FieldImportState>,
+    field_import_task: ResMut<'w, FieldImportTask>,
     #[system_param(ignore)]
     marker: std::marker::PhantomData<&'s ()>,
 }
@@ -93,6 +105,7 @@ fn render_ui(
     mut viewer_state: ResMut<ViewerState>,
     mut config: ResMut<TileConfig>,
     mut catalog_ui: CatalogUiState,
+    mut field_import_ui: FieldImportUiState,
     mut scene_ui: SceneUiState,
     cursor_map: Res<CursorMapState>,
     mut annotation_ui: AnnotationUiState,
@@ -100,8 +113,12 @@ fn render_ui(
     mut report_ui: ReportUiState,
 ) {
     let field_catalog = &mut catalog_ui.field_catalog;
+    let farm_list_task = &mut catalog_ui.farm_list_task;
+    let farm_field_history_task = &mut catalog_ui.farm_field_history_task;
     let field_list_task = &mut catalog_ui.field_list_task;
     let field_scenes_task = &mut catalog_ui.field_scenes_task;
+    let field_import_state = &mut field_import_ui.field_import_state;
+    let field_import_task = &mut field_import_ui.field_import_task;
     let manifest_state = &mut scene_ui.manifest_state;
     let manifest_task = &mut scene_ui.manifest_task;
     let tile_state = &mut scene_ui.tile_state;
@@ -125,8 +142,12 @@ fn render_ui(
         render_fields_panel(
             ui,
             field_catalog,
+            farm_list_task,
+            farm_field_history_task,
             field_list_task,
             field_scenes_task,
+            field_import_state,
+            field_import_task,
             &mut viewer_state,
             &mut config,
             manifest_state,
@@ -233,8 +254,12 @@ fn render_ui(
 fn render_fields_panel(
     ui: &mut egui::Ui,
     field_catalog: &mut FieldCatalogState,
+    farm_list_task: &mut FarmListFetchTask,
+    farm_field_history_task: &mut FarmFieldHistoryFetchTask,
     field_list_task: &mut FieldListFetchTask,
     field_scenes_task: &mut FieldScenesFetchTask,
+    field_import_state: &mut FieldImportState,
+    field_import_task: &mut FieldImportTask,
     viewer_state: &mut ViewerState,
     config: &mut TileConfig,
     manifest_state: &mut SceneManifestState,
@@ -257,16 +282,150 @@ fn render_fields_panel(
     report_generate_task: &mut ReportGenerateTask,
     commands: &mut Commands,
 ) {
+    ui.heading("Boundary Import");
+    ui.label("Import a local polygon .shp file in geographic lon/lat.");
+    ui.text_edit_singleline(&mut field_import_state.shapefile_path);
     ui.horizontal(|ui| {
-        ui.heading("Fields");
+        ui.label("Name");
+        ui.text_edit_singleline(&mut field_import_state.name_prefix);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Crop");
+        ui.text_edit_singleline(&mut field_import_state.crop);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Season");
+        ui.text_edit_singleline(&mut field_import_state.season);
+    });
+    ui.label("Notes");
+    ui.text_edit_multiline(&mut field_import_state.notes);
+    if ui.button("Import .shp").clicked() {
+        let request = ShapefileImportRequest {
+            path: field_import_state.shapefile_path.trim().to_string(),
+            name_prefix: optional_text(&field_import_state.name_prefix),
+            farm_id: field_catalog.selected_farm_id.clone(),
+            crop: optional_text(&field_import_state.crop),
+            season: optional_text(&field_import_state.season),
+            notes: optional_text(&field_import_state.notes),
+        };
+        field_import_state.status_message = Some("Importing shapefile...".to_string());
+        if let Err(err) = start_field_import(field_import_task, config, request) {
+            field_import_state.status_message = Some(err.to_string());
+            tile_state.status = TileStatus::Error(err.to_string());
+        }
+    }
+    if let Some(message) = field_import_state.status_message.as_deref() {
+        ui.small(message);
+    }
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        ui.heading("Farms");
         if ui.button("Refresh").clicked() {
+            if let Err(err) = start_farm_list_fetch(farm_list_task, config) {
+                tile_state.status = TileStatus::Error(err.to_string());
+            }
             if let Err(err) = start_field_list_fetch(field_list_task, config) {
                 tile_state.status = TileStatus::Error(err.to_string());
             }
         }
     });
     ui.separator();
-    if field_catalog.fields.is_empty() {
+    if field_catalog.farms.is_empty() {
+        ui.label("No farms loaded");
+    } else {
+        let farms = field_catalog.farms.clone();
+        for farm in farms {
+            let selected = field_catalog.selected_farm_id.as_deref() == Some(&farm.farm_id);
+            let response = ui.selectable_label(selected, farm.name.clone());
+            if response.clicked() && !selected {
+                field_catalog.selected_farm_id = Some(farm.farm_id.clone());
+                field_catalog.selected_field_id = None;
+                field_catalog.selected_scene_id = None;
+                field_catalog.scenes.clear();
+                field_catalog.season_groups.clear();
+                if let Err(err) =
+                    start_farm_field_history_fetch(farm_field_history_task, config, &farm.farm_id)
+                {
+                    tile_state.status = TileStatus::Error(err.to_string());
+                }
+            }
+            response.on_hover_text(farm.notes.unwrap_or_else(|| "No farm notes".to_string()));
+        }
+    }
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        ui.heading("Fields");
+        if ui.button("Refresh Fields").clicked() {
+            if let Err(err) = start_field_list_fetch(field_list_task, config) {
+                tile_state.status = TileStatus::Error(err.to_string());
+            }
+            if let Some(farm_id) = field_catalog.selected_farm_id.as_deref() {
+                if let Err(err) =
+                    start_farm_field_history_fetch(farm_field_history_task, config, farm_id)
+                {
+                    tile_state.status = TileStatus::Error(err.to_string());
+                }
+            }
+        }
+    });
+    ui.separator();
+    if let Some(selected_farm_id) = field_catalog.selected_farm_id.as_deref() {
+        if field_catalog
+            .farms
+            .iter()
+            .all(|farm| farm.farm_id != selected_farm_id)
+        {
+            field_catalog.selected_farm_id = None;
+        }
+    }
+    if field_catalog.selected_farm_id.is_some() {
+        if field_catalog.season_groups.is_empty() {
+            ui.label("No fields loaded for selected farm");
+        } else {
+            let groups = field_catalog.season_groups.clone();
+            for group in groups {
+                ui.collapsing(
+                    group.season.as_deref().unwrap_or("Season Unspecified"),
+                    |ui| {
+                        for field in group.fields {
+                            let selected =
+                                field_catalog.selected_field_id.as_deref() == Some(&field.field_id);
+                            let response = ui.selectable_label(
+                                selected,
+                                format!(
+                                    "{} ({})",
+                                    field.name,
+                                    field.crop.as_deref().unwrap_or("crop n/a")
+                                ),
+                            );
+                            if response.clicked() && !selected {
+                                field_catalog.selected_field_id = Some(field.field_id.clone());
+                                field_catalog.selected_scene_id = None;
+                                field_catalog.scenes.clear();
+                                if let Err(err) = start_field_scenes_fetch(
+                                    field_scenes_task,
+                                    config,
+                                    &field.field_id,
+                                ) {
+                                    tile_state.status = TileStatus::Error(err.to_string());
+                                }
+                            }
+                            response.on_hover_text(format!(
+                                "Season: {}\nExtent: {:.5}, {:.5} -> {:.5}, {:.5}",
+                                field.season.as_deref().unwrap_or("n/a"),
+                                field.extent.min_lon,
+                                field.extent.min_lat,
+                                field.extent.max_lon,
+                                field.extent.max_lat
+                            ));
+                        }
+                    },
+                );
+            }
+        }
+    } else if field_catalog.fields.is_empty() {
         ui.label("No fields loaded");
     } else {
         let fields = field_catalog.fields.clone();
@@ -302,7 +461,7 @@ fn render_fields_panel(
     }
     ui.add_space(8.0);
 
-    ui.heading("Scenes");
+    ui.heading("Scene History");
     ui.separator();
     if field_catalog.selected_field_id.is_none() {
         ui.label("Select a field");
@@ -357,6 +516,11 @@ fn render_fields_panel(
         ));
         ui.add_space(8.0);
     }
+}
+
+fn optional_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn render_layers_panel(

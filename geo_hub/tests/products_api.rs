@@ -580,6 +580,745 @@ async fn import_fields_geojson_rejects_non_polygon_geometry() -> Result<()> {
 }
 
 #[tokio::test]
+async fn import_fields_shapefile_creates_fields_from_polygon_records() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let shapefile_path = tmp.path().join("north_field.shp");
+    write_polygon_shapefile(
+        &shapefile_path,
+        &[vec![
+            (-96.7, 41.1),
+            (-96.2, 41.1),
+            (-96.2, 41.4),
+            (-96.7, 41.4),
+            (-96.7, 41.1),
+        ]],
+    )?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields/import/shapefile")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "path": shapefile_path.to_string_lossy().to_string(),
+                        "name_prefix": "North Boundary",
+                        "crop": "corn",
+                        "season": "2026",
+                        "notes": "shapefile import"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let fields_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(fields_json.as_array().map(|items| items.len()), Some(1));
+    assert_eq!(
+        fields_json
+            .pointer("/0/name")
+            .and_then(|value| value.as_str()),
+        Some("North Boundary")
+    );
+    assert_eq!(
+        fields_json
+            .pointer("/0/crop")
+            .and_then(|value| value.as_str()),
+        Some("corn")
+    );
+    assert_eq!(
+        fields_json
+            .pointer("/0/season")
+            .and_then(|value| value.as_str()),
+        Some("2026")
+    );
+    assert_eq!(
+        fields_json
+            .pointer("/0/boundary/coordinates")
+            .and_then(|value| value.as_array())
+            .map(|coords| coords.len()),
+        Some(4)
+    );
+
+    let list_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_fields_shapefile_rejects_unsupported_geometry() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let shapefile_path = tmp.path().join("points.shp");
+    write_point_shapefile(&shapefile_path, &[(-96.45, 41.25)])?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields/import/shapefile")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "path": shapefile_path.to_string_lossy().to_string()
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("only polygon field boundaries are supported"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_fields_shapefile_rejects_non_geographic_coordinates() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let shapefile_path = tmp.path().join("projected.shp");
+    write_polygon_shapefile(
+        &shapefile_path,
+        &[vec![
+            (500_000.0, 4_500_000.0),
+            (500_100.0, 4_500_000.0),
+            (500_100.0, 4_500_100.0),
+            (500_000.0, 4_500_000.0),
+        ]],
+    )?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields/import/shapefile")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "path": shapefile_path.to_string_lossy().to_string()
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("EPSG:4326"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn farm_crud_and_field_history_roundtrip() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-1",
+                        "name": "River Bend",
+                        "notes": "primary client farm"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let get_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/farms/farm-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get_response.status(), StatusCode::OK);
+
+    for (field_id, season) in [("field-a", "2026"), ("field-b", "2025")] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fields")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "farm_id": "farm-1",
+                            "field_id": field_id,
+                            "name": format!("Field {}", field_id),
+                            "crop": "corn",
+                            "season": season,
+                            "boundary": {
+                                "coordinates": [
+                                    { "longitude": -96.7, "latitude": 41.1 },
+                                    { "longitude": -96.2, "latitude": 41.1 },
+                                    { "longitude": -96.2, "latitude": 41.4 }
+                                ]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let fields_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/farms/farm-1/fields")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(fields_response.status(), StatusCode::OK);
+    let body = to_bytes(fields_response.into_body(), 64 * 1024).await?;
+    let fields_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(fields_json.as_array().map(|items| items.len()), Some(2));
+    assert_eq!(
+        fields_json
+            .pointer("/0/farm_id")
+            .and_then(|value| value.as_str()),
+        Some("farm-1")
+    );
+
+    let history_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/farms/farm-1/fields/history")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(history_response.status(), StatusCode::OK);
+    let body = to_bytes(history_response.into_body(), 64 * 1024).await?;
+    let history_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(history_json.as_array().map(|items| items.len()), Some(2));
+
+    let update_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/farms/farm-1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "River Bend Updated",
+                        "notes": "updated farm notes"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(update_response.status(), StatusCode::OK);
+
+    let delete_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/farms/farm-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn farm_field_scene_relationships_roundtrip() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create_farm = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-scene",
+                        "name": "South Block"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_farm.status(), StatusCode::OK);
+
+    let create_field = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-scene",
+                        "field_id": "field-scene",
+                        "name": "South Pivot",
+                        "season": "2026",
+                        "boundary": {
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_field.status(), StatusCode::OK);
+
+    let scene_id = "farm-scene-1";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (scene_id, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(scene_id)
+    .bind("landsat8")
+    .bind("2025-01-01T00:00:00Z")
+    .bind(scene_dir.to_string_lossy().to_string())
+    .bind(
+        json!({
+            "metadata": {
+                "timestamp": "2025-01-01T00:00:00Z",
+                "gps_position": null,
+                "bands": ["B4", "B5"],
+                "exposure_time": 1.0,
+                "gain": 1.0,
+                "width": 1,
+                "height": 1
+            },
+            "file_paths": {
+                "B4": "B4.png",
+                "B5": "B5.png"
+            },
+            "image_id": Uuid::new_v4()
+        })
+        .to_string(),
+    )
+    .bind(None::<f64>)
+    .bind("2025-01-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    let link_scene = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/scenes/{scene_id}/field/field-scene"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(link_scene.status(), StatusCode::OK);
+
+    let field_scenes = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/field-scene/scenes")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(field_scenes.status(), StatusCode::OK);
+    let body = to_bytes(field_scenes.into_body(), 64 * 1024).await?;
+    let scenes_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(scenes_json.as_array().map(|items| items.len()), Some(1));
+
+    let history_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/farms/farm-scene/fields/history")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(history_response.status(), StatusCode::OK);
+    let body = to_bytes(history_response.into_body(), 64 * 1024).await?;
+    let history_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        history_json
+            .pointer("/0/fields/0/field_id")
+            .and_then(|value| value.as_str()),
+        Some("field-scene")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn acceptance_import_field_link_scene_and_load_layer() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{}/products/ndvi", fixture.scene_id))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    assert_eq!(body.as_ref(), TEST_PNG_BYTES);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn acceptance_annotation_lifecycle_roundtrip() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{}/annotations", fixture.scene_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "annotation_id": "accept-ann-1",
+                        "label": "Stress patch",
+                        "severity": "medium",
+                        "geometry": {
+                            "type": "point",
+                            "coordinate": {
+                                "longitude": -96.45,
+                                "latitude": 41.25
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let update_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/api/scenes/{}/annotations/accept-ann-1",
+                    fixture.scene_id
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "label": "Stress polygon",
+                        "note": "Expanded after review",
+                        "severity": "high",
+                        "geometry": {
+                            "type": "polygon",
+                            "coordinates": [
+                                { "longitude": -96.46, "latitude": 41.24 },
+                                { "longitude": -96.44, "latitude": 41.24 },
+                                { "longitude": -96.44, "latitude": 41.26 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(update_response.status(), StatusCode::OK);
+
+    let delete_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/scenes/{}/annotations/accept-ann-1",
+                    fixture.scene_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn acceptance_create_recommendation_from_annotation() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+    create_acceptance_annotation(&ctx, &fixture.scene_id).await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{}/recommendations", fixture.scene_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recommendation_id": "accept-rec-1",
+                        "title": "Inspect irrigation lane",
+                        "category": "irrigation",
+                        "priority": "high",
+                        "status": "open",
+                        "annotation_ids": ["accept-ann-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let recommendation_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        recommendation_json
+            .pointer("/annotation_ids/0")
+            .and_then(|value| value.as_str()),
+        Some("accept-ann-1")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn acceptance_generate_and_retrieve_report() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+    create_acceptance_annotation(&ctx, &fixture.scene_id).await?;
+
+    let recommendation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{}/recommendations", fixture.scene_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "Check soil moisture",
+                        "category": "irrigation",
+                        "priority": "medium",
+                        "status": "open",
+                        "annotation_ids": ["accept-ann-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(recommendation_response.status(), StatusCode::OK);
+
+    let generate_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{}/reports", fixture.scene_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "Acceptance report"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(generate_response.status(), StatusCode::OK);
+    let body = to_bytes(generate_response.into_body(), 128 * 1024).await?;
+    let report_json: serde_json::Value = serde_json::from_slice(&body)?;
+    let report_id = report_json
+        .get("report_id")
+        .and_then(|value| value.as_str())
+        .expect("report_id should exist");
+
+    let download_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{}/reports/{}",
+                    fixture.scene_id, report_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(download_response.status(), StatusCode::OK);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn acceptance_geojson_export_returns_expected_field_geometry() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/export/geojson")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    let features = geojson
+        .get("features")
+        .and_then(|value| value.as_array())
+        .expect("feature collection should contain features");
+    let feature = features
+        .iter()
+        .find(|feature| {
+            feature.get("id").and_then(|value| value.as_str()) == Some(&fixture.field_id)
+        })
+        .expect("fixture field should be exported");
+    assert_eq!(
+        feature
+            .pointer("/geometry/coordinates/0")
+            .and_then(|value| value.as_array())
+            .map(|ring| ring.len()),
+        Some(5)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_and_list_scene_annotations_for_file_backed_scene() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -991,6 +1730,263 @@ async fn recommendation_crud_roundtrip_with_annotation_linkage() -> Result<()> {
 }
 
 #[tokio::test]
+async fn annotation_exports_return_csv_and_geojson() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "annotation-export-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/annotations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "annotation_id": "ann-export-1",
+                        "label": "Stress pocket",
+                        "note": "West edge looks dry",
+                        "severity": "high",
+                        "geometry": {
+                            "type": "polygon",
+                            "coordinates": [
+                                { "longitude": -96.46, "latitude": 41.24 },
+                                { "longitude": -96.44, "latitude": 41.24 },
+                                { "longitude": -96.44, "latitude": 41.26 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/exports/annotations.csv"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    assert_eq!(
+        csv_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    assert_eq!(
+        csv_response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"annotations.csv\"")
+    );
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let csv_text = String::from_utf8(body.to_vec())?;
+    assert!(csv_text.contains("annotation_id,label,severity,note,geometry_type"));
+    assert!(csv_text.contains("ann-export-1,Stress pocket,high,West edge looks dry,polygon"));
+
+    let geojson_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/exports/annotations.geojson"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    assert_eq!(
+        geojson_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/geo+json")
+    );
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson.get("type").and_then(|value| value.as_str()),
+        Some("FeatureCollection")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/id")
+            .and_then(|value| value.as_str()),
+        Some("ann-export-1")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/geometry/type")
+            .and_then(|value| value.as_str()),
+        Some("Polygon")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn recommendation_exports_return_csv_and_geojson() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "recommendation-export-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+
+    let annotation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/annotations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "annotation_id": "ann-export-rec-1",
+                        "label": "Irrigation gap",
+                        "severity": "medium",
+                        "geometry": {
+                            "type": "point",
+                            "coordinate": {
+                                "longitude": -96.45,
+                                "latitude": 41.25
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(annotation_response.status(), StatusCode::OK);
+
+    let recommendation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/recommendations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recommendation_id": "rec-export-1",
+                        "title": "Inspect irrigation line",
+                        "note": "Dispatch operator before noon",
+                        "category": "irrigation",
+                        "priority": "critical",
+                        "status": "open",
+                        "annotation_ids": ["ann-export-rec-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(recommendation_response.status(), StatusCode::OK);
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/exports/recommendations.csv"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    assert_eq!(
+        csv_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let csv_text = String::from_utf8(body.to_vec())?;
+    assert!(
+        csv_text.contains("recommendation_id,title,category,priority,status,annotation_ids,note")
+    );
+    assert!(csv_text.contains(
+        "rec-export-1,Inspect irrigation line,irrigation,critical,open,ann-export-rec-1,Dispatch operator before noon"
+    ));
+
+    let geojson_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/exports/recommendations.geojson"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    assert_eq!(
+        geojson_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/geo+json")
+    );
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson.get("type").and_then(|value| value.as_str()),
+        Some("FeatureCollection")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/recommendation_id")
+            .and_then(|value| value.as_str()),
+        Some("rec-export-1")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/annotation_id")
+            .and_then(|value| value.as_str()),
+        Some("ann-export-rec-1")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/geometry/type")
+            .and_then(|value| value.as_str()),
+        Some("Point")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn report_generation_and_download_roundtrip() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -1352,6 +2348,181 @@ struct TestContext {
     data_root: PathBuf,
 }
 
+struct AcceptanceFixture {
+    field_id: String,
+    scene_id: String,
+}
+
+async fn setup_golden_acceptance_fixture(
+    ctx: &TestContext,
+    tmp: &TempDir,
+) -> Result<AcceptanceFixture> {
+    let farm_id = "acceptance-farm".to_string();
+    let create_farm = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": farm_id,
+                        "name": "Acceptance Farm"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_farm.status(), StatusCode::OK);
+
+    let shapefile_path = tmp.path().join("acceptance_field.shp");
+    write_polygon_shapefile(
+        &shapefile_path,
+        &[vec![
+            (-96.7, 41.1),
+            (-96.2, 41.1),
+            (-96.2, 41.4),
+            (-96.7, 41.4),
+            (-96.7, 41.1),
+        ]],
+    )?;
+    let import_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields/import/shapefile")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "path": shapefile_path.to_string_lossy().to_string(),
+                        "farm_id": farm_id,
+                        "name_prefix": "Acceptance Field",
+                        "crop": "corn",
+                        "season": "2026"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(import_response.status(), StatusCode::OK);
+    let body = to_bytes(import_response.into_body(), 64 * 1024).await?;
+    let fields_json: serde_json::Value = serde_json::from_slice(&body)?;
+    let field_id = fields_json
+        .pointer("/0/field_id")
+        .and_then(|value| value.as_str())
+        .expect("field_id should exist")
+        .to_string();
+
+    let scene_id = "acceptance-scene".to_string();
+    let scene_dir = ctx.data_root.join("scenes").join(&scene_id);
+    let product_path = scene_dir.join("products").join("ndvi").join("sample.png");
+    std::fs::create_dir_all(product_path.parent().expect("product parent exists"))?;
+    std::fs::write(&product_path, TEST_PNG_BYTES)?;
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (scene_id, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&scene_id)
+    .bind("landsat8")
+    .bind("2025-01-01T00:00:00Z")
+    .bind(scene_dir.to_string_lossy().to_string())
+    .bind(
+        json!({
+            "metadata": {
+                "timestamp": "2025-01-01T00:00:00Z",
+                "gps_position": {
+                    "latitude": 41.25,
+                    "longitude": -96.45,
+                    "altitude": 350.0
+                },
+                "bands": ["B4", "B5"],
+                "exposure_time": 1.0,
+                "gain": 1.0,
+                "width": 256,
+                "height": 256,
+                "spatial_ref": {
+                    "georeferenced": true,
+                    "crs": "EPSG:4326",
+                    "bbox": {
+                        "min_lon": -96.7,
+                        "min_lat": 41.1,
+                        "max_lon": -96.2,
+                        "max_lat": 41.4
+                    }
+                }
+            },
+            "file_paths": {
+                "B4": "B4.png",
+                "B5": "B5.png"
+            },
+            "image_id": Uuid::new_v4()
+        })
+        .to_string(),
+    )
+    .bind(None::<f64>)
+    .bind("2025-01-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    let link_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/scenes/{scene_id}/field/{field_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(link_response.status(), StatusCode::OK);
+
+    Ok(AcceptanceFixture { field_id, scene_id })
+}
+
+async fn create_acceptance_annotation(ctx: &TestContext, scene_id: &str) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/annotations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "annotation_id": "accept-ann-1",
+                        "label": "Acceptance issue",
+                        "severity": "medium",
+                        "geometry": {
+                            "type": "point",
+                            "coordinate": {
+                                "longitude": -96.45,
+                                "latitude": 41.25
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
 async fn test_app(tmp: &TempDir) -> Result<TestContext> {
     let data_root = tmp.path().join("data");
     let db_path = tmp.path().join("geo_hub_test.db");
@@ -1385,4 +2556,108 @@ fn write_gray_png(path: &Path, value: u8) -> Result<()> {
     let img = GrayImage::from_pixel(2, 2, Luma([value]));
     img.save(path)?;
     Ok(())
+}
+
+fn write_polygon_shapefile(path: &Path, rings: &[Vec<(f64, f64)>]) -> Result<()> {
+    write_shapefile(path, 5, rings)
+}
+
+fn write_point_shapefile(path: &Path, points: &[(f64, f64)]) -> Result<()> {
+    let records = points
+        .iter()
+        .map(|(x, y)| vec![(*x, *y)])
+        .collect::<Vec<_>>();
+    write_shapefile(path, 1, &records)
+}
+
+fn write_shapefile(path: &Path, shape_type: i32, records: &[Vec<(f64, f64)>]) -> Result<()> {
+    let mut bytes = vec![0u8; 100];
+    bytes[0..4].copy_from_slice(&9994i32.to_be_bytes());
+    bytes[28..32].copy_from_slice(&1000i32.to_le_bytes());
+    bytes[32..36].copy_from_slice(&shape_type.to_le_bytes());
+
+    let mut file_x_min = f64::INFINITY;
+    let mut file_x_max = f64::NEG_INFINITY;
+    let mut file_y_min = f64::INFINITY;
+    let mut file_y_max = f64::NEG_INFINITY;
+
+    for (index, record) in records.iter().enumerate() {
+        let record_content = shapefile_record_content(shape_type, record)?;
+        let content_len_words = (record_content.len() / 2) as i32;
+        bytes.extend_from_slice(&((index as i32) + 1).to_be_bytes());
+        bytes.extend_from_slice(&content_len_words.to_be_bytes());
+        bytes.extend_from_slice(&record_content);
+
+        for (x, y) in record {
+            file_x_min = file_x_min.min(*x);
+            file_x_max = file_x_max.max(*x);
+            file_y_min = file_y_min.min(*y);
+            file_y_max = file_y_max.max(*y);
+        }
+    }
+
+    if file_x_min.is_finite() {
+        bytes[36..44].copy_from_slice(&file_x_min.to_le_bytes());
+        bytes[44..52].copy_from_slice(&file_y_min.to_le_bytes());
+        bytes[52..60].copy_from_slice(&file_x_max.to_le_bytes());
+        bytes[60..68].copy_from_slice(&file_y_max.to_le_bytes());
+    }
+
+    let file_len_words = (bytes.len() / 2) as i32;
+    bytes[24..28].copy_from_slice(&file_len_words.to_be_bytes());
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn shapefile_record_content(shape_type: i32, points: &[(f64, f64)]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&shape_type.to_le_bytes());
+
+    match shape_type {
+        1 => {
+            let (x, y) = points
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("point shapefile record requires one point"))?;
+            bytes.extend_from_slice(&x.to_le_bytes());
+            bytes.extend_from_slice(&y.to_le_bytes());
+        }
+        5 => {
+            let x_min = points
+                .iter()
+                .map(|point| point.0)
+                .fold(f64::INFINITY, f64::min);
+            let x_max = points
+                .iter()
+                .map(|point| point.0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let y_min = points
+                .iter()
+                .map(|point| point.1)
+                .fold(f64::INFINITY, f64::min);
+            let y_max = points
+                .iter()
+                .map(|point| point.1)
+                .fold(f64::NEG_INFINITY, f64::max);
+            bytes.extend_from_slice(&x_min.to_le_bytes());
+            bytes.extend_from_slice(&y_min.to_le_bytes());
+            bytes.extend_from_slice(&x_max.to_le_bytes());
+            bytes.extend_from_slice(&y_max.to_le_bytes());
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+            bytes.extend_from_slice(&(points.len() as i32).to_le_bytes());
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+            for (x, y) in points {
+                bytes.extend_from_slice(&x.to_le_bytes());
+                bytes.extend_from_slice(&y.to_le_bytes());
+            }
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported test shapefile type {}",
+                shape_type
+            ))
+        }
+    }
+
+    Ok(bytes)
 }

@@ -4,11 +4,12 @@ use crate::plugins::{
 };
 use crate::state::{
     initial_tile_config, AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask,
-    AnnotationOverlayState, AnnotationUpdateTask, CursorMapState, FieldCatalogState,
-    FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask, MapViewState,
-    RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
-    RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask,
-    ReportOverlayState, SceneManifestState, TileFetchTasks, TileRenderState, DEFAULT_TILE_ZOOM,
+    AnnotationOverlayState, AnnotationUpdateTask, CursorMapState, FarmFieldHistoryFetchTask,
+    FarmListFetchTask, FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask,
+    FieldScenesFetchTask, ManifestFetchTask, MapViewState, RecommendationCreateTask,
+    RecommendationDeleteTask, RecommendationFetchTask, RecommendationOverlayState,
+    RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask, ReportOverlayState,
+    SceneManifestState, TileFetchTasks, TileRenderState, DEFAULT_TILE_ZOOM,
 };
 use anyhow::Result;
 use bevy::{prelude::*, window::WindowResolution};
@@ -47,9 +48,13 @@ pub fn run() -> Result<()> {
         .insert_resource(tile_config)
         .insert_resource(FieldListFetchTask::default())
         .insert_resource(FieldScenesFetchTask::default())
+        .insert_resource(FarmListFetchTask::default())
+        .insert_resource(FarmFieldHistoryFetchTask::default())
+        .insert_resource(FieldImportTask::default())
         .insert_resource(ManifestFetchTask::default())
         .insert_resource(SceneManifestState::default())
         .insert_resource(FieldCatalogState::default())
+        .insert_resource(FieldImportState::default())
         .insert_resource(TileFetchTasks::default())
         .insert_resource(AnnotationFetchTask::default())
         .insert_resource(AnnotationCreateTask::default())

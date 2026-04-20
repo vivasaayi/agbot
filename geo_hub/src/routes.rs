@@ -1,6 +1,6 @@
 use crate::{
     error::{AppError, AppResult},
-    ingest,
+    ingest, shapefile,
     state::AppState,
 };
 use anyhow::Error;
@@ -17,9 +17,9 @@ use geojson::{
 use image::{imageops::FilterType, DynamicImage, ImageFormat};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    bounds_from_points, AnnotationGeometry, AnnotationRecord, FieldBoundary, FieldRecord, GeoPoint,
-    GpsCoords, MultispectralImage, RecommendationPriority, RecommendationRecord,
-    RecommendationStatus, ReportFormat, ReportRecord,
+    bounds_from_points, AnnotationGeometry, AnnotationRecord, FarmRecord, FieldBoundary,
+    FieldRecord, GeoPoint, GpsCoords, MultispectralImage, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -83,12 +83,26 @@ pub struct SceneExtent {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateFieldRequest {
+    pub farm_id: Option<String>,
     pub field_id: Option<String>,
     pub name: String,
     pub crop: Option<String>,
     pub season: Option<String>,
     pub notes: Option<String>,
     pub boundary: FieldBoundary,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateFarmRequest {
+    pub farm_id: Option<String>,
+    pub name: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateFarmRequest {
+    pub name: String,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,18 +150,53 @@ pub struct CreateReportRequest {
     pub title: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ImportShapefileRequest {
+    pub path: String,
+    pub name_prefix: Option<String>,
+    pub farm_id: Option<String>,
+    pub crop: Option<String>,
+    pub season: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldSeasonGroup {
+    pub season: Option<String>,
+    pub fields: Vec<FieldRecord>,
+}
+
 pub async fn import_fields_geojson(
     State(state): State<AppState>,
     Json(payload): Json<GeoJson>,
 ) -> AppResult<Json<Vec<FieldRecord>>> {
     let fields = fields_from_geojson(payload)?;
 
-    for field in &fields {
+    upsert_fields(&state, &fields).await?;
+
+    Ok(Json(fields))
+}
+
+pub async fn import_fields_shapefile(
+    State(state): State<AppState>,
+    Json(payload): Json<ImportShapefileRequest>,
+) -> AppResult<Json<Vec<FieldRecord>>> {
+    let fields = fields_from_shapefile(payload).await?;
+
+    upsert_fields(&state, &fields).await?;
+
+    Ok(Json(fields))
+}
+
+async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<()> {
+    for field in fields {
+        ensure_field_farm_exists(state, field.farm_id.as_deref()).await?;
         sqlx::query(
             r#"
-            INSERT INTO fields (field_id, name, crop, season, notes, boundary_json, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+            INSERT INTO fields (field_id, farm_id, name, crop, season, notes, boundary_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
             ON CONFLICT(field_id) DO UPDATE SET
+                farm_id = excluded.farm_id,
                 name = excluded.name,
                 crop = excluded.crop,
                 season = excluded.season,
@@ -156,6 +205,7 @@ pub async fn import_fields_geojson(
             "#,
         )
         .bind(&field.field_id)
+        .bind(&field.farm_id)
         .bind(&field.name)
         .bind(&field.crop)
         .bind(&field.season)
@@ -166,12 +216,140 @@ pub async fn import_fields_geojson(
         .map_err(Error::from)?;
     }
 
+    Ok(())
+}
+
+pub async fn list_farms(State(state): State<AppState>) -> AppResult<Json<Vec<FarmRecord>>> {
+    let rows = sqlx::query("SELECT farm_id, name, notes FROM farms ORDER BY name ASC")
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?;
+
+    let mut farms = Vec::with_capacity(rows.len());
+    for row in rows {
+        farms.push(decode_farm_record(&row));
+    }
+
+    Ok(Json(farms))
+}
+
+pub async fn create_farm(
+    State(state): State<AppState>,
+    Json(request): Json<CreateFarmRequest>,
+) -> AppResult<Json<FarmRecord>> {
+    let farm = build_farm_record(request)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO farms (farm_id, name, notes, created_at)
+        VALUES (?1, ?2, ?3, datetime('now'))
+        "#,
+    )
+    .bind(&farm.farm_id)
+    .bind(&farm.name)
+    .bind(&farm.notes)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(farm))
+}
+
+pub async fn get_farm(
+    Path(farm_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<FarmRecord>> {
+    let farm = load_farm(&state, &farm_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(farm))
+}
+
+pub async fn update_farm(
+    Path(farm_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateFarmRequest>,
+) -> AppResult<Json<FarmRecord>> {
+    let mut farm = load_farm(&state, &farm_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    farm.name = normalize_farm_name(request.name)?;
+    farm.notes = normalize_optional_text(request.notes);
+
+    sqlx::query(
+        r#"
+        UPDATE farms
+        SET name = ?2, notes = ?3
+        WHERE farm_id = ?1
+        "#,
+    )
+    .bind(&farm.farm_id)
+    .bind(&farm.name)
+    .bind(&farm.notes)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(farm))
+}
+
+pub async fn delete_farm(
+    Path(farm_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<StatusCode> {
+    if load_farm(&state, &farm_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    sqlx::query("UPDATE fields SET farm_id = NULL WHERE farm_id = ?1")
+        .bind(&farm_id)
+        .execute(&state.pool)
+        .await
+        .map_err(Error::from)?;
+    sqlx::query("DELETE FROM farms WHERE farm_id = ?1")
+        .bind(&farm_id)
+        .execute(&state.pool)
+        .await
+        .map_err(Error::from)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_farm_fields(
+    Path(farm_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<FieldRecord>>> {
+    if load_farm(&state, &farm_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let rows = sqlx::query(
+        "SELECT field_id, farm_id, name, crop, season, notes, boundary_json FROM fields WHERE farm_id = ?1 ORDER BY COALESCE(season, '') DESC, name ASC",
+    )
+    .bind(&farm_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut fields = Vec::with_capacity(rows.len());
+    for row in rows {
+        fields.push(decode_field_record(&row)?);
+    }
+
     Ok(Json(fields))
+}
+
+pub async fn list_farm_field_history(
+    Path(farm_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<FieldSeasonGroup>>> {
+    let fields = list_farm_fields(Path(farm_id), State(state)).await?.0;
+    Ok(Json(group_fields_by_season(fields)))
 }
 
 pub async fn list_fields(State(state): State<AppState>) -> AppResult<Json<Vec<FieldRecord>>> {
     let rows = sqlx::query(
-        "SELECT field_id, name, crop, season, notes, boundary_json FROM fields ORDER BY name ASC",
+        "SELECT field_id, farm_id, name, crop, season, notes, boundary_json FROM fields ORDER BY name ASC",
     )
     .fetch_all(&state.pool)
     .await
@@ -187,7 +365,7 @@ pub async fn list_fields(State(state): State<AppState>) -> AppResult<Json<Vec<Fi
 
 pub async fn export_fields_geojson(State(state): State<AppState>) -> AppResult<Json<GeoJson>> {
     let rows = sqlx::query(
-        "SELECT field_id, name, crop, season, notes, boundary_json FROM fields ORDER BY name ASC",
+        "SELECT field_id, farm_id, name, crop, season, notes, boundary_json FROM fields ORDER BY name ASC",
     )
     .fetch_all(&state.pool)
     .await
@@ -617,7 +795,13 @@ pub async fn export_scene_annotations_csv(
     let annotations = load_scene_annotation_records(&state, &scene_id).await?;
     let mut writer = csv::Writer::from_writer(Vec::new());
     writer
-        .write_record(["annotation_id", "label", "severity", "note", "geometry_type"])
+        .write_record([
+            "annotation_id",
+            "label",
+            "severity",
+            "note",
+            "geometry_type",
+        ])
         .map_err(|err| AppError::Anyhow(err.into()))?;
     for annotation in annotations {
         writer
@@ -684,42 +868,54 @@ pub async fn export_scene_recommendations_csv(
 pub async fn export_scene_annotations_geojson(
     Path(scene_id): Path<String>,
     State(state): State<AppState>,
-) -> AppResult<Json<GeoJson>> {
+) -> AppResult<Response> {
     if !scene_exists(&state, &scene_id).await? {
         return Err(AppError::NotFound);
     }
 
     let annotations = load_scene_annotation_records(&state, &scene_id).await?;
-    Ok(Json(GeoJson::FeatureCollection(FeatureCollection {
+    let geojson = GeoJson::FeatureCollection(FeatureCollection {
         bbox: None,
         foreign_members: None,
         features: annotations
             .iter()
             .map(feature_from_annotation)
             .collect::<AppResult<Vec<_>>>()?,
-    })))
+    });
+
+    response_with_bytes(
+        serde_json::to_vec(&geojson).map_err(|err| AppError::Anyhow(err.into()))?,
+        "application/geo+json",
+        "annotations.geojson",
+    )
 }
 
 pub async fn export_scene_recommendations_geojson(
     Path(scene_id): Path<String>,
     State(state): State<AppState>,
-) -> AppResult<Json<GeoJson>> {
+) -> AppResult<Response> {
     if !scene_exists(&state, &scene_id).await? {
         return Err(AppError::NotFound);
     }
 
     let recommendations = load_scene_recommendation_records(&state, &scene_id).await?;
     let annotations = load_scene_annotation_records(&state, &scene_id).await?;
-    let features = recommendations
-        .iter()
-        .flat_map(|recommendation| recommendation_features(recommendation, &annotations))
-        .collect::<AppResult<Vec<_>>>()?;
+    let mut features = Vec::new();
+    for recommendation in &recommendations {
+        features.extend(recommendation_features(recommendation, &annotations)?);
+    }
 
-    Ok(Json(GeoJson::FeatureCollection(FeatureCollection {
+    let geojson = GeoJson::FeatureCollection(FeatureCollection {
         bbox: None,
         foreign_members: None,
         features,
-    })))
+    });
+
+    response_with_bytes(
+        serde_json::to_vec(&geojson).map_err(|err| AppError::Anyhow(err.into()))?,
+        "application/geo+json",
+        "recommendations.geojson",
+    )
 }
 
 pub async fn create_field(
@@ -727,14 +923,16 @@ pub async fn create_field(
     Json(request): Json<CreateFieldRequest>,
 ) -> AppResult<Json<FieldRecord>> {
     let field = build_field_record(request)?;
+    ensure_field_farm_exists(&state, field.farm_id.as_deref()).await?;
 
     sqlx::query(
         r#"
-        INSERT INTO fields (field_id, name, crop, season, notes, boundary_json, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+        INSERT INTO fields (field_id, farm_id, name, crop, season, notes, boundary_json, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
         "#,
     )
     .bind(&field.field_id)
+    .bind(&field.farm_id)
     .bind(&field.name)
     .bind(&field.crop)
     .bind(&field.season)
@@ -754,6 +952,28 @@ pub async fn get_field(
     let field = load_field(&state, &field_id)
         .await?
         .ok_or(AppError::NotFound)?;
+    Ok(Json(field))
+}
+
+pub async fn link_field_to_farm(
+    Path((field_id, farm_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<Json<FieldRecord>> {
+    let mut field = load_field(&state, &field_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if load_farm(&state, &farm_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    sqlx::query("UPDATE fields SET farm_id = ?2 WHERE field_id = ?1")
+        .bind(&field_id)
+        .bind(&farm_id)
+        .execute(&state.pool)
+        .await
+        .map_err(Error::from)?;
+
+    field.farm_id = Some(farm_id);
     Ok(Json(field))
 }
 
@@ -1281,6 +1501,7 @@ fn build_field_record(request: CreateFieldRequest) -> AppResult<FieldRecord> {
     })?;
 
     Ok(FieldRecord {
+        farm_id: request.farm_id,
         field_id,
         name,
         crop: request.crop,
@@ -1288,6 +1509,18 @@ fn build_field_record(request: CreateFieldRequest) -> AppResult<FieldRecord> {
         notes: request.notes,
         boundary: request.boundary,
         extent,
+    })
+}
+
+fn build_farm_record(request: CreateFarmRequest) -> AppResult<FarmRecord> {
+    let farm_id = request
+        .farm_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    Ok(FarmRecord {
+        farm_id,
+        name: normalize_farm_name(request.name)?,
+        notes: normalize_optional_text(request.notes),
     })
 }
 
@@ -1415,6 +1648,14 @@ fn normalize_annotation_label(label: String) -> AppResult<String> {
     Ok(label)
 }
 
+fn normalize_farm_name(name: String) -> AppResult<String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("farm name is required".to_string()));
+    }
+    Ok(name)
+}
+
 fn normalize_recommendation_title(title: String) -> AppResult<String> {
     let title = title.trim().to_string();
     if title.is_empty() {
@@ -1445,12 +1686,104 @@ fn fields_from_geojson(geojson: GeoJson) -> AppResult<Vec<FieldRecord>> {
     }
 }
 
+async fn fields_from_shapefile(request: ImportShapefileRequest) -> AppResult<Vec<FieldRecord>> {
+    let path = PathBuf::from(request.path.trim());
+    if path.as_os_str().is_empty() {
+        return Err(AppError::BadRequest(
+            "shapefile path is required".to_string(),
+        ));
+    }
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| !ext.eq_ignore_ascii_case("shp"))
+        .unwrap_or(true)
+    {
+        return Err(AppError::BadRequest(
+            "shapefile import currently requires a .shp path".to_string(),
+        ));
+    }
+
+    let bytes = fs::read(&path).await.map_err(|err| {
+        AppError::BadRequest(format!(
+            "failed to read shapefile {}: {err}",
+            path.display()
+        ))
+    })?;
+    let shapes = shapefile::parse_polygon_records(&path, &bytes)?;
+    let base_name = request
+        .name_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "Imported Field".to_string());
+    let single_shape = shapes.len() == 1;
+
+    shapes
+        .into_iter()
+        .map(|shape| {
+            let shape_name = if single_shape {
+                base_name.clone()
+            } else {
+                format!("{} {}", base_name, shape.record_index + 1)
+            };
+            build_field_record(CreateFieldRequest {
+                farm_id: request.farm_id.clone(),
+                field_id: None,
+                name: shape_name,
+                crop: request.crop.clone(),
+                season: request.season.clone(),
+                notes: request.notes.clone(),
+                boundary: FieldBoundary {
+                    coordinates: shape.coordinates,
+                },
+            })
+        })
+        .collect()
+}
+
+fn group_fields_by_season(fields: Vec<FieldRecord>) -> Vec<FieldSeasonGroup> {
+    let mut grouped: BTreeMap<Option<String>, Vec<FieldRecord>> = BTreeMap::new();
+    for field in fields {
+        grouped.entry(field.season.clone()).or_default().push(field);
+    }
+
+    grouped
+        .into_iter()
+        .rev()
+        .map(|(season, fields)| FieldSeasonGroup { season, fields })
+        .collect()
+}
+
 fn geojson_from_fields(fields: Vec<FieldRecord>) -> GeoJson {
     GeoJson::FeatureCollection(FeatureCollection {
         bbox: None,
         foreign_members: None,
         features: fields.into_iter().map(feature_from_field).collect(),
     })
+}
+
+fn response_with_bytes(bytes: Vec<u8>, content_type: &str, filename: &str) -> AppResult<Response> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type).map_err(|err| AppError::Anyhow(err.into()))?,
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .map_err(|err| AppError::Anyhow(err.into()))?,
+    );
+
+    Ok((headers, Body::from(bytes)).into_response())
 }
 
 fn feature_from_field(field: FieldRecord) -> Feature {
@@ -1469,6 +1802,9 @@ fn feature_from_field(field: FieldRecord) -> Feature {
         "field_id".to_string(),
         serde_json::Value::String(field.field_id.clone()),
     );
+    if let Some(farm_id) = field.farm_id {
+        properties.insert("farm_id".to_string(), serde_json::Value::String(farm_id));
+    }
     properties.insert("name".to_string(), serde_json::Value::String(field.name));
     if let Some(crop) = field.crop {
         properties.insert("crop".to_string(), serde_json::Value::String(crop));
@@ -1487,6 +1823,129 @@ fn feature_from_field(field: FieldRecord) -> Feature {
         properties: Some(properties),
         foreign_members: None,
     }
+}
+
+fn feature_from_annotation(annotation: &AnnotationRecord) -> AppResult<Feature> {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "annotation_id".to_string(),
+        serde_json::Value::String(annotation.annotation_id.clone()),
+    );
+    properties.insert(
+        "label".to_string(),
+        serde_json::Value::String(annotation.label.clone()),
+    );
+    if let Some(severity) = annotation.severity.as_ref() {
+        properties.insert(
+            "severity".to_string(),
+            serde_json::Value::String(severity.clone()),
+        );
+    }
+    if let Some(note) = annotation.note.as_ref() {
+        properties.insert("note".to_string(), serde_json::Value::String(note.clone()));
+    }
+
+    Ok(Feature {
+        bbox: None,
+        geometry: Some(geometry_from_annotation(&annotation.geometry)?),
+        id: Some(GeoJsonId::String(annotation.annotation_id.clone())),
+        properties: Some(properties),
+        foreign_members: None,
+    })
+}
+
+fn recommendation_features(
+    recommendation: &RecommendationRecord,
+    annotations: &[AnnotationRecord],
+) -> AppResult<Vec<Feature>> {
+    if recommendation.annotation_ids.is_empty() {
+        let mut properties = serde_json::Map::new();
+        populate_recommendation_properties(&mut properties, recommendation);
+        return Ok(vec![Feature {
+            bbox: None,
+            geometry: None,
+            id: Some(GeoJsonId::String(recommendation.recommendation_id.clone())),
+            properties: Some(properties),
+            foreign_members: None,
+        }]);
+    }
+
+    let mut features = Vec::new();
+    for annotation_id in &recommendation.annotation_ids {
+        if let Some(annotation) = annotations
+            .iter()
+            .find(|annotation| annotation.annotation_id == *annotation_id)
+        {
+            let mut properties = serde_json::Map::new();
+            populate_recommendation_properties(&mut properties, recommendation);
+            properties.insert(
+                "annotation_id".to_string(),
+                serde_json::Value::String(annotation.annotation_id.clone()),
+            );
+            features.push(Feature {
+                bbox: None,
+                geometry: Some(geometry_from_annotation(&annotation.geometry)?),
+                id: Some(GeoJsonId::String(format!(
+                    "{}:{}",
+                    recommendation.recommendation_id, annotation.annotation_id
+                ))),
+                properties: Some(properties),
+                foreign_members: None,
+            });
+        }
+    }
+
+    Ok(features)
+}
+
+fn populate_recommendation_properties(
+    properties: &mut serde_json::Map<String, serde_json::Value>,
+    recommendation: &RecommendationRecord,
+) {
+    properties.insert(
+        "recommendation_id".to_string(),
+        serde_json::Value::String(recommendation.recommendation_id.clone()),
+    );
+    properties.insert(
+        "title".to_string(),
+        serde_json::Value::String(recommendation.title.clone()),
+    );
+    properties.insert(
+        "priority".to_string(),
+        serde_json::Value::String(recommendation_priority_str(recommendation.priority).to_string()),
+    );
+    properties.insert(
+        "status".to_string(),
+        serde_json::Value::String(recommendation_status_str(recommendation.status).to_string()),
+    );
+    if let Some(category) = recommendation.category.as_ref() {
+        properties.insert(
+            "category".to_string(),
+            serde_json::Value::String(category.clone()),
+        );
+    }
+    if let Some(note) = recommendation.note.as_ref() {
+        properties.insert("note".to_string(), serde_json::Value::String(note.clone()));
+    }
+}
+
+fn geometry_from_annotation(geometry: &AnnotationGeometry) -> AppResult<Geometry> {
+    Ok(match geometry {
+        AnnotationGeometry::Point { coordinate } => Geometry::new(GeoJsonValue::Point(vec![
+            coordinate.longitude,
+            coordinate.latitude,
+        ])),
+        AnnotationGeometry::Polygon { coordinates } => {
+            let mut ring = coordinates
+                .iter()
+                .map(|coordinate| vec![coordinate.longitude, coordinate.latitude])
+                .collect::<Vec<_>>();
+            if let Some(first) = ring.first().cloned() {
+                ring.push(first);
+            }
+            Geometry::new(GeoJsonValue::Polygon(vec![ring]))
+        }
+    })
 }
 
 fn validate_annotation_geometry(geometry: &AnnotationGeometry) -> AppResult<()> {
@@ -1545,6 +2004,7 @@ fn build_field_from_feature(feature: geojson::Feature, index: usize) -> AppResul
     build_field_from_geometry(
         geometry,
         Some(CreateFieldRequest {
+            farm_id: None,
             field_id,
             name,
             crop: property_string(&properties, "crop"),
@@ -1565,6 +2025,7 @@ fn build_field_from_geometry(
 ) -> AppResult<FieldRecord> {
     let boundary = boundary_from_geometry(geometry)?;
     let template = template.unwrap_or(CreateFieldRequest {
+        farm_id: None,
         field_id: None,
         name: format!("Imported Field {}", index + 1),
         crop: None,
@@ -1576,6 +2037,7 @@ fn build_field_from_geometry(
     });
 
     build_field_record(CreateFieldRequest {
+        farm_id: template.farm_id,
         field_id: template.field_id,
         name: template.name,
         crop: template.crop,
@@ -1666,6 +2128,7 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
     })?;
 
     Ok(FieldRecord {
+        farm_id: row.get("farm_id"),
         field_id: row.get("field_id"),
         name: row.get("name"),
         crop: row.get("crop"),
@@ -1674,6 +2137,14 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
         boundary,
         extent,
     })
+}
+
+fn decode_farm_record(row: &sqlx::sqlite::SqliteRow) -> FarmRecord {
+    FarmRecord {
+        farm_id: row.get("farm_id"),
+        name: row.get("name"),
+        notes: row.get("notes"),
+    }
 }
 
 fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<AnnotationRecord> {
@@ -1734,7 +2205,7 @@ fn decode_report_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ReportRecord
 
 async fn load_field(state: &AppState, field_id: &str) -> AppResult<Option<FieldRecord>> {
     let row = sqlx::query(
-        "SELECT field_id, name, crop, season, notes, boundary_json FROM fields WHERE field_id = ?1",
+        "SELECT field_id, farm_id, name, crop, season, notes, boundary_json FROM fields WHERE field_id = ?1",
     )
     .bind(field_id)
     .fetch_optional(&state.pool)
@@ -1742,6 +2213,28 @@ async fn load_field(state: &AppState, field_id: &str) -> AppResult<Option<FieldR
     .map_err(Error::from)?;
 
     row.map(|row| decode_field_record(&row)).transpose()
+}
+
+async fn load_farm(state: &AppState, farm_id: &str) -> AppResult<Option<FarmRecord>> {
+    let row = sqlx::query("SELECT farm_id, name, notes FROM farms WHERE farm_id = ?1")
+        .bind(farm_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(Error::from)?;
+
+    Ok(row.map(|row| decode_farm_record(&row)))
+}
+
+async fn ensure_field_farm_exists(state: &AppState, farm_id: Option<&str>) -> AppResult<()> {
+    if let Some(farm_id) = farm_id {
+        if load_farm(state, farm_id).await?.is_none() {
+            return Err(AppError::BadRequest(format!(
+                "farm {} does not exist",
+                farm_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn load_scene_field(
@@ -2481,6 +2974,7 @@ mod tests {
     #[test]
     fn build_field_record_computes_extent_from_boundary() {
         let field = build_field_record(CreateFieldRequest {
+            farm_id: None,
             field_id: Some("north-80".to_string()),
             name: "North 80".to_string(),
             crop: Some("corn".to_string()),
@@ -2521,6 +3015,7 @@ mod tests {
     #[test]
     fn build_field_record_rejects_short_boundary() {
         let err = build_field_record(CreateFieldRequest {
+            farm_id: None,
             field_id: None,
             name: "Short boundary".to_string(),
             crop: None,
@@ -2547,6 +3042,7 @@ mod tests {
     #[test]
     fn build_field_record_rejects_invalid_coordinate_ranges() {
         let err = build_field_record(CreateFieldRequest {
+            farm_id: None,
             field_id: None,
             name: "Bad coordinates".to_string(),
             crop: None,

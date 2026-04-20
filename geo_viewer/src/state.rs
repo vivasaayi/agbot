@@ -2,9 +2,9 @@ use anyhow::Result;
 use bevy::prelude::*;
 use bevy::tasks::Task;
 use image::DynamicImage;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    AnnotationRecord, FieldRecord, GeoPoint, GpsCoords, RecommendationPriority,
+    AnnotationRecord, FarmRecord, FieldRecord, GeoPoint, GpsCoords, RecommendationPriority,
     RecommendationRecord, RecommendationStatus, ReportRecord,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +34,15 @@ pub struct FieldListFetchTask(pub Option<Task<anyhow::Result<Vec<FieldRecord>>>>
 
 #[derive(Resource, Default)]
 pub struct FieldScenesFetchTask(pub Option<Task<anyhow::Result<Vec<FieldSceneSummary>>>>);
+
+#[derive(Resource, Default)]
+pub struct FarmListFetchTask(pub Option<Task<anyhow::Result<Vec<FarmRecord>>>>);
+
+#[derive(Resource, Default)]
+pub struct FarmFieldHistoryFetchTask(pub Option<Task<anyhow::Result<Vec<FieldSeasonGroup>>>>);
+
+#[derive(Resource, Default)]
+pub struct FieldImportTask(pub Option<Task<anyhow::Result<Vec<FieldRecord>>>>);
 
 #[derive(Resource, Default)]
 pub struct ManifestFetchTask(pub Option<Task<anyhow::Result<SceneManifest>>>);
@@ -95,6 +104,12 @@ pub struct FieldSceneSummary {
     pub scene_id: String,
     pub sensor: String,
     pub acquired_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FieldSeasonGroup {
+    pub season: Option<String>,
+    pub fields: Vec<FieldRecord>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,10 +197,33 @@ pub struct SceneManifestState {
 
 #[derive(Resource, Default)]
 pub struct FieldCatalogState {
+    pub farms: Vec<FarmRecord>,
     pub fields: Vec<FieldRecord>,
+    pub season_groups: Vec<FieldSeasonGroup>,
     pub scenes: Vec<FieldSceneSummary>,
+    pub selected_farm_id: Option<String>,
     pub selected_field_id: Option<String>,
     pub selected_scene_id: Option<String>,
+}
+
+#[derive(Resource, Default)]
+pub struct FieldImportState {
+    pub shapefile_path: String,
+    pub name_prefix: String,
+    pub crop: String,
+    pub season: String,
+    pub notes: String,
+    pub status_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShapefileImportRequest {
+    pub path: String,
+    pub name_prefix: Option<String>,
+    pub farm_id: Option<String>,
+    pub crop: Option<String>,
+    pub season: Option<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Resource)]

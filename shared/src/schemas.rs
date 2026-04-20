@@ -29,7 +29,16 @@ pub struct FieldBoundary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FarmRecord {
+    pub farm_id: String,
+    pub name: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldRecord {
+    #[serde(default)]
+    pub farm_id: Option<String>,
     pub field_id: String,
     pub name: String,
     pub crop: Option<String>,
@@ -389,6 +398,7 @@ mod tests {
     #[test]
     fn field_record_round_trips_through_json() {
         let field = FieldRecord {
+            farm_id: Some("farm-1".to_string()),
             field_id: "field-1".to_string(),
             name: "North 80".to_string(),
             crop: Some("corn".to_string()),

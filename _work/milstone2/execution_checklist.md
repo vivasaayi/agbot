@@ -120,8 +120,8 @@ This is the first directly sellable output.
 71. `[x]` Add map snapshot or rendered map image into the report
 72. `[x]` Add “generate report” action in `geo_viewer`
 73. `[x]` Add report history panel in `geo_viewer`
-74. `[ ]` Add CSV export for annotations and recommendations
-75. `[ ]` Add GeoJSON export for annotations and recommendations
+74. `[x]` Add CSV export for annotations and recommendations
+75. `[x]` Add GeoJSON export for annotations and recommendations
 
 Exit criteria for Phase 4:
 - Advisor can produce a farmer-ready report without leaving the platform.
@@ -130,17 +130,17 @@ Exit criteria for Phase 4:
 
 This needs a deliberate technical decision, not an accidental partial implementation.
 
-76. `[ ]` Decide shapefile import strategy:
+76. `[x]` Decide shapefile import strategy:
 Notes:
 - Option A: pure Rust shapefile crate
 - Option B: GDAL/OGR-backed import with explicit system dependency
 
-77. `[ ]` Document the chosen shapefile import strategy in the repo
-78. `[ ]` Implement shapefile field import in `geo_hub`
-79. `[ ]` Add shapefile import tests in `geo_hub`
-80. `[ ]` Add import failure reporting for invalid layers and unsupported geometry
-81. `[ ]` Add KML import decision note: in scope later or not
-82. `[ ]` Add import UI or operator workflow entry point in `geo_viewer`
+77. `[x]` Document the chosen shapefile import strategy in the repo
+78. `[x]` Implement shapefile field import in `geo_hub`
+79. `[x]` Add shapefile import tests in `geo_hub`
+80. `[x]` Add import failure reporting for invalid layers and unsupported geometry
+81. `[x]` Add KML import decision note: in scope later or not
+82. `[x]` Add import UI or operator workflow entry point in `geo_viewer`
 
 Exit criteria for Phase 5:
 - Advisor can bring in field boundaries from real external GIS sources.
@@ -149,14 +149,14 @@ Exit criteria for Phase 5:
 
 This is needed for real client workflows across multiple farms and seasons.
 
-83. `[ ]` Add `Farm` contract in `shared`
-84. `[ ]` Add farm storage in backend
-85. `[ ]` Link fields to farms in backend
-86. `[ ]` Add farm CRUD APIs
-87. `[ ]` Add field history grouped by field and season
-88. `[ ]` Add field timeline or scene history view in `geo_viewer`
-89. `[ ]` Add farm and field navigation hierarchy in `geo_viewer`
-90. `[ ]` Add integration tests for farm-field-scene relationships
+83. `[x]` Add `Farm` contract in `shared`
+84. `[x]` Add farm storage in backend
+85. `[x]` Link fields to farms in backend
+86. `[x]` Add farm CRUD APIs
+87. `[x]` Add field history grouped by field and season
+88. `[x]` Add field timeline or scene history view in `geo_viewer`
+89. `[x]` Add farm and field navigation hierarchy in `geo_viewer`
+90. `[x]` Add integration tests for farm-field-scene relationships
 
 Exit criteria for Phase 6:
 - Advisor can manage more than one field without flat scene browsing.
@@ -165,14 +165,14 @@ Exit criteria for Phase 6:
 
 This is what prevents the GIS stack from regressing as features accumulate.
 
-91. `[ ]` Define one golden end-to-end workflow fixture
-92. `[ ]` Add acceptance test: import field -> link scene -> load layer
-93. `[ ]` Add acceptance test: create annotation -> update annotation -> delete annotation
-94. `[ ]` Add acceptance test: create recommendation from annotation
-95. `[ ]` Add acceptance test: generate and retrieve report
-96. `[ ]` Add acceptance test: GeoJSON export returns expected field geometry
-97. `[ ]` Add CI commands or `justfile` targets for fast GIS test runs
-98. `[ ]` Document local developer commands for GIS regression runs
+91. `[x]` Define one golden end-to-end workflow fixture
+92. `[x]` Add acceptance test: import field -> link scene -> load layer
+93. `[x]` Add acceptance test: create annotation -> update annotation -> delete annotation
+94. `[x]` Add acceptance test: create recommendation from annotation
+95. `[x]` Add acceptance test: generate and retrieve report
+96. `[x]` Add acceptance test: GeoJSON export returns expected field geometry
+97. `[x]` Add CI commands or `justfile` targets for fast GIS test runs
+98. `[x]` Document local developer commands for GIS regression runs
 
 Exit criteria for Phase 7:
 - Core advisor workflow is guarded by repeatable automated tests.

@@ -5,13 +5,14 @@ use crate::plugins::map::{
 use crate::plugins::recommendations::{clear_recommendations, start_recommendation_fetch};
 use crate::plugins::reports::{clear_reports, start_report_fetch};
 use crate::state::{
-    AnnotationFetchTask, AnnotationOverlayState, FetchedTile, FieldCatalogState,
-    FieldListFetchTask, FieldSceneSummary, FieldScenesFetchTask, ManifestFetchTask, MapCamera,
+    AnnotationFetchTask, AnnotationOverlayState, FarmFieldHistoryFetchTask, FarmListFetchTask,
+    FetchedTile, FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask,
+    FieldSceneSummary, FieldScenesFetchTask, FieldSeasonGroup, ManifestFetchTask, MapCamera,
     MapViewState, RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
     RecommendationOverlayState, RecommendationUpdateTask, RenderedTile, ReportFetchTask,
-    ReportGenerateTask, ReportOverlayState, SceneManifest, SceneManifestState, TileConfig,
-    TileDisplay, TileFetchTasks, TileId, TilePresence, TileRenderState, TileSource, TileStatus,
-    ViewerState, DEFAULT_TILE_ZOOM,
+    ReportGenerateTask, ReportOverlayState, SceneManifest, SceneManifestState,
+    ShapefileImportRequest, TileConfig, TileDisplay, TileFetchTasks, TileId, TilePresence,
+    TileRenderState, TileSource, TileStatus, ViewerState, DEFAULT_TILE_ZOOM,
 };
 use anyhow::{Context, Result};
 use bevy::ecs::system::SystemParam;
@@ -26,7 +27,7 @@ use bevy::{
 };
 use futures_lite::future;
 use image::{self, DynamicImage};
-use shared::schemas::FieldRecord;
+use shared::schemas::{FarmRecord, FieldRecord};
 use tracing::info;
 
 pub struct ViewerNetworkPlugin;
@@ -34,6 +35,7 @@ pub struct ViewerNetworkPlugin;
 #[derive(SystemParam)]
 struct ManifestCatalogState<'w, 's> {
     field_catalog: ResMut<'w, FieldCatalogState>,
+    farm_field_history_task: ResMut<'w, FarmFieldHistoryFetchTask>,
     field_scenes_task: ResMut<'w, FieldScenesFetchTask>,
     #[system_param(ignore)]
     marker: std::marker::PhantomData<&'s ()>,
@@ -73,8 +75,11 @@ impl Plugin for ViewerNetworkPlugin {
             .add_systems(
                 Update,
                 (
+                    poll_farm_list_fetch,
+                    poll_farm_field_history_fetch,
                     poll_field_list_fetch,
                     poll_field_scenes_fetch,
+                    poll_field_import,
                     poll_manifest_fetch,
                     poll_tile_fetch,
                 ),
@@ -88,6 +93,7 @@ impl Plugin for ViewerNetworkPlugin {
 
 fn bootstrap_network_state(
     config: Res<TileConfig>,
+    mut farm_list_task: ResMut<FarmListFetchTask>,
     mut field_list_task: ResMut<FieldListFetchTask>,
     mut manifest_task: ResMut<ManifestFetchTask>,
     mut manifest_state: ResMut<SceneManifestState>,
@@ -97,6 +103,9 @@ fn bootstrap_network_state(
     mut report_fetch_task: ResMut<ReportFetchTask>,
     mut tile_state: ResMut<TileRenderState>,
 ) {
+    if let Err(err) = start_farm_list_fetch(&mut farm_list_task, &config) {
+        tile_state.status = TileStatus::Error(err.to_string());
+    }
     if let Err(err) = start_field_list_fetch(&mut field_list_task, &config) {
         tile_state.status = TileStatus::Error(err.to_string());
     }
@@ -146,6 +155,21 @@ fn poll_manifest_fetch(
                     manifest_state.products = products;
                     catalog_state.field_catalog.selected_scene_id = Some(scene_id);
                     if let Some(field) = linked_field {
+                        if let Some(farm_id) = field.farm_id.clone() {
+                            let farm_changed =
+                                catalog_state.field_catalog.selected_farm_id.as_deref()
+                                    != Some(&farm_id);
+                            catalog_state.field_catalog.selected_farm_id = Some(farm_id.clone());
+                            if farm_changed {
+                                if let Err(err) = start_farm_field_history_fetch(
+                                    &mut catalog_state.farm_field_history_task,
+                                    &config,
+                                    &farm_id,
+                                ) {
+                                    tile_state.status = TileStatus::Error(err.to_string());
+                                }
+                            }
+                        }
                         let field_changed =
                             catalog_state.field_catalog.selected_field_id.as_deref()
                                 != Some(&field.field_id);
@@ -559,6 +583,49 @@ pub fn start_field_list_fetch(
     Ok(())
 }
 
+pub fn start_farm_list_fetch(
+    farm_list_task: &mut FarmListFetchTask,
+    config: &TileConfig,
+) -> Result<()> {
+    let url = format!("{}/api/farms", config.base_url);
+    farm_list_task.0 = Some(IoTaskPool::get().spawn(async move {
+        let response =
+            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+        if !response.status().is_success() {
+            anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
+        }
+        let bytes = response.bytes().context("failed to read farm list body")?;
+        let farms =
+            serde_json::from_slice::<Vec<FarmRecord>>(&bytes).context("failed to decode farms")?;
+        Ok(farms)
+    }));
+
+    Ok(())
+}
+
+pub fn start_farm_field_history_fetch(
+    farm_field_history_task: &mut FarmFieldHistoryFetchTask,
+    config: &TileConfig,
+    farm_id: &str,
+) -> Result<()> {
+    let url = format!("{}/api/farms/{}/fields/history", config.base_url, farm_id);
+    farm_field_history_task.0 = Some(IoTaskPool::get().spawn(async move {
+        let response =
+            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+        if !response.status().is_success() {
+            anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
+        }
+        let bytes = response
+            .bytes()
+            .context("failed to read farm field history body")?;
+        let groups = serde_json::from_slice::<Vec<FieldSeasonGroup>>(&bytes)
+            .context("failed to decode farm field history")?;
+        Ok(groups)
+    }));
+
+    Ok(())
+}
+
 pub fn start_field_scenes_fetch(
     field_scenes_task: &mut FieldScenesFetchTask,
     config: &TileConfig,
@@ -577,6 +644,37 @@ pub fn start_field_scenes_fetch(
         let scenes = serde_json::from_slice::<Vec<FieldSceneSummary>>(&bytes)
             .context("failed to decode field scenes")?;
         Ok(scenes)
+    }));
+
+    Ok(())
+}
+
+pub fn start_field_import(
+    field_import_task: &mut FieldImportTask,
+    config: &TileConfig,
+    request: ShapefileImportRequest,
+) -> Result<()> {
+    let url = format!("{}/api/fields/import/shapefile", config.base_url);
+    field_import_task.0 = Some(IoTaskPool::get().spawn(async move {
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .post(&url)
+            .json(&request)
+            .send()
+            .with_context(|| format!("request failed: {}", url))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "failed to read error body".to_string());
+            anyhow::bail!("geo_hub returned {status} for {url}: {body}");
+        }
+        let bytes = response
+            .bytes()
+            .context("failed to read shapefile import body")?;
+        let fields = serde_json::from_slice::<Vec<FieldRecord>>(&bytes)
+            .context("failed to decode imported fields")?;
+        Ok(fields)
     }));
 
     Ok(())
@@ -637,6 +735,104 @@ pub fn clear_manifest_state(manifest_state: &mut SceneManifestState) {
     manifest_state.field = None;
     manifest_state.geospatial = Default::default();
     manifest_state.products.clear();
+}
+
+fn poll_farm_list_fetch(
+    mut farm_list_task: ResMut<FarmListFetchTask>,
+    mut field_catalog: ResMut<FieldCatalogState>,
+) {
+    if let Some(mut task) = farm_list_task.0.take() {
+        if let Some(result) = future::block_on(future::poll_once(&mut task)) {
+            if let Ok(farms) = result {
+                field_catalog.farms = farms;
+                if let Some(selected_farm_id) = field_catalog.selected_farm_id.as_ref() {
+                    if !field_catalog
+                        .farms
+                        .iter()
+                        .any(|farm| &farm.farm_id == selected_farm_id)
+                    {
+                        field_catalog.selected_farm_id = None;
+                        field_catalog.season_groups.clear();
+                    }
+                }
+            }
+        } else {
+            farm_list_task.0 = Some(task);
+        }
+    }
+}
+
+fn poll_farm_field_history_fetch(
+    mut farm_field_history_task: ResMut<FarmFieldHistoryFetchTask>,
+    mut field_catalog: ResMut<FieldCatalogState>,
+) {
+    if let Some(mut task) = farm_field_history_task.0.take() {
+        if let Some(result) = future::block_on(future::poll_once(&mut task)) {
+            if let Ok(groups) = result {
+                field_catalog.season_groups = groups.clone();
+                field_catalog.fields = groups
+                    .into_iter()
+                    .flat_map(|group| group.fields.into_iter())
+                    .collect();
+                if let Some(selected_field_id) = field_catalog.selected_field_id.as_ref() {
+                    if !field_catalog
+                        .fields
+                        .iter()
+                        .any(|field| &field.field_id == selected_field_id)
+                    {
+                        field_catalog.selected_field_id = None;
+                        field_catalog.selected_scene_id = None;
+                        field_catalog.scenes.clear();
+                    }
+                }
+            }
+        } else {
+            farm_field_history_task.0 = Some(task);
+        }
+    }
+}
+
+fn poll_field_import(
+    config: Res<TileConfig>,
+    mut field_import_task: ResMut<FieldImportTask>,
+    mut field_import_state: ResMut<FieldImportState>,
+    mut farm_field_history_task: ResMut<FarmFieldHistoryFetchTask>,
+    mut field_list_task: ResMut<FieldListFetchTask>,
+    mut field_catalog: ResMut<FieldCatalogState>,
+    mut tile_state: ResMut<TileRenderState>,
+) {
+    if let Some(mut task) = field_import_task.0.take() {
+        if let Some(result) = future::block_on(future::poll_once(&mut task)) {
+            match result {
+                Ok(imported) => {
+                    field_import_state.status_message =
+                        Some(format!("Imported {} shapefile field(s)", imported.len()));
+                    if let Some(first) = imported.first() {
+                        field_catalog.selected_field_id = Some(first.field_id.clone());
+                        field_catalog.selected_farm_id = first.farm_id.clone();
+                        if let Some(farm_id) = first.farm_id.as_deref() {
+                            if let Err(err) = start_farm_field_history_fetch(
+                                &mut farm_field_history_task,
+                                &config,
+                                farm_id,
+                            ) {
+                                tile_state.status = TileStatus::Error(err.to_string());
+                            }
+                        }
+                    }
+                    if let Err(err) = start_field_list_fetch(&mut field_list_task, &config) {
+                        tile_state.status = TileStatus::Error(err.to_string());
+                    }
+                }
+                Err(err) => {
+                    field_import_state.status_message = Some(err.to_string());
+                    tile_state.status = TileStatus::Error("Field import failed".to_string());
+                }
+            }
+        } else {
+            field_import_task.0 = Some(task);
+        }
+    }
 }
 
 pub fn clear_loaded_tiles(commands: &mut Commands, tile_state: &mut TileRenderState) {
