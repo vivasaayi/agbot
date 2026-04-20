@@ -1,11 +1,12 @@
 use crate::state::{
-    CursorMapState, MapCamera, MapViewState, SceneExtent, SceneManifestState, TileRenderState,
-    ViewerState, MAP_UNITS_PER_DEGREE,
+    CursorMapState, MapCamera, MapViewState, SceneExtent, SceneManifestState, TileId,
+    TileRenderState, ViewerState, MAP_UNITS_PER_DEGREE,
 };
 use bevy::{
     input::mouse::{MouseMotion, MouseWheel},
     prelude::*,
 };
+use std::collections::BTreeSet;
 
 pub struct ViewerMapPlugin;
 
@@ -179,10 +180,85 @@ pub fn scene_local_to_geo(extent: &SceneExtent, world_position: Vec2) -> (f64, f
     (longitude, latitude)
 }
 
+pub fn tile_world_size(world_dimensions: Vec2, zoom: u8) -> Vec2 {
+    let tiles_per_axis = 1_u32 << zoom;
+    Vec2::new(
+        world_dimensions.x / tiles_per_axis as f32,
+        world_dimensions.y / tiles_per_axis as f32,
+    )
+}
+
+pub fn tile_center_world(world_dimensions: Vec2, tile_id: TileId) -> Vec2 {
+    let tile_size = tile_world_size(world_dimensions, tile_id.z);
+    let world_left = -world_dimensions.x / 2.0;
+    let world_top = world_dimensions.y / 2.0;
+
+    Vec2::new(
+        world_left + tile_size.x * (tile_id.x as f32 + 0.5),
+        world_top - tile_size.y * (tile_id.y as f32 + 0.5),
+    )
+}
+
+pub fn visible_tiles_for_view(
+    camera_center: Vec2,
+    camera_scale: f32,
+    window_size: Vec2,
+    world_dimensions: Vec2,
+    zoom: u8,
+) -> BTreeSet<TileId> {
+    if world_dimensions.x <= 0.0 || world_dimensions.y <= 0.0 {
+        return BTreeSet::new();
+    }
+
+    let half_view = Vec2::new(
+        window_size.x * camera_scale / 2.0,
+        window_size.y * camera_scale / 2.0,
+    );
+    let view_min = camera_center - half_view;
+    let view_max = camera_center + half_view;
+
+    let tiles_per_axis = 1_u32 << zoom;
+    let tile_size = tile_world_size(world_dimensions, zoom);
+    let world_left = -world_dimensions.x / 2.0;
+    let world_right = world_dimensions.x / 2.0;
+    let world_bottom = -world_dimensions.y / 2.0;
+    let world_top = world_dimensions.y / 2.0;
+
+    let clamped_min_x = view_min.x.max(world_left);
+    let clamped_max_x = view_max.x.min(world_right);
+    let clamped_min_y = view_min.y.max(world_bottom);
+    let clamped_max_y = view_max.y.min(world_top);
+    if clamped_min_x > clamped_max_x || clamped_min_y > clamped_max_y {
+        return BTreeSet::new();
+    }
+
+    let start_x = (((clamped_min_x - world_left) / tile_size.x).floor() as i32)
+        .clamp(0, tiles_per_axis as i32 - 1) as u32;
+    let end_x = ((((clamped_max_x - world_left) / tile_size.x).ceil() as i32) - 1)
+        .clamp(0, tiles_per_axis as i32 - 1) as u32;
+
+    let start_y = ((((world_top - clamped_max_y) / tile_size.y).floor()) as i32)
+        .clamp(0, tiles_per_axis as i32 - 1) as u32;
+    let end_y = ((((world_top - clamped_min_y) / tile_size.y).ceil() as i32) - 1)
+        .clamp(0, tiles_per_axis as i32 - 1) as u32;
+
+    let mut tiles = BTreeSet::new();
+    for x in start_x..=end_x {
+        for y in start_y..=end_y {
+            tiles.insert(TileId { z: zoom, x, y });
+        }
+    }
+
+    tiles
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extent_world_size, geo_to_scene_local, scene_local_to_geo};
-    use crate::state::SceneExtent;
+    use super::{
+        extent_world_size, geo_to_scene_local, scene_local_to_geo, tile_center_world,
+        tile_world_size, visible_tiles_for_view,
+    };
+    use crate::state::{SceneExtent, TileId};
     use bevy::prelude::Vec2;
 
     fn sample_extent() -> SceneExtent {
@@ -218,5 +294,63 @@ mod tests {
 
         assert!((longitude - -89.0).abs() < 0.000_001);
         assert!((latitude - 40.5).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn tile_world_size_divides_scene_evenly() {
+        let tile_size = tile_world_size(Vec2::new(400.0, 200.0), 2);
+        assert_eq!(tile_size, Vec2::new(100.0, 50.0));
+    }
+
+    #[test]
+    fn top_left_tile_center_matches_scene_grid() {
+        let center = tile_center_world(Vec2::new(400.0, 200.0), TileId { z: 2, x: 0, y: 0 });
+        assert_eq!(center, Vec2::new(-150.0, 75.0));
+    }
+
+    #[test]
+    fn visible_tiles_cover_center_of_scene() {
+        let tiles = visible_tiles_for_view(
+            Vec2::ZERO,
+            0.5,
+            Vec2::new(200.0, 200.0),
+            Vec2::new(400.0, 400.0),
+            2,
+        );
+        assert!(tiles.contains(&TileId { z: 2, x: 1, y: 1 }));
+        assert!(tiles.contains(&TileId { z: 2, x: 2, y: 1 }));
+        assert!(tiles.contains(&TileId { z: 2, x: 1, y: 2 }));
+        assert!(tiles.contains(&TileId { z: 2, x: 2, y: 2 }));
+    }
+
+    #[test]
+    fn visible_tiles_clamp_to_scene_bounds() {
+        let tiles = visible_tiles_for_view(
+            Vec2::new(-150.0, 150.0),
+            1.0,
+            Vec2::new(200.0, 200.0),
+            Vec2::new(400.0, 400.0),
+            2,
+        );
+        assert!(tiles.contains(&TileId { z: 2, x: 0, y: 0 }));
+    }
+
+    #[test]
+    fn tile_geo_alignment_matches_scene_extent() {
+        let extent = sample_extent();
+        let world_dimensions = extent_world_size(&extent);
+        let tile_id = TileId { z: 1, x: 0, y: 0 };
+        let tile_size = tile_world_size(world_dimensions, tile_id.z);
+        let tile_center = tile_center_world(world_dimensions, tile_id);
+        let top_left = tile_center + Vec2::new(-tile_size.x / 2.0, tile_size.y / 2.0);
+        let bottom_right = tile_center + Vec2::new(tile_size.x / 2.0, -tile_size.y / 2.0);
+
+        let (min_lon, max_lat) = scene_local_to_geo(&extent, top_left);
+        let (max_lon, min_lat) = scene_local_to_geo(&extent, bottom_right);
+
+        assert!((min_lon - -89.5).abs() < 0.000_001);
+        assert!((max_lon - -89.0).abs() < 0.000_001);
+        assert!((min_lat - 40.5).abs() < 0.000_001);
+        assert!((max_lat - 41.0).abs() < 0.000_001);
     }
 }

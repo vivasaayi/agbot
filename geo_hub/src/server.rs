@@ -48,6 +48,40 @@ pub fn build_router(state: AppState) -> Router {
             put(routes::update_scene_annotation).delete(routes::delete_scene_annotation),
         )
         .route(
+            "/api/scenes/:scene_id/recommendations",
+            get(routes::list_scene_recommendations).post(routes::create_scene_recommendation),
+        )
+        .route(
+            "/api/scenes/:scene_id/recommendations/:recommendation_id",
+            get(routes::get_scene_recommendation)
+                .put(routes::update_scene_recommendation)
+                .delete(routes::delete_scene_recommendation),
+        )
+        .route(
+            "/api/scenes/:scene_id/reports",
+            get(routes::list_scene_reports).post(routes::generate_scene_report),
+        )
+        .route(
+            "/api/scenes/:scene_id/reports/:report_id",
+            get(routes::download_scene_report),
+        )
+        .route(
+            "/api/scenes/:scene_id/exports/annotations.csv",
+            get(routes::export_scene_annotations_csv),
+        )
+        .route(
+            "/api/scenes/:scene_id/exports/recommendations.csv",
+            get(routes::export_scene_recommendations_csv),
+        )
+        .route(
+            "/api/scenes/:scene_id/exports/annotations.geojson",
+            get(routes::export_scene_annotations_geojson),
+        )
+        .route(
+            "/api/scenes/:scene_id/exports/recommendations.geojson",
+            get(routes::export_scene_recommendations_geojson),
+        )
+        .route(
             "/api/scenes/:scene_id/field/:field_id",
             put(routes::link_scene_to_field),
         )

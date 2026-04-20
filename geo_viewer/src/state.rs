@@ -3,13 +3,17 @@ use bevy::prelude::*;
 use bevy::tasks::Task;
 use image::DynamicImage;
 use serde::Deserialize;
-use shared::schemas::{AnnotationRecord, FieldRecord, GeoPoint, GpsCoords};
+use shared::schemas::{
+    AnnotationRecord, FieldRecord, GeoPoint, GpsCoords, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, ReportRecord,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub const APP_TITLE: &str = "Geo Viewer";
 pub const DEFAULT_PRODUCT_KIND: &str = "ndvi";
 pub const MAP_UNITS_PER_DEGREE: f32 = 10_000.0;
-pub const DEFAULT_TILE_ZOOM: u8 = 0;
+pub const DEFAULT_TILE_ZOOM: u8 = 2;
 
 #[derive(Resource)]
 pub struct ViewerState {
@@ -35,7 +39,7 @@ pub struct FieldScenesFetchTask(pub Option<Task<anyhow::Result<Vec<FieldSceneSum
 pub struct ManifestFetchTask(pub Option<Task<anyhow::Result<SceneManifest>>>);
 
 #[derive(Resource, Default)]
-pub struct TileFetchTask(pub Option<Task<anyhow::Result<FetchedTile>>>);
+pub struct TileFetchTasks(pub BTreeMap<TileId, Task<anyhow::Result<FetchedTile>>>);
 
 #[derive(Resource, Default)]
 pub struct AnnotationFetchTask(pub Option<Task<anyhow::Result<Vec<AnnotationRecord>>>>);
@@ -49,12 +53,31 @@ pub struct AnnotationUpdateTask(pub Option<Task<anyhow::Result<AnnotationRecord>
 #[derive(Resource, Default)]
 pub struct AnnotationDeleteTask(pub Option<Task<anyhow::Result<String>>>);
 
+#[derive(Resource, Default)]
+pub struct RecommendationFetchTask(pub Option<Task<anyhow::Result<Vec<RecommendationRecord>>>>);
+
+#[derive(Resource, Default)]
+pub struct RecommendationCreateTask(pub Option<Task<anyhow::Result<RecommendationRecord>>>);
+
+#[derive(Resource, Default)]
+pub struct RecommendationUpdateTask(pub Option<Task<anyhow::Result<RecommendationRecord>>>);
+
+#[derive(Resource, Default)]
+pub struct RecommendationDeleteTask(pub Option<Task<anyhow::Result<String>>>);
+
+#[derive(Resource, Default)]
+pub struct ReportFetchTask(pub Option<Task<anyhow::Result<Vec<ReportRecord>>>>);
+
+#[derive(Resource, Default)]
+pub struct ReportGenerateTask(pub Option<Task<anyhow::Result<ReportRecord>>>);
+
 pub struct FetchedTile {
     pub tile_id: TileId,
     pub image: DynamicImage,
+    pub missing: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TileId {
     pub z: u8,
     pub x: u32,
@@ -167,11 +190,40 @@ pub struct FieldCatalogState {
 
 #[derive(Resource)]
 pub struct TileRenderState {
-    pub entity: Option<Entity>,
-    pub handle: Option<Handle<Image>>,
+    pub tiles: BTreeMap<TileId, RenderedTile>,
+    pub visible_tiles: BTreeSet<TileId>,
     pub image_dimensions: Vec2,
     pub world_dimensions: Vec2,
+    pub current_zoom: u8,
     pub status: TileStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TilePresence {
+    Loading,
+    Ready,
+    Missing,
+}
+
+pub struct RenderedTile {
+    pub entity: Entity,
+    pub presence: TilePresence,
+}
+
+impl TileRenderState {
+    pub fn ready_tile_count(&self) -> usize {
+        self.tiles
+            .values()
+            .filter(|tile| tile.presence == TilePresence::Ready)
+            .count()
+    }
+
+    pub fn missing_tile_count(&self) -> usize {
+        self.tiles
+            .values()
+            .filter(|tile| tile.presence == TilePresence::Missing)
+            .count()
+    }
 }
 
 #[derive(Resource)]
@@ -236,6 +288,43 @@ impl Default for AnnotationOverlayState {
             show_other: true,
         }
     }
+}
+
+#[derive(Resource)]
+pub struct RecommendationOverlayState {
+    pub items: Vec<RecommendationRecord>,
+    pub selected_recommendation_id: Option<String>,
+    pub draft_title: String,
+    pub draft_note: String,
+    pub draft_category: String,
+    pub draft_priority: RecommendationPriority,
+    pub draft_status: RecommendationStatus,
+    pub linked_annotation_ids: Vec<String>,
+    pub status_filter: Option<RecommendationStatus>,
+    pub priority_filter: Option<RecommendationPriority>,
+}
+
+impl Default for RecommendationOverlayState {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            selected_recommendation_id: None,
+            draft_title: String::new(),
+            draft_note: String::new(),
+            draft_category: String::new(),
+            draft_priority: RecommendationPriority::default(),
+            draft_status: RecommendationStatus::default(),
+            linked_annotation_ids: Vec::new(),
+            status_filter: None,
+            priority_filter: None,
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct ReportOverlayState {
+    pub items: Vec<ReportRecord>,
+    pub draft_title: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

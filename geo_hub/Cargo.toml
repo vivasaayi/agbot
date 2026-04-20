@@ -24,6 +24,7 @@ imagery_processor = { path = "../imagery_processor" }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
 image = { workspace = true }
+csv = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.10"

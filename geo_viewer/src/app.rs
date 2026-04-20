@@ -1,12 +1,14 @@
 use crate::plugins::{
     annotations::ViewerAnnotationsPlugin, map::ViewerMapPlugin, network::ViewerNetworkPlugin,
-    ui::ViewerUiPlugin,
+    recommendations::ViewerRecommendationsPlugin, reports::ViewerReportsPlugin, ui::ViewerUiPlugin,
 };
 use crate::state::{
     initial_tile_config, AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask,
     AnnotationOverlayState, AnnotationUpdateTask, CursorMapState, FieldCatalogState,
-    FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask, MapViewState, SceneManifestState,
-    TileFetchTask, TileRenderState,
+    FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask, MapViewState,
+    RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
+    RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask,
+    ReportOverlayState, SceneManifestState, TileFetchTasks, TileRenderState, DEFAULT_TILE_ZOOM,
 };
 use anyhow::Result;
 use bevy::{prelude::*, window::WindowResolution};
@@ -37,6 +39,8 @@ pub fn run() -> Result<()> {
             ViewerNetworkPlugin,
             ViewerMapPlugin,
             ViewerAnnotationsPlugin,
+            ViewerRecommendationsPlugin,
+            ViewerReportsPlugin,
             ViewerUiPlugin,
         ))
         .insert_resource(viewer_state)
@@ -46,16 +50,23 @@ pub fn run() -> Result<()> {
         .insert_resource(ManifestFetchTask::default())
         .insert_resource(SceneManifestState::default())
         .insert_resource(FieldCatalogState::default())
-        .insert_resource(TileFetchTask::default())
+        .insert_resource(TileFetchTasks::default())
         .insert_resource(AnnotationFetchTask::default())
         .insert_resource(AnnotationCreateTask::default())
         .insert_resource(AnnotationUpdateTask::default())
         .insert_resource(AnnotationDeleteTask::default())
+        .insert_resource(RecommendationFetchTask::default())
+        .insert_resource(RecommendationCreateTask::default())
+        .insert_resource(RecommendationUpdateTask::default())
+        .insert_resource(RecommendationDeleteTask::default())
+        .insert_resource(ReportFetchTask::default())
+        .insert_resource(ReportGenerateTask::default())
         .insert_resource(TileRenderState {
-            entity: None,
-            handle: None,
+            tiles: Default::default(),
+            visible_tiles: Default::default(),
             image_dimensions: Vec2::ZERO,
             world_dimensions: Vec2::ZERO,
+            current_zoom: DEFAULT_TILE_ZOOM,
             status: initial_status,
         })
         .insert_resource(MapViewState {
@@ -66,6 +77,14 @@ pub fn run() -> Result<()> {
         .insert_resource(CursorMapState::default())
         .insert_resource(AnnotationOverlayState {
             draft_label: "Issue".to_string(),
+            ..default()
+        })
+        .insert_resource(RecommendationOverlayState {
+            draft_title: "Recommended action".to_string(),
+            ..default()
+        })
+        .insert_resource(ReportOverlayState {
+            draft_title: "Scene agronomy report".to_string(),
             ..default()
         })
         .run();

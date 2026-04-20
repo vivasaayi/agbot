@@ -18,7 +18,8 @@ use image::{imageops::FilterType, DynamicImage, ImageFormat};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     bounds_from_points, AnnotationGeometry, AnnotationRecord, FieldBoundary, FieldRecord, GeoPoint,
-    GpsCoords, MultispectralImage,
+    GpsCoords, MultispectralImage, RecommendationPriority, RecommendationRecord,
+    RecommendationStatus, ReportFormat, ReportRecord,
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -105,6 +106,34 @@ pub struct UpdateAnnotationRequest {
     pub note: Option<String>,
     pub severity: Option<String>,
     pub geometry: AnnotationGeometry,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRecommendationRequest {
+    pub recommendation_id: Option<String>,
+    pub title: String,
+    pub note: Option<String>,
+    pub category: Option<String>,
+    pub priority: Option<RecommendationPriority>,
+    pub status: Option<RecommendationStatus>,
+    #[serde(default)]
+    pub annotation_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateRecommendationRequest {
+    pub title: String,
+    pub note: Option<String>,
+    pub category: Option<String>,
+    pub priority: RecommendationPriority,
+    pub status: RecommendationStatus,
+    #[serde(default)]
+    pub annotation_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateReportRequest {
+    pub title: Option<String>,
 }
 
 pub async fn import_fields_geojson(
@@ -309,6 +338,388 @@ pub async fn delete_scene_annotation(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_scene_recommendations(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<RecommendationRecord>>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, created_at, updated_at
+        FROM recommendations
+        WHERE scene_id = ?1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(&scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut recommendations = Vec::with_capacity(rows.len());
+    for row in rows {
+        recommendations.push(decode_recommendation_record(&state, &row).await?);
+    }
+
+    Ok(Json(recommendations))
+}
+
+pub async fn get_scene_recommendation(
+    Path((scene_id, recommendation_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<Json<RecommendationRecord>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let recommendation = load_recommendation(&state, &scene_id, &recommendation_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    Ok(Json(recommendation))
+}
+
+pub async fn create_scene_recommendation(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CreateRecommendationRequest>,
+) -> AppResult<Json<RecommendationRecord>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let recommendation = build_recommendation_record(&state, &scene_id, request).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO recommendations (
+            recommendation_id, scene_id, field_id, title, note, category, priority, status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(&recommendation.recommendation_id)
+    .bind(&recommendation.scene_id)
+    .bind(&recommendation.field_id)
+    .bind(&recommendation.title)
+    .bind(&recommendation.note)
+    .bind(&recommendation.category)
+    .bind(recommendation_priority_str(recommendation.priority))
+    .bind(recommendation_status_str(recommendation.status))
+    .bind(&recommendation.created_at)
+    .bind(&recommendation.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    persist_recommendation_annotations(
+        &state,
+        &recommendation.recommendation_id,
+        &recommendation.annotation_ids,
+    )
+    .await?;
+
+    Ok(Json(recommendation))
+}
+
+pub async fn update_scene_recommendation(
+    Path((scene_id, recommendation_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateRecommendationRequest>,
+) -> AppResult<Json<RecommendationRecord>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let existing = load_recommendation(&state, &scene_id, &recommendation_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    validate_recommendation_annotation_ids(&state, &scene_id, &request.annotation_ids).await?;
+
+    let updated = RecommendationRecord {
+        recommendation_id: recommendation_id.clone(),
+        scene_id: scene_id.clone(),
+        field_id: load_scene_field_id(&state, &scene_id).await?,
+        title: normalize_recommendation_title(request.title)?,
+        note: normalize_optional_text(request.note),
+        category: normalize_optional_text(request.category),
+        priority: request.priority,
+        status: request.status,
+        annotation_ids: request.annotation_ids,
+        created_at: existing.created_at,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let result = sqlx::query(
+        r#"
+        UPDATE recommendations
+        SET field_id = ?1, title = ?2, note = ?3, category = ?4, priority = ?5, status = ?6, updated_at = ?7
+        WHERE recommendation_id = ?8 AND scene_id = ?9
+        "#,
+    )
+    .bind(&updated.field_id)
+    .bind(&updated.title)
+    .bind(&updated.note)
+    .bind(&updated.category)
+    .bind(recommendation_priority_str(updated.priority))
+    .bind(recommendation_status_str(updated.status))
+    .bind(&updated.updated_at)
+    .bind(&updated.recommendation_id)
+    .bind(&updated.scene_id)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    persist_recommendation_annotations(&state, &updated.recommendation_id, &updated.annotation_ids)
+        .await?;
+
+    Ok(Json(updated))
+}
+
+pub async fn delete_scene_recommendation(
+    Path((scene_id, recommendation_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<StatusCode> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let result =
+        sqlx::query("DELETE FROM recommendations WHERE recommendation_id = ?1 AND scene_id = ?2")
+            .bind(&recommendation_id)
+            .bind(&scene_id)
+            .execute(&state.pool)
+            .await
+            .map_err(Error::from)?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_scene_reports(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ReportRecord>>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT report_id, scene_id, field_id, title, format, path, annotation_count, recommendation_count, created_at
+        FROM reports
+        WHERE scene_id = ?1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(&scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut reports = Vec::with_capacity(rows.len());
+    for row in rows {
+        reports.push(decode_report_record(&row)?);
+    }
+
+    Ok(Json(reports))
+}
+
+pub async fn generate_scene_report(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CreateReportRequest>,
+) -> AppResult<Json<ReportRecord>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let report = build_scene_report(&state, &scene_id, request.title).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO reports (
+            report_id, scene_id, field_id, title, format, path, annotation_count, recommendation_count, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&report.report_id)
+    .bind(&report.scene_id)
+    .bind(&report.field_id)
+    .bind(&report.title)
+    .bind(report_format_str(report.format))
+    .bind(&report.artifact_path)
+    .bind(report.annotation_count as i64)
+    .bind(report.recommendation_count as i64)
+    .bind(&report.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(report))
+}
+
+pub async fn download_scene_report(
+    Path((scene_id, report_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let report = load_report(&state, &scene_id, &report_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let report_path = PathBuf::from(&report.artifact_path);
+
+    let file = File::open(&report_path)
+        .await
+        .map_err(|error| match error.kind() {
+            ErrorKind::NotFound => AppError::NotFound,
+            _ => AppError::Anyhow(error.into()),
+        })?;
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    if let Some(filename) = report_path.file_name().and_then(|name| name.to_str()) {
+        if let Ok(value) = HeaderValue::from_str(&format!("inline; filename=\"{}\"", filename)) {
+            headers.insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+
+    Ok((headers, body).into_response())
+}
+
+pub async fn export_scene_annotations_csv(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let annotations = load_scene_annotation_records(&state, &scene_id).await?;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer
+        .write_record(["annotation_id", "label", "severity", "note", "geometry_type"])
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    for annotation in annotations {
+        writer
+            .write_record([
+                annotation.annotation_id,
+                annotation.label,
+                annotation.severity.unwrap_or_default(),
+                annotation.note.unwrap_or_default(),
+                match annotation.geometry {
+                    AnnotationGeometry::Point { .. } => "point".to_string(),
+                    AnnotationGeometry::Polygon { .. } => "polygon".to_string(),
+                },
+            ])
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+    let csv_bytes = writer
+        .into_inner()
+        .map_err(|err| AppError::Anyhow(err.into_error().into()))?;
+
+    response_with_bytes(csv_bytes, "text/csv; charset=utf-8", "annotations.csv")
+}
+
+pub async fn export_scene_recommendations_csv(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let recommendations = load_scene_recommendation_records(&state, &scene_id).await?;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer
+        .write_record([
+            "recommendation_id",
+            "title",
+            "category",
+            "priority",
+            "status",
+            "annotation_ids",
+            "note",
+        ])
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    for recommendation in recommendations {
+        writer
+            .write_record([
+                recommendation.recommendation_id,
+                recommendation.title,
+                recommendation.category.unwrap_or_default(),
+                recommendation_priority_str(recommendation.priority).to_string(),
+                recommendation_status_str(recommendation.status).to_string(),
+                recommendation.annotation_ids.join("|"),
+                recommendation.note.unwrap_or_default(),
+            ])
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+    let csv_bytes = writer
+        .into_inner()
+        .map_err(|err| AppError::Anyhow(err.into_error().into()))?;
+
+    response_with_bytes(csv_bytes, "text/csv; charset=utf-8", "recommendations.csv")
+}
+
+pub async fn export_scene_annotations_geojson(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<GeoJson>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let annotations = load_scene_annotation_records(&state, &scene_id).await?;
+    Ok(Json(GeoJson::FeatureCollection(FeatureCollection {
+        bbox: None,
+        foreign_members: None,
+        features: annotations
+            .iter()
+            .map(feature_from_annotation)
+            .collect::<AppResult<Vec<_>>>()?,
+    })))
+}
+
+pub async fn export_scene_recommendations_geojson(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<GeoJson>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let recommendations = load_scene_recommendation_records(&state, &scene_id).await?;
+    let annotations = load_scene_annotation_records(&state, &scene_id).await?;
+    let features = recommendations
+        .iter()
+        .flat_map(|recommendation| recommendation_features(recommendation, &annotations))
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(Json(GeoJson::FeatureCollection(FeatureCollection {
+        bbox: None,
+        foreign_members: None,
+        features,
+    })))
 }
 
 pub async fn create_field(
@@ -907,6 +1318,93 @@ async fn build_annotation_record(
     })
 }
 
+async fn build_recommendation_record(
+    state: &AppState,
+    scene_id: &str,
+    request: CreateRecommendationRequest,
+) -> AppResult<RecommendationRecord> {
+    validate_recommendation_annotation_ids(state, scene_id, &request.annotation_ids).await?;
+
+    let recommendation_id = request
+        .recommendation_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    Ok(RecommendationRecord {
+        recommendation_id,
+        scene_id: scene_id.to_string(),
+        field_id: load_scene_field_id(state, scene_id).await?,
+        title: normalize_recommendation_title(request.title)?,
+        note: normalize_optional_text(request.note),
+        category: normalize_optional_text(request.category),
+        priority: request.priority.unwrap_or_default(),
+        status: request.status.unwrap_or_default(),
+        annotation_ids: request.annotation_ids,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    })
+}
+
+async fn build_scene_report(
+    state: &AppState,
+    scene_id: &str,
+    title: Option<String>,
+) -> AppResult<ReportRecord> {
+    let scene_row = sqlx::query(
+        "SELECT scene_id, sensor, acquired_at, data_path, metadata_json, field_id FROM scenes WHERE scene_id = ?1",
+    )
+    .bind(scene_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    let scene_dir = state.config.data_root.join("scenes").join(scene_id);
+    let metadata = load_scene_metadata(scene_row.as_ref(), &scene_dir).await?;
+    let field = load_scene_field(state, scene_row.as_ref()).await?;
+    let geospatial = build_geospatial_metadata(metadata.as_ref());
+    let annotations = load_scene_annotation_records(state, scene_id).await?;
+    let recommendations = load_scene_recommendation_records(state, scene_id).await?;
+    let report_id = Uuid::new_v4().to_string();
+    let report_title = title
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .unwrap_or_else(|| format!("Scene {} field intelligence report", scene_id));
+    let report_dir = state.config.data_root.join("reports").join(scene_id);
+    fs::create_dir_all(&report_dir)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let artifact_path = report_dir.join(format!("{report_id}.html"));
+    let html = render_scene_report_html(
+        scene_id,
+        scene_row.as_ref().map(|row| row.get("sensor")),
+        scene_row.as_ref().map(|row| row.get("acquired_at")),
+        metadata.as_ref(),
+        field.as_ref(),
+        &geospatial,
+        &annotations,
+        &recommendations,
+        &report_title,
+    );
+    fs::write(&artifact_path, html)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    Ok(ReportRecord {
+        report_id: report_id.clone(),
+        scene_id: scene_id.to_string(),
+        field_id: field.as_ref().map(|field| field.field_id.clone()),
+        title: report_title,
+        format: ReportFormat::Html,
+        artifact_path: artifact_path.to_string_lossy().to_string(),
+        download_url: format!("/api/scenes/{scene_id}/reports/{report_id}"),
+        annotation_count: annotations.len(),
+        recommendation_count: recommendations.len(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
 fn normalize_annotation_label(label: String) -> AppResult<String> {
     let label = label.trim().to_string();
     if label.is_empty() {
@@ -915,6 +1413,16 @@ fn normalize_annotation_label(label: String) -> AppResult<String> {
         ));
     }
     Ok(label)
+}
+
+fn normalize_recommendation_title(title: String) -> AppResult<String> {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err(AppError::BadRequest(
+            "recommendation title is required".to_string(),
+        ));
+    }
+    Ok(title)
 }
 
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
@@ -1187,6 +1695,43 @@ fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Annotati
     })
 }
 
+async fn decode_recommendation_record(
+    state: &AppState,
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<RecommendationRecord> {
+    let recommendation_id: String = row.get("recommendation_id");
+    Ok(RecommendationRecord {
+        recommendation_id: recommendation_id.clone(),
+        scene_id: row.get("scene_id"),
+        field_id: row.get("field_id"),
+        title: row.get("title"),
+        note: row.get("note"),
+        category: row.get("category"),
+        priority: parse_recommendation_priority(row.get("priority"))?,
+        status: parse_recommendation_status(row.get("status"))?,
+        annotation_ids: load_recommendation_annotation_ids(state, &recommendation_id).await?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_report_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ReportRecord> {
+    let scene_id: String = row.get("scene_id");
+    let report_id: String = row.get("report_id");
+    Ok(ReportRecord {
+        report_id: report_id.clone(),
+        scene_id: scene_id.clone(),
+        field_id: row.get("field_id"),
+        title: row.get("title"),
+        format: parse_report_format(row.get("format"))?,
+        artifact_path: row.get("path"),
+        download_url: format!("/api/scenes/{scene_id}/reports/{report_id}"),
+        annotation_count: row.get::<i64, _>("annotation_count") as usize,
+        recommendation_count: row.get::<i64, _>("recommendation_count") as usize,
+        created_at: row.get("created_at"),
+    })
+}
+
 async fn load_field(state: &AppState, field_id: &str) -> AppResult<Option<FieldRecord>> {
     let row = sqlx::query(
         "SELECT field_id, name, crop, season, notes, boundary_json FROM fields WHERE field_id = ?1",
@@ -1231,6 +1776,124 @@ async fn load_annotation(
     row.map(|row| decode_annotation_record(&row)).transpose()
 }
 
+async fn load_recommendation(
+    state: &AppState,
+    scene_id: &str,
+    recommendation_id: &str,
+) -> AppResult<Option<RecommendationRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, created_at, updated_at
+        FROM recommendations
+        WHERE scene_id = ?1 AND recommendation_id = ?2
+        "#,
+    )
+    .bind(scene_id)
+    .bind(recommendation_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    match row {
+        Some(row) => Ok(Some(decode_recommendation_record(state, &row).await?)),
+        None => Ok(None),
+    }
+}
+
+async fn load_report(
+    state: &AppState,
+    scene_id: &str,
+    report_id: &str,
+) -> AppResult<Option<ReportRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT report_id, scene_id, field_id, title, format, path, annotation_count, recommendation_count, created_at
+        FROM reports
+        WHERE scene_id = ?1 AND report_id = ?2
+        "#,
+    )
+    .bind(scene_id)
+    .bind(report_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_report_record(&row)).transpose()
+}
+
+async fn load_recommendation_annotation_ids(
+    state: &AppState,
+    recommendation_id: &str,
+) -> AppResult<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT annotation_id
+        FROM recommendation_annotations
+        WHERE recommendation_id = ?1
+        ORDER BY annotation_id ASC
+        "#,
+    )
+    .bind(recommendation_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("annotation_id"))
+        .collect())
+}
+
+async fn load_scene_annotation_records(
+    state: &AppState,
+    scene_id: &str,
+) -> AppResult<Vec<AnnotationRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT annotation_id, scene_id, field_id, label, note, severity, geometry_json, created_at, updated_at
+        FROM annotations
+        WHERE scene_id = ?1
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut annotations = Vec::with_capacity(rows.len());
+    for row in rows {
+        annotations.push(decode_annotation_record(&row)?);
+    }
+
+    Ok(annotations)
+}
+
+async fn load_scene_recommendation_records(
+    state: &AppState,
+    scene_id: &str,
+) -> AppResult<Vec<RecommendationRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, created_at, updated_at
+        FROM recommendations
+        WHERE scene_id = ?1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut recommendations = Vec::with_capacity(rows.len());
+    for row in rows {
+        recommendations.push(decode_recommendation_record(state, &row).await?);
+    }
+
+    Ok(recommendations)
+}
+
 async fn load_scene_field_id(state: &AppState, scene_id: &str) -> AppResult<Option<String>> {
     Ok(
         sqlx::query("SELECT field_id FROM scenes WHERE scene_id = ?1")
@@ -1240,6 +1903,364 @@ async fn load_scene_field_id(state: &AppState, scene_id: &str) -> AppResult<Opti
             .map_err(Error::from)?
             .and_then(|row| row.get::<Option<String>, _>("field_id")),
     )
+}
+
+async fn validate_recommendation_annotation_ids(
+    state: &AppState,
+    scene_id: &str,
+    annotation_ids: &[String],
+) -> AppResult<()> {
+    for annotation_id in annotation_ids {
+        let annotation_id = annotation_id.trim();
+        if annotation_id.is_empty() {
+            return Err(AppError::BadRequest(
+                "recommendation annotation links cannot be empty".to_string(),
+            ));
+        }
+        if load_annotation(state, scene_id, annotation_id)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::BadRequest(format!(
+                "annotation {} does not exist on this scene",
+                annotation_id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+async fn persist_recommendation_annotations(
+    state: &AppState,
+    recommendation_id: &str,
+    annotation_ids: &[String],
+) -> AppResult<()> {
+    sqlx::query("DELETE FROM recommendation_annotations WHERE recommendation_id = ?1")
+        .bind(recommendation_id)
+        .execute(&state.pool)
+        .await
+        .map_err(Error::from)?;
+
+    for annotation_id in annotation_ids {
+        sqlx::query(
+            r#"
+            INSERT INTO recommendation_annotations (recommendation_id, annotation_id)
+            VALUES (?1, ?2)
+            "#,
+        )
+        .bind(recommendation_id)
+        .bind(annotation_id)
+        .execute(&state.pool)
+        .await
+        .map_err(Error::from)?;
+    }
+
+    Ok(())
+}
+
+fn recommendation_priority_str(priority: RecommendationPriority) -> &'static str {
+    match priority {
+        RecommendationPriority::Low => "low",
+        RecommendationPriority::Medium => "medium",
+        RecommendationPriority::High => "high",
+        RecommendationPriority::Critical => "critical",
+    }
+}
+
+fn recommendation_status_str(status: RecommendationStatus) -> &'static str {
+    match status {
+        RecommendationStatus::Open => "open",
+        RecommendationStatus::Reviewed => "reviewed",
+        RecommendationStatus::Closed => "closed",
+    }
+}
+
+fn parse_recommendation_priority(value: String) -> AppResult<RecommendationPriority> {
+    match value.as_str() {
+        "low" => Ok(RecommendationPriority::Low),
+        "medium" => Ok(RecommendationPriority::Medium),
+        "high" => Ok(RecommendationPriority::High),
+        "critical" => Ok(RecommendationPriority::Critical),
+        _ => Err(AppError::Anyhow(anyhow::anyhow!(
+            "invalid recommendation priority {}",
+            value
+        ))),
+    }
+}
+
+fn parse_recommendation_status(value: String) -> AppResult<RecommendationStatus> {
+    match value.as_str() {
+        "open" => Ok(RecommendationStatus::Open),
+        "reviewed" => Ok(RecommendationStatus::Reviewed),
+        "closed" => Ok(RecommendationStatus::Closed),
+        _ => Err(AppError::Anyhow(anyhow::anyhow!(
+            "invalid recommendation status {}",
+            value
+        ))),
+    }
+}
+
+fn report_format_str(format: ReportFormat) -> &'static str {
+    match format {
+        ReportFormat::Html => "html",
+    }
+}
+
+fn parse_report_format(value: String) -> AppResult<ReportFormat> {
+    match value.as_str() {
+        "html" => Ok(ReportFormat::Html),
+        _ => Err(AppError::Anyhow(anyhow::anyhow!(
+            "invalid report format {}",
+            value
+        ))),
+    }
+}
+
+fn render_scene_report_html(
+    scene_id: &str,
+    sensor: Option<String>,
+    acquired_at: Option<String>,
+    metadata: Option<&MultispectralImage>,
+    field: Option<&FieldRecord>,
+    geospatial: &SceneGeospatialMetadata,
+    annotations: &[AnnotationRecord],
+    recommendations: &[RecommendationRecord],
+    report_title: &str,
+) -> String {
+    let field_name = field
+        .map(|field| field.name.clone())
+        .unwrap_or_else(|| "Unlinked field".to_string());
+    let map_svg = render_report_map_svg(field, geospatial, annotations, recommendations);
+    let recommendations_html = recommendations
+        .iter()
+        .map(|recommendation| {
+            format!(
+                "<li><strong>{}</strong> [{} / {}]{}{} </li>",
+                escape_html(&recommendation.title),
+                recommendation_status_str(recommendation.status),
+                recommendation_priority_str(recommendation.priority),
+                recommendation
+                    .category
+                    .as_ref()
+                    .map(|category| format!(" Category: {}.", escape_html(category)))
+                    .unwrap_or_default(),
+                recommendation
+                    .note
+                    .as_ref()
+                    .map(|note| format!(" {}", escape_html(note)))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let annotations_html = annotations
+        .iter()
+        .map(|annotation| {
+            format!(
+                "<li><strong>{}</strong>{}{} </li>",
+                escape_html(&annotation.label),
+                annotation
+                    .severity
+                    .as_ref()
+                    .map(|severity| format!(" [{}]", escape_html(severity)))
+                    .unwrap_or_default(),
+                annotation
+                    .note
+                    .as_ref()
+                    .map(|note| format!(" {}", escape_html(note)))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{title}</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #1a1f26; background: #f7f4ee; }}
+    h1, h2 {{ margin-bottom: 8px; }}
+    .meta {{ display: grid; grid-template-columns: repeat(2, minmax(240px, 1fr)); gap: 12px; margin-bottom: 24px; }}
+    .card {{ background: #ffffff; border: 1px solid #d8d0c4; border-radius: 10px; padding: 16px; }}
+    .map {{ margin: 24px 0; background: #ffffff; border: 1px solid #d8d0c4; border-radius: 10px; padding: 16px; }}
+    ul {{ padding-left: 20px; }}
+    .muted {{ color: #5b6572; }}
+  </style>
+</head>
+<body>
+  <h1>{title}</h1>
+  <p class="muted">Scene {scene_id} • Field {field_name}</p>
+  <div class="meta">
+    <div class="card"><strong>Sensor</strong><div>{sensor}</div></div>
+    <div class="card"><strong>Acquired</strong><div>{acquired_at}</div></div>
+    <div class="card"><strong>Raster</strong><div>{width} × {height} px</div></div>
+    <div class="card"><strong>Products</strong><div>{bands}</div></div>
+    <div class="card"><strong>Annotations</strong><div>{annotation_count}</div></div>
+    <div class="card"><strong>Recommendations</strong><div>{recommendation_count}</div></div>
+  </div>
+  <div class="map">
+    <h2>Field Snapshot</h2>
+    {map_svg}
+  </div>
+  <div class="card">
+    <h2>Findings</h2>
+    <ul>{annotations_html}</ul>
+  </div>
+  <div class="card" style="margin-top: 16px;">
+    <h2>Recommendations</h2>
+    <ul>{recommendations_html}</ul>
+  </div>
+</body>
+</html>"#,
+        title = escape_html(report_title),
+        scene_id = escape_html(scene_id),
+        field_name = escape_html(&field_name),
+        sensor = escape_html(sensor.as_deref().unwrap_or("unknown")),
+        acquired_at = escape_html(acquired_at.as_deref().unwrap_or("n/a")),
+        width = metadata
+            .map(|image| image.metadata.width)
+            .unwrap_or_default(),
+        height = metadata
+            .map(|image| image.metadata.height)
+            .unwrap_or_default(),
+        bands = escape_html(
+            &metadata
+                .map(|image| image.metadata.bands.join(", "))
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        annotation_count = annotations.len(),
+        recommendation_count = recommendations.len(),
+        annotations_html = annotations_html,
+        recommendations_html = recommendations_html,
+        map_svg = map_svg,
+    )
+}
+
+fn render_report_map_svg(
+    field: Option<&FieldRecord>,
+    geospatial: &SceneGeospatialMetadata,
+    annotations: &[AnnotationRecord],
+    recommendations: &[RecommendationRecord],
+) -> String {
+    let width = 820.0;
+    let height = 360.0;
+    let extent = geospatial.extent.clone().or_else(|| {
+        field.map(|field| SceneExtent {
+            min_lon: field.extent.min_lon,
+            min_lat: field.extent.min_lat,
+            max_lon: field.extent.max_lon,
+            max_lat: field.extent.max_lat,
+        })
+    });
+
+    let Some(extent) = extent else {
+        return "<div class=\"muted\">No geospatial extent available for map preview.</div>"
+            .to_string();
+    };
+
+    let mut svg = format!(
+        "<svg viewBox=\"0 0 {width} {height}\" width=\"100%\" height=\"{height}\" xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"100%\" height=\"100%\" fill=\"#f4efe5\"/>"
+    );
+
+    if let Some(field) = field {
+        let points = field
+            .boundary
+            .coordinates
+            .iter()
+            .map(|point| svg_project(point.longitude, point.latitude, &extent, width, height))
+            .map(|(x, y)| format!("{x:.1},{y:.1}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        svg.push_str(&format!(
+            "<polygon points=\"{}\" fill=\"#e4d7b5\" stroke=\"#967433\" stroke-width=\"2\"/>",
+            points
+        ));
+    }
+
+    for annotation in annotations {
+        match &annotation.geometry {
+            AnnotationGeometry::Point { coordinate } => {
+                let (x, y) = svg_project(
+                    coordinate.longitude,
+                    coordinate.latitude,
+                    &extent,
+                    width,
+                    height,
+                );
+                svg.push_str(&format!(
+                    "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"6\" fill=\"#c64242\" stroke=\"#ffffff\" stroke-width=\"2\"/>"
+                ));
+            }
+            AnnotationGeometry::Polygon { coordinates } => {
+                let points = coordinates
+                    .iter()
+                    .map(|point| {
+                        svg_project(point.longitude, point.latitude, &extent, width, height)
+                    })
+                    .map(|(x, y)| format!("{x:.1},{y:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                svg.push_str(&format!(
+                    "<polygon points=\"{}\" fill=\"rgba(198,66,66,0.2)\" stroke=\"#c64242\" stroke-width=\"2\"/>",
+                    points
+                ));
+            }
+        }
+    }
+
+    for recommendation in recommendations {
+        if recommendation.annotation_ids.is_empty() {
+            continue;
+        }
+        svg.push_str(&format!(
+            "<text x=\"16\" y=\"{}\" font-size=\"12\" fill=\"#1a1f26\">{} [{} / {}]</text>",
+            22 + (recommendations
+                .iter()
+                .position(
+                    |candidate| candidate.recommendation_id == recommendation.recommendation_id
+                )
+                .unwrap_or(0) as i32
+                * 18),
+            escape_html(&recommendation.title),
+            recommendation_status_str(recommendation.status),
+            recommendation_priority_str(recommendation.priority),
+        ));
+    }
+
+    svg.push_str("</svg>");
+    svg
+}
+
+fn svg_project(
+    longitude: f64,
+    latitude: f64,
+    extent: &SceneExtent,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    let x = if (extent.max_lon - extent.min_lon).abs() <= f64::EPSILON {
+        width / 2.0
+    } else {
+        ((longitude - extent.min_lon) / (extent.max_lon - extent.min_lon)) * width
+    };
+    let y = if (extent.max_lat - extent.min_lat).abs() <= f64::EPSILON {
+        height / 2.0
+    } else {
+        (1.0 - ((latitude - extent.min_lat) / (extent.max_lat - extent.min_lat))) * height
+    };
+    (x.clamp(0.0, width), y.clamp(0.0, height))
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn scene_exists(state: &AppState, scene_id: &str) -> AppResult<bool> {

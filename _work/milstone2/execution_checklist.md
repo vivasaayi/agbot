@@ -71,13 +71,13 @@ This is the main technical gap before the GIS stack is credible for large scenes
 39. `[x]` Add tile cache invalidation rules for regenerated products
 40. `[x]` Add tile endpoint error-path tests in `geo_hub`
 41. `[x]` Add `geo_viewer` tile source abstraction
-42. `[ ]` Replace single full-image sprite fetch with single-zoom tile rendering
-43. `[ ]` Add visible tile grid calculation from camera extent
-44. `[ ]` Add tile loading and unloading as the camera moves
-45. `[ ]` Add tile request deduplication in `geo_viewer`
-46. `[ ]` Add tile placeholder and missing-tile fallback behavior
-47. `[ ]` Add tile rendering smoke checks or deterministic viewer-side tests
-48. `[ ]` Verify raster alignment between tiles, field boundaries, and annotations
+42. `[x]` Replace single full-image sprite fetch with single-zoom tile rendering
+43. `[x]` Add visible tile grid calculation from camera extent
+44. `[x]` Add tile loading and unloading as the camera moves
+45. `[x]` Add tile request deduplication in `geo_viewer`
+46. `[x]` Add tile placeholder and missing-tile fallback behavior
+47. `[x]` Add tile rendering smoke checks or deterministic viewer-side tests
+48. `[x]` Verify raster alignment between tiles, field boundaries, and annotations
 
 Exit criteria for Phase 2:
 - Viewer loads a scene as map tiles, not one full raster texture.
@@ -87,19 +87,19 @@ Exit criteria for Phase 2:
 
 This is what turns the platform from a GIS viewer into an agronomy workflow tool.
 
-49. `[ ]` Add `Recommendation` contract in `shared`
-50. `[ ]` Add recommendation storage in `geo_hub`
-51. `[ ]` Add recommendation CRUD APIs in `geo_hub`
-52. `[ ]` Link recommendations to field, scene, and one or more annotations
-53. `[ ]` Add recommendation status model: `open`, `reviewed`, `closed`
-54. `[ ]` Add recommendation priority model
-55. `[ ]` Add recommendation type/category model
-56. `[ ]` Add integration tests for recommendation CRUD and annotation linkage
-57. `[ ]` Add recommendation list and detail panel in `geo_viewer`
-58. `[ ]` Add “create recommendation from selected annotation” flow in `geo_viewer`
-59. `[ ]` Add recommendation update/close actions in `geo_viewer`
-60. `[ ]` Add recommendation filtering by status and priority
-61. `[ ]` Add recommendation summary on scene view and field view
+49. `[x]` Add `Recommendation` contract in `shared`
+50. `[x]` Add recommendation storage in `geo_hub`
+51. `[x]` Add recommendation CRUD APIs in `geo_hub`
+52. `[x]` Link recommendations to field, scene, and one or more annotations
+53. `[x]` Add recommendation status model: `open`, `reviewed`, `closed`
+54. `[x]` Add recommendation priority model
+55. `[x]` Add recommendation type/category model
+56. `[x]` Add integration tests for recommendation CRUD and annotation linkage
+57. `[x]` Add recommendation list and detail panel in `geo_viewer`
+58. `[x]` Add “create recommendation from selected annotation” flow in `geo_viewer`
+59. `[x]` Add recommendation update/close actions in `geo_viewer`
+60. `[x]` Add recommendation filtering by status and priority
+61. `[x]` Add recommendation summary on scene view and field view
 
 Exit criteria for Phase 3:
 - Advisor can move from finding to recommendation in one workflow.
@@ -108,18 +108,18 @@ Exit criteria for Phase 3:
 
 This is the first directly sellable output.
 
-62. `[ ]` Add report metadata contract in `shared`
-63. `[ ]` Add report artifact storage model in backend
-64. `[ ]` Decide first report generation path: HTML-to-PDF or direct PDF library
-65. `[ ]` Build report data assembly pipeline from field, scene, annotations, recommendations
-66. `[ ]` Add report generation endpoint in backend
-67. `[ ]` Add report listing endpoint in backend
-68. `[ ]` Add report download endpoint in backend
-69. `[ ]` Add report integration tests for real generated artifact metadata
-70. `[ ]` Add report template with field summary, scene metadata, findings, recommendations
-71. `[ ]` Add map snapshot or rendered map image into the report
-72. `[ ]` Add “generate report” action in `geo_viewer`
-73. `[ ]` Add report history panel in `geo_viewer`
+62. `[x]` Add report metadata contract in `shared`
+63. `[x]` Add report artifact storage model in backend
+64. `[x]` Decide first report generation path: HTML-to-PDF or direct PDF library
+65. `[x]` Build report data assembly pipeline from field, scene, annotations, recommendations
+66. `[x]` Add report generation endpoint in backend
+67. `[x]` Add report listing endpoint in backend
+68. `[x]` Add report download endpoint in backend
+69. `[x]` Add report integration tests for real generated artifact metadata
+70. `[x]` Add report template with field summary, scene metadata, findings, recommendations
+71. `[x]` Add map snapshot or rendered map image into the report
+72. `[x]` Add “generate report” action in `geo_viewer`
+73. `[x]` Add report history panel in `geo_viewer`
 74. `[ ]` Add CSV export for annotations and recommendations
 75. `[ ]` Add GeoJSON export for annotations and recommendations
 

@@ -5,18 +5,28 @@ use crate::plugins::annotations::{
     start_annotation_delete, start_annotation_fetch, start_annotation_update,
 };
 use crate::plugins::network::{
-    clear_loaded_tile, clear_manifest_state, start_field_list_fetch, start_field_scenes_fetch,
-    start_manifest_fetch, start_tile_fetch,
+    clear_loaded_tiles, clear_manifest_state, start_field_list_fetch, start_field_scenes_fetch,
+    start_manifest_fetch,
 };
+use crate::plugins::recommendations::{
+    clear_recommendation_draft, clear_recommendations, load_recommendation_into_draft,
+    recommendation_matches_filters, seed_recommendation_from_annotation, selected_recommendation,
+    start_recommendation_create, start_recommendation_delete, start_recommendation_fetch,
+    start_recommendation_update,
+};
+use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
     AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask, AnnotationOverlayState,
     AnnotationUpdateTask, CursorMapState, DraftMode, FieldCatalogState, FieldListFetchTask,
-    FieldScenesFetchTask, ManifestFetchTask, MapViewState, SceneManifestState, TileConfig,
-    TileFetchTask, TileRenderState, TileStatus, ViewerState,
+    FieldScenesFetchTask, ManifestFetchTask, MapViewState, RecommendationCreateTask,
+    RecommendationDeleteTask, RecommendationFetchTask, RecommendationOverlayState,
+    RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask, ReportOverlayState,
+    SceneManifestState, TileConfig, TileFetchTasks, TileRenderState, TileStatus, ViewerState,
 };
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
+use shared::schemas::{RecommendationPriority, RecommendationStatus};
 
 pub struct ViewerUiPlugin;
 
@@ -40,7 +50,7 @@ struct SceneUiState<'w, 's> {
     manifest_state: ResMut<'w, SceneManifestState>,
     manifest_task: ResMut<'w, ManifestFetchTask>,
     tile_state: ResMut<'w, TileRenderState>,
-    fetch_task: ResMut<'w, TileFetchTask>,
+    fetch_tasks: ResMut<'w, TileFetchTasks>,
     map_view: ResMut<'w, MapViewState>,
     #[system_param(ignore)]
     marker: std::marker::PhantomData<&'s ()>,
@@ -57,6 +67,26 @@ struct AnnotationUiState<'w, 's> {
     marker: std::marker::PhantomData<&'s ()>,
 }
 
+#[derive(SystemParam)]
+struct RecommendationUiState<'w, 's> {
+    recommendations: ResMut<'w, RecommendationOverlayState>,
+    recommendation_fetch_task: ResMut<'w, RecommendationFetchTask>,
+    recommendation_create_task: ResMut<'w, RecommendationCreateTask>,
+    recommendation_update_task: ResMut<'w, RecommendationUpdateTask>,
+    recommendation_delete_task: ResMut<'w, RecommendationDeleteTask>,
+    #[system_param(ignore)]
+    marker: std::marker::PhantomData<&'s ()>,
+}
+
+#[derive(SystemParam)]
+struct ReportUiState<'w, 's> {
+    reports: ResMut<'w, ReportOverlayState>,
+    report_fetch_task: ResMut<'w, ReportFetchTask>,
+    report_generate_task: ResMut<'w, ReportGenerateTask>,
+    #[system_param(ignore)]
+    marker: std::marker::PhantomData<&'s ()>,
+}
+
 fn render_ui(
     mut commands: Commands,
     mut contexts: EguiContexts,
@@ -66,6 +96,8 @@ fn render_ui(
     mut scene_ui: SceneUiState,
     cursor_map: Res<CursorMapState>,
     mut annotation_ui: AnnotationUiState,
+    mut recommendation_ui: RecommendationUiState,
+    mut report_ui: ReportUiState,
 ) {
     let field_catalog = &mut catalog_ui.field_catalog;
     let field_list_task = &mut catalog_ui.field_list_task;
@@ -73,13 +105,21 @@ fn render_ui(
     let manifest_state = &mut scene_ui.manifest_state;
     let manifest_task = &mut scene_ui.manifest_task;
     let tile_state = &mut scene_ui.tile_state;
-    let fetch_task = &mut scene_ui.fetch_task;
+    let fetch_tasks = &mut scene_ui.fetch_tasks;
     let map_view = &mut scene_ui.map_view;
     let annotations = &mut annotation_ui.annotations;
     let annotation_fetch_task = &mut annotation_ui.annotation_fetch_task;
     let annotation_create_task = &mut annotation_ui.annotation_create_task;
     let annotation_update_task = &mut annotation_ui.annotation_update_task;
     let annotation_delete_task = &mut annotation_ui.annotation_delete_task;
+    let recommendations = &mut recommendation_ui.recommendations;
+    let recommendation_fetch_task = &mut recommendation_ui.recommendation_fetch_task;
+    let recommendation_create_task = &mut recommendation_ui.recommendation_create_task;
+    let recommendation_update_task = &mut recommendation_ui.recommendation_update_task;
+    let recommendation_delete_task = &mut recommendation_ui.recommendation_delete_task;
+    let reports = &mut report_ui.reports;
+    let report_fetch_task = &mut report_ui.report_fetch_task;
+    let report_generate_task = &mut report_ui.report_generate_task;
 
     egui::SidePanel::left("layers_panel").show(contexts.ctx_mut(), |ui| {
         render_fields_panel(
@@ -92,13 +132,21 @@ fn render_ui(
             manifest_state,
             manifest_task,
             tile_state,
-            fetch_task,
+            fetch_tasks,
             map_view,
             annotations,
             annotation_fetch_task,
             annotation_create_task,
             annotation_update_task,
             annotation_delete_task,
+            recommendations,
+            recommendation_fetch_task,
+            recommendation_create_task,
+            recommendation_update_task,
+            recommendation_delete_task,
+            reports,
+            report_fetch_task,
+            report_generate_task,
             &mut commands,
         );
 
@@ -107,7 +155,8 @@ fn render_ui(
             manifest_state,
             &mut viewer_state,
             &mut config,
-            fetch_task,
+            &mut commands,
+            fetch_tasks,
             tile_state,
         );
         render_scene_panel(
@@ -118,13 +167,21 @@ fn render_ui(
             manifest_state,
             manifest_task,
             tile_state,
-            fetch_task,
+            fetch_tasks,
             map_view,
             annotations,
             annotation_fetch_task,
             annotation_create_task,
             annotation_update_task,
             annotation_delete_task,
+            recommendations,
+            recommendation_fetch_task,
+            recommendation_create_task,
+            recommendation_update_task,
+            recommendation_delete_task,
+            reports,
+            report_fetch_task,
+            report_generate_task,
             &mut commands,
         );
         render_view_panel(ui, &mut viewer_state, map_view);
@@ -139,6 +196,25 @@ fn render_ui(
             annotation_delete_task,
             tile_state,
         );
+        render_recommendations_panel(
+            ui,
+            &config,
+            annotations,
+            recommendations,
+            recommendation_fetch_task,
+            recommendation_create_task,
+            recommendation_update_task,
+            recommendation_delete_task,
+            tile_state,
+        );
+        render_reports_panel(
+            ui,
+            &config,
+            reports,
+            report_fetch_task,
+            report_generate_task,
+            tile_state,
+        );
     });
 
     render_status_bar(
@@ -149,6 +225,7 @@ fn render_ui(
         tile_state,
         &cursor_map,
         annotations,
+        recommendations,
     );
 }
 
@@ -163,13 +240,21 @@ fn render_fields_panel(
     manifest_state: &mut SceneManifestState,
     manifest_task: &mut ManifestFetchTask,
     tile_state: &mut TileRenderState,
-    fetch_task: &mut TileFetchTask,
+    fetch_tasks: &mut TileFetchTasks,
     map_view: &mut MapViewState,
     annotations: &mut AnnotationOverlayState,
     annotation_fetch_task: &mut AnnotationFetchTask,
     annotation_create_task: &mut AnnotationCreateTask,
     annotation_update_task: &mut AnnotationUpdateTask,
     annotation_delete_task: &mut AnnotationDeleteTask,
+    recommendations: &mut RecommendationOverlayState,
+    recommendation_fetch_task: &mut RecommendationFetchTask,
+    recommendation_create_task: &mut RecommendationCreateTask,
+    recommendation_update_task: &mut RecommendationUpdateTask,
+    recommendation_delete_task: &mut RecommendationDeleteTask,
+    reports: &mut ReportOverlayState,
+    report_fetch_task: &mut ReportFetchTask,
+    report_generate_task: &mut ReportGenerateTask,
     commands: &mut Commands,
 ) {
     ui.horizontal(|ui| {
@@ -237,7 +322,7 @@ fn render_fields_panel(
                 config.scene_id = Some(scene.scene_id.clone());
                 viewer_state.selected_layer = 0;
                 config.product_kind = crate::state::DEFAULT_PRODUCT_KIND.to_string();
-                clear_loaded_tile(commands, tile_state);
+                clear_loaded_tiles(commands, tile_state);
                 clear_manifest_state(manifest_state);
                 clear_annotations(
                     annotations,
@@ -246,7 +331,15 @@ fn render_fields_panel(
                     annotation_update_task,
                     annotation_delete_task,
                 );
-                fetch_task.0 = None;
+                clear_recommendations(
+                    recommendations,
+                    recommendation_fetch_task,
+                    recommendation_create_task,
+                    recommendation_update_task,
+                    recommendation_delete_task,
+                );
+                clear_reports(reports, report_fetch_task, report_generate_task);
+                fetch_tasks.0.clear();
                 map_view.center = Vec2::ZERO;
                 map_view.needs_fit = true;
                 if let Err(err) = start_manifest_fetch(manifest_task, manifest_state, config) {
@@ -257,6 +350,13 @@ fn render_fields_panel(
         }
     }
     ui.add_space(8.0);
+    if field_catalog.selected_field_id.is_some() {
+        ui.small(format!(
+            "Loaded-scene recommendations for this field: {}",
+            recommendations.items.len()
+        ));
+        ui.add_space(8.0);
+    }
 }
 
 fn render_layers_panel(
@@ -264,7 +364,8 @@ fn render_layers_panel(
     manifest_state: &SceneManifestState,
     viewer_state: &mut ViewerState,
     config: &mut TileConfig,
-    fetch_task: &mut TileFetchTask,
+    commands: &mut Commands,
+    fetch_tasks: &mut TileFetchTasks,
     tile_state: &mut TileRenderState,
 ) {
     ui.heading("Layers");
@@ -282,9 +383,9 @@ fn render_layers_panel(
             let response = ui.radio_value(&mut viewer_state.selected_layer, idx, label);
             if response.changed() {
                 config.product_kind = product.kind.clone();
-                if let Err(err) = start_tile_fetch(fetch_task, tile_state, config) {
-                    tile_state.status = TileStatus::Error(err.to_string());
-                }
+                clear_loaded_tiles(commands, tile_state);
+                fetch_tasks.0.clear();
+                tile_state.status = TileStatus::Fetching;
             }
             response.on_hover_text(product.url_path.clone());
         }
@@ -301,16 +402,46 @@ fn render_scene_panel(
     manifest_state: &mut SceneManifestState,
     manifest_task: &mut ManifestFetchTask,
     tile_state: &mut TileRenderState,
-    fetch_task: &mut TileFetchTask,
+    fetch_tasks: &mut TileFetchTasks,
     map_view: &mut MapViewState,
     annotations: &mut AnnotationOverlayState,
     annotation_fetch_task: &mut AnnotationFetchTask,
     annotation_create_task: &mut AnnotationCreateTask,
     annotation_update_task: &mut AnnotationUpdateTask,
     annotation_delete_task: &mut AnnotationDeleteTask,
+    recommendations: &mut RecommendationOverlayState,
+    recommendation_fetch_task: &mut RecommendationFetchTask,
+    recommendation_create_task: &mut RecommendationCreateTask,
+    recommendation_update_task: &mut RecommendationUpdateTask,
+    recommendation_delete_task: &mut RecommendationDeleteTask,
+    reports: &mut ReportOverlayState,
+    report_fetch_task: &mut ReportFetchTask,
+    report_generate_task: &mut ReportGenerateTask,
     commands: &mut Commands,
 ) {
     ui.heading("Scene");
+    let open_recommendations = recommendations
+        .items
+        .iter()
+        .filter(|recommendation| recommendation.status == RecommendationStatus::Open)
+        .count();
+    let reviewed_recommendations = recommendations
+        .items
+        .iter()
+        .filter(|recommendation| recommendation.status == RecommendationStatus::Reviewed)
+        .count();
+    let closed_recommendations = recommendations
+        .items
+        .iter()
+        .filter(|recommendation| recommendation.status == RecommendationStatus::Closed)
+        .count();
+    ui.small(format!(
+        "Recommendations: {} total, {} open, {} reviewed, {} closed",
+        recommendations.items.len(),
+        open_recommendations,
+        reviewed_recommendations,
+        closed_recommendations
+    ));
     ui.label("Scene ID");
     let mut load_requested = false;
     let response = ui.text_edit_singleline(&mut viewer_state.scene_id_input);
@@ -331,7 +462,9 @@ fn render_scene_panel(
         field_catalog.selected_scene_id = None;
         config.product_kind = crate::state::DEFAULT_PRODUCT_KIND.to_string();
         tile_state.status = TileStatus::MissingScene;
-        clear_loaded_tile(commands, tile_state);
+        clear_loaded_tiles(commands, tile_state);
+        tile_state.image_dimensions = Vec2::ZERO;
+        tile_state.world_dimensions = Vec2::ZERO;
         clear_manifest_state(manifest_state);
         clear_annotations(
             annotations,
@@ -340,7 +473,15 @@ fn render_scene_panel(
             annotation_update_task,
             annotation_delete_task,
         );
-        fetch_task.0 = None;
+        clear_recommendations(
+            recommendations,
+            recommendation_fetch_task,
+            recommendation_create_task,
+            recommendation_update_task,
+            recommendation_delete_task,
+        );
+        clear_reports(reports, report_fetch_task, report_generate_task);
+        fetch_tasks.0.clear();
         manifest_task.0 = None;
         map_view.center = Vec2::ZERO;
         map_view.needs_fit = true;
@@ -351,7 +492,7 @@ fn render_scene_panel(
     field_catalog.selected_scene_id = Some(trimmed.clone());
     viewer_state.selected_layer = 0;
     config.product_kind = crate::state::DEFAULT_PRODUCT_KIND.to_string();
-    clear_loaded_tile(commands, tile_state);
+    clear_loaded_tiles(commands, tile_state);
     clear_annotations(
         annotations,
         annotation_fetch_task,
@@ -359,7 +500,15 @@ fn render_scene_panel(
         annotation_update_task,
         annotation_delete_task,
     );
-    fetch_task.0 = None;
+    clear_recommendations(
+        recommendations,
+        recommendation_fetch_task,
+        recommendation_create_task,
+        recommendation_update_task,
+        recommendation_delete_task,
+    );
+    clear_reports(reports, report_fetch_task, report_generate_task);
+    fetch_tasks.0.clear();
     map_view.center = Vec2::ZERO;
     map_view.needs_fit = true;
     if let Err(err) = start_manifest_fetch(manifest_task, manifest_state, config) {
@@ -640,6 +789,369 @@ fn render_annotations_panel(
         });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_recommendations_panel(
+    ui: &mut egui::Ui,
+    config: &TileConfig,
+    annotations: &AnnotationOverlayState,
+    recommendations: &mut RecommendationOverlayState,
+    recommendation_fetch_task: &mut RecommendationFetchTask,
+    recommendation_create_task: &mut RecommendationCreateTask,
+    recommendation_update_task: &mut RecommendationUpdateTask,
+    recommendation_delete_task: &mut RecommendationDeleteTask,
+    tile_state: &mut TileRenderState,
+) {
+    ui.add_space(8.0);
+    ui.heading("Recommendations");
+    ui.horizontal(|ui| {
+        ui.label(format!("Count: {}", recommendations.items.len()));
+        if ui.button("Refresh").clicked() {
+            if let Err(err) = start_recommendation_fetch(recommendation_fetch_task, config) {
+                tile_state.status = TileStatus::Error(err.to_string());
+            }
+        }
+    });
+
+    ui.collapsing("Filters", |ui| {
+        ui.label("Status");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut recommendations.status_filter, None, "All");
+            ui.selectable_value(
+                &mut recommendations.status_filter,
+                Some(RecommendationStatus::Open),
+                "Open",
+            );
+            ui.selectable_value(
+                &mut recommendations.status_filter,
+                Some(RecommendationStatus::Reviewed),
+                "Reviewed",
+            );
+            ui.selectable_value(
+                &mut recommendations.status_filter,
+                Some(RecommendationStatus::Closed),
+                "Closed",
+            );
+        });
+        ui.label("Priority");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut recommendations.priority_filter, None, "All");
+            ui.selectable_value(
+                &mut recommendations.priority_filter,
+                Some(RecommendationPriority::Critical),
+                "Critical",
+            );
+            ui.selectable_value(
+                &mut recommendations.priority_filter,
+                Some(RecommendationPriority::High),
+                "High",
+            );
+            ui.selectable_value(
+                &mut recommendations.priority_filter,
+                Some(RecommendationPriority::Medium),
+                "Medium",
+            );
+            ui.selectable_value(
+                &mut recommendations.priority_filter,
+                Some(RecommendationPriority::Low),
+                "Low",
+            );
+        });
+    });
+
+    ui.label("Title");
+    ui.text_edit_singleline(&mut recommendations.draft_title);
+    ui.label("Category");
+    ui.text_edit_singleline(&mut recommendations.draft_category);
+    ui.label("Note");
+    ui.text_edit_multiline(&mut recommendations.draft_note);
+    ui.horizontal(|ui| {
+        ui.label("Priority");
+        egui::ComboBox::from_id_source("recommendation_priority")
+            .selected_text(priority_label(recommendations.draft_priority))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut recommendations.draft_priority,
+                    RecommendationPriority::Critical,
+                    "Critical",
+                );
+                ui.selectable_value(
+                    &mut recommendations.draft_priority,
+                    RecommendationPriority::High,
+                    "High",
+                );
+                ui.selectable_value(
+                    &mut recommendations.draft_priority,
+                    RecommendationPriority::Medium,
+                    "Medium",
+                );
+                ui.selectable_value(
+                    &mut recommendations.draft_priority,
+                    RecommendationPriority::Low,
+                    "Low",
+                );
+            });
+    });
+    ui.horizontal(|ui| {
+        ui.label("Status");
+        egui::ComboBox::from_id_source("recommendation_status")
+            .selected_text(status_label(recommendations.draft_status))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut recommendations.draft_status,
+                    RecommendationStatus::Open,
+                    "Open",
+                );
+                ui.selectable_value(
+                    &mut recommendations.draft_status,
+                    RecommendationStatus::Reviewed,
+                    "Reviewed",
+                );
+                ui.selectable_value(
+                    &mut recommendations.draft_status,
+                    RecommendationStatus::Closed,
+                    "Closed",
+                );
+            });
+    });
+
+    let selected_annotation =
+        annotations
+            .selected_annotation_id
+            .as_ref()
+            .and_then(|annotation_id| {
+                annotations
+                    .items
+                    .iter()
+                    .find(|annotation| annotation.annotation_id == *annotation_id)
+            });
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                config.scene_id.is_some() && selected_annotation.is_some(),
+                egui::Button::new("Link Selected Annotation"),
+            )
+            .clicked()
+        {
+            if let Some(annotation) = selected_annotation {
+                seed_recommendation_from_annotation(
+                    recommendations,
+                    &annotation.annotation_id,
+                    &annotation.label,
+                );
+            }
+        }
+        if ui.button("Clear Draft").clicked() {
+            clear_recommendation_draft(recommendations);
+        }
+    });
+    if recommendations.linked_annotation_ids.is_empty() {
+        ui.small("No linked annotations");
+    } else {
+        ui.small(format!(
+            "Linked annotations: {}",
+            recommendations.linked_annotation_ids.join(", ")
+        ));
+    }
+
+    let create_enabled =
+        config.scene_id.is_some() && !recommendations.draft_title.trim().is_empty();
+    if ui
+        .add_enabled(
+            create_enabled && recommendations.selected_recommendation_id.is_none(),
+            egui::Button::new("Create Recommendation"),
+        )
+        .clicked()
+    {
+        if let Err(err) = start_recommendation_create(
+            recommendation_create_task,
+            config,
+            recommendations.draft_title.clone(),
+            recommendations.draft_note.clone(),
+            recommendations.draft_category.clone(),
+            recommendations.draft_priority,
+            recommendations.draft_status,
+            recommendations.linked_annotation_ids.clone(),
+        ) {
+            tile_state.status = TileStatus::Error(err.to_string());
+        }
+    }
+
+    let update_enabled =
+        config.scene_id.is_some() && recommendations.selected_recommendation_id.is_some();
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(update_enabled, egui::Button::new("Update Selected"))
+            .clicked()
+        {
+            if let Some(recommendation_id) = recommendations.selected_recommendation_id.clone() {
+                if let Err(err) = start_recommendation_update(
+                    recommendation_update_task,
+                    config,
+                    &recommendation_id,
+                    recommendations.draft_title.clone(),
+                    recommendations.draft_note.clone(),
+                    recommendations.draft_category.clone(),
+                    recommendations.draft_priority,
+                    recommendations.draft_status,
+                    recommendations.linked_annotation_ids.clone(),
+                ) {
+                    tile_state.status = TileStatus::Error(err.to_string());
+                }
+            }
+        }
+        if ui
+            .add_enabled(update_enabled, egui::Button::new("Close Selected"))
+            .clicked()
+        {
+            if let Some(recommendation_id) = recommendations.selected_recommendation_id.clone() {
+                if let Err(err) = start_recommendation_update(
+                    recommendation_update_task,
+                    config,
+                    &recommendation_id,
+                    recommendations.draft_title.clone(),
+                    recommendations.draft_note.clone(),
+                    recommendations.draft_category.clone(),
+                    recommendations.draft_priority,
+                    RecommendationStatus::Closed,
+                    recommendations.linked_annotation_ids.clone(),
+                ) {
+                    tile_state.status = TileStatus::Error(err.to_string());
+                }
+            }
+        }
+        if ui
+            .add_enabled(update_enabled, egui::Button::new("Delete Selected"))
+            .clicked()
+        {
+            if let Some(recommendation_id) = recommendations.selected_recommendation_id.clone() {
+                if let Err(err) = start_recommendation_delete(
+                    recommendation_delete_task,
+                    config,
+                    &recommendation_id,
+                ) {
+                    tile_state.status = TileStatus::Error(err.to_string());
+                }
+            }
+        }
+    });
+
+    if let Some(selected) = selected_recommendation(recommendations) {
+        ui.separator();
+        ui.heading("Selected Recommendation");
+        ui.small(format!("ID: {}", selected.recommendation_id));
+        ui.small(format!("Priority: {}", priority_label(selected.priority)));
+        ui.small(format!("Status: {}", status_label(selected.status)));
+        if let Some(category) = selected.category.as_deref() {
+            ui.small(format!("Category: {}", category));
+        }
+        if let Some(note) = selected.note.as_deref() {
+            ui.small(format!("Note: {}", note));
+        }
+        ui.small(format!(
+            "Linked annotations: {}",
+            if selected.annotation_ids.is_empty() {
+                "none".to_string()
+            } else {
+                selected.annotation_ids.join(", ")
+            }
+        ));
+    }
+
+    ui.separator();
+    let filtered_recommendations: Vec<_> = recommendations
+        .items
+        .iter()
+        .filter(|recommendation| recommendation_matches_filters(recommendation, recommendations))
+        .cloned()
+        .collect();
+    if filtered_recommendations.is_empty() {
+        ui.label("No recommendations for this scene");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(220.0)
+        .show(ui, |ui| {
+            for recommendation in &filtered_recommendations {
+                let selected = recommendations.selected_recommendation_id.as_deref()
+                    == Some(recommendation.recommendation_id.as_str());
+                let response = ui.selectable_label(
+                    selected,
+                    format!(
+                        "{} [{} / {}]",
+                        recommendation.title,
+                        status_label(recommendation.status),
+                        priority_label(recommendation.priority)
+                    ),
+                );
+                if response.clicked() {
+                    recommendations.selected_recommendation_id =
+                        Some(recommendation.recommendation_id.clone());
+                    load_recommendation_into_draft(recommendations, recommendation);
+                }
+                if let Some(note) = recommendation.note.as_deref() {
+                    ui.small(note);
+                }
+                ui.small(recommendation.created_at.as_str());
+                ui.separator();
+            }
+        });
+}
+
+fn render_reports_panel(
+    ui: &mut egui::Ui,
+    config: &TileConfig,
+    reports: &mut ReportOverlayState,
+    report_fetch_task: &mut ReportFetchTask,
+    report_generate_task: &mut ReportGenerateTask,
+    tile_state: &mut TileRenderState,
+) {
+    ui.add_space(8.0);
+    ui.heading("Reports");
+    ui.horizontal(|ui| {
+        ui.label(format!("Generated: {}", reports.items.len()));
+        if ui.button("Refresh").clicked() {
+            if let Err(err) = start_report_fetch(report_fetch_task, config) {
+                tile_state.status = TileStatus::Error(err.to_string());
+            }
+        }
+    });
+    ui.label("Title");
+    ui.text_edit_singleline(&mut reports.draft_title);
+    if ui
+        .add_enabled(
+            config.scene_id.is_some() && !reports.draft_title.trim().is_empty(),
+            egui::Button::new("Generate Report"),
+        )
+        .clicked()
+    {
+        if let Err(err) =
+            start_report_generate(report_generate_task, config, reports.draft_title.clone())
+        {
+            tile_state.status = TileStatus::Error(err.to_string());
+        }
+    }
+    ui.separator();
+    if reports.items.is_empty() {
+        ui.label("No reports generated for this scene");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(180.0)
+        .show(ui, |ui| {
+            for report in &reports.items {
+                ui.label(report.title.as_str());
+                ui.small(format!(
+                    "{} • {} annotations • {} recommendations",
+                    report.created_at, report.annotation_count, report.recommendation_count
+                ));
+                ui.small(report.download_url.as_str());
+                ui.separator();
+            }
+        });
+}
+
 fn render_status_bar(
     ctx: &egui::Context,
     config: &TileConfig,
@@ -648,6 +1160,7 @@ fn render_status_bar(
     tile_state: &TileRenderState,
     cursor_map: &CursorMapState,
     annotations: &AnnotationOverlayState,
+    recommendations: &RecommendationOverlayState,
 ) {
     let status_message = tile_state.status.message();
     let dimension_text = if matches!(tile_state.status, TileStatus::Ready) {
@@ -736,6 +1249,18 @@ fn render_status_bar(
         .map(|(longitude, latitude)| format!("{:.5}, {:.5}", latitude, longitude))
         .unwrap_or_else(|| "n/a".to_string());
     let annotation_count = annotations.items.len();
+    let recommendation_count = recommendations.items.len();
+    let open_recommendations = recommendations
+        .items
+        .iter()
+        .filter(|recommendation| recommendation.status == RecommendationStatus::Open)
+        .count();
+    let tile_counts = format!(
+        "Tiles: {}/{} ready, {} missing",
+        tile_state.ready_tile_count(),
+        tile_state.visible_tiles.len(),
+        tile_state.missing_tile_count()
+    );
 
     egui::TopBottomPanel::top("status_bar").show(ctx, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -773,6 +1298,13 @@ fn render_status_bar(
             ui.separator();
             ui.label(format!("Annotations: {}", annotation_count));
             ui.separator();
+            ui.label(format!(
+                "Recommendations: {} ({} open)",
+                recommendation_count, open_recommendations
+            ));
+            ui.separator();
+            ui.label(tile_counts);
+            ui.separator();
             ui.label(status_message);
             if !dimension_text.is_empty() {
                 ui.separator();
@@ -780,4 +1312,21 @@ fn render_status_bar(
             }
         });
     });
+}
+
+fn priority_label(priority: RecommendationPriority) -> &'static str {
+    match priority {
+        RecommendationPriority::Critical => "Critical",
+        RecommendationPriority::High => "High",
+        RecommendationPriority::Medium => "Medium",
+        RecommendationPriority::Low => "Low",
+    }
+}
+
+fn status_label(status: RecommendationStatus) -> &'static str {
+    match status {
+        RecommendationStatus::Open => "Open",
+        RecommendationStatus::Reviewed => "Reviewed",
+        RecommendationStatus::Closed => "Closed",
+    }
 }

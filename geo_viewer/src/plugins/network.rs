@@ -1,12 +1,20 @@
 use crate::plugins::annotations::{clear_annotation_draft_geometry, start_annotation_fetch};
-use crate::plugins::map::extent_world_size;
+use crate::plugins::map::{
+    extent_world_size, tile_center_world, tile_world_size, visible_tiles_for_view,
+};
+use crate::plugins::recommendations::{clear_recommendations, start_recommendation_fetch};
+use crate::plugins::reports::{clear_reports, start_report_fetch};
 use crate::state::{
     AnnotationFetchTask, AnnotationOverlayState, FetchedTile, FieldCatalogState,
-    FieldListFetchTask, FieldSceneSummary, FieldScenesFetchTask, ManifestFetchTask, MapViewState,
-    SceneManifest, SceneManifestState, TileConfig, TileDisplay, TileFetchTask, TileId,
-    TileRenderState, TileStatus, ViewerState, DEFAULT_TILE_ZOOM,
+    FieldListFetchTask, FieldSceneSummary, FieldScenesFetchTask, ManifestFetchTask, MapCamera,
+    MapViewState, RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
+    RecommendationOverlayState, RecommendationUpdateTask, RenderedTile, ReportFetchTask,
+    ReportGenerateTask, ReportOverlayState, SceneManifest, SceneManifestState, TileConfig,
+    TileDisplay, TileFetchTasks, TileId, TilePresence, TileRenderState, TileSource, TileStatus,
+    ViewerState, DEFAULT_TILE_ZOOM,
 };
 use anyhow::{Context, Result};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::{
     render::{
@@ -17,11 +25,47 @@ use bevy::{
     tasks::IoTaskPool,
 };
 use futures_lite::future;
-use image::{self};
+use image::{self, DynamicImage};
 use shared::schemas::FieldRecord;
 use tracing::info;
 
 pub struct ViewerNetworkPlugin;
+
+#[derive(SystemParam)]
+struct ManifestCatalogState<'w, 's> {
+    field_catalog: ResMut<'w, FieldCatalogState>,
+    field_scenes_task: ResMut<'w, FieldScenesFetchTask>,
+    #[system_param(ignore)]
+    marker: std::marker::PhantomData<&'s ()>,
+}
+
+#[derive(SystemParam)]
+struct ManifestAnnotationState<'w, 's> {
+    annotation_fetch_task: ResMut<'w, AnnotationFetchTask>,
+    annotations: ResMut<'w, AnnotationOverlayState>,
+    #[system_param(ignore)]
+    marker: std::marker::PhantomData<&'s ()>,
+}
+
+#[derive(SystemParam)]
+struct ManifestRecommendationState<'w, 's> {
+    recommendation_fetch_task: ResMut<'w, RecommendationFetchTask>,
+    recommendation_create_task: ResMut<'w, RecommendationCreateTask>,
+    recommendation_update_task: ResMut<'w, RecommendationUpdateTask>,
+    recommendation_delete_task: ResMut<'w, RecommendationDeleteTask>,
+    recommendations: ResMut<'w, RecommendationOverlayState>,
+    #[system_param(ignore)]
+    marker: std::marker::PhantomData<&'s ()>,
+}
+
+#[derive(SystemParam)]
+struct ManifestReportState<'w, 's> {
+    report_fetch_task: ResMut<'w, ReportFetchTask>,
+    report_generate_task: ResMut<'w, ReportGenerateTask>,
+    reports: ResMut<'w, ReportOverlayState>,
+    #[system_param(ignore)]
+    marker: std::marker::PhantomData<&'s ()>,
+}
 
 impl Plugin for ViewerNetworkPlugin {
     fn build(&self, app: &mut App) {
@@ -34,6 +78,10 @@ impl Plugin for ViewerNetworkPlugin {
                     poll_manifest_fetch,
                     poll_tile_fetch,
                 ),
+            )
+            .add_systems(
+                Update,
+                sync_visible_tiles.after(crate::plugins::map::sync_map_camera),
             );
     }
 }
@@ -43,8 +91,10 @@ fn bootstrap_network_state(
     mut field_list_task: ResMut<FieldListFetchTask>,
     mut manifest_task: ResMut<ManifestFetchTask>,
     mut manifest_state: ResMut<SceneManifestState>,
-    mut fetch_task: ResMut<TileFetchTask>,
+    mut tile_fetch_tasks: ResMut<TileFetchTasks>,
     mut annotation_fetch_task: ResMut<AnnotationFetchTask>,
+    mut recommendation_fetch_task: ResMut<RecommendationFetchTask>,
+    mut report_fetch_task: ResMut<ReportFetchTask>,
     mut tile_state: ResMut<TileRenderState>,
 ) {
     if let Err(err) = start_field_list_fetch(&mut field_list_task, &config) {
@@ -55,21 +105,24 @@ fn bootstrap_network_state(
         if let Err(err) = start_manifest_fetch(&mut manifest_task, &mut manifest_state, &config) {
             tile_state.status = TileStatus::Error(err.to_string());
         }
-        fetch_task.0 = None;
+        tile_fetch_tasks.0.clear();
         annotation_fetch_task.0 = None;
+        recommendation_fetch_task.0 = None;
+        report_fetch_task.0 = None;
     }
 }
 
-pub fn poll_manifest_fetch(
+fn poll_manifest_fetch(
+    mut commands: Commands,
     mut manifest_task: ResMut<ManifestFetchTask>,
     mut manifest_state: ResMut<SceneManifestState>,
     mut config: ResMut<TileConfig>,
     mut viewer_state: ResMut<ViewerState>,
-    mut field_catalog: ResMut<FieldCatalogState>,
-    mut field_scenes_task: ResMut<FieldScenesFetchTask>,
-    mut fetch_task: ResMut<TileFetchTask>,
-    mut annotation_fetch_task: ResMut<AnnotationFetchTask>,
-    mut annotations: ResMut<AnnotationOverlayState>,
+    mut catalog_state: ManifestCatalogState,
+    mut tile_fetch_tasks: ResMut<TileFetchTasks>,
+    mut annotation_state: ManifestAnnotationState,
+    mut recommendation_state: ManifestRecommendationState,
+    mut report_state: ManifestReportState,
     mut tile_state: ResMut<TileRenderState>,
     mut map_view: ResMut<MapViewState>,
 ) {
@@ -91,24 +144,28 @@ pub fn poll_manifest_fetch(
                     manifest_state.field = linked_field.clone();
                     manifest_state.geospatial = manifest.geospatial;
                     manifest_state.products = products;
-                    field_catalog.selected_scene_id = Some(scene_id);
+                    catalog_state.field_catalog.selected_scene_id = Some(scene_id);
                     if let Some(field) = linked_field {
                         let field_changed =
-                            field_catalog.selected_field_id.as_deref() != Some(&field.field_id);
-                        field_catalog.selected_field_id = Some(field.field_id.clone());
-                        if !field_catalog
+                            catalog_state.field_catalog.selected_field_id.as_deref()
+                                != Some(&field.field_id);
+                        catalog_state.field_catalog.selected_field_id =
+                            Some(field.field_id.clone());
+                        if !catalog_state
+                            .field_catalog
                             .fields
                             .iter()
                             .any(|known| known.field_id == field.field_id)
                         {
-                            field_catalog.fields.push(field.clone());
-                            field_catalog
+                            catalog_state.field_catalog.fields.push(field.clone());
+                            catalog_state
+                                .field_catalog
                                 .fields
                                 .sort_by(|left, right| left.name.cmp(&right.name));
                         }
                         if field_changed {
                             if let Err(err) = start_field_scenes_fetch(
-                                &mut field_scenes_task,
+                                &mut catalog_state.field_scenes_task,
                                 &config,
                                 &field.field_id,
                             ) {
@@ -132,14 +189,55 @@ pub fn poll_manifest_fetch(
                     config.product_kind = manifest_state.products[selected_idx].kind.clone();
                     map_view.center = Vec2::ZERO;
                     map_view.needs_fit = true;
-                    annotations.items.clear();
-                    annotations.selected_annotation_id = None;
-                    clear_annotation_draft_geometry(&mut annotations);
+                    annotation_state.annotations.items.clear();
+                    annotation_state.annotations.selected_annotation_id = None;
+                    clear_annotation_draft_geometry(&mut annotation_state.annotations);
+                    clear_recommendations(
+                        &mut recommendation_state.recommendations,
+                        &mut recommendation_state.recommendation_fetch_task,
+                        &mut recommendation_state.recommendation_create_task,
+                        &mut recommendation_state.recommendation_update_task,
+                        &mut recommendation_state.recommendation_delete_task,
+                    );
+                    clear_reports(
+                        &mut report_state.reports,
+                        &mut report_state.report_fetch_task,
+                        &mut report_state.report_generate_task,
+                    );
 
-                    if let Err(err) = start_tile_fetch(&mut fetch_task, &mut tile_state, &config) {
+                    clear_loaded_tiles(&mut commands, &mut tile_state);
+                    tile_fetch_tasks.0.clear();
+                    tile_state.current_zoom = DEFAULT_TILE_ZOOM;
+                    tile_state.image_dimensions = Vec2::new(
+                        manifest_state.width.unwrap_or_default() as f32,
+                        manifest_state.height.unwrap_or_default() as f32,
+                    );
+                    tile_state.world_dimensions = manifest_state
+                        .geospatial
+                        .extent
+                        .as_ref()
+                        .map(extent_world_size)
+                        .or_else(|| {
+                            (manifest_state.width.zip(manifest_state.height))
+                                .map(|(width, height)| Vec2::new(width as f32, height as f32))
+                        })
+                        .unwrap_or(Vec2::ZERO);
+                    tile_state.status = TileStatus::Fetching;
+
+                    if let Err(err) =
+                        start_annotation_fetch(&mut annotation_state.annotation_fetch_task, &config)
+                    {
                         tile_state.status = TileStatus::Error(err.to_string());
                     }
-                    if let Err(err) = start_annotation_fetch(&mut annotation_fetch_task, &config) {
+                    if let Err(err) = start_recommendation_fetch(
+                        &mut recommendation_state.recommendation_fetch_task,
+                        &config,
+                    ) {
+                        tile_state.status = TileStatus::Error(err.to_string());
+                    }
+                    if let Err(err) =
+                        start_report_fetch(&mut report_state.report_fetch_task, &config)
+                    {
                         tile_state.status = TileStatus::Error(err.to_string());
                     }
                 }
@@ -155,9 +253,25 @@ pub fn poll_manifest_fetch(
                     manifest_state.field = None;
                     manifest_state.geospatial = Default::default();
                     manifest_state.products.clear();
-                    annotations.items.clear();
-                    annotations.selected_annotation_id = None;
-                    clear_annotation_draft_geometry(&mut annotations);
+                    annotation_state.annotations.items.clear();
+                    annotation_state.annotations.selected_annotation_id = None;
+                    clear_annotation_draft_geometry(&mut annotation_state.annotations);
+                    clear_recommendations(
+                        &mut recommendation_state.recommendations,
+                        &mut recommendation_state.recommendation_fetch_task,
+                        &mut recommendation_state.recommendation_create_task,
+                        &mut recommendation_state.recommendation_update_task,
+                        &mut recommendation_state.recommendation_delete_task,
+                    );
+                    clear_reports(
+                        &mut report_state.reports,
+                        &mut report_state.report_fetch_task,
+                        &mut report_state.report_generate_task,
+                    );
+                    clear_loaded_tiles(&mut commands, &mut tile_state);
+                    tile_fetch_tasks.0.clear();
+                    tile_state.image_dimensions = Vec2::ZERO;
+                    tile_state.world_dimensions = Vec2::ZERO;
                     tile_state.status = TileStatus::Error(err.to_string());
                 }
             }
@@ -226,26 +340,38 @@ pub fn poll_field_scenes_fetch(
 
 pub fn poll_tile_fetch(
     mut commands: Commands,
-    mut fetch_task: ResMut<TileFetchTask>,
+    mut tile_fetch_tasks: ResMut<TileFetchTasks>,
     mut tile_state: ResMut<TileRenderState>,
-    manifest_state: Res<SceneManifestState>,
-    mut map_view: ResMut<MapViewState>,
     mut textures: ResMut<Assets<Image>>,
 ) {
-    if let Some(mut task) = fetch_task.0.take() {
-        if let Some(result) = future::block_on(future::poll_once(&mut task)) {
+    let pending_ids: Vec<_> = tile_fetch_tasks.0.keys().copied().collect();
+    let mut completed = Vec::new();
+
+    for tile_id in pending_ids {
+        let Some(task) = tile_fetch_tasks.0.get_mut(&tile_id) else {
+            continue;
+        };
+
+        if let Some(result) = future::block_on(future::poll_once(task)) {
+            completed.push(tile_id);
             match result {
                 Ok(fetched) => {
-                    let tile_id = fetched.tile_id;
+                    let tile_size = tile_world_size(tile_state.world_dimensions, fetched.tile_id.z);
+                    let Some(rendered) = tile_state.tiles.get_mut(&fetched.tile_id) else {
+                        continue;
+                    };
+                    if fetched.missing {
+                        rendered.presence = TilePresence::Missing;
+                        commands.entity(rendered.entity).insert(Sprite {
+                            color: missing_tile_color(fetched.tile_id),
+                            custom_size: Some(tile_size),
+                            ..default()
+                        });
+                        continue;
+                    }
+
                     let rgba = fetched.image.to_rgba8();
                     let (width, height) = rgba.dimensions();
-                    let world_dimensions = manifest_state
-                        .geospatial
-                        .extent
-                        .as_ref()
-                        .map(extent_world_size)
-                        .unwrap_or_else(|| Vec2::new(width as f32, height as f32));
-
                     let mut bevy_image = Image::new(
                         Extent3d {
                             width,
@@ -262,84 +388,153 @@ pub fn poll_tile_fetch(
                     bevy_image.sampler = ImageSampler::nearest();
 
                     let handle = textures.add(bevy_image);
-
-                    if let Some(entity) = tile_state.entity.take() {
-                        commands.entity(entity).despawn_recursive();
-                    }
-
-                    let entity = commands
-                        .spawn((
-                            SpriteBundle {
-                                texture: handle.clone(),
-                                sprite: Sprite {
-                                    custom_size: Some(world_dimensions),
-                                    ..default()
-                                },
-                                transform: Transform::from_translation(Vec3::ZERO),
-                                ..default()
-                            },
-                            TileDisplay,
-                        ))
-                        .id();
-
-                    tile_state.entity = Some(entity);
-                    tile_state.handle = Some(handle);
-                    tile_state.image_dimensions = Vec2::new(width as f32, height as f32);
-                    tile_state.world_dimensions = world_dimensions;
-                    tile_state.status = TileStatus::Ready;
-                    map_view.center = Vec2::ZERO;
-                    map_view.needs_fit = true;
-                    info!(tile = %tile_id, width, height, "tile loaded");
+                    rendered.presence = TilePresence::Ready;
+                    commands.entity(rendered.entity).insert(handle);
+                    commands.entity(rendered.entity).insert(Sprite {
+                        color: Color::WHITE,
+                        custom_size: Some(tile_size),
+                        ..default()
+                    });
+                    info!(tile = %fetched.tile_id, width, height, "tile loaded");
                 }
                 Err(err) => {
                     tile_state.status = TileStatus::Error(err.to_string());
-                    fetch_task.0 = None;
                 }
             }
-        } else {
-            fetch_task.0 = Some(task);
         }
     }
+
+    for tile_id in completed {
+        tile_fetch_tasks.0.remove(&tile_id);
+    }
+
+    update_tile_status(&mut tile_state, &tile_fetch_tasks);
+}
+
+pub fn sync_visible_tiles(
+    mut commands: Commands,
+    windows: Query<&Window>,
+    camera_query: Query<(&Transform, &Projection), With<MapCamera>>,
+    config: Res<TileConfig>,
+    manifest_state: Res<SceneManifestState>,
+    mut tile_fetch_tasks: ResMut<TileFetchTasks>,
+    mut tile_state: ResMut<TileRenderState>,
+) {
+    let Some(tile_source) = active_tile_source(&manifest_state, &config) else {
+        return;
+    };
+    if tile_state.world_dimensions.x <= 0.0 || tile_state.world_dimensions.y <= 0.0 {
+        return;
+    }
+
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+    let Ok((camera_transform, projection)) = camera_query.get_single() else {
+        return;
+    };
+    let Projection::Orthographic(orthographic) = projection else {
+        return;
+    };
+
+    let desired_tiles = visible_tiles_for_view(
+        camera_transform.translation.truncate(),
+        orthographic.scale,
+        Vec2::new(window.width(), window.height()),
+        tile_state.world_dimensions,
+        tile_state.current_zoom,
+    );
+
+    let stale_tiles: Vec<_> = tile_state
+        .tiles
+        .keys()
+        .copied()
+        .filter(|tile_id| !desired_tiles.contains(tile_id))
+        .collect();
+    for tile_id in stale_tiles {
+        if let Some(rendered) = tile_state.tiles.remove(&tile_id) {
+            commands.entity(rendered.entity).despawn_recursive();
+        }
+        tile_fetch_tasks.0.remove(&tile_id);
+    }
+    tile_fetch_tasks
+        .0
+        .retain(|tile_id, _| desired_tiles.contains(tile_id));
+
+    let tile_size = tile_world_size(tile_state.world_dimensions, tile_state.current_zoom);
+    for tile_id in &desired_tiles {
+        if tile_state.tiles.contains_key(tile_id) || tile_fetch_tasks.0.contains_key(tile_id) {
+            continue;
+        }
+
+        let entity = commands
+            .spawn((
+                SpriteBundle {
+                    sprite: Sprite {
+                        color: loading_tile_color(*tile_id),
+                        custom_size: Some(tile_size),
+                        ..default()
+                    },
+                    transform: Transform::from_translation(
+                        tile_center_world(tile_state.world_dimensions, *tile_id).extend(0.0),
+                    ),
+                    ..default()
+                },
+                TileDisplay,
+            ))
+            .id();
+        tile_state.tiles.insert(
+            *tile_id,
+            RenderedTile {
+                entity,
+                presence: TilePresence::Loading,
+            },
+        );
+
+        if let Err(err) = start_tile_fetch(&mut tile_fetch_tasks, &tile_source, *tile_id) {
+            tile_state.status = TileStatus::Error(err.to_string());
+        }
+    }
+
+    tile_state.visible_tiles = desired_tiles;
+    update_tile_status(&mut tile_state, &tile_fetch_tasks);
 }
 
 pub fn start_tile_fetch(
-    fetch_task: &mut TileFetchTask,
-    tile_state: &mut TileRenderState,
-    config: &TileConfig,
+    tile_fetch_tasks: &mut TileFetchTasks,
+    tile_source: &TileSource,
+    tile_id: TileId,
 ) -> Result<()> {
-    let scene_id = match &config.scene_id {
-        Some(id) => id.clone(),
-        None => {
-            tile_state.status = TileStatus::MissingScene;
-            return Ok(());
-        }
-    };
+    if tile_fetch_tasks.0.contains_key(&tile_id) {
+        return Ok(());
+    }
 
-    let base_url = config.base_url.clone();
-    let product_kind = config.product_kind.clone();
-    let url = format!(
-        "{}/api/scenes/{}/products/{}",
-        base_url, scene_id, product_kind
+    let url = tile_source.tile_url(tile_id);
+    tile_fetch_tasks.0.insert(
+        tile_id,
+        IoTaskPool::get().spawn(async move {
+            let response =
+                reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(FetchedTile {
+                    tile_id,
+                    image: DynamicImage::new_rgba8(1, 1),
+                    missing: true,
+                });
+            }
+            if !response.status().is_success() {
+                anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
+            }
+            let bytes = response.bytes().context("failed to read response body")?;
+            let dynamic =
+                image::load_from_memory(&bytes).context("failed to decode image bytes")?;
+            Ok(FetchedTile {
+                tile_id,
+                image: dynamic,
+                missing: false,
+            })
+        }),
     );
-
-    tile_state.status = TileStatus::Fetching;
-    fetch_task.0 = Some(IoTaskPool::get().spawn(async move {
-        let response =
-            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
-        if !response.status().is_success() {
-            anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
-        }
-        let bytes = response.bytes().context("failed to read response body")?;
-        let dynamic = image::load_from_memory(&bytes).context("failed to decode image bytes")?;
-        Ok(FetchedTile {
-            tile_id: TileId {
-                z: DEFAULT_TILE_ZOOM,
-                x: 0,
-                y: 0,
-            },
-            image: dynamic,
-        })
-    }));
 
     Ok(())
 }
@@ -444,11 +639,62 @@ pub fn clear_manifest_state(manifest_state: &mut SceneManifestState) {
     manifest_state.products.clear();
 }
 
-pub fn clear_loaded_tile(commands: &mut Commands, tile_state: &mut TileRenderState) {
-    if let Some(entity) = tile_state.entity.take() {
-        commands.entity(entity).despawn_recursive();
+pub fn clear_loaded_tiles(commands: &mut Commands, tile_state: &mut TileRenderState) {
+    for rendered in tile_state.tiles.values() {
+        commands.entity(rendered.entity).despawn_recursive();
     }
-    tile_state.handle = None;
-    tile_state.image_dimensions = Vec2::ZERO;
-    tile_state.world_dimensions = Vec2::ZERO;
+    tile_state.tiles.clear();
+    tile_state.visible_tiles.clear();
+}
+
+fn active_tile_source(
+    manifest_state: &SceneManifestState,
+    config: &TileConfig,
+) -> Option<TileSource> {
+    manifest_state
+        .products
+        .iter()
+        .find(|product| product.kind == config.product_kind)
+        .map(|product| product.tile_source(&config.base_url))
+}
+
+fn update_tile_status(tile_state: &mut TileRenderState, tile_fetch_tasks: &TileFetchTasks) {
+    if matches!(
+        tile_state.status,
+        TileStatus::MissingScene | TileStatus::Error(_)
+    ) {
+        return;
+    }
+
+    if tile_state.visible_tiles.is_empty() {
+        tile_state.status = TileStatus::Idle;
+        return;
+    }
+
+    if !tile_fetch_tasks.0.is_empty()
+        || tile_state
+            .tiles
+            .values()
+            .any(|tile| tile.presence == TilePresence::Loading)
+    {
+        tile_state.status = TileStatus::Fetching;
+    } else {
+        tile_state.status = TileStatus::Ready;
+    }
+}
+
+fn loading_tile_color(tile_id: TileId) -> Color {
+    if (tile_id.x + tile_id.y).is_multiple_of(2) {
+        Color::srgba(0.22, 0.24, 0.28, 0.85)
+    } else {
+        Color::srgba(0.18, 0.20, 0.24, 0.85)
+    }
+}
+
+fn missing_tile_color(tile_id: TileId) -> Color {
+    if (tile_id.x + tile_id.y).is_multiple_of(2) {
+        Color::srgba(0.45, 0.12, 0.12, 0.85)
+    } else {
+        Color::srgba(0.35, 0.10, 0.10, 0.85)
+    }
 }

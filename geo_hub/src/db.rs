@@ -92,6 +92,57 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS recommendations (
+            recommendation_id TEXT PRIMARY KEY,
+            scene_id TEXT NOT NULL,
+            field_id TEXT,
+            title TEXT NOT NULL,
+            note TEXT,
+            category TEXT,
+            priority TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS recommendation_annotations (
+            recommendation_id TEXT NOT NULL,
+            annotation_id TEXT NOT NULL,
+            PRIMARY KEY (recommendation_id, annotation_id),
+            FOREIGN KEY(recommendation_id) REFERENCES recommendations(recommendation_id) ON DELETE CASCADE,
+            FOREIGN KEY(annotation_id) REFERENCES annotations(annotation_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS reports (
+            report_id TEXT PRIMARY KEY,
+            scene_id TEXT NOT NULL,
+            field_id TEXT,
+            title TEXT NOT NULL,
+            format TEXT NOT NULL,
+            path TEXT NOT NULL,
+            annotation_count INTEGER NOT NULL,
+            recommendation_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_scenes_field_id ON scenes(field_id);
         "#,
     )
@@ -109,6 +160,39 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     sqlx::query(
         r#"
         CREATE INDEX IF NOT EXISTS idx_annotations_field_id ON annotations(field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_recommendations_scene_id ON recommendations(scene_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_recommendations_field_id ON recommendations(field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_recommendation_annotations_annotation_id
+        ON recommendation_annotations(annotation_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_reports_scene_id ON reports(scene_id);
         "#,
     )
     .execute(pool)

@@ -59,6 +59,71 @@ pub struct AnnotationRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendationStatus {
+    Open,
+    Reviewed,
+    Closed,
+}
+
+impl Default for RecommendationStatus {
+    fn default() -> Self {
+        Self::Open
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendationPriority {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl Default for RecommendationPriority {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecommendationRecord {
+    pub recommendation_id: String,
+    pub scene_id: String,
+    pub field_id: Option<String>,
+    pub title: String,
+    pub note: Option<String>,
+    pub category: Option<String>,
+    pub priority: RecommendationPriority,
+    pub status: RecommendationStatus,
+    #[serde(default)]
+    pub annotation_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportFormat {
+    Html,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportRecord {
+    pub report_id: String,
+    pub scene_id: String,
+    pub field_id: Option<String>,
+    pub title: String,
+    pub format: ReportFormat,
+    pub artifact_path: String,
+    pub download_url: String,
+    pub annotation_count: usize,
+    pub recommendation_count: usize,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RasterSpatialRef {
     #[serde(default)]
@@ -214,7 +279,8 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 mod tests {
     use super::{
         bounds_from_points, AnnotationGeometry, AnnotationRecord, FieldBoundary, FieldRecord,
-        GeoBounds, GeoPoint, MultispectralImage, RasterSpatialRef,
+        GeoBounds, GeoPoint, MultispectralImage, RasterSpatialRef, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
     };
 
     #[test]
@@ -382,5 +448,50 @@ mod tests {
             serde_json::from_value(value).expect("annotation should deserialize");
 
         assert_eq!(decoded, annotation);
+    }
+
+    #[test]
+    fn recommendation_record_round_trips_through_json() {
+        let recommendation = RecommendationRecord {
+            recommendation_id: "rec-1".to_string(),
+            scene_id: "scene-1".to_string(),
+            field_id: Some("field-1".to_string()),
+            title: "Inspect water stress zone".to_string(),
+            note: Some("Check irrigation and re-scout in 48h".to_string()),
+            category: Some("irrigation".to_string()),
+            priority: RecommendationPriority::High,
+            status: RecommendationStatus::Reviewed,
+            annotation_ids: vec!["ann-1".to_string(), "ann-2".to_string()],
+            created_at: "2026-04-19T00:00:00Z".to_string(),
+            updated_at: "2026-04-19T01:00:00Z".to_string(),
+        };
+
+        let value = serde_json::to_value(&recommendation).expect("recommendation should serialize");
+        let decoded: RecommendationRecord =
+            serde_json::from_value(value).expect("recommendation should deserialize");
+
+        assert_eq!(decoded, recommendation);
+    }
+
+    #[test]
+    fn report_record_round_trips_through_json() {
+        let report = ReportRecord {
+            report_id: "report-1".to_string(),
+            scene_id: "scene-1".to_string(),
+            field_id: Some("field-1".to_string()),
+            title: "Scene 1 agronomy report".to_string(),
+            format: ReportFormat::Html,
+            artifact_path: "/tmp/report-1.html".to_string(),
+            download_url: "/api/scenes/scene-1/reports/report-1".to_string(),
+            annotation_count: 3,
+            recommendation_count: 2,
+            created_at: "2026-04-19T02:00:00Z".to_string(),
+        };
+
+        let value = serde_json::to_value(&report).expect("report should serialize");
+        let decoded: ReportRecord =
+            serde_json::from_value(value).expect("report should deserialize");
+
+        assert_eq!(decoded, report);
     }
 }

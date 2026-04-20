@@ -830,6 +830,312 @@ async fn update_and_delete_scene_annotation_roundtrip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn recommendation_crud_roundtrip_with_annotation_linkage() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "recommendation-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+
+    let annotation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/annotations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "annotation_id": "ann-rec-1",
+                        "label": "Stress zone",
+                        "severity": "high",
+                        "geometry": {
+                            "type": "point",
+                            "coordinate": {
+                                "longitude": -96.45,
+                                "latitude": 41.25
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(annotation_response.status(), StatusCode::OK);
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/recommendations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recommendation_id": "rec-1",
+                        "title": "Scout irrigation line",
+                        "note": "Verify nozzle coverage",
+                        "category": "irrigation",
+                        "priority": "high",
+                        "status": "open",
+                        "annotation_ids": ["ann-rec-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let body = to_bytes(create_response.into_body(), 64 * 1024).await?;
+    let created_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created_json.get("title").and_then(|v| v.as_str()),
+        Some("Scout irrigation line")
+    );
+    assert_eq!(
+        created_json.get("priority").and_then(|v| v.as_str()),
+        Some("high")
+    );
+    assert_eq!(
+        created_json
+            .pointer("/annotation_ids/0")
+            .and_then(|v| v.as_str()),
+        Some("ann-rec-1")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/recommendations"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let list_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(list_json.as_array().map(|items| items.len()), Some(1));
+
+    let get_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/recommendations/rec-1"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get_response.status(), StatusCode::OK);
+
+    let update_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/scenes/{scene_id}/recommendations/rec-1"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "Close irrigation gap",
+                        "note": "Action assigned to operator",
+                        "category": "irrigation",
+                        "priority": "critical",
+                        "status": "reviewed",
+                        "annotation_ids": ["ann-rec-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(update_response.status(), StatusCode::OK);
+    let body = to_bytes(update_response.into_body(), 64 * 1024).await?;
+    let updated_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        updated_json.get("status").and_then(|v| v.as_str()),
+        Some("reviewed")
+    );
+    assert_eq!(
+        updated_json.get("priority").and_then(|v| v.as_str()),
+        Some("critical")
+    );
+
+    let delete_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/scenes/{scene_id}/recommendations/rec-1"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn report_generation_and_download_roundtrip() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "report-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+
+    let annotation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/annotations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "annotation_id": "ann-report-1",
+                        "label": "Dry patch",
+                        "severity": "medium",
+                        "geometry": {
+                            "type": "point",
+                            "coordinate": {
+                                "longitude": -96.45,
+                                "latitude": 41.25
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(annotation_response.status(), StatusCode::OK);
+
+    let recommendation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/recommendations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "Check irrigation pressure",
+                        "category": "irrigation",
+                        "priority": "high",
+                        "status": "open",
+                        "annotation_ids": ["ann-report-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(recommendation_response.status(), StatusCode::OK);
+
+    let generate_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/reports"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "North field agronomy report"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(generate_response.status(), StatusCode::OK);
+    let body = to_bytes(generate_response.into_body(), 256 * 1024).await?;
+    let report_json: serde_json::Value = serde_json::from_slice(&body)?;
+    let report_id = report_json
+        .get("report_id")
+        .and_then(|value| value.as_str())
+        .expect("report_id should exist")
+        .to_string();
+    assert_eq!(
+        report_json.get("format").and_then(|value| value.as_str()),
+        Some("html")
+    );
+    assert_eq!(
+        report_json
+            .get("annotation_count")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        report_json
+            .get("recommendation_count")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/reports"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+
+    let download_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/reports/{report_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(download_response.status(), StatusCode::OK);
+    assert_eq!(
+        download_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let body = to_bytes(download_response.into_body(), 256 * 1024).await?;
+    let html = String::from_utf8(body.to_vec())?;
+    assert!(html.contains("North field agronomy report"));
+    assert!(html.contains("Check irrigation pressure"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn scene_manifest_lists_available_products_from_disk() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
