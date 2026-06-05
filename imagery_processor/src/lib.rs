@@ -199,10 +199,6 @@ pub enum ThermalProduct {
     Lst,
 }
 
-fn default_thermal_products() -> Vec<ThermalProduct> {
-    vec![ThermalProduct::Lst]
-}
-
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, ValueEnum, Debug)]
 pub enum MaskKind {
     Cloud,

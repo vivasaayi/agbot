@@ -130,7 +130,7 @@ The visualizer integrates with other AgBot components:
 - Connects to `multi_drone_control` for live telemetry
 - Reads mission data from `mission_planner`
 - Visualizes sensor data from `sensor_overlay_engine`
-- Displays processed NDVI data from `ndvi_processor`
+- Displays processed NDVI data from `imagery_processor`
 
 ## Troubleshooting
 

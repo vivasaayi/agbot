@@ -4,6 +4,7 @@ use crate::{
     state::AppState,
 };
 use anyhow::Error;
+use axum::response::Html;
 use axum::response::{IntoResponse, Response};
 use axum::{
     body::Body,
@@ -14,12 +15,13 @@ use axum::{
 use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
 };
-use image::{imageops::FilterType, DynamicImage, ImageFormat};
+use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     bounds_from_points, AnnotationGeometry, AnnotationRecord, FarmRecord, FieldBoundary,
-    FieldRecord, GeoPoint, GpsCoords, MultispectralImage, RecommendationPriority,
-    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
+    FieldRecord, GeoBounds, GeoPoint, GpsCoords, ImageMetadata, MultispectralImage,
+    RasterSpatialRef, RecommendationPriority, RecommendationRecord, RecommendationStatus,
+    ReportFormat, ReportRecord,
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -33,6 +35,7 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 const TILE_SIZE: u32 = 256;
+const MOBILE_APP_HTML: &str = include_str!("mobile_app.html");
 
 #[derive(Debug, Serialize)]
 pub struct SceneSummary {
@@ -164,6 +167,416 @@ pub struct ImportShapefileRequest {
 pub struct FieldSeasonGroup {
     pub season: Option<String>,
     pub fields: Vec<FieldRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MobileAnalyzeRequest {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub date: Option<String>,
+    pub days: Option<u8>,
+    pub products: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MobileAnalyzeResponse {
+    pub scene_id: String,
+    pub sensor: String,
+    pub acquired_at: String,
+    pub source: String,
+    pub location: GpsCoords,
+    pub extent: SceneExtent,
+    pub products: Vec<MobileProduct>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MobileProduct {
+    pub kind: String,
+    pub label: String,
+    pub url_path: String,
+    pub tile_url_template: String,
+    pub stats: Option<serde_json::Value>,
+}
+
+pub async fn mobile_app() -> Html<&'static str> {
+    Html(MOBILE_APP_HTML)
+}
+
+pub async fn mobile_analyze(
+    State(state): State<AppState>,
+    Json(request): Json<MobileAnalyzeRequest>,
+) -> AppResult<Json<MobileAnalyzeResponse>> {
+    validate_lat_lon(request.latitude, request.longitude)?;
+
+    let products = normalize_mobile_products(request.products);
+    let acquired_at = request
+        .date
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| chrono::Utc::now().date_naive().to_string());
+    let days = request.days.unwrap_or(3).clamp(1, 14);
+    let scene_id = format!(
+        "mobile_{:.5}_{:.5}_{}_{}d_{}",
+        request.latitude,
+        request.longitude,
+        acquired_at.replace('-', ""),
+        days,
+        Uuid::new_v4().simple()
+    )
+    .replace('.', "p")
+    .replace('-', "m");
+
+    let scene_dir = state.config.data_root.join("scenes").join(&scene_id);
+    fs::create_dir_all(&scene_dir)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    let extent = extent_around(request.latitude, request.longitude, 0.035);
+    let image = write_synthetic_landsat_scene(
+        &scene_dir,
+        request.latitude,
+        request.longitude,
+        &acquired_at,
+        extent.clone(),
+    )
+    .await?;
+    let metadata_json = serde_json::to_string_pretty(&image).map_err(Error::from)?;
+    fs::write(scene_dir.join("metadata_ingested.json"), &metadata_json)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (scene_id, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+        ON CONFLICT(scene_id) DO UPDATE SET sensor = excluded.sensor,
+                                          acquired_at = excluded.acquired_at,
+                                          data_path = excluded.data_path,
+                                          metadata_json = excluded.metadata_json,
+                                          cloud_cover = excluded.cloud_cover
+        "#,
+    )
+    .bind(&scene_id)
+    .bind("landsat8-simulated")
+    .bind(format!("{acquired_at}T00:00:00Z"))
+    .bind(scene_dir.to_string_lossy().to_string())
+    .bind(&metadata_json)
+    .bind(8.0f64)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    create_rgb_product(&state, &scene_id, &scene_dir).await?;
+
+    let mut mobile_products = Vec::new();
+    mobile_products.push(mobile_product_from_kind(&scene_id, "rgb", None));
+
+    for kind in products {
+        let product_path = ingest::ensure_product(&state.pool, &scene_id, &kind)
+            .await
+            .map_err(AppError::Anyhow)?;
+        let stats = read_product_stats(&product_path).await?;
+        mobile_products.push(mobile_product_from_kind(&scene_id, &kind, stats));
+    }
+
+    Ok(Json(MobileAnalyzeResponse {
+        scene_id,
+        sensor: "Landsat 8 sample backend".to_string(),
+        acquired_at,
+        source: "backend-generated Landsat-style sample; STAC download plugs into this API next"
+            .to_string(),
+        location: GpsCoords {
+            latitude: request.latitude,
+            longitude: request.longitude,
+            altitude: 0.0,
+        },
+        extent,
+        products: mobile_products,
+    }))
+}
+
+fn validate_lat_lon(latitude: f64, longitude: f64) -> AppResult<()> {
+    if !latitude.is_finite() || !longitude.is_finite() {
+        return Err(AppError::BadRequest(
+            "latitude and longitude must be finite numbers".to_string(),
+        ));
+    }
+    if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
+        return Err(AppError::BadRequest(
+            "latitude or longitude outside valid range".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_mobile_products(products: Option<Vec<String>>) -> Vec<String> {
+    let requested = products.unwrap_or_else(|| {
+        vec![
+            "ndvi".to_string(),
+            "ndmi".to_string(),
+            "nbr".to_string(),
+            "mndwi".to_string(),
+            "evi2".to_string(),
+        ]
+    });
+
+    let supported = [
+        "ndvi", "ndre", "evi", "savi", "vari", "gndvi", "ndwi", "mndwi", "msavi", "nbr", "ndmi",
+        "evi2",
+    ];
+    let mut normalized = Vec::new();
+    for product in requested {
+        let kind = product.trim().to_lowercase();
+        if supported.contains(&kind.as_str()) && !normalized.contains(&kind) {
+            normalized.push(kind);
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push("ndvi".to_string());
+    }
+    normalized
+}
+
+fn extent_around(latitude: f64, longitude: f64, half_size_degrees: f64) -> SceneExtent {
+    SceneExtent {
+        min_lon: (longitude - half_size_degrees).clamp(-180.0, 180.0),
+        min_lat: (latitude - half_size_degrees).clamp(-90.0, 90.0),
+        max_lon: (longitude + half_size_degrees).clamp(-180.0, 180.0),
+        max_lat: (latitude + half_size_degrees).clamp(-90.0, 90.0),
+    }
+}
+
+async fn write_synthetic_landsat_scene(
+    scene_dir: &FsPath,
+    latitude: f64,
+    longitude: f64,
+    acquired_at: &str,
+    extent: SceneExtent,
+) -> AppResult<MultispectralImage> {
+    let width = 512;
+    let height = 512;
+    let bands = synthetic_landsat_bands(width, height, latitude, longitude);
+    let mut file_paths = BTreeMap::new();
+
+    for (band_name, pixels) in bands {
+        let path = scene_dir.join(format!("{band_name}.png"));
+        let image = GrayImage::from_raw(width, height, pixels).ok_or_else(|| {
+            AppError::Anyhow(anyhow::anyhow!(
+                "failed to create synthetic band {band_name}"
+            ))
+        })?;
+        image
+            .save(&path)
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+        file_paths.insert(band_name, path.to_string_lossy().to_string());
+    }
+
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&format!("{acquired_at}T00:00:00Z"))
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    Ok(MultispectralImage {
+        metadata: ImageMetadata {
+            timestamp,
+            gps_position: Some(GpsCoords {
+                latitude,
+                longitude,
+                altitude: 0.0,
+            }),
+            bands: file_paths.keys().cloned().collect(),
+            exposure_time: 1.0,
+            gain: 1.0,
+            width,
+            height,
+            spatial_ref: Some(RasterSpatialRef {
+                georeferenced: true,
+                crs: Some("EPSG:4326".to_string()),
+                bbox: Some(GeoBounds {
+                    min_lon: extent.min_lon,
+                    min_lat: extent.min_lat,
+                    max_lon: extent.max_lon,
+                    max_lat: extent.max_lat,
+                }),
+                geo_transform: None,
+            }),
+        },
+        file_paths: file_paths.into_iter().collect(),
+        image_id: Uuid::new_v4(),
+    })
+}
+
+fn synthetic_landsat_bands(
+    width: u32,
+    height: u32,
+    latitude: f64,
+    longitude: f64,
+) -> Vec<(String, Vec<u8>)> {
+    let mut b2 = Vec::with_capacity((width * height) as usize);
+    let mut b3 = Vec::with_capacity((width * height) as usize);
+    let mut b4 = Vec::with_capacity((width * height) as usize);
+    let mut b5 = Vec::with_capacity((width * height) as usize);
+    let mut b6 = Vec::with_capacity((width * height) as usize);
+    let mut b7 = Vec::with_capacity((width * height) as usize);
+
+    let location_phase = ((latitude * 0.37 + longitude * 0.19).sin() as f32) * 0.08;
+    for y in 0..height {
+        for x in 0..width {
+            let nx = x as f32 / (width - 1) as f32;
+            let ny = y as f32 / (height - 1) as f32;
+            let irrigation = ((nx * 18.0).sin() * (ny * 14.0).cos()).max(0.0);
+            let field_bands = (((nx * 5.0).floor() as i32 + (ny * 4.0).floor() as i32) % 2) as f32;
+            let stress_patch = gaussian(nx, ny, 0.72, 0.32, 0.13);
+            let wet_patch = gaussian(nx, ny, 0.25, 0.75, 0.16);
+            let vegetation = (0.55 + irrigation * 0.22 + field_bands * 0.08 - stress_patch * 0.38
+                + location_phase)
+                .clamp(0.05, 0.95);
+            let moisture = (0.35 + wet_patch * 0.42 - stress_patch * 0.16).clamp(0.05, 0.9);
+            let soil = (1.0 - vegetation).clamp(0.0, 1.0);
+
+            b2.push(to_u8(0.18 + soil * 0.10 + wet_patch * 0.06));
+            b3.push(to_u8(0.24 + vegetation * 0.22 + wet_patch * 0.08));
+            b4.push(to_u8(0.18 + soil * 0.30 + stress_patch * 0.20));
+            b5.push(to_u8(0.28 + vegetation * 0.58 - stress_patch * 0.24));
+            b6.push(to_u8(
+                0.22 + soil * 0.28 - moisture * 0.14 + stress_patch * 0.12,
+            ));
+            b7.push(to_u8(
+                0.18 + soil * 0.35 - moisture * 0.08 + stress_patch * 0.18,
+            ));
+        }
+    }
+
+    vec![
+        ("B2".to_string(), b2),
+        ("B3".to_string(), b3),
+        ("B4".to_string(), b4),
+        ("B5".to_string(), b5),
+        ("B6".to_string(), b6),
+        ("B7".to_string(), b7),
+    ]
+}
+
+fn gaussian(x: f32, y: f32, cx: f32, cy: f32, radius: f32) -> f32 {
+    let dx = x - cx;
+    let dy = y - cy;
+    (-(dx * dx + dy * dy) / (2.0 * radius * radius)).exp()
+}
+
+fn to_u8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+async fn create_rgb_product(state: &AppState, scene_id: &str, scene_dir: &FsPath) -> AppResult<()> {
+    let red = image::open(scene_dir.join("B4.png"))
+        .map_err(|err| AppError::Anyhow(err.into()))?
+        .to_luma8();
+    let green = image::open(scene_dir.join("B3.png"))
+        .map_err(|err| AppError::Anyhow(err.into()))?
+        .to_luma8();
+    let blue = image::open(scene_dir.join("B2.png"))
+        .map_err(|err| AppError::Anyhow(err.into()))?
+        .to_luma8();
+    let (width, height) = red.dimensions();
+    let mut rgb = ImageBuffer::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            rgb.put_pixel(
+                x,
+                y,
+                Rgb([
+                    red.get_pixel(x, y)[0],
+                    green.get_pixel(x, y)[0],
+                    blue.get_pixel(x, y)[0],
+                ]),
+            );
+        }
+    }
+
+    let product_dir = scene_dir.join("products").join("rgb");
+    fs::create_dir_all(&product_dir)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let product_path = product_dir.join("rgb.png");
+    DynamicImage::ImageRgb8(rgb)
+        .save(&product_path)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO products (scene_id, kind, path, created_at)
+        VALUES (?1, 'rgb', ?2, datetime('now'))
+        ON CONFLICT(scene_id, kind) DO UPDATE SET path = excluded.path,
+                                                created_at = datetime('now')
+        "#,
+    )
+    .bind(scene_id)
+    .bind(product_path.to_string_lossy().to_string())
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn read_product_stats(product_path: &FsPath) -> AppResult<Option<serde_json::Value>> {
+    let Some(product_dir) = product_path.parent() else {
+        return Ok(None);
+    };
+    let mut entries = fs::read_dir(product_dir)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?
+    {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("_result.json"))
+        {
+            let text = fs::read_to_string(path)
+                .await
+                .map_err(|err| AppError::Anyhow(err.into()))?;
+            let stats = serde_json::from_str(&text).map_err(Error::from)?;
+            return Ok(Some(stats));
+        }
+    }
+    Ok(None)
+}
+
+fn mobile_product_from_kind(
+    scene_id: &str,
+    kind: &str,
+    stats: Option<serde_json::Value>,
+) -> MobileProduct {
+    MobileProduct {
+        kind: kind.to_string(),
+        label: product_label(kind).to_string(),
+        url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
+        tile_url_template: format!(
+            "/api/scenes/{scene_id}/products/{kind}/tiles/{{z}}/{{x}}/{{y}}.png"
+        ),
+        stats,
+    }
+}
+
+fn product_label(kind: &str) -> &'static str {
+    match kind {
+        "rgb" => "Natural Color",
+        "ndvi" => "Vegetation Health (NDVI)",
+        "ndmi" => "Crop Moisture (NDMI)",
+        "nbr" => "Stress / Burn Index (NBR)",
+        "mndwi" => "Water / Wet Areas (MNDWI)",
+        "evi2" => "Enhanced Vegetation (EVI2)",
+        "ndwi" => "Water Index (NDWI)",
+        "savi" => "Soil Adjusted Vegetation (SAVI)",
+        "gndvi" => "Green NDVI",
+        "vari" => "Visible Atmospherically Resistant Index",
+        "ndre" => "Red Edge Index (NDRE)",
+        "msavi" => "Modified SAVI",
+        _ => "Analysis Layer",
+    }
 }
 
 pub async fn import_fields_geojson(

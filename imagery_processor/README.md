@@ -2,11 +2,12 @@
 
 Imagery processing toolkit for remote sensing: spectral indices, thermal visualization, and simple classification.
 
-Status: initial scaffold. PNG outputs are supported by default. Optional GeoTIFF output is available behind the `gdal-io` feature.
+Status: working MVP. PNG outputs are supported by default. Optional GeoTIFF output is available behind the `gdal-io` feature when GDAL is installed and discoverable by `pkg-config`.
 
 ## Features
-- Indices: NDVI, NDRE, EVI, SAVI
-- Thermal: simple DN→Kelvin visualization (placeholder for LST)
+- Indices: NDVI, NDRE, EVI, SAVI, VARI, GNDVI, NDWI, MNDWI, MSAVI, NBR, NDMI, EVI2
+- Thermal: radiance, brightness temperature, and emissivity-corrected LST outputs
+- Masks: Landsat QA_PIXEL cloud, shadow, snow, water, and clear masks
 - Classify: threshold or k-means on index rasters
 
 ## Usage
@@ -49,7 +50,7 @@ Enable the feature and request geotiff output:
 cargo run --features gdal-io --bin imagery_processor -- indices --input-dir ./data --output-dir ./out --out-format geotiff
 ```
 
-Note: This writes a basic GeoTIFF without CRS/GeoTransform for now. You’ll need GDAL installed on your system.
+Note: This writes a basic GeoTIFF and attempts to copy CRS/GeoTransform from the source band. You’ll need GDAL installed on your system.
 
 ## Roadmap
 - GDAL-based reading/writing with CRS and GeoTransform (COG)

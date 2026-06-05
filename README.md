@@ -8,7 +8,7 @@ A comprehensive Rust monorepo for autonomous agricultural drone operations, feat
 
 - **`mission_control`** - Async MAVLink flight controller interface with WebSocket telemetry
 - **`sensor_collector`** - Real-time LiDAR (RPLIDAR A3) and multispectral camera data acquisition
-- **`ndvi_processor`** - NDVI calculation from Red/NIR bands with GeoTIFF and PNG output
+- **`imagery_processor`** - Remote-sensing imagery processing: NDVI/spectral indices, thermal products, masks, and classification
 - **`lidar_mapper`** - Point cloud processing, occupancy grids, and 3D mapping
 - **`ground_station_ui`** - Web dashboard and CLI for telemetry, NDVI visualization, and LiDAR overlays
 - **`shared`** - Common configuration, schemas, error handling, and logging utilities
@@ -17,7 +17,7 @@ A comprehensive Rust monorepo for autonomous agricultural drone operations, feat
 
 - **Runtime**: Tokio async runtime with tracing observability
 - **Communication**: MAVLink protocol, WebSockets, JSON/gRPC APIs
-- **Image Processing**: NDVI calculation, multispectral analysis, GeoTIFF support
+- **Image Processing**: NDVI and multispectral analysis, optional GeoTIFF support, thermal products
 - **Mapping**: LiDAR point clouds, occupancy grids, heatmap generation
 - **Hardware**: Cross-compiled for ARM (Jetson Nano/Xavier, Raspberry Pi)
 
@@ -152,22 +152,23 @@ cargo run --release --bin ground_station_ui -- --web &
 Process captured multispectral imagery:
 
 ```bash
-# Single mission processing
-cargo run --bin ndvi_processor -- \
+# Single mission NDVI processing
+cargo run --bin imagery_processor -- indices \
     --input-dir /opt/agrodrone/data/camera/mission_001 \
-    --output-dir /opt/agrodrone/processed/ndvi/mission_001
+    --output-dir /opt/agrodrone/processed/ndvi/mission_001 \
+    --index ndvi
 
-# Batch processing with statistics
-cargo run --bin ndvi_processor -- \
+# Batch processing of all metadata_*.json captures
+cargo run --bin imagery_processor -- indices \
     --input-dir /opt/agrodrone/data/camera \
     --output-dir /opt/agrodrone/processed/ndvi \
-    --generate-stats
+    --index ndvi
 ```
 
 **Output formats:**
 - PNG images with NDVI visualization
-- GeoTIFF files with geospatial metadata
-- JSON statistics (mean, std, percentiles)
+- Optional GeoTIFF output with `--features gdal-io --out-format geotiff`
+- JSON statistics (min, max, mean)
 
 ### LiDAR Mapping Pipeline
 
@@ -721,10 +722,10 @@ agrodrone/
 │   │   ├── lib.rs
 │   │   ├── lidar_reader.rs   # LiDAR interface
 │   │   └── camera_reader.rs  # Camera interface
-├── ndvi_processor/            # Image processing
+├── imagery_processor/         # Remote-sensing imagery processing
 │   ├── src/
 │   │   ├── main.rs
-│   │   └── lib.rs            # NDVI calculation
+│   │   └── lib.rs            # Indices, thermal, masks, classification
 ├── lidar_mapper/              # Point cloud processing
 │   ├── src/
 │   │   ├── main.rs

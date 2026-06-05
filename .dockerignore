@@ -1,0 +1,8 @@
+.git
+target
+data
+processed
+out
+node_modules
+**/node_modules
+.DS_Store

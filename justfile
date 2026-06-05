@@ -121,7 +121,7 @@ ui-cli:
 # Process NDVI from sample data
 ndvi:
     @echo "🌱 Processing NDVI..."
-    cargo run --bin ndvi_processor -- --input-dir data/camera --output-dir processed/ndvi
+    cargo run --bin imagery_processor -- indices --input-dir data/camera --output-dir processed/ndvi --index ndvi
 
 # Process LiDAR from sample data
 lidar:

@@ -1,5 +1,6 @@
 use anyhow::Context;
-use shared::{schemas::MultispectralImage, AgroResult};
+use image::GrayImage;
+use shared::{error::AgroError, schemas::MultispectralImage, AgroResult};
 use std::path::PathBuf;
 use tracing::{error, info};
 
@@ -22,13 +23,67 @@ pub async fn run_indices(args: &IndicesArgs) -> AgroResult<()> {
 
     info!(count = metadata_files.len(), index = ?args.index, "Found metadata files");
 
+    let mut failures = Vec::new();
     for mf in metadata_files {
         if let Err(e) = process_one(&mf, args).await {
             error!(file=%mf.display(), error=%e, "Failed processing");
+            failures.push(format!("{}: {}", mf.display(), e));
         }
     }
 
+    if !failures.is_empty() {
+        return Err(AgroError::Processing(format!(
+            "{} metadata file(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        )));
+    }
+
     Ok(())
+}
+
+fn processing_error(message: impl Into<String>) -> AgroError {
+    AgroError::Processing(message.into())
+}
+
+fn require_band_path<'a>(
+    image: &'a MultispectralImage,
+    band_name: &str,
+    role: &str,
+) -> AgroResult<&'a str> {
+    image
+        .file_paths
+        .get(band_name)
+        .map(String::as_str)
+        .ok_or_else(|| processing_error(format!("{role} band '{band_name}' not found")))
+}
+
+fn load_luma_band(
+    image: &MultispectralImage,
+    band_name: &str,
+    role: &str,
+    expected_dimensions: (u32, u32),
+) -> AgroResult<GrayImage> {
+    let band_path = require_band_path(image, band_name, role)?;
+    let band = image::open(band_path)
+        .map_err(|e| processing_error(format!("Failed to load {role} band: {e}")))?
+        .to_luma8();
+
+    if band.dimensions() != expected_dimensions {
+        return Err(processing_error(format!(
+            "{role} band dimensions mismatch: expected {:?}, got {:?}",
+            expected_dimensions,
+            band.dimensions()
+        )));
+    }
+
+    Ok(band)
+}
+
+fn valid_mask_at(mask_img: &Option<GrayImage>, x: u32, y: u32) -> bool {
+    mask_img
+        .as_ref()
+        .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
 }
 
 async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<()> {
@@ -60,12 +115,8 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
     let swir2_name = args.swir2.clone().unwrap_or_else(|| "SWIR2".to_string());
 
     // Locate band files
-    let red_path = image.file_paths.get(&red_name).ok_or_else(|| {
-        shared::error::AgroError::Processing(format!("Red band '{}' not found", red_name))
-    })?;
-    let nir_path = image.file_paths.get(&nir_name).ok_or_else(|| {
-        shared::error::AgroError::Processing(format!("NIR band '{}' not found", nir_name))
-    })?;
+    let red_path = require_band_path(&image, &red_name, "Red")?;
+    let nir_path = require_band_path(&image, &nir_name, "NIR")?;
 
     // Load bands (prefer GDAL for TIFFs when enabled)
     #[cfg(feature = "gdal-io")]
@@ -80,22 +131,15 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         #[cfg(feature = "gdal-io")]
         {
             let (rw, rh, red_buf, r_nd) = crate::io::gdal_util::read_first_band_as_f32(red_path)
-                .map_err(|e| {
-                    shared::error::AgroError::Processing(format!("GDAL read red failed: {}", e))
-                })?;
+                .map_err(|e| processing_error(format!("GDAL read red failed: {}", e)))?;
             let (nw, nh, nir_buf0, n_nd0) = crate::io::gdal_util::read_first_band_as_f32(nir_path)
-                .map_err(|e| {
-                    shared::error::AgroError::Processing(format!("GDAL read nir failed: {}", e))
-                })?;
+                .map_err(|e| processing_error(format!("GDAL read nir failed: {}", e)))?;
             let (nw, nh, nir_buf, n_nd) = if rw != nw || rh != nh {
                 // Resample NIR to red dimensions
                 let (_w, _h, buf, nd) =
                     crate::io::gdal_util::read_first_band_as_f32_resampled(nir_path, rw, rh)
                         .map_err(|e| {
-                            shared::error::AgroError::Processing(format!(
-                                "GDAL resample nir failed: {}",
-                                e
-                            ))
+                            processing_error(format!("GDAL resample nir failed: {}", e))
                         })?;
                 (rw, rh, buf, nd)
             } else {
@@ -130,14 +174,10 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
     } else {
         let red_img = image::open(red_path)
-            .map_err(|e| {
-                shared::error::AgroError::Processing(format!("Failed to load Red band: {}", e))
-            })?
+            .map_err(|e| processing_error(format!("Failed to load Red band: {}", e)))?
             .to_luma8();
         let nir_img = image::open(nir_path)
-            .map_err(|e| {
-                shared::error::AgroError::Processing(format!("Failed to load NIR band: {}", e))
-            })?
+            .map_err(|e| processing_error(format!("Failed to load NIR band: {}", e)))?
             .to_luma8();
         (
             red_img,
@@ -150,9 +190,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
     };
 
     if red_img.dimensions() != nir_img.dimensions() {
-        return Err(shared::error::AgroError::Processing(
-            "Band dimensions mismatch".into(),
-        ));
+        return Err(processing_error("Band dimensions mismatch"));
     }
 
     let (width, height) = red_img.dimensions();
@@ -168,16 +206,21 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
     let mut stats_min = f32::INFINITY;
     let mut stats_max = f32::NEG_INFINITY;
     let mut stats_sum = 0.0f64;
+    let mut stats_count = 0usize;
 
     // Optional mask: non-zero means valid pixel
     let mask_img = if let Some(mask_path) = &args.mask {
-        Some(
-            image::open(mask_path)
-                .map_err(|e| {
-                    shared::error::AgroError::Processing(format!("Failed to load mask: {}", e))
-                })?
-                .to_luma8(),
-        )
+        let mask = image::open(mask_path)
+            .map_err(|e| processing_error(format!("Failed to load mask: {}", e)))?
+            .to_luma8();
+        if mask.dimensions() != (width, height) {
+            return Err(processing_error(format!(
+                "Mask dimensions mismatch: expected {:?}, got {:?}",
+                (width, height),
+                mask.dimensions()
+            )));
+        }
+        Some(mask)
     } else {
         None
     };
@@ -185,9 +228,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
     match args.index {
         IndexKind::Ndvi => {
             for (x, y, pix) in out.enumerate_pixels_mut() {
-                let valid_mask = mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0);
+                let valid_mask = valid_mask_at(&mask_img, x, y);
                 let (r, n, valid_data) =
                     if let (Some(ref rbuf), Some(ref nbuf)) = (&red_f32_opt, &nir_f32_opt) {
                         let i = (y * width + x) as usize;
@@ -216,6 +257,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -229,21 +271,13 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
             }
         }
         IndexKind::Ndre => {
-            let re_path = image.file_paths.get(&re_name).ok_or_else(|| {
-                shared::error::AgroError::Processing(format!(
-                    "Red-edge band '{}' not found",
-                    re_name
-                ))
-            })?;
+            let re_path = require_band_path(&image, &re_name, "Red-edge")?;
             let re_img = if use_gdal {
                 #[cfg(feature = "gdal-io")]
                 {
                     let (rw, rh, re_buf, _nd) =
                         crate::io::gdal_util::read_first_band_as_f32(re_path).map_err(|e| {
-                            shared::error::AgroError::Processing(format!(
-                                "GDAL read red-edge failed: {}",
-                                e
-                            ))
+                            processing_error(format!("GDAL read red-edge failed: {}", e))
                         })?;
                     let mut re_img = image::GrayImage::new(rw as u32, rh as u32);
                     for y in 0..rh {
@@ -261,23 +295,14 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                 }
             } else {
                 image::open(re_path)
-                    .map_err(|e| {
-                        shared::error::AgroError::Processing(format!(
-                            "Failed to load Red-edge band: {}",
-                            e
-                        ))
-                    })?
+                    .map_err(|e| processing_error(format!("Failed to load Red-edge band: {}", e)))?
                     .to_luma8()
             };
             if re_img.dimensions() != red_img.dimensions() {
-                return Err(shared::error::AgroError::Processing(
-                    "Band dimensions mismatch".into(),
-                ));
+                return Err(processing_error("Red-edge band dimensions mismatch"));
             }
             for (x, y, pix) in out.enumerate_pixels_mut() {
-                let valid_mask = mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0);
+                let valid_mask = valid_mask_at(&mask_img, x, y);
                 let (re, n, valid_data) =
                     if let (Some(ref _rbuf), Some(ref nbuf)) = (&red_f32_opt, &nir_f32_opt) {
                         let i = (y * width + x) as usize;
@@ -304,6 +329,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -318,16 +344,9 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
         IndexKind::Evi => {
             // EVI = 2.5 * (NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1)
-            // For now, approximate Blue=Red if missing
-            let blue_img = image
-                .file_paths
-                .get("Blue")
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
+            let blue_img = load_luma_band(&image, &blue_name, "Blue", (width, height))?;
             for (x, y, pix) in out.enumerate_pixels_mut() {
-                let valid_mask = mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0);
+                let valid_mask = valid_mask_at(&mask_img, x, y);
                 let r = if let Some(ref rbuf) = red_f32_opt {
                     rbuf[(y * width + x) as usize]
                 } else {
@@ -338,10 +357,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                 } else {
                     nir_img.get_pixel(x, y)[0] as f32
                 };
-                let b = blue_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(r);
+                let b = blue_img.get_pixel(x, y)[0] as f32;
                 let denom = n + 6.0 * r - 7.5 * b + 1.0;
                 let mut write_val = NODATA_F32;
                 let nodata_ok = match nd_red {
@@ -357,6 +373,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -371,38 +388,21 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
         IndexKind::Vari => {
             // VARI = (G - R) / (G + R - B)
-            let g_img = image
-                .file_paths
-                .get(&green_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            let b_img = image
-                .file_paths
-                .get(&blue_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
+            let g_img = load_luma_band(&image, &green_name, "Green", (width, height))?;
+            let b_img = load_luma_band(&image, &blue_name, "Blue", (width, height))?;
             for (x, y, pix) in out.enumerate_pixels_mut() {
                 let r = red_img.get_pixel(x, y)[0] as f32;
-                let g = g_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(r);
-                let b = b_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(r);
+                let g = g_img.get_pixel(x, y)[0] as f32;
+                let b = b_img.get_pixel(x, y)[0] as f32;
                 let denom = g + r - b;
                 let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
+                if valid_mask_at(&mask_img, x, y) && denom.abs() > f32::EPSILON {
                     let v = (g - r) / denom;
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -416,29 +416,19 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
         IndexKind::Gndvi => {
             // GNDVI = (NIR - G) / (NIR + G)
-            let g_img = image
-                .file_paths
-                .get(&green_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
+            let g_img = load_luma_band(&image, &green_name, "Green", (width, height))?;
             for (x, y, pix) in out.enumerate_pixels_mut() {
-                let g = g_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(red_img.get_pixel(x, y)[0] as f32);
+                let g = g_img.get_pixel(x, y)[0] as f32;
                 let n = nir_img.get_pixel(x, y)[0] as f32;
                 let denom = n + g;
                 let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
+                if valid_mask_at(&mask_img, x, y) && denom.abs() > f32::EPSILON {
                     let v = (n - g) / denom;
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -452,29 +442,19 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
         IndexKind::Ndwi => {
             // NDWI (McFeeters) = (G - NIR) / (G + NIR)
-            let g_img = image
-                .file_paths
-                .get(&green_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
+            let g_img = load_luma_band(&image, &green_name, "Green", (width, height))?;
             for (x, y, pix) in out.enumerate_pixels_mut() {
-                let g = g_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(red_img.get_pixel(x, y)[0] as f32);
+                let g = g_img.get_pixel(x, y)[0] as f32;
                 let n = nir_img.get_pixel(x, y)[0] as f32;
                 let denom = g + n;
                 let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
+                if valid_mask_at(&mask_img, x, y) && denom.abs() > f32::EPSILON {
                     let v = (g - n) / denom;
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -488,37 +468,20 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
         IndexKind::Mndwi => {
             // MNDWI (Xu) = (G - SWIR1) / (G + SWIR1)
-            let g_img = image
-                .file_paths
-                .get(&green_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            let s_img = image
-                .file_paths
-                .get(&swir1_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
+            let g_img = load_luma_band(&image, &green_name, "Green", (width, height))?;
+            let s_img = load_luma_band(&image, &swir1_name, "SWIR1", (width, height))?;
             for (x, y, pix) in out.enumerate_pixels_mut() {
-                let g = g_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(red_img.get_pixel(x, y)[0] as f32);
-                let s = s_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(nir_img.get_pixel(x, y)[0] as f32);
+                let g = g_img.get_pixel(x, y)[0] as f32;
+                let s = s_img.get_pixel(x, y)[0] as f32;
                 let denom = g + s;
                 let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
+                if valid_mask_at(&mask_img, x, y) && denom.abs() > f32::EPSILON {
                     let v = (g - s) / denom;
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -537,16 +500,13 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                 let n = nir_img.get_pixel(x, y)[0] as f32;
                 let term = (2.0 * n + 1.0) * (2.0 * n + 1.0) - 8.0 * (n - r);
                 let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && term >= 0.0
-                {
+                if valid_mask_at(&mask_img, x, y) && term >= 0.0 {
                     let v = (2.0 * n + 1.0 - term.sqrt()) * 0.5;
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -560,29 +520,19 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
         IndexKind::Nbr => {
             // NBR = (NIR - SWIR2) / (NIR + SWIR2)
-            let s2_img = image
-                .file_paths
-                .get(&swir2_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
+            let s2_img = load_luma_band(&image, &swir2_name, "SWIR2", (width, height))?;
             for (x, y, pix) in out.enumerate_pixels_mut() {
                 let n = nir_img.get_pixel(x, y)[0] as f32;
-                let s2 = s2_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(n);
+                let s2 = s2_img.get_pixel(x, y)[0] as f32;
                 let denom = n + s2;
                 let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
+                if valid_mask_at(&mask_img, x, y) && denom.abs() > f32::EPSILON {
                     let v = (n - s2) / denom;
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -596,29 +546,19 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
         IndexKind::Ndmi => {
             // NDMI = (NIR - SWIR1) / (NIR + SWIR1)
-            let s1_img = image
-                .file_paths
-                .get(&swir1_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
+            let s1_img = load_luma_band(&image, &swir1_name, "SWIR1", (width, height))?;
             for (x, y, pix) in out.enumerate_pixels_mut() {
                 let n = nir_img.get_pixel(x, y)[0] as f32;
-                let s1 = s1_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(n);
+                let s1 = s1_img.get_pixel(x, y)[0] as f32;
                 let denom = n + s1;
                 let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
+                if valid_mask_at(&mask_img, x, y) && denom.abs() > f32::EPSILON {
                     let v = (n - s1) / denom;
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -637,16 +577,13 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                 let n = nir_img.get_pixel(x, y)[0] as f32;
                 let denom = n + 2.4 * r + 1.0;
                 let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
+                if valid_mask_at(&mask_img, x, y) && denom.abs() > f32::EPSILON {
                     let v = 2.5 * (n - r) / denom;
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -662,9 +599,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
             // SAVI = (1+L)*(NIR-Red)/(NIR+Red+L), L typically 0.5
             let l = 0.5f32;
             for (x, y, pix) in out.enumerate_pixels_mut() {
-                let valid_mask = mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0);
+                let valid_mask = valid_mask_at(&mask_img, x, y);
                 let r = if let Some(ref rbuf) = red_f32_opt {
                     rbuf[(y * width + x) as usize]
                 } else {
@@ -690,6 +625,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
                     stats_sum += v as f64;
+                    stats_count += 1;
                 }
                 if let Some(ref mut f32buf) = out_f32 {
                     f32buf[(y * width + x) as usize] = write_val;
@@ -704,8 +640,15 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
     }
 
-    let count = (width as usize) * (height as usize);
-    let mean = (stats_sum / count as f64) as f32;
+    let (min, max, mean) = if stats_count > 0 {
+        (
+            stats_min,
+            stats_max,
+            (stats_sum / stats_count as f64) as f32,
+        )
+    } else {
+        (f32::NAN, f32::NAN, f32::NAN)
+    };
 
     let out_path = match args.out_format {
         OutputFormat::Png => {
@@ -784,8 +727,8 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         source_images: vec![image.image_id],
         output_path: out_path.to_string_lossy().to_string(),
         index: format!("{:?}", args.index).to_lowercase(),
-        min: stats_min,
-        max: stats_max,
+        min,
+        max,
         mean,
     };
 

@@ -14,11 +14,11 @@ The repo must contain the following workspace members:
    - Reads raw frames from a multispectral camera (simulate if hardware not connected).
    - Saves all data to timestamped local folders.
 
-3. `ndvi_processor` – A post-flight image processor that:
-   - Accepts folder of captured multispectral bands (NIR + Red).
-   - Generates NDVI images using `(NIR - Red) / (NIR + Red)`.
-   - Saves resulting images as GeoTIFF or PNG with GPS overlay metadata if available.
-   - Uses the `image` crate and optionally FFI-bindings to `opencv`.
+3. `imagery_processor` – A post-flight imagery processor that:
+   - Accepts folders of captured multispectral bands (NIR + Red and other spectral bands).
+   - Generates NDVI and other spectral-index products.
+   - Saves resulting images as PNG by default, with optional GeoTIFF output when GDAL is enabled.
+   - Supports thermal, mask, and simple classification workflows.
 
 4. `lidar_mapper` – A LiDAR post-processing module that:
    - Accepts scan data (timestamp, angle, distance).

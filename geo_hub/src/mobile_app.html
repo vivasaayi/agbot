@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>AgBot Field Imagery</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f4;
+      --panel: #ffffff;
+      --ink: #172018;
+      --muted: #637064;
+      --line: #dce2db;
+      --accent: #197a4f;
+      --accent-strong: #0d5d3b;
+      --warn: #9f5b10;
+      --shadow: 0 12px 32px rgba(28, 40, 30, 0.14);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      min-height: 100svh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      padding: max(16px, env(safe-area-inset-top)) 16px 12px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    .subhead {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .controls {
+      padding: 12px 16px;
+      display: grid;
+      gap: 10px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+
+    label {
+      display: grid;
+      gap: 5px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    input, select, button {
+      width: 100%;
+      min-height: 44px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      font: inherit;
+      letter-spacing: 0;
+    }
+
+    input, select {
+      padding: 10px 12px;
+      background: #fff;
+      color: var(--ink);
+    }
+
+    button {
+      border: 0;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      padding: 10px 14px;
+    }
+
+    button.secondary {
+      background: #eef4ef;
+      color: var(--accent-strong);
+      border: 1px solid #c9dacd;
+    }
+
+    button:disabled {
+      opacity: 0.55;
+    }
+
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .stage {
+      flex: 1;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: 0;
+    }
+
+    .layerbar {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding: 10px 16px;
+      background: #eef2ec;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .chip {
+      flex: 0 0 auto;
+      width: auto;
+      min-height: 36px;
+      padding: 8px 11px;
+      border-radius: 999px;
+      border: 1px solid #c8d7cc;
+      background: #fff;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .chip.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    .viewer {
+      min-height: 280px;
+      display: grid;
+      place-items: center;
+      padding: 14px;
+      background:
+        linear-gradient(90deg, rgba(0,0,0,0.035) 1px, transparent 1px),
+        linear-gradient(rgba(0,0,0,0.035) 1px, transparent 1px),
+        #dfe8dd;
+      background-size: 32px 32px;
+      overflow: hidden;
+    }
+
+    .viewer img {
+      width: min(100%, 620px);
+      max-height: 54svh;
+      object-fit: contain;
+      image-rendering: auto;
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      background: #fff;
+    }
+
+    .placeholder {
+      padding: 28px 20px;
+      text-align: center;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .summary {
+      background: var(--panel);
+      border-top: 1px solid var(--line);
+      padding: 12px 16px max(16px, env(safe-area-inset-bottom));
+      display: grid;
+      gap: 8px;
+    }
+
+    .metric {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 14px;
+    }
+
+    .metric span:first-child { color: var(--muted); }
+    .metric span:last-child { font-weight: 700; text-align: right; }
+
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    .status.error { color: #a12821; }
+    .status.warn { color: var(--warn); }
+
+    @media (min-width: 760px) {
+      main {
+        max-width: 920px;
+        margin: 0 auto;
+        border-left: 1px solid var(--line);
+        border-right: 1px solid var(--line);
+      }
+      .controls {
+        grid-template-columns: 1fr 1fr auto;
+        align-items: end;
+      }
+      .controls .wide { grid-column: span 2; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Field Imagery</h1>
+      <p class="subhead">Pick a location and let the backend generate Landsat-style analysis layers. The phone only views results.</p>
+    </header>
+
+    <section class="controls">
+      <div class="grid2 wide">
+        <label>
+          Latitude
+          <input id="lat" inputmode="decimal" value="36.7783" />
+        </label>
+        <label>
+          Longitude
+          <input id="lon" inputmode="decimal" value="-119.4179" />
+        </label>
+      </div>
+      <div class="grid2 wide">
+        <label>
+          Target Date
+          <input id="date" type="date" />
+        </label>
+        <label>
+          Window
+          <select id="days">
+            <option value="3">3 days</option>
+            <option value="7">7 days</option>
+            <option value="14">14 days</option>
+          </select>
+        </label>
+      </div>
+      <button id="locate" class="secondary">Use My Location</button>
+      <button id="analyze">Find Image & Analyze</button>
+      <div id="status" class="status wide">Ready.</div>
+    </section>
+
+    <section class="stage">
+      <div id="layers" class="layerbar"></div>
+      <div class="viewer">
+        <div id="placeholder" class="placeholder">Results will appear here after analysis.</div>
+        <img id="productImage" alt="Selected analysis layer" hidden />
+      </div>
+      <div id="summary" class="summary"></div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = { response: null, selected: null };
+
+    $("date").value = new Date().toISOString().slice(0, 10);
+
+    $("locate").addEventListener("click", () => {
+      if (!navigator.geolocation) {
+        setStatus("Location is not available in this browser.", "error");
+        return;
+      }
+      setStatus("Requesting location...");
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          $("lat").value = position.coords.latitude.toFixed(6);
+          $("lon").value = position.coords.longitude.toFixed(6);
+          setStatus("Location set. Tap analyze.");
+        },
+        (error) => setStatus(error.message || "Unable to get location.", "error"),
+        { enableHighAccuracy: true, timeout: 10000 }
+      );
+    });
+
+    $("analyze").addEventListener("click", async () => {
+      const latitude = Number($("lat").value);
+      const longitude = Number($("lon").value);
+      const date = $("date").value;
+      const days = Number($("days").value);
+
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+        setStatus("Enter a valid latitude and longitude.", "error");
+        return;
+      }
+
+      $("analyze").disabled = true;
+      setStatus("Backend is creating the scene and products...");
+      renderLayers([]);
+      $("summary").innerHTML = "";
+      $("productImage").hidden = true;
+      $("placeholder").hidden = false;
+
+      try {
+        const response = await fetch("/api/mobile/analyze", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            latitude,
+            longitude,
+            date,
+            days,
+            products: ["ndvi", "ndmi", "nbr", "mndwi", "evi2"]
+          })
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        state.response = await response.json();
+        state.selected = state.response.products[0]?.kind || null;
+        setStatus(`Scene ${state.response.scene_id} ready.`);
+        renderLayers(state.response.products);
+        renderSelected();
+      } catch (error) {
+        setStatus(error.message || "Analysis failed.", "error");
+      } finally {
+        $("analyze").disabled = false;
+      }
+    });
+
+    function renderLayers(products) {
+      const container = $("layers");
+      container.innerHTML = "";
+      for (const product of products) {
+        const button = document.createElement("button");
+        button.className = "chip" + (product.kind === state.selected ? " active" : "");
+        button.textContent = product.kind.toUpperCase();
+        button.title = product.label;
+        button.addEventListener("click", () => {
+          state.selected = product.kind;
+          renderLayers(state.response.products);
+          renderSelected();
+        });
+        container.appendChild(button);
+      }
+    }
+
+    function renderSelected() {
+      const product = state.response?.products.find((item) => item.kind === state.selected);
+      if (!product) return;
+
+      const image = $("productImage");
+      image.src = product.url_path + "?t=" + Date.now();
+      image.hidden = false;
+      $("placeholder").hidden = true;
+
+      const stats = product.stats || {};
+      const rows = [
+        ["Layer", product.label],
+        ["Source", state.response.source],
+        ["Acquired", state.response.acquired_at],
+      ];
+      if (typeof stats.mean === "number") rows.push(["Mean", stats.mean.toFixed(3)]);
+      if (typeof stats.min === "number") rows.push(["Min", stats.min.toFixed(3)]);
+      if (typeof stats.max === "number") rows.push(["Max", stats.max.toFixed(3)]);
+      rows.push(["Tile URL", product.tile_url_template.replace("{z}", "0").replace("{x}", "0").replace("{y}", "0")]);
+
+      $("summary").innerHTML = rows.map(([label, value]) =>
+        `<div class="metric"><span>${escapeHtml(label)}</span><span>${escapeHtml(String(value))}</span></div>`
+      ).join("");
+    }
+
+    function setStatus(message, level = "") {
+      const status = $("status");
+      status.textContent = message;
+      status.className = "status " + level;
+    }
+
+    function escapeHtml(value) {
+      return value.replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+      }[char]));
+    }
+  </script>
+</body>
+</html>
