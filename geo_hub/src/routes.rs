@@ -1,6 +1,6 @@
 use crate::{
     error::{AppError, AppResult},
-    ingest, shapefile,
+    ingest, landsat, shapefile,
     state::AppState,
 };
 use anyhow::Error;
@@ -176,14 +176,22 @@ pub struct MobileAnalyzeRequest {
     pub date: Option<String>,
     pub days: Option<u8>,
     pub products: Option<Vec<String>>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct MobileAnalyzeResponse {
     pub scene_id: String,
+    pub external_scene_id: Option<String>,
     pub sensor: String,
     pub acquired_at: String,
     pub source: String,
+    pub provider: Option<String>,
+    pub collection: Option<String>,
+    pub cloud_cover: Option<f64>,
+    pub asset_count: usize,
+    pub search_days: u8,
+    pub real_products_ready: bool,
     pub location: GpsCoords,
     pub extent: SceneExtent,
     pub products: Vec<MobileProduct>,
@@ -213,13 +221,47 @@ pub async fn mobile_analyze(
         .date
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| chrono::Utc::now().date_naive().to_string());
-    let days = request.days.unwrap_or(3).clamp(1, 14);
+    let requested_days = request.days.unwrap_or(14).clamp(1, 30);
+    let source_mode = request
+        .source
+        .as_deref()
+        .unwrap_or("landsat")
+        .trim()
+        .to_lowercase();
+    let mut search_days = requested_days;
+    let landsat_candidate = if source_mode == "sample" {
+        None
+    } else {
+        let mut found = None;
+        for window_days in expanded_landsat_windows(requested_days) {
+            search_days = window_days;
+            match landsat::search_best_scene(
+                request.latitude,
+                request.longitude,
+                &acquired_at,
+                window_days,
+            )
+            .await
+            {
+                Ok(Some(candidate)) => {
+                    found = Some(candidate);
+                    break;
+                }
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(error = %err, "real Landsat scene search failed; using sample fallback");
+                    break;
+                }
+            }
+        }
+        found
+    };
     let scene_id = format!(
         "mobile_{:.5}_{:.5}_{}_{}d_{}",
         request.latitude,
         request.longitude,
         acquired_at.replace('-', ""),
-        days,
+        search_days,
         Uuid::new_v4().simple()
     )
     .replace('.', "p")
@@ -231,15 +273,35 @@ pub async fn mobile_analyze(
         .map_err(|err| AppError::Anyhow(err.into()))?;
 
     let extent = extent_around(request.latitude, request.longitude, 0.035);
-    let image = write_synthetic_landsat_scene(
-        &scene_dir,
-        request.latitude,
-        request.longitude,
-        &acquired_at,
-        extent.clone(),
-    )
-    .await?;
-    let metadata_json = serde_json::to_string_pretty(&image).map_err(Error::from)?;
+    let image = if let Some(candidate) = &landsat_candidate {
+        describe_real_landsat_scene(
+            candidate,
+            request.latitude,
+            request.longitude,
+            extent.clone(),
+        )
+    } else {
+        write_synthetic_landsat_scene(
+            &scene_dir,
+            request.latitude,
+            request.longitude,
+            &acquired_at,
+            extent.clone(),
+        )
+        .await?
+    };
+    let mut metadata_value = serde_json::to_value(&image).map_err(Error::from)?;
+    if let Some(candidate) = &landsat_candidate {
+        metadata_value["landsat_provider"] = serde_json::json!({
+            "provider": candidate.provider,
+            "collection": candidate.collection,
+            "item_id": candidate.item_id,
+            "acquired_at": candidate.acquired_at,
+            "cloud_cover": candidate.cloud_cover,
+            "assets": candidate.assets,
+        });
+    }
+    let metadata_json = serde_json::to_string_pretty(&metadata_value).map_err(Error::from)?;
     fs::write(scene_dir.join("metadata_ingested.json"), &metadata_json)
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?;
@@ -256,34 +318,113 @@ pub async fn mobile_analyze(
         "#,
     )
     .bind(&scene_id)
-    .bind("landsat8-simulated")
-    .bind(format!("{acquired_at}T00:00:00Z"))
+    .bind(if landsat_candidate.is_some() {
+        "landsat8-stac-rendered-products"
+    } else {
+        "landsat8-simulated"
+    })
+    .bind(
+        landsat_candidate
+            .as_ref()
+            .map(|candidate| candidate.acquired_at.clone())
+            .unwrap_or_else(|| format!("{acquired_at}T00:00:00Z")),
+    )
     .bind(scene_dir.to_string_lossy().to_string())
     .bind(&metadata_json)
-    .bind(8.0f64)
+    .bind(
+        landsat_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.cloud_cover)
+            .unwrap_or(8.0f64),
+    )
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
 
-    create_rgb_product(&state, &scene_id, &scene_dir).await?;
-
     let mut mobile_products = Vec::new();
-    mobile_products.push(mobile_product_from_kind(&scene_id, "rgb", None));
+    if let Some(candidate) = &landsat_candidate {
+        let rgb_path = create_real_landsat_product(&state, &scene_id, &scene_dir, candidate, "rgb")
+            .await?;
+        mobile_products.push(mobile_product_from_kind(
+            &scene_id,
+            "rgb",
+            read_product_stats(&rgb_path).await?,
+        ));
 
-    for kind in products {
-        let product_path = ingest::ensure_product(&state.pool, &scene_id, &kind)
-            .await
-            .map_err(AppError::Anyhow)?;
-        let stats = read_product_stats(&product_path).await?;
-        mobile_products.push(mobile_product_from_kind(&scene_id, &kind, stats));
+        for kind in products {
+            let product_path =
+                create_real_landsat_product(&state, &scene_id, &scene_dir, candidate, &kind)
+                    .await?;
+            let stats = read_product_stats(&product_path).await?;
+            mobile_products.push(mobile_product_from_kind(&scene_id, &kind, stats));
+        }
+    } else {
+        create_rgb_product(&state, &scene_id, &scene_dir).await?;
+        mobile_products.push(mobile_product_from_kind(&scene_id, "rgb", None));
+
+        for kind in products {
+            let product_path = ingest::ensure_product(&state.pool, &scene_id, &kind)
+                .await
+                .map_err(AppError::Anyhow)?;
+            let stats = read_product_stats(&product_path).await?;
+            mobile_products.push(mobile_product_from_kind(&scene_id, &kind, stats));
+        }
     }
+
+    let response_acquired_at = landsat_candidate
+        .as_ref()
+        .map(|candidate| candidate.acquired_at.clone())
+        .unwrap_or_else(|| acquired_at.clone());
+    let source = match &landsat_candidate {
+        Some(candidate) if search_days > requested_days => {
+            format!(
+                "real Landsat scene selected and rendered from {} after expanding search to {} days",
+                candidate.provider, search_days
+            )
+        }
+        Some(candidate) => {
+            format!(
+                "real Landsat scene selected and rendered from {}",
+                candidate.provider
+            )
+        }
+        None if source_mode == "sample" => {
+            "backend-generated Landsat-style sample selected by user".to_string()
+        }
+        None => {
+            "backend-generated Landsat-style sample; real Landsat search did not return a usable scene"
+                .to_string()
+        }
+    };
+    let asset_count = landsat_candidate
+        .as_ref()
+        .map(|candidate| candidate.assets.len())
+        .unwrap_or(0);
 
     Ok(Json(MobileAnalyzeResponse {
         scene_id,
-        sensor: "Landsat 8 sample backend".to_string(),
-        acquired_at,
-        source: "backend-generated Landsat-style sample; STAC download plugs into this API next"
-            .to_string(),
+        external_scene_id: landsat_candidate
+            .as_ref()
+            .map(|candidate| candidate.item_id.clone()),
+        sensor: if landsat_candidate.is_some() {
+            "Landsat Collection 2 scene metadata".to_string()
+        } else {
+            "Landsat 8 sample backend".to_string()
+        },
+        acquired_at: response_acquired_at,
+        source,
+        provider: landsat_candidate
+            .as_ref()
+            .map(|candidate| candidate.provider.clone()),
+        collection: landsat_candidate
+            .as_ref()
+            .map(|candidate| candidate.collection.clone()),
+        cloud_cover: landsat_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.cloud_cover),
+        asset_count,
+        search_days,
+        real_products_ready: landsat_candidate.is_some(),
         location: GpsCoords {
             latitude: request.latitude,
             longitude: request.longitude,
@@ -334,6 +475,16 @@ fn normalize_mobile_products(products: Option<Vec<String>>) -> Vec<String> {
         normalized.push("ndvi".to_string());
     }
     normalized
+}
+
+fn expanded_landsat_windows(requested_days: u8) -> Vec<u8> {
+    let mut windows = Vec::new();
+    for window in [requested_days.clamp(1, 30), 14, 30] {
+        if !windows.contains(&window) {
+            windows.push(window);
+        }
+    }
+    windows
 }
 
 fn extent_around(latitude: f64, longitude: f64, half_size_degrees: f64) -> SceneExtent {
@@ -404,6 +555,46 @@ async fn write_synthetic_landsat_scene(
     })
 }
 
+fn describe_real_landsat_scene(
+    candidate: &landsat::LandsatSceneCandidate,
+    latitude: f64,
+    longitude: f64,
+    extent: SceneExtent,
+) -> MultispectralImage {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&candidate.acquired_at)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    MultispectralImage {
+        metadata: ImageMetadata {
+            timestamp,
+            gps_position: Some(GpsCoords {
+                latitude,
+                longitude,
+                altitude: 0.0,
+            }),
+            bands: candidate.assets.keys().cloned().collect(),
+            exposure_time: 1.0,
+            gain: 1.0,
+            width: 512,
+            height: 512,
+            spatial_ref: Some(RasterSpatialRef {
+                georeferenced: true,
+                crs: Some("EPSG:4326".to_string()),
+                bbox: Some(GeoBounds {
+                    min_lon: extent.min_lon,
+                    min_lat: extent.min_lat,
+                    max_lon: extent.max_lon,
+                    max_lat: extent.max_lat,
+                }),
+                geo_transform: None,
+            }),
+        },
+        file_paths: candidate.assets.clone().into_iter().collect(),
+        image_id: Uuid::new_v4(),
+    }
+}
+
 fn synthetic_landsat_bands(
     width: u32,
     height: u32,
@@ -417,24 +608,47 @@ fn synthetic_landsat_bands(
     let mut b6 = Vec::with_capacity((width * height) as usize);
     let mut b7 = Vec::with_capacity((width * height) as usize);
 
-    let location_phase = ((latitude * 0.37 + longitude * 0.19).sin() as f32) * 0.08;
+    let lat_seed = latitude as f32;
+    let lon_seed = longitude as f32;
+    let location_phase = ((latitude * 0.37 + longitude * 0.19).sin() as f32) * 0.10;
+    let field_scale_x = 3.0 + ((lat_seed * 1.91).sin().abs() * 5.0);
+    let field_scale_y = 3.0 + ((lon_seed * 1.37).cos().abs() * 5.0);
+    let row_angle = (lat_seed * 0.17 + lon_seed * 0.11).sin();
+    let stress_cx = 0.18 + ((lat_seed * 0.73).sin().abs() * 0.64);
+    let stress_cy = 0.18 + ((lon_seed * 0.67).cos().abs() * 0.64);
+    let wet_cx = 0.15 + ((lat_seed * 0.41 + lon_seed * 0.23).cos().abs() * 0.70);
+    let wet_cy = 0.15 + ((lat_seed * 0.29 - lon_seed * 0.31).sin().abs() * 0.70);
+    let tint_r = ((lat_seed * 0.13).sin() * 0.045).clamp(-0.045, 0.045);
+    let tint_g = ((lon_seed * 0.09).cos() * 0.045).clamp(-0.045, 0.045);
+    let tint_b = (((lat_seed + lon_seed) * 0.07).sin() * 0.035).clamp(-0.035, 0.035);
     for y in 0..height {
         for x in 0..width {
             let nx = x as f32 / (width - 1) as f32;
             let ny = y as f32 / (height - 1) as f32;
-            let irrigation = ((nx * 18.0).sin() * (ny * 14.0).cos()).max(0.0);
-            let field_bands = (((nx * 5.0).floor() as i32 + (ny * 4.0).floor() as i32) % 2) as f32;
-            let stress_patch = gaussian(nx, ny, 0.72, 0.32, 0.13);
-            let wet_patch = gaussian(nx, ny, 0.25, 0.75, 0.16);
-            let vegetation = (0.55 + irrigation * 0.22 + field_bands * 0.08 - stress_patch * 0.38
+            let rotated_x = (nx * row_angle.cos()) - (ny * row_angle.sin());
+            let rotated_y = (nx * row_angle.sin()) + (ny * row_angle.cos());
+            let irrigation = ((rotated_x * 22.0 + lat_seed as f32).sin()
+                * (rotated_y * 17.0 + lon_seed as f32).cos())
+            .max(0.0);
+            let field_bands = (((nx * field_scale_x).floor() as i32
+                + (ny * field_scale_y).floor() as i32)
+                % 2) as f32;
+            let stress_patch = gaussian(nx, ny, stress_cx, stress_cy, 0.10 + field_scale_x * 0.006);
+            let wet_patch = gaussian(nx, ny, wet_cx, wet_cy, 0.11 + field_scale_y * 0.007);
+            let diagonal = ((nx + ny + location_phase).fract() * 0.08).clamp(0.0, 0.08);
+            let vegetation = (0.48 + irrigation * 0.24 + field_bands * 0.12 - stress_patch * 0.42
                 + location_phase)
                 .clamp(0.05, 0.95);
             let moisture = (0.35 + wet_patch * 0.42 - stress_patch * 0.16).clamp(0.05, 0.9);
             let soil = (1.0 - vegetation).clamp(0.0, 1.0);
 
-            b2.push(to_u8(0.18 + soil * 0.10 + wet_patch * 0.06));
-            b3.push(to_u8(0.24 + vegetation * 0.22 + wet_patch * 0.08));
-            b4.push(to_u8(0.18 + soil * 0.30 + stress_patch * 0.20));
+            b2.push(to_u8(0.18 + soil * 0.10 + wet_patch * 0.06 + tint_b));
+            b3.push(to_u8(
+                0.24 + vegetation * 0.22 + wet_patch * 0.08 + tint_g + diagonal,
+            ));
+            b4.push(to_u8(
+                0.18 + soil * 0.30 + stress_patch * 0.20 + tint_r + diagonal * 0.5,
+            ));
             b5.push(to_u8(0.28 + vegetation * 0.58 - stress_patch * 0.24));
             b6.push(to_u8(
                 0.22 + soil * 0.28 - moisture * 0.14 + stress_patch * 0.12,
@@ -515,6 +729,67 @@ async fn create_rgb_product(state: &AppState, scene_id: &str, scene_dir: &FsPath
     .map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn create_real_landsat_product(
+    state: &AppState,
+    scene_id: &str,
+    scene_dir: &FsPath,
+    candidate: &landsat::LandsatSceneCandidate,
+    kind: &str,
+) -> AppResult<PathBuf> {
+    let kind = kind.to_lowercase();
+    let product_dir = scene_dir.join("products").join(&kind);
+    fs::create_dir_all(&product_dir)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    let bytes = landsat::render_product_png(candidate, &kind)
+        .await
+        .map_err(AppError::Anyhow)?;
+    image::load_from_memory(&bytes).map_err(|err| AppError::Anyhow(err.into()))?;
+    let product_path = product_dir.join(format!("{kind}.png"));
+    fs::write(&product_path, bytes)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    if let Some(mut stats) = landsat::product_statistics(candidate, &kind)
+        .await
+        .map_err(AppError::Anyhow)?
+    {
+        if let Some(object) = stats.as_object_mut() {
+            object.insert(
+                "output_path".to_string(),
+                serde_json::Value::String(product_path.to_string_lossy().to_string()),
+            );
+            object.insert(
+                "timestamp".to_string(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+        let stats_path = product_dir.join(format!("{kind}_result.json"));
+        let stats_json = serde_json::to_string_pretty(&stats).map_err(Error::from)?;
+        fs::write(stats_path, stats_json)
+            .await
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO products (scene_id, kind, path, created_at)
+        VALUES (?1, ?2, ?3, datetime('now'))
+        ON CONFLICT(scene_id, kind) DO UPDATE SET path = excluded.path,
+                                                created_at = datetime('now')
+        "#,
+    )
+    .bind(scene_id)
+    .bind(&kind)
+    .bind(product_path.to_string_lossy().to_string())
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(product_path)
 }
 
 async fn read_product_stats(product_path: &FsPath) -> AppResult<Option<serde_json::Value>> {

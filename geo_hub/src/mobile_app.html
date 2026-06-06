@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>AgBot Field Imagery</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     :root {
       color-scheme: light;
@@ -15,6 +16,7 @@
       --accent: #197a4f;
       --accent-strong: #0d5d3b;
       --warn: #9f5b10;
+      --info: #235a86;
       --shadow: 0 12px 32px rgba(28, 40, 30, 0.14);
     }
 
@@ -61,6 +63,41 @@
       border-bottom: 1px solid var(--line);
     }
 
+    .map-picker {
+      padding: 12px 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      gap: 8px;
+    }
+
+    .map-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    #locationMap {
+      width: 100%;
+      height: 310px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #dde8dc;
+    }
+
+    .leaflet-container {
+      font: inherit;
+    }
+
+    .leaflet-control-attribution {
+      font-size: 10px;
+    }
+
     label {
       display: grid;
       gap: 5px;
@@ -100,6 +137,11 @@
 
     button:disabled {
       opacity: 0.55;
+    }
+
+    .manual-location {
+      display: grid;
+      gap: 10px;
     }
 
     .grid2 {
@@ -200,6 +242,16 @@
     .status.error { color: #a12821; }
     .status.warn { color: var(--warn); }
 
+    .scene-note {
+      border: 1px solid #c9d9e7;
+      background: #f0f6fb;
+      color: var(--info);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
     @media (min-width: 760px) {
       main {
         max-width: 920px;
@@ -212,6 +264,7 @@
         align-items: end;
       }
       .controls .wide { grid-column: span 2; }
+      #locationMap { height: 360px; }
     }
   </style>
 </head>
@@ -219,11 +272,19 @@
   <main>
     <header>
       <h1>Field Imagery</h1>
-      <p class="subhead">Pick a location and let the backend generate Landsat-style analysis layers. The phone only views results.</p>
+      <p class="subhead">Tap the map to pick a field location. The backend handles imagery and calculations.</p>
     </header>
 
+    <section class="map-picker">
+      <div class="map-title">
+        <span>FIELD LOCATION</span>
+        <span id="pickedLocation">36.778300, -119.417900</span>
+      </div>
+      <div id="locationMap" aria-label="Map location picker"></div>
+    </section>
+
     <section class="controls">
-      <div class="grid2 wide">
+      <div class="grid2 wide manual-location">
         <label>
           Latitude
           <input id="lat" inputmode="decimal" value="36.7783" />
@@ -243,10 +304,17 @@
           <select id="days">
             <option value="3">3 days</option>
             <option value="7">7 days</option>
-            <option value="14">14 days</option>
+            <option value="14" selected>14 days</option>
           </select>
         </label>
       </div>
+      <label class="wide">
+        Imagery Source
+        <select id="source">
+          <option value="landsat">Real Landsat products</option>
+          <option value="sample">Sample products only</option>
+        </select>
+      </label>
       <button id="locate" class="secondary">Use My Location</button>
       <button id="analyze">Find Image & Analyze</button>
       <div id="status" class="status wide">Ready.</div>
@@ -262,11 +330,16 @@
     </section>
   </main>
 
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { response: null, selected: null };
+    const state = { response: null, selected: null, map: null, marker: null };
 
     $("date").value = new Date().toISOString().slice(0, 10);
+    initLocationMap();
+
+    $("lat").addEventListener("change", syncMapFromInputs);
+    $("lon").addEventListener("change", syncMapFromInputs);
 
     $("locate").addEventListener("click", () => {
       if (!navigator.geolocation) {
@@ -276,8 +349,7 @@
       setStatus("Requesting location...");
       navigator.geolocation.getCurrentPosition(
         (position) => {
-          $("lat").value = position.coords.latitude.toFixed(6);
-          $("lon").value = position.coords.longitude.toFixed(6);
+          setPickedLocation(position.coords.latitude, position.coords.longitude, true);
           setStatus("Location set. Tap analyze.");
         },
         (error) => setStatus(error.message || "Unable to get location.", "error"),
@@ -285,11 +357,72 @@
       );
     });
 
+    function initLocationMap() {
+      const lat = Number($("lat").value);
+      const lon = Number($("lon").value);
+
+      if (!window.L) {
+        setStatus("Map library did not load. You can still enter latitude and longitude manually.", "warn");
+        updatePickedLocationText(lat, lon);
+        return;
+      }
+
+      state.map = L.map("locationMap", {
+        zoomControl: true,
+        attributionControl: true
+      }).setView([lat, lon], 13);
+
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap"
+      }).addTo(state.map);
+
+      state.marker = L.marker([lat, lon], { draggable: true }).addTo(state.map);
+      state.marker.on("dragend", () => {
+        const point = state.marker.getLatLng();
+        setPickedLocation(point.lat, point.lng, false);
+      });
+
+      state.map.on("click", (event) => {
+        setPickedLocation(event.latlng.lat, event.latlng.lng, false);
+      });
+
+      setTimeout(() => state.map.invalidateSize(), 50);
+      updatePickedLocationText(lat, lon);
+    }
+
+    function syncMapFromInputs() {
+      const lat = Number($("lat").value);
+      const lon = Number($("lon").value);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+      setPickedLocation(lat, lon, false);
+    }
+
+    function setPickedLocation(latitude, longitude, recenter) {
+      $("lat").value = latitude.toFixed(6);
+      $("lon").value = longitude.toFixed(6);
+      updatePickedLocationText(latitude, longitude);
+
+      if (state.marker) {
+        state.marker.setLatLng([latitude, longitude]);
+      }
+      if (state.map && recenter) {
+        state.map.setView([latitude, longitude], Math.max(state.map.getZoom(), 14));
+      } else if (state.map) {
+        state.map.panTo([latitude, longitude], { animate: true });
+      }
+    }
+
+    function updatePickedLocationText(latitude, longitude) {
+      $("pickedLocation").textContent = `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
+    }
+
     $("analyze").addEventListener("click", async () => {
       const latitude = Number($("lat").value);
       const longitude = Number($("lon").value);
       const date = $("date").value;
       const days = Number($("days").value);
+      const source = $("source").value;
 
       if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
         setStatus("Enter a valid latitude and longitude.", "error");
@@ -297,7 +430,7 @@
       }
 
       $("analyze").disabled = true;
-      setStatus("Backend is creating the scene and products...");
+      setStatus(source === "landsat" ? "Searching Landsat and preparing products..." : "Preparing sample products...");
       renderLayers([]);
       $("summary").innerHTML = "";
       $("productImage").hidden = true;
@@ -312,6 +445,7 @@
             longitude,
             date,
             days,
+            source,
             products: ["ndvi", "ndmi", "nbr", "mndwi", "evi2"]
           })
         });
@@ -320,7 +454,11 @@
         }
         state.response = await response.json();
         state.selected = state.response.products[0]?.kind || null;
-        setStatus(`Scene ${state.response.scene_id} ready.`);
+        if (state.response.external_scene_id) {
+          setStatus(`Landsat scene ${state.response.external_scene_id} selected.`);
+        } else {
+          setStatus(`Sample scene ${state.response.scene_id} ready.`);
+        }
         renderLayers(state.response.products);
         renderSelected();
       } catch (error) {
@@ -358,16 +496,25 @@
 
       const stats = product.stats || {};
       const rows = [
+        ["Product Mode", state.response.real_products_ready ? "Real processed imagery" : "Sample products"],
         ["Layer", product.label],
         ["Source", state.response.source],
         ["Acquired", state.response.acquired_at],
       ];
+      if (state.response.provider) rows.push(["Provider", state.response.provider]);
+      if (state.response.collection) rows.push(["Collection", state.response.collection]);
+      if (state.response.external_scene_id) rows.push(["Landsat Scene", state.response.external_scene_id]);
+      if (typeof state.response.cloud_cover === "number") rows.push(["Cloud Cover", `${state.response.cloud_cover.toFixed(1)}%`]);
+      if (typeof state.response.asset_count === "number" && state.response.asset_count > 0) rows.push(["Band Assets", state.response.asset_count]);
+      if (typeof state.response.search_days === "number") rows.push(["Search Window", `${state.response.search_days} days`]);
       if (typeof stats.mean === "number") rows.push(["Mean", stats.mean.toFixed(3)]);
       if (typeof stats.min === "number") rows.push(["Min", stats.min.toFixed(3)]);
       if (typeof stats.max === "number") rows.push(["Max", stats.max.toFixed(3)]);
       rows.push(["Tile URL", product.tile_url_template.replace("{z}", "0").replace("{x}", "0").replace("{y}", "0")]);
 
-      $("summary").innerHTML = rows.map(([label, value]) =>
+      const note = state.response.real_products_ready ? "" :
+        `<div class="scene-note">${escapeHtml("No usable Landsat scene was found for this location and date window. The backend is showing sample fallback products.")}</div>`;
+      $("summary").innerHTML = note + rows.map(([label, value]) =>
         `<div class="metric"><span>${escapeHtml(label)}</span><span>${escapeHtml(String(value))}</span></div>`
       ).join("");
     }

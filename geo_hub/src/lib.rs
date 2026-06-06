@@ -2,6 +2,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod ingest;
+pub mod landsat;
 pub mod routes;
 pub mod server;
 pub mod shapefile;
