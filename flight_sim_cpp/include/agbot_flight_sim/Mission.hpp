@@ -34,5 +34,6 @@ struct Mission {
 
 [[nodiscard]] const char* to_string(WaypointAction action);
 [[nodiscard]] WaypointAction waypoint_action_from_string(const std::string& value);
+[[nodiscard]] std::string mission_to_json(const Mission& mission);
 
 } // namespace agbot::flight_sim

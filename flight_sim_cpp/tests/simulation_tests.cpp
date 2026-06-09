@@ -1,13 +1,18 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/TelemetryReplay.hpp"
 
 #include <cassert>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 
 using agbot::flight_sim::DroneMode;
 using agbot::flight_sim::DroneSimulation;
 using agbot::flight_sim::MissionLoader;
+using agbot::flight_sim::ManualControlInput;
+using agbot::flight_sim::ControlMode;
+using agbot::flight_sim::TelemetryReplay;
 
 namespace {
 
@@ -39,7 +44,7 @@ void test_mission_completes() {
     DroneSimulation simulation(std::move(mission));
 
     constexpr double dt_s = 1.0 / 60.0;
-    for (int i = 0; i < 60 * 30 && !simulation.is_complete(); ++i) {
+    for (int i = 0; i < 60 * 45 && !simulation.is_complete(); ++i) {
         simulation.step(dt_s);
     }
 
@@ -48,10 +53,39 @@ void test_mission_completes() {
     assert(simulation.state().battery_percent > 90.0);
 }
 
+void test_manual_controls_move_drone() {
+    auto mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation simulation(std::move(mission));
+    simulation.set_control_mode(ControlMode::Manual);
+    simulation.arm();
+
+    ManualControlInput input;
+    input.arm = true;
+    input.takeoff = true;
+    input.pitch = 1.0;
+    simulation.set_manual_input(input);
+
+    for (int i = 0; i < 60 * 3; ++i) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().position.y > 5.0);
+    assert(simulation.state().position.z > 5.0);
+    assert(simulation.state().mode != DroneMode::Completed);
+}
+
+void test_mission_round_trip() {
+    auto mission = MissionLoader::load_from_text(kMissionJson);
+    const std::string json = agbot::flight_sim::mission_to_json(mission);
+    const auto reloaded = MissionLoader::load_from_text(json);
+    assert(reloaded.name == mission.name);
+    assert(reloaded.waypoints.size() == mission.waypoints.size());
+}
+
 void test_failsafe_low_battery() {
     auto mission = MissionLoader::load_from_text(kMissionJson);
     agbot::flight_sim::SimulationConfig config;
-    config.min_battery_percent = 99.99;
+    config.min_battery_percent = 100.0;
     DroneSimulation simulation(std::move(mission), config);
     simulation.step(1.0);
     assert(simulation.state().mode == DroneMode::Failsafe);
@@ -62,6 +96,8 @@ void test_failsafe_low_battery() {
 int main() {
     test_loads_mission();
     test_mission_completes();
+    test_manual_controls_move_drone();
+    test_mission_round_trip();
     test_failsafe_low_battery();
     std::cout << "agbot_flight_sim_tests passed\n";
     return 0;

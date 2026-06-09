@@ -10,6 +10,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(agbot_flight_sim_core
     src/DroneSimulation.cpp
     src/MissionLoader.cpp
+    src/TelemetryReplay.cpp
     src/TelemetryRecorder.cpp
 )
 
@@ -36,6 +37,11 @@ add_executable(agbot_flight_sim_headless
     src/headless_main.cpp
 )
 target_link_libraries(agbot_flight_sim_headless PRIVATE agbot_flight_sim_core)
+
+add_executable(agbot_mission_bridge
+    src/mission_bridge_main.cpp
+)
+target_link_libraries(agbot_mission_bridge PRIVATE agbot_flight_sim_core)
 
 enable_testing()
 add_executable(agbot_flight_sim_tests

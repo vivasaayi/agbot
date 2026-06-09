@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 
@@ -18,6 +19,33 @@ std::string read_all(const std::filesystem::path& path) {
     std::ostringstream buffer;
     buffer << file.rdbuf();
     return buffer.str();
+}
+
+std::string escape_json(const std::string& value) {
+    std::ostringstream output;
+    for (const char c : value) {
+        switch (c) {
+            case '"':
+                output << "\\\"";
+                break;
+            case '\\':
+                output << "\\\\";
+                break;
+            case '\n':
+                output << "\\n";
+                break;
+            case '\r':
+                output << "\\r";
+                break;
+            case '\t':
+                output << "\\t";
+                break;
+            default:
+                output << c;
+                break;
+        }
+    }
+    return output.str();
 }
 
 std::size_t find_key(const std::string& text, const std::string& key, std::size_t start = 0) {
@@ -245,8 +273,60 @@ Mission MissionLoader::load_from_text(const std::string& text) {
     return mission;
 }
 
+void MissionLoader::save_to_file(const Mission& mission, const std::filesystem::path& path) {
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+
+    std::ofstream file(path);
+    if (!file) {
+        throw std::runtime_error("Unable to write mission file: " + path.string());
+    }
+    file << mission_to_json(mission);
+}
+
 std::filesystem::path default_sample_mission_path() {
     return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "samples" / "sample_field_loop.json";
+}
+
+std::string mission_to_json(const Mission& mission) {
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(3);
+    output << "{\n";
+    output << "  \"name\": \"" << escape_json(mission.name) << "\",\n";
+    output << "  \"home\": {\n";
+    output << "    \"x\": " << mission.home.x << ",\n";
+    output << "    \"y\": " << mission.home.y << ",\n";
+    output << "    \"z\": " << mission.home.z << "\n";
+    output << "  },\n";
+    output << "  \"cruise_speed_mps\": " << mission.cruise_speed_mps << ",\n";
+    output << "  \"acceptance_radius_m\": " << mission.acceptance_radius_m << ",\n";
+    output << "  \"waypoints\": [\n";
+
+    for (std::size_t index = 0; index < mission.waypoints.size(); ++index) {
+        const Waypoint& waypoint = mission.waypoints[index];
+        output << "    {\n";
+        output << "      \"name\": \"" << escape_json(waypoint.name) << "\",\n";
+        output << "      \"action\": \"" << to_string(waypoint.action) << "\",\n";
+        output << "      \"x\": " << waypoint.position.x << ",\n";
+        output << "      \"y\": " << waypoint.position.y << ",\n";
+        output << "      \"z\": " << waypoint.position.z;
+        if (waypoint.speed_mps.has_value()) {
+            output << ",\n      \"speed_mps\": " << *waypoint.speed_mps;
+        }
+        if (waypoint.hold_seconds > 0.0) {
+            output << ",\n      \"hold_seconds\": " << waypoint.hold_seconds;
+        }
+        output << "\n    }";
+        if (index + 1 < mission.waypoints.size()) {
+            output << ",";
+        }
+        output << "\n";
+    }
+
+    output << "  ]\n";
+    output << "}\n";
+    return output.str();
 }
 
 } // namespace agbot::flight_sim

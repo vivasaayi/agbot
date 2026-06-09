@@ -3,6 +3,7 @@
 
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/TelemetryReplay.hpp"
 
 #include <cmath>
 #include <filesystem>
@@ -17,7 +18,10 @@
 
 using agbot::flight_sim::DroneSimulation;
 using agbot::flight_sim::DroneState;
+using agbot::flight_sim::ControlMode;
+using agbot::flight_sim::ManualControlInput;
 using agbot::flight_sim::MissionLoader;
+using agbot::flight_sim::TelemetryReplay;
 using agbot::flight_sim::Vec3;
 using agbot::flight_sim::Waypoint;
 using agbot::flight_sim::WaypointAction;
@@ -96,14 +100,31 @@ NSString* ns_string(const std::filesystem::path& path) {
 
 @interface FlightSimOpenGLView : NSOpenGLView {
     std::unique_ptr<DroneSimulation> simulation_;
+    std::unique_ptr<TelemetryReplay> replay_;
     std::vector<Vec3> trail_;
     NSTimer* timer_;
     bool paused_;
     bool chase_camera_;
+    bool manual_mode_;
+    bool replay_mode_;
+    bool key_w_;
+    bool key_a_;
+    bool key_s_;
+    bool key_d_;
+    bool key_q_;
+    bool key_e_;
+    bool key_up_;
+    bool key_down_;
+    bool key_t_;
+    bool key_l_;
+    int selected_waypoint_;
+    bool dragging_waypoint_;
     double zoom_m_;
     double pan_x_;
     double pan_z_;
     double trail_sample_accumulator_;
+    double replay_time_s_;
+    std::filesystem::path mission_path_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame missionPath:(NSString*)missionPath;
@@ -130,16 +151,32 @@ NSString* ns_string(const std::filesystem::path& path) {
     if (self) {
         paused_ = false;
         chase_camera_ = true;
+        manual_mode_ = false;
+        replay_mode_ = false;
+        key_w_ = false;
+        key_a_ = false;
+        key_s_ = false;
+        key_d_ = false;
+        key_q_ = false;
+        key_e_ = false;
+        key_up_ = false;
+        key_down_ = false;
+        key_t_ = false;
+        key_l_ = false;
+        selected_waypoint_ = -1;
+        dragging_waypoint_ = false;
         zoom_m_ = 260.0;
         pan_x_ = 0.0;
         pan_z_ = 0.0;
         trail_sample_accumulator_ = 0.0;
+        replay_time_s_ = 0.0;
 
         try {
-            std::filesystem::path path([missionPath UTF8String]);
-            simulation_ = std::make_unique<DroneSimulation>(MissionLoader::load_from_file(path));
+            mission_path_ = std::filesystem::path([missionPath UTF8String]);
+            simulation_ = std::make_unique<DroneSimulation>(MissionLoader::load_from_file(mission_path_));
         } catch (const std::exception& error) {
             std::cerr << "Unable to load mission: " << error.what() << "\n";
+            mission_path_ = default_sample_mission_path();
             simulation_ = std::make_unique<DroneSimulation>(MissionLoader::load_from_file(default_sample_mission_path()));
         }
 
@@ -175,8 +212,20 @@ NSString* ns_string(const std::filesystem::path& path) {
 
 - (void)tick:(NSTimer*)timer {
     (void)timer;
-    if (simulation_ && !paused_ && !simulation_->is_complete()) {
+    if (simulation_ && !paused_ && replay_mode_ && replay_ && !replay_->empty()) {
+        replay_time_s_ += 1.0 / 60.0;
+        const DroneState& sample = replay_->sample(replay_time_s_);
+        if (trail_.empty() || trail_sample_accumulator_ >= 0.2) {
+            trail_.push_back(sample.position);
+            trail_sample_accumulator_ = 0.0;
+        }
+        trail_sample_accumulator_ += 1.0 / 60.0;
+        if (replay_time_s_ >= replay_->duration_s()) {
+            paused_ = true;
+        }
+    } else if (simulation_ && !paused_ && !simulation_->is_complete()) {
         constexpr double dt_s = 1.0 / 60.0;
+        [self updateManualInput];
         simulation_->step(dt_s);
         trail_sample_accumulator_ += dt_s;
 
@@ -195,13 +244,134 @@ NSString* ns_string(const std::filesystem::path& path) {
         return;
     }
 
-    const DroneState& state = simulation_->state();
+    const DroneState& state = [self displayState];
     std::ostringstream title;
     title << "AgBot FlightSim | " << simulation_->mission().name
+          << " | " << (replay_mode_ ? "replay" : to_string(simulation_->control_mode()))
           << " | " << to_string(state.mode)
           << " | t=" << std::fixed << std::setprecision(1) << state.mission_time_s << "s"
           << " | battery=" << std::setprecision(0) << state.battery_percent << "%";
     [[self window] setTitle:[NSString stringWithUTF8String:title.str().c_str()]];
+}
+
+- (const DroneState&)displayState {
+    if (replay_mode_ && replay_ && !replay_->empty()) {
+        return replay_->sample(replay_time_s_);
+    }
+    return simulation_->state();
+}
+
+- (NSPoint)viewCenter {
+    if (chase_camera_ && simulation_) {
+        const DroneState& state = [self displayState];
+        return NSMakePoint(state.position.x, state.position.z);
+    }
+    return NSMakePoint(pan_x_, pan_z_);
+}
+
+- (Vec3)worldPointFromEvent:(NSEvent*)event altitude:(double)altitude {
+    const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
+    const NSRect bounds = [self bounds];
+    const NSPoint center = [self viewCenter];
+    const double aspect = std::max(0.1, bounds.size.width / std::max(1.0, bounds.size.height));
+    const double half_height = zoom_m_;
+    const double half_width = zoom_m_ * aspect;
+    const double x = center.x - half_width + (location.x / std::max(1.0, bounds.size.width)) * half_width * 2.0;
+    const double z = center.y - half_height + (location.y / std::max(1.0, bounds.size.height)) * half_height * 2.0;
+    return Vec3(x, altitude, z);
+}
+
+- (int)nearestWaypointIndex:(Vec3)point maxDistance:(double)maxDistance {
+    if (!simulation_) {
+        return -1;
+    }
+
+    int best_index = -1;
+    double best_distance = maxDistance;
+    const auto& waypoints = simulation_->mission().waypoints;
+    for (std::size_t index = 0; index < waypoints.size(); ++index) {
+        const Vec3 delta = waypoints[index].position - point;
+        const double distance = std::sqrt(delta.x * delta.x + delta.z * delta.z);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = static_cast<int>(index);
+        }
+    }
+    return best_index;
+}
+
+- (void)addWaypointAt:(Vec3)point {
+    if (!simulation_) {
+        return;
+    }
+
+    Waypoint waypoint;
+    waypoint.name = "edited_waypoint_" + std::to_string(simulation_->mission().waypoints.size() + 1);
+    waypoint.position = point;
+    waypoint.action = WaypointAction::FlyThrough;
+    simulation_->mutable_mission().waypoints.push_back(waypoint);
+    selected_waypoint_ = static_cast<int>(simulation_->mission().waypoints.size()) - 1;
+}
+
+- (void)deleteWaypointAtIndex:(int)index {
+    if (!simulation_ || index < 0) {
+        return;
+    }
+    auto& waypoints = simulation_->mutable_mission().waypoints;
+    if (waypoints.size() <= 1 || static_cast<std::size_t>(index) >= waypoints.size()) {
+        return;
+    }
+    waypoints.erase(waypoints.begin() + index);
+    selected_waypoint_ = -1;
+}
+
+- (void)saveMission {
+    if (!simulation_) {
+        return;
+    }
+
+    const std::filesystem::path output =
+        std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "out" / "edited_mission.json";
+    try {
+        MissionLoader::save_to_file(simulation_->mission(), output);
+        std::cout << "Saved edited mission: " << output << "\n";
+    } catch (const std::exception& error) {
+        std::cerr << "Failed to save mission: " << error.what() << "\n";
+    }
+}
+
+- (void)loadReplay {
+    const std::filesystem::path path =
+        std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "out" / "telemetry.jsonl";
+    try {
+        replay_ = std::make_unique<TelemetryReplay>(TelemetryReplay::load_jsonl(path));
+        replay_mode_ = replay_ && !replay_->empty();
+        replay_time_s_ = 0.0;
+        paused_ = false;
+        trail_.clear();
+        if (simulation_) {
+            simulation_->set_control_mode(ControlMode::Replay);
+        }
+        std::cout << "Loaded telemetry replay: " << path << "\n";
+    } catch (const std::exception& error) {
+        std::cerr << "Failed to load replay: " << error.what() << "\n";
+    }
+}
+
+- (void)updateManualInput {
+    if (!simulation_ || !manual_mode_ || replay_mode_) {
+        return;
+    }
+
+    ManualControlInput input;
+    input.arm = true;
+    input.pitch = (key_w_ ? 1.0 : 0.0) + (key_s_ ? -1.0 : 0.0);
+    input.roll = (key_d_ ? 1.0 : 0.0) + (key_a_ ? -1.0 : 0.0);
+    input.yaw = (key_e_ ? 1.0 : 0.0) + (key_q_ ? -1.0 : 0.0);
+    input.throttle = (key_up_ ? 1.0 : 0.0) + (key_down_ ? -1.0 : 0.0);
+    input.takeoff = key_t_;
+    input.land = key_l_;
+    simulation_->set_manual_input(input);
 }
 
 - (void)drawGrid {
@@ -242,10 +412,16 @@ NSString* ns_string(const std::filesystem::path& path) {
     glEnd();
 
     for (const Waypoint& waypoint : mission.waypoints) {
+        const int waypoint_index = static_cast<int>(&waypoint - mission.waypoints.data());
         color_for_action(waypoint.action);
         draw_filled_circle(waypoint.position.x, waypoint.position.z, 3.2);
-        set_color(0.02, 0.025, 0.03, 1.0);
-        draw_circle(waypoint.position.x, waypoint.position.z, 5.0);
+        if (waypoint_index == selected_waypoint_) {
+            set_color(1.0, 1.0, 1.0, 1.0);
+            draw_circle(waypoint.position.x, waypoint.position.z, 8.0);
+        } else {
+            set_color(0.02, 0.025, 0.03, 1.0);
+            draw_circle(waypoint.position.x, waypoint.position.z, 5.0);
+        }
     }
 
     set_color(0.25, 1.0, 0.72, 1.0);
@@ -271,7 +447,7 @@ NSString* ns_string(const std::filesystem::path& path) {
         return;
     }
 
-    const DroneState& state = simulation_->state();
+    const DroneState& state = [self displayState];
     const Vec3 position = state.position;
     const double yaw = state.yaw_rad;
 
@@ -308,7 +484,7 @@ NSString* ns_string(const std::filesystem::path& path) {
 
     const double width = bounds.size.width;
     const double height = bounds.size.height;
-    const DroneState& state = simulation_->state();
+    const DroneState& state = [self displayState];
 
     glMatrixMode(GL_PROJECTION);
     glPushMatrix();
@@ -355,8 +531,9 @@ NSString* ns_string(const std::filesystem::path& path) {
     double center_x = pan_x_;
     double center_z = pan_z_;
     if (chase_camera_ && simulation_) {
-        center_x = simulation_->state().position.x;
-        center_z = simulation_->state().position.z;
+        const DroneState& state = [self displayState];
+        center_x = state.position.x;
+        center_z = state.position.z;
     }
 
     const double aspect = std::max(0.1, bounds.size.width / std::max(1.0, bounds.size.height));
@@ -379,6 +556,14 @@ NSString* ns_string(const std::filesystem::path& path) {
 }
 
 - (void)keyDown:(NSEvent*)event {
+    if (([event modifierFlags] & NSEventModifierFlagCommand) != 0) {
+        NSString* commandCharacters = [[event charactersIgnoringModifiers] lowercaseString];
+        if ([commandCharacters length] > 0 && [commandCharacters characterAtIndex:0] == 's') {
+            [self saveMission];
+            return;
+        }
+    }
+
     NSString* characters = [[event charactersIgnoringModifiers] lowercaseString];
     if ([characters length] > 0) {
         const unichar key = [characters characterAtIndex:0];
@@ -387,8 +572,69 @@ NSString* ns_string(const std::filesystem::path& path) {
             return;
         }
         if (key == 'r' && simulation_) {
-            simulation_->reset();
+            if (replay_mode_) {
+                replay_time_s_ = 0.0;
+                paused_ = false;
+            } else {
+                simulation_->reset();
+                if (manual_mode_) {
+                    simulation_->set_control_mode(ControlMode::Manual);
+                    simulation_->arm();
+                }
+            }
             trail_.clear();
+            return;
+        }
+        if (key == 'm' && simulation_) {
+            replay_mode_ = false;
+            manual_mode_ = !manual_mode_;
+            simulation_->set_control_mode(manual_mode_ ? ControlMode::Manual : ControlMode::Autopilot);
+            if (manual_mode_) {
+                simulation_->arm();
+            }
+            return;
+        }
+        if (key == 'g') {
+            if (replay_mode_) {
+                replay_mode_ = false;
+                if (simulation_) {
+                    simulation_->set_control_mode(manual_mode_ ? ControlMode::Manual : ControlMode::Autopilot);
+                }
+            } else {
+                [self loadReplay];
+            }
+            return;
+        }
+        if (key == 'w') {
+            key_w_ = true;
+            return;
+        }
+        if (key == 'a') {
+            key_a_ = true;
+            return;
+        }
+        if (key == 's') {
+            key_s_ = true;
+            return;
+        }
+        if (key == 'd') {
+            key_d_ = true;
+            return;
+        }
+        if (key == 'q') {
+            key_q_ = true;
+            return;
+        }
+        if (key == 'e') {
+            key_e_ = true;
+            return;
+        }
+        if (key == 't') {
+            key_t_ = true;
+            return;
+        }
+        if (key == 'l') {
+            key_l_ = true;
             return;
         }
         if (key == 'c') {
@@ -416,17 +662,122 @@ NSString* ns_string(const std::filesystem::path& path) {
             pan_x_ += pan_step;
             break;
         case 125:
-            chase_camera_ = false;
-            pan_z_ -= pan_step;
+            if (manual_mode_) {
+                key_down_ = true;
+            } else {
+                chase_camera_ = false;
+                pan_z_ -= pan_step;
+            }
             break;
         case 126:
-            chase_camera_ = false;
-            pan_z_ += pan_step;
+            if (manual_mode_) {
+                key_up_ = true;
+            } else {
+                chase_camera_ = false;
+                pan_z_ += pan_step;
+            }
             break;
         default:
             [super keyDown:event];
             break;
     }
+}
+
+- (void)keyUp:(NSEvent*)event {
+    NSString* characters = [[event charactersIgnoringModifiers] lowercaseString];
+    if ([characters length] > 0) {
+        const unichar key = [characters characterAtIndex:0];
+        if (key == 'w') {
+            key_w_ = false;
+            return;
+        }
+        if (key == 'a') {
+            key_a_ = false;
+            return;
+        }
+        if (key == 's') {
+            key_s_ = false;
+            return;
+        }
+        if (key == 'd') {
+            key_d_ = false;
+            return;
+        }
+        if (key == 'q') {
+            key_q_ = false;
+            return;
+        }
+        if (key == 'e') {
+            key_e_ = false;
+            return;
+        }
+        if (key == 't') {
+            key_t_ = false;
+            return;
+        }
+        if (key == 'l') {
+            key_l_ = false;
+            return;
+        }
+    }
+
+    switch ([event keyCode]) {
+        case 125:
+            key_down_ = false;
+            break;
+        case 126:
+            key_up_ = false;
+            break;
+        default:
+            [super keyUp:event];
+            break;
+    }
+}
+
+- (void)mouseDown:(NSEvent*)event {
+    if (!simulation_ || replay_mode_) {
+        return;
+    }
+
+    double altitude = 30.0;
+    if (!simulation_->mission().waypoints.empty()) {
+        altitude = simulation_->mission().waypoints.back().position.y;
+    }
+
+    const Vec3 point = [self worldPointFromEvent:event altitude:altitude];
+    const int nearest = [self nearestWaypointIndex:point maxDistance:(zoom_m_ * 0.035)];
+
+    if (([event modifierFlags] & NSEventModifierFlagOption) != 0) {
+        [self deleteWaypointAtIndex:nearest];
+        return;
+    }
+
+    if (nearest >= 0) {
+        selected_waypoint_ = nearest;
+        dragging_waypoint_ = true;
+    } else {
+        [self addWaypointAt:point];
+        dragging_waypoint_ = true;
+    }
+}
+
+- (void)mouseDragged:(NSEvent*)event {
+    if (!simulation_ || selected_waypoint_ < 0 || !dragging_waypoint_) {
+        return;
+    }
+
+    auto& waypoints = simulation_->mutable_mission().waypoints;
+    if (static_cast<std::size_t>(selected_waypoint_) >= waypoints.size()) {
+        return;
+    }
+
+    const double altitude = waypoints[static_cast<std::size_t>(selected_waypoint_)].position.y;
+    waypoints[static_cast<std::size_t>(selected_waypoint_)].position = [self worldPointFromEvent:event altitude:altitude];
+}
+
+- (void)mouseUp:(NSEvent*)event {
+    (void)event;
+    dragging_waypoint_ = false;
 }
 
 - (void)scrollWheel:(NSEvent*)event {
