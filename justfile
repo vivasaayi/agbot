@@ -14,6 +14,9 @@ help:
     @echo ""
     @echo "Build:"
     @echo "  build     - Build all workspace members"
+    @echo "  flight-sim-build - Build C++ FlightSim"
+    @echo "  flight-sim-test - Test C++ FlightSim"
+    @echo "  flight-sim-run - Run C++ FlightSim viewer"
     @echo "  check     - Check code without building"
     @echo "  test      - Run tests"
     @echo "  gis-test  - Run fast GIS regression suite"
@@ -54,6 +57,22 @@ build:
 build-release:
     @echo "🔨 Building release version..."
     cargo build --release
+
+# Build the standalone C++ flight simulator
+flight-sim-build:
+    @echo "🛩️ Building AgBot FlightSim C++..."
+    cmake -S flight_sim_cpp -B flight_sim_cpp/build
+    cmake --build flight_sim_cpp/build
+
+# Test the standalone C++ flight simulator
+flight-sim-test: flight-sim-build
+    @echo "🧪 Testing AgBot FlightSim C++..."
+    ctest --test-dir flight_sim_cpp/build --output-on-failure
+
+# Run the macOS OpenGL FlightSim viewer
+flight-sim-run: flight-sim-build
+    @echo "🛩️ Starting AgBot FlightSim viewer..."
+    flight_sim_cpp/build/agbot_flight_sim_viewer
 
 # Check code
 check:
@@ -159,34 +178,7 @@ watch:
 sample-mission:
     @echo "📋 Generating sample mission..."
     @mkdir -p missions
-    @cat > missions/sample_mission.json << 'EOF'
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "name": "Sample Survey Mission",
-  "created_at": "2024-01-01T12:00:00Z",
-  "home_position": {
-    "latitude": 37.7749,
-    "longitude": -122.4194,
-    "altitude": 100.0
-  },
-  "waypoints": [
-    {
-      "sequence": 0,
-      "position": {"latitude": 37.7750, "longitude": -122.4195, "altitude": 100.0},
-      "command": 16,
-      "auto_continue": true,
-      "param1": 0.0, "param2": 0.0, "param3": 0.0, "param4": 0.0
-    },
-    {
-      "sequence": 1,
-      "position": {"latitude": 37.7751, "longitude": -122.4195, "altitude": 100.0},
-      "command": 16,
-      "auto_continue": true,
-      "param1": 0.0, "param2": 0.0, "param3": 0.0, "param4": 0.0
-    }
-  ]
-}
-EOF
+    @cp mission_planner/samples/sample_mission.json missions/sample_mission.json
     @echo "✅ Sample mission created at missions/sample_mission.json"
 
 # Show project status

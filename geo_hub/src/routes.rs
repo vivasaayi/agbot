@@ -178,6 +178,7 @@ pub struct MobileAnalyzeRequest {
     pub products: Option<Vec<String>>,
     pub source: Option<String>,
     pub external_scene_id: Option<String>,
+    pub selected_scene: Option<MobileSceneCandidate>,
     pub field_geometry: Option<serde_json::Value>,
 }
 
@@ -187,6 +188,7 @@ pub struct MobileSceneSearchRequest {
     pub longitude: f64,
     pub date: Option<String>,
     pub days: Option<u8>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,13 +197,16 @@ pub struct MobileSceneSearchResponse {
     pub search_days: u8,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MobileSceneCandidate {
     pub external_scene_id: String,
+    pub dataset: String,
+    pub dataset_label: String,
     pub provider: String,
     pub collection: String,
     pub acquired_at: String,
     pub cloud_cover: Option<f64>,
+    pub resolution_m: f64,
     pub asset_count: usize,
 }
 
@@ -212,9 +217,12 @@ pub struct MobileAnalyzeResponse {
     pub sensor: String,
     pub acquired_at: String,
     pub source: String,
+    pub dataset: Option<String>,
+    pub dataset_label: Option<String>,
     pub provider: Option<String>,
     pub collection: Option<String>,
     pub cloud_cover: Option<f64>,
+    pub resolution_m: Option<f64>,
     pub asset_count: usize,
     pub search_days: u8,
     pub real_products_ready: bool,
@@ -246,12 +254,20 @@ pub async fn mobile_search_scenes(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| chrono::Utc::now().date_naive().to_string());
     let requested_days = request.days.unwrap_or(14).clamp(1, 30);
+    let source_mode = normalize_source_mode(request.source.as_deref());
     let mut search_days = requested_days;
     let mut candidates = Vec::new();
+    if source_mode == "sample" {
+        return Ok(Json(MobileSceneSearchResponse {
+            scenes: Vec::new(),
+            search_days,
+        }));
+    }
 
     for window_days in expanded_landsat_windows(requested_days) {
         search_days = window_days;
-        match landsat::search_scenes(
+        match landsat::search_scenes_for_source(
+            &source_mode,
             request.latitude,
             request.longitude,
             &target_date,
@@ -266,7 +282,7 @@ pub async fn mobile_search_scenes(
             }
             Ok(_) => continue,
             Err(err) => {
-                tracing::warn!(error = %err, "real Landsat scene search failed");
+                tracing::warn!(error = %err, "real satellite scene search failed");
                 return Err(AppError::Anyhow(err));
             }
         }
@@ -290,21 +306,34 @@ pub async fn mobile_analyze(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| chrono::Utc::now().date_naive().to_string());
     let requested_days = request.days.unwrap_or(14).clamp(1, 30);
-    let source_mode = request
-        .source
-        .as_deref()
-        .unwrap_or("landsat")
-        .trim()
-        .to_lowercase();
+    let source_mode = request.source.as_deref();
+    let source_mode = normalize_source_mode(source_mode);
     let field_geometry = normalize_field_geometry(request.field_geometry.as_ref())?;
     let mut search_days = requested_days;
+    let selected_candidate = request
+        .selected_scene
+        .as_ref()
+        .map(candidate_from_mobile_scene);
+    if let (Some(selected_id), Some(candidate)) = (
+        request.external_scene_id.as_deref(),
+        selected_candidate.as_ref(),
+    ) {
+        if selected_id != candidate.item_id {
+            return Err(AppError::BadRequest(
+                "selected scene payload does not match selected scene id".to_string(),
+            ));
+        }
+    }
     let landsat_candidate = if source_mode == "sample" {
         None
+    } else if selected_candidate.is_some() {
+        selected_candidate
     } else {
         let mut found = None;
         for window_days in expanded_landsat_windows(requested_days) {
             search_days = window_days;
-            match landsat::search_best_scene(
+            match landsat::search_best_scene_for_source(
+                &source_mode,
                 request.latitude,
                 request.longitude,
                 &acquired_at,
@@ -318,7 +347,8 @@ pub async fn mobile_analyze(
                         .as_deref()
                         .is_some_and(|selected| selected != candidate.item_id)
                     {
-                        match landsat::search_scenes(
+                        match landsat::search_scenes_for_source(
+                            &source_mode,
                             request.latitude,
                             request.longitude,
                             &acquired_at,
@@ -339,7 +369,7 @@ pub async fn mobile_analyze(
                                 }
                             }
                             Err(err) => {
-                                tracing::warn!(error = %err, "selected Landsat scene lookup failed");
+                                tracing::warn!(error = %err, "selected satellite scene lookup failed");
                                 break;
                             }
                         }
@@ -350,14 +380,14 @@ pub async fn mobile_analyze(
                 }
                 Ok(None) => continue,
                 Err(err) => {
-                    tracing::warn!(error = %err, "real Landsat scene search failed; using sample fallback");
+                    tracing::warn!(error = %err, "real satellite scene search failed; using sample fallback");
                     break;
                 }
             }
         }
         if request.external_scene_id.is_some() && found.is_none() {
             return Err(AppError::BadRequest(
-                "selected Landsat scene was not found for this location and date window"
+                "selected satellite scene was not found for this location and date window"
                     .to_string(),
             ));
         }
@@ -404,12 +434,15 @@ pub async fn mobile_analyze(
     };
     let mut metadata_value = serde_json::to_value(&image).map_err(Error::from)?;
     if let Some(candidate) = &landsat_candidate {
-        metadata_value["landsat_provider"] = serde_json::json!({
+        metadata_value["satellite_provider"] = serde_json::json!({
+            "dataset": candidate.dataset,
+            "dataset_label": candidate.dataset_label,
             "provider": candidate.provider,
             "collection": candidate.collection,
             "item_id": candidate.item_id,
             "acquired_at": candidate.acquired_at,
             "cloud_cover": candidate.cloud_cover,
+            "resolution_m": candidate.resolution_m,
             "assets": candidate.assets,
         });
     }
@@ -433,11 +466,12 @@ pub async fn mobile_analyze(
         "#,
     )
     .bind(&scene_id)
-    .bind(if landsat_candidate.is_some() {
-        "landsat8-stac-rendered-products"
-    } else {
-        "landsat8-simulated"
-    })
+    .bind(
+        landsat_candidate
+            .as_ref()
+            .map(|candidate| format!("{}-stac-rendered-products", candidate.dataset))
+            .unwrap_or_else(|| "landsat8-simulated".to_string()),
+    )
     .bind(
         landsat_candidate
             .as_ref()
@@ -506,14 +540,14 @@ pub async fn mobile_analyze(
     let source = match &landsat_candidate {
         Some(candidate) if search_days > requested_days => {
             format!(
-                "real Landsat scene selected and rendered from {} after expanding search to {} days",
-                candidate.provider, search_days
+                "real {} scene selected and rendered from {} after expanding search to {} days",
+                candidate.dataset_label, candidate.provider, search_days
             )
         }
         Some(candidate) => {
             format!(
-                "real Landsat scene selected and rendered from {}",
-                candidate.provider
+                "real {} scene selected and rendered from {}",
+                candidate.dataset_label, candidate.provider
             )
         }
         None if source_mode == "sample" => {
@@ -526,7 +560,7 @@ pub async fn mobile_analyze(
     };
     let asset_count = landsat_candidate
         .as_ref()
-        .map(|candidate| candidate.assets.len())
+        .map(|candidate| candidate.asset_count)
         .unwrap_or(0);
 
     Ok(Json(MobileAnalyzeResponse {
@@ -535,12 +569,21 @@ pub async fn mobile_analyze(
             .as_ref()
             .map(|candidate| candidate.item_id.clone()),
         sensor: if landsat_candidate.is_some() {
-            "Landsat Collection 2 scene metadata".to_string()
+            landsat_candidate
+                .as_ref()
+                .map(|candidate| candidate.dataset_label.clone())
+                .unwrap_or_else(|| "Satellite scene metadata".to_string())
         } else {
             "Landsat 8 sample backend".to_string()
         },
         acquired_at: response_acquired_at,
         source,
+        dataset: landsat_candidate
+            .as_ref()
+            .map(|candidate| candidate.dataset.clone()),
+        dataset_label: landsat_candidate
+            .as_ref()
+            .map(|candidate| candidate.dataset_label.clone()),
         provider: landsat_candidate
             .as_ref()
             .map(|candidate| candidate.provider.clone()),
@@ -550,6 +593,9 @@ pub async fn mobile_analyze(
         cloud_cover: landsat_candidate
             .as_ref()
             .and_then(|candidate| candidate.cloud_cover),
+        resolution_m: landsat_candidate
+            .as_ref()
+            .map(|candidate| candidate.resolution_m),
         asset_count,
         search_days,
         real_products_ready: landsat_candidate.is_some(),
@@ -610,6 +656,15 @@ fn normalize_field_geometry(
     Ok(Some(geometry.clone()))
 }
 
+fn normalize_source_mode(source: Option<&str>) -> String {
+    match source.unwrap_or("auto").trim().to_lowercase().as_str() {
+        "sample" => "sample".to_string(),
+        "landsat" | "landsat8" | "landsat9" => "landsat".to_string(),
+        "sentinel" | "sentinel2" | "sentinel-2" | "sentinel_2" => "sentinel2".to_string(),
+        _ => "auto".to_string(),
+    }
+}
+
 fn normalize_mobile_products(products: Option<Vec<String>>) -> Vec<String> {
     let requested = products.unwrap_or_else(|| {
         vec![
@@ -651,11 +706,29 @@ fn expanded_landsat_windows(requested_days: u8) -> Vec<u8> {
 fn mobile_scene_candidate(candidate: landsat::LandsatSceneCandidate) -> MobileSceneCandidate {
     MobileSceneCandidate {
         external_scene_id: candidate.item_id,
+        dataset: candidate.dataset,
+        dataset_label: candidate.dataset_label,
         provider: candidate.provider,
         collection: candidate.collection,
         acquired_at: candidate.acquired_at,
         cloud_cover: candidate.cloud_cover,
-        asset_count: candidate.assets.len(),
+        resolution_m: candidate.resolution_m,
+        asset_count: candidate.asset_count,
+    }
+}
+
+fn candidate_from_mobile_scene(scene: &MobileSceneCandidate) -> landsat::LandsatSceneCandidate {
+    landsat::LandsatSceneCandidate {
+        dataset: normalize_source_mode(Some(&scene.dataset)),
+        dataset_label: scene.dataset_label.clone(),
+        provider: scene.provider.clone(),
+        collection: scene.collection.clone(),
+        item_id: scene.external_scene_id.clone(),
+        acquired_at: scene.acquired_at.clone(),
+        cloud_cover: scene.cloud_cover,
+        resolution_m: scene.resolution_m,
+        asset_count: scene.asset_count,
+        assets: BTreeMap::new(),
     }
 }
 
@@ -665,8 +738,8 @@ fn cached_landsat_scene_id(
     longitude: f64,
 ) -> String {
     sanitize_scene_id(&format!(
-        "landsat_{}_{:.5}_{:.5}",
-        candidate.item_id, latitude, longitude
+        "{}_{}_{:.5}_{:.5}",
+        candidate.dataset, candidate.item_id, latitude, longitude
     ))
 }
 
@@ -4027,11 +4100,15 @@ mod tests {
     #[test]
     fn cached_landsat_scene_id_is_stable_and_filesystem_safe() {
         let candidate = landsat::LandsatSceneCandidate {
+            dataset: "landsat".to_string(),
+            dataset_label: "Landsat 8/9 Collection 2".to_string(),
             provider: "Microsoft Planetary Computer".to_string(),
             collection: "landsat-c2-l2".to_string(),
             item_id: "LC09_L2SP_042034_20260601_02_T1".to_string(),
             acquired_at: "2026-06-01T18:32:58Z".to_string(),
             cloud_cover: Some(3.85),
+            resolution_m: 30.0,
+            asset_count: 7,
             assets: BTreeMap::new(),
         };
 

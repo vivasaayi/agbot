@@ -352,7 +352,9 @@
       <label class="wide">
         Imagery Source
         <select id="source">
-          <option value="landsat">Real Landsat products</option>
+          <option value="auto">Best available satellite</option>
+          <option value="sentinel2">Sentinel-2 L2A</option>
+          <option value="landsat">Landsat 8/9</option>
           <option value="sample">Sample products only</option>
         </select>
       </label>
@@ -573,22 +575,23 @@
         return;
       }
 
-      if ($("source").value === "sample") {
+      const source = $("source").value;
+      if (source === "sample") {
         clearScenes();
-        setStatus("Sample mode does not need a Landsat scene.");
+        setStatus("Sample mode does not need a satellite scene.");
         return;
       }
 
       $("searchScenes").disabled = true;
       $("analyze").disabled = true;
-      setStatus("Searching available Landsat scenes...");
+      setStatus("Searching available satellite scenes...");
       renderSceneList([]);
 
       try {
         const response = await fetch("/api/mobile/scenes/search", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ latitude, longitude, date, days })
+          body: JSON.stringify({ latitude, longitude, date, days, source })
         });
         if (!response.ok) throw new Error(await response.text());
         const payload = await response.json();
@@ -596,9 +599,9 @@
         state.selectedSceneId = state.scenes[0]?.external_scene_id || null;
         renderSceneList(state.scenes);
         if (state.selectedSceneId) {
-          setStatus(`${state.scenes.length} Landsat scene${state.scenes.length === 1 ? "" : "s"} found.`);
+          setStatus(`${state.scenes.length} satellite scene${state.scenes.length === 1 ? "" : "s"} found.`);
         } else {
-          setStatus("No Landsat scenes found for this location and window.", "warn");
+          setStatus("No satellite scenes found for this location and window.", "warn");
         }
       } catch (error) {
         setStatus(error.message || "Scene search failed.", "error");
@@ -616,7 +619,8 @@
         button.className = "scene-card" + (scene.external_scene_id === state.selectedSceneId ? " active" : "");
         const cloud = typeof scene.cloud_cover === "number" ? `${scene.cloud_cover.toFixed(1)}% cloud` : "cloud unknown";
         const acquired = formatSceneDate(scene.acquired_at);
-        button.innerHTML = `${escapeHtml(scene.external_scene_id)}<span>${escapeHtml(acquired)} · ${escapeHtml(cloud)} · ${escapeHtml(scene.provider)}</span>`;
+        const resolution = typeof scene.resolution_m === "number" ? `${scene.resolution_m.toFixed(0)}m` : "resolution unknown";
+        button.innerHTML = `${escapeHtml(scene.external_scene_id)}<span>${escapeHtml(scene.dataset_label || scene.collection)} · ${escapeHtml(resolution)} · ${escapeHtml(acquired)} · ${escapeHtml(cloud)}</span>`;
         button.addEventListener("click", () => {
           state.selectedSceneId = scene.external_scene_id;
           renderSceneList(state.scenes);
@@ -632,6 +636,10 @@
       renderSceneList([]);
     }
 
+    function selectedScene() {
+      return state.scenes.find((scene) => scene.external_scene_id === state.selectedSceneId) || null;
+    }
+
     $("analyze").addEventListener("click", async () => {
       const latitude = Number($("lat").value);
       const longitude = Number($("lon").value);
@@ -645,7 +653,7 @@
       }
 
       $("analyze").disabled = true;
-      setStatus(source === "landsat" ? "Searching Landsat and preparing products..." : "Preparing sample products...");
+      setStatus(source === "sample" ? "Preparing sample products..." : "Preparing satellite products...");
       renderLayers([]);
       $("summary").innerHTML = "";
       $("productImage").hidden = true;
@@ -662,6 +670,7 @@
             days,
             source,
             external_scene_id: state.selectedSceneId,
+            selected_scene: selectedScene(),
             field_geometry: fieldGeometry(),
             products: ["ndvi", "ndmi", "nbr", "mndwi", "evi2"]
           })
@@ -672,7 +681,7 @@
         state.response = await response.json();
         state.selected = state.response.products[0]?.kind || null;
         if (state.response.external_scene_id) {
-          setStatus(`Landsat scene ${state.response.external_scene_id} selected.`);
+          setStatus(`${state.response.dataset_label || "Satellite"} scene ${state.response.external_scene_id} selected.`);
         } else {
           setStatus(`Sample scene ${state.response.scene_id} ready.`);
         }
@@ -719,8 +728,10 @@
         ["Acquired", state.response.acquired_at],
       ];
       if (state.response.provider) rows.push(["Provider", state.response.provider]);
+      if (state.response.dataset_label) rows.push(["Dataset", state.response.dataset_label]);
       if (state.response.collection) rows.push(["Collection", state.response.collection]);
-      if (state.response.external_scene_id) rows.push(["Landsat Scene", state.response.external_scene_id]);
+      if (typeof state.response.resolution_m === "number") rows.push(["Resolution", `${state.response.resolution_m.toFixed(0)}m`]);
+      if (state.response.external_scene_id) rows.push(["Satellite Scene", state.response.external_scene_id]);
       if (typeof state.response.cloud_cover === "number") rows.push(["Cloud Cover", `${state.response.cloud_cover.toFixed(1)}%`]);
       if (typeof state.response.asset_count === "number" && state.response.asset_count > 0) rows.push(["Band Assets", state.response.asset_count]);
       if (typeof state.response.search_days === "number") rows.push(["Search Window", `${state.response.search_days} days`]);
