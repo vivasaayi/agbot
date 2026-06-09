@@ -81,6 +81,12 @@
       font-weight: 700;
     }
 
+    .map-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
     #locationMap {
       width: 100%;
       height: 310px;
@@ -310,6 +316,11 @@
         <span>FIELD LOCATION</span>
         <span id="pickedLocation">36.778300, -119.417900</span>
       </div>
+      <div class="map-actions">
+        <button id="drawField" class="secondary">Draw Field</button>
+        <button id="clearField" class="secondary">Clear Field</button>
+      </div>
+      <div id="fieldStatus" class="status">No field boundary selected.</div>
       <div id="locationMap" aria-label="Map location picker"></div>
     </section>
 
@@ -365,7 +376,18 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { response: null, selected: null, scenes: [], selectedSceneId: null, map: null, marker: null };
+    const state = {
+      response: null,
+      selected: null,
+      scenes: [],
+      selectedSceneId: null,
+      map: null,
+      marker: null,
+      fieldMode: false,
+      fieldPoints: [],
+      fieldLayer: null,
+      fieldVertexLayers: []
+    };
 
     $("date").value = new Date().toISOString().slice(0, 10);
     initLocationMap();
@@ -419,7 +441,11 @@
       });
 
       state.map.on("click", (event) => {
-        setPickedLocation(event.latlng.lat, event.latlng.lng, false);
+        if (state.fieldMode) {
+          addFieldPoint(event.latlng);
+        } else {
+          setPickedLocation(event.latlng.lat, event.latlng.lng, false);
+        }
       });
 
       setTimeout(() => state.map.invalidateSize(), 50);
@@ -451,6 +477,87 @@
 
     function updatePickedLocationText(latitude, longitude) {
       $("pickedLocation").textContent = `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
+    }
+
+    $("drawField").addEventListener("click", () => {
+      state.fieldMode = !state.fieldMode;
+      $("drawField").textContent = state.fieldMode ? "Finish Field" : "Draw Field";
+      if (!state.fieldMode && state.fieldPoints.length > 0 && state.fieldPoints.length < 3) {
+        setStatus("Add at least three field points.", "warn");
+      } else if (state.fieldMode) {
+        setStatus("Tap field corners on the map.");
+      } else if (state.fieldPoints.length >= 3) {
+        setStatus("Field boundary ready.");
+      }
+      renderFieldBoundary();
+    });
+
+    $("clearField").addEventListener("click", () => {
+      state.fieldMode = false;
+      state.fieldPoints = [];
+      $("drawField").textContent = "Draw Field";
+      renderFieldBoundary();
+      setStatus("Field boundary cleared.");
+    });
+
+    function addFieldPoint(latlng) {
+      state.fieldPoints.push([latlng.lat, latlng.lng]);
+      renderFieldBoundary();
+      setStatus(state.fieldPoints.length < 3 ? "Add at least three field points." : "Field boundary ready.");
+    }
+
+    function renderFieldBoundary() {
+      if (!state.map) return;
+      if (state.fieldLayer) {
+        state.map.removeLayer(state.fieldLayer);
+        state.fieldLayer = null;
+      }
+      for (const layer of state.fieldVertexLayers) {
+        state.map.removeLayer(layer);
+      }
+      state.fieldVertexLayers = [];
+
+      for (const point of state.fieldPoints) {
+        state.fieldVertexLayers.push(
+          L.circleMarker(point, {
+            radius: 5,
+            color: "#0d5d3b",
+            weight: 2,
+            fillColor: "#ffffff",
+            fillOpacity: 1
+          }).addTo(state.map)
+        );
+      }
+
+      if (state.fieldPoints.length >= 3) {
+        state.fieldLayer = L.polygon(state.fieldPoints, {
+          color: "#197a4f",
+          weight: 2,
+          fillColor: "#197a4f",
+          fillOpacity: 0.18
+        }).addTo(state.map);
+        $("fieldStatus").textContent = `${state.fieldPoints.length} point field boundary selected.`;
+      } else if (state.fieldPoints.length > 1) {
+        state.fieldLayer = L.polyline(state.fieldPoints, {
+          color: "#197a4f",
+          weight: 2,
+          dashArray: "4 4"
+        }).addTo(state.map);
+        $("fieldStatus").textContent = `${state.fieldPoints.length} field points selected.`;
+      } else {
+        $("fieldStatus").textContent = "No field boundary selected.";
+      }
+    }
+
+    function fieldGeometry() {
+      if (state.fieldPoints.length < 3) return null;
+      const ring = state.fieldPoints.map(([lat, lon]) => [lon, lat]);
+      const first = ring[0];
+      const last = ring[ring.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) {
+        ring.push(first);
+      }
+      return { type: "Polygon", coordinates: [ring] };
     }
 
     $("searchScenes").addEventListener("click", searchScenes);
@@ -555,6 +662,7 @@
             days,
             source,
             external_scene_id: state.selectedSceneId,
+            field_geometry: fieldGeometry(),
             products: ["ndvi", "ndmi", "nbr", "mndwi", "evi2"]
           })
         });
@@ -619,6 +727,10 @@
       if (typeof stats.mean === "number") rows.push(["Mean", stats.mean.toFixed(3)]);
       if (typeof stats.min === "number") rows.push(["Min", stats.min.toFixed(3)]);
       if (typeof stats.max === "number") rows.push(["Max", stats.max.toFixed(3)]);
+      if (stats.summary_scope) rows.push(["Summary Area", stats.summary_scope === "field_aoi" ? "Field boundary" : "Full scene"]);
+      if (typeof stats.valid_percent === "number") rows.push(["Valid Pixels", `${stats.valid_percent.toFixed(1)}%`]);
+      if (typeof stats.masked_pixels === "number") rows.push(["Masked Pixels", Math.round(stats.masked_pixels).toLocaleString()]);
+      if (product.kind === "ndvi" && typeof stats.mean === "number") rows.push(["NDVI Status", ndviStatus(stats.mean)]);
       rows.push(["Tile URL", product.tile_url_template.replace("{z}", "0").replace("{x}", "0").replace("{y}", "0")]);
 
       const note = state.response.real_products_ready ? "" :
@@ -638,6 +750,13 @@
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return value;
       return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+    }
+
+    function ndviStatus(mean) {
+      if (mean < 0.1) return "Bare or very low vegetation";
+      if (mean < 0.25) return "Low vegetation";
+      if (mean < 0.45) return "Moderate vegetation";
+      return "Strong vegetation";
     }
 
     function escapeHtml(value) {

@@ -20,7 +20,10 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(routes::mobile_app))
         .route("/app", get(routes::mobile_app))
-        .route("/api/mobile/scenes/search", post(routes::mobile_search_scenes))
+        .route(
+            "/api/mobile/scenes/search",
+            post(routes::mobile_search_scenes),
+        )
         .route("/api/mobile/analyze", post(routes::mobile_analyze))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))

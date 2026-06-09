@@ -178,6 +178,7 @@ pub struct MobileAnalyzeRequest {
     pub products: Option<Vec<String>>,
     pub source: Option<String>,
     pub external_scene_id: Option<String>,
+    pub field_geometry: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,10 +273,7 @@ pub async fn mobile_search_scenes(
     }
 
     Ok(Json(MobileSceneSearchResponse {
-        scenes: candidates
-            .into_iter()
-            .map(mobile_scene_candidate)
-            .collect(),
+        scenes: candidates.into_iter().map(mobile_scene_candidate).collect(),
         search_days,
     }))
 }
@@ -298,6 +296,7 @@ pub async fn mobile_analyze(
         .unwrap_or("landsat")
         .trim()
         .to_lowercase();
+    let field_geometry = normalize_field_geometry(request.field_geometry.as_ref())?;
     let mut search_days = requested_days;
     let landsat_candidate = if source_mode == "sample" {
         None
@@ -414,6 +413,9 @@ pub async fn mobile_analyze(
             "assets": candidate.assets,
         });
     }
+    if let Some(geometry) = &field_geometry {
+        metadata_value["field_geometry"] = geometry.clone();
+    }
     let metadata_json = serde_json::to_string_pretty(&metadata_value).map_err(Error::from)?;
     fs::write(scene_dir.join("metadata_ingested.json"), &metadata_json)
         .await
@@ -456,19 +458,32 @@ pub async fn mobile_analyze(
 
     let mut mobile_products = Vec::new();
     if let Some(candidate) = &landsat_candidate {
-        let rgb_path = create_real_landsat_product(&state, &scene_id, &scene_dir, candidate, "rgb")
-            .await?;
+        let (rgb_path, rgb_stats) = create_real_landsat_product(
+            &state,
+            &scene_id,
+            &scene_dir,
+            candidate,
+            "rgb",
+            field_geometry.as_ref(),
+        )
+        .await?;
         mobile_products.push(mobile_product_from_kind(
             &scene_id,
             "rgb",
-            read_product_stats(&rgb_path).await?,
+            rgb_stats.or(read_product_stats(&rgb_path).await?),
         ));
 
         for kind in products {
-            let product_path =
-                create_real_landsat_product(&state, &scene_id, &scene_dir, candidate, &kind)
-                    .await?;
-            let stats = read_product_stats(&product_path).await?;
+            let (product_path, request_stats) = create_real_landsat_product(
+                &state,
+                &scene_id,
+                &scene_dir,
+                candidate,
+                &kind,
+                field_geometry.as_ref(),
+            )
+            .await?;
+            let stats = request_stats.or(read_product_stats(&product_path).await?);
             mobile_products.push(mobile_product_from_kind(&scene_id, &kind, stats));
         }
     } else {
@@ -560,6 +575,39 @@ fn validate_lat_lon(latitude: f64, longitude: f64) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+fn normalize_field_geometry(
+    geometry: Option<&serde_json::Value>,
+) -> AppResult<Option<serde_json::Value>> {
+    let Some(value) = geometry else {
+        return Ok(None);
+    };
+
+    let geometry = if value.get("type").and_then(|item| item.as_str()) == Some("Feature") {
+        value.get("geometry").ok_or_else(|| {
+            AppError::BadRequest("field GeoJSON feature must include geometry".to_string())
+        })?
+    } else {
+        value
+    };
+    let Some(geometry_type) = geometry.get("type").and_then(|item| item.as_str()) else {
+        return Err(AppError::BadRequest(
+            "field geometry must include a GeoJSON type".to_string(),
+        ));
+    };
+    if !matches!(geometry_type, "Polygon" | "MultiPolygon") {
+        return Err(AppError::BadRequest(
+            "field geometry must be a Polygon or MultiPolygon".to_string(),
+        ));
+    }
+    if geometry.get("coordinates").is_none() {
+        return Err(AppError::BadRequest(
+            "field geometry must include coordinates".to_string(),
+        ));
+    }
+
+    Ok(Some(geometry.clone()))
 }
 
 fn normalize_mobile_products(products: Option<Vec<String>>) -> Vec<String> {
@@ -887,7 +935,8 @@ async fn create_real_landsat_product(
     scene_dir: &FsPath,
     candidate: &landsat::LandsatSceneCandidate,
     kind: &str,
-) -> AppResult<PathBuf> {
+    field_geometry: Option<&serde_json::Value>,
+) -> AppResult<(PathBuf, Option<serde_json::Value>)> {
     let kind = kind.to_lowercase();
     let product_dir = scene_dir.join("products").join(&kind);
     fs::create_dir_all(&product_dir)
@@ -897,7 +946,14 @@ async fn create_real_landsat_product(
     let product_path = product_dir.join(format!("{kind}.png"));
     if product_path.exists() {
         upsert_product_path(state, scene_id, &kind, &product_path).await?;
-        return Ok(product_path);
+        let stats = if field_geometry.is_some() {
+            landsat::product_statistics(candidate, &kind, field_geometry)
+                .await
+                .map_err(AppError::Anyhow)?
+        } else {
+            None
+        };
+        return Ok((product_path, stats));
     }
 
     let bytes = landsat::render_product_png(candidate, &kind)
@@ -908,30 +964,32 @@ async fn create_real_landsat_product(
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?;
 
-    if let Some(mut stats) = landsat::product_statistics(candidate, &kind)
+    let request_stats = landsat::product_statistics(candidate, &kind, field_geometry)
         .await
-        .map_err(AppError::Anyhow)?
-    {
-        if let Some(object) = stats.as_object_mut() {
-            object.insert(
-                "output_path".to_string(),
-                serde_json::Value::String(product_path.to_string_lossy().to_string()),
-            );
-            object.insert(
-                "timestamp".to_string(),
-                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-            );
+        .map_err(AppError::Anyhow)?;
+    if field_geometry.is_none() {
+        if let Some(mut stats) = request_stats.clone() {
+            if let Some(object) = stats.as_object_mut() {
+                object.insert(
+                    "output_path".to_string(),
+                    serde_json::Value::String(product_path.to_string_lossy().to_string()),
+                );
+                object.insert(
+                    "timestamp".to_string(),
+                    serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+                );
+            }
+            let stats_path = product_dir.join(format!("{kind}_result.json"));
+            let stats_json = serde_json::to_string_pretty(&stats).map_err(Error::from)?;
+            fs::write(stats_path, stats_json)
+                .await
+                .map_err(|err| AppError::Anyhow(err.into()))?;
         }
-        let stats_path = product_dir.join(format!("{kind}_result.json"));
-        let stats_json = serde_json::to_string_pretty(&stats).map_err(Error::from)?;
-        fs::write(stats_path, stats_json)
-            .await
-            .map_err(|err| AppError::Anyhow(err.into()))?;
     }
 
     upsert_product_path(state, scene_id, &kind, &product_path).await?;
 
-    Ok(product_path)
+    Ok((product_path, request_stats))
 }
 
 async fn upsert_product_path(
@@ -3684,12 +3742,15 @@ async fn load_scene_metadata(
 mod tests {
     use super::{
         build_field_record, build_geospatial_metadata, build_product_summary,
-        content_type_for_path, is_missing_scene_error, is_png, AppError, CreateFieldRequest,
+        cached_landsat_scene_id, content_type_for_path, is_missing_scene_error, is_png,
+        normalize_field_geometry, AppError, CreateFieldRequest,
     };
+    use crate::landsat;
     use shared::schemas::{
         FieldBoundary, GeoBounds, GeoPoint, GpsCoords, ImageMetadata, MultispectralImage,
         RasterSpatialRef,
     };
+    use std::collections::BTreeMap;
     use std::path::Path;
     use uuid::Uuid;
 
@@ -3922,5 +3983,63 @@ mod tests {
         .expect_err("invalid coordinates should be rejected");
 
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn normalize_field_geometry_accepts_polygon_feature() {
+        let feature = serde_json::json!({
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-119.45, 36.74],
+                    [-119.38, 36.74],
+                    [-119.38, 36.81],
+                    [-119.45, 36.74]
+                ]]
+            }
+        });
+
+        let geometry = normalize_field_geometry(Some(&feature))
+            .expect("field geometry should be accepted")
+            .expect("geometry should be returned");
+
+        assert_eq!(
+            geometry.get("type").and_then(|value| value.as_str()),
+            Some("Polygon")
+        );
+    }
+
+    #[test]
+    fn normalize_field_geometry_rejects_points() {
+        let point = serde_json::json!({
+            "type": "Point",
+            "coordinates": [-119.45, 36.74]
+        });
+
+        let err = normalize_field_geometry(Some(&point))
+            .expect_err("point geometry should not be accepted as a field");
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn cached_landsat_scene_id_is_stable_and_filesystem_safe() {
+        let candidate = landsat::LandsatSceneCandidate {
+            provider: "Microsoft Planetary Computer".to_string(),
+            collection: "landsat-c2-l2".to_string(),
+            item_id: "LC09_L2SP_042034_20260601_02_T1".to_string(),
+            acquired_at: "2026-06-01T18:32:58Z".to_string(),
+            cloud_cover: Some(3.85),
+            assets: BTreeMap::new(),
+        };
+
+        let scene_id = cached_landsat_scene_id(&candidate, 36.7783, -119.4179);
+
+        assert_eq!(
+            scene_id,
+            "landsat_lc09_l2sp_042034_20260601_02_t1_36_77830__119_41790"
+        );
     }
 }

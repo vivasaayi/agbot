@@ -96,7 +96,8 @@ pub async fn search_scenes(
 }
 
 pub async fn render_product_png(scene: &LandsatSceneCandidate, kind: &str) -> Result<Vec<u8>> {
-    let render = product_render(kind).ok_or_else(|| anyhow!("unsupported Landsat product: {kind}"))?;
+    let render =
+        product_render(kind).ok_or_else(|| anyhow!("unsupported Landsat product: {kind}"))?;
     let mut url = reqwest::Url::parse(&format!("{PLANETARY_COMPUTER_DATA_ITEM}/preview.png"))?;
     {
         let mut query = url.query_pairs_mut();
@@ -107,7 +108,10 @@ pub async fn render_product_png(scene: &LandsatSceneCandidate, kind: &str) -> Re
             .append_pair("width", "512")
             .append_pair("height", "512");
         match render {
-            ProductRender::Assets { assets, color_formula } => {
+            ProductRender::Assets {
+                assets,
+                color_formula,
+            } => {
                 for asset in assets {
                     query.append_pair("assets", asset);
                 }
@@ -115,7 +119,10 @@ pub async fn render_product_png(scene: &LandsatSceneCandidate, kind: &str) -> Re
                     query.append_pair("color_formula", color_formula);
                 }
             }
-            ProductRender::Expression { expression, colormap_name } => {
+            ProductRender::Expression {
+                expression,
+                colormap_name,
+            } => {
                 query
                     .append_pair("expression", expression)
                     .append_pair("asset_as_band", "true")
@@ -135,7 +142,9 @@ pub async fn render_product_png(scene: &LandsatSceneCandidate, kind: &str) -> Re
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Landsat {kind} render failed with {status}: {text}"));
+        return Err(anyhow!(
+            "Landsat {kind} render failed with {status}: {text}"
+        ));
     }
 
     Ok(response.bytes().await?.to_vec())
@@ -144,6 +153,7 @@ pub async fn render_product_png(scene: &LandsatSceneCandidate, kind: &str) -> Re
 pub async fn product_statistics(
     scene: &LandsatSceneCandidate,
     kind: &str,
+    geometry: Option<&serde_json::Value>,
 ) -> Result<Option<serde_json::Value>> {
     let Some(ProductRender::Expression { expression, .. }) = product_render(kind) else {
         return Ok(None);
@@ -160,8 +170,18 @@ pub async fn product_statistics(
             .append_pair("max_size", "512");
     }
 
-    let response = reqwest::Client::new()
-        .get(url)
+    let client = reqwest::Client::new();
+    let request = if let Some(geometry) = geometry {
+        let feature = json!({
+            "type": "Feature",
+            "properties": {},
+            "geometry": geometry,
+        });
+        client.post(url).json(&feature)
+    } else {
+        client.get(url)
+    };
+    let response = request
         .header(reqwest::header::USER_AGENT, "agbot-geo-hub/0.1")
         .send()
         .await
@@ -169,15 +189,13 @@ pub async fn product_statistics(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Landsat {kind} statistics failed with {status}: {text}"));
+        return Err(anyhow!(
+            "Landsat {kind} statistics failed with {status}: {text}"
+        ));
     }
 
     let value: serde_json::Value = response.json().await?;
-    let Some(stats) = value
-        .as_object()
-        .and_then(|object| object.values().next())
-        .cloned()
-    else {
+    let Some(stats) = extract_statistics_value(&value).cloned() else {
         return Ok(None);
     };
     Ok(Some(json!({
@@ -186,11 +204,25 @@ pub async fn product_statistics(
         "max": stats.get("max").cloned().unwrap_or(serde_json::Value::Null),
         "mean": stats.get("mean").cloned().unwrap_or(serde_json::Value::Null),
         "std": stats.get("std").cloned().unwrap_or(serde_json::Value::Null),
+        "count": stats.get("count").cloned().unwrap_or(serde_json::Value::Null),
+        "masked_pixels": stats.get("masked_pixels").cloned().unwrap_or(serde_json::Value::Null),
         "valid_percent": stats.get("valid_percent").cloned().unwrap_or(serde_json::Value::Null),
         "valid_pixels": stats.get("valid_pixels").cloned().unwrap_or(serde_json::Value::Null),
+        "percentile_2": stats.get("percentile_2").cloned().unwrap_or(serde_json::Value::Null),
+        "percentile_98": stats.get("percentile_98").cloned().unwrap_or(serde_json::Value::Null),
+        "summary_scope": if geometry.is_some() { "field_aoi" } else { "scene" },
         "source_scene": scene.item_id,
         "provider": scene.provider,
     })))
+}
+
+fn extract_statistics_value(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value
+        .get("properties")
+        .and_then(|properties| properties.get("statistics"))
+        .and_then(|statistics| statistics.as_object())
+        .and_then(|object| object.values().next())
+        .or_else(|| value.as_object().and_then(|object| object.values().next()))
 }
 
 enum ProductRender {
@@ -257,7 +289,9 @@ fn product_render(kind: &str) -> Option<ProductRender> {
 impl LandsatSceneCandidate {
     fn try_from_feature(feature: StacFeature) -> Option<Self> {
         let item_id = feature.id;
-        let collection = feature.collection.unwrap_or_else(|| "landsat-c2-l2".to_string());
+        let collection = feature
+            .collection
+            .unwrap_or_else(|| "landsat-c2-l2".to_string());
         let acquired_at = feature
             .properties
             .datetime
