@@ -25,6 +25,19 @@ pub async fn search_best_scene(
     target_date: &str,
     days: u8,
 ) -> Result<Option<LandsatSceneCandidate>> {
+    Ok(search_scenes(latitude, longitude, target_date, days, 10)
+        .await?
+        .into_iter()
+        .next())
+}
+
+pub async fn search_scenes(
+    latitude: f64,
+    longitude: f64,
+    target_date: &str,
+    days: u8,
+    limit: usize,
+) -> Result<Vec<LandsatSceneCandidate>> {
     let date = NaiveDate::parse_from_str(target_date, "%Y-%m-%d")
         .with_context(|| format!("invalid target date: {target_date}"))?;
     let half_window = i64::from(days.saturating_sub(1)) / 2;
@@ -39,7 +52,7 @@ pub async fn search_best_scene(
             "coordinates": [longitude, latitude]
         },
         "datetime": datetime,
-        "limit": 10,
+        "limit": limit.clamp(1, 25),
         "query": {
             "eo:cloud_cover": { "lt": 85.0 }
         }
@@ -79,7 +92,7 @@ pub async fn search_best_scene(
             .then_with(|| left.acquired_at.cmp(&right.acquired_at))
     });
 
-    Ok(candidates.into_iter().next())
+    Ok(candidates)
 }
 
 pub async fn render_product_png(scene: &LandsatSceneCandidate, kind: &str) -> Result<Vec<u8>> {

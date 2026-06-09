@@ -177,6 +177,31 @@ pub struct MobileAnalyzeRequest {
     pub days: Option<u8>,
     pub products: Option<Vec<String>>,
     pub source: Option<String>,
+    pub external_scene_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MobileSceneSearchRequest {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub date: Option<String>,
+    pub days: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MobileSceneSearchResponse {
+    pub scenes: Vec<MobileSceneCandidate>,
+    pub search_days: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MobileSceneCandidate {
+    pub external_scene_id: String,
+    pub provider: String,
+    pub collection: String,
+    pub acquired_at: String,
+    pub cloud_cover: Option<f64>,
+    pub asset_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,6 +233,51 @@ pub struct MobileProduct {
 
 pub async fn mobile_app() -> Html<&'static str> {
     Html(MOBILE_APP_HTML)
+}
+
+pub async fn mobile_search_scenes(
+    Json(request): Json<MobileSceneSearchRequest>,
+) -> AppResult<Json<MobileSceneSearchResponse>> {
+    validate_lat_lon(request.latitude, request.longitude)?;
+
+    let target_date = request
+        .date
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| chrono::Utc::now().date_naive().to_string());
+    let requested_days = request.days.unwrap_or(14).clamp(1, 30);
+    let mut search_days = requested_days;
+    let mut candidates = Vec::new();
+
+    for window_days in expanded_landsat_windows(requested_days) {
+        search_days = window_days;
+        match landsat::search_scenes(
+            request.latitude,
+            request.longitude,
+            &target_date,
+            window_days,
+            5,
+        )
+        .await
+        {
+            Ok(found) if !found.is_empty() => {
+                candidates = found;
+                break;
+            }
+            Ok(_) => continue,
+            Err(err) => {
+                tracing::warn!(error = %err, "real Landsat scene search failed");
+                return Err(AppError::Anyhow(err));
+            }
+        }
+    }
+
+    Ok(Json(MobileSceneSearchResponse {
+        scenes: candidates
+            .into_iter()
+            .map(mobile_scene_candidate)
+            .collect(),
+        search_days,
+    }))
 }
 
 pub async fn mobile_analyze(
@@ -244,8 +314,40 @@ pub async fn mobile_analyze(
             .await
             {
                 Ok(Some(candidate)) => {
-                    found = Some(candidate);
-                    break;
+                    if request
+                        .external_scene_id
+                        .as_deref()
+                        .is_some_and(|selected| selected != candidate.item_id)
+                    {
+                        match landsat::search_scenes(
+                            request.latitude,
+                            request.longitude,
+                            &acquired_at,
+                            window_days,
+                            10,
+                        )
+                        .await
+                        {
+                            Ok(candidates) => {
+                                found = candidates.into_iter().find(|candidate| {
+                                    request
+                                        .external_scene_id
+                                        .as_deref()
+                                        .is_some_and(|selected| selected == candidate.item_id)
+                                });
+                                if found.is_some() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "selected Landsat scene lookup failed");
+                                break;
+                            }
+                        }
+                    } else {
+                        found = Some(candidate);
+                        break;
+                    }
                 }
                 Ok(None) => continue,
                 Err(err) => {
@@ -254,18 +356,29 @@ pub async fn mobile_analyze(
                 }
             }
         }
+        if request.external_scene_id.is_some() && found.is_none() {
+            return Err(AppError::BadRequest(
+                "selected Landsat scene was not found for this location and date window"
+                    .to_string(),
+            ));
+        }
         found
     };
-    let scene_id = format!(
-        "mobile_{:.5}_{:.5}_{}_{}d_{}",
-        request.latitude,
-        request.longitude,
-        acquired_at.replace('-', ""),
-        search_days,
-        Uuid::new_v4().simple()
-    )
-    .replace('.', "p")
-    .replace('-', "m");
+    let scene_id = landsat_candidate
+        .as_ref()
+        .map(|candidate| cached_landsat_scene_id(candidate, request.latitude, request.longitude))
+        .unwrap_or_else(|| {
+            format!(
+                "mobile_{:.5}_{:.5}_{}_{}d_{}",
+                request.latitude,
+                request.longitude,
+                acquired_at.replace('-', ""),
+                search_days,
+                Uuid::new_v4().simple()
+            )
+            .replace('.', "p")
+            .replace('-', "m")
+        });
 
     let scene_dir = state.config.data_root.join("scenes").join(&scene_id);
     fs::create_dir_all(&scene_dir)
@@ -485,6 +598,43 @@ fn expanded_landsat_windows(requested_days: u8) -> Vec<u8> {
         }
     }
     windows
+}
+
+fn mobile_scene_candidate(candidate: landsat::LandsatSceneCandidate) -> MobileSceneCandidate {
+    MobileSceneCandidate {
+        external_scene_id: candidate.item_id,
+        provider: candidate.provider,
+        collection: candidate.collection,
+        acquired_at: candidate.acquired_at,
+        cloud_cover: candidate.cloud_cover,
+        asset_count: candidate.assets.len(),
+    }
+}
+
+fn cached_landsat_scene_id(
+    candidate: &landsat::LandsatSceneCandidate,
+    latitude: f64,
+    longitude: f64,
+) -> String {
+    sanitize_scene_id(&format!(
+        "landsat_{}_{:.5}_{:.5}",
+        candidate.item_id, latitude, longitude
+    ))
+}
+
+fn sanitize_scene_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
 }
 
 fn extent_around(latitude: f64, longitude: f64, half_size_degrees: f64) -> SceneExtent {
@@ -744,11 +894,16 @@ async fn create_real_landsat_product(
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?;
 
+    let product_path = product_dir.join(format!("{kind}.png"));
+    if product_path.exists() {
+        upsert_product_path(state, scene_id, &kind, &product_path).await?;
+        return Ok(product_path);
+    }
+
     let bytes = landsat::render_product_png(candidate, &kind)
         .await
         .map_err(AppError::Anyhow)?;
     image::load_from_memory(&bytes).map_err(|err| AppError::Anyhow(err.into()))?;
-    let product_path = product_dir.join(format!("{kind}.png"));
     fs::write(&product_path, bytes)
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?;
@@ -774,6 +929,17 @@ async fn create_real_landsat_product(
             .map_err(|err| AppError::Anyhow(err.into()))?;
     }
 
+    upsert_product_path(state, scene_id, &kind, &product_path).await?;
+
+    Ok(product_path)
+}
+
+async fn upsert_product_path(
+    state: &AppState,
+    scene_id: &str,
+    kind: &str,
+    product_path: &FsPath,
+) -> AppResult<()> {
     sqlx::query(
         r#"
         INSERT INTO products (scene_id, kind, path, created_at)
@@ -783,13 +949,13 @@ async fn create_real_landsat_product(
         "#,
     )
     .bind(scene_id)
-    .bind(&kind)
+    .bind(kind)
     .bind(product_path.to_string_lossy().to_string())
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
 
-    Ok(product_path)
+    Ok(())
 }
 
 async fn read_product_stats(product_path: &FsPath) -> AppResult<Option<serde_json::Value>> {
