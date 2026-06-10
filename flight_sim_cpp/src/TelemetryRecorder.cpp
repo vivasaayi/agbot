@@ -16,7 +16,15 @@ TelemetryRecorder::TelemetryRecorder(const std::filesystem::path& output_path) {
     }
 }
 
+TelemetryRecorder::~TelemetryRecorder() {
+    close();
+}
+
 void TelemetryRecorder::write_sample(const DroneState& state) {
+    if (!stream_) {
+        throw std::runtime_error("Telemetry recorder is not open");
+    }
+
     stream_ << std::fixed << std::setprecision(3)
             << "{\"time_s\":" << state.mission_time_s
             << ",\"mode\":\"" << to_string(state.mode) << "\""
@@ -35,8 +43,14 @@ void TelemetryRecorder::write_sample(const DroneState& state) {
 }
 
 void TelemetryRecorder::close() {
-    stream_.flush();
-    stream_.close();
+    if (stream_.is_open()) {
+        stream_.flush();
+        stream_.close();
+    }
+}
+
+bool TelemetryRecorder::is_open() const {
+    return stream_.is_open();
 }
 
 } // namespace agbot::flight_sim

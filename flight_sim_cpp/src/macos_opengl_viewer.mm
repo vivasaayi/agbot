@@ -3,9 +3,12 @@
 
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -21,6 +24,7 @@ using agbot::flight_sim::DroneState;
 using agbot::flight_sim::ControlMode;
 using agbot::flight_sim::ManualControlInput;
 using agbot::flight_sim::MissionLoader;
+using agbot::flight_sim::TelemetryRecorder;
 using agbot::flight_sim::TelemetryReplay;
 using agbot::flight_sim::Vec3;
 using agbot::flight_sim::Waypoint;
@@ -96,11 +100,70 @@ NSString* ns_string(const std::filesystem::path& path) {
     return [NSString stringWithUTF8String:path.string().c_str()];
 }
 
+NSString* ns_string(const std::string& text) {
+    return [NSString stringWithUTF8String:text.c_str()];
+}
+
+std::filesystem::path telemetry_latest_path() {
+    return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "out" / "telemetry.jsonl";
+}
+
+std::filesystem::path telemetry_runs_dir() {
+    return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "out" / "runs";
+}
+
+std::string timestamp_for_filename() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time {};
+    localtime_r(&now_time, &local_time);
+
+    std::ostringstream output;
+    output << std::put_time(&local_time, "%Y%m%d_%H%M%S");
+    return output.str();
+}
+
+std::filesystem::path telemetry_run_path() {
+    return telemetry_runs_dir() / ("flight_" + timestamp_for_filename() + ".jsonl");
+}
+
+NSTextField* make_label(NSString* text, NSFont* font, NSColor* color) {
+    NSTextField* label = [NSTextField labelWithString:text];
+    [label setFont:font];
+    [label setTextColor:color];
+    [label setLineBreakMode:NSLineBreakByWordWrapping];
+    [label setSelectable:NO];
+    return label;
+}
+
+NSButton* make_button(NSString* title, id target, SEL action) {
+    NSButton* button = [NSButton buttonWithTitle:title target:target action:action];
+    [button setBezelStyle:NSBezelStyleRounded];
+    [button setFont:[NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium]];
+    return button;
+}
+
+NSSlider* make_slider(id target, SEL action) {
+    NSSlider* slider = [NSSlider sliderWithValue:0.0 minValue:0.0 maxValue:1.0 target:target action:action];
+    [slider setContinuous:YES];
+    [slider setEnabled:NO];
+    return slider;
+}
+
+struct ViewBounds {
+    double min_x = 0.0;
+    double max_x = 0.0;
+    double min_z = 0.0;
+    double max_z = 0.0;
+};
+
 } // namespace
 
 @interface FlightSimOpenGLView : NSOpenGLView {
     std::unique_ptr<DroneSimulation> simulation_;
     std::unique_ptr<TelemetryReplay> replay_;
+    std::unique_ptr<TelemetryRecorder> run_recorder_;
+    std::unique_ptr<TelemetryRecorder> latest_recorder_;
     std::vector<Vec3> trail_;
     NSTimer* timer_;
     bool paused_;
@@ -119,12 +182,33 @@ NSString* ns_string(const std::filesystem::path& path) {
     bool key_l_;
     int selected_waypoint_;
     bool dragging_waypoint_;
+    NSVisualEffectView* side_panel_;
+    NSTextField* title_label_;
+    NSTextField* telemetry_label_;
+    NSTextField* mission_label_;
+    NSTextField* message_label_;
+    NSTextField* replay_time_label_;
+    NSButton* manual_button_;
+    NSButton* arm_button_;
+    NSButton* pause_button_;
+    NSButton* chase_button_;
+    NSButton* fit_button_;
+    NSButton* replay_button_;
+    NSButton* load_mission_button_;
+    NSButton* load_replay_button_;
+    NSButton* save_button_;
+    NSButton* reset_button_;
+    NSSlider* replay_slider_;
     double zoom_m_;
     double pan_x_;
     double pan_z_;
     double trail_sample_accumulator_;
+    double record_sample_accumulator_;
     double replay_time_s_;
     std::filesystem::path mission_path_;
+    std::filesystem::path replay_path_;
+    std::filesystem::path recording_path_;
+    std::string status_message_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame missionPath:(NSString*)missionPath;
@@ -150,7 +234,7 @@ NSString* ns_string(const std::filesystem::path& path) {
 
     if (self) {
         paused_ = false;
-        chase_camera_ = true;
+        chase_camera_ = false;
         manual_mode_ = false;
         replay_mode_ = false;
         key_w_ = false;
@@ -169,7 +253,26 @@ NSString* ns_string(const std::filesystem::path& path) {
         pan_x_ = 0.0;
         pan_z_ = 0.0;
         trail_sample_accumulator_ = 0.0;
+        record_sample_accumulator_ = 0.0;
         replay_time_s_ = 0.0;
+        status_message_ = "Ready";
+        side_panel_ = nil;
+        title_label_ = nil;
+        telemetry_label_ = nil;
+        mission_label_ = nil;
+        message_label_ = nil;
+        replay_time_label_ = nil;
+        manual_button_ = nil;
+        arm_button_ = nil;
+        pause_button_ = nil;
+        chase_button_ = nil;
+        fit_button_ = nil;
+        replay_button_ = nil;
+        load_mission_button_ = nil;
+        load_replay_button_ = nil;
+        save_button_ = nil;
+        reset_button_ = nil;
+        replay_slider_ = nil;
 
         try {
             mission_path_ = std::filesystem::path([missionPath UTF8String]);
@@ -179,6 +282,10 @@ NSString* ns_string(const std::filesystem::path& path) {
             mission_path_ = default_sample_mission_path();
             simulation_ = std::make_unique<DroneSimulation>(MissionLoader::load_from_file(default_sample_mission_path()));
         }
+        [self fitMissionCamera];
+        [self setupOverlayControls];
+        [self startNewRecording];
+        [self updatePanelText];
 
         timer_ = [NSTimer scheduledTimerWithTimeInterval:(1.0 / 60.0)
                                                   target:self
@@ -191,12 +298,111 @@ NSString* ns_string(const std::filesystem::path& path) {
 }
 
 - (void)dealloc {
+    [self finishRecording];
     [timer_ invalidate];
     [super dealloc];
 }
 
 - (BOOL)acceptsFirstResponder {
     return YES;
+}
+
+- (NSRect)sceneRect {
+    const NSRect bounds = [self bounds];
+    const CGFloat panel_width = 306.0;
+    const CGFloat scene_width = std::max<CGFloat>(240.0, bounds.size.width - panel_width);
+    return NSMakeRect(0.0, 0.0, scene_width, bounds.size.height);
+}
+
+- (void)setupOverlayControls {
+    side_panel_ = [[[NSVisualEffectView alloc] initWithFrame:NSZeroRect] autorelease];
+    [side_panel_ setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
+    [side_panel_ setMaterial:NSVisualEffectMaterialSidebar];
+    [side_panel_ setState:NSVisualEffectStateActive];
+    [side_panel_ setWantsLayer:YES];
+    [side_panel_.layer setCornerRadius:0.0];
+    [self addSubview:side_panel_];
+
+    title_label_ = make_label(@"AgBot FlightSim", [NSFont systemFontOfSize:18.0 weight:NSFontWeightSemibold], [NSColor labelColor]);
+    telemetry_label_ = make_label(@"", [NSFont monospacedSystemFontOfSize:12.0 weight:NSFontWeightRegular], [NSColor labelColor]);
+    mission_label_ = make_label(@"", [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightRegular], [NSColor secondaryLabelColor]);
+    message_label_ = make_label(@"Ready", [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium], [NSColor controlAccentColor]);
+    replay_time_label_ = make_label(@"Replay -", [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightRegular], [NSColor secondaryLabelColor]);
+
+    manual_button_ = make_button(@"Manual", self, @selector(toggleManualMode:));
+    arm_button_ = make_button(@"Arm", self, @selector(toggleArmAction:));
+    pause_button_ = make_button(@"Pause", self, @selector(togglePause:));
+    chase_button_ = make_button(@"Chase", self, @selector(toggleChaseCamera:));
+    fit_button_ = make_button(@"Fit", self, @selector(fitCameraAction:));
+    replay_button_ = make_button(@"Replay", self, @selector(toggleReplayAction:));
+    load_mission_button_ = make_button(@"Load Mission", self, @selector(loadMissionAction:));
+    load_replay_button_ = make_button(@"Replay File", self, @selector(loadReplayFileAction:));
+    save_button_ = make_button(@"Save", self, @selector(saveMissionAction:));
+    reset_button_ = make_button(@"Reset", self, @selector(resetMissionAction:));
+    replay_slider_ = make_slider(self, @selector(scrubReplay:));
+
+    for (NSView* subview in @[title_label_, telemetry_label_, mission_label_, message_label_,
+                              replay_time_label_, replay_slider_,
+                              manual_button_, arm_button_, pause_button_, reset_button_,
+                              chase_button_, fit_button_, save_button_, load_mission_button_,
+                              replay_button_, load_replay_button_]) {
+        [side_panel_ addSubview:subview];
+    }
+}
+
+- (void)layout {
+    [super layout];
+
+    if (!side_panel_) {
+        return;
+    }
+
+    const NSRect bounds = [self bounds];
+    const CGFloat panel_width = 306.0;
+    [side_panel_ setFrame:NSMakeRect(bounds.size.width - panel_width, 0.0, panel_width, bounds.size.height)];
+
+    CGFloat y = bounds.size.height - 42.0;
+    const CGFloat x = 18.0;
+    const CGFloat width = panel_width - 36.0;
+    [title_label_ setFrame:NSMakeRect(x, y, width, 24.0)];
+
+    y -= 128.0;
+    [telemetry_label_ setFrame:NSMakeRect(x, y, width, 118.0)];
+
+    y -= 132.0;
+    [mission_label_ setFrame:NSMakeRect(x, y, width, 118.0)];
+
+    y -= 36.0;
+    [message_label_ setFrame:NSMakeRect(x, y, width, 24.0)];
+
+    y -= 30.0;
+    [replay_time_label_ setFrame:NSMakeRect(x, y, width, 18.0)];
+
+    y -= 24.0;
+    [replay_slider_ setFrame:NSMakeRect(x, y, width, 22.0)];
+
+    const CGFloat button_height = 30.0;
+    const CGFloat gap = 8.0;
+    const CGFloat col_width = (width - gap) * 0.5;
+    y -= 44.0;
+    [manual_button_ setFrame:NSMakeRect(x, y, col_width, button_height)];
+    [arm_button_ setFrame:NSMakeRect(x + col_width + gap, y, col_width, button_height)];
+
+    y -= button_height + gap;
+    [pause_button_ setFrame:NSMakeRect(x, y, col_width, button_height)];
+    [reset_button_ setFrame:NSMakeRect(x + col_width + gap, y, col_width, button_height)];
+
+    y -= button_height + gap;
+    [chase_button_ setFrame:NSMakeRect(x, y, col_width, button_height)];
+    [fit_button_ setFrame:NSMakeRect(x + col_width + gap, y, col_width, button_height)];
+
+    y -= button_height + gap;
+    [save_button_ setFrame:NSMakeRect(x, y, col_width, button_height)];
+    [load_mission_button_ setFrame:NSMakeRect(x + col_width + gap, y, col_width, button_height)];
+
+    y -= button_height + gap;
+    [replay_button_ setFrame:NSMakeRect(x, y, col_width, button_height)];
+    [load_replay_button_ setFrame:NSMakeRect(x + col_width + gap, y, col_width, button_height)];
 }
 
 - (void)prepareOpenGL {
@@ -208,6 +414,71 @@ NSString* ns_string(const std::filesystem::path& path) {
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glClearColor(0.025f, 0.032f, 0.042f, 1.0f);
+}
+
+- (void)writeTelemetrySample:(const DroneState&)state {
+    try {
+        if (run_recorder_) {
+            run_recorder_->write_sample(state);
+        }
+        if (latest_recorder_) {
+            latest_recorder_->write_sample(state);
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "Telemetry recording failed: " << error.what() << "\n";
+        run_recorder_.reset();
+        latest_recorder_.reset();
+        recording_path_.clear();
+        [self setStatusMessage:"Recording failed"];
+    }
+}
+
+- (void)startNewRecording {
+    if (!simulation_) {
+        return;
+    }
+
+    run_recorder_.reset();
+    latest_recorder_.reset();
+    record_sample_accumulator_ = 0.0;
+    recording_path_ = telemetry_run_path();
+
+    try {
+        run_recorder_ = std::make_unique<TelemetryRecorder>(recording_path_);
+        latest_recorder_ = std::make_unique<TelemetryRecorder>(telemetry_latest_path());
+        [self writeTelemetrySample:simulation_->state()];
+        [self setStatusMessage:"Recording flight"];
+    } catch (const std::exception& error) {
+        std::cerr << "Unable to start telemetry recording: " << error.what() << "\n";
+        run_recorder_.reset();
+        latest_recorder_.reset();
+        recording_path_.clear();
+        [self setStatusMessage:"Recording unavailable"];
+    }
+}
+
+- (void)finishRecording {
+    if (simulation_ && (run_recorder_ || latest_recorder_)) {
+        [self writeTelemetrySample:simulation_->state()];
+    }
+    run_recorder_.reset();
+    latest_recorder_.reset();
+}
+
+- (void)recordLiveTelemetry:(double)dt_s {
+    if (!simulation_ || replay_mode_ || (!run_recorder_ && !latest_recorder_)) {
+        return;
+    }
+
+    record_sample_accumulator_ += dt_s;
+    if (record_sample_accumulator_ >= 0.25 || simulation_->is_complete()) {
+        [self writeTelemetrySample:simulation_->state()];
+        record_sample_accumulator_ = 0.0;
+    }
+
+    if (simulation_->is_complete()) {
+        [self finishRecording];
+    }
 }
 
 - (void)tick:(NSTimer*)timer {
@@ -227,6 +498,7 @@ NSString* ns_string(const std::filesystem::path& path) {
         constexpr double dt_s = 1.0 / 60.0;
         [self updateManualInput];
         simulation_->step(dt_s);
+        [self recordLiveTelemetry:dt_s];
         trail_sample_accumulator_ += dt_s;
 
         if (trail_.empty() || trail_sample_accumulator_ >= 0.2) {
@@ -236,6 +508,7 @@ NSString* ns_string(const std::filesystem::path& path) {
     }
 
     [self updateWindowTitle];
+    [self updatePanelText];
     [self setNeedsDisplay:YES];
 }
 
@@ -254,6 +527,298 @@ NSString* ns_string(const std::filesystem::path& path) {
     [[self window] setTitle:[NSString stringWithUTF8String:title.str().c_str()]];
 }
 
+- (void)setStatusMessage:(std::string)message {
+    status_message_ = std::move(message);
+    [self updatePanelText];
+}
+
+- (void)updatePanelText {
+    if (!simulation_ || !telemetry_label_) {
+        return;
+    }
+
+    const DroneState& state = [self displayState];
+    const double speed = state.velocity.length();
+    const std::size_t waypoint_count = simulation_->mission().waypoints.size();
+    const std::size_t waypoint_index = std::min(state.target_waypoint_index + 1, waypoint_count);
+
+    std::ostringstream telemetry;
+    telemetry << std::fixed << std::setprecision(1)
+              << "Mode      " << (replay_mode_ ? "replay" : to_string(simulation_->control_mode())) << "\n"
+              << "Flight    " << to_string(state.mode) << "\n"
+              << "Armed     " << (state.armed ? "yes" : "no") << "\n"
+              << "Speed     " << speed << " m/s\n"
+              << "Altitude  " << state.position.y << " m\n"
+              << "Battery   " << std::setprecision(0) << state.battery_percent << "%\n"
+              << std::setprecision(1)
+              << "Time      " << state.mission_time_s << " s\n"
+              << "Camera    " << (chase_camera_ ? "chase" : "map");
+    [telemetry_label_ setStringValue:ns_string(telemetry.str())];
+
+    std::ostringstream mission;
+    mission << "Mission   " << simulation_->mission().name << "\n"
+            << "Waypoint  " << waypoint_index << " / " << waypoint_count << "\n"
+            << "Selected  ";
+    if (selected_waypoint_ >= 0) {
+        mission << (selected_waypoint_ + 1);
+    } else {
+        mission << "-";
+    }
+    mission << "\n"
+            << "Path      " << mission_path_.filename().string() << "\n"
+            << "Edited    " << std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR)
+                   .append("out").append("edited_mission.json").filename().string() << "\n"
+            << "Record    ";
+    if (!recording_path_.empty()) {
+        mission << recording_path_.filename().string();
+    } else {
+        mission << "-";
+    }
+    [mission_label_ setStringValue:ns_string(mission.str())];
+
+    const double replay_duration = replay_ ? replay_->duration_s() : 0.0;
+    std::ostringstream replay_time;
+    replay_time << std::fixed << std::setprecision(1)
+                << "Replay   " << replay_time_s_ << " / " << replay_duration << " s";
+    if (!replay_path_.empty()) {
+        replay_time << "  " << replay_path_.filename().string();
+    }
+    [replay_time_label_ setStringValue:ns_string(replay_time.str())];
+    [replay_slider_ setMinValue:0.0];
+    [replay_slider_ setMaxValue:std::max(1.0, replay_duration)];
+    [replay_slider_ setDoubleValue:std::clamp(replay_time_s_, 0.0, std::max(1.0, replay_duration))];
+    [replay_slider_ setEnabled:(replay_ && !replay_->empty())];
+
+    [message_label_ setStringValue:ns_string(status_message_)];
+    [manual_button_ setTitle:(manual_mode_ ? @"Autopilot" : @"Manual")];
+    [arm_button_ setTitle:(state.armed ? @"Disarm" : @"Arm")];
+    [pause_button_ setTitle:(paused_ ? @"Resume" : @"Pause")];
+    [chase_button_ setTitle:(chase_camera_ ? @"Map" : @"Chase")];
+    [replay_button_ setTitle:(replay_mode_ ? @"Live" : @"Replay")];
+}
+
+- (void)toggleManualMode:(id)sender {
+    (void)sender;
+    if (!simulation_) {
+        return;
+    }
+    replay_mode_ = false;
+    manual_mode_ = !manual_mode_;
+    simulation_->set_control_mode(manual_mode_ ? ControlMode::Manual : ControlMode::Autopilot);
+    if (manual_mode_) {
+        [self setStatusMessage:"Manual enabled; arm to fly"];
+    } else {
+        [self setStatusMessage:"Autopilot enabled"];
+    }
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)toggleArmAction:(id)sender {
+    (void)sender;
+    if (!simulation_ || replay_mode_) {
+        return;
+    }
+
+    if (!manual_mode_) {
+        manual_mode_ = true;
+        simulation_->set_control_mode(ControlMode::Manual);
+    }
+
+    if (simulation_->state().armed) {
+        simulation_->disarm();
+        [self setStatusMessage:"Disarmed"];
+    } else {
+        simulation_->arm();
+        [self setStatusMessage:"Armed"];
+    }
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)togglePause:(id)sender {
+    (void)sender;
+    paused_ = !paused_;
+    [self setStatusMessage:(paused_ ? "Paused" : "Running")];
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)toggleChaseCamera:(id)sender {
+    (void)sender;
+    chase_camera_ = !chase_camera_;
+    [self setStatusMessage:(chase_camera_ ? "Chase camera" : "Mission map camera")];
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)fitCameraAction:(id)sender {
+    (void)sender;
+    [self fitMissionCamera];
+    [self setStatusMessage:"Mission fitted"];
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)toggleReplayAction:(id)sender {
+    (void)sender;
+    if (replay_mode_) {
+        replay_mode_ = false;
+        if (simulation_) {
+            simulation_->set_control_mode(manual_mode_ ? ControlMode::Manual : ControlMode::Autopilot);
+        }
+        [self setStatusMessage:"Live simulation"];
+    } else {
+        [self loadReplay];
+    }
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)saveMissionAction:(id)sender {
+    (void)sender;
+    [self saveMission];
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)resetMissionAction:(id)sender {
+    (void)sender;
+    if (!simulation_) {
+        return;
+    }
+    if (replay_mode_) {
+        replay_time_s_ = 0.0;
+        paused_ = false;
+        trail_.clear();
+        [self rebuildReplayTrail];
+    } else {
+        [self finishRecording];
+        simulation_->reset();
+        if (manual_mode_) {
+            simulation_->set_control_mode(ControlMode::Manual);
+        }
+        trail_.clear();
+        [self startNewRecording];
+    }
+    [self setStatusMessage:"Reset"];
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)loadMissionFromPath:(std::filesystem::path)path {
+    if (!simulation_) {
+        return;
+    }
+
+    try {
+        auto mission = MissionLoader::load_from_file(path);
+        [self finishRecording];
+        simulation_->replace_mission(std::move(mission));
+        mission_path_ = std::move(path);
+        replay_.reset();
+        replay_path_.clear();
+        replay_mode_ = false;
+        manual_mode_ = false;
+        selected_waypoint_ = -1;
+        dragging_waypoint_ = false;
+        replay_time_s_ = 0.0;
+        trail_.clear();
+        simulation_->set_control_mode(ControlMode::Autopilot);
+        [self fitMissionCamera];
+        [self startNewRecording];
+        [self setStatusMessage:"Mission loaded"];
+    } catch (const std::exception& error) {
+        std::cerr << "Failed to load mission: " << error.what() << "\n";
+        [self setStatusMessage:"Mission load failed"];
+    }
+}
+
+- (void)loadMissionAction:(id)sender {
+    (void)sender;
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    [panel setAllowsMultipleSelection:NO];
+    [panel setCanChooseDirectories:NO];
+    [panel setCanChooseFiles:YES];
+    [panel setAllowedFileTypes:@[@"json"]];
+    if ([panel runModal] == NSModalResponseOK) {
+        NSURL* url = [[panel URLs] firstObject];
+        if (url) {
+            [self loadMissionFromPath:std::filesystem::path([[url path] UTF8String])];
+        }
+    }
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)rebuildReplayTrail {
+    trail_.clear();
+    if (!replay_ || replay_->empty()) {
+        return;
+    }
+
+    double next_sample_s = 0.0;
+    for (const auto& frame : replay_->frames()) {
+        if (frame.state.mission_time_s > replay_time_s_) {
+            break;
+        }
+        if (frame.state.mission_time_s + 1e-6 >= next_sample_s) {
+            trail_.push_back(frame.state.position);
+            next_sample_s += 0.2;
+        }
+    }
+
+    const Vec3 current_position = replay_->sample(replay_time_s_).position;
+    if (trail_.empty() || (trail_.back() - current_position).length() > 1e-6) {
+        trail_.push_back(current_position);
+    }
+}
+
+- (void)loadReplayFromPath:(std::filesystem::path)path {
+    try {
+        [self finishRecording];
+        replay_ = std::make_unique<TelemetryReplay>(TelemetryReplay::load_jsonl(path));
+        replay_path_ = std::move(path);
+        replay_mode_ = replay_ && !replay_->empty();
+        replay_time_s_ = 0.0;
+        paused_ = false;
+        trail_sample_accumulator_ = 0.0;
+        [self rebuildReplayTrail];
+        if (simulation_) {
+            simulation_->set_control_mode(ControlMode::Replay);
+        }
+        std::cout << "Loaded telemetry replay: " << replay_path_ << "\n";
+        [self setStatusMessage:"Telemetry replay loaded"];
+    } catch (const std::exception& error) {
+        std::cerr << "Failed to load replay: " << error.what() << "\n";
+        [self setStatusMessage:"Replay load failed"];
+    }
+}
+
+- (void)loadReplayFileAction:(id)sender {
+    (void)sender;
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    [panel setAllowsMultipleSelection:NO];
+    [panel setCanChooseDirectories:NO];
+    [panel setCanChooseFiles:YES];
+    [panel setDirectoryURL:[NSURL fileURLWithPath:ns_string(telemetry_runs_dir())]];
+    [panel setAllowedFileTypes:@[@"jsonl", @"json"]];
+    if ([panel runModal] == NSModalResponseOK) {
+        NSURL* url = [[panel URLs] firstObject];
+        if (url) {
+            [self loadReplayFromPath:std::filesystem::path([[url path] UTF8String])];
+        }
+    }
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)scrubReplay:(id)sender {
+    (void)sender;
+    if (!replay_ || replay_->empty()) {
+        return;
+    }
+
+    replay_time_s_ = std::clamp([replay_slider_ doubleValue], 0.0, replay_->duration_s());
+    replay_mode_ = true;
+    paused_ = true;
+    if (simulation_) {
+        simulation_->set_control_mode(ControlMode::Replay);
+    }
+    [self rebuildReplayTrail];
+    [self setStatusMessage:"Replay scrubbed"];
+}
+
 - (const DroneState&)displayState {
     if (replay_mode_ && replay_ && !replay_->empty()) {
         return replay_->sample(replay_time_s_);
@@ -269,14 +834,65 @@ NSString* ns_string(const std::filesystem::path& path) {
     return NSMakePoint(pan_x_, pan_z_);
 }
 
-- (Vec3)worldPointFromEvent:(NSEvent*)event altitude:(double)altitude {
-    const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
-    const NSRect bounds = [self bounds];
+- (ViewBounds)viewBoundsForRect:(NSRect)bounds {
     const NSPoint center = [self viewCenter];
     const double aspect = std::max(0.1, bounds.size.width / std::max(1.0, bounds.size.height));
     const double half_height = zoom_m_;
     const double half_width = zoom_m_ * aspect;
-    const double x = center.x - half_width + (location.x / std::max(1.0, bounds.size.width)) * half_width * 2.0;
+    return {
+        center.x - half_width,
+        center.x + half_width,
+        center.y - half_height,
+        center.y + half_height,
+    };
+}
+
+- (void)fitMissionCamera {
+    if (!simulation_) {
+        return;
+    }
+
+    const auto& mission = simulation_->mission();
+    double min_x = mission.home.x;
+    double max_x = mission.home.x;
+    double min_z = mission.home.z;
+    double max_z = mission.home.z;
+
+    for (const Waypoint& waypoint : mission.waypoints) {
+        min_x = std::min(min_x, waypoint.position.x);
+        max_x = std::max(max_x, waypoint.position.x);
+        min_z = std::min(min_z, waypoint.position.z);
+        max_z = std::max(max_z, waypoint.position.z);
+    }
+
+    for (const Vec3& point : trail_) {
+        min_x = std::min(min_x, point.x);
+        max_x = std::max(max_x, point.x);
+        min_z = std::min(min_z, point.z);
+        max_z = std::max(max_z, point.z);
+    }
+
+    const NSRect bounds = [self sceneRect];
+    const double aspect = std::max(0.1, bounds.size.width / std::max(1.0, bounds.size.height));
+    const double width = std::max(80.0, max_x - min_x);
+    const double height = std::max(80.0, max_z - min_z);
+    const double padding = 45.0;
+
+    pan_x_ = (min_x + max_x) * 0.5;
+    pan_z_ = (min_z + max_z) * 0.5;
+    zoom_m_ = std::max((height * 0.5) + padding, ((width * 0.5) + padding) / aspect);
+    zoom_m_ = std::clamp(zoom_m_, 80.0, 1600.0);
+    chase_camera_ = false;
+}
+
+- (Vec3)worldPointFromEvent:(NSEvent*)event altitude:(double)altitude {
+    const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
+    const NSRect bounds = [self sceneRect];
+    const NSPoint center = [self viewCenter];
+    const double aspect = std::max(0.1, bounds.size.width / std::max(1.0, bounds.size.height));
+    const double half_height = zoom_m_;
+    const double half_width = zoom_m_ * aspect;
+    const double x = center.x - half_width + ((location.x - bounds.origin.x) / std::max(1.0, bounds.size.width)) * half_width * 2.0;
     const double z = center.y - half_height + (location.y / std::max(1.0, bounds.size.height)) * half_height * 2.0;
     return Vec3(x, altitude, z);
 }
@@ -335,27 +951,15 @@ NSString* ns_string(const std::filesystem::path& path) {
     try {
         MissionLoader::save_to_file(simulation_->mission(), output);
         std::cout << "Saved edited mission: " << output << "\n";
+        [self setStatusMessage:"Saved edited_mission.json"];
     } catch (const std::exception& error) {
         std::cerr << "Failed to save mission: " << error.what() << "\n";
+        [self setStatusMessage:"Save failed"];
     }
 }
 
 - (void)loadReplay {
-    const std::filesystem::path path =
-        std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "out" / "telemetry.jsonl";
-    try {
-        replay_ = std::make_unique<TelemetryReplay>(TelemetryReplay::load_jsonl(path));
-        replay_mode_ = replay_ && !replay_->empty();
-        replay_time_s_ = 0.0;
-        paused_ = false;
-        trail_.clear();
-        if (simulation_) {
-            simulation_->set_control_mode(ControlMode::Replay);
-        }
-        std::cout << "Loaded telemetry replay: " << path << "\n";
-    } catch (const std::exception& error) {
-        std::cerr << "Failed to load replay: " << error.what() << "\n";
-    }
+    [self loadReplayFromPath:telemetry_latest_path()];
 }
 
 - (void)updateManualInput {
@@ -364,7 +968,6 @@ NSString* ns_string(const std::filesystem::path& path) {
     }
 
     ManualControlInput input;
-    input.arm = true;
     input.pitch = (key_w_ ? 1.0 : 0.0) + (key_s_ ? -1.0 : 0.0);
     input.roll = (key_d_ ? 1.0 : 0.0) + (key_a_ ? -1.0 : 0.0);
     input.yaw = (key_e_ ? 1.0 : 0.0) + (key_q_ ? -1.0 : 0.0);
@@ -374,25 +977,47 @@ NSString* ns_string(const std::filesystem::path& path) {
     simulation_->set_manual_input(input);
 }
 
-- (void)drawGrid {
+- (void)drawGrid:(ViewBounds)viewBounds {
+    const double major_step = 100.0;
+    const double minor_step = 20.0;
+    const double min_x = std::floor(viewBounds.min_x / minor_step) * minor_step;
+    const double max_x = std::ceil(viewBounds.max_x / minor_step) * minor_step;
+    const double min_z = std::floor(viewBounds.min_z / minor_step) * minor_step;
+    const double max_z = std::ceil(viewBounds.max_z / minor_step) * minor_step;
+
     set_color(0.16, 0.18, 0.21, 1.0);
     glLineWidth(1.0f);
     glBegin(GL_LINES);
-    for (int value = -1000; value <= 1000; value += 20) {
-        glVertex2d(value, -1000);
-        glVertex2d(value, 1000);
-        glVertex2d(-1000, value);
-        glVertex2d(1000, value);
+    for (double x = min_x; x <= max_x; x += minor_step) {
+        glVertex2d(x, min_z);
+        glVertex2d(x, max_z);
+    }
+    for (double z = min_z; z <= max_z; z += minor_step) {
+        glVertex2d(min_x, z);
+        glVertex2d(max_x, z);
     }
     glEnd();
 
-    set_color(0.36, 0.4, 0.45, 1.0);
+    set_color(0.24, 0.28, 0.34, 1.0);
+    glLineWidth(1.4f);
+    glBegin(GL_LINES);
+    for (double x = std::floor(viewBounds.min_x / major_step) * major_step; x <= max_x; x += major_step) {
+        glVertex2d(x, min_z);
+        glVertex2d(x, max_z);
+    }
+    for (double z = std::floor(viewBounds.min_z / major_step) * major_step; z <= max_z; z += major_step) {
+        glVertex2d(min_x, z);
+        glVertex2d(max_x, z);
+    }
+    glEnd();
+
+    set_color(0.48, 0.55, 0.66, 1.0);
     glLineWidth(2.0f);
     glBegin(GL_LINES);
-    glVertex2d(-1000, 0);
-    glVertex2d(1000, 0);
-    glVertex2d(0, -1000);
-    glVertex2d(0, 1000);
+    glVertex2d(min_x, 0);
+    glVertex2d(max_x, 0);
+    glVertex2d(0, min_z);
+    glVertex2d(0, max_z);
     glEnd();
 }
 
@@ -525,32 +1150,23 @@ NSString* ns_string(const std::filesystem::path& path) {
     [[self openGLContext] makeCurrentContext];
 
     const NSRect bounds = [self bounds];
-    glViewport(0, 0, static_cast<GLsizei>(bounds.size.width), static_cast<GLsizei>(bounds.size.height));
+    const NSRect scene = [self sceneRect];
+    glViewport(0, 0, static_cast<GLsizei>(scene.size.width), static_cast<GLsizei>(scene.size.height));
     glClear(GL_COLOR_BUFFER_BIT);
 
-    double center_x = pan_x_;
-    double center_z = pan_z_;
-    if (chase_camera_ && simulation_) {
-        const DroneState& state = [self displayState];
-        center_x = state.position.x;
-        center_z = state.position.z;
-    }
-
-    const double aspect = std::max(0.1, bounds.size.width / std::max(1.0, bounds.size.height));
-    const double half_height = zoom_m_;
-    const double half_width = zoom_m_ * aspect;
+    const ViewBounds viewBounds = [self viewBoundsForRect:scene];
 
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(center_x - half_width, center_x + half_width, center_z - half_height, center_z + half_height, -1.0, 1.0);
+    glOrtho(viewBounds.min_x, viewBounds.max_x, viewBounds.min_z, viewBounds.max_z, -1.0, 1.0);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    [self drawGrid];
+    [self drawGrid:viewBounds];
     [self drawMissionPath];
     [self drawTrail];
     [self drawDrone];
-    [self drawHud:bounds];
+    [self drawHud:scene];
 
     [[self openGLContext] flushBuffer];
 }
@@ -562,47 +1178,33 @@ NSString* ns_string(const std::filesystem::path& path) {
             [self saveMission];
             return;
         }
+        if ([commandCharacters length] > 0 && [commandCharacters characterAtIndex:0] == 'o') {
+            [self loadMissionAction:nil];
+            return;
+        }
     }
 
     NSString* characters = [[event charactersIgnoringModifiers] lowercaseString];
     if ([characters length] > 0) {
         const unichar key = [characters characterAtIndex:0];
         if (key == ' ') {
-            paused_ = !paused_;
+            [self togglePause:nil];
             return;
         }
         if (key == 'r' && simulation_) {
-            if (replay_mode_) {
-                replay_time_s_ = 0.0;
-                paused_ = false;
-            } else {
-                simulation_->reset();
-                if (manual_mode_) {
-                    simulation_->set_control_mode(ControlMode::Manual);
-                    simulation_->arm();
-                }
-            }
-            trail_.clear();
+            [self resetMissionAction:nil];
             return;
         }
         if (key == 'm' && simulation_) {
-            replay_mode_ = false;
-            manual_mode_ = !manual_mode_;
-            simulation_->set_control_mode(manual_mode_ ? ControlMode::Manual : ControlMode::Autopilot);
-            if (manual_mode_) {
-                simulation_->arm();
-            }
+            [self toggleManualMode:nil];
+            return;
+        }
+        if (key == 'x' && simulation_) {
+            [self toggleArmAction:nil];
             return;
         }
         if (key == 'g') {
-            if (replay_mode_) {
-                replay_mode_ = false;
-                if (simulation_) {
-                    simulation_->set_control_mode(manual_mode_ ? ControlMode::Manual : ControlMode::Autopilot);
-                }
-            } else {
-                [self loadReplay];
-            }
+            [self toggleReplayAction:nil];
             return;
         }
         if (key == 'w') {
@@ -638,7 +1240,11 @@ NSString* ns_string(const std::filesystem::path& path) {
             return;
         }
         if (key == 'c') {
-            chase_camera_ = !chase_camera_;
+            [self toggleChaseCamera:nil];
+            return;
+        }
+        if (key == 'f') {
+            [self fitCameraAction:nil];
             return;
         }
         if (key == '-' || key == '_') {
@@ -736,6 +1342,11 @@ NSString* ns_string(const std::filesystem::path& path) {
 
 - (void)mouseDown:(NSEvent*)event {
     if (!simulation_ || replay_mode_) {
+        return;
+    }
+
+    const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
+    if (location.x > [self sceneRect].size.width) {
         return;
     }
 

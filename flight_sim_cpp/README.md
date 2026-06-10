@@ -51,12 +51,18 @@ flight_sim_cpp/build/agbot_flight_sim_viewer
 
 Controls:
 
+The viewer has a right-side panel for live telemetry, mission/debug state, and command buttons.
+Keyboard controls are still available when the simulator view has focus.
+Live viewer runs are recorded automatically to `flight_sim_cpp/out/runs/flight_*.jsonl` and mirrored to `flight_sim_cpp/out/telemetry.jsonl`.
+
 - `Space`: pause/resume
 - `R`: reset mission
 - `C`: toggle chase camera
+- `F`: fit mission camera
 - Arrow keys: pan camera
 - Mouse wheel, `+`, `-`: zoom
 - `M`: toggle manual/autopilot
+- `X`: arm/disarm manual flight
 - `W/A/S/D`: manual pitch/roll
 - `Q/E`: manual yaw
 - Up/down arrows: manual throttle
@@ -65,7 +71,10 @@ Controls:
 - Drag: move selected waypoint
 - Option-click: delete waypoint
 - Command-S: save edited mission to `flight_sim_cpp/out/edited_mission.json`
+- Command-O: load a mission JSON file
 - `G`: load/toggle telemetry replay from `flight_sim_cpp/out/telemetry.jsonl`
+- Use the replay slider to scrub loaded telemetry.
+- Use `Replay File` to load an archived JSONL run from `flight_sim_cpp/out/runs`.
 
 ## Mission Planner Bridge
 

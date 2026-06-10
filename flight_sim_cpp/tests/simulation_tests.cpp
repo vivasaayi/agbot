@@ -1,5 +1,6 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
 
 #include <cassert>
@@ -12,6 +13,7 @@ using agbot::flight_sim::DroneSimulation;
 using agbot::flight_sim::MissionLoader;
 using agbot::flight_sim::ManualControlInput;
 using agbot::flight_sim::ControlMode;
+using agbot::flight_sim::TelemetryRecorder;
 using agbot::flight_sim::TelemetryReplay;
 
 namespace {
@@ -91,6 +93,23 @@ void test_failsafe_low_battery() {
     assert(simulation.state().mode == DroneMode::Failsafe);
 }
 
+void test_telemetry_recorder_close_is_idempotent() {
+    auto mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation simulation(std::move(mission));
+    const auto output = std::filesystem::temp_directory_path() / "agbot_flight_sim_recorder_test.jsonl";
+
+    TelemetryRecorder recorder(output);
+    recorder.write_sample(simulation.state());
+    assert(recorder.is_open());
+    recorder.close();
+    assert(!recorder.is_open());
+    recorder.close();
+
+    const auto replay = TelemetryReplay::load_jsonl(output);
+    assert(!replay.empty());
+    std::filesystem::remove(output);
+}
+
 } // namespace
 
 int main() {
@@ -99,6 +118,7 @@ int main() {
     test_manual_controls_move_drone();
     test_mission_round_trip();
     test_failsafe_low_battery();
+    test_telemetry_recorder_close_is_idempotent();
     std::cout << "agbot_flight_sim_tests passed\n";
     return 0;
 }
