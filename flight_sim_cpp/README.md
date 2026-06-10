@@ -61,6 +61,7 @@ The viewer can also load a real-world location directly from latitude/longitude.
 - `R`: reset mission
 - `C`: toggle chase camera
 - `B`: toggle globe picker
+- `V`: toggle 3D terrain view
 - `F`: fit mission camera
 - Arrow keys: pan camera
 - Mouse wheel, `+`, `-`: zoom
@@ -80,6 +81,7 @@ The viewer can also load a real-world location directly from latitude/longitude.
 - Use `Replay File` to load an archived JSONL run from `flight_sim_cpp/out/runs`.
 - Use `Location` to load a real-world coordinate and area. Elevation tiles are cached in `flight_sim_cpp/out/elevation_tiles`.
 - Use `Globe` to rotate an in-view globe and click a point to load that location through the same C++ terrain pipeline. In Globe mode, mouse wheel and `+`/`-` zoom the globe; zooming in switches the cached world-map tile detail from z3 to z4.
+- Use `3D` or `V` to switch from the 2D map into a perspective terrain view of the loaded area. In 3D mode, drag to orbit, mouse wheel or `+`/`-` zooms the camera, arrow keys pan the target, and `C` follows the drone while it flies over the terrain.
 
 ## Mission Planner Bridge
 

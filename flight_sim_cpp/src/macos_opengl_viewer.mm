@@ -409,6 +409,29 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     return {x, y, depth, depth >= 0.0};
 }
 
+Vec3 cross(Vec3 lhs, Vec3 rhs) {
+    return {
+        lhs.y * rhs.z - lhs.z * rhs.y,
+        lhs.z * rhs.x - lhs.x * rhs.z,
+        lhs.x * rhs.y - lhs.y * rhs.x,
+    };
+}
+
+void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
+    const Vec3 forward = (center - eye).normalized();
+    const Vec3 side = cross(forward, up).normalized();
+    const Vec3 corrected_up = cross(side, forward);
+
+    const GLdouble matrix[16] = {
+        side.x, side.y, side.z, 0.0,
+        corrected_up.x, corrected_up.y, corrected_up.z, 0.0,
+        -forward.x, -forward.y, -forward.z, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    };
+    glMultMatrixd(matrix);
+    glTranslated(-eye.x, -eye.y, -eye.z);
+}
+
 } // namespace
 
 @interface FlightSimOpenGLView : NSOpenGLView {
@@ -427,6 +450,8 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     bool replay_mode_;
     bool globe_mode_;
     bool dragging_globe_;
+    bool terrain_3d_mode_;
+    bool dragging_3d_camera_;
     bool key_w_;
     bool key_a_;
     bool key_s_;
@@ -452,6 +477,7 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     NSButton* chase_button_;
     NSButton* fit_button_;
     NSButton* globe_button_;
+    NSButton* three_d_button_;
     NSButton* replay_button_;
     NSButton* load_mission_button_;
     NSButton* load_replay_button_;
@@ -473,6 +499,12 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     NSPoint globe_drag_start_;
     double globe_drag_start_latitude_;
     double globe_drag_start_longitude_;
+    NSPoint terrain3d_drag_start_;
+    double terrain3d_yaw_rad_;
+    double terrain3d_pitch_rad_;
+    double terrain3d_distance_m_;
+    double terrain3d_drag_start_yaw_;
+    double terrain3d_drag_start_pitch_;
     std::filesystem::path mission_path_;
     std::filesystem::path replay_path_;
     std::filesystem::path recording_path_;
@@ -511,6 +543,8 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
         replay_mode_ = false;
         globe_mode_ = false;
         dragging_globe_ = false;
+        terrain_3d_mode_ = false;
+        dragging_3d_camera_ = false;
         key_w_ = false;
         key_a_ = false;
         key_s_ = false;
@@ -534,6 +568,11 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
         globe_map_zoom_ = 0;
         globe_center_latitude_ = 20.0;
         globe_center_longitude_ = 0.0;
+        terrain3d_yaw_rad_ = -0.72;
+        terrain3d_pitch_rad_ = 0.78;
+        terrain3d_distance_m_ = 4200.0;
+        terrain3d_drag_start_yaw_ = terrain3d_yaw_rad_;
+        terrain3d_drag_start_pitch_ = terrain3d_pitch_rad_;
         status_message_ = "Ready";
         map_status_ = "Map off";
         terrain_status_ = "Terrain off";
@@ -551,6 +590,7 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
         chase_button_ = nil;
         fit_button_ = nil;
         globe_button_ = nil;
+        three_d_button_ = nil;
         replay_button_ = nil;
         load_mission_button_ = nil;
         load_replay_button_ = nil;
@@ -628,6 +668,7 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     chase_button_ = make_button(@"Chase", self, @selector(toggleChaseCamera:));
     fit_button_ = make_button(@"Fit", self, @selector(fitCameraAction:));
     globe_button_ = make_button(@"Globe", self, @selector(toggleGlobeMode:));
+    three_d_button_ = make_button(@"3D", self, @selector(toggle3DMode:));
     replay_button_ = make_button(@"Replay", self, @selector(toggleReplayAction:));
     load_mission_button_ = make_button(@"Load Mission", self, @selector(loadMissionAction:));
     load_replay_button_ = make_button(@"Replay File", self, @selector(loadReplayFileAction:));
@@ -640,7 +681,8 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
                               replay_time_label_, replay_slider_,
                               manual_button_, arm_button_, pause_button_, reset_button_,
                               chase_button_, fit_button_, save_button_, load_mission_button_,
-                              replay_button_, load_replay_button_, globe_button_, location_button_]) {
+                              replay_button_, load_replay_button_, globe_button_, three_d_button_,
+                              location_button_]) {
         [side_panel_ addSubview:subview];
     }
     [self addSubview:globe_overlay_label_];
@@ -703,7 +745,10 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
 
     y -= button_height + gap;
     [globe_button_ setFrame:NSMakeRect(x, y, col_width, button_height)];
-    [location_button_ setFrame:NSMakeRect(x + col_width + gap, y, col_width, button_height)];
+    [three_d_button_ setFrame:NSMakeRect(x + col_width + gap, y, col_width, button_height)];
+
+    y -= button_height + gap;
+    [location_button_ setFrame:NSMakeRect(x, y, width, button_height)];
 }
 
 - (void)prepareOpenGL {
@@ -1076,7 +1121,9 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
               << "Battery   " << std::setprecision(0) << state.battery_percent << "%\n"
               << std::setprecision(1)
               << "Time      " << state.mission_time_s << " s\n"
-              << "Camera    " << (globe_mode_ ? "globe" : (chase_camera_ ? "chase" : "map")) << "\n"
+              << "Camera    "
+              << (globe_mode_ ? "globe" : (terrain_3d_mode_ ? (chase_camera_ ? "3d chase" : "3d") : (chase_camera_ ? "chase" : "map")))
+              << "\n"
               << "Map       " << map_status_ << "\n"
               << "Terrain   " << terrain_status_ << "\n"
               << "Globe     " << globe_map_status_;
@@ -1109,20 +1156,29 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     [mission_label_ setStringValue:ns_string(mission.str())];
 
     if (globe_overlay_label_) {
-        std::ostringstream globe_text;
-        if (simulation_->mission().home_geo) {
-            const GeoCoordinate home = *simulation_->mission().home_geo;
-            globe_text << std::fixed << std::setprecision(5)
-                       << "Pin  lat " << home.latitude << "  lon " << home.longitude
-                       << "   Area " << std::setprecision(1) << real_world_area_km2_ << " km2\n";
+        std::ostringstream overlay_text;
+        if (globe_mode_) {
+            if (simulation_->mission().home_geo) {
+                const GeoCoordinate home = *simulation_->mission().home_geo;
+                overlay_text << std::fixed << std::setprecision(5)
+                             << "Pin  lat " << home.latitude << "  lon " << home.longitude
+                             << "   Area " << std::setprecision(1) << real_world_area_km2_ << " km2\n";
+            } else {
+                overlay_text << "Pin  no geodetic mission loaded\n";
+            }
+            overlay_text << globe_map_status_ << "   View "
+                         << std::fixed << std::setprecision(1) << globe_view_zoom_
+                         << "x   Wheel/+/- zoom, drag rotate, click to load";
+        } else if (terrain_3d_mode_) {
+            overlay_text << "3D terrain  distance "
+                         << std::fixed << std::setprecision(0) << terrain3d_distance_m_ << " m"
+                         << "   " << terrain_status_ << "\n"
+                         << "Drag orbit, wheel/+/- zoom, arrows pan, C chase, V return to 2D";
         } else {
-            globe_text << "Pin  no geodetic mission loaded\n";
+            overlay_text << "";
         }
-        globe_text << globe_map_status_ << "   View "
-                   << std::fixed << std::setprecision(1) << globe_view_zoom_
-                   << "x   Wheel/+/- zoom, drag rotate, click to load";
-        [globe_overlay_label_ setStringValue:ns_string(globe_text.str())];
-        [globe_overlay_label_ setHidden:!globe_mode_];
+        [globe_overlay_label_ setStringValue:ns_string(overlay_text.str())];
+        [globe_overlay_label_ setHidden:(!globe_mode_ && !terrain_3d_mode_)];
     }
 
     const double replay_duration = replay_ ? replay_->duration_s() : 0.0;
@@ -1144,6 +1200,7 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     [pause_button_ setTitle:(paused_ ? @"Resume" : @"Pause")];
     [chase_button_ setTitle:(chase_camera_ ? @"Map" : @"Chase")];
     [globe_button_ setTitle:(globe_mode_ ? @"Map" : @"Globe")];
+    [three_d_button_ setTitle:(terrain_3d_mode_ ? @"2D" : @"3D")];
     [replay_button_ setTitle:(replay_mode_ ? @"Live" : @"Replay")];
 }
 
@@ -1195,16 +1252,18 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     (void)sender;
     globe_mode_ = false;
     chase_camera_ = !chase_camera_;
-    [self setStatusMessage:(chase_camera_ ? "Chase camera" : "Mission map camera")];
+    [self setStatusMessage:(chase_camera_ ? "Chase camera" : (terrain_3d_mode_ ? "3D terrain camera" : "Mission map camera"))];
     [[self window] makeFirstResponder:self];
 }
 
 - (void)toggleGlobeMode:(id)sender {
     (void)sender;
     globe_mode_ = !globe_mode_;
+    terrain_3d_mode_ = false;
     chase_camera_ = false;
     dragging_waypoint_ = false;
     dragging_globe_ = false;
+    dragging_3d_camera_ = false;
     if (globe_mode_) {
         if (simulation_ && simulation_->mission().home_geo) {
             const GeoCoordinate home = *simulation_->mission().home_geo;
@@ -1214,6 +1273,56 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
         [self loadGlobeMapTiles];
     }
     [self setStatusMessage:(globe_mode_ ? "Globe picker" : "Mission map camera")];
+    [[self window] makeFirstResponder:self];
+}
+
+- (double)defaultTerrain3DDistance {
+    if (terrain_mesh_.vertices.empty()) {
+        return std::clamp(zoom_m_ * 4.5, 900.0, 18000.0);
+    }
+
+    double min_x = terrain_mesh_.vertices.front().position.x;
+    double max_x = min_x;
+    double min_z = terrain_mesh_.vertices.front().position.z;
+    double max_z = min_z;
+    double min_y = terrain_mesh_.vertices.front().position.y;
+    double max_y = min_y;
+    for (const auto& vertex : terrain_mesh_.vertices) {
+        min_x = std::min(min_x, vertex.position.x);
+        max_x = std::max(max_x, vertex.position.x);
+        min_z = std::min(min_z, vertex.position.z);
+        max_z = std::max(max_z, vertex.position.z);
+        min_y = std::min(min_y, vertex.position.y);
+        max_y = std::max(max_y, vertex.position.y);
+    }
+
+    const double footprint = std::max(max_x - min_x, max_z - min_z);
+    const double elevation = std::max(0.0, max_y - min_y);
+    return std::clamp((footprint + elevation) * 1.25, 900.0, 22000.0);
+}
+
+- (void)adjustTerrain3DZoomBy:(double)factor {
+    terrain3d_distance_m_ = std::clamp(terrain3d_distance_m_ * factor, 120.0, 30000.0);
+    std::ostringstream message;
+    message << "3D zoom " << std::fixed << std::setprecision(0) << terrain3d_distance_m_ << " m";
+    [self setStatusMessage:message.str()];
+    [self setNeedsDisplay:YES];
+}
+
+- (void)toggle3DMode:(id)sender {
+    (void)sender;
+    terrain_3d_mode_ = !terrain_3d_mode_;
+    globe_mode_ = false;
+    dragging_waypoint_ = false;
+    dragging_globe_ = false;
+    dragging_3d_camera_ = false;
+    if (terrain_3d_mode_) {
+        [self loadRealWorldTerrainForMission];
+        terrain3d_distance_m_ = [self defaultTerrain3DDistance];
+    } else {
+        chase_camera_ = false;
+    }
+    [self setStatusMessage:(terrain_3d_mode_ ? "3D terrain view" : "Mission map camera")];
     [[self window] makeFirstResponder:self];
 }
 
@@ -1235,6 +1344,9 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     (void)sender;
     globe_mode_ = false;
     [self fitMissionCamera];
+    if (terrain_3d_mode_) {
+        terrain3d_distance_m_ = [self defaultTerrain3DDistance];
+    }
     [self loadMapTilesForMission];
     [self setStatusMessage:"Mission fitted"];
     [[self window] makeFirstResponder:self];
@@ -1305,6 +1417,9 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
         [self fitMissionCamera];
         [self loadMapTilesForMission];
         [self loadRealWorldTerrainForMission];
+        if (terrain_3d_mode_) {
+            terrain3d_distance_m_ = [self defaultTerrain3DDistance];
+        }
         [self startNewRecording];
         [self setStatusMessage:"Mission loaded"];
     } catch (const std::exception& error) {
@@ -1352,6 +1467,9 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
         [self fitMissionCamera];
         [self loadMapTilesForMission];
         [self loadRealWorldTerrainForMission];
+        if (terrain_3d_mode_) {
+            terrain3d_distance_m_ = [self defaultTerrain3DDistance];
+        }
         [self startNewRecording];
         [self setStatusMessage:source + " loaded"];
     } catch (const std::exception& error) {
@@ -1576,6 +1694,54 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
         }
     }
     return best_index;
+}
+
+- (double)terrainHeightAtX:(double)x z:(double)z {
+    if (terrain_mesh_.vertices.empty()) {
+        return 0.0;
+    }
+
+    const int resolution = static_cast<int>(std::lround(std::sqrt(static_cast<double>(terrain_mesh_.vertices.size()))));
+    if (resolution < 2 || resolution * resolution != static_cast<int>(terrain_mesh_.vertices.size())) {
+        return 0.0;
+    }
+
+    const double min_x = terrain_mesh_.vertices.front().position.x;
+    const double max_x = terrain_mesh_.vertices[static_cast<std::size_t>(resolution - 1)].position.x;
+    const double min_z = terrain_mesh_.vertices.front().position.z;
+    const double max_z = terrain_mesh_.vertices[static_cast<std::size_t>((resolution - 1) * resolution)].position.z;
+    if (std::abs(max_x - min_x) <= 1e-9 || std::abs(max_z - min_z) <= 1e-9) {
+        return 0.0;
+    }
+
+    const double grid_x = std::clamp((x - min_x) / (max_x - min_x), 0.0, 1.0) * static_cast<double>(resolution - 1);
+    const double grid_z = std::clamp((z - min_z) / (max_z - min_z), 0.0, 1.0) * static_cast<double>(resolution - 1);
+    const int x0 = static_cast<int>(std::floor(grid_x));
+    const int z0 = static_cast<int>(std::floor(grid_z));
+    const int x1 = std::min(resolution - 1, x0 + 1);
+    const int z1 = std::min(resolution - 1, z0 + 1);
+    const double tx = grid_x - static_cast<double>(x0);
+    const double tz = grid_z - static_cast<double>(z0);
+
+    auto height_at = [&](int sample_x, int sample_z) {
+        return terrain_mesh_.vertices[static_cast<std::size_t>(sample_z * resolution + sample_x)].position.y;
+    };
+
+    const double h00 = height_at(x0, z0);
+    const double h10 = height_at(x1, z0);
+    const double h01 = height_at(x0, z1);
+    const double h11 = height_at(x1, z1);
+    const double h0 = h00 + (h10 - h00) * tx;
+    const double h1 = h01 + (h11 - h01) * tx;
+    return h0 + (h1 - h0) * tz;
+}
+
+- (Vec3)renderPositionForFlightPosition:(Vec3)position {
+    return Vec3(
+        position.x,
+        position.y + [self terrainHeightAtX:position.x z:position.z],
+        position.z
+    );
 }
 
 - (void)addWaypointAt:(Vec3)point {
@@ -1818,6 +1984,214 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
     draw_circle(position.x, position.z, std::max(5.0, state.position.y * 0.2));
 }
 
+- (Vec3)terrain3DTarget {
+    if (chase_camera_ && simulation_) {
+        return [self renderPositionForFlightPosition:[self displayState].position];
+    }
+    return Vec3(pan_x_, [self terrainHeightAtX:pan_x_ z:pan_z_] + 30.0, pan_z_);
+}
+
+- (void)apply3DCameraForScene:(NSRect)scene {
+    const double aspect = std::max(0.1, scene.size.width / std::max(1.0, scene.size.height));
+    constexpr double near_plane = 2.0;
+    const double far_plane = std::max(12000.0, terrain3d_distance_m_ * 5.0);
+    const double fov_rad = 55.0 * M_PI / 180.0;
+    const double top = std::tan(fov_rad * 0.5) * near_plane;
+    const double right = top * aspect;
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glFrustum(-right, right, -top, top, near_plane, far_plane);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    const Vec3 target = [self terrain3DTarget];
+    const double pitch = std::clamp(terrain3d_pitch_rad_, 0.16, 1.38);
+    const double cp = std::cos(pitch);
+    const Vec3 eye = target + Vec3(
+        std::sin(terrain3d_yaw_rad_) * cp * terrain3d_distance_m_,
+        std::sin(pitch) * terrain3d_distance_m_,
+        std::cos(terrain3d_yaw_rad_) * cp * terrain3d_distance_m_
+    );
+    apply_look_at(eye, target, Vec3(0.0, 1.0, 0.0));
+}
+
+- (void)drawMapTiles3D {
+    if (map_tiles_.empty()) {
+        return;
+    }
+
+    glEnable(GL_TEXTURE_2D);
+    set_color(1.0, 1.0, 1.0, 0.78);
+    for (const MapTile& tile : map_tiles_) {
+        glBindTexture(GL_TEXTURE_2D, tile.texture_id);
+        glBegin(GL_QUADS);
+        glTexCoord2d(0.0, 1.0);
+        glVertex3d(tile.min_x, -0.3, tile.min_z);
+        glTexCoord2d(1.0, 1.0);
+        glVertex3d(tile.max_x, -0.3, tile.min_z);
+        glTexCoord2d(1.0, 0.0);
+        glVertex3d(tile.max_x, -0.3, tile.max_z);
+        glTexCoord2d(0.0, 0.0);
+        glVertex3d(tile.min_x, -0.3, tile.max_z);
+        glEnd();
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
+}
+
+- (void)drawGroundGrid3D {
+    double min_x = -500.0;
+    double max_x = 500.0;
+    double min_z = -500.0;
+    double max_z = 500.0;
+    if (!terrain_mesh_.vertices.empty()) {
+        min_x = max_x = terrain_mesh_.vertices.front().position.x;
+        min_z = max_z = terrain_mesh_.vertices.front().position.z;
+        for (const auto& vertex : terrain_mesh_.vertices) {
+            min_x = std::min(min_x, vertex.position.x);
+            max_x = std::max(max_x, vertex.position.x);
+            min_z = std::min(min_z, vertex.position.z);
+            max_z = std::max(max_z, vertex.position.z);
+        }
+    }
+
+    const double step = 250.0;
+    min_x = std::floor(min_x / step) * step;
+    max_x = std::ceil(max_x / step) * step;
+    min_z = std::floor(min_z / step) * step;
+    max_z = std::ceil(max_z / step) * step;
+
+    set_color(0.12, 0.16, 0.20, 0.75);
+    glLineWidth(1.0f);
+    glBegin(GL_LINES);
+    for (double x = min_x; x <= max_x; x += step) {
+        glVertex3d(x, 0.12, min_z);
+        glVertex3d(x, 0.12, max_z);
+    }
+    for (double z = min_z; z <= max_z; z += step) {
+        glVertex3d(min_x, 0.12, z);
+        glVertex3d(max_x, 0.12, z);
+    }
+    glEnd();
+}
+
+- (void)drawTerrain3D {
+    if (terrain_mesh_.vertices.empty() || terrain_mesh_.indices.empty()) {
+        return;
+    }
+
+    const double elevation_span = std::max(
+        1.0,
+        static_cast<double>(terrain_mesh_.max_elevation_m - terrain_mesh_.min_elevation_m)
+    );
+
+    glBegin(GL_TRIANGLES);
+    for (const std::uint32_t index : terrain_mesh_.indices) {
+        if (index >= terrain_mesh_.vertices.size()) {
+            continue;
+        }
+        const auto& vertex = terrain_mesh_.vertices[index];
+        const double normalized_height = std::clamp(vertex.position.y / elevation_span, 0.0, 1.0);
+        const double light = std::clamp(
+            vertex.normal.x * -0.25 + vertex.normal.y * 0.78 + vertex.normal.z * 0.30,
+            0.38,
+            1.0
+        );
+        const double r = (0.13 + normalized_height * 0.50) * light;
+        const double g = (0.34 + normalized_height * 0.34) * light;
+        const double b = (0.20 + normalized_height * 0.18) * light;
+        set_color(r, g, b, terrain_mesh_.has_elevation ? 0.70 : 0.28);
+        glNormal3d(vertex.normal.x, vertex.normal.y, vertex.normal.z);
+        glVertex3d(vertex.position.x, vertex.position.y, vertex.position.z);
+    }
+    glEnd();
+}
+
+- (void)drawMissionPath3D {
+    if (!simulation_) {
+        return;
+    }
+
+    const auto& mission = simulation_->mission();
+    set_color(0.86, 0.90, 1.0, 0.92);
+    glLineWidth(3.0f);
+    glBegin(GL_LINE_STRIP);
+    const Vec3 home = [self renderPositionForFlightPosition:mission.home];
+    glVertex3d(home.x, home.y + 0.5, home.z);
+    for (const Waypoint& waypoint : mission.waypoints) {
+        const Vec3 point = [self renderPositionForFlightPosition:waypoint.position];
+        glVertex3d(point.x, point.y, point.z);
+    }
+    glEnd();
+
+    glPointSize(8.0f);
+    glBegin(GL_POINTS);
+    set_color(0.25, 1.0, 0.72, 1.0);
+    glVertex3d(home.x, home.y + 0.5, home.z);
+    for (const Waypoint& waypoint : mission.waypoints) {
+        color_for_action(waypoint.action);
+        const Vec3 point = [self renderPositionForFlightPosition:waypoint.position];
+        glVertex3d(point.x, point.y, point.z);
+    }
+    glEnd();
+    glPointSize(1.0f);
+}
+
+- (void)drawTrail3D {
+    if (trail_.size() < 2) {
+        return;
+    }
+
+    set_color(0.2, 0.88, 1.0, 0.95);
+    glLineWidth(2.5f);
+    glBegin(GL_LINE_STRIP);
+    for (const Vec3& point : trail_) {
+        const Vec3 rendered = [self renderPositionForFlightPosition:point];
+        glVertex3d(rendered.x, rendered.y, rendered.z);
+    }
+    glEnd();
+}
+
+- (void)drawDrone3D {
+    if (!simulation_) {
+        return;
+    }
+
+    const DroneState& state = [self displayState];
+    const Vec3 position = [self renderPositionForFlightPosition:state.position];
+    const double yaw = state.yaw_rad;
+    const Vec3 forward(std::sin(yaw), 0.0, std::cos(yaw));
+    const Vec3 right(std::cos(yaw), 0.0, -std::sin(yaw));
+
+    const Vec3 nose = position + forward * 12.0 + Vec3(0.0, 1.5, 0.0);
+    const Vec3 left = position - forward * 7.0 - right * 6.0;
+    const Vec3 right_point = position - forward * 7.0 + right * 6.0;
+    const double ground_y = [self terrainHeightAtX:state.position.x z:state.position.z] + 0.3;
+
+    set_color(0.25, 0.95, 1.0, 0.55);
+    glLineWidth(1.5f);
+    glBegin(GL_LINES);
+    glVertex3d(position.x, ground_y, position.z);
+    glVertex3d(position.x, position.y, position.z);
+    glEnd();
+
+    set_color(1.0, 0.88, 0.18, 1.0);
+    glBegin(GL_TRIANGLES);
+    glVertex3d(nose.x, nose.y, nose.z);
+    glVertex3d(left.x, left.y, left.z);
+    glVertex3d(right_point.x, right_point.y, right_point.z);
+    glEnd();
+
+    set_color(0.02, 0.025, 0.03, 1.0);
+    glLineWidth(2.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex3d(nose.x, nose.y, nose.z);
+    glVertex3d(left.x, left.y, left.z);
+    glVertex3d(right_point.x, right_point.y, right_point.z);
+    glEnd();
+}
+
 - (NSRect)globeFrameForScene:(NSRect)scene {
     const CGFloat size = std::min(scene.size.width, scene.size.height) * 0.78 * globe_view_zoom_;
     return NSMakeRect(
@@ -2055,16 +2429,30 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
         static_cast<GLsizei>(backing_scene.size.width),
         static_cast<GLsizei>(backing_scene.size.height)
     );
-    glClear(GL_COLOR_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     if (globe_mode_) {
+        glDisable(GL_DEPTH_TEST);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
         glOrtho(0.0, scene.size.width, 0.0, scene.size.height, -1.0, 1.0);
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
         [self drawGlobe:scene];
+    } else if (terrain_3d_mode_) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        [self apply3DCameraForScene:scene];
+        [self drawMapTiles3D];
+        [self drawGroundGrid3D];
+        [self drawTerrain3D];
+        [self drawMissionPath3D];
+        [self drawTrail3D];
+        [self drawDrone3D];
+        glDisable(GL_DEPTH_TEST);
+        [self drawHud:scene];
     } else {
+        glDisable(GL_DEPTH_TEST);
         const ViewBounds viewBounds = [self viewBoundsForRect:scene];
 
         glMatrixMode(GL_PROJECTION);
@@ -2161,6 +2549,10 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
             [self toggleGlobeMode:nil];
             return;
         }
+        if (key == 'v') {
+            [self toggle3DMode:nil];
+            return;
+        }
         if (key == 'f') {
             [self fitCameraAction:nil];
             return;
@@ -2170,12 +2562,20 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
                 [self adjustGlobeZoomBy:0.85];
                 return;
             }
+            if (terrain_3d_mode_) {
+                [self adjustTerrain3DZoomBy:1.15];
+                return;
+            }
             zoom_m_ = std::min(1000.0, zoom_m_ * 1.15);
             return;
         }
         if (key == '=' || key == '+') {
             if (globe_mode_) {
                 [self adjustGlobeZoomBy:1.18];
+                return;
+            }
+            if (terrain_3d_mode_) {
+                [self adjustTerrain3DZoomBy:0.87];
                 return;
             }
             zoom_m_ = std::max(30.0, zoom_m_ / 1.15);
@@ -2267,12 +2667,24 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
 }
 
 - (void)mouseDown:(NSEvent*)event {
-    if (!simulation_ || replay_mode_) {
+    if (!simulation_) {
         return;
     }
 
     const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
     if (location.x > [self sceneRect].size.width) {
+        return;
+    }
+
+    if (terrain_3d_mode_) {
+        terrain3d_drag_start_ = location;
+        terrain3d_drag_start_yaw_ = terrain3d_yaw_rad_;
+        terrain3d_drag_start_pitch_ = terrain3d_pitch_rad_;
+        dragging_3d_camera_ = true;
+        return;
+    }
+
+    if (replay_mode_) {
         return;
     }
 
@@ -2307,6 +2719,18 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
 }
 
 - (void)mouseDragged:(NSEvent*)event {
+    if (terrain_3d_mode_ && dragging_3d_camera_) {
+        const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
+        terrain3d_yaw_rad_ = terrain3d_drag_start_yaw_ - (location.x - terrain3d_drag_start_.x) * 0.006;
+        terrain3d_pitch_rad_ = std::clamp(
+            terrain3d_drag_start_pitch_ + (location.y - terrain3d_drag_start_.y) * 0.004,
+            0.16,
+            1.38
+        );
+        [self setNeedsDisplay:YES];
+        return;
+    }
+
     if (globe_mode_ && dragging_globe_) {
         const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
         const NSRect scene = [self sceneRect];
@@ -2345,6 +2769,12 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
 }
 
 - (void)mouseUp:(NSEvent*)event {
+    if (terrain_3d_mode_ && dragging_3d_camera_) {
+        dragging_3d_camera_ = false;
+        [[self window] makeFirstResponder:self];
+        return;
+    }
+
     if (globe_mode_ && dragging_globe_) {
         const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
         const double dx = location.x - globe_drag_start_.x;
@@ -2371,6 +2801,15 @@ GlobePoint project_globe_point(double latitude, double longitude, double center_
             [self adjustGlobeZoomBy:1.08];
         } else if ([event scrollingDeltaY] < 0.0) {
             [self adjustGlobeZoomBy:0.92];
+        }
+        return;
+    }
+
+    if (terrain_3d_mode_) {
+        if ([event scrollingDeltaY] > 0.0) {
+            [self adjustTerrain3DZoomBy:0.92];
+        } else if ([event scrollingDeltaY] < 0.0) {
+            [self adjustTerrain3DZoomBy:1.08];
         }
         return;
     }
