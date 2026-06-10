@@ -33,12 +33,60 @@ const char* kMissionJson = R"json(
 }
 )json";
 
+const char* kGeoMissionJson = R"json(
+{
+  "name": "Geo Test Mission",
+  "home_position": {
+    "latitude": 37.7749,
+    "longitude": -122.4194,
+    "altitude": 0.0
+  },
+  "waypoints": [
+    {
+      "sequence": 0,
+      "position": {
+        "latitude": 37.7750,
+        "longitude": -122.4195,
+        "altitude": 30.0
+      },
+      "command": 22
+    },
+    {
+      "sequence": 1,
+      "position": {
+        "latitude": 37.7751,
+        "longitude": -122.4195,
+        "altitude": 30.0
+      },
+      "command": 16
+    }
+  ]
+}
+)json";
+
 void test_loads_mission() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     assert(mission.name == "Unit Test Mission");
     assert(mission.waypoints.size() == 4);
     assert(std::abs(mission.cruise_speed_mps - 10.0) < 1e-9);
     assert(std::abs(mission.acceptance_radius_m - 0.5) < 1e-9);
+}
+
+void test_loads_geodetic_mission() {
+    const auto mission = MissionLoader::load_from_text(kGeoMissionJson);
+    assert(mission.name == "Geo Test Mission");
+    assert(mission.home_geo.has_value());
+    assert(mission.waypoints.size() == 2);
+    assert(mission.waypoints[0].geo.has_value());
+    assert(mission.waypoints[0].position.y == 30.0);
+    assert(std::abs(mission.waypoints[0].position.x) > 1.0);
+    assert(std::abs(mission.waypoints[0].position.z) > 1.0);
+
+    const std::string json = agbot::flight_sim::mission_to_json(mission);
+    const auto reloaded = MissionLoader::load_from_text(json);
+    assert(reloaded.home_geo.has_value());
+    assert(reloaded.waypoints[0].geo.has_value());
+    assert(std::abs(reloaded.waypoints[0].geo->latitude - 37.7750) < 1e-6);
 }
 
 void test_mission_completes() {
@@ -114,6 +162,7 @@ void test_telemetry_recorder_close_is_idempotent() {
 
 int main() {
     test_loads_mission();
+    test_loads_geodetic_mission();
     test_mission_completes();
     test_manual_controls_move_drone();
     test_mission_round_trip();

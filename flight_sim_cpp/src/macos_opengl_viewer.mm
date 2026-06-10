@@ -21,6 +21,7 @@
 
 using agbot::flight_sim::DroneSimulation;
 using agbot::flight_sim::DroneState;
+using agbot::flight_sim::GeoCoordinate;
 using agbot::flight_sim::ControlMode;
 using agbot::flight_sim::ManualControlInput;
 using agbot::flight_sim::MissionLoader;
@@ -30,6 +31,8 @@ using agbot::flight_sim::Vec3;
 using agbot::flight_sim::Waypoint;
 using agbot::flight_sim::WaypointAction;
 using agbot::flight_sim::default_sample_mission_path;
+using agbot::flight_sim::geo_from_local;
+using agbot::flight_sim::local_from_geo;
 using agbot::flight_sim::to_string;
 
 namespace {
@@ -157,6 +160,141 @@ struct ViewBounds {
     double max_z = 0.0;
 };
 
+struct MapTile {
+    GLuint texture_id = 0;
+    double min_x = 0.0;
+    double max_x = 0.0;
+    double min_z = 0.0;
+    double max_z = 0.0;
+};
+
+struct TileCoordinate {
+    int z = 0;
+    int x = 0;
+    int y = 0;
+};
+
+double deg_to_rad(double degrees) {
+    return degrees * M_PI / 180.0;
+}
+
+double rad_to_deg(double radians) {
+    return radians * 180.0 / M_PI;
+}
+
+TileCoordinate tile_for_geo(const GeoCoordinate& coordinate, int zoom) {
+    const double n = std::pow(2.0, zoom);
+    const double lat_rad = deg_to_rad(std::clamp(coordinate.latitude, -85.05112878, 85.05112878));
+    const int max_tile = static_cast<int>(n) - 1;
+    return {
+        zoom,
+        std::clamp(static_cast<int>(std::floor((coordinate.longitude + 180.0) / 360.0 * n)), 0, max_tile),
+        std::clamp(static_cast<int>(std::floor((1.0 - std::log(std::tan(lat_rad) + (1.0 / std::cos(lat_rad))) / M_PI) / 2.0 * n)), 0, max_tile),
+    };
+}
+
+GeoCoordinate geo_for_tile_corner(int zoom, int x, int y) {
+    const double n = std::pow(2.0, zoom);
+    const double longitude = (static_cast<double>(x) / n * 360.0) - 180.0;
+    const double mercator = M_PI * (1.0 - 2.0 * static_cast<double>(y) / n);
+    const double latitude = rad_to_deg(std::atan(std::sinh(mercator)));
+    return {latitude, longitude, 0.0};
+}
+
+std::filesystem::path map_tile_cache_path(int zoom, int x, int y) {
+    return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR)
+        / "out" / "map_tiles" / std::to_string(zoom) / std::to_string(x) / (std::to_string(y) + ".png");
+}
+
+NSData* data_for_tile(int zoom, int x, int y) {
+    const std::filesystem::path cache_path = map_tile_cache_path(zoom, x, y);
+    if (std::filesystem::exists(cache_path)) {
+        return [NSData dataWithContentsOfFile:ns_string(cache_path)];
+    }
+
+    std::ostringstream url_text;
+    url_text << "https://tile.openstreetmap.org/" << zoom << "/" << x << "/" << y << ".png";
+    NSURL* url = [NSURL URLWithString:ns_string(url_text.str())];
+    NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:@"AgBotFlightSim/0.1 local simulator" forHTTPHeaderField:@"User-Agent"];
+    [request setTimeoutInterval:5.0];
+
+    NSError* error = nil;
+    NSHTTPURLResponse* response = nil;
+    NSData* data = [NSURLConnection sendSynchronousRequest:request returningResponse:&response error:&error];
+    if (!data || error || [response statusCode] >= 400) {
+        return nil;
+    }
+
+    std::filesystem::create_directories(cache_path.parent_path());
+    [data writeToFile:ns_string(cache_path) atomically:YES];
+    return data;
+}
+
+GLuint texture_from_image_data(NSData* data) {
+    if (!data) {
+        return 0;
+    }
+
+    NSImage* image = [[NSImage alloc] initWithData:data];
+    if (!image) {
+        return 0;
+    }
+
+    CGImageRef image_ref = [image CGImageForProposedRect:nullptr context:nil hints:nil];
+    if (!image_ref) {
+        [image release];
+        return 0;
+    }
+
+    const std::size_t width = CGImageGetWidth(image_ref);
+    const std::size_t height = CGImageGetHeight(image_ref);
+    std::vector<unsigned char> pixels(width * height * 4);
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(
+        pixels.data(),
+        width,
+        height,
+        8,
+        width * 4,
+        color_space,
+        static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast) | kCGBitmapByteOrder32Big
+    );
+
+    if (!context) {
+        CGColorSpaceRelease(color_space);
+        [image release];
+        return 0;
+    }
+
+    CGContextDrawImage(context, CGRectMake(0.0, 0.0, width, height), image_ref);
+
+    GLuint texture_id = 0;
+    glGenTextures(1, &texture_id);
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(
+        GL_TEXTURE_2D,
+        0,
+        GL_RGBA,
+        static_cast<GLsizei>(width),
+        static_cast<GLsizei>(height),
+        0,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        pixels.data()
+    );
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    CGContextRelease(context);
+    CGColorSpaceRelease(color_space);
+    [image release];
+    return texture_id;
+}
+
 } // namespace
 
 @interface FlightSimOpenGLView : NSOpenGLView {
@@ -165,6 +303,7 @@ struct ViewBounds {
     std::unique_ptr<TelemetryRecorder> run_recorder_;
     std::unique_ptr<TelemetryRecorder> latest_recorder_;
     std::vector<Vec3> trail_;
+    std::vector<MapTile> map_tiles_;
     NSTimer* timer_;
     bool paused_;
     bool chase_camera_;
@@ -209,6 +348,7 @@ struct ViewBounds {
     std::filesystem::path replay_path_;
     std::filesystem::path recording_path_;
     std::string status_message_;
+    std::string map_status_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame missionPath:(NSString*)missionPath;
@@ -230,6 +370,7 @@ struct ViewBounds {
 
     NSOpenGLPixelFormat* pixelFormat = [[NSOpenGLPixelFormat alloc] initWithAttributes:attributes];
     self = [super initWithFrame:frame pixelFormat:pixelFormat];
+    [self setWantsBestResolutionOpenGLSurface:YES];
     [pixelFormat release];
 
     if (self) {
@@ -256,6 +397,7 @@ struct ViewBounds {
         record_sample_accumulator_ = 0.0;
         replay_time_s_ = 0.0;
         status_message_ = "Ready";
+        map_status_ = "Map off";
         side_panel_ = nil;
         title_label_ = nil;
         telemetry_label_ = nil;
@@ -299,6 +441,7 @@ struct ViewBounds {
 
 - (void)dealloc {
     [self finishRecording];
+    [self clearMapTiles];
     [timer_ invalidate];
     [super dealloc];
 }
@@ -366,11 +509,11 @@ struct ViewBounds {
     const CGFloat width = panel_width - 36.0;
     [title_label_ setFrame:NSMakeRect(x, y, width, 24.0)];
 
-    y -= 128.0;
-    [telemetry_label_ setFrame:NSMakeRect(x, y, width, 118.0)];
+    y -= 142.0;
+    [telemetry_label_ setFrame:NSMakeRect(x, y, width, 132.0)];
 
-    y -= 132.0;
-    [mission_label_ setFrame:NSMakeRect(x, y, width, 118.0)];
+    y -= 126.0;
+    [mission_label_ setFrame:NSMakeRect(x, y, width, 112.0)];
 
     y -= 36.0;
     [message_label_ setFrame:NSMakeRect(x, y, width, 24.0)];
@@ -414,6 +557,108 @@ struct ViewBounds {
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glClearColor(0.025f, 0.032f, 0.042f, 1.0f);
+    [self loadMapTilesForMission];
+}
+
+- (void)clearMapTiles {
+    [[self openGLContext] makeCurrentContext];
+    for (const MapTile& tile : map_tiles_) {
+        if (tile.texture_id != 0) {
+            GLuint texture_id = tile.texture_id;
+            glDeleteTextures(1, &texture_id);
+        }
+    }
+    map_tiles_.clear();
+    map_status_ = "Map off";
+}
+
+- (void)loadMapTilesForMission {
+    if (!simulation_ || !simulation_->mission().home_geo) {
+        [self clearMapTiles];
+        return;
+    }
+
+    [[self openGLContext] makeCurrentContext];
+    [self clearMapTiles];
+
+    const auto& mission = simulation_->mission();
+    const GeoCoordinate origin = *mission.home_geo;
+    const ViewBounds view_bounds = [self viewBoundsForRect:[self sceneRect]];
+    const double padding_m = 40.0;
+    const std::vector<GeoCoordinate> corners = {
+        geo_from_local(Vec3(view_bounds.min_x - padding_m, 0.0, view_bounds.min_z - padding_m), origin),
+        geo_from_local(Vec3(view_bounds.min_x - padding_m, 0.0, view_bounds.max_z + padding_m), origin),
+        geo_from_local(Vec3(view_bounds.max_x + padding_m, 0.0, view_bounds.min_z - padding_m), origin),
+        geo_from_local(Vec3(view_bounds.max_x + padding_m, 0.0, view_bounds.max_z + padding_m), origin),
+    };
+
+    int selected_zoom = 18;
+    int min_tile_x = 0;
+    int max_tile_x = 0;
+    int min_tile_y = 0;
+    int max_tile_y = 0;
+
+    for (int zoom = 18; zoom >= 14; --zoom) {
+        bool first = true;
+        for (const GeoCoordinate& corner : corners) {
+            const TileCoordinate tile = tile_for_geo(corner, zoom);
+            if (first) {
+                min_tile_x = max_tile_x = tile.x;
+                min_tile_y = max_tile_y = tile.y;
+                first = false;
+            } else {
+                min_tile_x = std::min(min_tile_x, tile.x);
+                max_tile_x = std::max(max_tile_x, tile.x);
+                min_tile_y = std::min(min_tile_y, tile.y);
+                max_tile_y = std::max(max_tile_y, tile.y);
+            }
+        }
+
+        min_tile_x = std::max(0, min_tile_x - 1);
+        min_tile_y = std::max(0, min_tile_y - 1);
+        const int max_index = (1 << zoom) - 1;
+        max_tile_x = std::min(max_index, max_tile_x + 1);
+        max_tile_y = std::min(max_index, max_tile_y + 1);
+
+        const int tile_count = (max_tile_x - min_tile_x + 1) * (max_tile_y - min_tile_y + 1);
+        selected_zoom = zoom;
+        if (tile_count <= 16 || zoom == 14) {
+            break;
+        }
+    }
+
+    int loaded_count = 0;
+    for (int tile_y = min_tile_y; tile_y <= max_tile_y; ++tile_y) {
+        for (int tile_x = min_tile_x; tile_x <= max_tile_x; ++tile_x) {
+            NSData* data = data_for_tile(selected_zoom, tile_x, tile_y);
+            const GLuint texture_id = texture_from_image_data(data);
+            if (texture_id == 0) {
+                continue;
+            }
+
+            const GeoCoordinate north_west = geo_for_tile_corner(selected_zoom, tile_x, tile_y);
+            const GeoCoordinate south_east = geo_for_tile_corner(selected_zoom, tile_x + 1, tile_y + 1);
+            const Vec3 local_north_west = local_from_geo(north_west, origin);
+            const Vec3 local_south_east = local_from_geo(south_east, origin);
+
+            map_tiles_.push_back({
+                texture_id,
+                local_north_west.x,
+                local_south_east.x,
+                local_south_east.z,
+                local_north_west.z,
+            });
+            ++loaded_count;
+        }
+    }
+
+    if (loaded_count > 0) {
+        map_status_ = "OSM z" + std::to_string(selected_zoom);
+        [self setStatusMessage:"Map tiles loaded"];
+    } else {
+        map_status_ = "Grid only";
+        [self setStatusMessage:"Map unavailable"];
+    }
 }
 
 - (void)writeTelemetrySample:(const DroneState&)state {
@@ -552,7 +797,8 @@ struct ViewBounds {
               << "Battery   " << std::setprecision(0) << state.battery_percent << "%\n"
               << std::setprecision(1)
               << "Time      " << state.mission_time_s << " s\n"
-              << "Camera    " << (chase_camera_ ? "chase" : "map");
+              << "Camera    " << (chase_camera_ ? "chase" : "map") << "\n"
+              << "Map       " << map_status_;
     [telemetry_label_ setStringValue:ns_string(telemetry.str())];
 
     std::ostringstream mission;
@@ -651,6 +897,7 @@ struct ViewBounds {
 - (void)fitCameraAction:(id)sender {
     (void)sender;
     [self fitMissionCamera];
+    [self loadMapTilesForMission];
     [self setStatusMessage:"Mission fitted"];
     [[self window] makeFirstResponder:self];
 }
@@ -718,6 +965,7 @@ struct ViewBounds {
         trail_.clear();
         simulation_->set_control_mode(ControlMode::Autopilot);
         [self fitMissionCamera];
+        [self loadMapTilesForMission];
         [self startNewRecording];
         [self setStatusMessage:"Mission loaded"];
     } catch (const std::exception& error) {
@@ -924,6 +1172,9 @@ struct ViewBounds {
     Waypoint waypoint;
     waypoint.name = "edited_waypoint_" + std::to_string(simulation_->mission().waypoints.size() + 1);
     waypoint.position = point;
+    if (simulation_->mission().home_geo) {
+        waypoint.geo = geo_from_local(point, *simulation_->mission().home_geo);
+    }
     waypoint.action = WaypointAction::FlyThrough;
     simulation_->mutable_mission().waypoints.push_back(waypoint);
     selected_waypoint_ = static_cast<int>(simulation_->mission().waypoints.size()) - 1;
@@ -1019,6 +1270,30 @@ struct ViewBounds {
     glVertex2d(0, min_z);
     glVertex2d(0, max_z);
     glEnd();
+}
+
+- (void)drawMapTiles {
+    if (map_tiles_.empty()) {
+        return;
+    }
+
+    glEnable(GL_TEXTURE_2D);
+    set_color(1.0, 1.0, 1.0, 0.88);
+    for (const MapTile& tile : map_tiles_) {
+        glBindTexture(GL_TEXTURE_2D, tile.texture_id);
+        glBegin(GL_QUADS);
+        glTexCoord2d(0.0, 1.0);
+        glVertex2d(tile.min_x, tile.min_z);
+        glTexCoord2d(1.0, 1.0);
+        glVertex2d(tile.max_x, tile.min_z);
+        glTexCoord2d(1.0, 0.0);
+        glVertex2d(tile.max_x, tile.max_z);
+        glTexCoord2d(0.0, 0.0);
+        glVertex2d(tile.min_x, tile.max_z);
+        glEnd();
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
 }
 
 - (void)drawMissionPath {
@@ -1151,7 +1426,13 @@ struct ViewBounds {
 
     const NSRect bounds = [self bounds];
     const NSRect scene = [self sceneRect];
-    glViewport(0, 0, static_cast<GLsizei>(scene.size.width), static_cast<GLsizei>(scene.size.height));
+    const NSRect backing_scene = [self convertRectToBacking:scene];
+    glViewport(
+        static_cast<GLint>(backing_scene.origin.x),
+        static_cast<GLint>(backing_scene.origin.y),
+        static_cast<GLsizei>(backing_scene.size.width),
+        static_cast<GLsizei>(backing_scene.size.height)
+    );
     glClear(GL_COLOR_BUFFER_BIT);
 
     const ViewBounds viewBounds = [self viewBoundsForRect:scene];
@@ -1162,6 +1443,7 @@ struct ViewBounds {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
+    [self drawMapTiles];
     [self drawGrid:viewBounds];
     [self drawMissionPath];
     [self drawTrail];
@@ -1383,7 +1665,11 @@ struct ViewBounds {
     }
 
     const double altitude = waypoints[static_cast<std::size_t>(selected_waypoint_)].position.y;
-    waypoints[static_cast<std::size_t>(selected_waypoint_)].position = [self worldPointFromEvent:event altitude:altitude];
+    Waypoint& waypoint = waypoints[static_cast<std::size_t>(selected_waypoint_)];
+    waypoint.position = [self worldPointFromEvent:event altitude:altitude];
+    if (simulation_->mission().home_geo) {
+        waypoint.geo = geo_from_local(waypoint.position, *simulation_->mission().home_geo);
+    }
 }
 
 - (void)mouseUp:(NSEvent*)event {

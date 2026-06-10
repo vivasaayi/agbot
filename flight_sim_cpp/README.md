@@ -54,6 +54,7 @@ Controls:
 The viewer has a right-side panel for live telemetry, mission/debug state, and command buttons.
 Keyboard controls are still available when the simulator view has focus.
 Live viewer runs are recorded automatically to `flight_sim_cpp/out/runs/flight_*.jsonl` and mirrored to `flight_sim_cpp/out/telemetry.jsonl`.
+If the mission has a real `home` coordinate, the viewer tries to load OpenStreetMap tiles under the flight area and caches them in `flight_sim_cpp/out/map_tiles`.
 
 - `Space`: pause/resume
 - `R`: reset mission
@@ -99,11 +100,13 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
 
 ## Mission Coordinates
 
-The local simulator uses meters:
+The simulator flies in local meters:
 
 - `x`: east/west
 - `y`: altitude
 - `z`: north/south
+
+Mission JSON can also include real earth coordinates. When `home` or `home_position` has `latitude` and `longitude`, the viewer uses that point as the map origin. Waypoints may either keep local `x/y/z` or provide `latitude`/`longitude`/`altitude` directly.
 
 Example waypoint:
 
@@ -114,6 +117,18 @@ Example waypoint:
   "x": 0.0,
   "y": 30.0,
   "z": 120.0
+}
+```
+
+Example geodetic waypoint:
+
+```json
+{
+  "name": "north_entry",
+  "action": "fly",
+  "latitude": 36.779378,
+  "longitude": -119.417900,
+  "altitude": 30.0
 }
 ```
 

@@ -2,13 +2,18 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <sstream>
 #include <stdexcept>
 
 namespace agbot::flight_sim {
 namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kEarthMetersPerDegreeLat = 111'320.0;
 
 std::string read_all(const std::filesystem::path& path) {
     std::ifstream file(path);
@@ -113,6 +118,14 @@ std::string object_for_key(const std::string& text, const std::string& key) {
     return text.substr(value_start, end - value_start + 1);
 }
 
+std::optional<std::string> optional_object_for_key(const std::string& text, const std::string& key) {
+    try {
+        return object_for_key(text, key);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 std::string array_for_key(const std::string& text, const std::string& key) {
     const std::size_t value_start = find_value_start(text, key);
     if (value_start >= text.size() || text[value_start] != '[') {
@@ -164,6 +177,15 @@ std::optional<double> optional_number_for_key(const std::string& text, const std
     }
 }
 
+std::optional<double> optional_number_for_keys(const std::string& text, std::initializer_list<const char*> keys) {
+    for (const char* key : keys) {
+        if (auto value = optional_number_for_key(text, key)) {
+            return value;
+        }
+    }
+    return std::nullopt;
+}
+
 std::string string_for_key(const std::string& text, const std::string& key, const std::string& fallback = {}) {
     try {
         const std::size_t value_start = find_value_start(text, key);
@@ -193,25 +215,98 @@ std::string string_for_key(const std::string& text, const std::string& key, cons
     return fallback;
 }
 
-Vec3 vec3_from_object(const std::string& object) {
-    return {
-        number_for_key(object, "x"),
-        number_for_key(object, "y"),
-        number_for_key(object, "z"),
+std::optional<Vec3> optional_vec3_from_object(const std::string& object) {
+    const auto x = optional_number_for_key(object, "x");
+    const auto y = optional_number_for_key(object, "y");
+    const auto z = optional_number_for_key(object, "z");
+    if (!x || !y || !z) {
+        return std::nullopt;
+    }
+    return Vec3(*x, *y, *z);
+}
+
+std::optional<GeoCoordinate> geo_from_object(const std::string& object) {
+    const auto latitude = optional_number_for_keys(object, {"latitude", "lat"});
+    const auto longitude = optional_number_for_keys(object, {"longitude", "lon", "lng"});
+    if (!latitude || !longitude) {
+        return std::nullopt;
+    }
+
+    return GeoCoordinate {
+        *latitude,
+        *longitude,
+        optional_number_for_keys(object, {"altitude", "altitude_m", "alt"}).value_or(0.0),
     };
 }
 
-Waypoint waypoint_from_object(const std::string& object) {
+WaypointAction waypoint_action_from_command(double command) {
+    const int mavlink_command = static_cast<int>(std::round(command));
+    switch (mavlink_command) {
+        case 21:
+            return WaypointAction::Land;
+        case 22:
+            return WaypointAction::Takeoff;
+        case 17:
+            return WaypointAction::Loiter;
+        case 20:
+            return WaypointAction::ReturnHome;
+        default:
+            return WaypointAction::FlyThrough;
+    }
+}
+
+Waypoint waypoint_from_object(const std::string& object, const Mission& mission) {
     Waypoint waypoint;
+    const auto position_object = optional_object_for_key(object, "position");
+    const std::string& coordinate_source = position_object.value_or(object);
+
     waypoint.name = string_for_key(object, "name", "waypoint");
-    waypoint.position = vec3_from_object(object);
-    waypoint.action = waypoint_action_from_string(string_for_key(object, "action", "fly"));
+    if (const auto sequence = optional_number_for_key(object, "sequence")) {
+        waypoint.name = "waypoint_" + std::to_string(static_cast<int>(*sequence));
+    }
+
+    waypoint.geo = geo_from_object(coordinate_source);
+    if (waypoint.geo && mission.home_geo) {
+        waypoint.position = local_from_geo(*waypoint.geo, *mission.home_geo);
+    } else if (const auto position = optional_vec3_from_object(coordinate_source)) {
+        waypoint.position = *position;
+    } else if (const auto position = optional_vec3_from_object(object)) {
+        waypoint.position = *position;
+    } else {
+        throw std::runtime_error("Waypoint must contain either x/y/z or latitude/longitude coordinates");
+    }
+
+    if (const auto command = optional_number_for_key(object, "command")) {
+        waypoint.action = waypoint_action_from_command(*command);
+    } else {
+        waypoint.action = waypoint_action_from_string(string_for_key(object, "action", "fly"));
+    }
     waypoint.speed_mps = optional_number_for_key(object, "speed_mps");
     waypoint.hold_seconds = optional_number_for_key(object, "hold_seconds", 0.0);
     return waypoint;
 }
 
 } // namespace
+
+Vec3 local_from_geo(const GeoCoordinate& coordinate, const GeoCoordinate& origin) {
+    const double meters_per_degree_lon =
+        kEarthMetersPerDegreeLat * std::cos(origin.latitude * kPi / 180.0);
+    return {
+        (coordinate.longitude - origin.longitude) * meters_per_degree_lon,
+        coordinate.altitude_m,
+        (coordinate.latitude - origin.latitude) * kEarthMetersPerDegreeLat,
+    };
+}
+
+GeoCoordinate geo_from_local(const Vec3& local_position, const GeoCoordinate& origin) {
+    const double meters_per_degree_lon =
+        kEarthMetersPerDegreeLat * std::cos(origin.latitude * kPi / 180.0);
+    return {
+        origin.latitude + (local_position.z / kEarthMetersPerDegreeLat),
+        origin.longitude + (local_position.x / meters_per_degree_lon),
+        local_position.y,
+    };
+}
 
 const char* to_string(WaypointAction action) {
     switch (action) {
@@ -257,7 +352,22 @@ Mission MissionLoader::load_from_file(const std::filesystem::path& path) {
 Mission MissionLoader::load_from_text(const std::string& text) {
     Mission mission;
     mission.name = string_for_key(text, "name", mission.name);
-    mission.home = vec3_from_object(object_for_key(text, "home"));
+
+    auto home_object = optional_object_for_key(text, "home");
+    if (!home_object) {
+        home_object = optional_object_for_key(text, "home_position");
+    }
+    if (!home_object) {
+        throw std::runtime_error("Mission JSON is missing home or home_position");
+    }
+
+    mission.home_geo = geo_from_object(*home_object);
+    if (const auto home = optional_vec3_from_object(*home_object)) {
+        mission.home = *home;
+    } else {
+        mission.home = {};
+    }
+
     mission.cruise_speed_mps = optional_number_for_key(text, "cruise_speed_mps", mission.cruise_speed_mps);
     mission.acceptance_radius_m = optional_number_for_key(text, "acceptance_radius_m", mission.acceptance_radius_m);
 
@@ -268,7 +378,7 @@ Mission MissionLoader::load_from_text(const std::string& text) {
 
     mission.waypoints.reserve(waypoint_objects.size());
     for (const std::string& object : waypoint_objects) {
-        mission.waypoints.push_back(waypoint_from_object(object));
+        mission.waypoints.push_back(waypoint_from_object(object, mission));
     }
     return mission;
 }
@@ -295,6 +405,11 @@ std::string mission_to_json(const Mission& mission) {
     output << "{\n";
     output << "  \"name\": \"" << escape_json(mission.name) << "\",\n";
     output << "  \"home\": {\n";
+    if (mission.home_geo) {
+        output << "    \"latitude\": " << mission.home_geo->latitude << ",\n";
+        output << "    \"longitude\": " << mission.home_geo->longitude << ",\n";
+        output << "    \"altitude\": " << mission.home_geo->altitude_m << ",\n";
+    }
     output << "    \"x\": " << mission.home.x << ",\n";
     output << "    \"y\": " << mission.home.y << ",\n";
     output << "    \"z\": " << mission.home.z << "\n";
@@ -308,6 +423,12 @@ std::string mission_to_json(const Mission& mission) {
         output << "    {\n";
         output << "      \"name\": \"" << escape_json(waypoint.name) << "\",\n";
         output << "      \"action\": \"" << to_string(waypoint.action) << "\",\n";
+        if (mission.home_geo) {
+            const GeoCoordinate coordinate = waypoint.geo.value_or(geo_from_local(waypoint.position, *mission.home_geo));
+            output << "      \"latitude\": " << coordinate.latitude << ",\n";
+            output << "      \"longitude\": " << coordinate.longitude << ",\n";
+            output << "      \"altitude\": " << coordinate.altitude_m << ",\n";
+        }
         output << "      \"x\": " << waypoint.position.x << ",\n";
         output << "      \"y\": " << waypoint.position.y << ",\n";
         output << "      \"z\": " << waypoint.position.z;

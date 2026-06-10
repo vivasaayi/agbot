@@ -1,6 +1,9 @@
 {
   "name": "AgBot FlightSim Sandbox Loop",
   "home": {
+    "latitude": 36.7783,
+    "longitude": -119.4179,
+    "altitude": 0.0,
     "x": 0.0,
     "y": 0.0,
     "z": 0.0
