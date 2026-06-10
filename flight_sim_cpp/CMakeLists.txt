@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(agbot_flight_sim_core
     src/DroneSimulation.cpp
+    src/GeoTerrain.cpp
     src/MissionLoader.cpp
     src/TelemetryReplay.cpp
     src/TelemetryRecorder.cpp

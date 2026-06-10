@@ -55,10 +55,12 @@ The viewer has a right-side panel for live telemetry, mission/debug state, and c
 Keyboard controls are still available when the simulator view has focus.
 Live viewer runs are recorded automatically to `flight_sim_cpp/out/runs/flight_*.jsonl` and mirrored to `flight_sim_cpp/out/telemetry.jsonl`.
 If the mission has a real `home` coordinate, the viewer tries to load OpenStreetMap tiles under the flight area and caches them in `flight_sim_cpp/out/map_tiles`.
+The viewer can also load a real-world location directly from latitude/longitude. Use the `Location` button to enter a coordinate and area in square kilometers. The C++ viewer creates a local flight footprint, fetches/caches OSM imagery and AWS Terrarium elevation tiles, and renders an elevation-tinted terrain layer behind the mission.
 
 - `Space`: pause/resume
 - `R`: reset mission
 - `C`: toggle chase camera
+- `B`: toggle globe picker
 - `F`: fit mission camera
 - Arrow keys: pan camera
 - Mouse wheel, `+`, `-`: zoom
@@ -76,6 +78,8 @@ If the mission has a real `home` coordinate, the viewer tries to load OpenStreet
 - `G`: load/toggle telemetry replay from `flight_sim_cpp/out/telemetry.jsonl`
 - Use the replay slider to scrub loaded telemetry.
 - Use `Replay File` to load an archived JSONL run from `flight_sim_cpp/out/runs`.
+- Use `Location` to load a real-world coordinate and area. Elevation tiles are cached in `flight_sim_cpp/out/elevation_tiles`.
+- Use `Globe` to rotate an in-view globe and click a point to load that location through the same C++ terrain pipeline. In Globe mode, mouse wheel and `+`/`-` zoom the globe; zooming in switches the cached world-map tile detail from z3 to z4.
 
 ## Mission Planner Bridge
 

@@ -2,17 +2,20 @@
 #import <OpenGL/gl.h>
 
 #include "agbot_flight_sim/DroneSimulation.hpp"
+#include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <algorithm>
 #include <sstream>
 #include <string>
@@ -22,18 +25,30 @@
 using agbot::flight_sim::DroneSimulation;
 using agbot::flight_sim::DroneState;
 using agbot::flight_sim::GeoCoordinate;
+using agbot::flight_sim::GeoBounds;
 using agbot::flight_sim::ControlMode;
+using agbot::flight_sim::ElevationTile;
 using agbot::flight_sim::ManualControlInput;
+using agbot::flight_sim::Mission;
 using agbot::flight_sim::MissionLoader;
+using agbot::flight_sim::TerrainMesh;
 using agbot::flight_sim::TelemetryRecorder;
 using agbot::flight_sim::TelemetryReplay;
+using agbot::flight_sim::TileCoordinate;
 using agbot::flight_sim::Vec3;
 using agbot::flight_sim::Waypoint;
 using agbot::flight_sim::WaypointAction;
 using agbot::flight_sim::default_sample_mission_path;
+using agbot::flight_sim::build_terrain_mesh;
+using agbot::flight_sim::composite_elevation;
+using agbot::flight_sim::elevation_tile_from_terrarium_rgba;
 using agbot::flight_sim::geo_from_local;
 using agbot::flight_sim::local_from_geo;
+using agbot::flight_sim::radius_m_for_area_km2;
+using agbot::flight_sim::tile_for_geo;
+using agbot::flight_sim::tiles_for_bounds;
 using agbot::flight_sim::to_string;
+using agbot::flight_sim::zoom_for_radius_m;
 
 namespace {
 
@@ -168,53 +183,39 @@ struct MapTile {
     double max_z = 0.0;
 };
 
-struct TileCoordinate {
-    int z = 0;
-    int x = 0;
-    int y = 0;
+struct GlobeMapTile {
+    GLuint texture_id = 0;
+    GeoBounds bounds;
 };
 
-double deg_to_rad(double degrees) {
-    return degrees * M_PI / 180.0;
-}
+struct GlobePoint {
+    double x = 0.0;
+    double y = 0.0;
+    double depth = 0.0;
+    bool visible = false;
+};
 
-double rad_to_deg(double radians) {
-    return radians * 180.0 / M_PI;
-}
-
-TileCoordinate tile_for_geo(const GeoCoordinate& coordinate, int zoom) {
-    const double n = std::pow(2.0, zoom);
-    const double lat_rad = deg_to_rad(std::clamp(coordinate.latitude, -85.05112878, 85.05112878));
-    const int max_tile = static_cast<int>(n) - 1;
-    return {
-        zoom,
-        std::clamp(static_cast<int>(std::floor((coordinate.longitude + 180.0) / 360.0 * n)), 0, max_tile),
-        std::clamp(static_cast<int>(std::floor((1.0 - std::log(std::tan(lat_rad) + (1.0 / std::cos(lat_rad))) / M_PI) / 2.0 * n)), 0, max_tile),
-    };
-}
-
-GeoCoordinate geo_for_tile_corner(int zoom, int x, int y) {
-    const double n = std::pow(2.0, zoom);
-    const double longitude = (static_cast<double>(x) / n * 360.0) - 180.0;
-    const double mercator = M_PI * (1.0 - 2.0 * static_cast<double>(y) / n);
-    const double latitude = rad_to_deg(std::atan(std::sinh(mercator)));
-    return {latitude, longitude, 0.0};
-}
+constexpr int kGlobeMapMinZoom = 3;
+constexpr int kGlobeMapMaxZoom = 4;
+constexpr double kMinGlobeViewZoom = 0.75;
+constexpr double kMaxGlobeViewZoom = 2.75;
 
 std::filesystem::path map_tile_cache_path(int zoom, int x, int y) {
     return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR)
         / "out" / "map_tiles" / std::to_string(zoom) / std::to_string(x) / (std::to_string(y) + ".png");
 }
 
-NSData* data_for_tile(int zoom, int x, int y) {
-    const std::filesystem::path cache_path = map_tile_cache_path(zoom, x, y);
+std::filesystem::path elevation_tile_cache_path(int zoom, int x, int y) {
+    return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR)
+        / "out" / "elevation_tiles" / std::to_string(zoom) / std::to_string(x) / (std::to_string(y) + ".png");
+}
+
+NSData* data_for_url_cached(const std::filesystem::path& cache_path, const std::string& url_text) {
     if (std::filesystem::exists(cache_path)) {
         return [NSData dataWithContentsOfFile:ns_string(cache_path)];
     }
 
-    std::ostringstream url_text;
-    url_text << "https://tile.openstreetmap.org/" << zoom << "/" << x << "/" << y << ".png";
-    NSURL* url = [NSURL URLWithString:ns_string(url_text.str())];
+    NSURL* url = [NSURL URLWithString:ns_string(url_text)];
     NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url];
     [request setValue:@"AgBotFlightSim/0.1 local simulator" forHTTPHeaderField:@"User-Agent"];
     [request setTimeoutInterval:5.0];
@@ -229,6 +230,62 @@ NSData* data_for_tile(int zoom, int x, int y) {
     std::filesystem::create_directories(cache_path.parent_path());
     [data writeToFile:ns_string(cache_path) atomically:YES];
     return data;
+}
+
+NSData* data_for_tile(int zoom, int x, int y) {
+    std::ostringstream url_text;
+    url_text << "https://tile.openstreetmap.org/" << zoom << "/" << x << "/" << y << ".png";
+    return data_for_url_cached(map_tile_cache_path(zoom, x, y), url_text.str());
+}
+
+NSData* data_for_elevation_tile(int zoom, int x, int y) {
+    std::ostringstream url_text;
+    url_text << "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/" << zoom << "/" << x << "/" << y << ".png";
+    return data_for_url_cached(elevation_tile_cache_path(zoom, x, y), url_text.str());
+}
+
+bool rgba_pixels_from_image_data(NSData* data, std::vector<std::uint8_t>& pixels, int& width, int& height) {
+    if (!data) {
+        return false;
+    }
+
+    NSImage* image = [[NSImage alloc] initWithData:data];
+    if (!image) {
+        return false;
+    }
+
+    CGImageRef image_ref = [image CGImageForProposedRect:nullptr context:nil hints:nil];
+    if (!image_ref) {
+        [image release];
+        return false;
+    }
+
+    width = static_cast<int>(CGImageGetWidth(image_ref));
+    height = static_cast<int>(CGImageGetHeight(image_ref));
+    pixels.assign(static_cast<std::size_t>(width * height * 4), 0);
+
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(
+        pixels.data(),
+        static_cast<std::size_t>(width),
+        static_cast<std::size_t>(height),
+        8,
+        static_cast<std::size_t>(width * 4),
+        color_space,
+        static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast) | kCGBitmapByteOrder32Big
+    );
+
+    if (!context) {
+        CGColorSpaceRelease(color_space);
+        [image release];
+        return false;
+    }
+
+    CGContextDrawImage(context, CGRectMake(0.0, 0.0, width, height), image_ref);
+    CGContextRelease(context);
+    CGColorSpaceRelease(color_space);
+    [image release];
+    return true;
 }
 
 GLuint texture_from_image_data(NSData* data) {
@@ -295,6 +352,63 @@ GLuint texture_from_image_data(NSData* data) {
     return texture_id;
 }
 
+Mission mission_for_location(GeoCoordinate center, double area_km2) {
+    const double radius_m = radius_m_for_area_km2(area_km2);
+    const double half_extent_m = radius_m / std::sqrt(2.0);
+
+    Mission mission;
+    std::ostringstream name;
+    name << "Location " << std::fixed << std::setprecision(4)
+         << center.latitude << ", " << center.longitude;
+    mission.name = name.str();
+    mission.home = Vec3(0.0, 0.0, 0.0);
+    mission.home_geo = center;
+    mission.cruise_speed_mps = 12.0;
+    mission.acceptance_radius_m = 3.0;
+
+    const std::vector<std::pair<std::string, Vec3>> points = {
+        {"takeoff", Vec3(0.0, 30.0, 0.0)},
+        {"north_west", Vec3(-half_extent_m, 30.0, half_extent_m)},
+        {"north_east", Vec3(half_extent_m, 30.0, half_extent_m)},
+        {"south_east", Vec3(half_extent_m, 30.0, -half_extent_m)},
+        {"south_west", Vec3(-half_extent_m, 30.0, -half_extent_m)},
+        {"land", Vec3(0.0, 0.0, 0.0)},
+    };
+
+    for (const auto& [waypoint_name, position] : points) {
+        Waypoint waypoint;
+        waypoint.name = waypoint_name;
+        waypoint.position = position;
+        waypoint.geo = geo_from_local(position, center);
+        waypoint.speed_mps = mission.cruise_speed_mps;
+        if (waypoint_name == "takeoff") {
+            waypoint.action = WaypointAction::Takeoff;
+        } else if (waypoint_name == "land") {
+            waypoint.action = WaypointAction::Land;
+        } else {
+            waypoint.action = WaypointAction::FlyThrough;
+        }
+        mission.waypoints.push_back(waypoint);
+    }
+
+    return mission;
+}
+
+GlobePoint project_globe_point(double latitude, double longitude, double center_latitude, double center_longitude) {
+    const double lat = latitude * M_PI / 180.0;
+    const double lon = (longitude - center_longitude) * M_PI / 180.0;
+    const double center_lat = center_latitude * M_PI / 180.0;
+
+    const double cos_lat = std::cos(lat);
+    const double x = cos_lat * std::sin(lon);
+    const double y = std::cos(center_lat) * std::sin(lat) -
+        std::sin(center_lat) * cos_lat * std::cos(lon);
+    const double depth = std::sin(center_lat) * std::sin(lat) +
+        std::cos(center_lat) * cos_lat * std::cos(lon);
+
+    return {x, y, depth, depth >= 0.0};
+}
+
 } // namespace
 
 @interface FlightSimOpenGLView : NSOpenGLView {
@@ -304,11 +418,15 @@ GLuint texture_from_image_data(NSData* data) {
     std::unique_ptr<TelemetryRecorder> latest_recorder_;
     std::vector<Vec3> trail_;
     std::vector<MapTile> map_tiles_;
+    std::vector<GlobeMapTile> globe_map_tiles_;
+    TerrainMesh terrain_mesh_;
     NSTimer* timer_;
     bool paused_;
     bool chase_camera_;
     bool manual_mode_;
     bool replay_mode_;
+    bool globe_mode_;
+    bool dragging_globe_;
     bool key_w_;
     bool key_a_;
     bool key_s_;
@@ -327,14 +445,17 @@ GLuint texture_from_image_data(NSData* data) {
     NSTextField* mission_label_;
     NSTextField* message_label_;
     NSTextField* replay_time_label_;
+    NSTextField* globe_overlay_label_;
     NSButton* manual_button_;
     NSButton* arm_button_;
     NSButton* pause_button_;
     NSButton* chase_button_;
     NSButton* fit_button_;
+    NSButton* globe_button_;
     NSButton* replay_button_;
     NSButton* load_mission_button_;
     NSButton* load_replay_button_;
+    NSButton* location_button_;
     NSButton* save_button_;
     NSButton* reset_button_;
     NSSlider* replay_slider_;
@@ -344,11 +465,21 @@ GLuint texture_from_image_data(NSData* data) {
     double trail_sample_accumulator_;
     double record_sample_accumulator_;
     double replay_time_s_;
+    double real_world_area_km2_;
+    double globe_view_zoom_;
+    int globe_map_zoom_;
+    double globe_center_latitude_;
+    double globe_center_longitude_;
+    NSPoint globe_drag_start_;
+    double globe_drag_start_latitude_;
+    double globe_drag_start_longitude_;
     std::filesystem::path mission_path_;
     std::filesystem::path replay_path_;
     std::filesystem::path recording_path_;
     std::string status_message_;
     std::string map_status_;
+    std::string terrain_status_;
+    std::string globe_map_status_;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame missionPath:(NSString*)missionPath;
@@ -378,6 +509,8 @@ GLuint texture_from_image_data(NSData* data) {
         chase_camera_ = false;
         manual_mode_ = false;
         replay_mode_ = false;
+        globe_mode_ = false;
+        dragging_globe_ = false;
         key_w_ = false;
         key_a_ = false;
         key_s_ = false;
@@ -396,22 +529,32 @@ GLuint texture_from_image_data(NSData* data) {
         trail_sample_accumulator_ = 0.0;
         record_sample_accumulator_ = 0.0;
         replay_time_s_ = 0.0;
+        real_world_area_km2_ = 20.0;
+        globe_view_zoom_ = 1.0;
+        globe_map_zoom_ = 0;
+        globe_center_latitude_ = 20.0;
+        globe_center_longitude_ = 0.0;
         status_message_ = "Ready";
         map_status_ = "Map off";
+        terrain_status_ = "Terrain off";
+        globe_map_status_ = "World map off";
         side_panel_ = nil;
         title_label_ = nil;
         telemetry_label_ = nil;
         mission_label_ = nil;
         message_label_ = nil;
         replay_time_label_ = nil;
+        globe_overlay_label_ = nil;
         manual_button_ = nil;
         arm_button_ = nil;
         pause_button_ = nil;
         chase_button_ = nil;
         fit_button_ = nil;
+        globe_button_ = nil;
         replay_button_ = nil;
         load_mission_button_ = nil;
         load_replay_button_ = nil;
+        location_button_ = nil;
         save_button_ = nil;
         reset_button_ = nil;
         replay_slider_ = nil;
@@ -442,6 +585,7 @@ GLuint texture_from_image_data(NSData* data) {
 - (void)dealloc {
     [self finishRecording];
     [self clearMapTiles];
+    [self clearGlobeMapTiles];
     [timer_ invalidate];
     [super dealloc];
 }
@@ -471,15 +615,23 @@ GLuint texture_from_image_data(NSData* data) {
     mission_label_ = make_label(@"", [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightRegular], [NSColor secondaryLabelColor]);
     message_label_ = make_label(@"Ready", [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium], [NSColor controlAccentColor]);
     replay_time_label_ = make_label(@"Replay -", [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightRegular], [NSColor secondaryLabelColor]);
+    globe_overlay_label_ = make_label(@"", [NSFont monospacedSystemFontOfSize:12.0 weight:NSFontWeightMedium], [NSColor colorWithCalibratedWhite:0.92 alpha:1.0]);
+    [globe_overlay_label_ setWantsLayer:YES];
+    [globe_overlay_label_ setDrawsBackground:YES];
+    [globe_overlay_label_ setBackgroundColor:[NSColor colorWithCalibratedWhite:0.0 alpha:0.55]];
+    [globe_overlay_label_.layer setCornerRadius:6.0];
+    [globe_overlay_label_ setHidden:YES];
 
     manual_button_ = make_button(@"Manual", self, @selector(toggleManualMode:));
     arm_button_ = make_button(@"Arm", self, @selector(toggleArmAction:));
     pause_button_ = make_button(@"Pause", self, @selector(togglePause:));
     chase_button_ = make_button(@"Chase", self, @selector(toggleChaseCamera:));
     fit_button_ = make_button(@"Fit", self, @selector(fitCameraAction:));
+    globe_button_ = make_button(@"Globe", self, @selector(toggleGlobeMode:));
     replay_button_ = make_button(@"Replay", self, @selector(toggleReplayAction:));
     load_mission_button_ = make_button(@"Load Mission", self, @selector(loadMissionAction:));
     load_replay_button_ = make_button(@"Replay File", self, @selector(loadReplayFileAction:));
+    location_button_ = make_button(@"Location", self, @selector(loadLocationAction:));
     save_button_ = make_button(@"Save", self, @selector(saveMissionAction:));
     reset_button_ = make_button(@"Reset", self, @selector(resetMissionAction:));
     replay_slider_ = make_slider(self, @selector(scrubReplay:));
@@ -488,9 +640,10 @@ GLuint texture_from_image_data(NSData* data) {
                               replay_time_label_, replay_slider_,
                               manual_button_, arm_button_, pause_button_, reset_button_,
                               chase_button_, fit_button_, save_button_, load_mission_button_,
-                              replay_button_, load_replay_button_]) {
+                              replay_button_, load_replay_button_, globe_button_, location_button_]) {
         [side_panel_ addSubview:subview];
     }
+    [self addSubview:globe_overlay_label_];
 }
 
 - (void)layout {
@@ -503,17 +656,18 @@ GLuint texture_from_image_data(NSData* data) {
     const NSRect bounds = [self bounds];
     const CGFloat panel_width = 306.0;
     [side_panel_ setFrame:NSMakeRect(bounds.size.width - panel_width, 0.0, panel_width, bounds.size.height)];
+    [globe_overlay_label_ setFrame:NSMakeRect(24.0, 24.0, std::max<CGFloat>(420.0, bounds.size.width - panel_width - 72.0), 48.0)];
 
     CGFloat y = bounds.size.height - 42.0;
     const CGFloat x = 18.0;
     const CGFloat width = panel_width - 36.0;
     [title_label_ setFrame:NSMakeRect(x, y, width, 24.0)];
 
-    y -= 142.0;
-    [telemetry_label_ setFrame:NSMakeRect(x, y, width, 132.0)];
+    y -= 176.0;
+    [telemetry_label_ setFrame:NSMakeRect(x, y, width, 166.0)];
 
-    y -= 126.0;
-    [mission_label_ setFrame:NSMakeRect(x, y, width, 112.0)];
+    y -= 142.0;
+    [mission_label_ setFrame:NSMakeRect(x, y, width, 128.0)];
 
     y -= 36.0;
     [message_label_ setFrame:NSMakeRect(x, y, width, 24.0)];
@@ -546,6 +700,10 @@ GLuint texture_from_image_data(NSData* data) {
     y -= button_height + gap;
     [replay_button_ setFrame:NSMakeRect(x, y, col_width, button_height)];
     [load_replay_button_ setFrame:NSMakeRect(x + col_width + gap, y, col_width, button_height)];
+
+    y -= button_height + gap;
+    [globe_button_ setFrame:NSMakeRect(x, y, col_width, button_height)];
+    [location_button_ setFrame:NSMakeRect(x + col_width + gap, y, col_width, button_height)];
 }
 
 - (void)prepareOpenGL {
@@ -558,6 +716,7 @@ GLuint texture_from_image_data(NSData* data) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glClearColor(0.025f, 0.032f, 0.042f, 1.0f);
     [self loadMapTilesForMission];
+    [self loadRealWorldTerrainForMission];
 }
 
 - (void)clearMapTiles {
@@ -570,6 +729,60 @@ GLuint texture_from_image_data(NSData* data) {
     }
     map_tiles_.clear();
     map_status_ = "Map off";
+}
+
+- (void)clearGlobeMapTiles {
+    [[self openGLContext] makeCurrentContext];
+    for (const GlobeMapTile& tile : globe_map_tiles_) {
+        if (tile.texture_id != 0) {
+            GLuint texture_id = tile.texture_id;
+            glDeleteTextures(1, &texture_id);
+        }
+    }
+    globe_map_tiles_.clear();
+    globe_map_zoom_ = 0;
+    globe_map_status_ = "World map off";
+}
+
+- (int)desiredGlobeMapZoom {
+    return globe_view_zoom_ >= 1.45 ? kGlobeMapMaxZoom : kGlobeMapMinZoom;
+}
+
+- (void)loadGlobeMapTiles {
+    const int desired_zoom = [self desiredGlobeMapZoom];
+    if (!globe_map_tiles_.empty() && globe_map_zoom_ == desired_zoom) {
+        return;
+    }
+
+    [[self openGLContext] makeCurrentContext];
+    [self clearGlobeMapTiles];
+
+    const int tile_count = 1 << desired_zoom;
+    int loaded_count = 0;
+    for (int y = 0; y < tile_count; ++y) {
+        for (int x = 0; x < tile_count; ++x) {
+            NSData* data = data_for_tile(desired_zoom, x, y);
+            const GLuint texture_id = texture_from_image_data(data);
+            if (texture_id == 0) {
+                continue;
+            }
+            globe_map_tiles_.push_back({
+                texture_id,
+                TileCoordinate{desired_zoom, x, y}.bounds(),
+            });
+            ++loaded_count;
+        }
+    }
+
+    if (loaded_count > 0) {
+        globe_map_zoom_ = desired_zoom;
+        globe_map_status_ = "World map OSM z" + std::to_string(desired_zoom) + " " +
+            std::to_string(loaded_count) + "/" + std::to_string(tile_count * tile_count);
+        [self setStatusMessage:"World map loaded"];
+    } else {
+        globe_map_status_ = "World map unavailable";
+        [self setStatusMessage:"World map unavailable"];
+    }
 }
 
 - (void)loadMapTilesForMission {
@@ -636,8 +849,9 @@ GLuint texture_from_image_data(NSData* data) {
                 continue;
             }
 
-            const GeoCoordinate north_west = geo_for_tile_corner(selected_zoom, tile_x, tile_y);
-            const GeoCoordinate south_east = geo_for_tile_corner(selected_zoom, tile_x + 1, tile_y + 1);
+            const GeoBounds tile_bounds = TileCoordinate{selected_zoom, tile_x, tile_y}.bounds();
+            const GeoCoordinate north_west {tile_bounds.max_latitude, tile_bounds.min_longitude, 0.0};
+            const GeoCoordinate south_east {tile_bounds.min_latitude, tile_bounds.max_longitude, 0.0};
             const Vec3 local_north_west = local_from_geo(north_west, origin);
             const Vec3 local_south_east = local_from_geo(south_east, origin);
 
@@ -659,6 +873,71 @@ GLuint texture_from_image_data(NSData* data) {
         map_status_ = "Grid only";
         [self setStatusMessage:"Map unavailable"];
     }
+}
+
+- (void)clearTerrain {
+    terrain_mesh_ = {};
+    terrain_status_ = "Terrain off";
+}
+
+- (void)loadRealWorldTerrainForMission {
+    if (!simulation_ || !simulation_->mission().home_geo) {
+        [self clearTerrain];
+        return;
+    }
+
+    const GeoCoordinate origin = *simulation_->mission().home_geo;
+    const double radius_m = radius_m_for_area_km2(real_world_area_km2_);
+    const GeoBounds bounds = GeoBounds::from_center(origin, radius_m);
+    int zoom = zoom_for_radius_m(radius_m);
+    std::vector<TileCoordinate> requested_tiles = tiles_for_bounds(bounds, zoom);
+
+    while (requested_tiles.size() > 16 && zoom > 10) {
+        --zoom;
+        requested_tiles = tiles_for_bounds(bounds, zoom);
+    }
+
+    std::vector<ElevationTile> elevation_tiles;
+    int failed_tiles = 0;
+    for (const TileCoordinate& tile : requested_tiles) {
+        NSData* data = data_for_elevation_tile(tile.z, tile.x, tile.y);
+        std::vector<std::uint8_t> rgba_pixels;
+        int width = 0;
+        int height = 0;
+        if (!rgba_pixels_from_image_data(data, rgba_pixels, width, height)) {
+            ++failed_tiles;
+            continue;
+        }
+
+        auto elevation_tile = elevation_tile_from_terrarium_rgba(tile, width, height, rgba_pixels);
+        if (!elevation_tile) {
+            ++failed_tiles;
+            continue;
+        }
+        elevation_tiles.push_back(std::move(*elevation_tile));
+    }
+
+    constexpr int kTerrainResolution = 96;
+    const auto heightmap = composite_elevation(elevation_tiles, bounds, kTerrainResolution);
+    terrain_mesh_ = build_terrain_mesh(heightmap, kTerrainResolution, bounds.width_m(), bounds.height_m(), 1.0);
+
+    std::ostringstream status;
+    status << "Terrain z" << zoom << " " << elevation_tiles.size() << "/" << requested_tiles.size();
+    if (failed_tiles > 0) {
+        status << " (" << failed_tiles << " failed)";
+    }
+    if (terrain_mesh_.has_elevation) {
+        status << " " << std::fixed << std::setprecision(0)
+               << terrain_mesh_.min_elevation_m << "-" << terrain_mesh_.max_elevation_m << "m";
+        [self setStatusMessage:"Elevation loaded"];
+    } else if (elevation_tiles.empty()) {
+        status << " flat/no data";
+        [self setStatusMessage:"Elevation unavailable"];
+    } else {
+        status << " flat";
+        [self setStatusMessage:"Flat elevation"];
+    }
+    terrain_status_ = status.str();
 }
 
 - (void)writeTelemetrySample:(const DroneState&)state {
@@ -797,8 +1076,10 @@ GLuint texture_from_image_data(NSData* data) {
               << "Battery   " << std::setprecision(0) << state.battery_percent << "%\n"
               << std::setprecision(1)
               << "Time      " << state.mission_time_s << " s\n"
-              << "Camera    " << (chase_camera_ ? "chase" : "map") << "\n"
-              << "Map       " << map_status_;
+              << "Camera    " << (globe_mode_ ? "globe" : (chase_camera_ ? "chase" : "map")) << "\n"
+              << "Map       " << map_status_ << "\n"
+              << "Terrain   " << terrain_status_ << "\n"
+              << "Globe     " << globe_map_status_;
     [telemetry_label_ setStringValue:ns_string(telemetry.str())];
 
     std::ostringstream mission;
@@ -820,7 +1101,29 @@ GLuint texture_from_image_data(NSData* data) {
     } else {
         mission << "-";
     }
+    if (simulation_->mission().home_geo) {
+        const GeoCoordinate home = *simulation_->mission().home_geo;
+        mission << "\nHome      " << std::fixed << std::setprecision(4)
+                << home.latitude << ", " << home.longitude;
+    }
     [mission_label_ setStringValue:ns_string(mission.str())];
+
+    if (globe_overlay_label_) {
+        std::ostringstream globe_text;
+        if (simulation_->mission().home_geo) {
+            const GeoCoordinate home = *simulation_->mission().home_geo;
+            globe_text << std::fixed << std::setprecision(5)
+                       << "Pin  lat " << home.latitude << "  lon " << home.longitude
+                       << "   Area " << std::setprecision(1) << real_world_area_km2_ << " km2\n";
+        } else {
+            globe_text << "Pin  no geodetic mission loaded\n";
+        }
+        globe_text << globe_map_status_ << "   View "
+                   << std::fixed << std::setprecision(1) << globe_view_zoom_
+                   << "x   Wheel/+/- zoom, drag rotate, click to load";
+        [globe_overlay_label_ setStringValue:ns_string(globe_text.str())];
+        [globe_overlay_label_ setHidden:!globe_mode_];
+    }
 
     const double replay_duration = replay_ ? replay_->duration_s() : 0.0;
     std::ostringstream replay_time;
@@ -840,6 +1143,7 @@ GLuint texture_from_image_data(NSData* data) {
     [arm_button_ setTitle:(state.armed ? @"Disarm" : @"Arm")];
     [pause_button_ setTitle:(paused_ ? @"Resume" : @"Pause")];
     [chase_button_ setTitle:(chase_camera_ ? @"Map" : @"Chase")];
+    [globe_button_ setTitle:(globe_mode_ ? @"Map" : @"Globe")];
     [replay_button_ setTitle:(replay_mode_ ? @"Live" : @"Replay")];
 }
 
@@ -889,13 +1193,47 @@ GLuint texture_from_image_data(NSData* data) {
 
 - (void)toggleChaseCamera:(id)sender {
     (void)sender;
+    globe_mode_ = false;
     chase_camera_ = !chase_camera_;
     [self setStatusMessage:(chase_camera_ ? "Chase camera" : "Mission map camera")];
     [[self window] makeFirstResponder:self];
 }
 
+- (void)toggleGlobeMode:(id)sender {
+    (void)sender;
+    globe_mode_ = !globe_mode_;
+    chase_camera_ = false;
+    dragging_waypoint_ = false;
+    dragging_globe_ = false;
+    if (globe_mode_) {
+        if (simulation_ && simulation_->mission().home_geo) {
+            const GeoCoordinate home = *simulation_->mission().home_geo;
+            globe_center_latitude_ = home.latitude;
+            globe_center_longitude_ = home.longitude;
+        }
+        [self loadGlobeMapTiles];
+    }
+    [self setStatusMessage:(globe_mode_ ? "Globe picker" : "Mission map camera")];
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)adjustGlobeZoomBy:(double)factor {
+    const int previous_tile_zoom = [self desiredGlobeMapZoom];
+    globe_view_zoom_ = std::clamp(globe_view_zoom_ * factor, kMinGlobeViewZoom, kMaxGlobeViewZoom);
+    const int next_tile_zoom = [self desiredGlobeMapZoom];
+    if (globe_mode_ && previous_tile_zoom != next_tile_zoom) {
+        [self loadGlobeMapTiles];
+    }
+
+    std::ostringstream message;
+    message << "Globe zoom " << std::fixed << std::setprecision(1) << globe_view_zoom_ << "x";
+    [self setStatusMessage:message.str()];
+    [self setNeedsDisplay:YES];
+}
+
 - (void)fitCameraAction:(id)sender {
     (void)sender;
+    globe_mode_ = false;
     [self fitMissionCamera];
     [self loadMapTilesForMission];
     [self setStatusMessage:"Mission fitted"];
@@ -966,6 +1304,7 @@ GLuint texture_from_image_data(NSData* data) {
         simulation_->set_control_mode(ControlMode::Autopilot);
         [self fitMissionCamera];
         [self loadMapTilesForMission];
+        [self loadRealWorldTerrainForMission];
         [self startNewRecording];
         [self setStatusMessage:"Mission loaded"];
     } catch (const std::exception& error) {
@@ -987,6 +1326,81 @@ GLuint texture_from_image_data(NSData* data) {
             [self loadMissionFromPath:std::filesystem::path([[url path] UTF8String])];
         }
     }
+    [[self window] makeFirstResponder:self];
+}
+
+- (void)loadLocationCoordinate:(GeoCoordinate)coordinate areaKm2:(double)area_km2 source:(const std::string&)source {
+    if (!simulation_) {
+        return;
+    }
+
+    try {
+        [self finishRecording];
+        real_world_area_km2_ = std::clamp(area_km2, 1.0, 400.0);
+        Mission mission = mission_for_location(coordinate, real_world_area_km2_);
+        simulation_->replace_mission(std::move(mission));
+        mission_path_.clear();
+        replay_.reset();
+        replay_path_.clear();
+        replay_mode_ = false;
+        manual_mode_ = false;
+        selected_waypoint_ = -1;
+        dragging_waypoint_ = false;
+        replay_time_s_ = 0.0;
+        trail_.clear();
+        simulation_->set_control_mode(ControlMode::Autopilot);
+        [self fitMissionCamera];
+        [self loadMapTilesForMission];
+        [self loadRealWorldTerrainForMission];
+        [self startNewRecording];
+        [self setStatusMessage:source + " loaded"];
+    } catch (const std::exception& error) {
+        std::cerr << "Failed to load location: " << error.what() << "\n";
+        [self setStatusMessage:"Location load failed"];
+    }
+}
+
+- (void)loadLocationAction:(id)sender {
+    (void)sender;
+    if (!simulation_) {
+        return;
+    }
+
+    const GeoCoordinate current = simulation_->mission().home_geo.value_or(GeoCoordinate{36.7783, -119.4179, 0.0});
+
+    NSAlert* alert = [[[NSAlert alloc] init] autorelease];
+    [alert setMessageText:@"Load Real World Location"];
+    [alert setInformativeText:@"Enter latitude, longitude, and total area in square kilometers."];
+    [alert addButtonWithTitle:@"Load"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSStackView* stack = [[[NSStackView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 280.0, 92.0)] autorelease];
+    [stack setOrientation:NSUserInterfaceLayoutOrientationVertical];
+    [stack setSpacing:8.0];
+
+    NSTextField* latitude_field = [NSTextField textFieldWithString:[NSString stringWithFormat:@"%.6f", current.latitude]];
+    NSTextField* longitude_field = [NSTextField textFieldWithString:[NSString stringWithFormat:@"%.6f", current.longitude]];
+    NSTextField* area_field = [NSTextField textFieldWithString:[NSString stringWithFormat:@"%.1f", real_world_area_km2_]];
+    [latitude_field setPlaceholderString:@"Latitude"];
+    [longitude_field setPlaceholderString:@"Longitude"];
+    [area_field setPlaceholderString:@"Area km²"];
+
+    [stack addArrangedSubview:latitude_field];
+    [stack addArrangedSubview:longitude_field];
+    [stack addArrangedSubview:area_field];
+    [alert setAccessoryView:stack];
+
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        [[self window] makeFirstResponder:self];
+        return;
+    }
+
+    const double latitude = std::clamp([[latitude_field stringValue] doubleValue], -85.0, 85.0);
+    const double longitude = std::clamp([[longitude_field stringValue] doubleValue], -180.0, 180.0);
+    const double area_km2 = std::clamp([[area_field stringValue] doubleValue], 1.0, 400.0);
+
+    [self loadLocationCoordinate:{latitude, longitude, 0.0} areaKm2:area_km2 source:"Location"];
+
     [[self window] makeFirstResponder:self];
 }
 
@@ -1296,6 +1710,33 @@ GLuint texture_from_image_data(NSData* data) {
     glDisable(GL_TEXTURE_2D);
 }
 
+- (void)drawTerrain {
+    if (terrain_mesh_.vertices.empty() || terrain_mesh_.indices.empty()) {
+        return;
+    }
+
+    const double elevation_span = std::max(
+        1.0,
+        static_cast<double>(terrain_mesh_.max_elevation_m - terrain_mesh_.min_elevation_m)
+    );
+
+    glLineWidth(1.0f);
+    glBegin(GL_TRIANGLES);
+    for (const std::uint32_t index : terrain_mesh_.indices) {
+        if (index >= terrain_mesh_.vertices.size()) {
+            continue;
+        }
+        const auto& vertex = terrain_mesh_.vertices[index];
+        const double normalized_height = std::clamp(vertex.position.y / elevation_span, 0.0, 1.0);
+        const double r = 0.16 + normalized_height * 0.54;
+        const double g = 0.30 + normalized_height * 0.38;
+        const double b = 0.22 + normalized_height * 0.18;
+        set_color(r, g, b, terrain_mesh_.has_elevation ? 0.52 : 0.18);
+        glVertex2d(vertex.position.x, vertex.position.z);
+    }
+    glEnd();
+}
+
 - (void)drawMissionPath {
     if (!simulation_) {
         return;
@@ -1377,6 +1818,187 @@ GLuint texture_from_image_data(NSData* data) {
     draw_circle(position.x, position.z, std::max(5.0, state.position.y * 0.2));
 }
 
+- (NSRect)globeFrameForScene:(NSRect)scene {
+    const CGFloat size = std::min(scene.size.width, scene.size.height) * 0.78 * globe_view_zoom_;
+    return NSMakeRect(
+        scene.origin.x + (scene.size.width - size) * 0.5,
+        scene.origin.y + (scene.size.height - size) * 0.52,
+        size,
+        size
+    );
+}
+
+- (NSPoint)screenPointForGlobePoint:(GlobePoint)point frame:(NSRect)frame {
+    return NSMakePoint(
+        frame.origin.x + frame.size.width * 0.5 + point.x * frame.size.width * 0.5,
+        frame.origin.y + frame.size.height * 0.5 + point.y * frame.size.height * 0.5
+    );
+}
+
+- (void)drawGlobeLineLatitude:(double)latitude frame:(NSRect)frame {
+    bool drawing = false;
+    glBegin(GL_LINE_STRIP);
+    for (double lon = -180.0; lon <= 180.0; lon += 3.0) {
+        const GlobePoint point = project_globe_point(latitude, lon, globe_center_latitude_, globe_center_longitude_);
+        if (!point.visible) {
+            if (drawing) {
+                glEnd();
+                glBegin(GL_LINE_STRIP);
+                drawing = false;
+            }
+            continue;
+        }
+        const NSPoint screen = [self screenPointForGlobePoint:point frame:frame];
+        glVertex2d(screen.x, screen.y);
+        drawing = true;
+    }
+    glEnd();
+}
+
+- (void)drawGlobeLineLongitude:(double)longitude frame:(NSRect)frame {
+    bool drawing = false;
+    glBegin(GL_LINE_STRIP);
+    for (double lat = -85.0; lat <= 85.0; lat += 3.0) {
+        const GlobePoint point = project_globe_point(lat, longitude, globe_center_latitude_, globe_center_longitude_);
+        if (!point.visible) {
+            if (drawing) {
+                glEnd();
+                glBegin(GL_LINE_STRIP);
+                drawing = false;
+            }
+            continue;
+        }
+        const NSPoint screen = [self screenPointForGlobePoint:point frame:frame];
+        glVertex2d(screen.x, screen.y);
+        drawing = true;
+    }
+    glEnd();
+}
+
+- (void)drawGlobeMapTiles:(NSRect)frame {
+    if (globe_map_tiles_.empty()) {
+        return;
+    }
+
+    glEnable(GL_TEXTURE_2D);
+    set_color(1.0, 1.0, 1.0, 0.96);
+    for (const GlobeMapTile& tile : globe_map_tiles_) {
+        glBindTexture(GL_TEXTURE_2D, tile.texture_id);
+
+        constexpr int kSubdivisions = 10;
+        for (int row = 0; row < kSubdivisions; ++row) {
+            const double v0 = static_cast<double>(row) / static_cast<double>(kSubdivisions);
+            const double v1 = static_cast<double>(row + 1) / static_cast<double>(kSubdivisions);
+            const double lat0 = tile.bounds.max_latitude - v0 * (tile.bounds.max_latitude - tile.bounds.min_latitude);
+            const double lat1 = tile.bounds.max_latitude - v1 * (tile.bounds.max_latitude - tile.bounds.min_latitude);
+
+            for (int column = 0; column < kSubdivisions; ++column) {
+                const double u0 = static_cast<double>(column) / static_cast<double>(kSubdivisions);
+                const double u1 = static_cast<double>(column + 1) / static_cast<double>(kSubdivisions);
+                const double lon0 = tile.bounds.min_longitude + u0 * (tile.bounds.max_longitude - tile.bounds.min_longitude);
+                const double lon1 = tile.bounds.min_longitude + u1 * (tile.bounds.max_longitude - tile.bounds.min_longitude);
+
+                const GlobePoint north_west = project_globe_point(lat0, lon0, globe_center_latitude_, globe_center_longitude_);
+                const GlobePoint north_east = project_globe_point(lat0, lon1, globe_center_latitude_, globe_center_longitude_);
+                const GlobePoint south_east = project_globe_point(lat1, lon1, globe_center_latitude_, globe_center_longitude_);
+                const GlobePoint south_west = project_globe_point(lat1, lon0, globe_center_latitude_, globe_center_longitude_);
+                if (!north_west.visible || !north_east.visible || !south_east.visible || !south_west.visible) {
+                    continue;
+                }
+
+                const NSPoint nw = [self screenPointForGlobePoint:north_west frame:frame];
+                const NSPoint ne = [self screenPointForGlobePoint:north_east frame:frame];
+                const NSPoint se = [self screenPointForGlobePoint:south_east frame:frame];
+                const NSPoint sw = [self screenPointForGlobePoint:south_west frame:frame];
+
+                glBegin(GL_QUADS);
+                glTexCoord2d(u0, v0);
+                glVertex2d(nw.x, nw.y);
+                glTexCoord2d(u1, v0);
+                glVertex2d(ne.x, ne.y);
+                glTexCoord2d(u1, v1);
+                glVertex2d(se.x, se.y);
+                glTexCoord2d(u0, v1);
+                glVertex2d(sw.x, sw.y);
+                glEnd();
+            }
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
+}
+
+- (void)drawGlobe:(NSRect)scene {
+    const NSRect frame = [self globeFrameForScene:scene];
+    const double radius = frame.size.width * 0.5;
+    const double center_x = frame.origin.x + radius;
+    const double center_y = frame.origin.y + radius;
+
+    set_color(0.03, 0.07, 0.11, 1.0);
+    draw_filled_circle(center_x, center_y, radius, 96);
+
+    set_color(0.08, 0.22, 0.32, 1.0);
+    draw_filled_circle(center_x, center_y, radius * 0.98, 96);
+
+    [self drawGlobeMapTiles:frame];
+
+    set_color(0.72, 0.82, 0.9, 0.34);
+    glLineWidth(1.0f);
+    for (double lat = -60.0; lat <= 60.0; lat += 30.0) {
+        [self drawGlobeLineLatitude:lat frame:frame];
+    }
+    for (double lon = -180.0; lon < 180.0; lon += 30.0) {
+        [self drawGlobeLineLongitude:lon frame:frame];
+    }
+
+    set_color(0.84, 0.92, 1.0, 0.9);
+    glLineWidth(2.0f);
+    draw_circle(center_x, center_y, radius, 128);
+
+    if (simulation_ && simulation_->mission().home_geo) {
+        const GeoCoordinate home = *simulation_->mission().home_geo;
+        const GlobePoint marker = project_globe_point(home.latitude, home.longitude, globe_center_latitude_, globe_center_longitude_);
+        if (marker.visible) {
+            const NSPoint screen = [self screenPointForGlobePoint:marker frame:frame];
+            set_color(1.0, 0.85, 0.2, 1.0);
+            draw_filled_circle(screen.x, screen.y, 6.0, 24);
+            set_color(0.02, 0.025, 0.03, 1.0);
+            draw_circle(screen.x, screen.y, 8.0, 24);
+        }
+    }
+
+    set_color(0.0, 0.0, 0.0, 0.24);
+    draw_rect(18.0, 18.0, 365.0, 42.0);
+}
+
+- (std::optional<GeoCoordinate>)globeCoordinateFromEvent:(NSEvent*)event {
+    const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
+    const NSRect scene = [self sceneRect];
+    const NSRect frame = [self globeFrameForScene:scene];
+    const double radius = frame.size.width * 0.5;
+    const double x = (location.x - (frame.origin.x + radius)) / radius;
+    const double y = (location.y - (frame.origin.y + radius)) / radius;
+    const double r2 = x * x + y * y;
+    if (r2 > 1.0) {
+        return std::nullopt;
+    }
+
+    const double z = std::sqrt(std::max(0.0, 1.0 - r2));
+    const double center_lat = globe_center_latitude_ * M_PI / 180.0;
+
+    const double sin_lat = y * std::cos(center_lat) + z * std::sin(center_lat);
+    const double latitude = std::asin(std::clamp(sin_lat, -1.0, 1.0)) * 180.0 / M_PI;
+    const double lon_delta = std::atan2(x, z * std::cos(center_lat) - y * std::sin(center_lat)) * 180.0 / M_PI;
+    double longitude = globe_center_longitude_ + lon_delta;
+    while (longitude > 180.0) {
+        longitude -= 360.0;
+    }
+    while (longitude < -180.0) {
+        longitude += 360.0;
+    }
+    return GeoCoordinate{std::clamp(latitude, -85.0, 85.0), longitude, 0.0};
+}
+
 - (void)drawHud:(NSRect)bounds {
     if (!simulation_) {
         return;
@@ -1435,20 +2057,30 @@ GLuint texture_from_image_data(NSData* data) {
     );
     glClear(GL_COLOR_BUFFER_BIT);
 
-    const ViewBounds viewBounds = [self viewBoundsForRect:scene];
+    if (globe_mode_) {
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0.0, scene.size.width, 0.0, scene.size.height, -1.0, 1.0);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        [self drawGlobe:scene];
+    } else {
+        const ViewBounds viewBounds = [self viewBoundsForRect:scene];
 
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(viewBounds.min_x, viewBounds.max_x, viewBounds.min_z, viewBounds.max_z, -1.0, 1.0);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(viewBounds.min_x, viewBounds.max_x, viewBounds.min_z, viewBounds.max_z, -1.0, 1.0);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
 
-    [self drawMapTiles];
-    [self drawGrid:viewBounds];
-    [self drawMissionPath];
-    [self drawTrail];
-    [self drawDrone];
-    [self drawHud:scene];
+        [self drawTerrain];
+        [self drawMapTiles];
+        [self drawGrid:viewBounds];
+        [self drawMissionPath];
+        [self drawTrail];
+        [self drawDrone];
+        [self drawHud:scene];
+    }
 
     [[self openGLContext] flushBuffer];
 }
@@ -1525,15 +2157,27 @@ GLuint texture_from_image_data(NSData* data) {
             [self toggleChaseCamera:nil];
             return;
         }
+        if (key == 'b') {
+            [self toggleGlobeMode:nil];
+            return;
+        }
         if (key == 'f') {
             [self fitCameraAction:nil];
             return;
         }
         if (key == '-' || key == '_') {
+            if (globe_mode_) {
+                [self adjustGlobeZoomBy:0.85];
+                return;
+            }
             zoom_m_ = std::min(1000.0, zoom_m_ * 1.15);
             return;
         }
         if (key == '=' || key == '+') {
+            if (globe_mode_) {
+                [self adjustGlobeZoomBy:1.18];
+                return;
+            }
             zoom_m_ = std::max(30.0, zoom_m_ / 1.15);
             return;
         }
@@ -1632,6 +2276,14 @@ GLuint texture_from_image_data(NSData* data) {
         return;
     }
 
+    if (globe_mode_) {
+        globe_drag_start_ = location;
+        globe_drag_start_latitude_ = globe_center_latitude_;
+        globe_drag_start_longitude_ = globe_center_longitude_;
+        dragging_globe_ = true;
+        return;
+    }
+
     double altitude = 30.0;
     if (!simulation_->mission().waypoints.empty()) {
         altitude = simulation_->mission().waypoints.back().position.y;
@@ -1655,6 +2307,26 @@ GLuint texture_from_image_data(NSData* data) {
 }
 
 - (void)mouseDragged:(NSEvent*)event {
+    if (globe_mode_ && dragging_globe_) {
+        const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
+        const NSRect scene = [self sceneRect];
+        const double degrees_per_pixel = 180.0 / std::max(1.0, static_cast<double>(std::min(scene.size.width, scene.size.height)));
+        globe_center_longitude_ = globe_drag_start_longitude_ - (location.x - globe_drag_start_.x) * degrees_per_pixel;
+        globe_center_latitude_ = std::clamp(
+            globe_drag_start_latitude_ - (location.y - globe_drag_start_.y) * degrees_per_pixel,
+            -80.0,
+            80.0
+        );
+        while (globe_center_longitude_ > 180.0) {
+            globe_center_longitude_ -= 360.0;
+        }
+        while (globe_center_longitude_ < -180.0) {
+            globe_center_longitude_ += 360.0;
+        }
+        [self setNeedsDisplay:YES];
+        return;
+    }
+
     if (!simulation_ || selected_waypoint_ < 0 || !dragging_waypoint_) {
         return;
     }
@@ -1673,11 +2345,36 @@ GLuint texture_from_image_data(NSData* data) {
 }
 
 - (void)mouseUp:(NSEvent*)event {
-    (void)event;
+    if (globe_mode_ && dragging_globe_) {
+        const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
+        const double dx = location.x - globe_drag_start_.x;
+        const double dy = location.y - globe_drag_start_.y;
+        dragging_globe_ = false;
+
+        if (std::sqrt(dx * dx + dy * dy) <= 4.0) {
+            if (auto coordinate = [self globeCoordinateFromEvent:event]) {
+                globe_center_latitude_ = coordinate->latitude;
+                globe_center_longitude_ = coordinate->longitude;
+                globe_mode_ = false;
+                [self loadLocationCoordinate:*coordinate areaKm2:real_world_area_km2_ source:"Globe location"];
+            }
+        }
+        [[self window] makeFirstResponder:self];
+        return;
+    }
     dragging_waypoint_ = false;
 }
 
 - (void)scrollWheel:(NSEvent*)event {
+    if (globe_mode_) {
+        if ([event scrollingDeltaY] > 0.0) {
+            [self adjustGlobeZoomBy:1.08];
+        } else if ([event scrollingDeltaY] < 0.0) {
+            [self adjustGlobeZoomBy:0.92];
+        }
+        return;
+    }
+
     if ([event scrollingDeltaY] > 0.0) {
         zoom_m_ = std::max(30.0, zoom_m_ / 1.08);
     } else if ([event scrollingDeltaY] < 0.0) {
