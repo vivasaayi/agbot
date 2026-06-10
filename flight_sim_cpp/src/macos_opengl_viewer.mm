@@ -196,9 +196,10 @@ struct GlobePoint {
 };
 
 constexpr int kGlobeMapMinZoom = 3;
-constexpr int kGlobeMapMaxZoom = 4;
+constexpr int kGlobeMapMaxZoom = 17;
+constexpr int kMaxGlobeTileLoads = 128;
 constexpr double kMinGlobeViewZoom = 0.75;
-constexpr double kMaxGlobeViewZoom = 2.75;
+constexpr double kMaxGlobeViewZoom = 16384.0;
 
 std::filesystem::path map_tile_cache_path(int zoom, int x, int y) {
     return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR)
@@ -242,6 +243,82 @@ NSData* data_for_elevation_tile(int zoom, int x, int y) {
     std::ostringstream url_text;
     url_text << "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/" << zoom << "/" << x << "/" << y << ".png";
     return data_for_url_cached(elevation_tile_cache_path(zoom, x, y), url_text.str());
+}
+
+void push_unique_tile(std::vector<TileCoordinate>& tiles, TileCoordinate tile) {
+    for (const TileCoordinate& existing : tiles) {
+        if (existing.z == tile.z && existing.x == tile.x && existing.y == tile.y) {
+            return;
+        }
+    }
+    tiles.push_back(tile);
+}
+
+std::string key_for_tiles(const std::vector<TileCoordinate>& tiles) {
+    std::ostringstream key;
+    for (const TileCoordinate& tile : tiles) {
+        key << tile.z << ":" << tile.x << ":" << tile.y << ";";
+    }
+    return key.str();
+}
+
+std::vector<TileCoordinate> globe_tiles_for_view(
+    int zoom,
+    double center_latitude,
+    double center_longitude,
+    double view_zoom) {
+    const int tile_count = 1 << zoom;
+    std::vector<TileCoordinate> tiles;
+
+    if (zoom <= 4) {
+        tiles.reserve(static_cast<std::size_t>(tile_count * tile_count));
+        for (int y = 0; y < tile_count; ++y) {
+            for (int x = 0; x < tile_count; ++x) {
+                tiles.push_back({zoom, x, y});
+            }
+        }
+        return tiles;
+    }
+
+    const GeoCoordinate center {
+        std::clamp(center_latitude, -85.0, 85.0),
+        std::clamp(center_longitude, -180.0, 180.0),
+        0.0,
+    };
+    const TileCoordinate center_tile = tile_for_geo(center, zoom);
+    const double visible_fraction = std::clamp(1.0 / std::max(0.78, 0.78 * view_zoom), 0.00002, 0.995);
+    const double angular_radius_deg = std::asin(visible_fraction) * 180.0 / M_PI * 1.25;
+    const double lat_cos = std::max(0.10, std::abs(std::cos(center.latitude * M_PI / 180.0)));
+    const double tile_width_deg = 360.0 / static_cast<double>(tile_count);
+    const int radius_x = std::max(1, static_cast<int>(std::ceil((angular_radius_deg / lat_cos) / tile_width_deg)) + 1);
+    const TileCoordinate north_tile = tile_for_geo({
+        std::clamp(center.latitude + angular_radius_deg, -85.0, 85.0),
+        center.longitude,
+        0.0,
+    }, zoom);
+    const TileCoordinate south_tile = tile_for_geo({
+        std::clamp(center.latitude - angular_radius_deg, -85.0, 85.0),
+        center.longitude,
+        0.0,
+    }, zoom);
+    const int radius_y = std::max(
+        1,
+        std::max(std::abs(center_tile.y - north_tile.y), std::abs(center_tile.y - south_tile.y)) + 1
+    );
+
+    tiles.reserve(static_cast<std::size_t>((radius_x * 2 + 1) * (radius_y * 2 + 1)));
+    for (int dy = -radius_y; dy <= radius_y; ++dy) {
+        const int y = std::clamp(center_tile.y + dy, 0, tile_count - 1);
+        for (int dx = -radius_x; dx <= radius_x; ++dx) {
+            int x = (center_tile.x + dx) % tile_count;
+            if (x < 0) {
+                x += tile_count;
+            }
+            push_unique_tile(tiles, {zoom, x, y});
+        }
+    }
+
+    return tiles;
 }
 
 bool rgba_pixels_from_image_data(NSData* data, std::vector<std::uint8_t>& pixels, int& width, int& height) {
@@ -358,7 +435,7 @@ Mission mission_for_location(GeoCoordinate center, double area_km2) {
 
     Mission mission;
     std::ostringstream name;
-    name << "Location " << std::fixed << std::setprecision(4)
+    name << "Location " << std::fixed << std::setprecision(6)
          << center.latitude << ", " << center.longitude;
     mission.name = name.str();
     mission.home = Vec3(0.0, 0.0, 0.0);
@@ -423,9 +500,9 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     const Vec3 corrected_up = cross(side, forward);
 
     const GLdouble matrix[16] = {
-        side.x, side.y, side.z, 0.0,
-        corrected_up.x, corrected_up.y, corrected_up.z, 0.0,
-        -forward.x, -forward.y, -forward.z, 0.0,
+        side.x, corrected_up.x, -forward.x, 0.0,
+        side.y, corrected_up.y, -forward.y, 0.0,
+        side.z, corrected_up.z, -forward.z, 0.0,
         0.0, 0.0, 0.0, 1.0,
     };
     glMultMatrixd(matrix);
@@ -494,8 +571,10 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     double real_world_area_km2_;
     double globe_view_zoom_;
     int globe_map_zoom_;
+    std::string globe_map_key_;
     double globe_center_latitude_;
     double globe_center_longitude_;
+    std::optional<GeoCoordinate> globe_hover_coordinate_;
     NSPoint globe_drag_start_;
     double globe_drag_start_latitude_;
     double globe_drag_start_longitude_;
@@ -568,6 +647,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         globe_map_zoom_ = 0;
         globe_center_latitude_ = 20.0;
         globe_center_longitude_ = 0.0;
+        globe_hover_coordinate_.reset();
         terrain3d_yaw_rad_ = -0.72;
         terrain3d_pitch_rad_ = 0.78;
         terrain3d_distance_m_ = 4200.0;
@@ -634,6 +714,11 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     return YES;
 }
 
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    [[self window] setAcceptsMouseMovedEvents:YES];
+}
+
 - (NSRect)sceneRect {
     const NSRect bounds = [self bounds];
     const CGFloat panel_width = 306.0;
@@ -698,7 +783,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     const NSRect bounds = [self bounds];
     const CGFloat panel_width = 306.0;
     [side_panel_ setFrame:NSMakeRect(bounds.size.width - panel_width, 0.0, panel_width, bounds.size.height)];
-    [globe_overlay_label_ setFrame:NSMakeRect(24.0, 24.0, std::max<CGFloat>(420.0, bounds.size.width - panel_width - 72.0), 48.0)];
+    [globe_overlay_label_ setFrame:NSMakeRect(24.0, 24.0, std::max<CGFloat>(420.0, bounds.size.width - panel_width - 72.0), 68.0)];
 
     CGFloat y = bounds.size.height - 42.0;
     const CGFloat x = 18.0;
@@ -786,45 +871,61 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
     globe_map_tiles_.clear();
     globe_map_zoom_ = 0;
+    globe_map_key_.clear();
     globe_map_status_ = "World map off";
 }
 
 - (int)desiredGlobeMapZoom {
-    return globe_view_zoom_ >= 1.45 ? kGlobeMapMaxZoom : kGlobeMapMinZoom;
+    const double zoom_level = std::round(std::log2(std::max(1.0, globe_view_zoom_)) + static_cast<double>(kGlobeMapMinZoom));
+    return std::clamp(static_cast<int>(zoom_level), kGlobeMapMinZoom, kGlobeMapMaxZoom);
 }
 
 - (void)loadGlobeMapTiles {
-    const int desired_zoom = [self desiredGlobeMapZoom];
-    if (!globe_map_tiles_.empty() && globe_map_zoom_ == desired_zoom) {
+    int selected_zoom = [self desiredGlobeMapZoom];
+    std::vector<TileCoordinate> requested_tiles;
+    while (selected_zoom >= kGlobeMapMinZoom) {
+        requested_tiles = globe_tiles_for_view(
+            selected_zoom,
+            globe_center_latitude_,
+            globe_center_longitude_,
+            globe_view_zoom_
+        );
+        if (requested_tiles.size() <= kMaxGlobeTileLoads || selected_zoom <= 4) {
+            break;
+        }
+        --selected_zoom;
+    }
+
+    const std::string requested_key = key_for_tiles(requested_tiles);
+    if (!globe_map_tiles_.empty() && globe_map_zoom_ == selected_zoom && globe_map_key_ == requested_key) {
         return;
     }
 
     [[self openGLContext] makeCurrentContext];
     [self clearGlobeMapTiles];
 
-    const int tile_count = 1 << desired_zoom;
     int loaded_count = 0;
-    for (int y = 0; y < tile_count; ++y) {
-        for (int x = 0; x < tile_count; ++x) {
-            NSData* data = data_for_tile(desired_zoom, x, y);
-            const GLuint texture_id = texture_from_image_data(data);
-            if (texture_id == 0) {
-                continue;
-            }
-            globe_map_tiles_.push_back({
-                texture_id,
-                TileCoordinate{desired_zoom, x, y}.bounds(),
-            });
-            ++loaded_count;
+    for (const TileCoordinate& tile : requested_tiles) {
+        NSData* data = data_for_tile(tile.z, tile.x, tile.y);
+        const GLuint texture_id = texture_from_image_data(data);
+        if (texture_id == 0) {
+            continue;
         }
+        globe_map_tiles_.push_back({
+            texture_id,
+            tile.bounds(),
+        });
+        ++loaded_count;
     }
 
     if (loaded_count > 0) {
-        globe_map_zoom_ = desired_zoom;
-        globe_map_status_ = "World map OSM z" + std::to_string(desired_zoom) + " " +
-            std::to_string(loaded_count) + "/" + std::to_string(tile_count * tile_count);
+        globe_map_zoom_ = selected_zoom;
+        globe_map_key_ = requested_key;
+        globe_map_status_ = "Globe OSM z" + std::to_string(selected_zoom) + " " +
+            std::to_string(loaded_count) + "/" + std::to_string(requested_tiles.size());
         [self setStatusMessage:"World map loaded"];
     } else {
+        globe_map_key_.clear();
         globe_map_status_ = "World map unavailable";
         [self setStatusMessage:"World map unavailable"];
     }
@@ -1150,7 +1251,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
     if (simulation_->mission().home_geo) {
         const GeoCoordinate home = *simulation_->mission().home_geo;
-        mission << "\nHome      " << std::fixed << std::setprecision(4)
+        mission << "\nHome      " << std::fixed << std::setprecision(6)
                 << home.latitude << ", " << home.longitude;
     }
     [mission_label_ setStringValue:ns_string(mission.str())];
@@ -1158,9 +1259,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     if (globe_overlay_label_) {
         std::ostringstream overlay_text;
         if (globe_mode_) {
+            if (globe_hover_coordinate_) {
+                overlay_text << std::fixed << std::setprecision(6)
+                             << "Cursor lat " << globe_hover_coordinate_->latitude
+                             << "  lon " << globe_hover_coordinate_->longitude << "\n";
+            }
             if (simulation_->mission().home_geo) {
                 const GeoCoordinate home = *simulation_->mission().home_geo;
-                overlay_text << std::fixed << std::setprecision(5)
+                overlay_text << std::fixed << std::setprecision(6)
                              << "Pin  lat " << home.latitude << "  lon " << home.longitude
                              << "   Area " << std::setprecision(1) << real_world_area_km2_ << " km2\n";
             } else {
@@ -1264,6 +1370,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     dragging_waypoint_ = false;
     dragging_globe_ = false;
     dragging_3d_camera_ = false;
+    globe_hover_coordinate_.reset();
     if (globe_mode_) {
         if (simulation_ && simulation_->mission().home_geo) {
             const GeoCoordinate home = *simulation_->mission().home_geo;
@@ -1327,15 +1434,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 }
 
 - (void)adjustGlobeZoomBy:(double)factor {
-    const int previous_tile_zoom = [self desiredGlobeMapZoom];
     globe_view_zoom_ = std::clamp(globe_view_zoom_ * factor, kMinGlobeViewZoom, kMaxGlobeViewZoom);
-    const int next_tile_zoom = [self desiredGlobeMapZoom];
-    if (globe_mode_ && previous_tile_zoom != next_tile_zoom) {
+    if (globe_mode_) {
         [self loadGlobeMapTiles];
     }
 
     std::ostringstream message;
-    message << "Globe zoom " << std::fixed << std::setprecision(1) << globe_view_zoom_ << "x";
+    message << "Globe zoom " << std::fixed << std::setprecision(globe_view_zoom_ < 10.0 ? 1 : 0)
+            << globe_view_zoom_ << "x";
     [self setStatusMessage:message.str()];
     [self setNeedsDisplay:YES];
 }
@@ -2345,8 +2451,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     draw_rect(18.0, 18.0, 365.0, 42.0);
 }
 
-- (std::optional<GeoCoordinate>)globeCoordinateFromEvent:(NSEvent*)event {
-    const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
+- (std::optional<GeoCoordinate>)globeCoordinateFromPoint:(NSPoint)location {
     const NSRect scene = [self sceneRect];
     const NSRect frame = [self globeFrameForScene:scene];
     const double radius = frame.size.width * 0.5;
@@ -2371,6 +2476,10 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         longitude += 360.0;
     }
     return GeoCoordinate{std::clamp(latitude, -85.0, 85.0), longitude, 0.0};
+}
+
+- (std::optional<GeoCoordinate>)globeCoordinateFromEvent:(NSEvent*)event {
+    return [self globeCoordinateFromPoint:[self convertPoint:[event locationInWindow] fromView:nil]];
 }
 
 - (void)drawHud:(NSRect)bounds {
@@ -2442,10 +2551,17 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     } else if (terrain_3d_mode_) {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_TEXTURE_2D);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_LIGHTING);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         [self apply3DCameraForScene:scene];
+        glDepthMask(GL_FALSE);
         [self drawMapTiles3D];
-        [self drawGroundGrid3D];
+        glDepthMask(GL_TRUE);
         [self drawTerrain3D];
+        [self drawGroundGrid3D];
         [self drawMissionPath3D];
         [self drawTrail3D];
         [self drawDrone3D];
@@ -2559,7 +2675,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         }
         if (key == '-' || key == '_') {
             if (globe_mode_) {
-                [self adjustGlobeZoomBy:0.85];
+                [self adjustGlobeZoomBy:0.74];
                 return;
             }
             if (terrain_3d_mode_) {
@@ -2571,7 +2687,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         }
         if (key == '=' || key == '+') {
             if (globe_mode_) {
-                [self adjustGlobeZoomBy:1.18];
+                [self adjustGlobeZoomBy:1.35];
                 return;
             }
             if (terrain_3d_mode_) {
@@ -2666,6 +2782,21 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
 }
 
+- (void)mouseMoved:(NSEvent*)event {
+    if (!globe_mode_) {
+        globe_hover_coordinate_.reset();
+        return;
+    }
+
+    const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
+    if (location.x > [self sceneRect].size.width) {
+        globe_hover_coordinate_.reset();
+    } else {
+        globe_hover_coordinate_ = [self globeCoordinateFromPoint:location];
+    }
+    [self updatePanelText];
+}
+
 - (void)mouseDown:(NSEvent*)event {
     if (!simulation_) {
         return;
@@ -2692,6 +2823,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         globe_drag_start_ = location;
         globe_drag_start_latitude_ = globe_center_latitude_;
         globe_drag_start_longitude_ = globe_center_longitude_;
+        globe_hover_coordinate_ = [self globeCoordinateFromPoint:location];
         dragging_globe_ = true;
         return;
     }
@@ -2747,6 +2879,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         while (globe_center_longitude_ < -180.0) {
             globe_center_longitude_ += 360.0;
         }
+        globe_hover_coordinate_ = [self globeCoordinateFromPoint:location];
         [self setNeedsDisplay:YES];
         return;
     }
@@ -2786,8 +2919,11 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
                 globe_center_latitude_ = coordinate->latitude;
                 globe_center_longitude_ = coordinate->longitude;
                 globe_mode_ = false;
+                globe_hover_coordinate_.reset();
                 [self loadLocationCoordinate:*coordinate areaKm2:real_world_area_km2_ source:"Globe location"];
             }
+        } else {
+            [self loadGlobeMapTiles];
         }
         [[self window] makeFirstResponder:self];
         return;
@@ -2798,9 +2934,9 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 - (void)scrollWheel:(NSEvent*)event {
     if (globe_mode_) {
         if ([event scrollingDeltaY] > 0.0) {
-            [self adjustGlobeZoomBy:1.08];
+            [self adjustGlobeZoomBy:1.35];
         } else if ([event scrollingDeltaY] < 0.0) {
-            [self adjustGlobeZoomBy:0.92];
+            [self adjustGlobeZoomBy:0.74];
         }
         return;
     }
