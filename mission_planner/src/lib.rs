@@ -18,7 +18,10 @@ pub use api::MissionApi;
 pub use database::{DatabaseService, MissionStats};
 pub use flight_path::{FlightPath, PathSegment};
 pub use mission_optimizer::MissionOptimizer;
-pub use waypoint::{Action, Waypoint, WaypointType};
+pub use waypoint::{
+    validate_waypoint_sanity, Action, Waypoint, WaypointType, WaypointValidationCode,
+    WaypointValidationConfig, WaypointValidationError, WaypointValidationIssue,
+};
 
 /// Core mission planning structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +80,12 @@ pub struct MissionStateTransitionError {
     pub code: MissionStateErrorCode,
     pub from: MissionStatus,
     pub to: MissionStatus,
+}
+
+#[derive(Debug)]
+pub enum MissionValidationError {
+    State(MissionStateTransitionError),
+    Waypoint(WaypointValidationError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +209,29 @@ impl fmt::Display for MissionStateTransitionError {
 
 impl std::error::Error for MissionStateTransitionError {}
 
+impl fmt::Display for MissionValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(error) => write!(formatter, "{error}"),
+            Self::Waypoint(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for MissionValidationError {}
+
+impl From<MissionStateTransitionError> for MissionValidationError {
+    fn from(error: MissionStateTransitionError) -> Self {
+        Self::State(error)
+    }
+}
+
+impl From<WaypointValidationError> for MissionValidationError {
+    fn from(error: WaypointValidationError) -> Self {
+        Self::Waypoint(error)
+    }
+}
+
 impl Mission {
     pub fn new(name: String, description: String, area: Polygon<f64>) -> Self {
         Self::new_linked(name, description, area, MissionLinkage::unassigned())
@@ -257,8 +289,10 @@ impl Mission {
         Ok(())
     }
 
-    pub fn validate(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
-        self.transition_status(MissionStatus::Validated)
+    pub fn validate(&mut self) -> std::result::Result<(), MissionValidationError> {
+        validate_waypoint_sanity(&self.waypoints, WaypointValidationConfig::default())?;
+        self.transition_status(MissionStatus::Validated)?;
+        Ok(())
     }
 
     pub fn arm(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
@@ -478,11 +512,99 @@ mod tests {
         assert_eq!(error.to, MissionStatus::Armed);
         assert_eq!(mission.status, MissionStatus::Draft);
 
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.0, y: 0.0),
+            10.0,
+            WaypointType::Takeoff,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.5, y: 0.5),
+            20.0,
+            WaypointType::Navigation,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 1.0, y: 1.0),
+            0.0,
+            WaypointType::Landing,
+        ));
         mission.validate().expect("draft can validate");
         mission.arm().expect("validated can arm");
         mission.start().expect("armed can start");
         mission.complete().expect("in-flight can complete");
         assert_eq!(mission.status, MissionStatus::Completed);
+    }
+
+    #[test]
+    fn test_valid_waypoints_mark_mission_validated() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+        let mut mission = Mission::new(
+            "Waypoint Mission".to_string(),
+            "A valid waypoint mission".to_string(),
+            area,
+        );
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.0, y: 0.0),
+            10.0,
+            WaypointType::Takeoff,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.5, y: 0.5),
+            20.0,
+            WaypointType::Survey,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 1.0, y: 1.0),
+            0.0,
+            WaypointType::Landing,
+        ));
+
+        mission.validate().expect("valid waypoint plan validates");
+        assert_eq!(mission.status, MissionStatus::Validated);
+    }
+
+    #[test]
+    fn test_missing_landing_waypoint_is_rejected_with_reason_code() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+        let mut mission = Mission::new(
+            "Invalid Waypoint Mission".to_string(),
+            "Missing landing".to_string(),
+            area,
+        );
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.0, y: 0.0),
+            10.0,
+            WaypointType::Takeoff,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.5, y: 0.5),
+            20.0,
+            WaypointType::Navigation,
+        ));
+
+        let error = mission.validate().expect_err("missing landing must fail");
+        match error {
+            MissionValidationError::Waypoint(validation) => {
+                assert_eq!(
+                    validation.primary_code(),
+                    Some(WaypointValidationCode::MissingLanding)
+                );
+                assert_eq!(validation.issues[0].waypoint_index, None);
+            }
+            other => panic!("expected waypoint validation error, got {other:?}"),
+        }
+        assert_eq!(mission.status, MissionStatus::Draft);
     }
 
     #[tokio::test]
