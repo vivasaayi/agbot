@@ -6,7 +6,7 @@ Use this file as persistent project guidance for Claude Code or Claude Fable run
 
 AGBot (AgroDrone) is an autonomous agricultural drone platform: a Rust monorepo for real-time flight control, multi-sensor data acquisition, remote-sensing imagery analysis, LiDAR mapping, GIS serving, and ground-station visualization. Treat the product goal as a complete field-to-decision pipeline: fly missions safely, collect LiDAR and multispectral data, derive NDVI and other indices from evidence, build occupancy grids and 3D maps, serve geospatial layers and advisor recommendations, and drive both web and 3D (Bevy/egui) visualization. Favor deterministic, evidence-backed processing over opaque heuristics.
 
-The workspace crates are: `mission_planner`, `mission_control`, `drone_simulator`, `simulator`, `multi_drone_control`, `sensor_collector`, `data_collector`, `sensor_overlay_engine`, `imagery_processor`, `lidar_mapper`, `post_processor`, `geo_hub`, `geo_viewer`, `ground_station_ui`, and `shared`. There is also a C++ `flight_sim_cpp` component.
+The workspace crates are: `mission_planner`, `mission_control`, `drone_simulator`, `multi_drone_control`, `sensor_collector`, `data_collector`, `sensor_overlay_engine`, `imagery_processor`, `lidar_mapper`, `post_processor`, `geo_hub`, `geo_viewer`, `ground_station_ui`, and `shared`. There is also a C++ `flight_sim_cpp` component, which is the canonical interactive flight simulator (the former Rust/Bevy `simulator` crate was removed in its favor).
 
 ## Autonomous Operating Mode
 

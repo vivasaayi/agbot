@@ -230,8 +230,17 @@ This domain is the **core advisor MVP** alongside `07`/`08`/`09`: deterministic,
 - **Tests**: unit (outlier logic), gating test (ungeoreferenced → disabled), failure path (uniform raster → 0 flags).
 - **Depends on**: 05-10, 05-11, 05-08, `09`.
 
+### STORY 05-23 · M5 · L · P2 — Vegetation-type classification (crop/forest/bush) with confidence
+- **Story**: As `AG`, I want satellite and drone scenes classified into vegetation types — e.g., cotton, rice, palm, forest, bush/shrub — with per-class confidence, so that I know what is growing where; early accuracy may be modest and should improve season over season rather than block shipping.
+- **Deterministic / evidence**: the baseline is deterministic, no opaque model: match per-pixel spectral signatures (calibrated indices from 05-04/05-06) and temporal/phenological profiles (aligned via `28`) against a versioned signature library; every classification emits per-class confidence, the matched signature as citable evidence, and an uncertainty flag. ML models may later replace the matcher behind the same gated, flagged contract.
+- **Acceptance**:
+  - Given calibrated multi-date scenes of a field with a known crop, when classification runs, then a vegetation-type map is produced with per-class confidence and the matched signature evidence for each zone.
+  - Given a single uncalibrated scene, when classification runs, then the result is "insufficient evidence" or explicitly low-confidence — never an unflagged confident label.
+- **Tests**: fixture (known-crop scenes, including synthetic labeled scenes from the `02` dataset export where ground truth is perfect), unit (signature matching and confidence math), failure path (uncalibrated single scene gated).
+- **Depends on**: 05-04, 05-06, 05-15, `28` (temporal alignment), `02` STORY 02-23 (synthetic labeled fixtures), `07` (Landsat/Sentinel scene ingestion).
+
 ---
 
 ## Coverage note
 
-These 22 stories cover all 12 capabilities in `capability-map.md`, ordered by phase and consistent with `release-plan.md` (M1 16 / M2 15 / M3 22 / M4 16 / M5 7; P0 33 / P1 29 / P2 14). Geospatial correctness is the gating concern: every product asserts CRS/extent/resolution (05-10) and round-trips through GeoTIFF (05-11) before it is trusted by the viewer (`08`) or advisor (`09`). The curated ~76 backlog rows expand several stories into siblings — per-index variants of 05-04, additional QA classes in 05-07, and per-sensor calibration tables in 05-06 — when implemented.
+These 23 stories cover all 12 capabilities in `capability-map.md` plus vegetation-type classification, ordered by phase and consistent with `release-plan.md` (M1 16 / M2 15 / M3 22 / M4 16 / M5 10; P0 33 / P1 29 / P2 17). Geospatial correctness is the gating concern: every product asserts CRS/extent/resolution (05-10) and round-trips through GeoTIFF (05-11) before it is trusted by the viewer (`08`) or advisor (`09`). The curated ~76 backlog rows expand several stories into siblings — per-index variants of 05-04, additional QA classes in 05-07, and per-sensor calibration tables in 05-06 — when implemented.

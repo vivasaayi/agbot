@@ -70,7 +70,7 @@ These are not roadmap blockers, but should be confirmed before deep implementati
 
 - Is the commercial flagship the **Field Intelligence Suite advisor workflow** (capture → report), or autonomous flight/swarm operations? The roadmap currently sequences the advisor workflow first.
 - Should the domain/control plane (Organization/Farm/Field/Scene) default to self-hosted/local-first, SaaS, or hybrid?
-- Should the canonical flight simulator be the Rust/Bevy `simulator` or the C++ `flight_sim_cpp` viewer — or do they keep distinct roles (in-app vs. standalone)?
+- ~~Should the canonical flight simulator be the Rust/Bevy `simulator` or the C++ `flight_sim_cpp` viewer?~~ Resolved (June 2026): `flight_sim_cpp` is the canonical interactive simulator and the Bevy `simulator` crate was removed; `drone_simulator` remains the headless Rust twin for CI regression.
 - Which storage backend is authoritative for scenes and sessions: PostgreSQL/PostGIS (as `mission_planner`/`geo_hub` suggest), SQLite (`geo_hub.db`), or the file-based `data_collector` store?
 - In v1, may autonomous missions or swarm maneuvers ever execute without human confirmation, or is every flight approval-gated?
 - Which target hardware is the primary edge baseline: Jetson Nano/Xavier, Raspberry Pi 4+, or x86_64 only for now?

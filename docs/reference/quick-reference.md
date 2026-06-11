@@ -1,8 +1,10 @@
 # AgBot Terrain Viewer - Quick Reference
 
+> **Note (June 2026)**: the Bevy `visualizer` (`simulator` crate) described below was removed in favor of the canonical C++ simulator. Use `just flight-sim-run` (see `flight_sim_cpp/README.md`) for the flight-sim viewer, or `cargo run -p geo_viewer` for the GIS terrain viewer. The key bindings below are historical.
+
 ## Start the App
 ```bash
-cargo run -p visualizer
+cargo run -p visualizer  # removed — see note above
 ```
 
 ## Load Terrain (Choose One)

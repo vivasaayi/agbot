@@ -7,7 +7,6 @@ members = [
     "data_collector",
     "post_processor",
     "shared",
-    "simulator",
     "lidar_mapper",
     "imagery_processor",
     "geo_hub",
@@ -96,7 +95,6 @@ polars = { version = "0.35", features = ["lazy"] }
 # 3D Visualization & Game Engine
 bevy = { version = "0.14", features = ["dynamic_linking"] }
 bevy_egui = "0.28"
-bevy-inspector-egui = "0.25"
 
 [profile.release]
 lto = true

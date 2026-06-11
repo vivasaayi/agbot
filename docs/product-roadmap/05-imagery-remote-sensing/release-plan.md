@@ -12,7 +12,7 @@ Ship in maturity order. Band ingest and a real index product (M1) come first, th
 | M2 captured | 15 |
 | M3 explainable | 22 |
 | M4 interactive | 16 |
-| M5 autonomous-assist | 7 |
+| M5 autonomous-assist | 10 |
 
 ## Priority Counts
 
@@ -20,14 +20,14 @@ Ship in maturity order. Band ingest and a real index product (M1) come first, th
 | --- | --- |
 | P0 | 33 |
 | P1 | 29 |
-| P2 | 14 |
+| P2 | 17 |
 
 ## Ship Size Counts
 
 | Ship Size | Est. Feature Rows |
 | --- | --- |
-| L | 13 |
-| M | 39 |
+| L | 14 |
+| M | 41 |
 | S | 24 |
 
 ## First P0 Vertical Slices
@@ -50,3 +50,4 @@ Ship in maturity order. Band ingest and a real index product (M1) come first, th
 - Every deterministic product must retain min/max/mean and valid-pixel coverage as inspectable evidence.
 - Run the pipeline on captured `04` fixtures before real-hardware inputs.
 - Do not start M5 index-trend or anomaly advisories until georeferencing and the `09`/`10` advisor spine are reliable.
+- Vegetation-type classification (M5) starts deterministic — spectral/phenological signature matching with per-class confidence and citable evidence; ML may replace the matcher only behind the same gated, uncertainty-flagged contract, and synthetic labeled scenes from `02` are first-class test fixtures.

@@ -58,7 +58,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 
 ### STORY 02-05 · M2 · L · P0 — LiDAR raycast point-cloud simulation
 - **Story**: As `AG`, I want the simulator to emit a real raycast point cloud, so that capture (`04`) and LiDAR mapping (`06`) can be developed and regression-tested without hardware.
-- **Deterministic / evidence**: replace the one-line `simulator/src/lidar_simulator.rs` TODO with deterministic raycasting against terrain/obstacles, emitting capture-shaped `LidarScan`/`LidarPoint` consumable by `04`; seeded so output is reproducible.
+- **Deterministic / evidence**: implement deterministic raycasting against terrain/obstacles in the canonical simulator (`flight_sim_cpp`, bridged capture-shaped to Rust; the Bevy-era `lidar_simulator.rs` stub was removed with the `simulator` crate), emitting `LidarScan`/`LidarPoint` consumable by `04`; seeded so output is reproducible.
 - **Acceptance**:
   - Given a scene with known geometry and a seed, when the LiDAR sim runs, then it emits a reproducible point cloud whose ranges match the geometry within tolerance.
   - Given a degenerate empty scene, when the sim runs, then it emits an empty-but-valid scan, not a panic or garbage points.
@@ -103,7 +103,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
   - Given a field's DEM tiles, when terrain loads, then a known lat/lon round-trips to the correct elevation within tolerance and CRS/extent are asserted.
   - Given a missing tile, when terrain loads, then the gap is reported and the area marked "no elevation," not silently flattened to zero.
 - **Tests**: geospatial round-trip (coordinate → elevation), unit (CRS/extent assertions), failure path (missing tile reported).
-- **Depends on**: `simulator/src/terrain.rs`, `map_loader.rs`, `osm.rs`.
+- **Depends on**: `flight_sim_cpp/src/GeoTerrain.cpp` (OSM/Terrarium tile fetch, elevation sampling, terrain mesh).
 
 ### STORY 02-10 · M3 · M · P0 — Wind field and aerodynamic disturbance
 - **Story**: As `OPS`, I want a configurable wind field integrated into the physics, so that the twin can show whether a plan holds under realistic disturbance.
@@ -130,7 +130,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
   - Given a field extent, when textures load, then tiles align to the terrain grid within pixel tolerance.
   - Given a tile fetch failure, when textures load, then the placeholder is shown with a "tile unavailable" marker, not a silent procedural fill claiming to be real.
 - **Tests**: unit (tile alignment), failure path (tile fetch failure marked), fixture.
-- **Depends on**: 02-09, `simulator/src/earth_textures.rs`, `map_loader.rs`.
+- **Depends on**: 02-09, `flight_sim_cpp` map-tile fetching/caching (`GeoTerrain.cpp`, viewer tile compositor).
 
 ### STORY 02-13 · M3 · S · P2 — C++ headless runner shares mission/telemetry contract
 - **Story**: As `DSP`, I want the C++ headless runner to read the same mission format and emit the same telemetry as the Rust twin, so that the two simulators stay interchangeable for regression.
@@ -141,22 +141,40 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Tests**: cross-runner trace comparison, contract test (mission/telemetry format), failure path (format mismatch).
 - **Depends on**: 02-04, `flight_sim_cpp/src/MissionLoader.cpp`, `TelemetryRecorder.cpp`.
 
+### STORY 02-19 · M3 · L · P1 — Georeferenced 3D scene synthesis (buildings and farm vegetation)
+- **Story**: As `DSP`, I want the world around a chosen location populated with 3D scene objects — building footprints from OSM and farm vegetation (forest trees, bushes, crop rows by crop type) from land-cover classes — so that a simulated flight over a real farm encounters the obstacles and canopy a real flight would.
+- **Deterministic / evidence**: instantiate scene objects on the 02-09 DEM from OSM building footprints (`07`) and land-cover/vegetation classes (`05` classification products); placement is seeded and procedural per class (tree spacing, bush density, crop-row geometry); the run emits a reproducible scene manifest listing every object's class, georeferenced footprint, and height.
+- **Acceptance**:
+  - Given a location and a seed, when scene synthesis runs, then the scene manifest is byte-identical across runs and each object's footprint georeference matches its source feature within tolerance.
+  - Given an area with no land-cover or OSM coverage, when synthesis runs, then the area is marked "unpopulated" in the manifest, not filled with invented vegetation presented as real.
+- **Tests**: golden-file (seeded scene manifest), unit (footprint → placement geometry per class), failure path (missing land cover marked unpopulated).
+- **Depends on**: 02-09, `flight_sim_cpp/src/GeoTerrain.cpp`, `05` (vegetation classes), `07` (OSM features).
+
+### STORY 02-20 · M3 · L · P1 — Ray-traced drone camera with configurable field of view
+- **Story**: As `DSP`, I want a simulated drone camera that ray-traces the synthesized scene from the drone's pose through configurable FOV/intrinsics, so that perception and capture software can be developed against realistic frames before any real-world flight — the autonomous-vehicle-style sim-first approach.
+- **Deterministic / evidence**: cast rays from the drone pose through a pinhole intrinsics model (FOV, resolution, distortion optional) against terrain plus 02-19 scene objects; emit each frame with per-pixel depth, the camera pose, and a timestamp; seeded and reproducible; frame georeference derives from pose + intrinsics.
+- **Acceptance**:
+  - Given a known scene, pose, and seed, when a frame is captured, then it is reproducible and known objects appear at projectively correct pixel positions within tolerance.
+  - Given a pose outside the loaded scene extent, when capture runs, then the frame is marked "no scene coverage" rather than emitting an empty frame presented as real imagery.
+- **Tests**: golden-file (seeded frame hash), unit (ray–object intersection, projection math), failure path (no coverage).
+- **Depends on**: 02-19, 02-06 (georeferenced band emission), 02-08 (optional pose noise).
+
 ---
 
 ## M4 — Interactive
 
 ### STORY 02-14 · M4 · M · P0 — Mission preview overlay tied to a field boundary
 - **Story**: As `OPS`, I want to preview a planned mission as an overlay on the globe tied to the field boundary, so that I can sanity-check coverage before flying.
-- **Deterministic / evidence**: render the `01` waypoint mission and survey pattern over the field boundary in the Bevy globe with correct georeference; coverage fraction shown.
+- **Deterministic / evidence**: render the `01` waypoint mission and survey pattern over the field boundary in the canonical globe viewer (`flight_sim_cpp`) with correct georeference; coverage fraction shown.
 - **Acceptance**:
   - Given a mission and field boundary, when previewed, then waypoints and the boundary render aligned in the globe with reported coverage.
   - Given a mission referencing a field with no boundary, when previewed, then it shows "no boundary" rather than rendering an unanchored path.
 - **Tests**: unit (overlay georeference), integration (mission → overlay), failure path (no boundary).
-- **Depends on**: 02-09, `01` (mission + survey templates), `10` (field boundary), `simulator/src/globe_view.rs`, `globe_ui.rs`.
+- **Depends on**: 02-09, `01` (mission + survey templates), `10` (field boundary), `flight_sim_cpp` globe picker and mission editor (`macos_opengl_viewer.mm`).
 
 ### STORY 02-15 · M4 · M · P0 — Twin-as-backend for `01`/`03` simulation mode
 - **Story**: As `OPS`, I want `01` and `03` to drive their `Simulation` runtime mode through one twin API, so that there is a single canonical backend for sim-first testing.
-- **Deterministic / evidence**: expose a twin API consuming `shared` commands and producing telemetry; `01`/`03` in `Simulation` mode route through it; resolve the Rust-vs-C++ canonical-role question explicitly.
+- **Deterministic / evidence**: expose a twin API consuming `shared` commands and producing telemetry; `01`/`03` in `Simulation` mode route through it. Canonical roles are resolved: `flight_sim_cpp` is the canonical interactive simulator/viewer, `drone_simulator` is the headless Rust twin for CI regression (the Bevy `simulator` crate was removed).
 - **Acceptance**:
   - Given `01` in `Simulation` mode, when it dispatches commands, then they execute against the twin API and stream telemetry back.
   - Given the twin API is unavailable, when `01` enters `Simulation` mode, then it fails closed (refuses to "simulate" with no backend), not silently no-op.
@@ -170,11 +188,38 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
   - Given a running sim, when the HUD renders, then displayed altitude/speed/battery match telemetry within tolerance.
   - Given a battery-critical state, when the UI updates, then it reflects the emergency state and does not stay green.
 - **Tests**: unit (HUD value mapping), failure path (critical state reflected), fixture.
-- **Depends on**: 02-03, 02-14, `simulator/src/hud.rs`, `globe_ui.rs`.
+- **Depends on**: 02-03, 02-14, `flight_sim_cpp` viewer telemetry panel (`macos_opengl_viewer.mm`).
+
+### STORY 02-21 · M4 · M · P1 — Telemetry and encoded video streaming to an external collector
+- **Story**: As `OPS`, I want a simulated flight's telemetry and camera frames streamed as an encoded video feed to an external telemetry collector, so that the full drone-to-ground data path is exercised end to end with zero hardware.
+- **Deterministic / evidence**: encode the 02-20 frame sequence into a video stream; transmit telemetry (in the `shared` schema) and video to a configurable collector endpoint; record sent/acked counts; a local collector fixture asserts frame↔telemetry timestamp alignment and that the video decodes.
+- **Acceptance**:
+  - Given a simulated mission and a running collector, when streaming runs, then the collector receives decodable video and telemetry whose timestamps align, with sent/received counts matching.
+  - Given an unreachable collector, when streaming runs, then frames/telemetry are buffered or dropped with an explicit delivery-failure reason code, never silently lost.
+- **Tests**: integration (sim → local collector fixture), unit (timestamp alignment, encode/decode round-trip), failure path (unreachable collector).
+- **Depends on**: 02-20, 02-04 (shared telemetry contract), `04` (capture-shaped ingestion).
+
+### STORY 02-22 · M4 · M · P2 — Location-anchored scenario loading from globe navigation
+- **Story**: As `OPS`, I want to navigate the globe to any location and have terrain, scene objects, and a mission template load there automatically, so that any field in the world becomes a flyable scenario in minutes — the flight-simulator experience.
+- **Deterministic / evidence**: a globe pick triggers DEM/map-tile fetch (02-09/02-12), scene synthesis (02-19), and generation of a default survey mission anchored to the picked coordinates; the scenario manifest (location, tiles, scene seed, mission) is persisted and reloadable.
+- **Acceptance**:
+  - Given a picked location, when scenario loading completes, then the drone can fly a mission there and a known ground coordinate round-trips through the loaded terrain.
+  - Given unreachable tile or feature sources, when loading runs, then a partial scenario is produced with the gaps explicitly listed, not a silently flat or empty world.
+- **Tests**: integration (pick → flyable scenario), unit (coordinate anchoring), failure path (fetch failure → explicit gaps).
+- **Depends on**: 02-09, 02-12, 02-19, `flight_sim_cpp` globe picker.
 
 ---
 
 ## M5 — Autonomous-Assist
+
+### STORY 02-23 · M5 · L · P2 — Labeled synthetic perception dataset export
+- **Story**: As `AG`, I want every ray-traced frame exportable with perfect ground truth — per-pixel object-class masks, depth, object poses, and camera pose — so that vegetation and crop perception models can be trained sim-first, the way autonomous-vehicle stacks are.
+- **Deterministic / evidence**: dataset export derives label rasters directly from the 02-19 scene manifest and 02-20 ray hits (the renderer is the labeler — no model in the loop); seeded and reproducible; a dataset manifest links every frame to its scenario, seed, and pose.
+- **Acceptance**:
+  - Given an exported dataset, when masks are checked against the scene manifest, then every labeled pixel agrees with the geometry that produced it.
+  - Given a frame missing pose or scene linkage, when export runs, then it is excluded with a reason code, not emitted unlabeled.
+- **Tests**: unit (mask ↔ scene geometry agreement), golden-file (seeded dataset manifest), failure path (unlinked frame excluded).
+- **Depends on**: 02-19, 02-20, consumed by `05`/`23` (classifier fixtures and training).
 
 ### STORY 02-17 · M5 · M · P1 — Closed-loop coordination preview against `03`
 - **Story**: As `OPS`, I want to preview a coordinated multi-drone maneuver in the twin before any real swarm flight, so that formations and separation are validated safely.
@@ -198,4 +243,4 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 
 ## Coverage note
 
-~18 stories cover the 12 capabilities in `capability-map.md`, ordered by phase and weighted toward M3 (golden fixtures, terrain, physics) per `release-plan.md`. The curated counts in `release-plan.md` (≈78 rows) expand several of these — per-sensor noise models, per-command-mode golden traces, per-formation preview cases, and additional terrain-tile sources — into sibling stories when implemented. Every physics/controller story carries a seeded golden fixture, and the twin enforces the same geofence/altitude/battery limits as the real flight path so sim-first testing for `01`/`03` is meaningful.
+~23 stories cover the 12 capabilities in `capability-map.md` plus the synthetic-perception stack (scene synthesis → ray-traced camera → video/telemetry streaming → labeled dataset export, stories 02-19 to 02-23), ordered by phase and weighted toward M3 (golden fixtures, terrain, physics) per `release-plan.md`. The curated counts in `release-plan.md` (≈91 rows) expand several of these — per-sensor noise models, per-command-mode golden traces, per-formation preview cases, per-vegetation-class scene generators, and additional terrain-tile sources — into sibling stories when implemented. Every physics/controller story carries a seeded golden fixture, and the twin enforces the same geofence/altitude/battery limits as the real flight path so sim-first testing for `01`/`03` is meaningful.
