@@ -17,11 +17,11 @@ use crate::plugins::recommendations::{
 };
 use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
-    select_catalog_scene, AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask,
-    AnnotationOverlayState, AnnotationUpdateTask, CursorMapState, DraftMode,
-    FarmFieldHistoryFetchTask, FarmListFetchTask, FieldCatalogState, FieldImportState,
-    FieldImportTask, FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask, MapViewState,
-    RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
+    product_placement_for_manifest, select_catalog_scene, AnnotationCreateTask,
+    AnnotationDeleteTask, AnnotationFetchTask, AnnotationOverlayState, AnnotationUpdateTask,
+    CursorMapState, DraftMode, FarmFieldHistoryFetchTask, FarmListFetchTask, FieldCatalogState,
+    FieldImportState, FieldImportTask, FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask,
+    MapViewState, RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
     RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask,
     ReportOverlayState, SceneManifestState, ShapefileImportRequest, TileConfig, TileFetchTasks,
     TileRenderState, TileStatus, ViewerState,
@@ -552,6 +552,10 @@ fn render_layers_panel(
     if manifest_state.products.is_empty() {
         ui.label("No layers loaded");
     } else {
+        let placement = product_placement_for_manifest(&manifest_state.geospatial);
+        if let Some(reason) = placement.reason() {
+            ui.label(format!("Products unavailable for overlay: {reason}"));
+        }
         for (idx, product) in manifest_state.products.iter().enumerate() {
             let label = format!(
                 "{} ({}, {})",
@@ -559,14 +563,24 @@ fn render_layers_panel(
                 product.filename,
                 product.content_type
             );
-            let response = ui.radio_value(&mut viewer_state.selected_layer, idx, label);
-            if response.changed() {
-                config.product_kind = product.kind.clone();
-                clear_loaded_tiles(commands, tile_state);
-                fetch_tasks.0.clear();
-                tile_state.status = TileStatus::Fetching;
+            if placement.is_placeable() {
+                let response = ui.radio_value(&mut viewer_state.selected_layer, idx, label);
+                if response.changed() {
+                    config.product_kind = product.kind.clone();
+                    clear_loaded_tiles(commands, tile_state);
+                    fetch_tasks.0.clear();
+                    tile_state.status = TileStatus::Fetching;
+                }
+                response.on_hover_text(product.url_path.clone());
+            } else {
+                let selected = viewer_state.selected_layer == idx;
+                let response = ui.add_enabled(false, egui::RadioButton::new(selected, label));
+                response.on_hover_text(format!(
+                    "{}\n{}",
+                    product.url_path,
+                    placement.reason().unwrap_or("product is unplaceable")
+                ));
             }
-            response.on_hover_text(product.url_path.clone());
         }
     }
     ui.add_space(8.0);

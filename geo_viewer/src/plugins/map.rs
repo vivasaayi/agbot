@@ -156,6 +156,7 @@ pub fn render_field_boundary(mut gizmos: Gizmos, manifest_state: Res<SceneManife
     }
 }
 
+#[cfg(test)]
 pub fn extent_world_size(extent: &SceneExtent) -> Vec2 {
     Vec2::new(
         ((extent.max_lon - extent.min_lon) as f32).abs() * MAP_UNITS_PER_DEGREE,

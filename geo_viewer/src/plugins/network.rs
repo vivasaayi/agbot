@@ -1,14 +1,13 @@
 use crate::plugins::annotations::{clear_annotation_draft_geometry, start_annotation_fetch};
-use crate::plugins::map::{
-    extent_world_size, tile_center_world, tile_world_size, visible_tiles_for_view,
-};
+use crate::plugins::map::{tile_center_world, tile_world_size, visible_tiles_for_view};
 use crate::plugins::recommendations::{clear_recommendations, start_recommendation_fetch};
 use crate::plugins::reports::{clear_reports, start_report_fetch};
 use crate::state::{
-    AnnotationFetchTask, AnnotationOverlayState, FarmFieldHistoryFetchTask, FarmListFetchTask,
-    FetchedTile, FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask,
-    FieldSceneSummary, FieldScenesFetchTask, FieldSeasonGroup, ManifestFetchTask, MapCamera,
-    MapViewState, RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
+    manifest_world_dimensions, product_placement_for_manifest, AnnotationFetchTask,
+    AnnotationOverlayState, FarmFieldHistoryFetchTask, FarmListFetchTask, FetchedTile,
+    FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask, FieldSceneSummary,
+    FieldScenesFetchTask, FieldSeasonGroup, ManifestFetchTask, MapCamera, MapViewState,
+    RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
     RecommendationOverlayState, RecommendationUpdateTask, RenderedTile, ReportFetchTask,
     ReportGenerateTask, ReportOverlayState, SceneManifest, SceneManifestState,
     ShapefileImportRequest, TileConfig, TileDisplay, TileFetchTasks, TileId, TilePresence,
@@ -243,16 +242,23 @@ fn poll_manifest_fetch(
                         manifest_state.width.unwrap_or_default() as f32,
                         manifest_state.height.unwrap_or_default() as f32,
                     );
-                    tile_state.world_dimensions = manifest_state
-                        .geospatial
-                        .extent
-                        .as_ref()
-                        .map(extent_world_size)
-                        .or_else(|| {
-                            (manifest_state.width.zip(manifest_state.height))
-                                .map(|(width, height)| Vec2::new(width as f32, height as f32))
-                        })
-                        .unwrap_or(Vec2::ZERO);
+                    tile_state.world_dimensions = manifest_world_dimensions(
+                        &manifest_state.geospatial,
+                        manifest_state.width,
+                        manifest_state.height,
+                    );
+
+                    let placement = product_placement_for_manifest(&manifest_state.geospatial);
+                    if !placement.is_placeable() {
+                        tile_state.status = TileStatus::Error(format!(
+                            "{}; products are unplaceable",
+                            placement
+                                .reason()
+                                .unwrap_or("scene products are unplaceable")
+                        ));
+                        return;
+                    }
+
                     tile_state.status = TileStatus::Fetching;
 
                     if let Err(err) =
@@ -873,6 +879,10 @@ fn active_tile_source(
     manifest_state: &SceneManifestState,
     config: &TileConfig,
 ) -> Option<TileSource> {
+    if !product_placement_for_manifest(&manifest_state.geospatial).is_placeable() {
+        return None;
+    }
+
     manifest_state
         .products
         .iter()

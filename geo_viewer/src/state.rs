@@ -193,6 +193,59 @@ pub struct SceneGeospatialMetadata {
     pub extent: Option<SceneExtent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductPlacement {
+    Placeable,
+    Unplaceable(String),
+}
+
+impl ProductPlacement {
+    pub fn is_placeable(&self) -> bool {
+        matches!(self, Self::Placeable)
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Placeable => None,
+            Self::Unplaceable(reason) => Some(reason.as_str()),
+        }
+    }
+}
+
+pub fn product_placement_for_manifest(geospatial: &SceneGeospatialMetadata) -> ProductPlacement {
+    if geospatial.georeferenced {
+        ProductPlacement::Placeable
+    } else {
+        ProductPlacement::Unplaceable("scene manifest is not georeferenced".to_string())
+    }
+}
+
+pub fn manifest_world_dimensions(
+    geospatial: &SceneGeospatialMetadata,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Vec2 {
+    if !product_placement_for_manifest(geospatial).is_placeable() {
+        return Vec2::ZERO;
+    }
+
+    geospatial
+        .extent
+        .as_ref()
+        .map(|extent| {
+            Vec2::new(
+                ((extent.max_lon - extent.min_lon) as f32).abs() * MAP_UNITS_PER_DEGREE,
+                ((extent.max_lat - extent.min_lat) as f32).abs() * MAP_UNITS_PER_DEGREE,
+            )
+        })
+        .or_else(|| {
+            width
+                .zip(height)
+                .map(|(width, height)| Vec2::new(width as f32, height as f32))
+        })
+        .unwrap_or(Vec2::ZERO)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SceneExtent {
     pub min_lon: f64,
@@ -531,9 +584,11 @@ pub fn ensure_scene_id(config: &TileConfig, action: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        select_catalog_scene, summarize_tile_presences, FieldCatalogState, FieldSceneSummary,
-        SceneProduct, TileId, TilePresence,
+        manifest_world_dimensions, product_placement_for_manifest, select_catalog_scene,
+        summarize_tile_presences, FieldCatalogState, FieldSceneSummary, SceneExtent,
+        SceneGeospatialMetadata, SceneManifest, SceneProduct, TileId, TilePresence,
     };
+    use bevy::prelude::Vec2;
 
     #[test]
     fn tile_source_formats_tile_url_from_template() {
@@ -598,6 +653,107 @@ mod tests {
         assert_eq!(summary.ready, 2);
         assert_eq!(summary.missing, 1);
         assert_eq!(summary.failed, 1);
+    }
+
+    #[test]
+    fn scene_manifest_decodes_geospatial_metadata_and_product_list() {
+        let manifest: SceneManifest = serde_json::from_str(
+            r#"{
+                "scene_id": "scene-1",
+                "owner": "org-alpha",
+                "sensor": "landsat8",
+                "acquired_at": "2026-05-01T00:00:00Z",
+                "width": 256,
+                "height": 256,
+                "bands": ["red", "nir"],
+                "gps_position": null,
+                "data_path": "/tmp/scene-1",
+                "field_id": "field-1",
+                "season_id": "2026",
+                "linked_at": "2026-05-01T00:00:00Z",
+                "field": null,
+                "geospatial": {
+                    "georeferenced": true,
+                    "crs": "EPSG:4326",
+                    "center": null,
+                    "extent": {
+                        "min_lon": -89.5,
+                        "min_lat": 40.0,
+                        "max_lon": -88.5,
+                        "max_lat": 41.0
+                    }
+                },
+                "available_products": [
+                    {
+                        "kind": "ndvi",
+                        "filename": "ndvi.png",
+                        "content_type": "image/png",
+                        "url_path": "/api/scenes/scene-1/products/ndvi",
+                        "tile_url_template": "/api/scenes/scene-1/products/ndvi/tiles/{z}/{x}/{y}.png"
+                    }
+                ]
+            }"#,
+        )
+        .expect("scene manifest should decode");
+
+        assert_eq!(manifest.scene_id, "scene-1");
+        assert!(manifest.geospatial.georeferenced);
+        assert_eq!(manifest.geospatial.crs.as_deref(), Some("EPSG:4326"));
+        assert_eq!(manifest.available_products.len(), 1);
+        assert_eq!(manifest.available_products[0].kind, "ndvi");
+    }
+
+    #[test]
+    fn product_placement_refuses_not_georeferenced_manifest() {
+        let placement = product_placement_for_manifest(&SceneGeospatialMetadata {
+            georeferenced: false,
+            crs: None,
+            center: None,
+            extent: None,
+        });
+
+        assert!(!placement.is_placeable());
+        assert!(placement
+            .reason()
+            .expect("unplaceable reason")
+            .contains("not georeferenced"));
+    }
+
+    #[test]
+    fn manifest_world_dimensions_do_not_fabricate_ungeoreferenced_ground() {
+        let dimensions = manifest_world_dimensions(
+            &SceneGeospatialMetadata {
+                georeferenced: false,
+                crs: None,
+                center: None,
+                extent: None,
+            },
+            Some(256),
+            Some(128),
+        );
+
+        assert_eq!(dimensions, Vec2::ZERO);
+    }
+
+    #[test]
+    fn manifest_world_dimensions_use_extent_when_georeferenced() {
+        let dimensions = manifest_world_dimensions(
+            &SceneGeospatialMetadata {
+                georeferenced: true,
+                crs: Some("EPSG:4326".to_string()),
+                center: None,
+                extent: Some(SceneExtent {
+                    min_lon: -89.5,
+                    min_lat: 40.0,
+                    max_lon: -88.5,
+                    max_lat: 41.0,
+                }),
+            },
+            Some(256),
+            Some(128),
+        );
+
+        assert_ne!(dimensions, Vec2::ZERO);
     }
 
     #[test]
