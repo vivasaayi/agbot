@@ -4039,6 +4039,12 @@ async fn validate_recommendation_annotation_ids(
     scene_id: &str,
     annotation_ids: &[String],
 ) -> AppResult<()> {
+    if annotation_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "recommendation requires at least one annotation".to_string(),
+        ));
+    }
+
     for annotation_id in annotation_ids {
         let annotation_id = annotation_id.trim();
         if annotation_id.is_empty() {

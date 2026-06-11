@@ -11,10 +11,10 @@ use crate::plugins::network::{
     start_manifest_fetch,
 };
 use crate::plugins::recommendations::{
-    clear_recommendation_draft, clear_recommendations, load_recommendation_into_draft,
-    recommendation_matches_filters, seed_recommendation_from_annotation, selected_recommendation,
-    start_recommendation_create, start_recommendation_delete, start_recommendation_fetch,
-    start_recommendation_update,
+    build_recommendation_create_payload, clear_recommendation_draft, clear_recommendations,
+    load_recommendation_into_draft, recommendation_matches_filters,
+    seed_recommendation_from_annotation, selected_recommendation, start_recommendation_create,
+    start_recommendation_delete, start_recommendation_fetch, start_recommendation_update,
 };
 use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
@@ -1225,8 +1225,9 @@ fn render_recommendations_panel(
         ));
     }
 
-    let create_enabled =
-        config.scene_id.is_some() && !recommendations.draft_title.trim().is_empty();
+    let create_enabled = config.scene_id.is_some()
+        && !recommendations.draft_title.trim().is_empty()
+        && !recommendations.linked_annotation_ids.is_empty();
     if ui
         .add_enabled(
             create_enabled && recommendations.selected_recommendation_id.is_none(),
@@ -1234,17 +1235,15 @@ fn render_recommendations_panel(
         )
         .clicked()
     {
-        if let Err(err) = start_recommendation_create(
-            recommendation_create_task,
-            config,
-            recommendations.draft_title.clone(),
-            recommendations.draft_note.clone(),
-            recommendations.draft_category.clone(),
-            recommendations.draft_priority,
-            recommendations.draft_status,
-            recommendations.linked_annotation_ids.clone(),
-        ) {
-            tile_state.status = TileStatus::Error(err.to_string());
+        match build_recommendation_create_payload(recommendations) {
+            Ok(payload) => {
+                if let Err(err) =
+                    start_recommendation_create(recommendation_create_task, config, payload)
+                {
+                    tile_state.status = TileStatus::Error(err.to_string());
+                }
+            }
+            Err(err) => tile_state.status = TileStatus::Error(err.to_string()),
         }
     }
 

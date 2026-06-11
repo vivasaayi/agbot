@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use bevy::prelude::*;
 use bevy::tasks::IoTaskPool;
 use futures_lite::future;
+use serde::Serialize;
 use shared::schemas::{RecommendationPriority, RecommendationRecord, RecommendationStatus};
 
 pub struct ViewerRecommendationsPlugin;
@@ -187,6 +188,60 @@ pub fn clear_recommendation_draft(recommendations: &mut RecommendationOverlaySta
     recommendations.linked_annotation_ids.clear();
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RecommendationCreatePayload {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub priority: RecommendationPriority,
+    pub status: RecommendationStatus,
+    pub annotation_ids: Vec<String>,
+}
+
+pub fn build_recommendation_create_payload(
+    recommendations: &RecommendationOverlayState,
+) -> Result<RecommendationCreatePayload> {
+    let title = normalize_required_text(&recommendations.draft_title, "recommendation title")?;
+    let annotation_ids = normalized_annotation_ids(&recommendations.linked_annotation_ids)?;
+
+    Ok(RecommendationCreatePayload {
+        title,
+        note: normalize_optional_text(&recommendations.draft_note),
+        category: normalize_optional_text(&recommendations.draft_category),
+        priority: recommendations.draft_priority,
+        status: recommendations.draft_status,
+        annotation_ids,
+    })
+}
+
+fn normalized_annotation_ids(annotation_ids: &[String]) -> Result<Vec<String>> {
+    let normalized = annotation_ids
+        .iter()
+        .filter_map(|annotation_id| normalize_optional_text(annotation_id))
+        .collect::<Vec<_>>();
+
+    if normalized.is_empty() {
+        anyhow::bail!("recommendation requires at least one linked annotation");
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_required_text(value: &str, label: &str) -> Result<String> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("{} is required", label);
+    }
+    Ok(normalized.to_string())
+}
+
+fn normalize_optional_text(value: &str) -> Option<String> {
+    let normalized = value.trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
 pub fn start_recommendation_fetch(
     recommendation_fetch_task: &mut RecommendationFetchTask,
     config: &TileConfig,
@@ -223,27 +278,15 @@ pub fn start_recommendation_fetch(
 pub fn start_recommendation_create(
     recommendation_create_task: &mut RecommendationCreateTask,
     config: &TileConfig,
-    title: String,
-    note: String,
-    category: String,
-    priority: RecommendationPriority,
-    status: RecommendationStatus,
-    annotation_ids: Vec<String>,
+    payload: RecommendationCreatePayload,
 ) -> Result<()> {
     let scene_id = crate::state::ensure_scene_id(config, "create recommendations")?;
     let url = format!(
         "{}/api/scenes/{}/recommendations",
         config.base_url, scene_id
     );
-    let payload = serde_json::json!({
-        "title": title,
-        "note": note,
-        "category": category,
-        "priority": priority,
-        "status": status,
-        "annotation_ids": annotation_ids
-    })
-    .to_string();
+    let payload = serde_json::to_string(&payload)
+        .context("failed to encode recommendation create payload")?;
 
     recommendation_create_task.0 = Some(IoTaskPool::get().spawn(async move {
         let client = reqwest::blocking::Client::new();
@@ -360,7 +403,10 @@ pub fn clear_recommendations(
 
 #[cfg(test)]
 mod tests {
-    use super::{recommendation_matches_filters, RecommendationOverlayState};
+    use super::{
+        build_recommendation_create_payload, recommendation_matches_filters,
+        RecommendationOverlayState,
+    };
     use shared::schemas::{RecommendationPriority, RecommendationRecord, RecommendationStatus};
 
     fn sample_recommendation() -> RecommendationRecord {
@@ -394,5 +440,40 @@ mod tests {
 
         state.priority_filter = Some(RecommendationPriority::Low);
         assert!(!recommendation_matches_filters(&recommendation, &state));
+    }
+
+    #[test]
+    fn recommendation_create_payload_links_annotation_evidence() {
+        let state = RecommendationOverlayState {
+            draft_title: "Scout irrigation line".to_string(),
+            draft_note: "Verify nozzle coverage".to_string(),
+            draft_category: "irrigation".to_string(),
+            draft_priority: RecommendationPriority::High,
+            draft_status: RecommendationStatus::Open,
+            linked_annotation_ids: vec!["ann-1".to_string()],
+            ..Default::default()
+        };
+
+        let payload =
+            build_recommendation_create_payload(&state).expect("annotation evidence should create");
+
+        assert_eq!(payload.title, "Scout irrigation line");
+        assert_eq!(payload.category.as_deref(), Some("irrigation"));
+        assert_eq!(payload.priority, RecommendationPriority::High);
+        assert_eq!(payload.status, RecommendationStatus::Open);
+        assert_eq!(payload.annotation_ids, vec!["ann-1".to_string()]);
+    }
+
+    #[test]
+    fn recommendation_create_payload_rejects_zero_annotations() {
+        let state = RecommendationOverlayState {
+            draft_title: "Scout irrigation line".to_string(),
+            ..Default::default()
+        };
+
+        let err = build_recommendation_create_payload(&state)
+            .expect_err("zero linked annotations should be rejected");
+
+        assert!(err.to_string().contains("annotation"));
     }
 }

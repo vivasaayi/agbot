@@ -2124,6 +2124,31 @@ async fn recommendation_crud_roundtrip_with_annotation_linkage() -> Result<()> {
         Some("ann-rec-1")
     );
 
+    let empty_evidence_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/recommendations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recommendation_id": "rec-no-evidence",
+                        "title": "Scout without evidence",
+                        "category": "irrigation",
+                        "priority": "medium",
+                        "status": "open",
+                        "annotation_ids": []
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(empty_evidence_response.status(), StatusCode::BAD_REQUEST);
+
     let list_response = ctx
         .app
         .clone()
