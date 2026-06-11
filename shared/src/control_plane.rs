@@ -30,6 +30,8 @@ pub struct MembershipRecord {
     pub membership_id: Uuid,
     pub user_id: Uuid,
     pub org_id: Uuid,
+    #[serde(default)]
+    pub role: MembershipRole,
     pub joined_at: DateTime<Utc>,
 }
 
@@ -37,6 +39,38 @@ pub struct MembershipRecord {
 pub struct CreatedUserMembership {
     pub user: UserRecord,
     pub membership: MembershipRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MembershipRole {
+    Admin,
+    Advisor,
+    Operator,
+    Viewer,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlPlaneAction {
+    ReadEntity,
+    WriteEntity,
+    ManageUsers,
+    ViewAudit,
+    ExportData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthorizationDecision {
+    Allowed,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationResult {
+    pub role: MembershipRole,
+    pub action: ControlPlaneAction,
+    pub decision: AuthorizationDecision,
+    pub reason_code: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -57,6 +91,12 @@ pub struct ControlPlaneRegistry {
     users: HashMap<Uuid, UserRecord>,
     memberships: HashMap<Uuid, MembershipRecord>,
     email_index: HashMap<String, Uuid>,
+}
+
+impl Default for MembershipRole {
+    fn default() -> Self {
+        Self::Viewer
+    }
 }
 
 impl ControlPlaneRegistry {
@@ -84,6 +124,15 @@ impl ControlPlaneRegistry {
         org_id: Uuid,
         email: String,
     ) -> Result<CreatedUserMembership, ControlPlaneError> {
+        self.create_user_with_role(org_id, email, MembershipRole::Viewer)
+    }
+
+    pub fn create_user_with_role(
+        &mut self,
+        org_id: Uuid,
+        email: String,
+        role: MembershipRole,
+    ) -> Result<CreatedUserMembership, ControlPlaneError> {
         if !self.organizations.contains_key(&org_id) {
             return Err(ControlPlaneError::OrganizationNotFound { org_id });
         }
@@ -105,6 +154,7 @@ impl ControlPlaneRegistry {
             membership_id: Uuid::new_v4(),
             user_id: user.user_id,
             org_id,
+            role,
             joined_at: now,
         };
 
@@ -145,6 +195,43 @@ impl ControlPlaneRegistry {
             .collect::<Vec<_>>();
         memberships.sort_by(|left, right| left.joined_at.cmp(&right.joined_at));
         memberships
+    }
+}
+
+pub fn authorize(role: MembershipRole, action: ControlPlaneAction) -> AuthorizationResult {
+    let (decision, reason_code) = if role == MembershipRole::Unknown {
+        (AuthorizationDecision::Denied, "unknown_role")
+    } else if role_allows_action(role, action) {
+        (AuthorizationDecision::Allowed, "allowed")
+    } else {
+        (AuthorizationDecision::Denied, "role_not_permitted")
+    };
+
+    AuthorizationResult {
+        role,
+        action,
+        decision,
+        reason_code: reason_code.to_string(),
+    }
+}
+
+fn role_allows_action(role: MembershipRole, action: ControlPlaneAction) -> bool {
+    match role {
+        MembershipRole::Admin => true,
+        MembershipRole::Advisor => matches!(
+            action,
+            ControlPlaneAction::ReadEntity
+                | ControlPlaneAction::ViewAudit
+                | ControlPlaneAction::ExportData
+        ),
+        MembershipRole::Operator => {
+            matches!(
+                action,
+                ControlPlaneAction::ReadEntity | ControlPlaneAction::WriteEntity
+            )
+        }
+        MembershipRole::Viewer => matches!(action, ControlPlaneAction::ReadEntity),
+        MembershipRole::Unknown => false,
     }
 }
 
@@ -221,5 +308,34 @@ mod tests {
         assert_eq!(value["user"]["email"], "ops@example.com");
         assert_eq!(value["user"]["org_id"], org.org_id.to_string());
         assert_eq!(value["membership"]["org_id"], org.org_id.to_string());
+    }
+
+    #[test]
+    fn viewer_write_is_denied_and_admin_write_is_allowed() {
+        let viewer = authorize(MembershipRole::Viewer, ControlPlaneAction::WriteEntity);
+        let admin = authorize(MembershipRole::Admin, ControlPlaneAction::WriteEntity);
+
+        assert_eq!(viewer.decision, AuthorizationDecision::Denied);
+        assert_eq!(viewer.reason_code, "role_not_permitted");
+        assert_eq!(admin.decision, AuthorizationDecision::Allowed);
+    }
+
+    #[test]
+    fn unknown_role_fails_closed() {
+        let result = authorize(MembershipRole::Unknown, ControlPlaneAction::ReadEntity);
+
+        assert_eq!(result.decision, AuthorizationDecision::Denied);
+        assert_eq!(result.reason_code, "unknown_role");
+    }
+
+    #[test]
+    fn authorization_result_serializes_contract() {
+        let result = authorize(MembershipRole::Viewer, ControlPlaneAction::WriteEntity);
+        let value = serde_json::to_value(&result).expect("authorization serializes");
+
+        assert_eq!(value["role"], "Viewer");
+        assert_eq!(value["action"], "WriteEntity");
+        assert_eq!(value["decision"], "Denied");
+        assert_eq!(value["reason_code"], "role_not_permitted");
     }
 }
