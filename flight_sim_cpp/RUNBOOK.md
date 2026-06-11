@@ -31,6 +31,20 @@ Every headless run prints the simulator version, contract version, seed, timeste
 
 The sibling manifest records the same `run_id`, input hashes, output hash, PRNG nonce, and retention evidence.
 
+## Wind Field
+
+Use `--wind-mps X,Y,Z` on headless runs to apply a deterministic steady wind vector in m/s:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --wind-mps 3.0,0.0,0.0 \
+  --output flight_sim_cpp/out/windy.jsonl
+```
+
+The runner records the vector in `weather_config.wind_mps`; nonzero wind also records `source: steady_wind`. A zero vector preserves the no-wind golden trace.
+
 ## Trace Retention
 
 Use retention only on a dedicated run output directory:

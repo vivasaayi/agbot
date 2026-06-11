@@ -40,8 +40,17 @@ std::string escape_json(std::string_view value) {
     return output.str();
 }
 
-std::string default_weather_config_json() {
-    return "{\"wind_mps\":{\"x\":0.000,\"y\":0.000,\"z\":0.000}}";
+std::string weather_config_json(Vec3 steady_wind_mps) {
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(3)
+           << "{\"wind_mps\":{\"x\":" << steady_wind_mps.x
+           << ",\"y\":" << steady_wind_mps.y
+           << ",\"z\":" << steady_wind_mps.z << "}";
+    if (steady_wind_mps.length() > 1e-9) {
+        stream << ",\"source\":\"steady_wind\"";
+    }
+    stream << "}";
+    return stream.str();
 }
 
 std::string default_sensor_config_json() {
@@ -157,7 +166,7 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
 
     while (!simulation.is_complete() && simulation.state().mission_time_s < config.max_time_s) {
         append_fault_events_for_step(config.faults, step_count, fault_events);
-        simulation.set_wind(wind_fault_for_step(config.faults, step_count));
+        simulation.set_wind(config.steady_wind_mps + wind_fault_for_step(config.faults, step_count));
         if (simulation.state().mission_time_s >= next_record_s) {
             record(simulation.state(), step_count);
             next_record_s += config.record_interval_s;
@@ -187,6 +196,8 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
         terrain_tiles_json_for_mission_fallback(mission, 96),
         terrain_tiles_json_for_faults(config.faults));
     manifest.terrain_tiles_hash = sha256_hex(manifest.terrain_tiles_json);
+    manifest.weather_config_json = weather_config_json(config.steady_wind_mps);
+    manifest.weather_config_hash = sha256_hex(manifest.weather_config_json);
     {
         std::ostringstream run_id_input;
         run_id_input << std::fixed << std::setprecision(9)
@@ -199,14 +210,13 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
                      << config.max_time_s << "|"
                      << manifest.mission_hash << "|"
                      << manifest.faults_hash << "|"
-                     << manifest.terrain_tiles_hash;
+                     << manifest.terrain_tiles_hash << "|"
+                     << manifest.weather_config_hash;
         manifest.run_id = sha256_hex(run_id_input.str());
     }
     manifest.step_count = step_count;
     manifest.sample_count = sample_count;
     manifest.prng_nonce = prng_nonce;
-    manifest.weather_config_json = default_weather_config_json();
-    manifest.weather_config_hash = sha256_hex(manifest.weather_config_json);
     manifest.sensor_config_json = default_sensor_config_json();
     manifest.sensor_config_hash = sha256_hex(manifest.sensor_config_json);
     manifest.safety_config_json = default_safety_config_json();

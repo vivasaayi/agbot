@@ -203,6 +203,7 @@ TwinContractSchemaV1 build_schema() {
         "tile_cache_control",
         "fault_injection",
         "terrain_crs_extent_assertions",
+        "wind_field",
     };
     schema.schema_hash = sha256_hex(schema_json_without_hash(schema));
     return schema;

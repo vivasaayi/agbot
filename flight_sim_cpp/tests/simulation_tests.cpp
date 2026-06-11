@@ -152,6 +152,20 @@ void test_manual_controls_move_drone() {
     assert(simulation.state().mode != DroneMode::Completed);
 }
 
+void test_steady_wind_disturbs_ground_track() {
+    auto calm_mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation calm(std::move(calm_mission));
+    calm.step(1.0);
+
+    auto windy_mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation windy(std::move(windy_mission));
+    windy.set_wind({3.0, 0.0, 0.0});
+    windy.step(1.0);
+
+    assert(windy.wind().x == 3.0);
+    assert(windy.state().position.x > calm.state().position.x + 0.1);
+}
+
 void test_mission_round_trip() {
     auto mission = MissionLoader::load_from_text(kMissionJson);
     const std::string json = agbot::flight_sim::mission_to_json(mission);
@@ -434,6 +448,40 @@ void test_run_manifest_records_geodetic_terrain_fallback_evidence() {
     assert(json.find("\"terrain_tiles\":[{") != std::string::npos);
 }
 
+void test_zero_wind_keeps_deterministic_trace_identical() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto zero_wind = unit_run_config();
+    zero_wind.steady_wind_mps = {0.0, 0.0, 0.0};
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto zero = agbot::flight_sim::run_deterministic(mission, zero_wind);
+
+    assert(zero.trace_jsonl == baseline.trace_jsonl);
+    assert(zero.manifest.output_hash == baseline.manifest.output_hash);
+    assert(zero.manifest.weather_config_hash == baseline.manifest.weather_config_hash);
+}
+
+void test_steady_wind_is_reproducible_and_manifested() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto windy_config = unit_run_config();
+    windy_config.steady_wind_mps = {3.0, 0.0, 0.0};
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto a = agbot::flight_sim::run_deterministic(mission, windy_config);
+    const auto b = agbot::flight_sim::run_deterministic(mission, windy_config);
+
+    assert(a.trace_jsonl == b.trace_jsonl);
+    assert(a.manifest.to_json() == b.manifest.to_json());
+    assert(a.trace_jsonl != baseline.trace_jsonl);
+    assert(a.manifest.weather_config_json.find("\"wind_mps\":{\"x\":3.000") != std::string::npos);
+    assert(a.manifest.weather_config_json.find("\"source\":\"steady_wind\"") != std::string::npos);
+    assert(a.manifest.weather_config_hash == agbot::flight_sim::sha256_hex(a.manifest.weather_config_json));
+
+    const auto diff = agbot::flight_sim::diff_trace_text(baseline.trace_jsonl, a.trace_jsonl);
+    assert(!diff.identical);
+    assert(diff.field_path == "position.x");
+}
+
 // Story 02-24: the first TwinContractV1 slice names the shared wire schemas
 // and their required fields so downstream consumers can detect schema drift.
 void test_twin_contract_v1_schema_covers_required_types() {
@@ -461,6 +509,7 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.has_capability("simulation_health"));
     assert(schema.has_capability("fault_injection"));
     assert(schema.has_capability("terrain_crs_extent_assertions"));
+    assert(schema.has_capability("wind_field"));
     assert(schema.to_json().find("\"schema_hash\":\"" + schema.schema_hash + "\"") != std::string::npos);
 }
 
@@ -696,6 +745,7 @@ int main() {
     test_loads_geodetic_mission();
     test_mission_completes();
     test_manual_controls_move_drone();
+    test_steady_wind_disturbs_ground_track();
     test_mission_round_trip();
     test_failsafe_low_battery();
     test_safety_parity_harness_covers_required_rules();
@@ -711,6 +761,8 @@ int main() {
     test_deterministic_runner_seed_drives_prng();
     test_run_manifest_records_contract_and_hashes();
     test_run_manifest_records_geodetic_terrain_fallback_evidence();
+    test_zero_wind_keeps_deterministic_trace_identical();
+    test_steady_wind_is_reproducible_and_manifested();
     test_twin_contract_v1_schema_covers_required_types();
     test_twin_contract_version_compatibility();
     test_trace_diff_reports_divergent_field();

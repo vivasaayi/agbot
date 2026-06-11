@@ -29,8 +29,26 @@ struct Args {
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
     std::optional<std::size_t> trace_retention_keep;
+    agbot::flight_sim::Vec3 steady_wind_mps;
     agbot::flight_sim::FaultInjectionPlan faults;
 };
+
+agbot::flight_sim::Vec3 parse_vec3_csv(const std::string& text, const std::string& field) {
+    const std::size_t first_comma = text.find(',');
+    const std::size_t second_comma = first_comma == std::string::npos
+        ? std::string::npos
+        : text.find(',', first_comma + 1);
+    if (first_comma == std::string::npos || second_comma == std::string::npos
+        || text.find(',', second_comma + 1) != std::string::npos) {
+        throw std::runtime_error(field + " must be formatted as X,Y,Z");
+    }
+
+    return {
+        std::stod(text.substr(0, first_comma)),
+        std::stod(text.substr(first_comma + 1, second_comma - first_comma - 1)),
+        std::stod(text.substr(second_comma + 1)),
+    };
+}
 
 [[noreturn]] void print_usage_and_exit(int code) {
     std::cout << "Usage: agbot_flight_sim_headless --seed N [options]\n"
@@ -41,6 +59,7 @@ struct Args {
               << "  --output PATH        Telemetry JSONL output (default: out/telemetry.jsonl).\n"
               << "                       A <output>.manifest.json is written alongside it.\n"
               << "  --max-time S         Max mission seconds before giving up (default 600).\n"
+              << "  --wind-mps X,Y,Z     Steady wind vector in m/s applied to airborne ground track.\n"
               << "  --trace-retention-keep N\n"
               << "                       Delete older JSONL traces in the output directory after keeping N newest runs.\n"
               << "  --fault SPEC         Add seeded fault: class:seed:start_step:end_step:magnitude[:target].\n"
@@ -65,6 +84,8 @@ Args parse_args(int argc, char** argv) {
             args.record_interval_s = std::stod(argv[++index]);
         } else if (current == "--max-time" && index + 1 < argc) {
             args.max_time_s = std::stod(argv[++index]);
+        } else if (current == "--wind-mps" && index + 1 < argc) {
+            args.steady_wind_mps = parse_vec3_csv(argv[++index], "--wind-mps");
         } else if (current == "--trace-retention-keep" && index + 1 < argc) {
             args.trace_retention_keep = static_cast<std::size_t>(std::stoull(argv[++index]));
         } else if (current == "--fault" && index + 1 < argc) {
@@ -112,6 +133,7 @@ int main(int argc, char** argv) {
         config.timestep_s = args.timestep_ms / 1000.0;
         config.record_interval_s = args.record_interval_s;
         config.max_time_s = args.max_time_s;
+        config.steady_wind_mps = args.steady_wind_mps;
         config.faults = args.faults;
 
         RunResult result = run_deterministic(mission, config);

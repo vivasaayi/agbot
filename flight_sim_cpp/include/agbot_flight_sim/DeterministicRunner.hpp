@@ -35,6 +35,7 @@ struct RunConfig {
     double timestep_s = 1.0 / 60.0;
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
+    Vec3 steady_wind_mps;
     FaultInjectionPlan faults;
 };
 

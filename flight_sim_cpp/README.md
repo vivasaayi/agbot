@@ -60,6 +60,19 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
 
 The manifest records deleted traces in `trace_retention_deleted`.
 
+Run with a deterministic steady wind vector:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --wind-mps 3.0,0.0,0.0 \
+  --output flight_sim_cpp/out/windy.jsonl
+```
+
+The manifest records steady wind under `weather_config.wind_mps` and includes
+`weather_config_hash` in the deterministic run identity.
+
 Inject a seeded fault:
 
 ```bash
