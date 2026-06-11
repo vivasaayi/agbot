@@ -45,6 +45,9 @@ pub struct SceneSummary {
     pub sensor: String,
     pub acquired_at: String,
     pub created_at: String,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub linked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +62,9 @@ pub struct SceneDetail {
     pub bands: Vec<String>,
     pub gps_position: Option<GpsCoords>,
     pub data_path: Option<String>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub linked_at: Option<String>,
     pub field: Option<FieldRecord>,
     pub ingest: Option<ingest::SceneIngestRecord>,
     pub geospatial: SceneGeospatialMetadata,
@@ -2033,7 +2039,7 @@ pub async fn list_field_scenes(
     }
 
     let rows = sqlx::query(
-        "SELECT scene_id, owner, sensor, acquired_at, created_at FROM scenes WHERE field_id = ?1 ORDER BY acquired_at DESC",
+        "SELECT scene_id, owner, sensor, acquired_at, created_at, field_id, season_id, linked_at FROM scenes WHERE field_id = ?1 ORDER BY acquired_at DESC",
     )
     .bind(&field_id)
     .fetch_all(&state.pool)
@@ -2048,6 +2054,9 @@ pub async fn list_field_scenes(
             sensor: row.get("sensor"),
             acquired_at: row.get("acquired_at"),
             created_at: row.get("created_at"),
+            field_id: row.get("field_id"),
+            season_id: row.get("season_id"),
+            linked_at: row.get("linked_at"),
         })
         .collect();
 
@@ -2058,16 +2067,48 @@ pub async fn link_scene_to_field(
     Path((scene_id, field_id)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> AppResult<Json<SceneDetail>> {
-    if load_field(&state, &field_id).await?.is_none() {
-        return Err(AppError::NotFound);
+    let field = load_field(&state, &field_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let season_id = season_id_for_linked_field(&field)?;
+
+    let scene_row = sqlx::query(
+        "SELECT scene_id, owner, sensor, acquired_at, data_path, metadata_json, created_at, field_id, season_id, linked_at FROM scenes WHERE scene_id = ?1",
+    )
+    .bind(&scene_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?
+    .ok_or(AppError::NotFound)?;
+
+    let scene_dir = state.config.data_root.join("scenes").join(&scene_id);
+    let metadata = load_scene_metadata(Some(&scene_row), &scene_dir).await?;
+    let asserted_spatial_ref = ingest::load_scene_spatial_ref(&state.pool, &scene_id).await?;
+    assert_scene_spatial_ref_integrity(metadata.as_ref(), asserted_spatial_ref.as_ref())?;
+    let scene_extent = scene_extent_for_link(metadata.as_ref(), asserted_spatial_ref.as_ref())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "scene-field-season linkage requires a georeferenced scene extent".to_string(),
+            )
+        })?;
+
+    if !scene_extent_intersects_bounds(&scene_extent, &field.extent) {
+        return Err(AppError::BadRequest(
+            "no-overlap: scene extent does not intersect field boundary".to_string(),
+        ));
     }
 
-    let updated = sqlx::query("UPDATE scenes SET field_id = ?1 WHERE scene_id = ?2")
-        .bind(&field_id)
-        .bind(&scene_id)
-        .execute(&state.pool)
-        .await
-        .map_err(Error::from)?;
+    let linked_at = current_record_timestamp();
+    let updated = sqlx::query(
+        "UPDATE scenes SET field_id = ?1, season_id = ?2, linked_at = ?3 WHERE scene_id = ?4",
+    )
+    .bind(&field_id)
+    .bind(&season_id)
+    .bind(&linked_at)
+    .bind(&scene_id)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
     if updated.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
@@ -2078,7 +2119,7 @@ pub async fn link_scene_to_field(
 pub async fn list_scenes(State(state): State<AppState>) -> AppResult<Json<Vec<SceneSummary>>> {
     let rows =
         sqlx::query(
-            "SELECT scene_id, owner, sensor, acquired_at, created_at FROM scenes ORDER BY acquired_at DESC",
+            "SELECT scene_id, owner, sensor, acquired_at, created_at, field_id, season_id, linked_at FROM scenes ORDER BY acquired_at DESC",
         )
             .fetch_all(&state.pool)
             .await
@@ -2092,6 +2133,9 @@ pub async fn list_scenes(State(state): State<AppState>) -> AppResult<Json<Vec<Sc
             sensor: row.get("sensor"),
             acquired_at: row.get("acquired_at"),
             created_at: row.get("created_at"),
+            field_id: row.get("field_id"),
+            season_id: row.get("season_id"),
+            linked_at: row.get("linked_at"),
         })
         .collect();
 
@@ -2103,7 +2147,7 @@ pub async fn get_scene(
     State(state): State<AppState>,
 ) -> AppResult<Json<SceneDetail>> {
     let scene_row = sqlx::query(
-        "SELECT scene_id, owner, sensor, acquired_at, data_path, metadata_json, created_at, field_id FROM scenes WHERE scene_id = ?1",
+        "SELECT scene_id, owner, sensor, acquired_at, data_path, metadata_json, created_at, field_id, season_id, linked_at FROM scenes WHERE scene_id = ?1",
     )
             .bind(&scene_id)
             .fetch_optional(&state.pool)
@@ -2142,6 +2186,15 @@ pub async fn get_scene(
             .as_ref()
             .and_then(|image| image.metadata.gps_position.clone()),
         data_path: scene_row.as_ref().map(|row| row.get("data_path")),
+        field_id: scene_row
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>("field_id")),
+        season_id: scene_row
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>("season_id")),
+        linked_at: scene_row
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>("linked_at")),
         field,
         ingest,
         geospatial: build_geospatial_metadata_with_asserted(
@@ -2597,6 +2650,34 @@ fn metadata_integrity_mismatch(label: &str) -> AppError {
 
 fn build_geospatial_metadata(metadata: Option<&MultispectralImage>) -> SceneGeospatialMetadata {
     build_geospatial_metadata_with_asserted(metadata, None)
+}
+
+fn season_id_for_linked_field(field: &FieldRecord) -> AppResult<String> {
+    field
+        .season
+        .as_deref()
+        .map(str::trim)
+        .filter(|season| !season.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "scene-field-season linkage requires the field to have a season".to_string(),
+            )
+        })
+}
+
+fn scene_extent_for_link(
+    metadata: Option<&MultispectralImage>,
+    asserted_spatial_ref: Option<&RasterSpatialRef>,
+) -> Option<SceneExtent> {
+    build_geospatial_metadata_with_asserted(metadata, asserted_spatial_ref).extent
+}
+
+fn scene_extent_intersects_bounds(scene_extent: &SceneExtent, field_bounds: &GeoBounds) -> bool {
+    scene_extent.min_lon <= field_bounds.max_lon
+        && scene_extent.max_lon >= field_bounds.min_lon
+        && scene_extent.min_lat <= field_bounds.max_lat
+        && scene_extent.max_lat >= field_bounds.min_lat
 }
 
 fn build_geospatial_metadata_with_asserted(
@@ -4101,7 +4182,7 @@ mod tests {
     use super::{
         build_field_record, build_geospatial_metadata, build_product_summary,
         cached_landsat_scene_id, content_type_for_path, is_missing_scene_error, is_png,
-        normalize_field_geometry, AppError, CreateFieldRequest,
+        normalize_field_geometry, scene_extent_intersects_bounds, AppError, CreateFieldRequest,
     };
     use crate::landsat;
     use shared::schemas::{
@@ -4246,6 +4327,35 @@ mod tests {
                 max_lat: 40.8,
             })
         );
+    }
+
+    #[test]
+    fn scene_extent_intersection_detects_overlap_and_gap() {
+        let field_bounds = GeoBounds {
+            min_lon: -96.7,
+            min_lat: 41.1,
+            max_lon: -96.2,
+            max_lat: 41.4,
+        };
+
+        assert!(scene_extent_intersects_bounds(
+            &super::SceneExtent {
+                min_lon: -96.8,
+                min_lat: 41.0,
+                max_lon: -96.1,
+                max_lat: 41.5,
+            },
+            &field_bounds,
+        ));
+        assert!(!scene_extent_intersects_bounds(
+            &super::SceneExtent {
+                min_lon: -90.8,
+                min_lat: 35.0,
+                max_lon: -90.1,
+                max_lat: 35.5,
+            },
+            &field_bounds,
+        ));
     }
 
     #[test]

@@ -284,6 +284,20 @@ async fn creating_field_and_linking_scene_exposes_field_scoped_gis_data() -> Res
         .await
         .expect("router should handle request");
     assert_eq!(link_response.status(), StatusCode::OK);
+    let body = to_bytes(link_response.into_body(), 64 * 1024).await?;
+    let linked_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        linked_json.get("field_id").and_then(|v| v.as_str()),
+        Some("north-80")
+    );
+    assert_eq!(
+        linked_json.get("season_id").and_then(|v| v.as_str()),
+        Some("2026")
+    );
+    assert!(linked_json
+        .get("linked_at")
+        .and_then(|v| v.as_str())
+        .is_some_and(|value| !value.trim().is_empty()));
 
     let scenes_response = ctx
         .app
@@ -306,6 +320,14 @@ async fn creating_field_and_linking_scene_exposes_field_scoped_gis_data() -> Res
         scenes[0].get("scene_id").and_then(|v| v.as_str()),
         Some(scene_id)
     );
+    assert_eq!(
+        scenes[0].get("season_id").and_then(|v| v.as_str()),
+        Some("2026")
+    );
+    assert!(scenes[0]
+        .get("linked_at")
+        .and_then(|v| v.as_str())
+        .is_some_and(|value| !value.trim().is_empty()));
 
     let manifest_response = ctx
         .app
@@ -334,6 +356,115 @@ async fn creating_field_and_linking_scene_exposes_field_scoped_gis_data() -> Res
             .map(|coords| coords.len()),
         Some(4)
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn linking_scene_to_field_rejects_non_overlapping_extent() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "field_id": "overlap-field",
+                        "name": "Overlap Field",
+                        "season": "2026",
+                        "boundary": {
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 },
+                                { "longitude": -96.7, "latitude": 41.4 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let scene_id = "non-overlap-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (scene_id, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(scene_id)
+    .bind("landsat8")
+    .bind("2025-01-01T00:00:00Z")
+    .bind(scene_dir.to_string_lossy().to_string())
+    .bind(
+        json!({
+            "metadata": {
+                "timestamp": "2025-01-01T00:00:00Z",
+                "gps_position": null,
+                "bands": ["B4", "B5"],
+                "exposure_time": 1.0,
+                "gain": 1.0,
+                "width": 4,
+                "height": 4,
+                "spatial_ref": {
+                    "georeferenced": true,
+                    "crs": "EPSG:4326",
+                    "bbox": {
+                        "min_lon": -90.8,
+                        "min_lat": 35.0,
+                        "max_lon": -90.1,
+                        "max_lat": 35.5
+                    }
+                }
+            },
+            "file_paths": {
+                "B4": "B4.png",
+                "B5": "B5.png"
+            },
+            "image_id": Uuid::new_v4()
+        })
+        .to_string(),
+    )
+    .bind(None::<f64>)
+    .bind("2025-01-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    let link_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/scenes/{scene_id}/field/overlap-field"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(link_response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(link_response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("no-overlap"));
+
+    let linked_field: Option<String> =
+        sqlx::query_scalar("SELECT field_id FROM scenes WHERE scene_id = ?1")
+            .bind(scene_id)
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(linked_field, None);
 
     Ok(())
 }
@@ -1051,7 +1182,17 @@ async fn farm_field_scene_identity_persists_after_restart() -> Result<()> {
                 "exposure_time": 1.0,
                 "gain": 1.0,
                 "width": 1,
-                "height": 1
+                "height": 1,
+                "spatial_ref": {
+                    "georeferenced": true,
+                    "crs": "EPSG:4326",
+                    "bbox": {
+                        "min_lon": -96.8,
+                        "min_lat": 41.0,
+                        "max_lon": -96.1,
+                        "max_lat": 41.5
+                    }
+                }
             },
             "file_paths": {
                 "B4": "B4.png",
@@ -1266,7 +1407,17 @@ async fn farm_field_scene_relationships_roundtrip() -> Result<()> {
                 "exposure_time": 1.0,
                 "gain": 1.0,
                 "width": 1,
-                "height": 1
+                "height": 1,
+                "spatial_ref": {
+                    "georeferenced": true,
+                    "crs": "EPSG:4326",
+                    "bbox": {
+                        "min_lon": -96.8,
+                        "min_lat": 41.0,
+                        "max_lon": -96.1,
+                        "max_lat": 41.5
+                    }
+                }
             },
             "file_paths": {
                 "B4": "B4.png",

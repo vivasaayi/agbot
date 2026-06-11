@@ -105,6 +105,22 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     )
     .await?;
 
+    ensure_column(
+        pool,
+        "scenes",
+        "season_id",
+        "ALTER TABLE scenes ADD COLUMN season_id TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "scenes",
+        "linked_at",
+        "ALTER TABLE scenes ADD COLUMN linked_at TEXT",
+    )
+    .await?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS scene_ingests (
@@ -238,6 +254,14 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     sqlx::query(
         r#"
         CREATE INDEX IF NOT EXISTS idx_scenes_field_id ON scenes(field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_scenes_season_id ON scenes(season_id);
         "#,
     )
     .execute(pool)
