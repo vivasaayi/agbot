@@ -110,6 +110,28 @@ impl ThermalProcessor {
         Ok(image)
     }
 
+    pub fn render_colormap_overlay(
+        &self,
+        temperatures: &[f32],
+        width: u32,
+        height: u32,
+        spatial_bounds: &SpatialBounds,
+        colormap: &str,
+    ) -> Result<crate::utils::RenderedValueOverlay> {
+        crate::utils::render_value_overlay(
+            temperatures,
+            width,
+            height,
+            spatial_bounds,
+            colormap,
+            Some((
+                self.config.temperature_range.min_celsius,
+                self.config.temperature_range.max_celsius,
+            )),
+            5,
+        )
+    }
+
     /// Map temperature to color using thermal palette
     fn temperature_to_color(&self, temperature: f32) -> [u8; 3] {
         let normalized = (temperature - self.config.temperature_range.min_celsius)
@@ -401,12 +423,29 @@ mod tests {
         let processor = ThermalProcessor::new(ThermalConfig::default());
 
         // Test cold temperature
-        let cold_color = processor.temperature_to_color(-5.0);
+        let cold_color = processor.temperature_to_color(-10.0);
         assert_eq!(cold_color, [0, 0, 255]); // Should be blue
 
         // Test hot temperature
-        let hot_color = processor.temperature_to_color(45.0);
+        let hot_color = processor.temperature_to_color(50.0);
         assert_eq!(hot_color, [255, 0, 0]); // Should be red
+    }
+
+    #[test]
+    fn test_thermal_colormap_overlay_metadata() {
+        let processor = ThermalProcessor::new(ThermalConfig::default());
+        let bounds = SpatialBounds::new(-74.1, 40.6, -73.9, 40.8);
+
+        let rendered = processor
+            .render_colormap_overlay(&[-10.0, 20.0, 50.0], 3, 1, &bounds, "hot")
+            .unwrap();
+
+        let value_range = rendered.metadata.value_range.unwrap();
+        assert_eq!(rendered.metadata.colormap, "hot");
+        assert_eq!(value_range.min, -10.0);
+        assert_eq!(value_range.max, 50.0);
+        assert_eq!(rendered.metadata.legend_stops.len(), 5);
+        assert_eq!(rendered.metadata.spatial_bounds, bounds);
     }
 
     #[test]

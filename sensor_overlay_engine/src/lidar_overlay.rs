@@ -4,7 +4,7 @@ use crate::{
 use anyhow::Result;
 use chrono::Utc;
 use image::{ImageBuffer, Rgba, RgbaImage};
-use nalgebra::{Point3, Vector3};
+use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,6 +31,23 @@ pub struct HeightColorMapping {
     pub medium_vegetation: [u8; 4], // RGBA for crops
     pub high_vegetation: [u8; 4],   // RGBA for trees
     pub obstacles: [u8; 4],         // RGBA for obstacles
+}
+
+impl Default for LidarConfig {
+    fn default() -> Self {
+        Self {
+            point_cloud_resolution: 0.1,
+            height_color_mapping: HeightColorMapping {
+                ground_level: [139, 69, 19, 255],
+                low_vegetation: [50, 205, 50, 255],
+                medium_vegetation: [34, 139, 34, 255],
+                high_vegetation: [0, 100, 0, 255],
+                obstacles: [255, 0, 0, 255],
+            },
+            occupancy_grid_resolution: 0.2,
+            max_range: 100.0,
+        }
+    }
 }
 
 impl LidarOverlayProcessor {
