@@ -223,6 +223,8 @@ fn default_owner_id() -> String {
     "unassigned".to_string()
 }
 
+const DEFAULT_CAPTURE_FRESHNESS_THRESHOLD_SECONDS: i64 = 30;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureSessionRequest {
     pub flight_id: Uuid,
@@ -355,6 +357,180 @@ impl FlightSession {
                 | (SessionStatus::Collecting, SessionStatus::Failed)
         )
     }
+
+    fn record_successful_capture(&mut self, record: &FlightDataRecord, now: DateTime<Utc>) {
+        let last_record_at = self
+            .summary
+            .freshness
+            .last_record_at
+            .map_or(record.timestamp, |current| current.max(record.timestamp));
+        self.summary.freshness.last_record_at = Some(last_record_at);
+        self.refresh_capture_quality(now);
+    }
+
+    fn record_collection_failure(&mut self, failure: CollectionFailure, now: DateTime<Utc>) {
+        self.summary.collection_failures.push(failure);
+        self.refresh_capture_quality(now);
+    }
+
+    fn refresh_capture_quality(&mut self, now: DateTime<Utc>) {
+        let threshold = chrono::Duration::seconds(DEFAULT_CAPTURE_FRESHNESS_THRESHOLD_SECONDS);
+        self.summary.freshness = CaptureFreshness::from_last_record(
+            self.summary.freshness.last_record_at,
+            now,
+            threshold,
+        );
+        self.summary.coverage = CaptureCoverage::from_counts(
+            self.summary.record_count,
+            self.summary.collection_failures.len() as u32,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FreshnessStatus {
+    NoData,
+    Fresh,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureFreshness {
+    pub last_record_at: Option<DateTime<Utc>>,
+    pub age_seconds: Option<i64>,
+    pub status: FreshnessStatus,
+}
+
+impl CaptureFreshness {
+    fn from_last_record(
+        last_record_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        stale_after: chrono::Duration,
+    ) -> Self {
+        match last_record_at {
+            Some(last_record_at) => {
+                let age_seconds = now
+                    .signed_duration_since(last_record_at)
+                    .num_seconds()
+                    .max(0);
+                let status = if age_seconds <= stale_after.num_seconds() {
+                    FreshnessStatus::Fresh
+                } else {
+                    FreshnessStatus::Stale
+                };
+
+                Self {
+                    last_record_at: Some(last_record_at),
+                    age_seconds: Some(age_seconds),
+                    status,
+                }
+            }
+            None => Self::default(),
+        }
+    }
+}
+
+impl Default for CaptureFreshness {
+    fn default() -> Self {
+        Self {
+            last_record_at: None,
+            age_seconds: None,
+            status: FreshnessStatus::NoData,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CaptureCoverageStatus {
+    Unknown,
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaptureCoverage {
+    pub successful_records: u32,
+    pub failed_observations: u32,
+    pub expected_observations: u32,
+    pub captured_fraction: f32,
+    pub status: CaptureCoverageStatus,
+}
+
+impl CaptureCoverage {
+    fn from_counts(successful_records: u32, failed_observations: u32) -> Self {
+        let expected_observations = successful_records + failed_observations;
+        if expected_observations == 0 {
+            return Self::default();
+        }
+
+        let captured_fraction = successful_records as f32 / expected_observations as f32;
+        let status = if failed_observations == 0 {
+            CaptureCoverageStatus::Complete
+        } else {
+            CaptureCoverageStatus::Partial
+        };
+
+        Self {
+            successful_records,
+            failed_observations,
+            expected_observations,
+            captured_fraction,
+            status,
+        }
+    }
+}
+
+impl Default for CaptureCoverage {
+    fn default() -> Self {
+        Self {
+            successful_records: 0,
+            failed_observations: 0,
+            expected_observations: 0,
+            captured_fraction: 0.0,
+            status: CaptureCoverageStatus::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CollectionFailureKind {
+    SensorDropout,
+    MalformedFrame,
+    MissingBand,
+    ReaderError,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectionFailure {
+    pub id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub sensor_id: String,
+    pub data_type: DataType,
+    pub kind: CollectionFailureKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionFailureRequest {
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub sensor_id: String,
+    pub data_type: DataType,
+    pub kind: CollectionFailureKind,
+    pub message: String,
+}
+
+impl CollectionFailureRequest {
+    fn into_failure(self) -> CollectionFailure {
+        CollectionFailure {
+            id: Uuid::new_v4(),
+            occurred_at: self.occurred_at.unwrap_or_else(Utc::now),
+            sensor_id: self.sensor_id,
+            data_type: self.data_type,
+            kind: self.kind,
+            message: self.message,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +542,12 @@ pub struct SessionSummary {
     pub distance_covered_m: f32,
     pub area_covered_m2: f32,
     pub battery_consumed_percent: f32,
+    #[serde(default)]
+    pub freshness: CaptureFreshness,
+    #[serde(default)]
+    pub coverage: CaptureCoverage,
+    #[serde(default)]
+    pub collection_failures: Vec<CollectionFailure>,
 }
 
 /// Main data collector service
@@ -515,6 +697,42 @@ impl DataCollectorService {
         Ok(session)
     }
 
+    pub async fn record_collection_failure(
+        &mut self,
+        session_id: &Uuid,
+        failure: CollectionFailureRequest,
+    ) -> Result<CollectionFailure> {
+        let failure = failure.into_failure();
+
+        let session_snapshot = {
+            let session = self.active_sessions.get_mut(session_id).ok_or(
+                SessionLifecycleError::SessionNotFound {
+                    session_id: *session_id,
+                },
+            )?;
+
+            match session.status {
+                SessionStatus::Started => session.transition_status(SessionStatus::Collecting)?,
+                SessionStatus::Collecting => {}
+                SessionStatus::Ended | SessionStatus::Failed => {
+                    return Err(SessionLifecycleError::InvalidStatusTransition {
+                        session_id: *session_id,
+                        from: session.status,
+                        to: SessionStatus::Collecting,
+                    }
+                    .into());
+                }
+            }
+
+            session.record_collection_failure(failure.clone(), Utc::now());
+            session.clone()
+        };
+
+        self.storage.store_session(&session_snapshot).await?;
+
+        Ok(failure)
+    }
+
     pub async fn collect_data(&mut self, session_id: &Uuid, data: FlightDataRecord) -> Result<()> {
         data.validate_provenance()?;
         if data.session_id != *session_id {
@@ -567,6 +785,7 @@ impl DataCollectorService {
                 .data_types
                 .entry(stored_data.data_type.clone())
                 .or_insert(0) += 1;
+            session.record_successful_capture(&stored_data, Utc::now());
             session.clone()
         };
 
@@ -656,15 +875,28 @@ impl DataCollectorService {
     }
 
     async fn calculate_session_summary(&self, session: &FlightSession) -> Result<SessionSummary> {
-        let mut summary = SessionSummary::default();
+        let mut summary = SessionSummary {
+            freshness: session.summary.freshness.clone(),
+            coverage: session.summary.coverage.clone(),
+            collection_failures: session.summary.collection_failures.clone(),
+            ..SessionSummary::default()
+        };
+        let mut loaded_record_count = 0u32;
 
         // Calculate from stored records
         for record_id in &session.data_records {
             if let Some(record) = self.storage.load_data(record_id).await? {
+                loaded_record_count += 1;
                 summary.record_count += 1;
                 summary.total_data_size_bytes += record.size_bytes;
                 *summary.data_types.entry(record.data_type).or_insert(0) += 1;
             }
+        }
+
+        if loaded_record_count == 0 {
+            summary.record_count = session.summary.record_count;
+            summary.total_data_size_bytes = session.summary.total_data_size_bytes;
+            summary.data_types = session.summary.data_types.clone();
         }
 
         // Calculate flight metrics from telemetry data
@@ -716,6 +948,9 @@ impl Default for SessionSummary {
             distance_covered_m: 0.0,
             area_covered_m2: 0.0,
             battery_consumed_percent: 0.0,
+            freshness: CaptureFreshness::default(),
+            coverage: CaptureCoverage::default(),
+            collection_failures: Vec::new(),
         }
     }
 }
@@ -930,6 +1165,112 @@ mod tests {
         assert_eq!(stored_record.sensor_id, "sensor-rgb-01");
         assert_eq!(stored_record.gps_coords, Some(gps_coords()));
         assert_eq!(stored_record.calibration_ref, "calibration-2026-06");
+    }
+
+    #[tokio::test]
+    async fn test_capture_quality_tracks_freshness_and_full_coverage() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let record = telemetry_record(&session);
+        let record_timestamp = record.timestamp;
+
+        service.collect_data(&session_id, record).await.unwrap();
+
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        assert_eq!(
+            session.summary.freshness.last_record_at,
+            Some(record_timestamp)
+        );
+        assert_eq!(session.summary.freshness.status, FreshnessStatus::Fresh);
+        assert!(session.summary.freshness.age_seconds.unwrap() >= 0);
+        assert_eq!(session.summary.coverage.successful_records, 1);
+        assert_eq!(session.summary.coverage.failed_observations, 0);
+        assert_eq!(session.summary.coverage.expected_observations, 1);
+        assert_eq!(
+            session.summary.coverage.status,
+            CaptureCoverageStatus::Complete
+        );
+        assert!((session.summary.coverage.captured_fraction - 1.0).abs() < f32::EPSILON);
+        assert!(session.summary.collection_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stale_capture_freshness_is_flagged() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let mut record = telemetry_record(&session);
+        record.timestamp = Utc::now() - chrono::Duration::seconds(120);
+
+        service.collect_data(&session_id, record).await.unwrap();
+
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        assert_eq!(session.summary.freshness.status, FreshnessStatus::Stale);
+        assert!(session.summary.freshness.age_seconds.unwrap() >= 120);
+    }
+
+    #[tokio::test]
+    async fn test_collection_failure_reduces_coverage_and_persists() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let record = telemetry_record(&session);
+
+        service.collect_data(&session_id, record).await.unwrap();
+        let failure = service
+            .record_collection_failure(
+                &session_id,
+                CollectionFailureRequest {
+                    occurred_at: Some(Utc::now()),
+                    sensor_id: "lidar-a3".to_string(),
+                    data_type: DataType::LidarScan,
+                    kind: CollectionFailureKind::SensorDropout,
+                    message: "serial frame dropped mid-flight".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Collecting);
+        assert_eq!(session.summary.collection_failures, vec![failure.clone()]);
+        assert_eq!(session.summary.coverage.successful_records, 1);
+        assert_eq!(session.summary.coverage.failed_observations, 1);
+        assert_eq!(session.summary.coverage.expected_observations, 2);
+        assert_eq!(
+            session.summary.coverage.status,
+            CaptureCoverageStatus::Partial
+        );
+        assert!((session.summary.coverage.captured_fraction - 0.5).abs() < f32::EPSILON);
+
+        let stored_path = temp_dir
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("session.json");
+        let stored_json = tokio::fs::read(&stored_path).await.unwrap();
+        let stored_session: FlightSession = serde_json::from_slice(&stored_json).unwrap();
+        assert_eq!(stored_session.summary.collection_failures, vec![failure]);
+        assert_eq!(
+            stored_session.summary.coverage.status,
+            CaptureCoverageStatus::Partial
+        );
     }
 
     #[tokio::test]
