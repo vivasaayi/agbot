@@ -1,6 +1,7 @@
 #pragma once
 
 #include "agbot_flight_sim/DroneSimulation.hpp"
+#include "agbot_flight_sim/FaultInjection.hpp"
 #include "agbot_flight_sim/Mission.hpp"
 
 #include <cstddef>
@@ -34,6 +35,7 @@ struct RunConfig {
     double timestep_s = 1.0 / 60.0;
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
+    FaultInjectionPlan faults;
 };
 
 /// Per-run scenario manifest (story 02-28, minimal first slice). Records the
@@ -63,6 +65,10 @@ struct RunManifest {
     std::string safety_config_hash;
     std::size_t trace_retention_keep = 0;
     std::string trace_retention_deleted_json = "[]";
+    std::string faults_json = "[]";
+    std::string faults_hash;
+    std::string fault_events_json = "[]";
+    std::string fault_events_hash;
     std::string output_hash;      // SHA-256 hash of the emitted JSONL trace
     bool completed = false;
 

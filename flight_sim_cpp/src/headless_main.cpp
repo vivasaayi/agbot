@@ -29,6 +29,7 @@ struct Args {
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
     std::optional<std::size_t> trace_retention_keep;
+    agbot::flight_sim::FaultInjectionPlan faults;
 };
 
 [[noreturn]] void print_usage_and_exit(int code) {
@@ -41,7 +42,10 @@ struct Args {
               << "                       A <output>.manifest.json is written alongside it.\n"
               << "  --max-time S         Max mission seconds before giving up (default 600).\n"
               << "  --trace-retention-keep N\n"
-              << "                       Delete older JSONL traces in the output directory after keeping N newest runs.\n";
+              << "                       Delete older JSONL traces in the output directory after keeping N newest runs.\n"
+              << "  --fault SPEC         Add seeded fault: class:seed:start_step:end_step:magnitude[:target].\n"
+              << "                       Use '-' for open end_step. Classes: wind_gust, gps_drift, imu_noise,\n"
+              << "                       sensor_dropout, comm_loss, low_battery, stale_terrain, bad_tile, actuator_lag.\n";
     std::exit(code);
 }
 
@@ -63,6 +67,8 @@ Args parse_args(int argc, char** argv) {
             args.max_time_s = std::stod(argv[++index]);
         } else if (current == "--trace-retention-keep" && index + 1 < argc) {
             args.trace_retention_keep = static_cast<std::size_t>(std::stoull(argv[++index]));
+        } else if (current == "--fault" && index + 1 < argc) {
+            args.faults.faults.push_back(agbot::flight_sim::parse_fault_spec(argv[++index]));
         } else if (current == "--help" || current == "-h") {
             print_usage_and_exit(0);
         } else {
@@ -78,6 +84,7 @@ Args parse_args(int argc, char** argv) {
     if (args.trace_retention_keep.has_value() && *args.trace_retention_keep == 0) {
         throw std::runtime_error("--trace-retention-keep must be positive");
     }
+    agbot::flight_sim::validate_fault_plan(args.faults);
     return args;
 }
 
@@ -105,6 +112,7 @@ int main(int argc, char** argv) {
         config.timestep_s = args.timestep_ms / 1000.0;
         config.record_interval_s = args.record_interval_s;
         config.max_time_s = args.max_time_s;
+        config.faults = args.faults;
 
         RunResult result = run_deterministic(mission, config);
 

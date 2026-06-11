@@ -165,6 +165,10 @@ TwinContractSchemaV1 build_schema() {
                 "safety_config_hash",
                 "trace_retention_keep",
                 "trace_retention_deleted",
+                "faults",
+                "faults_hash",
+                "fault_events",
+                "fault_events_hash",
                 "output_hash",
                 "completed",
             },
@@ -197,6 +201,7 @@ TwinContractSchemaV1 build_schema() {
         "simulation_health",
         "trace_retention",
         "tile_cache_control",
+        "fault_injection",
     };
     schema.schema_hash = sha256_hex(schema_json_without_hash(schema));
     return schema;

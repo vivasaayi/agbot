@@ -60,6 +60,23 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
 
 The manifest records deleted traces in `trace_retention_deleted`.
 
+Inject a seeded fault:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --output flight_sim_cpp/out/faulted.jsonl \
+  --fault gps_drift:9001:0:-:2.0:gps
+```
+
+Fault specs use `class:seed:start_step:end_step:magnitude[:target]`. Use `-`
+for an open `end_step`. Supported classes are `wind_gust`, `gps_drift`,
+`imu_noise`, `sensor_dropout`, `comm_loss`, `low_battery`, `stale_terrain`,
+`bad_tile`, and `actuator_lag`. The runner rejects any injected fault without a
+seed. The manifest records `faults`, `faults_hash`, `fault_events`, and
+`fault_events_hash`; terrain faults also update `terrain_tiles`.
+
 ## Operational Health
 
 Run a structured health check:

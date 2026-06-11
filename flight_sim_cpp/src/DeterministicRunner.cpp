@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <random>
 #include <sstream>
+#include <vector>
 
 namespace agbot::flight_sim {
 namespace {
@@ -102,6 +103,10 @@ std::string RunManifest::to_json() const {
            << ",\"safety_config_hash\":\"" << escape_json(safety_config_hash) << "\""
            << ",\"trace_retention_keep\":" << trace_retention_keep
            << ",\"trace_retention_deleted\":" << trace_retention_deleted_json
+           << ",\"faults\":" << faults_json
+           << ",\"faults_hash\":\"" << escape_json(faults_hash) << "\""
+           << ",\"fault_events\":" << fault_events_json
+           << ",\"fault_events_hash\":\"" << escape_json(fault_events_hash) << "\""
            << ",\"output_hash\":\"" << escape_json(output_hash) << "\""
            << ",\"completed\":" << (completed ? "true" : "false")
            << "}";
@@ -109,6 +114,8 @@ std::string RunManifest::to_json() const {
 }
 
 RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
+    validate_fault_plan(config.faults);
+
     // Seeded PRNG. Currently the autopilot physics is deterministic and
     // seed-independent; the stream is plumbed here so that future sensor noise
     // and fault injection (stories 02-08/02-30) are reproducible by seed. The
@@ -123,22 +130,30 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     std::uint64_t step_count = 0;
     std::uint64_t sample_count = 0;
     double next_record_s = 0.0;
+    std::vector<FaultEvent> fault_events;
 
-    const auto record = [&](const DroneState& state) {
-        trace << format_telemetry_sample(state) << "\n";
+    const auto record = [&](const DroneState& state, std::uint64_t step) {
+        if (sensor_stream_suppressed(config.faults, step)) {
+            return;
+        }
+        const DroneState observed = apply_observation_faults(state, config.faults, step);
+        trace << format_telemetry_sample(observed) << "\n";
         ++sample_count;
     };
 
     while (!simulation.is_complete() && simulation.state().mission_time_s < config.max_time_s) {
+        append_fault_events_for_step(config.faults, step_count, fault_events);
+        simulation.set_wind(wind_fault_for_step(config.faults, step_count));
         if (simulation.state().mission_time_s >= next_record_s) {
-            record(simulation.state());
+            record(simulation.state(), step_count);
             next_record_s += config.record_interval_s;
         }
         simulation.step(config.timestep_s);
         ++step_count;
     }
     // Always record the terminal state so the trace ends at the true outcome.
-    record(simulation.state());
+    append_fault_events_for_step(config.faults, step_count, fault_events);
+    record(simulation.state(), step_count);
 
     RunResult result;
     result.trace_jsonl = trace.str();
@@ -152,6 +167,8 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     manifest.record_interval_s = config.record_interval_s;
     manifest.mission_name = mission.name;
     manifest.mission_hash = sha256_hex(mission_to_json(mission));
+    manifest.faults_json = config.faults.to_json();
+    manifest.faults_hash = sha256_hex(manifest.faults_json);
     {
         std::ostringstream run_id_input;
         run_id_input << std::fixed << std::setprecision(9)
@@ -162,13 +179,14 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
                      << manifest.timestep_s << "|"
                      << manifest.record_interval_s << "|"
                      << config.max_time_s << "|"
-                     << manifest.mission_hash;
+                     << manifest.mission_hash << "|"
+                     << manifest.faults_hash;
         manifest.run_id = sha256_hex(run_id_input.str());
     }
     manifest.step_count = step_count;
     manifest.sample_count = sample_count;
     manifest.prng_nonce = prng_nonce;
-    manifest.terrain_tiles_json = "[]";
+    manifest.terrain_tiles_json = terrain_tiles_json_for_faults(config.faults);
     manifest.terrain_tiles_hash = sha256_hex(manifest.terrain_tiles_json);
     manifest.weather_config_json = default_weather_config_json();
     manifest.weather_config_hash = sha256_hex(manifest.weather_config_json);
@@ -176,6 +194,8 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     manifest.sensor_config_hash = sha256_hex(manifest.sensor_config_json);
     manifest.safety_config_json = default_safety_config_json();
     manifest.safety_config_hash = sha256_hex(manifest.safety_config_json);
+    manifest.fault_events_json = fault_events_to_json(fault_events);
+    manifest.fault_events_hash = sha256_hex(manifest.fault_events_json);
     manifest.output_hash = sha256_hex(result.trace_jsonl);
     manifest.completed = simulation.is_complete();
 

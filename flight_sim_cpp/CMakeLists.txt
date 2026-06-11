@@ -10,6 +10,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(agbot_flight_sim_core
     src/DeterministicRunner.cpp
     src/DroneSimulation.cpp
+    src/FaultInjection.cpp
     src/GeoTerrain.cpp
     src/MissionLoader.cpp
     src/SafetyRules.cpp

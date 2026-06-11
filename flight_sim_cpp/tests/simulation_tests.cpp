@@ -1,5 +1,6 @@
 #include "agbot_flight_sim/DeterministicRunner.hpp"
 #include "agbot_flight_sim/DroneSimulation.hpp"
+#include "agbot_flight_sim/FaultInjection.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
@@ -347,6 +348,8 @@ void test_run_manifest_records_contract_and_hashes() {
     assert(json.find("\"seed\":42") != std::string::npos);
     assert(json.find("\"trace_retention_keep\":0") != std::string::npos);
     assert(json.find("\"trace_retention_deleted\":[]") != std::string::npos);
+    assert(json.find("\"faults\":[]") != std::string::npos);
+    assert(json.find("\"fault_events\":[]") != std::string::npos);
     assert(result.manifest.run_id.size() == 64);
     assert(json.find("\"terrain_tiles\":[]") != std::string::npos);
     assert(json.find("\"weather_config_hash\":\"") != std::string::npos);
@@ -380,9 +383,12 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.type_has_field("ScenarioManifestV1", "terrain_tiles_hash"));
     assert(schema.type_has_field("ScenarioManifestV1", "safety_config_hash"));
     assert(schema.type_has_field("ScenarioManifestV1", "trace_retention_deleted"));
+    assert(schema.type_has_field("ScenarioManifestV1", "faults"));
+    assert(schema.type_has_field("ScenarioManifestV1", "fault_events"));
     assert(schema.has_capability("deterministic_runner"));
     assert(schema.has_capability("scenario_manifest"));
     assert(schema.has_capability("simulation_health"));
+    assert(schema.has_capability("fault_injection"));
     assert(schema.to_json().find("\"schema_hash\":\"" + schema.schema_hash + "\"") != std::string::npos);
 }
 
@@ -523,6 +529,94 @@ void test_tile_cache_clear_removes_entries_but_keeps_directory() {
     std::filesystem::remove_all(root);
 }
 
+void test_fault_injection_gps_drift_is_seeded_and_reproducible() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto faulted_config = unit_run_config();
+    faulted_config.faults.faults.push_back({
+        agbot::flight_sim::FaultClass::GpsDrift,
+        9001,
+        0,
+        std::nullopt,
+        2.0,
+        "gps",
+    });
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto a = agbot::flight_sim::run_deterministic(mission, faulted_config);
+    const auto b = agbot::flight_sim::run_deterministic(mission, faulted_config);
+
+    assert(a.trace_jsonl == b.trace_jsonl);
+    assert(a.manifest.to_json() == b.manifest.to_json());
+    assert(a.trace_jsonl != baseline.trace_jsonl);
+    assert(a.manifest.faults_json.find("\"class\":\"gps_drift\"") != std::string::npos);
+    assert(a.manifest.fault_events_json.find("\"class\":\"gps_drift\"") != std::string::npos);
+
+    const auto diff = agbot::flight_sim::diff_trace_text(baseline.trace_jsonl, a.trace_jsonl);
+    assert(!diff.identical);
+    assert(diff.field_path == "position.x" || diff.field_path == "position.y" || diff.field_path == "position.z");
+}
+
+void test_fault_injection_sensor_dropout_prunes_samples_and_records_event() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto faulted_config = unit_run_config();
+    faulted_config.faults.faults.push_back({
+        agbot::flight_sim::FaultClass::SensorDropout,
+        1234,
+        100,
+        220,
+        0.0,
+        "telemetry",
+    });
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto faulted = agbot::flight_sim::run_deterministic(mission, faulted_config);
+
+    assert(faulted.trace_jsonl != baseline.trace_jsonl);
+    assert(faulted.manifest.sample_count < baseline.manifest.sample_count);
+    assert(faulted.manifest.faults_json.find("\"class\":\"sensor_dropout\"") != std::string::npos);
+    assert(faulted.manifest.fault_events_json.find("\"class\":\"sensor_dropout\"") != std::string::npos);
+}
+
+void test_fault_injection_bad_tile_marks_flat_fallback_in_manifest() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto faulted_config = unit_run_config();
+    faulted_config.faults.faults.push_back({
+        agbot::flight_sim::FaultClass::BadTile,
+        777,
+        0,
+        std::nullopt,
+        0.0,
+        "terrain/tile/z12/x655/y1583",
+    });
+
+    const auto faulted = agbot::flight_sim::run_deterministic(mission, faulted_config);
+    const std::string manifest = faulted.manifest.to_json();
+
+    assert(faulted.manifest.terrain_tiles_json.find("\"state\":\"flat_fallback\"") != std::string::npos);
+    assert(manifest.find("\"fault_seed\":777") != std::string::npos);
+    assert(manifest.find("\"class\":\"bad_tile\"") != std::string::npos);
+}
+
+void test_fault_injection_rejects_fault_without_seed() {
+    agbot::flight_sim::FaultInjectionPlan plan;
+    plan.faults.push_back({
+        agbot::flight_sim::FaultClass::GpsDrift,
+        std::nullopt,
+        0,
+        std::nullopt,
+        1.0,
+        "gps",
+    });
+
+    bool rejected = false;
+    try {
+        agbot::flight_sim::validate_fault_plan(plan);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    assert(rejected);
+}
+
 } // namespace
 
 int main() {
@@ -550,6 +644,10 @@ int main() {
     test_simulation_health_reports_pass_and_seed_failure();
     test_trace_retention_deletes_oldest_trace_and_records_evidence();
     test_tile_cache_clear_removes_entries_but_keeps_directory();
+    test_fault_injection_gps_drift_is_seeded_and_reproducible();
+    test_fault_injection_sensor_dropout_prunes_samples_and_records_event();
+    test_fault_injection_bad_tile_marks_flat_fallback_in_manifest();
+    test_fault_injection_rejects_fault_without_seed();
     std::cout << "agbot_flight_sim_tests passed\n";
     return 0;
 }
