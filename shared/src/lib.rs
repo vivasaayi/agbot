@@ -6,10 +6,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 // use nalgebra::{Point3, Vector3}; // uncomment when needed
 
 pub mod config;
+pub mod control_plane;
 pub mod error;
 pub mod schemas;
 pub mod types;
 
+pub use control_plane::*;
 pub use types::*;
 
 /// Initialize logging for the application
