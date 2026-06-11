@@ -102,7 +102,7 @@ impl StorageEngine {
 
         // Store individual records
         for record_id in &session.data_records {
-            let record_path = session_path.join(format!("{}.json", record_id));
+            let _record_path = session_path.join(format!("{}.json", record_id));
             // Note: This would need to load the actual record data
             // For now, we'll skip individual record storage in session export
             // Individual records are stored separately via store_data()
@@ -321,9 +321,16 @@ impl StorageEngine {
         Ok(data.clone())
     }
 
-    pub async fn load_session(&self, _session_id: &Uuid) -> Result<Option<crate::FlightSession>> {
-        // TODO: Implement session loading
-        Ok(None)
+    pub async fn load_session(&self, session_id: &Uuid) -> Result<Option<crate::FlightSession>> {
+        let session_path = self.get_session_path(session_id)?.join("session.json");
+
+        if !session_path.exists() {
+            return Ok(None);
+        }
+
+        let metadata = fs::read(&session_path).await?;
+        let session = serde_json::from_slice(&metadata)?;
+        Ok(Some(session))
     }
 
     pub async fn cleanup_before_date(
@@ -386,7 +393,6 @@ impl DataType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_storage_engine_creation() {
@@ -420,7 +426,7 @@ mod tests {
         };
 
         let path = engine.get_storage_path(&record).unwrap();
-        assert!(path.to_string_lossy().contains("camera"));
+        assert!(path.to_string_lossy().contains("image"));
         assert!(path.to_string_lossy().contains(&record.id.to_string()));
     }
 }

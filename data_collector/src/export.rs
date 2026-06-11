@@ -1,9 +1,8 @@
-use crate::{DataType, FlightDataRecord, FlightSession};
+use crate::{FlightDataRecord, FlightSession};
 use serde_json;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct ExportConfig {
@@ -128,8 +127,9 @@ struct ExportData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DataType;
     use chrono::Utc;
-    use std::collections::HashMap;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_json_export() {
@@ -142,11 +142,15 @@ mod tests {
 
         let session = FlightSession {
             id: Uuid::new_v4(),
+            flight_id: Uuid::new_v4(),
+            field_id: Uuid::new_v4(),
+            scene_id: Uuid::new_v4(),
+            owner_id: "grower-ops".to_string(),
             mission_id: Some(Uuid::new_v4()),
             drone_id: Uuid::new_v4(),
             start_time: Utc::now(),
             end_time: None,
-            status: crate::SessionStatus::Completed,
+            status: crate::SessionStatus::Ended,
             data_records: Vec::new(),
             summary: crate::SessionSummary::default(),
             tags: Vec::new(),
