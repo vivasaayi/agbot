@@ -11,6 +11,7 @@ pub mod dispatch_safety;
 pub mod flight_path;
 pub mod mavlink_integration;
 pub mod mission_optimizer;
+pub mod preflight_checklist;
 pub mod survey_template;
 pub mod telemetry;
 pub mod waypoint;
@@ -25,6 +26,11 @@ pub use dispatch_safety::{
 };
 pub use flight_path::{FlightPath, PathSegment, SurveyPattern};
 pub use mission_optimizer::MissionOptimizer;
+pub use preflight_checklist::{
+    evaluate_preflight_checklist, GpsFixStatus, GpsFixType, PreflightArmError, PreflightCheckName,
+    PreflightCheckResult, PreflightCheckStatus, PreflightChecklistConfig,
+    PreflightChecklistContext, PreflightChecklistReport,
+};
 pub use survey_template::{
     generate_survey_template, validate_plan_bounds, PlanBoundsConfig, PlanBoundsError,
     PlanBoundsIssue, PlanBoundsIssueCode, SurveyTemplateConfig, SurveyTemplateError,
@@ -324,6 +330,19 @@ impl Mission {
         let report = evaluate_dispatch_safety(self, current_position, no_fly_zones, config);
         if !report.is_clear() {
             return Err(DispatchSafetyError::SafetyViolation(report));
+        }
+
+        self.arm()?;
+        Ok(report)
+    }
+
+    pub fn arm_with_preflight_checklist(
+        &mut self,
+        context: &PreflightChecklistContext,
+    ) -> std::result::Result<PreflightChecklistReport, PreflightArmError> {
+        let report = evaluate_preflight_checklist(self, context);
+        if !report.is_clear() {
+            return Err(PreflightArmError::Checklist(report));
         }
 
         self.arm()?;
