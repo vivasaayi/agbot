@@ -204,6 +204,7 @@ TwinContractSchemaV1 build_schema() {
         "fault_injection",
         "terrain_crs_extent_assertions",
         "wind_field",
+        "sensor_noise_calibration",
     };
     schema.schema_hash = sha256_hex(schema_json_without_hash(schema));
     return schema;

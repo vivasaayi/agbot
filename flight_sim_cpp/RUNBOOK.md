@@ -45,6 +45,20 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
 
 The runner records the vector in `weather_config.wind_mps`; nonzero wind also records `source: steady_wind`. A zero vector preserves the no-wind golden trace.
 
+## Sensor Profiles
+
+Use `--sensor-profile NAME` to record deterministic calibration/noise settings for simulated GPS, IMU, barometer, and magnetometer readings:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --sensor-profile cheap_gps \
+  --output flight_sim_cpp/out/sensor_profile.jsonl
+```
+
+Supported profiles are `ideal`, `cheap_gps`, `rtk_gps`, and `noisy_imu`. The manifest records the selected profile under `sensor_config` with `deterministic_uniform` noise distribution and `sensor_config_hash`.
+
 ## Trace Retention
 
 Use retention only on a dedicated run output directory:

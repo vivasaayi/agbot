@@ -3,6 +3,7 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/FaultInjection.hpp"
 #include "agbot_flight_sim/Mission.hpp"
+#include "agbot_flight_sim/SensorModel.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +37,7 @@ struct RunConfig {
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
     Vec3 steady_wind_mps;
+    SensorCalibrationProfile sensor_profile = ideal_sensor_profile();
     FaultInjectionPlan faults;
 };
 

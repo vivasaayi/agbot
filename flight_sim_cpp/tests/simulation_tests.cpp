@@ -3,6 +3,7 @@
 #include "agbot_flight_sim/FaultInjection.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/SensorModel.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
 #include "agbot_flight_sim/SimulationOps.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
@@ -482,6 +483,58 @@ void test_steady_wind_is_reproducible_and_manifested() {
     assert(diff.field_path == "position.x");
 }
 
+void test_zero_noise_sensor_profile_is_exact() {
+    agbot::flight_sim::DroneState state;
+    state.position = {12.0, 34.0, -5.0};
+    state.velocity = {1.0, 2.0, 3.0};
+    state.yaw_rad = 0.25;
+    state.pitch_rad = -0.10;
+    state.roll_rad = 0.05;
+
+    const auto profile = agbot::flight_sim::ideal_sensor_profile();
+    const auto reading = agbot::flight_sim::calibrated_sensor_reading(state, profile, 42, 7);
+
+    assert(reading.profile_name == "ideal");
+    assert(reading.gps_position_m.x == state.position.x);
+    assert(reading.gps_position_m.y == state.position.y);
+    assert(reading.gps_position_m.z == state.position.z);
+    assert(reading.imu_yaw_rad == state.yaw_rad);
+    assert(reading.imu_pitch_rad == state.pitch_rad);
+    assert(reading.imu_roll_rad == state.roll_rad);
+    assert(reading.barometer_altitude_m == state.position.y);
+    assert(reading.magnetometer_heading_rad == state.yaw_rad);
+    assert(reading.to_json().find("\"profile\":\"ideal\"") != std::string::npos);
+}
+
+void test_seeded_sensor_noise_is_reproducible_and_inspectable() {
+    agbot::flight_sim::DroneState state;
+    state.position = {12.0, 34.0, -5.0};
+    state.velocity = {1.0, 2.0, 3.0};
+    state.yaw_rad = 0.25;
+    state.pitch_rad = -0.10;
+    state.roll_rad = 0.05;
+
+    auto profile = agbot::flight_sim::sensor_profile_by_name("cheap_gps");
+    profile.imu_attitude_noise_rad = 0.02;
+    profile.barometer_altitude_noise_m = 0.4;
+    profile.magnetometer_heading_noise_rad = 0.03;
+
+    const auto a = agbot::flight_sim::calibrated_sensor_reading(state, profile, 9001, 17);
+    const auto b = agbot::flight_sim::calibrated_sensor_reading(state, profile, 9001, 17);
+    const auto c = agbot::flight_sim::calibrated_sensor_reading(state, profile, 9002, 17);
+
+    assert(a.to_json() == b.to_json());
+    assert(a.to_json() != c.to_json());
+    assert(std::abs(a.gps_position_m.x - state.position.x) <= profile.gps_position_noise_m);
+    assert(std::abs(a.imu_yaw_rad - state.yaw_rad) <= profile.imu_attitude_noise_rad);
+    assert(std::abs(a.barometer_altitude_m - state.position.y) <= profile.barometer_altitude_noise_m);
+    assert(a.to_json().find("\"distribution\":\"deterministic_uniform\"") != std::string::npos);
+
+    const std::string config = agbot::flight_sim::sensor_config_json(profile);
+    assert(config.find("\"profile\":\"cheap_gps\"") != std::string::npos);
+    assert(config.find("\"gps_position_noise_m\":1.500") != std::string::npos);
+}
+
 // Story 02-24: the first TwinContractV1 slice names the shared wire schemas
 // and their required fields so downstream consumers can detect schema drift.
 void test_twin_contract_v1_schema_covers_required_types() {
@@ -510,6 +563,7 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.has_capability("fault_injection"));
     assert(schema.has_capability("terrain_crs_extent_assertions"));
     assert(schema.has_capability("wind_field"));
+    assert(schema.has_capability("sensor_noise_calibration"));
     assert(schema.to_json().find("\"schema_hash\":\"" + schema.schema_hash + "\"") != std::string::npos);
 }
 
@@ -763,6 +817,8 @@ int main() {
     test_run_manifest_records_geodetic_terrain_fallback_evidence();
     test_zero_wind_keeps_deterministic_trace_identical();
     test_steady_wind_is_reproducible_and_manifested();
+    test_zero_noise_sensor_profile_is_exact();
+    test_seeded_sensor_noise_is_reproducible_and_inspectable();
     test_twin_contract_v1_schema_covers_required_types();
     test_twin_contract_version_compatibility();
     test_trace_diff_reports_divergent_field();

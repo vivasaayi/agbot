@@ -53,10 +53,6 @@ std::string weather_config_json(Vec3 steady_wind_mps) {
     return stream.str();
 }
 
-std::string default_sensor_config_json() {
-    return "{\"profiles\":[],\"noise_model\":\"none\"}";
-}
-
 std::string default_safety_config_json() {
     SimulationConfig config;
     std::ostringstream stream;
@@ -198,6 +194,8 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     manifest.terrain_tiles_hash = sha256_hex(manifest.terrain_tiles_json);
     manifest.weather_config_json = weather_config_json(config.steady_wind_mps);
     manifest.weather_config_hash = sha256_hex(manifest.weather_config_json);
+    manifest.sensor_config_json = sensor_config_json(config.sensor_profile);
+    manifest.sensor_config_hash = sha256_hex(manifest.sensor_config_json);
     {
         std::ostringstream run_id_input;
         run_id_input << std::fixed << std::setprecision(9)
@@ -211,14 +209,13 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
                      << manifest.mission_hash << "|"
                      << manifest.faults_hash << "|"
                      << manifest.terrain_tiles_hash << "|"
-                     << manifest.weather_config_hash;
+                     << manifest.weather_config_hash << "|"
+                     << manifest.sensor_config_hash;
         manifest.run_id = sha256_hex(run_id_input.str());
     }
     manifest.step_count = step_count;
     manifest.sample_count = sample_count;
     manifest.prng_nonce = prng_nonce;
-    manifest.sensor_config_json = default_sensor_config_json();
-    manifest.sensor_config_hash = sha256_hex(manifest.sensor_config_json);
     manifest.safety_config_json = default_safety_config_json();
     manifest.safety_config_hash = sha256_hex(manifest.safety_config_json);
     manifest.fault_events_json = fault_events_to_json(fault_events);

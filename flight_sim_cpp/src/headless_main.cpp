@@ -30,6 +30,7 @@ struct Args {
     double max_time_s = 600.0;
     std::optional<std::size_t> trace_retention_keep;
     agbot::flight_sim::Vec3 steady_wind_mps;
+    agbot::flight_sim::SensorCalibrationProfile sensor_profile = agbot::flight_sim::ideal_sensor_profile();
     agbot::flight_sim::FaultInjectionPlan faults;
 };
 
@@ -60,6 +61,8 @@ agbot::flight_sim::Vec3 parse_vec3_csv(const std::string& text, const std::strin
               << "                       A <output>.manifest.json is written alongside it.\n"
               << "  --max-time S         Max mission seconds before giving up (default 600).\n"
               << "  --wind-mps X,Y,Z     Steady wind vector in m/s applied to airborne ground track.\n"
+              << "  --sensor-profile NAME\n"
+              << "                       Sensor calibration/noise profile: ideal, cheap_gps, rtk_gps, noisy_imu.\n"
               << "  --trace-retention-keep N\n"
               << "                       Delete older JSONL traces in the output directory after keeping N newest runs.\n"
               << "  --fault SPEC         Add seeded fault: class:seed:start_step:end_step:magnitude[:target].\n"
@@ -86,6 +89,8 @@ Args parse_args(int argc, char** argv) {
             args.max_time_s = std::stod(argv[++index]);
         } else if (current == "--wind-mps" && index + 1 < argc) {
             args.steady_wind_mps = parse_vec3_csv(argv[++index], "--wind-mps");
+        } else if (current == "--sensor-profile" && index + 1 < argc) {
+            args.sensor_profile = agbot::flight_sim::sensor_profile_by_name(argv[++index]);
         } else if (current == "--trace-retention-keep" && index + 1 < argc) {
             args.trace_retention_keep = static_cast<std::size_t>(std::stoull(argv[++index]));
         } else if (current == "--fault" && index + 1 < argc) {
@@ -134,6 +139,7 @@ int main(int argc, char** argv) {
         config.record_interval_s = args.record_interval_s;
         config.max_time_s = args.max_time_s;
         config.steady_wind_mps = args.steady_wind_mps;
+        config.sensor_profile = args.sensor_profile;
         config.faults = args.faults;
 
         RunResult result = run_deterministic(mission, config);
