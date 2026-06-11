@@ -396,7 +396,8 @@ async fn import_fields_geojson_creates_fields_from_feature_collection() -> Resul
                                     "name": "West Pivot",
                                     "crop": "soybean",
                                     "season": "2026",
-                                    "notes": "imported from geojson"
+                                    "notes": "imported from geojson",
+                                    "crs": "EPSG:4326"
                                 },
                                 "geometry": {
                                     "type": "Polygon",
@@ -432,6 +433,12 @@ async fn import_fields_geojson_creates_fields_from_feature_collection() -> Resul
     assert_eq!(
         imported[0].get("name").and_then(|v| v.as_str()),
         Some("West Pivot")
+    );
+    assert_eq!(
+        imported_json
+            .pointer("/0/boundary/crs")
+            .and_then(|v| v.as_str()),
+        Some("EPSG:4326")
     );
 
     let list_response = ctx
@@ -594,6 +601,7 @@ async fn import_fields_shapefile_creates_fields_from_polygon_records() -> Result
             (-96.7, 41.1),
         ]],
     )?;
+    write_wgs84_prj(&shapefile_path)?;
 
     let response = ctx
         .app
@@ -647,6 +655,12 @@ async fn import_fields_shapefile_creates_fields_from_polygon_records() -> Result
             .map(|coords| coords.len()),
         Some(4)
     );
+    assert_eq!(
+        fields_json
+            .pointer("/0/boundary/crs")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
 
     let list_response = ctx
         .app
@@ -665,11 +679,54 @@ async fn import_fields_shapefile_creates_fields_from_polygon_records() -> Result
 }
 
 #[tokio::test]
+async fn import_fields_shapefile_rejects_missing_crs() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let shapefile_path = tmp.path().join("no_crs.shp");
+    write_polygon_shapefile(
+        &shapefile_path,
+        &[vec![
+            (-96.7, 41.1),
+            (-96.2, 41.1),
+            (-96.2, 41.4),
+            (-96.7, 41.4),
+            (-96.7, 41.1),
+        ]],
+    )?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields/import/shapefile")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "path": shapefile_path.to_string_lossy().to_string()
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("missing CRS"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn import_fields_shapefile_rejects_unsupported_geometry() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
     let shapefile_path = tmp.path().join("points.shp");
     write_point_shapefile(&shapefile_path, &[(-96.45, 41.25)])?;
+    write_wgs84_prj(&shapefile_path)?;
 
     let response = ctx
         .app
@@ -711,6 +768,7 @@ async fn import_fields_shapefile_rejects_non_geographic_coordinates() -> Result<
             (500_000.0, 4_500_000.0),
         ]],
     )?;
+    write_wgs84_prj(&shapefile_path)?;
 
     let response = ctx
         .app
@@ -2772,6 +2830,7 @@ async fn setup_golden_acceptance_fixture(
             (-96.7, 41.1),
         ]],
     )?;
+    write_wgs84_prj(&shapefile_path)?;
     let import_response = ctx
         .app
         .clone()
@@ -3078,6 +3137,14 @@ fn write_point_shapefile(path: &Path, points: &[(f64, f64)]) -> Result<()> {
         .map(|(x, y)| vec![(*x, *y)])
         .collect::<Vec<_>>();
     write_shapefile(path, 1, &records)
+}
+
+fn write_wgs84_prj(shapefile_path: &Path) -> Result<()> {
+    std::fs::write(
+        shapefile_path.with_extension("prj"),
+        "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433],AUTHORITY[\"EPSG\",\"4326\"]]",
+    )?;
+    Ok(())
 }
 
 fn write_shapefile(path: &Path, shape_type: i32, records: &[Vec<(f64, f64)>]) -> Result<()> {

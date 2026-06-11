@@ -26,6 +26,8 @@ pub struct GeoPoint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldBoundary {
     pub coordinates: Vec<GeoPoint>,
+    #[serde(default)]
+    pub crs: Option<String>,
 }
 
 pub const DEFAULT_RECORD_OWNER: &str = "unassigned";
@@ -689,6 +691,7 @@ mod tests {
             season: Some("2026".to_string()),
             notes: Some("pivot irrigation".to_string()),
             boundary: FieldBoundary {
+                crs: Some("EPSG:4326".to_string()),
                 coordinates: vec![
                     GeoPoint {
                         longitude: -96.5,

@@ -165,6 +165,7 @@ pub struct CreateReportRequest {
 #[derive(Debug, Deserialize)]
 pub struct ImportShapefileRequest {
     pub path: String,
+    pub crs: Option<String>,
     pub name_prefix: Option<String>,
     pub farm_id: Option<String>,
     pub owner: Option<String>,
@@ -2630,7 +2631,7 @@ fn build_geospatial_metadata_with_asserted(
     }
 }
 
-fn build_field_record(request: CreateFieldRequest) -> AppResult<FieldRecord> {
+fn build_field_record(mut request: CreateFieldRequest) -> AppResult<FieldRecord> {
     let field_id = request
         .field_id
         .filter(|value| !value.trim().is_empty())
@@ -2639,6 +2640,7 @@ fn build_field_record(request: CreateFieldRequest) -> AppResult<FieldRecord> {
     if name.is_empty() {
         return Err(AppError::BadRequest("field name is required".to_string()));
     }
+    request.boundary.crs = request.boundary.crs.as_deref().and_then(normalize_crs_text);
     if request.boundary.coordinates.len() < 3 {
         return Err(AppError::BadRequest(
             "field boundary must contain at least three coordinates".to_string(),
@@ -2883,6 +2885,7 @@ async fn fields_from_shapefile(request: ImportShapefileRequest) -> AppResult<Vec
             path.display()
         ))
     })?;
+    let source_crs = resolve_shapefile_crs(&path, request.crs.as_deref()).await?;
     let shapes = shapefile::parse_polygon_records(&path, &bytes)?;
     let base_name = request
         .name_prefix
@@ -2918,10 +2921,50 @@ async fn fields_from_shapefile(request: ImportShapefileRequest) -> AppResult<Vec
                 notes: request.notes.clone(),
                 boundary: FieldBoundary {
                     coordinates: shape.coordinates,
+                    crs: Some(source_crs.clone()),
                 },
             })
         })
         .collect()
+}
+
+async fn resolve_shapefile_crs(path: &FsPath, supplied_crs: Option<&str>) -> AppResult<String> {
+    if let Some(crs) = supplied_crs.and_then(normalize_crs_text) {
+        return require_supported_boundary_crs(path, crs);
+    }
+
+    let prj_path = path.with_extension("prj");
+    let prj_text = fs::read_to_string(&prj_path).await.map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            AppError::BadRequest(format!(
+                "missing CRS for shapefile {}; provide a .prj file or crs in the import request",
+                path.display()
+            ))
+        } else {
+            AppError::BadRequest(format!(
+                "failed to read shapefile CRS {}: {err}",
+                prj_path.display()
+            ))
+        }
+    })?;
+    let crs = normalize_crs_text(&prj_text).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "missing CRS for shapefile {}; .prj is empty",
+            path.display()
+        ))
+    })?;
+    require_supported_boundary_crs(path, crs)
+}
+
+fn require_supported_boundary_crs(path: &FsPath, crs: String) -> AppResult<String> {
+    if crs == "EPSG:4326" {
+        Ok(crs)
+    } else {
+        Err(AppError::BadRequest(format!(
+            "shapefile {} CRS {crs} is not supported; import currently requires EPSG:4326 lon/lat coordinates",
+            path.display()
+        )))
+    }
 }
 
 fn group_fields_by_season(fields: Vec<FieldRecord>) -> Vec<FieldSeasonGroup> {
@@ -2988,6 +3031,9 @@ fn feature_from_field(field: FieldRecord) -> Feature {
         properties.insert("farm_id".to_string(), serde_json::Value::String(farm_id));
     }
     properties.insert("name".to_string(), serde_json::Value::String(field.name));
+    if let Some(crs) = field.boundary.crs.as_ref() {
+        properties.insert("crs".to_string(), serde_json::Value::String(crs.clone()));
+    }
     if let Some(crop) = field.crop {
         properties.insert("crop".to_string(), serde_json::Value::String(crop));
     }
@@ -3195,6 +3241,8 @@ fn build_field_from_feature(feature: geojson::Feature, index: usize) -> AppResul
             notes: property_string(&properties, "notes"),
             boundary: FieldBoundary {
                 coordinates: Vec::new(),
+                crs: property_string(&properties, "crs")
+                    .or_else(|| property_string(&properties, "source_crs")),
             },
         }),
         index,
@@ -3206,7 +3254,7 @@ fn build_field_from_geometry(
     template: Option<CreateFieldRequest>,
     index: usize,
 ) -> AppResult<FieldRecord> {
-    let boundary = boundary_from_geometry(geometry)?;
+    let mut boundary = boundary_from_geometry(geometry)?;
     let template = template.unwrap_or(CreateFieldRequest {
         farm_id: None,
         field_id: None,
@@ -3217,8 +3265,10 @@ fn build_field_from_geometry(
         notes: None,
         boundary: FieldBoundary {
             coordinates: Vec::new(),
+            crs: None,
         },
     });
+    boundary.crs = template.boundary.crs.clone();
 
     build_field_record(CreateFieldRequest {
         farm_id: template.farm_id,
@@ -3278,7 +3328,30 @@ fn boundary_from_ring(ring: Vec<Vec<f64>>) -> AppResult<FieldBoundary> {
         coordinates.pop();
     }
 
-    Ok(FieldBoundary { coordinates })
+    Ok(FieldBoundary {
+        coordinates,
+        crs: None,
+    })
+}
+
+fn normalize_crs_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.contains("EPSG:4326")
+        || upper.contains("\"EPSG\",\"4326\"")
+        || ((upper.contains("GEOGCS") || upper.contains("GEOGCRS"))
+            && !upper.contains("PROJCS")
+            && !upper.contains("PROJCRS")
+            && (upper.contains("WGS 84") || upper.contains("WGS_1984")))
+    {
+        Some("EPSG:4326".to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn property_string(
@@ -4186,6 +4259,7 @@ mod tests {
             season: Some("2026".to_string()),
             notes: Some("test field".to_string()),
             boundary: FieldBoundary {
+                crs: Some("EPSG:4326".to_string()),
                 coordinates: vec![
                     GeoPoint {
                         longitude: -96.7,
@@ -4228,6 +4302,7 @@ mod tests {
             season: None,
             notes: None,
             boundary: FieldBoundary {
+                crs: None,
                 coordinates: vec![
                     GeoPoint {
                         longitude: -96.7,
@@ -4256,6 +4331,7 @@ mod tests {
             season: None,
             notes: None,
             boundary: FieldBoundary {
+                crs: None,
                 coordinates: vec![
                     GeoPoint {
                         longitude: -96.7,
