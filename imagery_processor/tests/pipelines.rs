@@ -1,10 +1,10 @@
 // Minimal unit/integration tests for index edge cases and thermal calibration math.
 
-use image::{GrayImage, Luma};
+use image::{GrayImage, ImageBuffer, Luma};
 use imagery_processor::{
     io::{BandIngestEvidence, CalibrationStatus},
-    pipeline::indices::run_indices,
-    IndexKind, IndicesArgs, OutputFormat, SensorPreset,
+    pipeline::{indices::run_indices, masks::run_masks},
+    IndexKind, IndicesArgs, MasksArgs, OutputFormat, SensorPreset,
 };
 use serde_json::Value;
 use std::{
@@ -21,6 +21,17 @@ fn temp_test_dir(name: &str) -> PathBuf {
 fn write_gray_image(path: &Path, width: u32, height: u32, values: &[u8]) {
     assert_eq!(values.len(), (width * height) as usize);
     let mut image = GrayImage::new(width, height);
+    for (index, value) in values.iter().enumerate() {
+        let x = (index as u32) % width;
+        let y = (index as u32) / width;
+        image.put_pixel(x, y, Luma([*value]));
+    }
+    image.save(path).unwrap();
+}
+
+fn write_gray16_image(path: &Path, width: u32, height: u32, values: &[u16]) {
+    assert_eq!(values.len(), (width * height) as usize);
+    let mut image: ImageBuffer<Luma<u16>, Vec<u16>> = ImageBuffer::new(width, height);
     for (index, value) in values.iter().enumerate() {
         let x = (index as u32) % width;
         let y = (index as u32) / width;
@@ -79,6 +90,16 @@ fn base_indices_args(input_dir: PathBuf, output_dir: PathBuf) -> IndicesArgs {
     }
 }
 
+fn base_masks_args(input_dir: PathBuf, output_dir: PathBuf) -> MasksArgs {
+    MasksArgs {
+        input_dir,
+        output_dir,
+        qa_band: "QA_PIXEL".to_string(),
+        kinds: Vec::new(),
+        out_format: OutputFormat::Png,
+    }
+}
+
 fn read_result_meta(output_dir: &Path) -> Value {
     let path = fs::read_dir(output_dir)
         .unwrap()
@@ -100,6 +121,19 @@ fn read_band_ingest_evidence(output_dir: &Path) -> BandIngestEvidence {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("band_ingest_") && name.ends_with(".json"))
+        })
+        .unwrap();
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn read_mask_evidence(output_dir: &Path) -> Value {
+    let path = fs::read_dir(output_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("mask_evidence_") && name.ends_with(".json"))
         })
         .unwrap();
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
@@ -323,6 +357,54 @@ async fn missing_calibration_coefficients_are_marked_uncalibrated_dn() {
         meta["radiometric_calibration"]["status"].as_str().unwrap(),
         "UncalibratedDn"
     );
+}
+
+#[tokio::test]
+async fn masks_persist_class_count_evidence() {
+    let root = temp_test_dir("qa_mask_evidence");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let qa_path = input_dir.join("qa.png");
+    write_gray16_image(&qa_path, 5, 1, &[1 << 3, 1 << 4, 1 << 5, 1 << 7, 0]);
+    write_metadata(&input_dir, 5, 1, &[("QA_PIXEL", qa_path.as_path())]);
+
+    let args = base_masks_args(input_dir, output_dir.clone());
+
+    run_masks(&args).await.unwrap();
+
+    let evidence = read_mask_evidence(&output_dir);
+    assert_eq!(evidence["qa_band"].as_str().unwrap(), "QA_PIXEL");
+    assert_eq!(evidence["class_counts"]["cloud"].as_u64().unwrap(), 1);
+    assert_eq!(
+        evidence["class_counts"]["cloud_shadow"].as_u64().unwrap(),
+        1
+    );
+    assert_eq!(evidence["class_counts"]["snow"].as_u64().unwrap(), 1);
+    assert_eq!(evidence["class_counts"]["water"].as_u64().unwrap(), 1);
+    assert_eq!(evidence["class_counts"]["clear"].as_u64().unwrap(), 2);
+    assert!(evidence["outputs"]["clear"]
+        .as_str()
+        .unwrap()
+        .ends_with(".png"));
+}
+
+#[tokio::test]
+async fn masks_error_when_qa_band_is_missing() {
+    let root = temp_test_dir("qa_mask_missing_band");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    write_gray_image(&red_path, 1, 1, &[10]);
+    write_metadata(&input_dir, 1, 1, &[("Red", red_path.as_path())]);
+
+    let args = base_masks_args(input_dir, output_dir);
+
+    let err = run_masks(&args).await.unwrap_err();
+    assert!(err.to_string().contains("QA band 'QA_PIXEL' not found"));
 }
 
 #[tokio::test]
