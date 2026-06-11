@@ -2,6 +2,7 @@ use anyhow::Result;
 use bevy::prelude::*;
 use bevy::tasks::Task;
 use image::DynamicImage;
+use sensor_overlay_engine::{utils::OverlayValueRange, SpatialBounds};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     assert_raster_spatial_ref, AnnotationRecord, FarmRecord, FieldRecord, GeoPoint, GpsCoords,
@@ -249,6 +250,29 @@ pub struct LayerMetadataReadout {
     pub dimensions: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveProductSelection {
+    pub selected_layer: usize,
+    pub product_kind: String,
+    pub tile_source: TileSource,
+    pub legend: ProductLegend,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProductLegend {
+    pub product_kind: String,
+    pub colormap: String,
+    pub value_range: Option<OverlayValueRange>,
+    pub stops: Vec<ProductLegendStop>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProductLegendStop {
+    pub value: f32,
+    pub color: [u8; 3],
+    pub alpha: u8,
+}
+
 pub fn layer_metadata_readout(
     geospatial: &SceneGeospatialMetadata,
     width: Option<u32>,
@@ -287,6 +311,114 @@ pub fn layer_metadata_readout(
         resolution,
         dimensions,
     }
+}
+
+pub fn active_product_selection(
+    manifest_state: &SceneManifestState,
+    config: &TileConfig,
+    target_idx: usize,
+) -> Result<ActiveProductSelection> {
+    let placement = assert_manifest_layer_placement(
+        &manifest_state.geospatial,
+        manifest_state.width,
+        manifest_state.height,
+    )?;
+    let product = manifest_state
+        .products
+        .get(target_idx)
+        .ok_or_else(|| anyhow::anyhow!("product index {target_idx} is not available"))?;
+    if product.kind.trim().is_empty() {
+        anyhow::bail!("product kind is required before switching layers");
+    }
+    if product.tile_url_template.trim().is_empty() {
+        anyhow::bail!("product {} is missing a tile URL template", product.kind);
+    }
+
+    Ok(ActiveProductSelection {
+        selected_layer: target_idx,
+        product_kind: product.kind.clone(),
+        tile_source: product.tile_source(&config.base_url),
+        legend: product_legend_for_kind(&product.kind, &placement.extent)?,
+    })
+}
+
+pub fn switch_active_product(
+    manifest_state: &SceneManifestState,
+    viewer_state: &mut ViewerState,
+    config: &mut TileConfig,
+    target_idx: usize,
+) -> Result<ActiveProductSelection> {
+    let selection = active_product_selection(manifest_state, config, target_idx)?;
+    viewer_state.selected_layer = selection.selected_layer;
+    config.product_kind = selection.product_kind.clone();
+    Ok(selection)
+}
+
+pub fn product_legend_for_kind(kind: &str, extent: &SceneExtent) -> Result<ProductLegend> {
+    let (colormap, value_range) = legend_profile_for_product(kind);
+    let values = legend_sample_values(value_range, 5);
+    let spatial_bounds = SpatialBounds {
+        min_x: extent.min_lon,
+        min_y: extent.min_lat,
+        max_x: extent.max_lon,
+        max_y: extent.max_lat,
+        min_z: None,
+        max_z: None,
+    };
+    let rendered = sensor_overlay_engine::utils::render_value_overlay(
+        &values,
+        values.len() as u32,
+        1,
+        &spatial_bounds,
+        colormap,
+        Some(value_range),
+        5,
+    )?;
+    let metadata = rendered.metadata;
+    let stops = metadata
+        .legend_stops
+        .into_iter()
+        .map(|stop| ProductLegendStop {
+            value: stop.value,
+            color: [stop.color.r, stop.color.g, stop.color.b],
+            alpha: stop.alpha,
+        })
+        .collect();
+
+    Ok(ProductLegend {
+        product_kind: kind.to_string(),
+        colormap: metadata.colormap,
+        value_range: metadata.value_range,
+        stops,
+    })
+}
+
+fn legend_profile_for_product(kind: &str) -> (&'static str, (f32, f32)) {
+    let normalized = kind.to_ascii_lowercase();
+    if normalized.contains("ndvi") || normalized.contains("vegetation") {
+        ("viridis", (-1.0, 1.0))
+    } else if normalized.contains("thermal") || normalized.contains("temperature") {
+        ("hot", (-10.0, 50.0))
+    } else if normalized.contains("source")
+        || normalized.contains("rgb")
+        || normalized.contains("visual")
+    {
+        ("grayscale", (0.0, 255.0))
+    } else if normalized.contains("lidar") {
+        ("jet", (0.0, 1.0))
+    } else {
+        ("grayscale", (0.0, 1.0))
+    }
+}
+
+fn legend_sample_values((min, max): (f32, f32), count: usize) -> Vec<f32> {
+    if count <= 1 {
+        return vec![min];
+    }
+    let last = count - 1;
+    (0..count)
+        .map(|idx| min + (max - min) * (idx as f32 / last as f32))
+        .collect()
 }
 
 pub fn assert_manifest_layer_placement(
@@ -704,9 +836,10 @@ pub fn ensure_scene_id(config: &TileConfig, action: &str) -> Result<String> {
 mod tests {
     use super::{
         assert_manifest_layer_placement, layer_metadata_readout, manifest_world_dimensions,
-        product_placement_for_manifest, select_catalog_scene, summarize_tile_presences,
-        FieldCatalogState, FieldSceneSummary, SceneExtent, SceneGeospatialMetadata, SceneManifest,
-        SceneProduct, TileId, TilePresence,
+        product_legend_for_kind, product_placement_for_manifest, select_catalog_scene,
+        summarize_tile_presences, switch_active_product, FieldCatalogState, FieldSceneSummary,
+        SceneExtent, SceneGeospatialMetadata, SceneManifest, SceneManifestState, SceneProduct,
+        TileConfig, TileId, TilePresence, ViewerState, DEFAULT_PRODUCT_KIND,
     };
     use bevy::prelude::Vec2;
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
@@ -982,6 +1115,83 @@ mod tests {
         assert_eq!(readout.dimensions, "missing dimensions");
     }
 
+    #[test]
+    fn switch_active_product_updates_kind_and_legend_without_resetting_view() {
+        let manifest = sample_manifest_state();
+        let mut viewer = ViewerState {
+            selected_layer: 0,
+            zoom_level: 2.5,
+            scene_id_input: "scene-1".to_string(),
+        };
+        let mut config = TileConfig {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            scene_id: Some("scene-1".to_string()),
+            product_kind: DEFAULT_PRODUCT_KIND.to_string(),
+        };
+
+        let selection = switch_active_product(&manifest, &mut viewer, &mut config, 1)
+            .expect("thermal product should switch");
+
+        assert_eq!(viewer.selected_layer, 1);
+        assert_eq!(viewer.zoom_level, 2.5);
+        assert_eq!(viewer.scene_id_input, "scene-1");
+        assert_eq!(config.product_kind, "thermal");
+        assert_eq!(selection.product_kind, "thermal");
+        assert_eq!(selection.legend.colormap, "hot");
+        assert_eq!(selection.legend.stops.len(), 5);
+        assert_eq!(
+            selection.tile_source.tile_url(TileId { z: 2, x: 3, y: 1 }),
+            "http://127.0.0.1:8080/api/scenes/scene-1/products/thermal/tiles/2/3/1.png"
+        );
+    }
+
+    #[test]
+    fn switch_active_product_refuses_bad_geospatial_assertion_and_keeps_prior_layer() {
+        let mut manifest = sample_manifest_state();
+        manifest.geospatial.crs = Some("EPSG:3857".to_string());
+        let mut viewer = ViewerState {
+            selected_layer: 0,
+            zoom_level: 1.75,
+            scene_id_input: "scene-1".to_string(),
+        };
+        let mut config = TileConfig {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            scene_id: Some("scene-1".to_string()),
+            product_kind: DEFAULT_PRODUCT_KIND.to_string(),
+        };
+
+        let err = switch_active_product(&manifest, &mut viewer, &mut config, 1)
+            .expect_err("bad layer placement should refuse the switch");
+
+        assert!(err.to_string().contains("CRS"));
+        assert_eq!(viewer.selected_layer, 0);
+        assert_eq!(viewer.zoom_level, 1.75);
+        assert_eq!(config.product_kind, DEFAULT_PRODUCT_KIND);
+    }
+
+    #[test]
+    fn product_legend_for_kind_uses_sensor_overlay_colormaps() {
+        let ndvi = product_legend_for_kind("ndvi", &sample_extent())
+            .expect("NDVI legend should be available");
+        let thermal = product_legend_for_kind("thermal", &sample_extent())
+            .expect("thermal legend should be available");
+        let source = product_legend_for_kind("source", &sample_extent())
+            .expect("source legend should be available");
+
+        assert_eq!(ndvi.colormap, "viridis");
+        assert_eq!(
+            ndvi.value_range.map(|range| (range.min, range.max)),
+            Some((-1.0, 1.0))
+        );
+        assert_eq!(thermal.colormap, "hot");
+        assert_eq!(
+            thermal.value_range.map(|range| (range.min, range.max)),
+            Some((-10.0, 50.0))
+        );
+        assert_eq!(source.colormap, "grayscale");
+        assert_eq!(source.stops.len(), 5);
+    }
+
     fn sample_extent() -> SceneExtent {
         SceneExtent {
             min_lon: -89.5,
@@ -1003,6 +1213,48 @@ mod tests {
             }),
             geo_transform: Some([-89.5, 0.01, 0.0, 41.0, 0.0, -0.02]),
             resolution: Some(RasterResolution { x: 0.01, y: 0.02 }),
+        }
+    }
+
+    fn sample_manifest_state() -> SceneManifestState {
+        SceneManifestState {
+            scene_id: Some("scene-1".to_string()),
+            owner: Some("org-alpha".to_string()),
+            sensor: Some("landsat8".to_string()),
+            acquired_at: Some("2026-05-01T00:00:00Z".to_string()),
+            width: Some(100),
+            height: Some(50),
+            bands: vec!["red".to_string(), "nir".to_string(), "thermal".to_string()],
+            gps_position: None,
+            data_path: Some("/tmp/scene-1".to_string()),
+            field_id: Some("field-1".to_string()),
+            season_id: Some("2026".to_string()),
+            linked_at: Some("2026-05-01T00:00:00Z".to_string()),
+            field: None,
+            geospatial: SceneGeospatialMetadata {
+                georeferenced: true,
+                crs: Some("EPSG:4326".to_string()),
+                center: None,
+                extent: Some(sample_extent()),
+                spatial_ref: Some(valid_spatial_ref()),
+            },
+            products: vec![
+                sample_product("ndvi"),
+                sample_product("thermal"),
+                sample_product("source"),
+            ],
+        }
+    }
+
+    fn sample_product(kind: &str) -> SceneProduct {
+        SceneProduct {
+            kind: kind.to_string(),
+            filename: format!("{kind}.png"),
+            content_type: "image/png".to_string(),
+            url_path: format!("/api/scenes/scene-1/products/{kind}"),
+            tile_url_template: format!(
+                "/api/scenes/scene-1/products/{kind}/tiles/{{z}}/{{x}}/{{y}}.png"
+            ),
         }
     }
 

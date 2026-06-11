@@ -3,11 +3,11 @@ use crate::plugins::map::{tile_center_world, tile_world_size, visible_tiles_for_
 use crate::plugins::recommendations::{clear_recommendations, start_recommendation_fetch};
 use crate::plugins::reports::{clear_reports, start_report_fetch};
 use crate::state::{
-    assert_manifest_layer_placement, manifest_world_dimensions, AnnotationFetchTask,
-    AnnotationOverlayState, FarmFieldHistoryFetchTask, FarmListFetchTask, FetchedTile,
-    FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask, FieldSceneSummary,
-    FieldScenesFetchTask, FieldSeasonGroup, ManifestFetchTask, MapCamera, MapViewState,
-    RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
+    active_product_selection, assert_manifest_layer_placement, manifest_world_dimensions,
+    AnnotationFetchTask, AnnotationOverlayState, FarmFieldHistoryFetchTask, FarmListFetchTask,
+    FetchedTile, FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask,
+    FieldSceneSummary, FieldScenesFetchTask, FieldSeasonGroup, ManifestFetchTask, MapCamera,
+    MapViewState, RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
     RecommendationOverlayState, RecommendationUpdateTask, RenderedTile, ReportFetchTask,
     ReportGenerateTask, ReportOverlayState, SceneManifest, SceneManifestState,
     ShapefileImportRequest, TileConfig, TileDisplay, TileFetchTasks, TileId, TilePresence,
@@ -877,21 +877,13 @@ fn active_tile_source(
     manifest_state: &SceneManifestState,
     config: &TileConfig,
 ) -> Option<TileSource> {
-    if assert_manifest_layer_placement(
-        &manifest_state.geospatial,
-        manifest_state.width,
-        manifest_state.height,
-    )
-    .is_err()
-    {
-        return None;
-    }
-
-    manifest_state
+    let target_idx = manifest_state
         .products
         .iter()
-        .find(|product| product.kind == config.product_kind)
-        .map(|product| product.tile_source(&config.base_url))
+        .position(|product| product.kind == config.product_kind)?;
+    active_product_selection(manifest_state, config, target_idx)
+        .ok()
+        .map(|selection| selection.tile_source)
 }
 
 fn update_tile_status(tile_state: &mut TileRenderState, tile_fetch_tasks: &TileFetchTasks) {

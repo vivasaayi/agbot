@@ -17,14 +17,15 @@ use crate::plugins::recommendations::{
 };
 use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
-    assert_manifest_layer_placement, layer_metadata_readout, select_catalog_scene,
-    AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask, AnnotationOverlayState,
-    AnnotationUpdateTask, CursorMapState, DraftMode, FarmFieldHistoryFetchTask, FarmListFetchTask,
-    FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask, FieldScenesFetchTask,
-    ManifestFetchTask, MapViewState, RecommendationCreateTask, RecommendationDeleteTask,
-    RecommendationFetchTask, RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask,
-    ReportGenerateTask, ReportOverlayState, SceneManifestState, ShapefileImportRequest, TileConfig,
-    TileFetchTasks, TileRenderState, TileStatus, ViewerState,
+    active_product_selection, assert_manifest_layer_placement, layer_metadata_readout,
+    select_catalog_scene, switch_active_product, AnnotationCreateTask, AnnotationDeleteTask,
+    AnnotationFetchTask, AnnotationOverlayState, AnnotationUpdateTask, CursorMapState, DraftMode,
+    FarmFieldHistoryFetchTask, FarmListFetchTask, FieldCatalogState, FieldImportState,
+    FieldImportTask, FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask, MapViewState,
+    ProductLegend, RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
+    RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask,
+    ReportOverlayState, SceneManifestState, ShapefileImportRequest, TileConfig, TileFetchTasks,
+    TileRenderState, TileStatus, ViewerState,
 };
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -570,12 +571,20 @@ fn render_layers_panel(
                 product.content_type
             );
             if placement_error.is_none() {
-                let response = ui.radio_value(&mut viewer_state.selected_layer, idx, label);
-                if response.changed() {
-                    config.product_kind = product.kind.clone();
-                    clear_loaded_tiles(commands, tile_state);
-                    fetch_tasks.0.clear();
-                    tile_state.status = TileStatus::Fetching;
+                let selected = viewer_state.selected_layer == idx;
+                let response = ui.radio(selected, label);
+                if response.clicked() && !selected {
+                    match switch_active_product(manifest_state, viewer_state, config, idx) {
+                        Ok(_) => {
+                            clear_loaded_tiles(commands, tile_state);
+                            fetch_tasks.0.clear();
+                            tile_state.status = TileStatus::Fetching;
+                        }
+                        Err(err) => {
+                            tile_state.status =
+                                TileStatus::Error(format!("layer switch refused: {err}"));
+                        }
+                    }
                 }
                 response.on_hover_text(product.url_path.clone());
             } else {
@@ -590,8 +599,40 @@ fn render_layers_panel(
                 ));
             }
         }
+        if placement_error.is_none() {
+            if let Ok(selection) =
+                active_product_selection(manifest_state, config, viewer_state.selected_layer)
+            {
+                render_product_legend(ui, &selection.legend);
+            }
+        }
     }
     ui.add_space(8.0);
+}
+
+fn render_product_legend(ui: &mut egui::Ui, legend: &ProductLegend) {
+    ui.add_space(6.0);
+    ui.small(format!(
+        "{} legend ({})",
+        legend.product_kind.to_uppercase(),
+        legend.colormap
+    ));
+    ui.horizontal_wrapped(|ui| {
+        for stop in &legend.stops {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().rect_filled(
+                rect,
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(
+                    stop.color[0],
+                    stop.color[1],
+                    stop.color[2],
+                    stop.alpha,
+                ),
+            );
+            ui.small(format!("{:.2}", stop.value));
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
