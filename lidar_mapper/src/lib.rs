@@ -225,6 +225,56 @@ pub struct LidarGroundSegmentationResult {
     pub evidence: LidarGroundSegmentationEvidence,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LidarElevationRasterParams {
+    pub resolution_m: f64,
+    pub nodata: f32,
+}
+
+impl Default for LidarElevationRasterParams {
+    fn default() -> Self {
+        Self {
+            resolution_m: 1.0,
+            nodata: -9999.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarElevationRaster {
+    pub kind: String,
+    pub width: u32,
+    pub height: u32,
+    pub nodata: f32,
+    pub values: Vec<f32>,
+    pub spatial_ref: RasterSpatialRef,
+}
+
+impl LidarElevationRaster {
+    pub fn value_at(&self, x: u32, y: u32) -> Option<f32> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        self.values.get((y * self.width + x) as usize).copied()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarElevationEvidence {
+    pub points_in: usize,
+    pub ground_points: usize,
+    pub dsm_valid_cells: usize,
+    pub dtm_valid_cells: usize,
+    pub params: LidarElevationRasterParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarElevationProducts {
+    pub dsm: LidarElevationRaster,
+    pub dtm: LidarElevationRaster,
+    pub evidence: LidarElevationEvidence,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IndexedLidarPoint {
     scan_index: usize,
@@ -808,6 +858,180 @@ impl LidarMapper {
         Ok(())
     }
 
+    pub fn build_elevation_products(
+        &self,
+        points: &[LidarPoint3],
+        classifications: &[LidarPointClassification],
+        params: LidarElevationRasterParams,
+    ) -> AgroResult<LidarElevationProducts> {
+        Self::validate_elevation_params(params)?;
+        if points.is_empty() {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR elevation products require at least one point".into(),
+            ));
+        }
+        if points.len() != classifications.len() {
+            return Err(shared::error::AgroError::Processing(format!(
+                "LiDAR elevation products expected {} classifications for {} points",
+                points.len(),
+                classifications.len()
+            )));
+        }
+
+        let cells = Self::elevation_cell_bounds(points, params.resolution_m)?;
+        let (min_grid_x, min_grid_y, width, height) = cells;
+        let spatial_ref = Self::elevation_spatial_ref(
+            min_grid_x,
+            min_grid_y,
+            width,
+            height,
+            params.resolution_m,
+        )?;
+        let cell_count = (width * height) as usize;
+        let mut dsm = vec![None; cell_count];
+        let mut dtm = vec![None; cell_count];
+        let mut ground_points = 0;
+
+        for (point_index, (point, classification)) in
+            points.iter().zip(classifications.iter()).enumerate()
+        {
+            if classification.point_index != point_index {
+                return Err(shared::error::AgroError::Processing(format!(
+                    "LiDAR elevation classification index mismatch at point {point_index}"
+                )));
+            }
+            let x = (point.x / params.resolution_m).floor() as i32;
+            let y = (point.y / params.resolution_m).floor() as i32;
+            let raster_index = ((y - min_grid_y) as u32 * width + (x - min_grid_x) as u32) as usize;
+            dsm[raster_index] = Some(
+                dsm[raster_index]
+                    .map(|current: f64| current.max(point.z))
+                    .unwrap_or(point.z),
+            );
+            if classification.class == LidarPointClass::Ground {
+                ground_points += 1;
+                dtm[raster_index] = Some(
+                    dtm[raster_index]
+                        .map(|current: f64| current.min(point.z))
+                        .unwrap_or(point.z),
+                );
+            }
+        }
+
+        let dsm_valid_cells = dsm.iter().filter(|value| value.is_some()).count();
+        let dtm_valid_cells = dtm.iter().filter(|value| value.is_some()).count();
+        let dsm_values = Self::materialize_elevation_values(dsm, params.nodata);
+        let dtm_values = Self::materialize_elevation_values(dtm, params.nodata);
+
+        Ok(LidarElevationProducts {
+            dsm: LidarElevationRaster {
+                kind: "dsm".to_string(),
+                width,
+                height,
+                nodata: params.nodata,
+                values: dsm_values,
+                spatial_ref: spatial_ref.clone(),
+            },
+            dtm: LidarElevationRaster {
+                kind: "dtm".to_string(),
+                width,
+                height,
+                nodata: params.nodata,
+                values: dtm_values,
+                spatial_ref,
+            },
+            evidence: LidarElevationEvidence {
+                points_in: points.len(),
+                ground_points,
+                dsm_valid_cells,
+                dtm_valid_cells,
+                params,
+            },
+        })
+    }
+
+    fn validate_elevation_params(params: LidarElevationRasterParams) -> AgroResult<()> {
+        if !params.resolution_m.is_finite() || params.resolution_m <= 0.0 {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR elevation rasterization requires a positive resolution".into(),
+            ));
+        }
+        if !params.nodata.is_finite() {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR elevation rasterization requires a finite nodata value".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn elevation_cell_bounds(
+        points: &[LidarPoint3],
+        resolution_m: f64,
+    ) -> AgroResult<(i32, i32, u32, u32)> {
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
+        for point in points {
+            if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
+                return Err(shared::error::AgroError::Processing(
+                    "LiDAR elevation rasterization requires finite point coordinates".into(),
+                ));
+            }
+            let x = (point.x / resolution_m).floor() as i32;
+            let y = (point.y / resolution_m).floor() as i32;
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+        Ok((
+            min_x,
+            min_y,
+            (max_x - min_x + 1) as u32,
+            (max_y - min_y + 1) as u32,
+        ))
+    }
+
+    fn elevation_spatial_ref(
+        min_grid_x: i32,
+        min_grid_y: i32,
+        width: u32,
+        height: u32,
+        resolution_m: f64,
+    ) -> AgroResult<RasterSpatialRef> {
+        let origin_x = min_grid_x as f64 * resolution_m;
+        let origin_y = min_grid_y as f64 * resolution_m;
+        let spatial_ref = RasterSpatialRef {
+            georeferenced: true,
+            crs: Some(OCCUPANCY_GRID_LOCAL_CRS.to_string()),
+            bbox: Some(GeoBounds {
+                min_lon: origin_x,
+                min_lat: origin_y,
+                max_lon: origin_x + width as f64 * resolution_m,
+                max_lat: origin_y + height as f64 * resolution_m,
+            }),
+            geo_transform: Some([origin_x, resolution_m, 0.0, origin_y, 0.0, resolution_m]),
+            resolution: Some(RasterResolution {
+                x: resolution_m,
+                y: resolution_m,
+            }),
+        };
+
+        assert_raster_spatial_ref(Some(&spatial_ref), width, height).map_err(|e| {
+            shared::error::AgroError::Processing(format!(
+                "LiDAR elevation spatial reference assertion failed: {e}"
+            ))
+        })
+    }
+
+    fn materialize_elevation_values(values: Vec<Option<f64>>, nodata: f32) -> Vec<f32> {
+        values
+            .into_iter()
+            .map(|value| value.map(|z| z as f32).unwrap_or(nodata))
+            .collect()
+    }
+
     pub fn create_occupancy_grid(
         &self,
         scans: &[LidarScan],
@@ -1151,6 +1375,10 @@ mod tests {
             neighbor_count: 4,
             normal: Some(SurfaceNormal { x: 0.0, y: 0.0, z }),
         }
+    }
+
+    fn classification(point_index: usize, class: LidarPointClass) -> LidarPointClassification {
+        LidarPointClassification { point_index, class }
     }
 
     #[test]
@@ -1515,5 +1743,75 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("no ground surface"));
+    }
+
+    #[test]
+    fn build_elevation_products_rasterizes_dsm_dtm_with_asserted_spatial_ref() {
+        let mapper = test_mapper();
+        let params = LidarElevationRasterParams {
+            resolution_m: 1.0,
+            nodata: -9999.0,
+        };
+        let points = vec![
+            LidarPoint3::new(0.1, 0.1, 1.0),
+            LidarPoint3::new(0.1, 0.1, 2.0),
+            LidarPoint3::new(1.2, 0.1, 1.5),
+            LidarPoint3::new(0.1, 1.2, 3.0),
+        ];
+        let classifications = vec![
+            classification(0, LidarPointClass::Ground),
+            classification(1, LidarPointClass::NonGround),
+            classification(2, LidarPointClass::Ground),
+            classification(3, LidarPointClass::NonGround),
+        ];
+
+        let products = mapper
+            .build_elevation_products(&points, &classifications, params)
+            .unwrap();
+
+        assert_eq!(products.dsm.width, 2);
+        assert_eq!(products.dsm.height, 2);
+        assert_eq!(products.dsm.value_at(0, 0), Some(2.0));
+        assert_eq!(products.dsm.value_at(1, 0), Some(1.5));
+        assert_eq!(products.dsm.value_at(0, 1), Some(3.0));
+        assert_eq!(products.dsm.value_at(1, 1), Some(params.nodata));
+        assert_eq!(products.dtm.value_at(0, 0), Some(1.0));
+        assert_eq!(products.dtm.value_at(1, 0), Some(1.5));
+
+        let asserted = assert_raster_spatial_ref(Some(&products.dsm.spatial_ref), 2, 2).unwrap();
+        assert_eq!(asserted, products.dsm.spatial_ref);
+        assert_eq!(products.dtm.spatial_ref, products.dsm.spatial_ref);
+        assert_eq!(products.evidence.ground_points, 2);
+        assert_eq!(products.evidence.dsm_valid_cells, 3);
+        assert_eq!(products.evidence.dtm_valid_cells, 2);
+
+        let roundtrip: LidarElevationProducts =
+            serde_json::from_str(&serde_json::to_string(&products).unwrap()).unwrap();
+        assert_eq!(roundtrip, products);
+    }
+
+    #[test]
+    fn build_elevation_products_keeps_dtm_nodata_without_ground_returns() {
+        let mapper = test_mapper();
+        let params = LidarElevationRasterParams {
+            resolution_m: 1.0,
+            nodata: -9999.0,
+        };
+        let points = vec![
+            LidarPoint3::new(0.1, 0.1, 0.2),
+            LidarPoint3::new(1.1, 0.1, 2.5),
+        ];
+        let classifications = vec![
+            classification(0, LidarPointClass::Ground),
+            classification(1, LidarPointClass::NonGround),
+        ];
+
+        let products = mapper
+            .build_elevation_products(&points, &classifications, params)
+            .unwrap();
+
+        assert_eq!(products.dsm.value_at(1, 0), Some(2.5));
+        assert_eq!(products.dtm.value_at(1, 0), Some(params.nodata));
+        assert_ne!(products.dtm.value_at(1, 0), Some(0.0));
     }
 }
