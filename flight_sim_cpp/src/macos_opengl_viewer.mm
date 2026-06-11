@@ -40,7 +40,7 @@ using agbot::flight_sim::Waypoint;
 using agbot::flight_sim::WaypointAction;
 using agbot::flight_sim::default_sample_mission_path;
 using agbot::flight_sim::build_terrain_mesh;
-using agbot::flight_sim::composite_elevation;
+using agbot::flight_sim::composite_elevation_with_state;
 using agbot::flight_sim::elevation_tile_from_terrarium_rgba;
 using agbot::flight_sim::geo_from_local;
 using agbot::flight_sim::local_from_geo;
@@ -1064,13 +1064,23 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
 
     constexpr int kTerrainResolution = 96;
-    const auto heightmap = composite_elevation(elevation_tiles, bounds, kTerrainResolution);
-    terrain_mesh_ = build_terrain_mesh(heightmap, kTerrainResolution, bounds.width_m(), bounds.height_m(), 1.0);
+    const auto composite = composite_elevation_with_state(
+        elevation_tiles,
+        bounds,
+        kTerrainResolution,
+        requested_tiles);
+    terrain_mesh_ = build_terrain_mesh(composite.heightmap, kTerrainResolution, bounds.width_m(), bounds.height_m(), 1.0);
 
     std::ostringstream status;
     status << "Terrain z" << zoom << " " << elevation_tiles.size() << "/" << requested_tiles.size();
-    if (failed_tiles > 0) {
-        status << " (" << failed_tiles << " failed)";
+    const auto fallback_count = static_cast<int>(std::count_if(
+        composite.tile_states.begin(),
+        composite.tile_states.end(),
+        [](const auto& tile_status) {
+            return tile_status.state == agbot::flight_sim::TerrainTileState::FlatFallback;
+        }));
+    if (failed_tiles > 0 || fallback_count > 0) {
+        status << " (" << std::max(failed_tiles, fallback_count) << " flat_fallback)";
     }
     if (terrain_mesh_.has_elevation) {
         status << " " << std::fixed << std::setprecision(0)

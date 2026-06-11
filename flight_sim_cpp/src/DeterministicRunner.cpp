@@ -1,5 +1,6 @@
 #include "agbot_flight_sim/DeterministicRunner.hpp"
 
+#include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TwinContractV1.hpp"
 
@@ -57,6 +58,19 @@ std::string default_safety_config_json() {
            << ",\"no_fly_zone_count\":" << config.safety.no_fly_zones.size()
            << "}";
     return stream.str();
+}
+
+std::string merge_json_arrays(const std::string& left, const std::string& right) {
+    if (left == "[]") {
+        return right;
+    }
+    if (right == "[]") {
+        return left;
+    }
+    if (left.size() < 2 || right.size() < 2) {
+        return left;
+    }
+    return "[" + left.substr(1, left.size() - 2) + "," + right.substr(1, right.size() - 2) + "]";
 }
 
 } // namespace
@@ -169,6 +183,10 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     manifest.mission_hash = sha256_hex(mission_to_json(mission));
     manifest.faults_json = config.faults.to_json();
     manifest.faults_hash = sha256_hex(manifest.faults_json);
+    manifest.terrain_tiles_json = merge_json_arrays(
+        terrain_tiles_json_for_mission_fallback(mission, 96),
+        terrain_tiles_json_for_faults(config.faults));
+    manifest.terrain_tiles_hash = sha256_hex(manifest.terrain_tiles_json);
     {
         std::ostringstream run_id_input;
         run_id_input << std::fixed << std::setprecision(9)
@@ -180,14 +198,13 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
                      << manifest.record_interval_s << "|"
                      << config.max_time_s << "|"
                      << manifest.mission_hash << "|"
-                     << manifest.faults_hash;
+                     << manifest.faults_hash << "|"
+                     << manifest.terrain_tiles_hash;
         manifest.run_id = sha256_hex(run_id_input.str());
     }
     manifest.step_count = step_count;
     manifest.sample_count = sample_count;
     manifest.prng_nonce = prng_nonce;
-    manifest.terrain_tiles_json = terrain_tiles_json_for_faults(config.faults);
-    manifest.terrain_tiles_hash = sha256_hex(manifest.terrain_tiles_json);
     manifest.weather_config_json = default_weather_config_json();
     manifest.weather_config_hash = sha256_hex(manifest.weather_config_json);
     manifest.sensor_config_json = default_sensor_config_json();

@@ -278,6 +278,64 @@ void test_composites_empty_elevation_as_flat_zero() {
     assert(mesh.max_elevation_m == 0.0f);
 }
 
+void test_terrain_profile_asserts_crs_extent_resolution_and_samples_elevation() {
+    const GeoCoordinate center {37.7749, -122.4194, 0.0};
+    const TileCoordinate tile_coordinate = agbot::flight_sim::tile_for_geo(center, 14);
+    const GeoBounds bounds = tile_coordinate.bounds();
+    const GeoCoordinate sample_coordinate = bounds.center();
+
+    std::vector<std::uint8_t> pixels(2 * 2 * 4, 0);
+    write_terrarium_pixel(pixels, 0, 10.0f);
+    write_terrarium_pixel(pixels, 1, 20.0f);
+    write_terrarium_pixel(pixels, 2, 30.0f);
+    write_terrarium_pixel(pixels, 3, 40.0f);
+    const auto tile = agbot::flight_sim::elevation_tile_from_terrarium_rgba(
+        tile_coordinate,
+        2,
+        2,
+        pixels);
+    assert(tile.has_value());
+
+    const auto composite = agbot::flight_sim::composite_elevation_with_state({*tile}, bounds, 3, {tile_coordinate});
+    assert(composite.profile.asserted);
+    assert(composite.profile.crs == "EPSG:4326");
+    assert(composite.profile.resolution == 3);
+    assert(composite.profile.resolution_x_m > 0.0);
+    assert(composite.profile.resolution_y_m > 0.0);
+    assert(composite.profile.contains(sample_coordinate));
+
+    const auto sample = composite.sample_at(sample_coordinate);
+    assert(sample.has_value());
+    assert(sample->state == agbot::flight_sim::TerrainTileState::Available);
+    assert(std::abs(sample->elevation_m - 25.0f) < 0.01f);
+
+    const auto assertion = composite.assert_elevation_at(sample_coordinate, 25.0f, 0.01f);
+    assert(assertion.ok);
+    assert(assertion.reason == "terrain_georeference_asserted");
+}
+
+void test_missing_terrain_tile_is_sampled_and_manifested_as_flat_fallback() {
+    const GeoCoordinate center {37.7749, -122.4194, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 500.0);
+    const TileCoordinate expected_tile = agbot::flight_sim::tile_for_geo(center, 14);
+    const auto composite = agbot::flight_sim::composite_elevation_with_state({}, bounds, 4, {expected_tile});
+
+    const auto sample = composite.sample_at(center);
+    assert(sample.has_value());
+    assert(sample->state == agbot::flight_sim::TerrainTileState::FlatFallback);
+    assert(sample->elevation_m == 0.0f);
+
+    const std::string manifest = agbot::flight_sim::terrain_tiles_json(composite);
+    assert(manifest.find("\"state\":\"flat_fallback\"") != std::string::npos);
+    assert(manifest.find("\"crs\":\"EPSG:4326\"") != std::string::npos);
+    assert(manifest.find("\"resolution_x_m\":") != std::string::npos);
+    assert(manifest.find("\"bounds\":{") != std::string::npos);
+
+    const auto failed_assertion = composite.assert_elevation_at(center, 5.0f, 0.1f);
+    assert(!failed_assertion.ok);
+    assert(failed_assertion.reason == "elevation_mismatch");
+}
+
 void test_builds_terrain_mesh_from_heightmap() {
     const std::vector<float> heightmap {
         10.0f, 10.0f, 10.0f,
@@ -363,6 +421,19 @@ void test_run_manifest_records_contract_and_hashes() {
     assert(result.manifest.output_hash != result.manifest.mission_hash);
 }
 
+void test_run_manifest_records_geodetic_terrain_fallback_evidence() {
+    const auto mission = MissionLoader::load_from_text(kGeoMissionJson);
+    const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const std::string json = result.manifest.to_json();
+
+    assert(result.manifest.terrain_tiles_json.find("\"state\":\"flat_fallback\"") != std::string::npos);
+    assert(result.manifest.terrain_tiles_json.find("\"crs\":\"EPSG:4326\"") != std::string::npos);
+    assert(result.manifest.terrain_tiles_json.find("\"resolution\":96") != std::string::npos);
+    assert(result.manifest.terrain_tiles_json.find("\"bounds\":{") != std::string::npos);
+    assert(result.manifest.terrain_tiles_hash == agbot::flight_sim::sha256_hex(result.manifest.terrain_tiles_json));
+    assert(json.find("\"terrain_tiles\":[{") != std::string::npos);
+}
+
 // Story 02-24: the first TwinContractV1 slice names the shared wire schemas
 // and their required fields so downstream consumers can detect schema drift.
 void test_twin_contract_v1_schema_covers_required_types() {
@@ -389,6 +460,7 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.has_capability("scenario_manifest"));
     assert(schema.has_capability("simulation_health"));
     assert(schema.has_capability("fault_injection"));
+    assert(schema.has_capability("terrain_crs_extent_assertions"));
     assert(schema.to_json().find("\"schema_hash\":\"" + schema.schema_hash + "\"") != std::string::npos);
 }
 
@@ -632,10 +704,13 @@ int main() {
     test_geo_terrain_area_and_tiles();
     test_decodes_terrarium_elevation_without_png_dependency();
     test_composites_empty_elevation_as_flat_zero();
+    test_terrain_profile_asserts_crs_extent_resolution_and_samples_elevation();
+    test_missing_terrain_tile_is_sampled_and_manifested_as_flat_fallback();
     test_builds_terrain_mesh_from_heightmap();
     test_deterministic_runner_is_byte_identical();
     test_deterministic_runner_seed_drives_prng();
     test_run_manifest_records_contract_and_hashes();
+    test_run_manifest_records_geodetic_terrain_fallback_evidence();
     test_twin_contract_v1_schema_covers_required_types();
     test_twin_contract_version_compatibility();
     test_trace_diff_reports_divergent_field();

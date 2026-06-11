@@ -72,6 +72,8 @@ Fault specs use `class:seed:start_step:end_step:magnitude[:target]`. Use `-` for
 
 Every fault must provide a seed. The manifest records `faults`, `faults_hash`, `fault_events`, and `fault_events_hash`. Bad-tile faults mark the affected terrain tile as `flat_fallback`; stale-terrain faults mark it as `stale`.
 
+For geodetic missions, the manifest also records requested DEM tile evidence under `terrain_tiles`: CRS (`EPSG:4326`), tile bounds, grid resolution, meter resolution, state, and reason. Missing DEM coverage is explicit `flat_fallback`, not silent zero elevation.
+
 To inspect a faulted trace:
 
 ```bash

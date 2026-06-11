@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 namespace agbot::flight_sim {
@@ -32,6 +34,91 @@ float sample_heightmap(const std::vector<float>& heightmap, int resolution, int 
 
 bool same_tile(TileCoordinate a, TileCoordinate b) {
     return a.z == b.z && a.x == b.x && a.y == b.y;
+}
+
+bool bounds_contain(const GeoBounds& bounds, const GeoCoordinate& coordinate) {
+    return coordinate.latitude >= bounds.min_latitude
+        && coordinate.latitude <= bounds.max_latitude
+        && coordinate.longitude >= bounds.min_longitude
+        && coordinate.longitude <= bounds.max_longitude;
+}
+
+std::string escape_json(std::string_view value) {
+    std::ostringstream output;
+    for (const char c : value) {
+        switch (c) {
+            case '"':
+                output << "\\\"";
+                break;
+            case '\\':
+                output << "\\\\";
+                break;
+            case '\n':
+                output << "\\n";
+                break;
+            case '\r':
+                output << "\\r";
+                break;
+            case '\t':
+                output << "\\t";
+                break;
+            default:
+                output << c;
+                break;
+        }
+    }
+    return output.str();
+}
+
+std::optional<TerrainTileStatus> status_for_coordinate(
+    const std::vector<TerrainTileStatus>& tile_states,
+    const GeoCoordinate& coordinate) {
+    for (const TerrainTileStatus& status : tile_states) {
+        if (bounds_contain(status.coordinate.bounds(), coordinate)) {
+            return status;
+        }
+    }
+    return std::nullopt;
+}
+
+float sample_heightmap_bilinear(
+    const std::vector<float>& heightmap,
+    int resolution,
+    double u,
+    double v) {
+    if (resolution <= 0 || heightmap.size() != static_cast<std::size_t>(resolution * resolution)) {
+        return 0.0f;
+    }
+
+    u = std::clamp(u, 0.0, 1.0);
+    v = std::clamp(v, 0.0, 1.0);
+
+    const double fx = u * static_cast<double>(resolution - 1);
+    const double fz = v * static_cast<double>(resolution - 1);
+    const int x0 = static_cast<int>(std::floor(fx));
+    const int z0 = static_cast<int>(std::floor(fz));
+    const int x1 = std::min(x0 + 1, resolution - 1);
+    const int z1 = std::min(z0 + 1, resolution - 1);
+    const double tx = fx - static_cast<double>(x0);
+    const double tz = fz - static_cast<double>(z0);
+
+    const auto at = [&](int x, int z) {
+        return heightmap[static_cast<std::size_t>(z * resolution + x)];
+    };
+
+    const double top = static_cast<double>(at(x0, z0)) * (1.0 - tx) + static_cast<double>(at(x1, z0)) * tx;
+    const double bottom = static_cast<double>(at(x0, z1)) * (1.0 - tx) + static_cast<double>(at(x1, z1)) * tx;
+    return static_cast<float>(top * (1.0 - tz) + bottom * tz);
+}
+
+void write_bounds_json(std::ostringstream& output, const GeoBounds& bounds) {
+    output << std::fixed << std::setprecision(7)
+           << "\"bounds\":{"
+           << "\"min_latitude\":" << bounds.min_latitude
+           << ",\"min_longitude\":" << bounds.min_longitude
+           << ",\"max_latitude\":" << bounds.max_latitude
+           << ",\"max_longitude\":" << bounds.max_longitude
+           << "}";
 }
 
 } // namespace
@@ -111,6 +198,60 @@ bool ElevationComposite::has_state(TerrainTileState state) const {
     });
 }
 
+bool TerrainProfile::contains(const GeoCoordinate& coordinate) const {
+    return asserted && bounds_contain(bounds, coordinate);
+}
+
+std::optional<TerrainSample> ElevationComposite::sample_at(const GeoCoordinate& coordinate) const {
+    if (!profile.contains(coordinate) || heightmap.empty() || profile.resolution <= 0) {
+        return std::nullopt;
+    }
+
+    const double lat_span = profile.bounds.max_latitude - profile.bounds.min_latitude;
+    const double lon_span = profile.bounds.max_longitude - profile.bounds.min_longitude;
+    if (lat_span <= 0.0 || lon_span <= 0.0) {
+        return std::nullopt;
+    }
+
+    const double u = (coordinate.longitude - profile.bounds.min_longitude) / lon_span;
+    const double v = 1.0 - ((coordinate.latitude - profile.bounds.min_latitude) / lat_span);
+    TerrainSample sample;
+    sample.coordinate = coordinate;
+    sample.elevation_m = sample_heightmap_bilinear(heightmap, profile.resolution, u, v);
+
+    if (const auto status = status_for_coordinate(tile_states, coordinate)) {
+        sample.state = status->state;
+        sample.state_reason = status->reason;
+        sample.tile = status->coordinate;
+    } else {
+        sample.state = TerrainTileState::Missing;
+        sample.state_reason = "coordinate is inside terrain extent but no source tile covers it";
+    }
+    return sample;
+}
+
+TerrainElevationAssertion ElevationComposite::assert_elevation_at(
+    const GeoCoordinate& coordinate,
+    float expected_elevation_m,
+    float tolerance_m) const {
+    TerrainElevationAssertion assertion;
+    assertion.expected_elevation_m = expected_elevation_m;
+    assertion.tolerance_m = tolerance_m;
+
+    const auto sample = sample_at(coordinate);
+    if (!sample.has_value()) {
+        assertion.reason = "coordinate_outside_terrain_extent";
+        return assertion;
+    }
+
+    assertion.observed_elevation_m = sample->elevation_m;
+    assertion.state = sample->state;
+    assertion.delta_m = std::abs(sample->elevation_m - expected_elevation_m);
+    assertion.ok = assertion.delta_m <= tolerance_m;
+    assertion.reason = assertion.ok ? "terrain_georeference_asserted" : "elevation_mismatch";
+    return assertion;
+}
+
 const char* to_string(TerrainTileState state) {
     switch (state) {
         case TerrainTileState::Available:
@@ -171,6 +312,71 @@ std::vector<TileCoordinate> tiles_for_bounds(const GeoBounds& bounds, int zoom) 
         }
     }
     return tiles;
+}
+
+std::optional<GeoBounds> terrain_bounds_for_mission(const Mission& mission, double padding_m) {
+    if (!mission.home_geo.has_value()) {
+        return std::nullopt;
+    }
+
+    const GeoCoordinate origin = *mission.home_geo;
+    GeoBounds bounds {
+        origin.latitude,
+        origin.longitude,
+        origin.latitude,
+        origin.longitude,
+    };
+
+    const auto include = [&bounds](const GeoCoordinate& coordinate) {
+        bounds.min_latitude = std::min(bounds.min_latitude, coordinate.latitude);
+        bounds.min_longitude = std::min(bounds.min_longitude, coordinate.longitude);
+        bounds.max_latitude = std::max(bounds.max_latitude, coordinate.latitude);
+        bounds.max_longitude = std::max(bounds.max_longitude, coordinate.longitude);
+    };
+
+    for (const Waypoint& waypoint : mission.waypoints) {
+        include(waypoint.geo.value_or(geo_from_local(waypoint.position, origin)));
+    }
+
+    const GeoCoordinate middle = bounds.center();
+    const double lat_padding = std::max(0.0, padding_m) / kEarthMetersPerDegreeLat;
+    const double lon_padding = std::max(0.0, padding_m) * longitude_degrees_per_meter(middle.latitude);
+    bounds.min_latitude -= lat_padding;
+    bounds.max_latitude += lat_padding;
+    bounds.min_longitude -= lon_padding;
+    bounds.max_longitude += lon_padding;
+    return bounds;
+}
+
+std::vector<TileCoordinate> terrain_tiles_for_bounds_limited(
+    const GeoBounds& bounds,
+    double radius_m,
+    std::size_t max_tiles,
+    int min_zoom) {
+    int zoom = zoom_for_radius_m(radius_m);
+    std::vector<TileCoordinate> requested_tiles = tiles_for_bounds(bounds, zoom);
+    while (requested_tiles.size() > max_tiles && zoom > min_zoom) {
+        --zoom;
+        requested_tiles = tiles_for_bounds(bounds, zoom);
+    }
+    return requested_tiles;
+}
+
+TerrainProfile terrain_profile_for_bounds(const GeoBounds& bounds, int resolution) {
+    TerrainProfile profile;
+    profile.bounds = bounds;
+    profile.resolution = resolution;
+    profile.asserted = resolution > 0
+        && bounds.max_latitude > bounds.min_latitude
+        && bounds.max_longitude > bounds.min_longitude;
+    if (!profile.asserted) {
+        return profile;
+    }
+
+    const double denominator = static_cast<double>(std::max(1, resolution - 1));
+    profile.resolution_x_m = bounds.width_m() / denominator;
+    profile.resolution_y_m = bounds.height_m() / denominator;
+    return profile;
 }
 
 std::optional<ElevationTile> elevation_tile_from_terrarium_rgba(
@@ -256,6 +462,7 @@ ElevationComposite composite_elevation_with_state(
     const std::vector<TileCoordinate>& expected_tiles) {
     ElevationComposite composite;
     composite.heightmap = composite_elevation(tiles, bounds, resolution);
+    composite.profile = terrain_profile_for_bounds(bounds, resolution);
 
     for (const ElevationTile& tile : tiles) {
         composite.tile_states.push_back({
@@ -347,6 +554,54 @@ TerrainMesh build_terrain_mesh(
     }
 
     return mesh;
+}
+
+std::string terrain_tiles_json(const ElevationComposite& composite) {
+    if (composite.tile_states.empty() || !composite.profile.asserted) {
+        return "[]";
+    }
+
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(3) << "[";
+    for (std::size_t index = 0; index < composite.tile_states.size(); ++index) {
+        if (index > 0) {
+            output << ",";
+        }
+        const TerrainTileStatus& status = composite.tile_states[index];
+        const GeoBounds tile_bounds = status.coordinate.bounds();
+        output << "{"
+               << "\"tile\":\"terrain/tile/z" << status.coordinate.z
+               << "/x" << status.coordinate.x
+               << "/y" << status.coordinate.y << "\""
+               << ",\"z\":" << status.coordinate.z
+               << ",\"x\":" << status.coordinate.x
+               << ",\"y\":" << status.coordinate.y
+               << ",\"state\":\"" << to_string(status.state) << "\""
+               << ",\"reason\":\"" << escape_json(status.reason) << "\""
+               << ",\"crs\":\"" << escape_json(composite.profile.crs) << "\"";
+        output << ",";
+        write_bounds_json(output, tile_bounds);
+        output << ",\"resolution\":" << composite.profile.resolution
+               << ",\"resolution_x_m\":" << composite.profile.resolution_x_m
+               << ",\"resolution_y_m\":" << composite.profile.resolution_y_m
+               << "}";
+    }
+    output << "]";
+    return output.str();
+}
+
+std::string terrain_tiles_json_for_mission_fallback(const Mission& mission, int resolution) {
+    const auto bounds = terrain_bounds_for_mission(mission);
+    if (!bounds.has_value()) {
+        return "[]";
+    }
+
+    const double radius_m = std::max(bounds->width_m(), bounds->height_m()) * 0.5;
+    const std::vector<TileCoordinate> expected_tiles =
+        terrain_tiles_for_bounds_limited(*bounds, radius_m);
+    const ElevationComposite composite =
+        composite_elevation_with_state({}, *bounds, resolution, expected_tiles);
+    return terrain_tiles_json(composite);
 }
 
 } // namespace agbot::flight_sim

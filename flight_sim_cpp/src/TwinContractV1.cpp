@@ -202,6 +202,7 @@ TwinContractSchemaV1 build_schema() {
         "trace_retention",
         "tile_cache_control",
         "fault_injection",
+        "terrain_crs_extent_assertions",
     };
     schema.schema_hash = sha256_hex(schema_json_without_hash(schema));
     return schema;

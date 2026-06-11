@@ -76,6 +76,10 @@ for an open `end_step`. Supported classes are `wind_gust`, `gps_drift`,
 `bad_tile`, and `actuator_lag`. The runner rejects any injected fault without a
 seed. The manifest records `faults`, `faults_hash`, `fault_events`, and
 `fault_events_hash`; terrain faults also update `terrain_tiles`.
+For geodetic missions, `terrain_tiles` records the requested DEM tile state,
+CRS (`EPSG:4326`), tile extent, and meter resolution. If DEM data is absent,
+the tile is explicit `flat_fallback`; it is not silently treated as real zero
+elevation.
 
 ## Operational Health
 
@@ -127,7 +131,7 @@ The viewer has a right-side panel for live telemetry, mission/debug state, and c
 Keyboard controls are still available when the simulator view has focus.
 Live viewer runs are recorded automatically to `flight_sim_cpp/out/runs/flight_*.jsonl` and mirrored to `flight_sim_cpp/out/telemetry.jsonl`.
 If the mission has a real `home` coordinate, the viewer tries to load OpenStreetMap tiles under the flight area and caches them in `flight_sim_cpp/out/map_tiles`.
-The viewer can also load a real-world location directly from latitude/longitude. Use the `Location` button to enter a coordinate and area in square kilometers. The C++ viewer creates a local flight footprint, fetches/caches OSM imagery and AWS Terrarium elevation tiles, and renders an elevation-tinted terrain layer behind the mission.
+The viewer can also load a real-world location directly from latitude/longitude. Use the `Location` button to enter a coordinate and area in square kilometers. The C++ viewer creates a local flight footprint, fetches/caches OSM imagery and AWS Terrarium elevation tiles, asserts terrain CRS/extent/resolution through the shared terrain core, and renders an elevation-tinted terrain layer behind the mission. Missing DEM tiles are shown as `flat_fallback` in terrain status.
 
 - `Space`: pause/resume
 - `R`: reset mission
