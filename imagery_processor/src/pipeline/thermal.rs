@@ -1,5 +1,9 @@
 use anyhow::Context;
-use shared::{schemas::MultispectralImage, AgroResult};
+use shared::{
+    error::AgroError,
+    schemas::{assert_raster_spatial_ref, MultispectralImage},
+    AgroResult,
+};
 use std::path::PathBuf;
 use tracing::{error, info};
 
@@ -22,24 +26,119 @@ pub async fn run_thermal(args: &ThermalArgs) -> AgroResult<()> {
 
     info!(count = metadata_files.len(), "Found metadata files");
 
+    let mut failures = Vec::new();
     for mf in metadata_files {
         if let Err(e) = process_one(&mf, args).await {
             error!(file=%mf.display(), error=%e, "Failed thermal processing");
+            failures.push(format!("{}: {}", mf.display(), e));
         }
+    }
+
+    if !failures.is_empty() {
+        return Err(AgroError::Processing(format!(
+            "{} metadata file(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        )));
     }
 
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RunningStats {
+    min: f32,
+    max: f32,
+    sum: f64,
+    count: usize,
+}
+
+impl RunningStats {
+    fn empty() -> Self {
+        Self {
+            min: f32::INFINITY,
+            max: f32::NEG_INFINITY,
+            sum: 0.0,
+            count: 0,
+        }
+    }
+
+    fn record(&mut self, value: f32) {
+        if value.is_finite() {
+            self.min = self.min.min(value);
+            self.max = self.max.max(value);
+            self.sum += value as f64;
+            self.count += 1;
+        }
+    }
+
+    fn mean(self) -> f32 {
+        if self.count > 0 {
+            (self.sum / self.count as f64) as f32
+        } else {
+            f32::NAN
+        }
+    }
+
+    fn min_value(self) -> f32 {
+        if self.count > 0 {
+            self.min
+        } else {
+            f32::NAN
+        }
+    }
+
+    fn max_value(self) -> f32 {
+        if self.count > 0 {
+            self.max
+        } else {
+            f32::NAN
+        }
+    }
+
+    fn with_offset(self, offset: f32) -> Self {
+        if self.count > 0 {
+            Self {
+                min: self.min + offset,
+                max: self.max + offset,
+                sum: self.sum + offset as f64 * self.count as f64,
+                count: self.count,
+            }
+        } else {
+            self
+        }
+    }
+}
+
+fn processing_error(message: impl Into<String>) -> AgroError {
+    AgroError::Processing(message.into())
+}
+
+fn require_thermal_coefficient(name: &'static str, value: Option<f32>) -> AgroResult<f32> {
+    value.ok_or_else(|| processing_error(format!("thermal coefficient '{name}' is required")))
+}
+
+fn stats_json(stats: RunningStats) -> serde_json::Value {
+    serde_json::json!({
+        "min": stats.min_value(),
+        "max": stats.max_value(),
+        "mean": stats.mean(),
+        "count": stats.count,
+    })
+}
+
 async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<()> {
     let metadata_content = tokio::fs::read_to_string(metadata_file).await?;
     let image: MultispectralImage = serde_json::from_str(&metadata_content)?;
+    let spatial_ref = assert_raster_spatial_ref(
+        image.metadata.spatial_ref.as_ref(),
+        image.metadata.width,
+        image.metadata.height,
+    )
+    .map_err(|err| processing_error(err.to_string()))?;
 
     let t_path = image.file_paths.get(&args.thermal_band).ok_or_else(|| {
-        shared::error::AgroError::Processing(format!(
-            "Thermal band '{}' not found",
-            args.thermal_band
-        ))
+        processing_error(format!("Thermal band '{}' not found", args.thermal_band))
     })?;
 
     // Read thermal band as 16-bit if available; fall back to 8-bit
@@ -73,32 +172,23 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
     } else {
         t_img_u8.as_ref().unwrap().dimensions()
     };
+    if (w, h) != (image.metadata.width, image.metadata.height) {
+        return Err(processing_error(format!(
+            "Thermal band dimensions mismatch: expected {}x{}, got {}x{}",
+            image.metadata.width, image.metadata.height, w, h
+        )));
+    }
     let mut out_vis = image::GrayImage::new(w, h);
 
-    // Configure calibration params
-    // Defaults from Landsat 8/9 Collection 2 (typical example values; real scenes vary per metadata)
-    let (ml_def, al_def, k1_def, k2_def, lambda_def) = if is_landsat_b11 {
-        (0.0003342, 0.1, 480.8883, 1201.1442, 12.00) // rough example for B11
-    } else if is_landsat_b10 {
-        (0.0003342, 0.1, 774.8853, 1321.0789, 10.895)
-    } else {
-        // Generic defaults
-        (
-            args.ml.unwrap_or(0.0003342),
-            args.al.unwrap_or(0.1),
-            args.k1.unwrap_or(774.8853),
-            args.k2.unwrap_or(1321.0789),
-            args.lambda_um,
-        )
-    };
-    // Use user overrides if provided, otherwise sensor defaults
-    let ml = args.ml.unwrap_or(ml_def);
-    let al = args.al.unwrap_or(al_def);
-    let k1 = args.k1.unwrap_or(k1_def);
-    let k2 = args.k2.unwrap_or(k2_def);
+    let ml = require_thermal_coefficient("ml", args.ml)?;
+    let al = require_thermal_coefficient("al", args.al)?;
+    let k1 = require_thermal_coefficient("k1", args.k1)?;
+    let k2 = require_thermal_coefficient("k2", args.k2)?;
     let eps = args.emissivity.clamp(0.8, 1.0);
-    let lambda = if is_landsat_b10 || is_landsat_b11 {
-        lambda_def
+    let lambda = if is_landsat_b11 {
+        12.00
+    } else if is_landsat_b10 {
+        10.895
     } else {
         args.lambda_um
     }; // micrometers
@@ -108,9 +198,9 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
     // where rho = h*c/sigma ≈ 1.4388e-2 m*K; since lambda in um, convert: lambda_m = lambda_um * 1e-6
     let rho = 1.4388e-2f64; // m*K
     let lambda_m = (lambda as f64) * 1e-6;
-    let mut min_t = f32::INFINITY;
-    let mut max_t = f32::NEG_INFINITY;
-    let mut sum_t = 0.0f64;
+    let mut radiance_stats = RunningStats::empty();
+    let mut bt_stats = RunningStats::empty();
+    let mut lst_stats = RunningStats::empty();
 
     // Optional mask: non-zero means valid pixel
     let mask_img = if let Some(mask_path) = &args.mask {
@@ -146,19 +236,19 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
             let dn_max = if t_img_u16.is_some() { 65535.0 } else { 255.0 };
             // Radiance
             let l = ml * dn + al; // W/(m^2*sr*um)
-                                  // Brightness temperature from radiance using K1, K2: TB = K2 / ln(K1/L + 1)
+            radiance_stats.record(l);
+            // Brightness temperature from radiance using K1, K2: TB = K2 / ln(K1/L + 1)
             let tb = if l > 0.0 {
                 k2 / ((k1 / l).ln_1p())
             } else {
                 f32::NAN
             };
+            bt_stats.record(tb);
             // Emissivity correction to LST
             let tb_f64 = tb as f64;
             let lst_k = (tb_f64 / (1.0 + (lambda_m * tb_f64 / rho) * (eps as f64).ln())) as f32;
             if lst_k.is_finite() {
-                min_t = min_t.min(lst_k);
-                max_t = max_t.max(lst_k);
-                sum_t += lst_k as f64;
+                lst_stats.record(lst_k);
                 valid_count += 1;
             }
             out_f32[(y as usize) * (w as usize) + (x as usize)] = lst_k;
@@ -173,12 +263,6 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
             out_vis.put_pixel(x, y, image::Luma([vis]));
         }
     }
-
-    let mean_t = if valid_count > 0 {
-        (sum_t / valid_count as f64) as f32
-    } else {
-        f32::NAN
-    };
 
     let out_path = match args.out_format {
         OutputFormat::Png => {
@@ -211,8 +295,11 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
                 .map_err(|e| {
                     shared::error::AgroError::Processing(format!("Create GeoTIFF failed: {}", e))
                 })?;
-                // Try to copy georeferencing from thermal source band
-                let _ = crate::io::gdal_util::copy_geo_from(t_path, p.to_string_lossy().as_ref());
+                crate::io::gdal_util::apply_spatial_ref(p.to_string_lossy().as_ref(), &spatial_ref)
+                    .map_err(|e| {
+                        processing_error(format!("Apply GeoTIFF spatial reference failed: {}", e))
+                    })?;
+                crate::io::write_geotiff_spatial_sidecar(&p, &spatial_ref).await?;
                 p
             }
             #[cfg(not(feature = "gdal-io"))]
@@ -225,9 +312,9 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
     };
 
     // Unit conversion for summary (output GeoTIFF remains Kelvin internally)
-    let (min_out, max_out, mean_out) = match args.unit {
-        TemperatureUnit::Kelvin => (min_t, max_t, mean_t),
-        TemperatureUnit::Celsius => (min_t - 273.15, max_t - 273.15, mean_t - 273.15),
+    let lst_output_stats = match args.unit {
+        TemperatureUnit::Kelvin => lst_stats,
+        TemperatureUnit::Celsius => lst_stats.with_offset(-273.15),
     };
 
     let meta = serde_json::json!({
@@ -235,15 +322,22 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
         "source_images": [image.image_id],
         "output_path": out_path.to_string_lossy(),
         "unit": format!("{:?}", args.unit).to_lowercase(),
-        "min": min_out,
-        "max": max_out,
-        "mean": mean_out,
+        "min": lst_output_stats.min_value(),
+        "max": lst_output_stats.max_value(),
+        "mean": lst_output_stats.mean(),
+        "valid_pixel_count": valid_count,
+        "radiance": stats_json(radiance_stats),
+        "brightness_temperature": stats_json(bt_stats),
+        "lst": stats_json(lst_output_stats),
         "emissivity": eps,
-        "ml": ml,
-        "al": al,
-        "k1": k1,
-        "k2": k2,
-        "lambda_um": lambda,
+        "thermal_coefficients": {
+            "ml": ml,
+            "al": al,
+            "k1": k1,
+            "k2": k2,
+            "lambda_um": lambda,
+        },
+        "spatial_ref": spatial_ref,
     });
 
     let meta_path = args.output_dir.join(format!(

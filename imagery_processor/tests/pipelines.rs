@@ -6,8 +6,9 @@ use imagery_processor::{
         geotiff_spatial_sidecar_path, write_geotiff_spatial_sidecar, BandIngestEvidence,
         CalibrationStatus, GeoTiffSpatialSidecar,
     },
-    pipeline::{indices::run_indices, masks::run_masks},
-    IndexKind, IndicesArgs, MasksArgs, OutputFormat, SensorPreset,
+    pipeline::{indices::run_indices, masks::run_masks, thermal::run_thermal},
+    IndexKind, IndicesArgs, MasksArgs, OutputFormat, SensorPreset, TemperatureUnit, ThermalArgs,
+    ThermalProduct,
 };
 use serde_json::Value;
 use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef};
@@ -161,6 +162,30 @@ fn base_masks_args(input_dir: PathBuf, output_dir: PathBuf) -> MasksArgs {
     }
 }
 
+fn base_thermal_args(input_dir: PathBuf, output_dir: PathBuf) -> ThermalArgs {
+    ThermalArgs {
+        input_dir,
+        output_dir,
+        thermal_band: "Thermal".to_string(),
+        thermal_band2: None,
+        ml: Some(1.0),
+        al: Some(0.0),
+        k1: Some(774.8853),
+        k2: Some(1321.0789),
+        emissivity: 1.0,
+        lambda_um: 10.895,
+        unit: TemperatureUnit::Kelvin,
+        products: vec![ThermalProduct::Lst],
+        split_window: false,
+        emissivity_from_ndvi: false,
+        ndvi_image: None,
+        red: None,
+        nir: None,
+        out_format: OutputFormat::Png,
+        mask: None,
+    }
+}
+
 fn read_result_meta(output_dir: &Path) -> Value {
     let path = fs::read_dir(output_dir)
         .unwrap()
@@ -169,6 +194,19 @@ fn read_result_meta(output_dir: &Path) -> Value {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.ends_with("_result.json"))
+        })
+        .unwrap();
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn read_thermal_meta(output_dir: &Path) -> Value {
+    let path = fs::read_dir(output_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("thermal_result_") && name.ends_with(".json"))
         })
         .unwrap();
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
@@ -242,6 +280,85 @@ fn emissivity_correction_sane() {
     let lst_k = tb / (1.0 + (lambda_m * tb / rho) * eps.ln());
     // For eps < 1, LST should be slightly higher than TB
     assert!(lst_k > tb - 0.01);
+}
+
+#[tokio::test]
+async fn thermal_lst_records_intermediate_stats_and_spatial_ref() {
+    let root = temp_test_dir("thermal_lst_evidence");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let thermal_path = input_dir.join("thermal.png");
+    write_gray16_image(&thermal_path, 2, 1, &[10, 20]);
+    write_metadata(&input_dir, 2, 1, &[("Thermal", thermal_path.as_path())]);
+
+    let args = base_thermal_args(input_dir, output_dir.clone());
+
+    run_thermal(&args).await.unwrap();
+
+    let meta = read_thermal_meta(&output_dir);
+    let expected_bt_10 = (1321.0789_f32 / (774.8853_f32 / 10.0).ln_1p()) as f64;
+    let expected_bt_20 = (1321.0789_f32 / (774.8853_f32 / 20.0).ln_1p()) as f64;
+    assert_eq!(meta["unit"].as_str().unwrap(), "kelvin");
+    assert_eq!(meta["valid_pixel_count"].as_u64().unwrap(), 2);
+    assert_close(meta["radiance"]["min"].as_f64().unwrap(), 10.0);
+    assert_close(meta["radiance"]["max"].as_f64().unwrap(), 20.0);
+    assert_close(
+        meta["brightness_temperature"]["min"].as_f64().unwrap(),
+        expected_bt_10,
+    );
+    assert_close(
+        meta["brightness_temperature"]["max"].as_f64().unwrap(),
+        expected_bt_20,
+    );
+    assert_close(meta["lst"]["min"].as_f64().unwrap(), expected_bt_10);
+    assert_close(meta["lst"]["max"].as_f64().unwrap(), expected_bt_20);
+    assert_eq!(meta["emissivity"].as_f64().unwrap(), 1.0);
+    assert_eq!(meta["thermal_coefficients"]["ml"].as_f64().unwrap(), 1.0);
+    assert_eq!(meta["thermal_coefficients"]["al"].as_f64().unwrap(), 0.0);
+    assert_eq!(meta["spatial_ref"]["crs"].as_str().unwrap(), "EPSG:4326");
+    assert_close(
+        meta["spatial_ref"]["resolution"]["x"].as_f64().unwrap(),
+        0.0001,
+    );
+}
+
+#[tokio::test]
+async fn thermal_errors_when_coefficients_are_missing() {
+    let root = temp_test_dir("thermal_missing_coefficients");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let thermal_path = input_dir.join("thermal.png");
+    write_gray16_image(&thermal_path, 1, 1, &[10]);
+    write_metadata(&input_dir, 1, 1, &[("Thermal", thermal_path.as_path())]);
+
+    let mut args = base_thermal_args(input_dir, output_dir);
+    args.ml = None;
+
+    let error = run_thermal(&args).await.unwrap_err().to_string();
+
+    assert!(error.contains("thermal coefficient 'ml' is required"));
+}
+
+#[tokio::test]
+async fn thermal_errors_when_tir_band_is_missing() {
+    let root = temp_test_dir("thermal_missing_tir");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    write_gray_image(&red_path, 1, 1, &[10]);
+    write_metadata(&input_dir, 1, 1, &[("Red", red_path.as_path())]);
+
+    let args = base_thermal_args(input_dir, output_dir);
+
+    let error = run_thermal(&args).await.unwrap_err().to_string();
+
+    assert!(error.contains("Thermal band 'Thermal' not found"));
 }
 
 #[tokio::test]
