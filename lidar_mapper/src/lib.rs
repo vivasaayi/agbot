@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use shared::{
     config::AgroConfig,
     schemas::{
-        assert_raster_spatial_ref, GeoBounds, LidarScan, RasterResolution, RasterSpatialRef,
+        assert_raster_spatial_ref, GeoBounds, LidarPoint, LidarScan, RasterResolution,
+        RasterSpatialRef,
     },
     AgroResult,
 };
@@ -72,6 +73,7 @@ pub struct LidarScanIngest {
 }
 
 pub const OCCUPANCY_GRID_LOCAL_CRS: &str = "LOCAL_LIDAR_METERS";
+const OUTLIER_DISTANCE_EPSILON_METERS: f64 = 1.0e-9;
 
 #[derive(Debug, Clone)]
 pub struct LidarOccupancyGrid {
@@ -82,6 +84,44 @@ pub struct LidarOccupancyGrid {
     pub height: u32,
     pub min_grid_x: i32,
     pub min_grid_y: i32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LidarOutlierRemovalParams {
+    pub k_neighbors: usize,
+    pub stddev_multiplier: f32,
+}
+
+impl Default for LidarOutlierRemovalParams {
+    fn default() -> Self {
+        Self {
+            k_neighbors: 8,
+            stddev_multiplier: 2.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarOutlierRemovalEvidence {
+    pub points_in: usize,
+    pub points_removed: usize,
+    pub points_out: usize,
+    pub params: LidarOutlierRemovalParams,
+    pub mean_distance_threshold: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CleanedLidarScans {
+    pub scans: Vec<LidarScan>,
+    pub evidence: LidarOutlierRemovalEvidence,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexedLidarPoint {
+    scan_index: usize,
+    point_index: usize,
+    x: f64,
+    y: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +172,10 @@ impl LidarMapper {
         info!("Processing LiDAR scans in: {:?}", input_dir);
 
         let ingest = self.ingest_scans(input_dir, output_dir).await?;
-        let all_scans = ingest.scans;
+        let cleaned = self.clean_scans(&ingest.scans)?;
+        self.save_outlier_removal_evidence(&cleaned.evidence, output_dir)
+            .await?;
+        let all_scans = cleaned.scans;
 
         // Create occupancy grid
         let grid = self.build_occupancy_grid(&all_scans)?;
@@ -289,6 +332,171 @@ impl LidarMapper {
         let content = tokio::fs::read_to_string(scan_file).await?;
         let scan: LidarScan = serde_json::from_str(&content)?;
         Ok(scan)
+    }
+
+    pub fn clean_scans(&self, scans: &[LidarScan]) -> AgroResult<CleanedLidarScans> {
+        self.remove_statistical_outliers(scans, LidarOutlierRemovalParams::default())
+    }
+
+    pub fn remove_statistical_outliers(
+        &self,
+        scans: &[LidarScan],
+        params: LidarOutlierRemovalParams,
+    ) -> AgroResult<CleanedLidarScans> {
+        Self::validate_outlier_params(params)?;
+        let indexed_points = Self::indexed_lidar_points(scans);
+        let points_in = indexed_points.len();
+
+        if points_in <= params.k_neighbors || points_in < 2 {
+            return Ok(Self::unchanged_cleaned_scans(
+                scans, params, points_in, None,
+            ));
+        }
+
+        let mean_distances = Self::mean_neighbor_distances(&indexed_points, params.k_neighbors);
+        let mean = mean_distances.iter().sum::<f64>() / mean_distances.len() as f64;
+        let variance = mean_distances
+            .iter()
+            .map(|distance| {
+                let delta = distance - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / mean_distances.len() as f64;
+        let threshold = mean + params.stddev_multiplier as f64 * variance.sqrt();
+
+        let mut keep_points: Vec<Vec<bool>> = scans
+            .iter()
+            .map(|scan| vec![true; scan.points.len()])
+            .collect();
+        let mut points_removed = 0;
+        for (point, mean_distance) in indexed_points.iter().zip(mean_distances.iter()) {
+            if *mean_distance > threshold + OUTLIER_DISTANCE_EPSILON_METERS {
+                keep_points[point.scan_index][point.point_index] = false;
+                points_removed += 1;
+            }
+        }
+
+        let cleaned_scans = scans
+            .iter()
+            .enumerate()
+            .map(|(scan_index, scan)| {
+                let mut cleaned = scan.clone();
+                cleaned.points = scan
+                    .points
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(point_index, point)| {
+                        keep_points[scan_index][point_index].then(|| point.clone())
+                    })
+                    .collect();
+                cleaned
+            })
+            .collect();
+
+        Ok(CleanedLidarScans {
+            scans: cleaned_scans,
+            evidence: LidarOutlierRemovalEvidence {
+                points_in,
+                points_removed,
+                points_out: points_in - points_removed,
+                params,
+                mean_distance_threshold: Some(threshold),
+            },
+        })
+    }
+
+    fn validate_outlier_params(params: LidarOutlierRemovalParams) -> AgroResult<()> {
+        if params.k_neighbors == 0 {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR outlier removal requires at least one neighbor".into(),
+            ));
+        }
+        if !params.stddev_multiplier.is_finite() || params.stddev_multiplier < 0.0 {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR outlier removal requires a non-negative stddev multiplier".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn unchanged_cleaned_scans(
+        scans: &[LidarScan],
+        params: LidarOutlierRemovalParams,
+        points_in: usize,
+        mean_distance_threshold: Option<f64>,
+    ) -> CleanedLidarScans {
+        CleanedLidarScans {
+            scans: scans.to_vec(),
+            evidence: LidarOutlierRemovalEvidence {
+                points_in,
+                points_removed: 0,
+                points_out: points_in,
+                params,
+                mean_distance_threshold,
+            },
+        }
+    }
+
+    fn indexed_lidar_points(scans: &[LidarScan]) -> Vec<IndexedLidarPoint> {
+        scans
+            .iter()
+            .enumerate()
+            .flat_map(|(scan_index, scan)| {
+                scan.points
+                    .iter()
+                    .enumerate()
+                    .map(move |(point_index, point)| {
+                        let (x, y) = Self::lidar_point_xy(point);
+                        IndexedLidarPoint {
+                            scan_index,
+                            point_index,
+                            x,
+                            y,
+                        }
+                    })
+            })
+            .collect()
+    }
+
+    fn lidar_point_xy(point: &LidarPoint) -> (f64, f64) {
+        let angle_rad = (point.angle as f64).to_radians();
+        let distance_m = point.distance as f64 / 1000.0;
+        (distance_m * angle_rad.cos(), distance_m * angle_rad.sin())
+    }
+
+    fn mean_neighbor_distances(points: &[IndexedLidarPoint], k_neighbors: usize) -> Vec<f64> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let mut distances: Vec<f64> = points
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(other_index, other)| {
+                        (other_index != index).then(|| {
+                            let dx = point.x - other.x;
+                            let dy = point.y - other.y;
+                            dx.hypot(dy)
+                        })
+                    })
+                    .collect();
+                distances.sort_by(f64::total_cmp);
+                distances.iter().take(k_neighbors).sum::<f64>() / k_neighbors as f64
+            })
+            .collect()
+    }
+
+    async fn save_outlier_removal_evidence(
+        &self,
+        evidence: &LidarOutlierRemovalEvidence,
+        output_dir: &PathBuf,
+    ) -> AgroResult<()> {
+        let output_path = output_dir.join("lidar_outlier_removal_evidence.json");
+        let content = serde_json::to_vec_pretty(evidence)?;
+        tokio::fs::write(&output_path, content).await?;
+        info!("Saved LiDAR outlier removal evidence to: {:?}", output_path);
+        Ok(())
     }
 
     pub fn create_occupancy_grid(
@@ -783,5 +991,86 @@ mod tests {
             let err = mapper.build_occupancy_grid(&[]).unwrap_err();
             assert!(err.to_string().contains("positive resolution"));
         }
+    }
+
+    #[test]
+    fn remove_statistical_outliers_records_removed_points() {
+        let mapper = test_mapper();
+        let params = LidarOutlierRemovalParams {
+            k_neighbors: 2,
+            stddev_multiplier: 1.0,
+        };
+        let scan = LidarScan {
+            timestamp: Utc::now(),
+            points: vec![
+                point(0.0, 1000.0),
+                point(5.0, 1000.0),
+                point(355.0, 1000.0),
+                point(10.0, 1100.0),
+                point(0.0, 50_000.0),
+            ],
+            scan_id: Uuid::new_v4(),
+        };
+
+        let cleaned = mapper.remove_statistical_outliers(&[scan], params).unwrap();
+
+        assert_eq!(cleaned.evidence.points_in, 5);
+        assert_eq!(cleaned.evidence.points_removed, 1);
+        assert_eq!(cleaned.evidence.points_out, 4);
+        assert_eq!(cleaned.evidence.params, params);
+        assert!(cleaned.evidence.mean_distance_threshold.is_some());
+        assert_eq!(cleaned.scans[0].points.len(), 4);
+        assert!(cleaned.scans[0]
+            .points
+            .iter()
+            .all(|point| point.distance < 50_000.0));
+    }
+
+    #[test]
+    fn remove_statistical_outliers_keeps_clean_cloud() {
+        let mapper = test_mapper();
+        let params = LidarOutlierRemovalParams {
+            k_neighbors: 2,
+            stddev_multiplier: 1.0,
+        };
+        let scan = LidarScan {
+            timestamp: Utc::now(),
+            points: vec![
+                point(0.0, 1000.0),
+                point(90.0, 1000.0),
+                point(180.0, 1000.0),
+                point(270.0, 1000.0),
+            ],
+            scan_id: Uuid::new_v4(),
+        };
+
+        let cleaned = mapper.remove_statistical_outliers(&[scan], params).unwrap();
+
+        assert_eq!(cleaned.evidence.points_in, 4);
+        assert_eq!(cleaned.evidence.points_removed, 0);
+        assert_eq!(cleaned.evidence.points_out, 4);
+        assert_eq!(cleaned.scans[0].points.len(), 4);
+    }
+
+    #[test]
+    fn remove_statistical_outliers_handles_degenerate_cloud_without_crash() {
+        let mapper = test_mapper();
+        let params = LidarOutlierRemovalParams {
+            k_neighbors: 8,
+            stddev_multiplier: 1.0,
+        };
+        let scan = LidarScan {
+            timestamp: Utc::now(),
+            points: vec![point(0.0, 1000.0)],
+            scan_id: Uuid::new_v4(),
+        };
+
+        let cleaned = mapper.remove_statistical_outliers(&[scan], params).unwrap();
+
+        assert_eq!(cleaned.evidence.points_in, 1);
+        assert_eq!(cleaned.evidence.points_removed, 0);
+        assert_eq!(cleaned.evidence.points_out, 1);
+        assert_eq!(cleaned.evidence.mean_distance_threshold, None);
+        assert_eq!(cleaned.scans[0].points.len(), 1);
     }
 }
