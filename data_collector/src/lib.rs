@@ -852,8 +852,17 @@ impl DataCollectorService {
         };
         let exporter = DataExporter::new(export_config);
 
-        // TODO: Load session data first
-        let session_records = Vec::new(); // Placeholder
+        let mut session_records = Vec::with_capacity(session.data_records.len());
+        for record_id in &session.data_records {
+            let record = self.storage.load_data(record_id).await?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "record {} listed in session {} was not found",
+                    record_id,
+                    session.id
+                )
+            })?;
+            session_records.push(record);
+        }
 
         match exporter
             .export_session(&session, &session_records, output_path)
@@ -1314,6 +1323,91 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, record_id);
+    }
+
+    #[tokio::test]
+    async fn test_export_session_json_loads_real_records() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let record = telemetry_record(&session);
+        let record_id = record.id;
+
+        service.collect_data(&session_id, record).await.unwrap();
+
+        let output_path = temp_dir.path().join("session-export.json");
+        service
+            .export_session(&session_id, ExportFormat::Json, &output_path)
+            .await
+            .unwrap();
+
+        let exported_json = tokio::fs::read(&output_path).await.unwrap();
+        let exported: serde_json::Value = serde_json::from_slice(&exported_json).unwrap();
+        let records = exported["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"].as_str().unwrap(), record_id.to_string());
+        assert_eq!(
+            records[0]["session_id"].as_str().unwrap(),
+            session_id.to_string()
+        );
+        assert_eq!(records[0]["sensor_id"].as_str().unwrap(), "sensor-rgb-01");
+        assert_eq!(
+            records[0]["calibration_ref"].as_str().unwrap(),
+            "calibration-2026-06"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_session_csv_loads_real_records() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let record = telemetry_record(&session);
+        let record_id = record.id;
+
+        service.collect_data(&session_id, record).await.unwrap();
+
+        let output_path = temp_dir.path().join("session-export.csv");
+        service
+            .export_session(&session_id, ExportFormat::Csv, &output_path)
+            .await
+            .unwrap();
+
+        let exported = tokio::fs::read_to_string(&output_path).await.unwrap();
+        let lines = exported.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("record_id,session_id"));
+        assert!(lines[1].contains(&record_id.to_string()));
+        assert!(lines[1].contains("sensor-rgb-01"));
+        assert!(lines[1].contains("calibration-2026-06"));
+    }
+
+    #[tokio::test]
+    async fn test_export_session_json_allows_empty_session() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+
+        let output_path = temp_dir.path().join("empty-session-export.json");
+        service
+            .export_session(&session_id, ExportFormat::Json, &output_path)
+            .await
+            .unwrap();
+
+        let exported_json = tokio::fs::read(&output_path).await.unwrap();
+        let exported: serde_json::Value = serde_json::from_slice(&exported_json).unwrap();
+        assert_eq!(exported["records"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

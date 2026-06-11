@@ -72,25 +72,63 @@ impl DataExporter {
         records: &[FlightDataRecord],
         output_path: &Path,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let file = File::create(output_path)?;
-        let mut writer = BufWriter::new(file);
-
-        // Write CSV header
-        writeln!(writer, "timestamp,drone_id,data_type,position")?;
+        let mut writer = csv::Writer::from_path(output_path)?;
+        writer.write_record([
+            "record_id",
+            "session_id",
+            "timestamp",
+            "flight_id",
+            "drone_id",
+            "data_type",
+            "sensor_id",
+            "gps_lat",
+            "gps_lon",
+            "gps_alt",
+            "calibration_ref",
+            "size_bytes",
+            "position_lat",
+            "position_lon",
+            "position_alt",
+        ])?;
 
         for record in records {
-            writeln!(
-                writer,
-                "{},{},{:?},{}",
-                record.timestamp.timestamp(),
-                record.drone_id,
-                record.data_type,
-                match &record.payload {
-                    crate::DataPayload::Telemetry { position, .. } =>
-                        format!("{},{},{}", position.0, position.1, position.2),
-                    _ => ",,".to_string(),
-                }
-            )?;
+            let (gps_lat, gps_lon, gps_alt) = record
+                .gps_coords
+                .as_ref()
+                .map(|coords| {
+                    (
+                        coords.latitude.to_string(),
+                        coords.longitude.to_string(),
+                        coords.altitude.to_string(),
+                    )
+                })
+                .unwrap_or_else(|| (String::new(), String::new(), String::new()));
+            let (position_lat, position_lon, position_alt) = match &record.payload {
+                crate::DataPayload::Telemetry { position, .. } => (
+                    position.0.to_string(),
+                    position.1.to_string(),
+                    position.2.to_string(),
+                ),
+                _ => (String::new(), String::new(), String::new()),
+            };
+
+            writer.write_record(vec![
+                record.id.to_string(),
+                record.session_id.to_string(),
+                record.timestamp.to_rfc3339(),
+                record.flight_id.to_string(),
+                record.drone_id.to_string(),
+                format!("{:?}", record.data_type),
+                record.sensor_id.clone(),
+                gps_lat,
+                gps_lon,
+                gps_alt,
+                record.calibration_ref.clone(),
+                record.size_bytes.to_string(),
+                position_lat,
+                position_lon,
+                position_alt,
+            ])?;
         }
 
         writer.flush()?;
