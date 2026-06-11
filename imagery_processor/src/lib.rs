@@ -266,6 +266,8 @@ pub mod pipeline {
     pub mod thermal;
 }
 
+pub mod io;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexResultMeta {
     pub timestamp: chrono::DateTime<chrono::Utc>,

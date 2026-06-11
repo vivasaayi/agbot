@@ -87,28 +87,53 @@ fn valid_mask_at(mask_img: &Option<GrayImage>, x: u32, y: u32) -> bool {
 }
 
 async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<()> {
-    let metadata_content = tokio::fs::read_to_string(metadata_file).await?;
-    let image: MultispectralImage = serde_json::from_str(&metadata_content)?;
+    let overrides = crate::io::BandOverrides::from_indices_args(args);
+    let ingest = crate::io::ingest_multispectral_image(metadata_file, args.sensor, &overrides)
+        .await
+        .map_err(|err| processing_error(err.to_string()))?;
+    crate::io::write_band_ingest_evidence(&args.output_dir, &ingest.evidence)
+        .await
+        .map_err(|err| processing_error(err.to_string()))?;
 
-    // Resolve band names
-    let preset = args.sensor;
-    let (def_red, def_nir, def_re) = preset
+    let image: MultispectralImage = ingest.image;
+
+    let (def_red, def_nir, def_re) = args
+        .sensor
         .map(|p| p.default_bands())
         .unwrap_or((None, None, None));
-    let (red_name, nir_name, re_name) = (
-        args.red
-            .clone()
-            .or(def_red.map(|s| s.to_string()))
-            .unwrap_or_else(|| "Red".to_string()),
-        args.nir
-            .clone()
-            .or(def_nir.map(|s| s.to_string()))
-            .unwrap_or_else(|| "NIR".to_string()),
-        args.red_edge
-            .clone()
-            .or(def_re.map(|s| s.to_string()))
-            .unwrap_or_else(|| "RE".to_string()),
-    );
+    let red_name = ingest
+        .evidence
+        .resolved_bands
+        .get("red")
+        .cloned()
+        .unwrap_or_else(|| {
+            args.red
+                .clone()
+                .or(def_red.map(|s| s.to_string()))
+                .unwrap_or_else(|| "Red".to_string())
+        });
+    let nir_name = ingest
+        .evidence
+        .resolved_bands
+        .get("nir")
+        .cloned()
+        .unwrap_or_else(|| {
+            args.nir
+                .clone()
+                .or(def_nir.map(|s| s.to_string()))
+                .unwrap_or_else(|| "NIR".to_string())
+        });
+    let re_name = ingest
+        .evidence
+        .resolved_bands
+        .get("red_edge")
+        .cloned()
+        .unwrap_or_else(|| {
+            args.red_edge
+                .clone()
+                .or(def_re.map(|s| s.to_string()))
+                .unwrap_or_else(|| "RE".to_string())
+        });
     let green_name = args.green.clone().unwrap_or_else(|| "Green".to_string());
     let blue_name = args.blue.clone().unwrap_or_else(|| "Blue".to_string());
     let swir1_name = args.swir1.clone().unwrap_or_else(|| "SWIR1".to_string());

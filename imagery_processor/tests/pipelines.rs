@@ -1,7 +1,10 @@
 // Minimal unit/integration tests for index edge cases and thermal calibration math.
 
 use image::{GrayImage, Luma};
-use imagery_processor::{pipeline::indices::run_indices, IndexKind, IndicesArgs, OutputFormat};
+use imagery_processor::{
+    io::BandIngestEvidence, pipeline::indices::run_indices, IndexKind, IndicesArgs, OutputFormat,
+    SensorPreset,
+};
 use serde_json::Value;
 use std::{
     fs,
@@ -88,6 +91,19 @@ fn read_result_meta(output_dir: &Path) -> Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
+fn read_band_ingest_evidence(output_dir: &Path) -> BandIngestEvidence {
+    let path = fs::read_dir(output_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("band_ingest_") && name.ends_with(".json"))
+        })
+        .unwrap();
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
 #[test]
 fn ndvi_handles_zero_denominator() {
     // (n - r) / (n + r) when n = r = 0 should not panic and yield 0/NODATA per our logic
@@ -164,6 +180,44 @@ async fn ndvi_stats_use_valid_masked_pixels_only() {
     assert!((mean - 0.5).abs() < 1e-6);
     assert!((min - 0.5).abs() < 1e-6);
     assert!((max - 0.5).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn indices_persist_sentinel2_band_ingest_evidence() {
+    let root = temp_test_dir("sentinel2_ingest_evidence");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("b04.png");
+    let nir_path = input_dir.join("b08.png");
+    let red_edge_path = input_dir.join("b05.png");
+    write_gray_image(&red_path, 2, 1, &[10, 10]);
+    write_gray_image(&nir_path, 2, 1, &[30, 30]);
+    write_gray_image(&red_edge_path, 2, 1, &[20, 20]);
+    write_metadata(
+        &input_dir,
+        2,
+        1,
+        &[
+            ("B04", red_path.as_path()),
+            ("B08", nir_path.as_path()),
+            ("B05", red_edge_path.as_path()),
+        ],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.sensor = Some(SensorPreset::Sentinel2);
+
+    run_indices(&args).await.unwrap();
+
+    let evidence = read_band_ingest_evidence(&output_dir);
+    assert_eq!(evidence.sensor.as_deref(), Some("sentinel2"));
+    assert_eq!(evidence.width, 2);
+    assert_eq!(evidence.height, 1);
+    assert_eq!(evidence.resolved_bands.get("red").unwrap(), "B04");
+    assert_eq!(evidence.resolved_bands.get("nir").unwrap(), "B08");
+    assert_eq!(evidence.resolved_bands.get("red_edge").unwrap(), "B05");
 }
 
 #[tokio::test]
