@@ -18,9 +18,9 @@ use geojson::{
 use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    assert_raster_spatial_ref, bounds_from_points, AnnotationGeometry, AnnotationRecord,
-    FarmRecord, FieldBoundary, FieldRecord, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
-    MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
+    assert_raster_spatial_ref, bounds_from_points, validate_field_boundary, AnnotationGeometry,
+    AnnotationRecord, FarmRecord, FieldBoundary, FieldRecord, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
     RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, DEFAULT_RECORD_OWNER,
     GEO_EXTENT_ASSERTION_TOLERANCE,
 };
@@ -3387,7 +3387,9 @@ fn feature_from_field(field: FieldRecord) -> Feature {
         .map(|point| vec![point.longitude, point.latitude])
         .collect();
     if let Some(first) = ring.first().cloned() {
-        ring.push(first);
+        if ring.last() != Some(&first) {
+            ring.push(first);
+        }
     }
 
     let mut properties = serde_json::Map::new();
@@ -3611,6 +3613,8 @@ fn build_field_from_feature(feature: geojson::Feature, index: usize) -> AppResul
     let name = property_string(&properties, "name")
         .or_else(|| property_string(&properties, "field_name"))
         .unwrap_or_else(|| format!("Imported Field {}", index + 1));
+    let crs =
+        property_string(&properties, "crs").or_else(|| property_string(&properties, "source_crs"));
 
     build_field_from_geometry(
         geometry,
@@ -3625,8 +3629,7 @@ fn build_field_from_feature(feature: geojson::Feature, index: usize) -> AppResul
             notes: property_string(&properties, "notes"),
             boundary: FieldBoundary {
                 coordinates: Vec::new(),
-                crs: property_string(&properties, "crs")
-                    .or_else(|| property_string(&properties, "source_crs")),
+                crs,
             },
         }),
         index,
@@ -3653,7 +3656,9 @@ fn build_field_from_geometry(
             crs: None,
         },
     });
-    boundary.crs = template.boundary.crs.clone();
+    boundary.crs = Some(normalize_geojson_crs(template.boundary.crs.clone())?);
+    validate_field_boundary(&boundary)
+        .map_err(|err| AppError::BadRequest(format!("invalid GeoJSON field boundary: {err}")))?;
 
     build_field_record(CreateFieldRequest {
         farm_id: template.farm_id,
@@ -3710,14 +3715,33 @@ fn boundary_from_ring(ring: Vec<Vec<f64>>) -> AppResult<FieldBoundary> {
         });
     }
 
-    if coordinates.len() >= 2 && coordinates.first() == coordinates.last() {
-        coordinates.pop();
-    }
-
     Ok(FieldBoundary {
         coordinates,
         crs: None,
     })
+}
+
+fn normalize_geojson_crs(value: Option<String>) -> AppResult<String> {
+    let Some(value) = value else {
+        return Ok("EPSG:4326".to_string());
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok("EPSG:4326".to_string());
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if upper == "EPSG:4326"
+        || upper == "CRS84"
+        || upper.contains("OGC:1.3:CRS84")
+        || upper.contains("WGS 84")
+        || upper.contains("WGS_1984")
+    {
+        return Ok("EPSG:4326".to_string());
+    }
+
+    Err(AppError::BadRequest(format!(
+        "unsupported GeoJSON CRS: {trimmed}"
+    )))
 }
 
 fn normalize_crs_text(value: &str) -> Option<String> {
@@ -4498,13 +4522,15 @@ async fn load_scene_metadata(
 mod tests {
     use super::{
         build_field_record, build_geospatial_metadata, build_product_summary,
-        cached_landsat_scene_id, content_type_for_path, is_missing_scene_error, is_png,
-        normalize_field_geometry, scene_extent_intersects_bounds, AppError, CreateFieldRequest,
+        cached_landsat_scene_id, content_type_for_path, fields_from_geojson, geojson_from_fields,
+        is_missing_scene_error, is_png, normalize_field_geometry, scene_extent_intersects_bounds,
+        AppError, CreateFieldRequest,
     };
     use crate::landsat;
+    use geojson::{Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue};
     use shared::schemas::{
-        FieldBoundary, GeoBounds, GeoPoint, GpsCoords, ImageMetadata, MultispectralImage,
-        RasterResolution, RasterSpatialRef,
+        validate_field_boundary, FieldBoundary, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
+        MultispectralImage, RasterResolution, RasterSpatialRef,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -4781,6 +4807,89 @@ mod tests {
         .expect_err("invalid coordinates should be rejected");
 
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn geojson_import_defaults_crs_and_round_trips_closed_polygon() {
+        let geojson = GeoJson::Feature(square_feature(None));
+
+        let fields = fields_from_geojson(geojson).expect("field imports");
+
+        assert_eq!(fields.len(), 1);
+        let field = &fields[0];
+        assert_eq!(field.boundary.crs.as_deref(), Some("EPSG:4326"));
+        assert_eq!(
+            field.boundary.coordinates.first(),
+            field.boundary.coordinates.last()
+        );
+        validate_field_boundary(&field.boundary).expect("imported boundary validates");
+        let imported_ring_len = field.boundary.coordinates.len();
+
+        let exported = geojson_from_fields(fields);
+        let GeoJson::FeatureCollection(FeatureCollection { features, .. }) = exported else {
+            panic!("fields export as feature collection");
+        };
+        let GeoJsonValue::Polygon(rings) = features[0]
+            .geometry
+            .as_ref()
+            .expect("geometry exists")
+            .value
+            .clone()
+        else {
+            panic!("field exports as polygon");
+        };
+
+        assert_eq!(rings[0].first(), rings[0].last());
+        assert_eq!(rings[0].len(), imported_ring_len);
+        assert_eq!(
+            features[0]
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("crs"))
+                .and_then(|value| value.as_str()),
+            Some("EPSG:4326")
+        );
+    }
+
+    #[test]
+    fn geojson_import_rejects_unsupported_crs() {
+        let err = fields_from_geojson(GeoJson::Feature(square_feature(Some("EPSG:3857"))))
+            .expect_err("unsupported CRS is rejected");
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(format!("{err}").contains("unsupported GeoJSON CRS"));
+    }
+
+    fn square_feature(crs: Option<&str>) -> Feature {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "field_id".to_string(),
+            serde_json::Value::String("geojson-field".to_string()),
+        );
+        properties.insert(
+            "name".to_string(),
+            serde_json::Value::String("GeoJSON Field".to_string()),
+        );
+        if let Some(crs) = crs {
+            properties.insert(
+                "crs".to_string(),
+                serde_json::Value::String(crs.to_string()),
+            );
+        }
+
+        Feature {
+            bbox: None,
+            geometry: Some(Geometry::new(GeoJsonValue::Polygon(vec![vec![
+                vec![-96.5, 41.2],
+                vec![-96.2, 41.2],
+                vec![-96.2, 41.4],
+                vec![-96.5, 41.4],
+                vec![-96.5, 41.2],
+            ]]))),
+            id: None,
+            properties: Some(properties),
+            foreign_members: None,
+        }
     }
 
     #[test]
