@@ -2,11 +2,12 @@ use crate::{config::HubConfig, db::DbPool};
 use anyhow::{anyhow, Result};
 use clap::Args;
 use imagery_processor::{IndexKind, IndicesArgs, OutputFormat, Processor, SensorPreset};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use shared::schemas::{MultispectralImage, DEFAULT_RECORD_OWNER};
 use sqlx::Row;
 use std::{
     collections::HashMap,
+    fmt,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -34,51 +35,194 @@ struct SceneMetadataSummary {
     image_id: Uuid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SceneIngestStatus {
+    Queued,
+    Downloading,
+    Processing,
+    Stored,
+    Failed,
+}
+
+impl SceneIngestStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "Queued",
+            Self::Downloading => "Downloading",
+            Self::Processing => "Processing",
+            Self::Stored => "Stored",
+            Self::Failed => "Failed",
+        }
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Queued, Self::Downloading)
+                | (Self::Downloading, Self::Processing)
+                | (Self::Downloading, Self::Failed)
+                | (Self::Processing, Self::Stored)
+                | (Self::Processing, Self::Failed)
+                | (Self::Stored, Self::Queued)
+                | (Self::Failed, Self::Queued)
+        )
+    }
+}
+
+impl TryFrom<&str> for SceneIngestStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "Queued" => Ok(Self::Queued),
+            "Downloading" => Ok(Self::Downloading),
+            "Processing" => Ok(Self::Processing),
+            "Stored" => Ok(Self::Stored),
+            "Failed" => Ok(Self::Failed),
+            other => Err(anyhow!("unknown scene ingest status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneIngestRecord {
+    pub scene_id: String,
+    pub status: SceneIngestStatus,
+    pub status_reason: Option<String>,
+    pub ingested_at: Option<String>,
+    pub acquisition_date: Option<String>,
+    pub coverage_fraction: Option<f64>,
+}
+
+#[derive(Debug)]
+struct IngestStepError {
+    reason_code: &'static str,
+    error: anyhow::Error,
+}
+
+impl fmt::Display for IngestStepError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.reason_code, self.error)
+    }
+}
+
+fn ingest_step_error<E>(reason_code: &'static str, error: E) -> IngestStepError
+where
+    E: Into<anyhow::Error>,
+{
+    IngestStepError {
+        reason_code,
+        error: error.into(),
+    }
+}
+
+type IngestStepResult<T> = std::result::Result<T, IngestStepError>;
+
 pub async fn ingest_landsat(
     args: IngestLandsatArgs,
     config: &HubConfig,
     pool: &DbPool,
-) -> Result<()> {
+) -> Result<SceneIngestRecord> {
     let scenes_root = config.data_root.join("scenes");
     fs::create_dir_all(&scenes_root).await?;
-
-    let metadata_path = discover_metadata(&args.source_dir).await?;
-    let metadata_json_original = fs::read_to_string(&metadata_path).await?;
-    let mut image: MultispectralImage = serde_json::from_str(&metadata_json_original)?;
-
     let scene_dir = scenes_root.join(&args.scene_id);
+    let source_path = args.source_dir.to_string_lossy().to_string();
+
+    record_ingest_status(
+        pool,
+        &args.scene_id,
+        SceneIngestStatus::Queued,
+        None,
+        None,
+        None,
+        None,
+        &source_path,
+    )
+    .await?;
+    record_ingest_status(
+        pool,
+        &args.scene_id,
+        SceneIngestStatus::Downloading,
+        None,
+        None,
+        None,
+        None,
+        &source_path,
+    )
+    .await?;
+
+    match ingest_landsat_inner(&args, pool, &scene_dir, &source_path).await {
+        Ok(record) => Ok(record),
+        Err(err) => {
+            if let Err(cleanup_err) = cleanup_failed_ingest(pool, &args.scene_id, &scene_dir).await
+            {
+                warn!(
+                    scene = %args.scene_id,
+                    error = %cleanup_err,
+                    "failed to clean up partial scene ingest"
+                );
+            }
+            let _ = record_ingest_status(
+                pool,
+                &args.scene_id,
+                SceneIngestStatus::Failed,
+                Some(err.reason_code),
+                None,
+                None,
+                None,
+                &source_path,
+            )
+            .await?;
+            Err(anyhow!(err.to_string()))
+        }
+    }
+}
+
+async fn ingest_landsat_inner(
+    args: &IngestLandsatArgs,
+    pool: &DbPool,
+    scene_dir: &Path,
+    source_path: &str,
+) -> IngestStepResult<SceneIngestRecord> {
+    let metadata_path = discover_metadata(&args.source_dir)
+        .await
+        .map_err(|err| ingest_step_error("download_error", err))?;
+    let metadata_json_original = fs::read_to_string(&metadata_path)
+        .await
+        .map_err(|err| ingest_step_error("download_error", err))?;
+    let mut image: MultispectralImage = serde_json::from_str(&metadata_json_original)
+        .map_err(|err| ingest_step_error("metadata_error", err))?;
+
     if scene_dir.exists() {
         warn!(scene = %args.scene_id, "scene already ingested, overwriting metadata only");
     }
-    fs::create_dir_all(&scene_dir).await?;
+    fs::create_dir_all(&scene_dir)
+        .await
+        .map_err(|err| ingest_step_error("store_error", err))?;
+    let coverage_fraction = copy_scene_assets(&args.source_dir, scene_dir, &mut image).await?;
 
-    let mut rewritten_paths = HashMap::new();
-    for (band, path) in &image.file_paths {
-        let src = resolve_band_source(&args.source_dir, path);
-        let file_name = src
-            .file_name()
-            .map(|f| f.to_owned())
-            .unwrap_or_else(|| std::ffi::OsString::from(format!("{}_band", band)));
-        let dest = scene_dir.join(&file_name);
-        if src.exists() {
-            fs::copy(&src, &dest).await?;
-            rewritten_paths.insert(band.clone(), dest.to_string_lossy().to_string());
-        } else {
-            warn!(
-                band,
-                path, "band file missing, keeping original path reference"
-            );
-            rewritten_paths.insert(band.clone(), path.clone());
-        }
-    }
-    image.file_paths = rewritten_paths;
+    record_ingest_status(
+        pool,
+        &args.scene_id,
+        SceneIngestStatus::Processing,
+        None,
+        None,
+        None,
+        Some(coverage_fraction),
+        source_path,
+    )
+    .await
+    .map_err(|err| ingest_step_error("store_error", err))?;
 
     let metadata_filename = metadata_path
         .file_name()
         .map(|f| f.to_owned())
         .unwrap_or_else(|| std::ffi::OsString::from("metadata_ingested.json"));
-    let metadata_json = serde_json::to_string_pretty(&image)?;
-    fs::write(scene_dir.join(&metadata_filename), &metadata_json).await?;
+    let metadata_json = serde_json::to_string_pretty(&image)
+        .map_err(|err| ingest_step_error("metadata_error", err))?;
+    fs::write(scene_dir.join(&metadata_filename), &metadata_json)
+        .await
+        .map_err(|err| ingest_step_error("processing_error", err))?;
 
     let summary = SceneMetadataSummary {
         scene_id: args.scene_id.clone(),
@@ -88,6 +232,8 @@ pub async fn ingest_landsat(
         timestamp: image.metadata.timestamp,
         image_id: image.image_id,
     };
+    let acquisition_date = summary.timestamp.date_naive().to_string();
+    let ingested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     sqlx::query(
         r#"
@@ -105,11 +251,25 @@ pub async fn ingest_landsat(
     .bind(scene_dir.to_string_lossy().to_string())
     .bind(&metadata_json)
     .execute(pool)
-    .await?;
+    .await
+    .map_err(|err| ingest_step_error("store_error", err))?;
+
+    let record = record_ingest_status(
+        pool,
+        &args.scene_id,
+        SceneIngestStatus::Stored,
+        None,
+        Some(&ingested_at),
+        Some(&acquisition_date),
+        Some(coverage_fraction),
+        source_path,
+    )
+    .await
+    .map_err(|err| ingest_step_error("store_error", err))?;
 
     info!(scene = %args.scene_id, "scene ingested");
 
-    Ok(())
+    Ok(record)
 }
 
 async fn discover_metadata(source_dir: &Path) -> Result<PathBuf> {
@@ -129,6 +289,145 @@ async fn discover_metadata(source_dir: &Path) -> Result<PathBuf> {
     }
 
     metadata_path.ok_or_else(|| anyhow!("metadata file not found in {}", source_dir.display()))
+}
+
+async fn copy_scene_assets(
+    source_dir: &Path,
+    scene_dir: &Path,
+    image: &mut MultispectralImage,
+) -> IngestStepResult<f64> {
+    let total_assets = image.file_paths.len();
+    let mut copied_assets = 0usize;
+    let mut rewritten_paths = HashMap::new();
+
+    for (band, path) in &image.file_paths {
+        let src = resolve_band_source(source_dir, path);
+        let file_name = src
+            .file_name()
+            .map(|f| f.to_owned())
+            .unwrap_or_else(|| std::ffi::OsString::from(format!("{}_band", band)));
+        let dest = scene_dir.join(&file_name);
+        if !src.exists() {
+            warn!(
+                band,
+                path, "band file missing, keeping original path reference"
+            );
+            rewritten_paths.insert(band.clone(), path.clone());
+            continue;
+        }
+        let metadata = fs::metadata(&src)
+            .await
+            .map_err(|err| ingest_step_error("download_error", err))?;
+        if !metadata.is_file() {
+            return Err(ingest_step_error(
+                "download_error",
+                anyhow!("source asset {} is not a file", src.display()),
+            ));
+        }
+        fs::copy(&src, &dest)
+            .await
+            .map_err(|err| ingest_step_error("download_error", err))?;
+        copied_assets += 1;
+        rewritten_paths.insert(band.clone(), dest.to_string_lossy().to_string());
+    }
+
+    image.file_paths = rewritten_paths;
+    if total_assets == 0 {
+        Ok(0.0)
+    } else {
+        Ok(copied_assets as f64 / total_assets as f64)
+    }
+}
+
+pub async fn load_ingest_record(
+    pool: &DbPool,
+    scene_id: &str,
+) -> Result<Option<SceneIngestRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT scene_id, status, status_reason, ingested_at, acquisition_date, coverage_fraction
+        FROM scene_ingests
+        WHERE scene_id = ?1
+        "#,
+    )
+    .bind(scene_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|row| {
+        let status_text: String = row.get("status");
+        Ok(SceneIngestRecord {
+            scene_id: row.get("scene_id"),
+            status: SceneIngestStatus::try_from(status_text.as_str())?,
+            status_reason: row.get("status_reason"),
+            ingested_at: row.get("ingested_at"),
+            acquisition_date: row.get("acquisition_date"),
+            coverage_fraction: row.get("coverage_fraction"),
+        })
+    })
+    .transpose()
+}
+
+async fn record_ingest_status(
+    pool: &DbPool,
+    scene_id: &str,
+    status: SceneIngestStatus,
+    status_reason: Option<&str>,
+    ingested_at: Option<&str>,
+    acquisition_date: Option<&str>,
+    coverage_fraction: Option<f64>,
+    source_path: &str,
+) -> Result<SceneIngestRecord> {
+    sqlx::query(
+        r#"
+        INSERT INTO scene_ingests (
+            scene_id, status, status_reason, ingested_at, acquisition_date,
+            coverage_fraction, source_path, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+        ON CONFLICT(scene_id) DO UPDATE SET
+            status = excluded.status,
+            status_reason = excluded.status_reason,
+            ingested_at = excluded.ingested_at,
+            acquisition_date = excluded.acquisition_date,
+            coverage_fraction = excluded.coverage_fraction,
+            source_path = excluded.source_path,
+            updated_at = datetime('now')
+        "#,
+    )
+    .bind(scene_id)
+    .bind(status.as_str())
+    .bind(status_reason)
+    .bind(ingested_at)
+    .bind(acquisition_date)
+    .bind(coverage_fraction)
+    .bind(source_path)
+    .execute(pool)
+    .await?;
+
+    Ok(SceneIngestRecord {
+        scene_id: scene_id.to_string(),
+        status,
+        status_reason: status_reason.map(ToOwned::to_owned),
+        ingested_at: ingested_at.map(ToOwned::to_owned),
+        acquisition_date: acquisition_date.map(ToOwned::to_owned),
+        coverage_fraction,
+    })
+}
+
+async fn cleanup_failed_ingest(pool: &DbPool, scene_id: &str, scene_dir: &Path) -> Result<()> {
+    if fs::try_exists(scene_dir).await.unwrap_or(false) {
+        fs::remove_dir_all(scene_dir).await?;
+    }
+    sqlx::query("DELETE FROM products WHERE scene_id = ?1")
+        .bind(scene_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM scenes WHERE scene_id = ?1")
+        .bind(scene_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn ensure_product(pool: &DbPool, scene_id: &str, kind: &str) -> Result<PathBuf> {
@@ -275,4 +574,150 @@ async fn find_latest_file(dir: &Path, extensions: &[&str]) -> Result<PathBuf> {
     latest
         .map(|(_, path)| path)
         .ok_or_else(|| anyhow!("no product files produced in {}", dir.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use shared::schemas::{ImageMetadata, MultispectralImage};
+    use tempfile::TempDir;
+
+    #[test]
+    fn scene_ingest_status_lifecycle_is_ordered() {
+        assert!(SceneIngestStatus::Queued.can_transition_to(SceneIngestStatus::Downloading));
+        assert!(SceneIngestStatus::Downloading.can_transition_to(SceneIngestStatus::Processing));
+        assert!(SceneIngestStatus::Processing.can_transition_to(SceneIngestStatus::Stored));
+        assert!(SceneIngestStatus::Processing.can_transition_to(SceneIngestStatus::Failed));
+        assert!(!SceneIngestStatus::Queued.can_transition_to(SceneIngestStatus::Stored));
+        assert!(!SceneIngestStatus::Stored.can_transition_to(SceneIngestStatus::Processing));
+    }
+
+    #[tokio::test]
+    async fn ingest_landsat_records_freshness_coverage_and_status() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir)?;
+        write_scene_fixture(&source_dir, &[("B4", "B4.png"), ("B5", "B5.png")])?;
+
+        let config = test_config(&tmp);
+        config.ensure_data_dirs()?;
+        let pool = db::connect_pool(&config).await?;
+
+        let record = ingest_landsat(
+            IngestLandsatArgs {
+                scene_id: "scene-fresh".to_string(),
+                source_dir: source_dir.clone(),
+            },
+            &config,
+            &pool,
+        )
+        .await?;
+
+        assert_eq!(record.status, SceneIngestStatus::Stored);
+        assert_eq!(record.acquisition_date.as_deref(), Some("2026-05-01"));
+        assert_eq!(record.coverage_fraction, Some(1.0));
+        assert!(record.ingested_at.is_some());
+        assert!(record.status_reason.is_none());
+        assert!(config
+            .data_root
+            .join("scenes")
+            .join("scene-fresh")
+            .join("B4.png")
+            .exists());
+
+        let persisted = load_ingest_record(&pool, "scene-fresh")
+            .await?
+            .expect("ingest record should persist");
+        assert_eq!(persisted, record);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_landsat_failure_records_reason_and_cleans_partial_scene() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(source_dir.join("bad_band"))?;
+        write_scene_fixture(&source_dir, &[("B4", "bad_band")])?;
+
+        let config = test_config(&tmp);
+        config.ensure_data_dirs()?;
+        let pool = db::connect_pool(&config).await?;
+
+        let err = ingest_landsat(
+            IngestLandsatArgs {
+                scene_id: "scene-failed".to_string(),
+                source_dir: source_dir.clone(),
+            },
+            &config,
+            &pool,
+        )
+        .await
+        .expect_err("directory band copy should fail");
+        assert!(err.to_string().contains("download_error"));
+
+        let record = load_ingest_record(&pool, "scene-failed")
+            .await?
+            .expect("failed ingest record should persist");
+        assert_eq!(record.status, SceneIngestStatus::Failed);
+        assert_eq!(record.status_reason.as_deref(), Some("download_error"));
+        assert!(record.ingested_at.is_none());
+        assert!(!config
+            .data_root
+            .join("scenes")
+            .join("scene-failed")
+            .exists());
+
+        let scene_row: Option<i64> = sqlx::query_scalar("SELECT 1 FROM scenes WHERE scene_id = ?1")
+            .bind("scene-failed")
+            .fetch_optional(&pool)
+            .await?;
+        assert!(scene_row.is_none());
+
+        Ok(())
+    }
+
+    fn test_config(tmp: &TempDir) -> HubConfig {
+        HubConfig {
+            bind_address: "127.0.0.1:0".to_string(),
+            database_url: format!(
+                "sqlite://{}?mode=rwc",
+                tmp.path().join("geo_hub_ingest_test.db").display()
+            ),
+            data_root: tmp.path().join("data"),
+            ..HubConfig::default()
+        }
+    }
+
+    fn write_scene_fixture(source_dir: &Path, bands: &[(&str, &str)]) -> Result<()> {
+        let mut file_paths = HashMap::new();
+        for (band, file_name) in bands {
+            if *file_name != "bad_band" {
+                std::fs::write(source_dir.join(file_name), b"band-bytes")?;
+            }
+            file_paths.insert((*band).to_string(), (*file_name).to_string());
+        }
+        let image = MultispectralImage {
+            metadata: ImageMetadata {
+                timestamp: chrono::DateTime::parse_from_rfc3339("2026-05-01T12:34:56Z")
+                    .expect("timestamp should parse")
+                    .with_timezone(&chrono::Utc),
+                gps_position: None,
+                bands: bands.iter().map(|(band, _)| (*band).to_string()).collect(),
+                exposure_time: 1.0,
+                gain: 1.0,
+                width: 2,
+                height: 2,
+                spatial_ref: None,
+            },
+            file_paths,
+            image_id: Uuid::new_v4(),
+        };
+        std::fs::write(
+            source_dir.join("metadata_scene.json"),
+            serde_json::to_string_pretty(&image)?,
+        )?;
+        Ok(())
+    }
 }

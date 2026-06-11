@@ -107,6 +107,23 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS scene_ingests (
+            scene_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            status_reason TEXT,
+            ingested_at TEXT,
+            acquisition_date TEXT,
+            coverage_fraction REAL,
+            source_path TEXT,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scene_id TEXT NOT NULL,

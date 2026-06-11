@@ -59,6 +59,7 @@ pub struct SceneDetail {
     pub gps_position: Option<GpsCoords>,
     pub data_path: Option<String>,
     pub field: Option<FieldRecord>,
+    pub ingest: Option<ingest::SceneIngestRecord>,
     pub geospatial: SceneGeospatialMetadata,
     pub available_products: Vec<ProductSummary>,
 }
@@ -2117,6 +2118,7 @@ pub async fn get_scene(
 
     let metadata = load_scene_metadata(scene_row.as_ref(), &scene_dir).await?;
     let field = load_scene_field(&state, scene_row.as_ref()).await?;
+    let ingest = ingest::load_ingest_record(&state.pool, &scene_id).await?;
     let available_products = collect_scene_products(&state, &scene_id).await?;
 
     Ok(Json(SceneDetail {
@@ -2136,6 +2138,7 @@ pub async fn get_scene(
             .and_then(|image| image.metadata.gps_position.clone()),
         data_path: scene_row.as_ref().map(|row| row.get("data_path")),
         field,
+        ingest,
         geospatial: build_geospatial_metadata(metadata.as_ref()),
         available_products,
     }))
