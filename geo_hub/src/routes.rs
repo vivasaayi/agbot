@@ -3833,7 +3833,7 @@ mod tests {
     use crate::landsat;
     use shared::schemas::{
         FieldBoundary, GeoBounds, GeoPoint, GpsCoords, ImageMetadata, MultispectralImage,
-        RasterSpatialRef,
+        RasterResolution, RasterSpatialRef,
     };
     use std::collections::BTreeMap;
     use std::path::Path;

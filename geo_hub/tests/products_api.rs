@@ -2262,23 +2262,41 @@ async fn generates_ndvi_via_db_fallback_and_persists_product_row() -> Result<()>
 
     let b4_path = scene_dir.join("B4.png");
     let b5_path = scene_dir.join("B5.png");
+    let b6_path = scene_dir.join("B6.png");
     write_gray_png(&b4_path, 40)?;
     write_gray_png(&b5_path, 140)?;
+    write_gray_png(&b6_path, 90)?;
 
     let image_id = Uuid::new_v4();
     let metadata_json = json!({
         "metadata": {
             "timestamp": "2025-01-01T00:00:00Z",
             "gps_position": null,
-            "bands": ["B4", "B5"],
+            "bands": ["B4", "B5", "B6"],
             "exposure_time": 1.0,
             "gain": 1.0,
-            "width": 1,
-            "height": 1
+            "width": 2,
+            "height": 2,
+            "spatial_ref": {
+                "georeferenced": true,
+                "crs": "LOCAL_TEST",
+                "bbox": {
+                    "min_lon": 0.0,
+                    "min_lat": 0.0,
+                    "max_lon": 2.0,
+                    "max_lat": 2.0
+                },
+                "geo_transform": [0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                "resolution": {
+                    "x": 1.0,
+                    "y": 1.0
+                }
+            }
         },
         "file_paths": {
             "B4": b4_path.to_string_lossy().to_string(),
-            "B5": b5_path.to_string_lossy().to_string()
+            "B5": b5_path.to_string_lossy().to_string(),
+            "B6": b6_path.to_string_lossy().to_string()
         },
         "image_id": image_id
     })
@@ -2531,6 +2549,7 @@ async fn test_app(tmp: &TempDir) -> Result<TestContext> {
         bind_address: "127.0.0.1:0".to_string(),
         database_url: sqlite_url(&db_path),
         data_root: data_root.clone(),
+        ..HubConfig::default()
     };
 
     config.ensure_data_dirs()?;
