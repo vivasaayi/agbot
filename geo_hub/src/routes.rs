@@ -1,7 +1,7 @@
 use crate::{
     error::{AppError, AppResult},
     ingest, landsat, shapefile,
-    state::AppState,
+    state::{AppState, SceneSearchCacheKey},
 };
 use anyhow::Error;
 use axum::response::Html;
@@ -206,6 +206,7 @@ pub struct MobileSceneCandidate {
     pub collection: String,
     pub acquired_at: String,
     pub cloud_cover: Option<f64>,
+    pub bbox: Option<GeoBounds>,
     pub resolution_m: f64,
     pub asset_count: usize,
 }
@@ -245,6 +246,7 @@ pub async fn mobile_app() -> Html<&'static str> {
 }
 
 pub async fn mobile_search_scenes(
+    State(state): State<AppState>,
     Json(request): Json<MobileSceneSearchRequest>,
 ) -> AppResult<Json<MobileSceneSearchResponse>> {
     validate_lat_lon(request.latitude, request.longitude)?;
@@ -266,6 +268,21 @@ pub async fn mobile_search_scenes(
 
     for window_days in expanded_landsat_windows(requested_days) {
         search_days = window_days;
+        let cache_key = SceneSearchCacheKey::new(
+            &source_mode,
+            request.latitude,
+            request.longitude,
+            &target_date,
+            window_days,
+            5,
+        );
+        if let Some(found) = state.scene_search_cache.get(&cache_key) {
+            if !found.is_empty() {
+                candidates = found;
+                break;
+            }
+            continue;
+        }
         match landsat::search_scenes_for_source(
             &source_mode,
             request.latitude,
@@ -277,10 +294,14 @@ pub async fn mobile_search_scenes(
         .await
         {
             Ok(found) if !found.is_empty() => {
+                state.scene_search_cache.store(cache_key, found.clone());
                 candidates = found;
                 break;
             }
-            Ok(_) => continue,
+            Ok(found) => {
+                state.scene_search_cache.store(cache_key, found);
+                continue;
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "real satellite scene search failed");
                 return Err(AppError::Anyhow(err));
@@ -712,6 +733,7 @@ fn mobile_scene_candidate(candidate: landsat::LandsatSceneCandidate) -> MobileSc
         collection: candidate.collection,
         acquired_at: candidate.acquired_at,
         cloud_cover: candidate.cloud_cover,
+        bbox: candidate.bbox,
         resolution_m: candidate.resolution_m,
         asset_count: candidate.asset_count,
     }
@@ -726,6 +748,7 @@ fn candidate_from_mobile_scene(scene: &MobileSceneCandidate) -> landsat::Landsat
         item_id: scene.external_scene_id.clone(),
         acquired_at: scene.acquired_at.clone(),
         cloud_cover: scene.cloud_cover,
+        bbox: scene.bbox.clone(),
         resolution_m: scene.resolution_m,
         asset_count: scene.asset_count,
         assets: BTreeMap::new(),
@@ -4123,6 +4146,7 @@ mod tests {
             item_id: "LC09_L2SP_042034_20260601_02_T1".to_string(),
             acquired_at: "2026-06-01T18:32:58Z".to_string(),
             cloud_cover: Some(3.85),
+            bbox: None,
             resolution_m: 30.0,
             asset_count: 7,
             assets: BTreeMap::new(),

@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDuration, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use shared::schemas::GeoBounds;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -55,6 +56,7 @@ pub struct LandsatSceneCandidate {
     pub item_id: String,
     pub acquired_at: String,
     pub cloud_cover: Option<f64>,
+    pub bbox: Option<GeoBounds>,
     pub resolution_m: f64,
     pub asset_count: usize,
     pub assets: BTreeMap<String, String>,
@@ -204,6 +206,10 @@ fn sort_candidates(candidates: &mut [LandsatSceneCandidate]) {
             .then_with(|| left.acquired_at.cmp(&right.acquired_at))
             .then_with(|| left.dataset.cmp(&right.dataset))
     });
+}
+
+pub fn rank_scene_candidates(candidates: &mut [LandsatSceneCandidate]) {
+    sort_candidates(candidates);
 }
 
 pub async fn render_product_png(scene: &LandsatSceneCandidate, kind: &str) -> Result<Vec<u8>> {
@@ -513,6 +519,12 @@ impl LandsatSceneCandidate {
             .or(feature.properties.created)
             .unwrap_or_else(|| "unknown".to_string());
         let cloud_cover = feature.properties.cloud_cover;
+        let bbox = feature.bbox.map(|bbox| GeoBounds {
+            min_lon: bbox[0],
+            min_lat: bbox[1],
+            max_lon: bbox[2],
+            max_lat: bbox[3],
+        });
         let assets = extract_assets(dataset, feature.assets);
         if assets.is_empty() {
             return None;
@@ -526,6 +538,7 @@ impl LandsatSceneCandidate {
             item_id,
             acquired_at,
             cloud_cover,
+            bbox,
             resolution_m: dataset.resolution_m(),
             asset_count: assets.len(),
             assets,
@@ -583,6 +596,7 @@ struct StacFeatureCollection {
 struct StacFeature {
     id: String,
     collection: Option<String>,
+    bbox: Option<[f64; 4]>,
     properties: StacProperties,
     assets: BTreeMap<String, StacAsset>,
 }
@@ -598,4 +612,93 @@ struct StacProperties {
 #[derive(Debug, Deserialize)]
 struct StacAsset {
     href: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::schemas::GeoBounds;
+
+    fn asset(href: &str) -> StacAsset {
+        StacAsset {
+            href: href.to_string(),
+        }
+    }
+
+    fn candidate(
+        item_id: &str,
+        cloud_cover: Option<f64>,
+        acquired_at: &str,
+    ) -> LandsatSceneCandidate {
+        LandsatSceneCandidate {
+            dataset: "landsat".to_string(),
+            dataset_label: "Landsat 8/9 Collection 2".to_string(),
+            provider: "Microsoft Planetary Computer".to_string(),
+            collection: "landsat-c2-l2".to_string(),
+            item_id: item_id.to_string(),
+            acquired_at: acquired_at.to_string(),
+            cloud_cover,
+            bbox: None,
+            resolution_m: 30.0,
+            asset_count: 0,
+            assets: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn landsat_scene_candidate_extracts_bbox_and_metadata() {
+        let feature = StacFeature {
+            id: "LC09_TEST".to_string(),
+            collection: Some("landsat-c2-l2".to_string()),
+            bbox: Some([-97.0, 41.0, -96.0, 42.0]),
+            properties: StacProperties {
+                datetime: Some("2026-06-01T18:32:58Z".to_string()),
+                created: None,
+                cloud_cover: Some(3.5),
+            },
+            assets: BTreeMap::from([
+                ("red".to_string(), asset("https://example.test/red.tif")),
+                ("nir08".to_string(), asset("https://example.test/nir.tif")),
+            ]),
+        };
+
+        let candidate =
+            LandsatSceneCandidate::try_from_feature(SatelliteDataset::Landsat, feature).unwrap();
+
+        assert_eq!(candidate.item_id, "LC09_TEST");
+        assert_eq!(candidate.dataset, "landsat");
+        assert_eq!(candidate.acquired_at, "2026-06-01T18:32:58Z");
+        assert_eq!(candidate.cloud_cover, Some(3.5));
+        assert_eq!(
+            candidate.bbox,
+            Some(GeoBounds {
+                min_lon: -97.0,
+                min_lat: 41.0,
+                max_lon: -96.0,
+                max_lat: 42.0,
+            })
+        );
+        assert_eq!(candidate.asset_count, 2);
+    }
+
+    #[test]
+    fn rank_scene_candidates_orders_by_cloud_then_date_then_dataset() {
+        let mut candidates = vec![
+            candidate("unknown-cloud", None, "2026-06-01T00:00:00Z"),
+            candidate("clear-newer", Some(5.0), "2026-06-03T00:00:00Z"),
+            candidate("clear-older", Some(5.0), "2026-06-01T00:00:00Z"),
+            candidate("cloudy", Some(40.0), "2026-06-01T00:00:00Z"),
+        ];
+
+        rank_scene_candidates(&mut candidates);
+
+        let ids = candidates
+            .iter()
+            .map(|candidate| candidate.item_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["clear-older", "clear-newer", "cloudy", "unknown-cloud"]
+        );
+    }
 }

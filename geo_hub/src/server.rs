@@ -133,6 +133,7 @@ pub async fn serve(config: HubConfig, pool: crate::db::DbPool) -> Result<()> {
     let state = AppState {
         pool: pool.clone(),
         config: Arc::clone(&shared_config),
+        scene_search_cache: Default::default(),
     };
 
     let router = build_router(state);

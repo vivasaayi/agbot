@@ -2558,6 +2558,7 @@ async fn test_app(tmp: &TempDir) -> Result<TestContext> {
     let state = AppState {
         pool: pool.clone(),
         config: Arc::new(config),
+        scene_search_cache: Default::default(),
     };
 
     Ok(TestContext {
