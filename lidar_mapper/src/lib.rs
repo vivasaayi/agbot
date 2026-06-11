@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use nalgebra::{Matrix3, SymmetricEigen, Vector3};
 use serde::{Deserialize, Serialize};
 use shared::{
     config::AgroConfig,
@@ -114,6 +115,72 @@ pub struct LidarOutlierRemovalEvidence {
 pub struct CleanedLidarScans {
     pub scans: Vec<LidarScan>,
     pub evidence: LidarOutlierRemovalEvidence,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LidarPoint3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl LidarPoint3 {
+    pub fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
+    fn as_vector(self) -> Vector3<f64> {
+        Vector3::new(self.x, self.y, self.z)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct SurfaceNormal {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl SurfaceNormal {
+    fn from_vector(vector: Vector3<f64>) -> Self {
+        Self {
+            x: vector.x,
+            y: vector.y,
+            z: vector.z,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LidarNormalEstimationParams {
+    pub k_neighbors: usize,
+}
+
+impl Default for LidarNormalEstimationParams {
+    fn default() -> Self {
+        Self { k_neighbors: 8 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarNormalEstimate {
+    pub point_index: usize,
+    pub neighbor_count: usize,
+    pub normal: Option<SurfaceNormal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarNormalEstimationEvidence {
+    pub points_in: usize,
+    pub neighborhood_size: usize,
+    pub normals_defined: usize,
+    pub normals_undefined: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarNormalEstimationResult {
+    pub estimates: Vec<LidarNormalEstimate>,
+    pub evidence: LidarNormalEstimationEvidence,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -497,6 +564,132 @@ impl LidarMapper {
         tokio::fs::write(&output_path, content).await?;
         info!("Saved LiDAR outlier removal evidence to: {:?}", output_path);
         Ok(())
+    }
+
+    pub fn estimate_surface_normals(
+        &self,
+        points: &[LidarPoint3],
+        params: LidarNormalEstimationParams,
+    ) -> AgroResult<LidarNormalEstimationResult> {
+        Self::validate_normal_params(params)?;
+
+        let mut estimates = Vec::with_capacity(points.len());
+        let mut normals_defined = 0;
+        let mut normals_undefined = 0;
+        for point_index in 0..points.len() {
+            let neighbor_indices =
+                Self::nearest_point_indices(points, point_index, params.k_neighbors);
+            if neighbor_indices.len() < params.k_neighbors {
+                estimates.push(LidarNormalEstimate {
+                    point_index,
+                    neighbor_count: neighbor_indices.len(),
+                    normal: None,
+                });
+                normals_undefined += 1;
+                continue;
+            }
+
+            let neighbors: Vec<_> = neighbor_indices
+                .iter()
+                .map(|index| points[*index])
+                .collect();
+            let normal = Self::estimate_normal_from_neighbors(&neighbors);
+            if normal.is_some() {
+                normals_defined += 1;
+            } else {
+                normals_undefined += 1;
+            }
+            estimates.push(LidarNormalEstimate {
+                point_index,
+                neighbor_count: neighbor_indices.len(),
+                normal,
+            });
+        }
+
+        Ok(LidarNormalEstimationResult {
+            estimates,
+            evidence: LidarNormalEstimationEvidence {
+                points_in: points.len(),
+                neighborhood_size: params.k_neighbors,
+                normals_defined,
+                normals_undefined,
+            },
+        })
+    }
+
+    fn validate_normal_params(params: LidarNormalEstimationParams) -> AgroResult<()> {
+        if params.k_neighbors == 0 {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR normal estimation requires at least one neighbor".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn nearest_point_indices(
+        points: &[LidarPoint3],
+        point_index: usize,
+        k_neighbors: usize,
+    ) -> Vec<usize> {
+        let point = points[point_index];
+        let mut distances: Vec<(usize, f64)> = points
+            .iter()
+            .enumerate()
+            .filter_map(|(other_index, other)| {
+                (other_index != point_index).then(|| {
+                    let dx = point.x - other.x;
+                    let dy = point.y - other.y;
+                    let dz = point.z - other.z;
+                    (other_index, dx.hypot(dy).hypot(dz))
+                })
+            })
+            .collect();
+        distances.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        distances
+            .into_iter()
+            .take(k_neighbors)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn estimate_normal_from_neighbors(neighbors: &[LidarPoint3]) -> Option<SurfaceNormal> {
+        if neighbors.len() < 3 {
+            return None;
+        }
+
+        let centroid = neighbors
+            .iter()
+            .map(|point| point.as_vector())
+            .fold(Vector3::zeros(), |acc, point| acc + point)
+            / neighbors.len() as f64;
+        let covariance = neighbors.iter().fold(Matrix3::zeros(), |acc, point| {
+            let centered = point.as_vector() - centroid;
+            acc + centered * centered.transpose()
+        }) / neighbors.len() as f64;
+
+        let eigen = SymmetricEigen::new(covariance);
+        let min_index = (0..3)
+            .min_by(|left, right| eigen.eigenvalues[*left].total_cmp(&eigen.eigenvalues[*right]))
+            .unwrap_or(0);
+        let vector = eigen.eigenvectors.column(min_index).into_owned();
+        let norm = vector.norm();
+        if norm <= OUTLIER_DISTANCE_EPSILON_METERS || !norm.is_finite() {
+            return None;
+        }
+
+        let mut normal = vector / norm;
+        if normal.z < 0.0
+            || (normal.z.abs() <= OUTLIER_DISTANCE_EPSILON_METERS
+                && (normal.y < 0.0
+                    || (normal.y.abs() <= OUTLIER_DISTANCE_EPSILON_METERS && normal.x < 0.0)))
+        {
+            normal = -normal;
+        }
+        Some(SurfaceNormal::from_vector(normal))
     }
 
     pub fn create_occupancy_grid(
@@ -1072,5 +1265,56 @@ mod tests {
         assert_eq!(cleaned.evidence.points_out, 1);
         assert_eq!(cleaned.evidence.mean_distance_threshold, None);
         assert_eq!(cleaned.scans[0].points.len(), 1);
+    }
+
+    #[test]
+    fn estimate_surface_normals_for_planar_patch() {
+        let mapper = test_mapper();
+        let params = LidarNormalEstimationParams { k_neighbors: 4 };
+        let points = vec![
+            LidarPoint3::new(-1.0, -1.0, 2.0),
+            LidarPoint3::new(0.0, -1.0, 2.0),
+            LidarPoint3::new(1.0, -1.0, 2.0),
+            LidarPoint3::new(-1.0, 0.0, 2.0),
+            LidarPoint3::new(0.0, 0.0, 2.0),
+            LidarPoint3::new(1.0, 0.0, 2.0),
+            LidarPoint3::new(-1.0, 1.0, 2.0),
+            LidarPoint3::new(0.0, 1.0, 2.0),
+            LidarPoint3::new(1.0, 1.0, 2.0),
+        ];
+
+        let result = mapper.estimate_surface_normals(&points, params).unwrap();
+
+        assert_eq!(result.evidence.points_in, points.len());
+        assert_eq!(result.evidence.neighborhood_size, 4);
+        assert_eq!(result.evidence.normals_defined, points.len());
+        assert_eq!(result.evidence.normals_undefined, 0);
+        for estimate in &result.estimates {
+            let normal = estimate.normal.unwrap();
+            assert!(normal.x.abs() <= 1.0e-6);
+            assert!(normal.y.abs() <= 1.0e-6);
+            assert!((normal.z - 1.0).abs() <= 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn estimate_surface_normals_marks_insufficient_neighbors_undefined() {
+        let mapper = test_mapper();
+        let params = LidarNormalEstimationParams { k_neighbors: 3 };
+        let points = vec![
+            LidarPoint3::new(0.0, 0.0, 0.0),
+            LidarPoint3::new(1.0, 0.0, 0.0),
+        ];
+
+        let result = mapper.estimate_surface_normals(&points, params).unwrap();
+
+        assert_eq!(result.evidence.points_in, 2);
+        assert_eq!(result.evidence.neighborhood_size, 3);
+        assert_eq!(result.evidence.normals_defined, 0);
+        assert_eq!(result.evidence.normals_undefined, 2);
+        assert!(result
+            .estimates
+            .iter()
+            .all(|estimate| estimate.normal.is_none()));
     }
 }
