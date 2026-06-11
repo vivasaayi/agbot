@@ -233,6 +233,7 @@ pub struct IndexStatistics {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use shared::schemas::GpsCoords;
     use std::collections::HashMap;
 
     #[test]
@@ -242,6 +243,7 @@ mod tests {
 
         let record = FlightDataRecord {
             id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             drone_id: Uuid::new_v4(),
             flight_id: Uuid::new_v4(),
@@ -253,6 +255,13 @@ mod tests {
                 battery_level: 0.8,
                 signal_strength: 0.9,
             },
+            sensor_id: "telemetry-01".to_string(),
+            gps_coords: Some(GpsCoords {
+                latitude: 40.7128,
+                longitude: -74.0060,
+                altitude: 100.0,
+            }),
+            calibration_ref: "calibration-2026-06".to_string(),
             metadata: HashMap::new(),
             file_path: None,
             size_bytes: 0,
@@ -273,6 +282,7 @@ mod tests {
         let now = Utc::now();
         let record = FlightDataRecord {
             id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
             timestamp: now,
             drone_id: Uuid::new_v4(),
             flight_id: Uuid::new_v4(),
@@ -284,6 +294,13 @@ mod tests {
                 battery_level: 0.8,
                 signal_strength: 0.9,
             },
+            sensor_id: "telemetry-01".to_string(),
+            gps_coords: Some(GpsCoords {
+                latitude: 0.0,
+                longitude: 0.0,
+                altitude: 0.0,
+            }),
+            calibration_ref: "calibration-2026-06".to_string(),
             metadata: HashMap::new(),
             file_path: None,
             size_bytes: 0,

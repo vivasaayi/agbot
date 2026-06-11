@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use shared::schemas::GpsCoords;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -17,14 +18,144 @@ pub use storage::{StorageConfig, StorageEngine};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlightDataRecord {
     pub id: Uuid,
+    #[serde(default = "default_link_id")]
+    pub session_id: Uuid,
     pub flight_id: Uuid,
     pub drone_id: Uuid,
     pub timestamp: DateTime<Utc>,
     pub data_type: DataType,
     pub payload: DataPayload,
+    #[serde(default)]
+    pub sensor_id: String,
+    #[serde(default)]
+    pub gps_coords: Option<GpsCoords>,
+    #[serde(default)]
+    pub calibration_ref: String,
     pub metadata: HashMap<String, String>,
     pub file_path: Option<PathBuf>,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlightDataProvenance {
+    pub session_id: Uuid,
+    pub sensor_id: String,
+    pub gps_coords: Option<GpsCoords>,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub calibration_ref: String,
+}
+
+impl FlightDataProvenance {
+    pub fn complete(
+        session_id: Uuid,
+        sensor_id: String,
+        gps_coords: GpsCoords,
+        timestamp: DateTime<Utc>,
+        calibration_ref: String,
+    ) -> Self {
+        Self {
+            session_id,
+            sensor_id,
+            gps_coords: Some(gps_coords),
+            timestamp: Some(timestamp),
+            calibration_ref,
+        }
+    }
+
+    pub fn validate(&self) -> std::result::Result<DateTime<Utc>, FlightDataProvenanceError> {
+        if self.session_id == Uuid::nil() {
+            return Err(FlightDataProvenanceError::MissingSessionId);
+        }
+
+        if self.sensor_id.trim().is_empty() {
+            return Err(FlightDataProvenanceError::MissingSensorId);
+        }
+
+        let gps_coords = self
+            .gps_coords
+            .as_ref()
+            .ok_or(FlightDataProvenanceError::MissingGpsCoords)?;
+        if !gps_coords.latitude.is_finite()
+            || !gps_coords.longitude.is_finite()
+            || !gps_coords.altitude.is_finite()
+            || !(-90.0..=90.0).contains(&gps_coords.latitude)
+            || !(-180.0..=180.0).contains(&gps_coords.longitude)
+        {
+            return Err(FlightDataProvenanceError::InvalidGpsCoords);
+        }
+
+        let timestamp = self
+            .timestamp
+            .ok_or(FlightDataProvenanceError::MissingTimestamp)?;
+
+        if self.calibration_ref.trim().is_empty() {
+            return Err(FlightDataProvenanceError::MissingCalibrationRef);
+        }
+
+        Ok(timestamp)
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum FlightDataProvenanceError {
+    #[error("flight data record is missing session_id")]
+    MissingSessionId,
+    #[error("flight data record is missing sensor_id")]
+    MissingSensorId,
+    #[error("flight data record is missing gps coordinates")]
+    MissingGpsCoords,
+    #[error("flight data record has invalid gps coordinates")]
+    InvalidGpsCoords,
+    #[error("flight data record is missing timestamp")]
+    MissingTimestamp,
+    #[error("flight data record is missing calibration_ref")]
+    MissingCalibrationRef,
+    #[error("flight data record session {record_session_id} does not match collection session {expected_session_id}")]
+    SessionMismatch {
+        expected_session_id: Uuid,
+        record_session_id: Uuid,
+    },
+}
+
+impl FlightDataRecord {
+    pub fn new(
+        flight_id: Uuid,
+        drone_id: Uuid,
+        data_type: DataType,
+        payload: DataPayload,
+        provenance: FlightDataProvenance,
+        size_bytes: u64,
+    ) -> std::result::Result<Self, FlightDataProvenanceError> {
+        let timestamp = provenance.validate()?;
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            session_id: provenance.session_id,
+            flight_id,
+            drone_id,
+            timestamp,
+            data_type,
+            payload,
+            sensor_id: provenance.sensor_id,
+            gps_coords: provenance.gps_coords,
+            calibration_ref: provenance.calibration_ref,
+            metadata: HashMap::new(),
+            file_path: None,
+            size_bytes,
+        })
+    }
+
+    pub fn validate_provenance(&self) -> std::result::Result<(), FlightDataProvenanceError> {
+        FlightDataProvenance {
+            session_id: self.session_id,
+            sensor_id: self.sensor_id.clone(),
+            gps_coords: self.gps_coords.clone(),
+            timestamp: Some(self.timestamp),
+            calibration_ref: self.calibration_ref.clone(),
+        }
+        .validate()?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -385,6 +516,15 @@ impl DataCollectorService {
     }
 
     pub async fn collect_data(&mut self, session_id: &Uuid, data: FlightDataRecord) -> Result<()> {
+        data.validate_provenance()?;
+        if data.session_id != *session_id {
+            return Err(FlightDataProvenanceError::SessionMismatch {
+                expected_session_id: *session_id,
+                record_session_id: data.session_id,
+            }
+            .into());
+        }
+
         let current_status = self
             .active_sessions
             .get(session_id)
@@ -605,24 +745,100 @@ mod tests {
         )
     }
 
+    fn gps_coords() -> GpsCoords {
+        GpsCoords {
+            latitude: 40.0,
+            longitude: -105.0,
+            altitude: 30.0,
+        }
+    }
+
+    fn provenance(session: &FlightSession) -> FlightDataProvenance {
+        FlightDataProvenance::complete(
+            session.id,
+            "sensor-rgb-01".to_string(),
+            gps_coords(),
+            Utc::now(),
+            "calibration-2026-06".to_string(),
+        )
+    }
+
     fn telemetry_record(session: &FlightSession) -> FlightDataRecord {
-        FlightDataRecord {
-            id: Uuid::new_v4(),
-            flight_id: session.flight_id,
-            drone_id: session.drone_id,
-            timestamp: Utc::now(),
-            data_type: DataType::Telemetry,
-            payload: DataPayload::Telemetry {
+        FlightDataRecord::new(
+            session.flight_id,
+            session.drone_id,
+            DataType::Telemetry,
+            DataPayload::Telemetry {
                 position: (40.0, -105.0, 30.0),
                 velocity: (1.0, 0.0, 0.0),
                 orientation: (0.0, 0.0, 0.0),
                 battery_level: 0.9,
                 signal_strength: 0.95,
             },
-            metadata: HashMap::new(),
-            file_path: None,
-            size_bytes: 256,
-        }
+            provenance(session),
+            256,
+        )
+        .unwrap()
+    }
+
+    fn all_data_types() -> Vec<DataType> {
+        vec![
+            DataType::Telemetry,
+            DataType::SensorReading,
+            DataType::Image,
+            DataType::Video,
+            DataType::LidarScan,
+            DataType::MultispectralImage,
+            DataType::ThermalImage,
+            DataType::GPSTrack,
+            DataType::FlightLog,
+            DataType::MissionPlan,
+            DataType::WeatherData,
+            DataType::SystemLog,
+        ]
+    }
+
+    fn all_payloads() -> Vec<DataPayload> {
+        let now = Utc::now();
+        vec![
+            DataPayload::Telemetry {
+                position: (40.0, -105.0, 30.0),
+                velocity: (1.0, 0.0, 0.0),
+                orientation: (0.0, 0.0, 0.0),
+                battery_level: 0.9,
+                signal_strength: 0.95,
+            },
+            DataPayload::SensorData {
+                sensor_type: "multispectral".to_string(),
+                values: HashMap::from([("nir".to_string(), 0.72)]),
+                calibration_info: Some("calibration-2026-06".to_string()),
+            },
+            DataPayload::MediaFile {
+                file_type: "image/tiff".to_string(),
+                dimensions: Some((1024, 1024)),
+                duration_seconds: None,
+                compression: Some("none".to_string()),
+            },
+            DataPayload::PointCloud {
+                point_count: 42,
+                bounds: ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+                format: "ply".to_string(),
+                has_color: false,
+                has_intensity: true,
+            },
+            DataPayload::TrackLog {
+                waypoint_count: 2,
+                total_distance_m: 10.0,
+                duration_seconds: 5.0,
+                start_time: now,
+                end_time: now + chrono::Duration::seconds(5),
+            },
+            DataPayload::Raw {
+                format: "json".to_string(),
+                schema: Some("agbot.raw.v1".to_string()),
+                compression: None,
+            },
+        ]
     }
 
     #[tokio::test]
@@ -693,6 +909,8 @@ mod tests {
             .unwrap();
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         let record = telemetry_record(&session);
+        let record_id = record.id;
+        let record_timestamp = record.timestamp;
 
         service.collect_data(&session_id, record).await.unwrap();
 
@@ -700,6 +918,115 @@ mod tests {
         assert_eq!(session.status, SessionStatus::Collecting);
         assert_eq!(session.summary.record_count, 1);
         assert_eq!(session.data_records.len(), 1);
+
+        let stored_path = temp_dir
+            .path()
+            .join("records")
+            .join(record_timestamp.format("%Y/%m/%d").to_string())
+            .join(format!("telemetry_{}.json", record_id));
+        let stored_json = tokio::fs::read(&stored_path).await.unwrap();
+        let stored_record: FlightDataRecord = serde_json::from_slice(&stored_json).unwrap();
+        assert_eq!(stored_record.session_id, session.id);
+        assert_eq!(stored_record.sensor_id, "sensor-rgb-01");
+        assert_eq!(stored_record.gps_coords, Some(gps_coords()));
+        assert_eq!(stored_record.calibration_ref, "calibration-2026-06");
+    }
+
+    #[tokio::test]
+    async fn test_record_provenance_is_required_for_all_types_and_payloads() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+
+        for data_type in all_data_types() {
+            for payload in all_payloads() {
+                let record = FlightDataRecord::new(
+                    session.flight_id,
+                    session.drone_id,
+                    data_type.clone(),
+                    payload,
+                    provenance(&session),
+                    128,
+                )
+                .unwrap();
+
+                assert_eq!(record.session_id, session.id);
+                assert_eq!(record.sensor_id, "sensor-rgb-01");
+                assert_eq!(record.gps_coords, Some(gps_coords()));
+                assert_eq!(record.calibration_ref, "calibration-2026-06");
+                record.validate_provenance().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_gps_or_timestamp_is_rejected_as_provenance_error() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+
+        let mut missing_gps = provenance(&session);
+        missing_gps.gps_coords = None;
+        let gps_err = FlightDataRecord::new(
+            session.flight_id,
+            session.drone_id,
+            DataType::Telemetry,
+            DataPayload::Raw {
+                format: "json".to_string(),
+                schema: None,
+                compression: None,
+            },
+            missing_gps,
+            128,
+        )
+        .unwrap_err();
+        assert_eq!(gps_err, FlightDataProvenanceError::MissingGpsCoords);
+
+        let mut missing_timestamp = provenance(&session);
+        missing_timestamp.timestamp = None;
+        let timestamp_err = FlightDataRecord::new(
+            session.flight_id,
+            session.drone_id,
+            DataType::Telemetry,
+            DataPayload::Raw {
+                format: "json".to_string(),
+                schema: None,
+                compression: None,
+            },
+            missing_timestamp,
+            128,
+        )
+        .unwrap_err();
+        assert_eq!(timestamp_err, FlightDataProvenanceError::MissingTimestamp);
+    }
+
+    #[tokio::test]
+    async fn test_collect_data_rejects_incomplete_provenance_record() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let mut record = telemetry_record(&session);
+        record.gps_coords = None;
+
+        let err = service.collect_data(&session_id, record).await.unwrap_err();
+        let provenance_error = err.downcast_ref::<FlightDataProvenanceError>().unwrap();
+
+        assert_eq!(
+            provenance_error,
+            &FlightDataProvenanceError::MissingGpsCoords
+        );
     }
 
     #[tokio::test]

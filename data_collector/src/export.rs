@@ -129,6 +129,7 @@ mod tests {
     use super::*;
     use crate::DataType;
     use chrono::Utc;
+    use shared::schemas::GpsCoords;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -158,6 +159,7 @@ mod tests {
 
         let records = vec![FlightDataRecord {
             id: Uuid::new_v4(),
+            session_id: session.id,
             flight_id: Uuid::new_v4(),
             drone_id: Uuid::new_v4(),
             timestamp: Utc::now(),
@@ -169,6 +171,13 @@ mod tests {
                 battery_level: 0.8,
                 signal_strength: 0.9,
             },
+            sensor_id: "telemetry-01".to_string(),
+            gps_coords: Some(GpsCoords {
+                latitude: 0.0,
+                longitude: 0.0,
+                altitude: 0.0,
+            }),
+            calibration_ref: "calibration-2026-06".to_string(),
             metadata: std::collections::HashMap::new(),
             file_path: None,
             size_bytes: 256,

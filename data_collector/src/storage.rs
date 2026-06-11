@@ -393,6 +393,7 @@ impl DataType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::schemas::GpsCoords;
 
     #[tokio::test]
     async fn test_storage_engine_creation() {
@@ -411,6 +412,7 @@ mod tests {
 
         let record = crate::FlightDataRecord {
             id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
             flight_id: Uuid::new_v4(),
             drone_id: Uuid::new_v4(),
             data_type: DataType::Image,
@@ -420,6 +422,13 @@ mod tests {
                 schema: None,
                 compression: None,
             },
+            sensor_id: "camera-rgb-01".to_string(),
+            gps_coords: Some(GpsCoords {
+                latitude: 40.0,
+                longitude: -105.0,
+                altitude: 30.0,
+            }),
+            calibration_ref: "calibration-2026-06".to_string(),
             metadata: std::collections::HashMap::new(),
             file_path: None,
             size_bytes: 1024,
