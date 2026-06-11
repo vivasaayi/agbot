@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: fd536cf246fc270f279abf5ebe98ed6aa0ea7611 (`batch-08-04`)
-- **Latest checkpoint commit**: pending checkpoint commit for `batch-08-04`
-- **Current batch**: none — ready to select the next deterministic batch after STORY `08-04`
-- **Completed feature rows**: 50 committed; 1 blocked; 447 pending rows remain in the full-roadmap inventory
+- **Last implementation commit**: d4a3019459abf9a301ecd343ddebf8c83736a13e (`batch-08-05`)
+- **Latest checkpoint commit**: pending checkpoint commit for `batch-08-05`
+- **Current batch**: none — ready to select the next deterministic batch after STORY `08-05`
+- **Completed feature rows**: 51 committed; 1 blocked; 446 pending rows remain in the full-roadmap inventory
 - **Blocker**: STORY `07-11` is blocked on the documented storage-authority confirmation question.
 
 ## Latest verification
@@ -20,4 +20,4 @@
 
 ## Next action
 
-Re-read the checkpoint, verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and roadmap hash, then select the next deterministic batch after STORY `08-04`.
+Re-read the checkpoint, verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and roadmap hash, then select the next deterministic batch after STORY `08-05`.
