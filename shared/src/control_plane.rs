@@ -96,6 +96,30 @@ pub struct TenantBoundaryAuditEvent {
     pub reason_code: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRecordRequest {
+    pub actor_user_id: Uuid,
+    pub org_id: Uuid,
+    pub action: ControlPlaneAction,
+    pub target_ref: Option<Uuid>,
+    pub target_org_id: Option<Uuid>,
+    pub decision: AuthorizationDecision,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub audit_id: Uuid,
+    pub actor_user_id: Uuid,
+    pub org_id: Uuid,
+    pub action: ControlPlaneAction,
+    pub target_ref: Option<Uuid>,
+    pub target_org_id: Option<Uuid>,
+    pub decision: AuthorizationDecision,
+    pub reason_code: String,
+    pub at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ControlPlaneError {
     #[error("organization name cannot be empty")]
@@ -120,6 +144,14 @@ pub enum TenantIsolationError {
     ControlPlane(#[from] ControlPlaneError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AuditTrailError {
+    #[error("audit record is append-only: {audit_id}")]
+    AppendOnlyRecord { audit_id: Uuid },
+    #[error("audit record not found: {audit_id}")]
+    AuditRecordNotFound { audit_id: Uuid },
+}
+
 pub trait TenantScoped {
     fn tenant_org_id(&self) -> Uuid;
     fn tenant_record_id(&self) -> Uuid;
@@ -131,6 +163,8 @@ pub struct ControlPlaneRegistry {
     users: HashMap<Uuid, UserRecord>,
     memberships: HashMap<Uuid, MembershipRecord>,
     email_index: HashMap<String, Uuid>,
+    #[serde(default)]
+    audit_records: Vec<AuditRecord>,
 }
 
 impl Default for MembershipRole {
@@ -163,6 +197,20 @@ impl TenantIsolationError {
             Self::NotFound { audit } => audit.as_ref(),
             Self::WriteRejected { audit } => Some(audit),
             Self::ControlPlane(_) => None,
+        }
+    }
+}
+
+impl From<TenantBoundaryAuditEvent> for AuditRecordRequest {
+    fn from(event: TenantBoundaryAuditEvent) -> Self {
+        Self {
+            actor_user_id: event.actor_user_id,
+            org_id: event.actor_org_id,
+            action: event.action,
+            target_ref: event.target_ref,
+            target_org_id: event.target_org_id,
+            decision: event.decision,
+            reason_code: event.reason_code,
         }
     }
 }
@@ -271,8 +319,24 @@ impl ControlPlaneRegistry {
         email: String,
         role: MembershipRole,
     ) -> Result<CreatedUserMembership, TenantIsolationError> {
-        enforce_tenant_write_scope(principal, request_org_id, ControlPlaneAction::WriteEntity)?;
-        Ok(self.create_user_with_role(principal.org_id, email, role)?)
+        if let Err(error) =
+            enforce_tenant_write_scope(principal, request_org_id, ControlPlaneAction::WriteEntity)
+        {
+            self.append_tenant_error_audit(&error);
+            return Err(error);
+        }
+
+        let created = self.create_user_with_role(principal.org_id, email, role)?;
+        self.append_audit_record(AuditRecordRequest {
+            actor_user_id: principal.user_id,
+            org_id: principal.org_id,
+            action: ControlPlaneAction::WriteEntity,
+            target_ref: Some(created.user.user_id),
+            target_org_id: Some(created.user.org_id),
+            decision: AuthorizationDecision::Allowed,
+            reason_code: "allowed".to_string(),
+        });
+        Ok(created)
     }
 
     pub fn get_organization(&self, org_id: Uuid) -> Option<&OrganizationRecord> {
@@ -290,15 +354,43 @@ impl ControlPlaneRegistry {
     }
 
     pub fn get_user_scoped(
-        &self,
+        &mut self,
         principal: &TenantPrincipal,
         user_id: Uuid,
     ) -> Result<&UserRecord, TenantIsolationError> {
-        read_tenant_scoped(
-            principal,
-            self.users.get(&user_id),
-            ControlPlaneAction::ReadEntity,
-        )
+        match self
+            .users
+            .get(&user_id)
+            .map(|user| (user.user_id, user.org_id))
+        {
+            Some((target_ref, target_org_id)) if target_org_id == principal.org_id => {
+                self.append_audit_record(AuditRecordRequest {
+                    actor_user_id: principal.user_id,
+                    org_id: principal.org_id,
+                    action: ControlPlaneAction::ReadEntity,
+                    target_ref: Some(target_ref),
+                    target_org_id: Some(target_org_id),
+                    decision: AuthorizationDecision::Allowed,
+                    reason_code: "allowed".to_string(),
+                });
+                Ok(self
+                    .users
+                    .get(&user_id)
+                    .expect("user existed when scoped read was evaluated"))
+            }
+            Some((target_ref, target_org_id)) => {
+                let audit = tenant_boundary_audit_event(
+                    principal,
+                    ControlPlaneAction::ReadEntity,
+                    Some(target_ref),
+                    Some(target_org_id),
+                    "cross_tenant_read",
+                );
+                self.append_audit_record(AuditRecordRequest::from(audit.clone()));
+                Err(TenantIsolationError::NotFound { audit: Some(audit) })
+            }
+            None => Err(TenantIsolationError::NotFound { audit: None }),
+        }
     }
 
     pub fn users(&self) -> Vec<UserRecord> {
@@ -316,6 +408,74 @@ impl ControlPlaneRegistry {
             .collect::<Vec<_>>();
         memberships.sort_by(|left, right| left.joined_at.cmp(&right.joined_at));
         memberships
+    }
+
+    pub fn append_audit_record(&mut self, request: AuditRecordRequest) -> AuditRecord {
+        self.append_audit_record_at(request, Utc::now())
+    }
+
+    pub fn append_audit_record_at(
+        &mut self,
+        request: AuditRecordRequest,
+        at: DateTime<Utc>,
+    ) -> AuditRecord {
+        let record = AuditRecord {
+            audit_id: Uuid::new_v4(),
+            actor_user_id: request.actor_user_id,
+            org_id: request.org_id,
+            action: request.action,
+            target_ref: request.target_ref,
+            target_org_id: request.target_org_id,
+            decision: request.decision,
+            reason_code: request.reason_code,
+            at,
+        };
+        self.audit_records.push(record.clone());
+        record
+    }
+
+    pub fn audit_records_for_org(
+        &self,
+        org_id: Uuid,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Vec<AuditRecord> {
+        let mut records = self
+            .audit_records
+            .iter()
+            .filter(|record| record.org_id == org_id)
+            .filter(|record| from.as_ref().map_or(true, |from| record.at >= *from))
+            .filter(|record| to.as_ref().map_or(true, |to| record.at <= *to))
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.at
+                .cmp(&right.at)
+                .then(left.audit_id.cmp(&right.audit_id))
+        });
+        records
+    }
+
+    pub fn update_audit_record(
+        &mut self,
+        audit_id: Uuid,
+        _replacement: AuditRecordRequest,
+    ) -> Result<(), AuditTrailError> {
+        if self
+            .audit_records
+            .iter()
+            .any(|record| record.audit_id == audit_id)
+        {
+            return Err(AuditTrailError::AppendOnlyRecord { audit_id });
+        }
+
+        Err(AuditTrailError::AuditRecordNotFound { audit_id })
+    }
+
+    fn append_tenant_error_audit(&mut self, error: &TenantIsolationError) {
+        if let Some(audit) = error.audit_event().cloned() {
+            self.append_audit_record(AuditRecordRequest::from(audit));
+        }
     }
 }
 
@@ -426,6 +586,7 @@ fn normalize_email(email: &str) -> Result<String, ControlPlaneError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn organization_user_and_membership_are_linked() {
@@ -612,5 +773,147 @@ mod tests {
             registry.memberships_for_org(org_b.org_id).len(),
             org_b_memberships_before
         );
+    }
+
+    #[test]
+    fn audit_records_are_append_only_and_queryable_by_org_and_time() {
+        let mut registry = ControlPlaneRegistry::default();
+        let org_a = Uuid::new_v4();
+        let org_b = Uuid::new_v4();
+        let actor = Uuid::new_v4();
+        let before = Utc.with_ymd_and_hms(2026, 1, 1, 9, 0, 0).unwrap();
+        let inside = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
+        let after = Utc.with_ymd_and_hms(2026, 1, 1, 11, 0, 0).unwrap();
+        let target_ref = Uuid::new_v4();
+
+        registry.append_audit_record_at(
+            AuditRecordRequest {
+                actor_user_id: actor,
+                org_id: org_a,
+                action: ControlPlaneAction::ReadEntity,
+                target_ref: Some(target_ref),
+                target_org_id: Some(org_a),
+                decision: AuthorizationDecision::Allowed,
+                reason_code: "allowed".to_string(),
+            },
+            inside,
+        );
+        registry.append_audit_record_at(
+            AuditRecordRequest {
+                actor_user_id: actor,
+                org_id: org_b,
+                action: ControlPlaneAction::ReadEntity,
+                target_ref: Some(Uuid::new_v4()),
+                target_org_id: Some(org_b),
+                decision: AuthorizationDecision::Allowed,
+                reason_code: "allowed".to_string(),
+            },
+            inside,
+        );
+        registry.append_audit_record_at(
+            AuditRecordRequest {
+                actor_user_id: actor,
+                org_id: org_a,
+                action: ControlPlaneAction::ExportData,
+                target_ref: None,
+                target_org_id: Some(org_a),
+                decision: AuthorizationDecision::Denied,
+                reason_code: "role_not_permitted".to_string(),
+            },
+            after,
+        );
+
+        let records = registry.audit_records_for_org(org_a, Some(before), Some(inside));
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].actor_user_id, actor);
+        assert_eq!(records[0].org_id, org_a);
+        assert_eq!(records[0].target_ref, Some(target_ref));
+        assert_eq!(records[0].decision, AuthorizationDecision::Allowed);
+        assert_eq!(records[0].at, inside);
+    }
+
+    #[test]
+    fn audit_record_update_attempt_is_rejected() {
+        let mut registry = ControlPlaneRegistry::default();
+        let org_id = Uuid::new_v4();
+        let actor = Uuid::new_v4();
+        let at = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
+        let record = registry.append_audit_record_at(
+            AuditRecordRequest {
+                actor_user_id: actor,
+                org_id,
+                action: ControlPlaneAction::ManageUsers,
+                target_ref: None,
+                target_org_id: Some(org_id),
+                decision: AuthorizationDecision::Allowed,
+                reason_code: "allowed".to_string(),
+            },
+            at,
+        );
+
+        let error = registry
+            .update_audit_record(
+                record.audit_id,
+                AuditRecordRequest {
+                    actor_user_id: actor,
+                    org_id,
+                    action: ControlPlaneAction::ManageUsers,
+                    target_ref: None,
+                    target_org_id: Some(org_id),
+                    decision: AuthorizationDecision::Denied,
+                    reason_code: "changed".to_string(),
+                },
+            )
+            .expect_err("audit updates are rejected");
+        let records = registry.audit_records_for_org(org_id, None, None);
+
+        assert_eq!(
+            error,
+            AuditTrailError::AppendOnlyRecord {
+                audit_id: record.audit_id
+            }
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, AuthorizationDecision::Allowed);
+        assert_eq!(records[0].reason_code, "allowed");
+    }
+
+    #[test]
+    fn scoped_user_access_writes_allow_and_deny_audit_records() {
+        let mut registry = ControlPlaneRegistry::default();
+        let org_a = registry
+            .create_organization("Org A".to_string())
+            .expect("org A creates");
+        let org_b = registry
+            .create_organization("Org B".to_string())
+            .expect("org B creates");
+        let admin_a = registry
+            .create_user_with_role(
+                org_a.org_id,
+                "admin-a@example.com".to_string(),
+                MembershipRole::Admin,
+            )
+            .expect("admin A creates");
+        let user_b = registry
+            .create_user(org_b.org_id, "viewer-b@example.com".to_string())
+            .expect("user B creates");
+        let principal = TenantPrincipal::from_membership(&admin_a.membership);
+
+        registry
+            .get_user_scoped(&principal, admin_a.user.user_id)
+            .expect("same-org read succeeds");
+        let _ = registry
+            .get_user_scoped(&principal, user_b.user.user_id)
+            .expect_err("cross-org read is hidden");
+
+        let records = registry.audit_records_for_org(org_a.org_id, None, None);
+        let decisions = records
+            .iter()
+            .map(|record| (record.decision, record.reason_code.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(decisions.contains(&(AuthorizationDecision::Allowed, "allowed")));
+        assert!(decisions.contains(&(AuthorizationDecision::Denied, "cross_tenant_read")));
     }
 }
