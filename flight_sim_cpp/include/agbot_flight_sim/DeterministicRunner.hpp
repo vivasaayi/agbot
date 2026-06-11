@@ -40,17 +40,26 @@ struct RunConfig {
 struct RunManifest {
     std::string simulator_version;
     std::string contract_version;
+    std::string contract_schema_hash;
     std::uint64_t seed = 0;
     double timestep_s = 0.0;
     double record_interval_s = 0.0;
     std::string mission_name;
-    std::string mission_hash;     // hash of the canonical mission JSON
+    std::string mission_hash;     // SHA-256 hash of the canonical mission JSON
     std::uint64_t step_count = 0; // fixed-timestep steps executed
     std::uint64_t sample_count = 0;
     std::uint64_t prng_nonce = 0; // first draw from the seeded PRNG; proves the
                                   // seed drives the stream even when physics is
                                   // currently seed-independent
-    std::string output_hash;      // hash of the emitted JSONL trace
+    std::string terrain_tiles_json = "[]";
+    std::string terrain_tiles_hash;
+    std::string weather_config_json = "{}";
+    std::string weather_config_hash;
+    std::string sensor_config_json = "{}";
+    std::string sensor_config_hash;
+    std::string safety_config_json = "{}";
+    std::string safety_config_hash;
+    std::string output_hash;      // SHA-256 hash of the emitted JSONL trace
     bool completed = false;
 
     [[nodiscard]] std::string to_json() const;

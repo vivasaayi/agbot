@@ -6,6 +6,7 @@
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
 #include "agbot_flight_sim/TraceDiff.hpp"
+#include "agbot_flight_sim/TwinContractV1.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -334,12 +335,53 @@ void test_run_manifest_records_contract_and_hashes() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
     const std::string json = result.manifest.to_json();
+    const auto& contract = agbot::flight_sim::twin_contract_v1_schema();
 
     assert(json.find("\"contract_version\":\"1.0.0\"") != std::string::npos);
+    assert(json.find("\"contract_schema_hash\":\"") != std::string::npos);
+    assert(result.manifest.contract_schema_hash == contract.schema_hash);
     assert(json.find("\"seed\":42") != std::string::npos);
-    assert(result.manifest.output_hash.size() == 16);
-    assert(result.manifest.mission_hash.size() == 16);
+    assert(json.find("\"terrain_tiles\":[]") != std::string::npos);
+    assert(json.find("\"weather_config_hash\":\"") != std::string::npos);
+    assert(json.find("\"sensor_config_hash\":\"") != std::string::npos);
+    assert(json.find("\"safety_config_hash\":\"") != std::string::npos);
+    assert(result.manifest.output_hash.size() == 64);
+    assert(result.manifest.mission_hash.size() == 64);
+    assert(result.manifest.terrain_tiles_hash == agbot::flight_sim::sha256_hex("[]"));
+    assert(result.manifest.output_hash == agbot::flight_sim::sha256_hex(result.trace_jsonl));
+    assert(result.manifest.mission_hash == agbot::flight_sim::sha256_hex(agbot::flight_sim::mission_to_json(mission)));
     assert(result.manifest.output_hash != result.manifest.mission_hash);
+}
+
+// Story 02-24: the first TwinContractV1 slice names the shared wire schemas
+// and their required fields so downstream consumers can detect schema drift.
+void test_twin_contract_v1_schema_covers_required_types() {
+    const auto& schema = agbot::flight_sim::twin_contract_v1_schema();
+
+    assert(schema.version == agbot::flight_sim::kTwinContractVersion);
+    assert(schema.schema_hash.size() == 64);
+    assert(schema.has_type("FlightCommandV1"));
+    assert(schema.has_type("TelemetryV1"));
+    assert(schema.has_type("SimulationTraceV1"));
+    assert(schema.has_type("ScenarioManifestV1"));
+    assert(schema.has_type("TwinErrorV1"));
+    assert(schema.has_type("TwinCapabilitiesV1"));
+    assert(schema.type_has_field("TelemetryV1", "battery_percent"));
+    assert(schema.type_has_field("SimulationTraceV1", "contract_version"));
+    assert(schema.type_has_field("ScenarioManifestV1", "contract_schema_hash"));
+    assert(schema.type_has_field("ScenarioManifestV1", "terrain_tiles_hash"));
+    assert(schema.type_has_field("ScenarioManifestV1", "safety_config_hash"));
+    assert(schema.has_capability("deterministic_runner"));
+    assert(schema.has_capability("scenario_manifest"));
+    assert(schema.to_json().find("\"schema_hash\":\"" + schema.schema_hash + "\"") != std::string::npos);
+}
+
+void test_twin_contract_version_compatibility() {
+    assert(agbot::flight_sim::is_compatible_contract_version("1.0.0", "1.0.1"));
+    assert(agbot::flight_sim::is_compatible_contract_version("1.0.0", "1.1.0"));
+    assert(!agbot::flight_sim::is_compatible_contract_version("1.1.0", "1.0.0"));
+    assert(!agbot::flight_sim::is_compatible_contract_version("1.0.0", "2.0.0"));
+    assert(!agbot::flight_sim::is_compatible_contract_version("1.0.0", "not-semver"));
 }
 
 void test_trace_diff_reports_divergent_field() {
@@ -406,6 +448,8 @@ int main() {
     test_deterministic_runner_is_byte_identical();
     test_deterministic_runner_seed_drives_prng();
     test_run_manifest_records_contract_and_hashes();
+    test_twin_contract_v1_schema_covers_required_types();
+    test_twin_contract_version_compatibility();
     test_trace_diff_reports_divergent_field();
     test_deterministic_runner_matches_golden();
     test_fnv1a64_is_stable_and_distinct();
