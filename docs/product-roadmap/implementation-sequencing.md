@@ -43,12 +43,27 @@ Exit: a small advisory team can manage multiple farms and maintain field history
 
 ## Phase 4: Precision Ag Expansion and Scale (Milestone M4)
 
-- **Domain 09 + 05**: time-series comparison, prescriptions, management zones, and anomaly detection.
+- **Domain 28** (the time-series and change-detection engine): stand up the reusable scalar+raster series store and the co-registration guard first — it is the substrate for "time-series comparison" everywhere below, not a feature of any single domain.
+- **Domain 09 + 05 + 28**: time-series comparison, prescriptions, management zones, and anomaly detection, with `09`/`05` consuming `28` rather than each rolling its own trend logic.
+- **Domain 22**: the orthomosaic/photogrammetry pipeline — promote per-frame capture (`04`) into one georeferenced field map that `05`/`07`/`09` analyze; the missing core primitive between capture and analysis.
+- **Domain 23**: CV crop intelligence — deterministic stand count/canopy cover first, then evidence-gated pest/disease/weed detection; weed maps feed VRA export (`32`).
+- **Domain 32**: import/export and **VRA/prescription export** — the bridge that turns `09`/`23` findings into a file `14` executes; also Shapefile/KML/GeoPackage round-trip and platform interop.
 - **Domain 03**: real swarm coordination, formation control, and collision avoidance for multi-drone coverage.
 - **Domain 06 + 07**: large-raster and tile performance hardening, dense point-cloud scale.
-- **Domain 12**: alerts, fleet health, and enterprise operations support.
+- **Domain 12 + 25**: alerts, fleet health, and enterprise operations support; `25` predictive maintenance consumes `28` telemetry trends and gates dispatch.
 
-Exit: the platform supports repeated, comparative analysis at scale and operational outputs beyond static reports.
+Exit: the platform supports repeated, comparative analysis at scale, turns findings into machine-executable prescriptions, and operates beyond static reports.
+
+## Phase 4b: Cross-Cutting Trust and Interop Backbones (threaded, not bolted on)
+
+These subsystems are reusable backbones. They should be **built once and threaded back through earlier domains**, ideally starting as soon as the deterministic-product domains (`05`/`06`/`09`) are real — not deferred to the end.
+
+- **Domain 30 (provenance/audit ledger)**: stand up the append-only, hash-chained capture→product→finding→report lineage early; retrofit `04`/`05`/`06`/`09`/`22`/`23`/`28` to record evidence into it. Prerequisite for trustworthy MRV (`19`), compliance audit (`24`), and copilot citations (`26`).
+- **Domain 29 (alerting/notification)**: one rule engine + delivery backbone; once it exists, route `15`/`17`/`24`/`25`/`27`/`09` events through it instead of per-domain notifications.
+- **Domain 24 (regulatory/compliance)**: gate `01` flight authorization and `04`/spray records on deterministic rule checks backed by `30`.
+- **Domain 26 (agronomy copilot)**: only after `09`, `28`, and `30` are real — its citations must resolve to ledger evidence objects, and it must refuse when ungrounded.
+- **Domain 27 (soil/IoT sensor network)**: ground sensors that delegate series storage to `28` and feed irrigation (`16`) and alerts (`29`).
+- **Domain 31 (plugin SDK/open data)**: opens `05`/`08`/`09`/`29`/`32` extension points under a capability sandbox; sequence after those host domains stabilize their contracts.
 
 ## Phase 5: Adjacent Product Vision (Later Horizon — Greenfield)
 
@@ -59,6 +74,14 @@ Domains `13`–`21` are greenfield product-vision modules from `../reference/pro
 - **Third wave (new platforms and surfaces):** `14` Autonomous Tractor (a new ground-vehicle platform reusing flight mission/safety patterns), `21` Real-time Collaboration (new live-video and messaging infrastructure), `20` Content Management (largely decoupled), and `18` Supply Chain and Marketplace (furthest from the codebase, with external payment/compliance boundaries).
 
 Each should earn its place with user validation before implementation; none should pull engineering away from the advisor MVP.
+
+## Phase 6: Mission-Tier Horizons (Moonshots)
+
+Direction, not scheduled work — these compose existing domains rather than adding new ones, and start only once the cross-cutting backbones (`28`/`29`/`30`) are real:
+
+- **Closed-loop autonomy**: a significant change (`28`) or a cited finding (`26`) auto-proposes a targeted re-fly/treatment mission that executes only after human approval, tying `09` → `01`/`14`. Already seeded as the M5 stories of `28` and `26`.
+- **Offline-first / decentralized deployment**: local-first sync and conflict resolution for disconnected regions, extending the edge posture of `12` and the adapter model of `32`.
+- **Grow-pod / vertical-farming controller + federated learning**: a controlled-environment control plane plus privacy-preserving cross-farm model improvement; genuinely new platform scope, deliberately kept as a horizon rather than a domain.
 
 ## Cross-Domain Dependency Logic
 
