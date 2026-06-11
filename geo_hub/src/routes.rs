@@ -8,7 +8,7 @@ use axum::response::Html;
 use axum::response::{IntoResponse, Response};
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     Json,
 };
@@ -78,6 +78,45 @@ pub struct ProductSummary {
     pub content_type: String,
     pub url_path: String,
     pub tile_url_template: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LayerListQuery {
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub product_kind: Option<String>,
+    pub date: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerListResponse {
+    pub page: usize,
+    pub page_size: usize,
+    pub total: usize,
+    pub layers: Vec<LayerMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerMetadata {
+    pub layer_id: String,
+    pub scene_id: String,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub product_kind: String,
+    pub spatial_ref: RasterSpatialRef,
+    pub freshness: LayerFreshness,
+    pub source: String,
+    pub url_path: String,
+    pub tile_url_template: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerFreshness {
+    pub acquired_at: String,
+    pub ingested_at: Option<String>,
+    pub coverage_fraction: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -2205,6 +2244,49 @@ pub async fn get_scene(
     }))
 }
 
+pub async fn list_layers(
+    Query(query): Query<LayerListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<LayerListResponse>> {
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let rows = load_layer_rows(&state).await?;
+    let mut layers = Vec::new();
+
+    for row in rows {
+        if !layer_row_matches_query(&row, &query) {
+            continue;
+        }
+        if let Some(layer) = layer_from_row(&row, false).await? {
+            layers.push(layer);
+        }
+    }
+
+    let total = layers.len();
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let layers = layers.into_iter().skip(start).take(page_size).collect();
+
+    Ok(Json(LayerListResponse {
+        page,
+        page_size,
+        total,
+        layers,
+    }))
+}
+
+pub async fn get_layer_metadata(
+    Path((scene_id, kind)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<Json<LayerMetadata>> {
+    let row = load_layer_row(&state, &scene_id, &kind)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let layer = layer_from_row(&row, true)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(layer))
+}
+
 pub async fn stream_product(
     Path((scene_id, kind)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -2467,6 +2549,181 @@ async fn collect_scene_products(
     }
 
     Ok(products.into_values().collect())
+}
+
+async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::SqliteRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            p.kind,
+            p.path,
+            s.scene_id,
+            s.sensor,
+            s.acquired_at,
+            s.metadata_json,
+            s.field_id,
+            s.season_id,
+            i.ingested_at,
+            i.coverage_fraction,
+            i.source_path,
+            sr.spatial_ref_json
+        FROM products p
+        JOIN scenes s ON s.scene_id = p.scene_id
+        LEFT JOIN scene_ingests i ON i.scene_id = s.scene_id
+        LEFT JOIN scene_spatial_refs sr ON sr.scene_id = s.scene_id
+        ORDER BY s.acquired_at DESC, p.kind ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(rows)
+}
+
+async fn load_layer_row(
+    state: &AppState,
+    scene_id: &str,
+    kind: &str,
+) -> AppResult<Option<sqlx::sqlite::SqliteRow>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            p.kind,
+            p.path,
+            s.scene_id,
+            s.sensor,
+            s.acquired_at,
+            s.metadata_json,
+            s.field_id,
+            s.season_id,
+            i.ingested_at,
+            i.coverage_fraction,
+            i.source_path,
+            sr.spatial_ref_json
+        FROM products p
+        JOIN scenes s ON s.scene_id = p.scene_id
+        LEFT JOIN scene_ingests i ON i.scene_id = s.scene_id
+        LEFT JOIN scene_spatial_refs sr ON sr.scene_id = s.scene_id
+        WHERE p.scene_id = ?1 AND lower(p.kind) = lower(?2)
+        "#,
+    )
+    .bind(scene_id)
+    .bind(kind.trim())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(row)
+}
+
+fn layer_row_matches_query(row: &sqlx::sqlite::SqliteRow, query: &LayerListQuery) -> bool {
+    if !optional_filter_matches(
+        row.get::<Option<String>, _>("field_id"),
+        query.field_id.as_ref(),
+    ) {
+        return false;
+    }
+    if !optional_filter_matches(
+        row.get::<Option<String>, _>("season_id"),
+        query.season_id.as_ref(),
+    ) {
+        return false;
+    }
+    if let Some(kind) = query.product_kind.as_ref().and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then_some(trimmed.to_ascii_lowercase())
+    }) {
+        let row_kind: String = row.get("kind");
+        if row_kind.to_ascii_lowercase() != kind {
+            return false;
+        }
+    }
+    if let Some(date) = query.date.as_ref().and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }) {
+        let acquired_at: String = row.get("acquired_at");
+        if !acquired_at.starts_with(date) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn optional_filter_matches(row_value: Option<String>, filter: Option<&String>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    row_value.as_deref() == Some(filter)
+}
+
+async fn layer_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    strict: bool,
+) -> AppResult<Option<LayerMetadata>> {
+    let product_path = PathBuf::from(row.get::<String, _>("path"));
+    if !fs::try_exists(&product_path)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?
+    {
+        return if strict {
+            Err(AppError::NotFound)
+        } else {
+            Ok(None)
+        };
+    }
+
+    let scene_id: String = row.get("scene_id");
+    let product_kind: String = row.get("kind");
+    let Some(spatial_ref_json) = row.get::<Option<String>, _>("spatial_ref_json") else {
+        return if strict {
+            Err(AppError::BadRequest(format!(
+                "metadata-integrity: layer {scene_id}:{product_kind} has no asserted spatial_ref"
+            )))
+        } else {
+            Ok(None)
+        };
+    };
+    let spatial_ref =
+        serde_json::from_str::<RasterSpatialRef>(&spatial_ref_json).map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode layer spatial_ref"))
+        })?;
+    let metadata_json: String = row.get("metadata_json");
+    let image = serde_json::from_str::<MultispectralImage>(&metadata_json).map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode layer scene metadata_json from database"),
+        )
+    })?;
+    if let Err(err) = assert_scene_spatial_ref_integrity(Some(&image), Some(&spatial_ref)) {
+        return if strict { Err(err) } else { Ok(None) };
+    }
+
+    let source = row
+        .get::<Option<String>, _>("source_path")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| row.get("sensor"));
+    let url_path = format!("/api/scenes/{scene_id}/products/{product_kind}");
+
+    Ok(Some(LayerMetadata {
+        layer_id: format!("{scene_id}:{product_kind}"),
+        scene_id,
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        product_kind,
+        spatial_ref,
+        freshness: LayerFreshness {
+            acquired_at: row.get("acquired_at"),
+            ingested_at: row.get("ingested_at"),
+            coverage_fraction: row.get("coverage_fraction"),
+        },
+        source,
+        tile_url_template: format!("{url_path}/tiles/{{z}}/{{x}}/{{y}}.png"),
+        url_path,
+    }))
 }
 
 async fn is_supported_product_file(entry: &DirEntry) -> AppResult<bool> {

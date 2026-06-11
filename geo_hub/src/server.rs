@@ -68,6 +68,11 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_field_scenes),
         )
         .route("/api/scenes", get(routes::list_scenes))
+        .route("/api/layers", get(routes::list_layers))
+        .route(
+            "/api/layers/:scene_id/:kind",
+            get(routes::get_layer_metadata),
+        )
         .route("/api/scenes/:scene_id", get(routes::get_scene))
         .route(
             "/api/scenes/:scene_id/annotations",

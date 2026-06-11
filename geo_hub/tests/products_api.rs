@@ -2763,6 +2763,261 @@ async fn scene_detail_returns_persisted_spatial_ref_roundtrip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn list_layers_filters_and_returns_spatial_ref_metadata() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    });
+
+    let first_scene = "layer-scene-older";
+    let first_dir = ctx.data_root.join("scenes").join(first_scene);
+    std::fs::create_dir_all(&first_dir)?;
+    insert_scene_with_spatial_ref(&ctx, first_scene, &first_dir, spatial_ref.clone()).await?;
+    link_scene_context(&ctx, first_scene, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, first_scene, "ndvi").await?;
+    insert_ingest_source(&ctx, first_scene, "landsat:/older-source").await?;
+
+    let second_scene = "layer-scene-newer";
+    let second_dir = ctx.data_root.join("scenes").join(second_scene);
+    std::fs::create_dir_all(&second_dir)?;
+    insert_scene_with_spatial_ref(&ctx, second_scene, &second_dir, spatial_ref.clone()).await?;
+    sqlx::query("UPDATE scenes SET acquired_at = ?1 WHERE scene_id = ?2")
+        .bind("2026-05-02T00:00:00Z")
+        .bind(second_scene)
+        .execute(&ctx.pool)
+        .await?;
+    link_scene_context(&ctx, second_scene, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, second_scene, "ndvi").await?;
+    insert_ingest_source(&ctx, second_scene, "landsat:/newer-source").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/layers?field_id=field-alpha&season_id=2026&product_kind=ndvi&page=1&page_size=1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let layers_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        layers_json.get("total").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        layers_json
+            .get("page_size")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/scene_id")
+            .and_then(|value| value.as_str()),
+        Some(second_scene)
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/product_kind")
+            .and_then(|value| value.as_str()),
+        Some("ndvi")
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/spatial_ref/crs")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/freshness/acquired_at")
+            .and_then(|value| value.as_str()),
+        Some("2026-05-02T00:00:00Z")
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/source")
+            .and_then(|value| value.as_str()),
+        Some("landsat:/newer-source")
+    );
+
+    let date_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/layers?field_id=field-alpha&date=2026-05-01")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(date_response.status(), StatusCode::OK);
+    let body = to_bytes(date_response.into_body(), 64 * 1024).await?;
+    let date_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        date_json.get("total").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        date_json
+            .pointer("/layers/0/scene_id")
+            .and_then(|value| value.as_str()),
+        Some(first_scene)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn layer_metadata_endpoint_returns_asserted_spatial_ref() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "layer-detail-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    });
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref).await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/layers/{scene_id}/ndvi"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let layer_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        layer_json.get("layer_id").and_then(|value| value.as_str()),
+        Some("layer-detail-scene:ndvi")
+    );
+    assert_eq!(
+        layer_json
+            .pointer("/spatial_ref/resolution/x")
+            .and_then(|value| value.as_f64()),
+        Some(0.05)
+    );
+    assert_eq!(
+        layer_json.get("url_path").and_then(|value| value.as_str()),
+        Some("/api/scenes/layer-detail-scene/products/ndvi")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_layers_excludes_spatial_ref_integrity_mismatch() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "invalid-layer-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let metadata_spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    });
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, metadata_spatial_ref).await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let corrupted_spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.58,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.06, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.06,
+            "y": 0.05
+        }
+    });
+    upsert_scene_spatial_ref(&ctx, scene_id, corrupted_spatial_ref).await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/layers?field_id=field-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let layers_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        layers_json.get("total").and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        layers_json
+            .get("layers")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn product_request_rejects_spatial_ref_integrity_mismatch() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -3158,6 +3413,82 @@ async fn insert_scene_with_spatial_ref(
     .await?;
 
     upsert_scene_spatial_ref(ctx, scene_id, spatial_ref).await
+}
+
+async fn link_scene_context(
+    ctx: &TestContext,
+    scene_id: &str,
+    field_id: &str,
+    season_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE scenes SET field_id = ?1, season_id = ?2, linked_at = ?3 WHERE scene_id = ?4",
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .bind("2026-05-01T00:00:00Z")
+    .bind(scene_id)
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
+}
+
+async fn insert_layer_product(ctx: &TestContext, scene_id: &str, kind: &str) -> Result<()> {
+    let product_path = ctx
+        .data_root
+        .join("scenes")
+        .join(scene_id)
+        .join("products")
+        .join(kind)
+        .join(format!("{kind}.png"));
+    std::fs::create_dir_all(product_path.parent().expect("product parent exists"))?;
+    std::fs::write(&product_path, TEST_PNG_BYTES)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO products (scene_id, kind, path, created_at)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(scene_id, kind) DO UPDATE SET path = excluded.path,
+                                                created_at = excluded.created_at
+        "#,
+    )
+    .bind(scene_id)
+    .bind(kind)
+    .bind(product_path.to_string_lossy().to_string())
+    .bind("2026-05-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_ingest_source(ctx: &TestContext, scene_id: &str, source_path: &str) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO scene_ingests (
+            scene_id, status, status_reason, ingested_at, acquisition_date,
+            coverage_fraction, source_path, updated_at
+        )
+        VALUES (?1, 'stored', NULL, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(scene_id) DO UPDATE SET
+            status = excluded.status,
+            ingested_at = excluded.ingested_at,
+            acquisition_date = excluded.acquisition_date,
+            coverage_fraction = excluded.coverage_fraction,
+            source_path = excluded.source_path,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(scene_id)
+    .bind("2026-05-01T00:00:00Z")
+    .bind("2026-05-01")
+    .bind(0.92_f64)
+    .bind(source_path)
+    .bind("2026-05-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
 }
 
 async fn upsert_scene_spatial_ref(
