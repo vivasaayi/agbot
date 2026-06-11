@@ -38,8 +38,17 @@ pub struct BandIngestEvidence {
     pub sensor: Option<String>,
     pub band_index_to_name: BTreeMap<usize, String>,
     pub resolved_bands: BTreeMap<String, String>,
+    pub band_grids: BTreeMap<String, BandGridEvidence>,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BandGridEvidence {
+    pub width: u32,
+    pub height: u32,
+    pub dtype: String,
+    pub nodata: Option<String>,
 }
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -93,7 +102,6 @@ pub async fn ingest_multispectral_image(
 ) -> Result<IngestedMultispectralImage, BandIngestError> {
     let image = load_multispectral_metadata(metadata_path).await?;
     let evidence = resolve_band_ingest_evidence(&image, sensor, overrides)?;
-    assert_required_band_rasters(&image, &evidence)?;
     Ok(IngestedMultispectralImage { image, evidence })
 }
 
@@ -175,45 +183,67 @@ pub fn resolve_band_ingest_evidence(
         }
     }
 
+    let band_grids = inspect_band_grids(&image, image.metadata.width, image.metadata.height)?;
+
     Ok(BandIngestEvidence {
         image_id: image.image_id,
         sensor: sensor.map(sensor_name).map(str::to_string),
         band_index_to_name,
         resolved_bands,
+        band_grids,
         width: image.metadata.width,
         height: image.metadata.height,
     })
 }
 
-fn assert_required_band_rasters(
+fn inspect_band_grids(
     image: &MultispectralImage,
-    evidence: &BandIngestEvidence,
-) -> Result<(), BandIngestError> {
-    for band_name in evidence.resolved_bands.values() {
-        let band_path = image.file_paths.get(band_name).ok_or_else(|| {
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<BTreeMap<String, BandGridEvidence>, BandIngestError> {
+    let mut band_names = if image.metadata.bands.is_empty() {
+        image.file_paths.keys().cloned().collect::<Vec<_>>()
+    } else {
+        image.metadata.bands.clone()
+    };
+    band_names.sort();
+
+    let mut band_grids = BTreeMap::new();
+    for band_name in band_names {
+        let band_path = image.file_paths.get(&band_name).ok_or_else(|| {
             BandIngestError::MissingRequiredBand {
-                band_name: band_name.clone(),
+                band_name: band_name.to_string(),
             }
         })?;
         let band_path = PathBuf::from(band_path);
-        let (actual_width, actual_height) =
-            image::image_dimensions(&band_path).map_err(|err| BandIngestError::RasterInspect {
-                band_name: band_name.clone(),
-                path: band_path.clone(),
-                message: err.to_string(),
-            })?;
-        if actual_width != evidence.width || actual_height != evidence.height {
+        let band = image::open(&band_path).map_err(|err| BandIngestError::RasterInspect {
+            band_name: band_name.clone(),
+            path: band_path.clone(),
+            message: err.to_string(),
+        })?;
+        let actual_width = band.width();
+        let actual_height = band.height();
+        if actual_width != expected_width || actual_height != expected_height {
             return Err(BandIngestError::DimensionMismatch {
                 band_name: band_name.clone(),
-                expected_width: evidence.width,
-                expected_height: evidence.height,
+                expected_width,
+                expected_height,
                 actual_width,
                 actual_height,
             });
         }
+        band_grids.insert(
+            band_name,
+            BandGridEvidence {
+                width: actual_width,
+                height: actual_height,
+                dtype: format!("{:?}", band.color()),
+                nodata: None,
+            },
+        );
     }
 
-    Ok(())
+    Ok(band_grids)
 }
 
 fn sensor_name(sensor: SensorPreset) -> &'static str {
@@ -370,6 +400,79 @@ mod tests {
         assert!(matches!(
             error,
             BandIngestError::MissingRequiredBand { ref band_name } if band_name == "B05"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ingest_records_grid_evidence_for_every_band() {
+        let root = temp_test_dir("grid_evidence");
+        let input_dir = root.join("input");
+        fs::create_dir_all(&input_dir).unwrap();
+
+        let red_path = input_dir.join("red.png");
+        let nir_path = input_dir.join("nir.png");
+        let blue_path = input_dir.join("blue.png");
+        write_gray_image(&red_path, 2, 1, 10);
+        write_gray_image(&nir_path, 2, 1, 30);
+        write_gray_image(&blue_path, 2, 1, 5);
+        let metadata_path = write_metadata(
+            &input_dir,
+            2,
+            1,
+            &[
+                ("Red", red_path.as_path()),
+                ("NIR", nir_path.as_path()),
+                ("Blue", blue_path.as_path()),
+            ],
+        );
+
+        let ingest = ingest_multispectral_image(&metadata_path, None, &BandOverrides::default())
+            .await
+            .unwrap();
+
+        let blue_grid = ingest.evidence.band_grids.get("Blue").unwrap();
+        assert_eq!(blue_grid.width, 2);
+        assert_eq!(blue_grid.height, 1);
+        assert_eq!(blue_grid.dtype, "L8");
+        assert_eq!(blue_grid.nodata, None);
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_mismatched_dimensions_in_any_metadata_band() {
+        let root = temp_test_dir("grid_mismatch");
+        let input_dir = root.join("input");
+        fs::create_dir_all(&input_dir).unwrap();
+
+        let red_path = input_dir.join("red.png");
+        let nir_path = input_dir.join("nir.png");
+        let blue_path = input_dir.join("blue.png");
+        write_gray_image(&red_path, 2, 1, 10);
+        write_gray_image(&nir_path, 2, 1, 30);
+        write_gray_image(&blue_path, 1, 1, 5);
+        let metadata_path = write_metadata(
+            &input_dir,
+            2,
+            1,
+            &[
+                ("Red", red_path.as_path()),
+                ("NIR", nir_path.as_path()),
+                ("Blue", blue_path.as_path()),
+            ],
+        );
+
+        let error = ingest_multispectral_image(&metadata_path, None, &BandOverrides::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BandIngestError::DimensionMismatch {
+                ref band_name,
+                expected_width: 2,
+                expected_height: 1,
+                actual_width: 1,
+                actual_height: 1,
+            } if band_name == "Blue"
         ));
     }
 }
