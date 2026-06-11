@@ -140,6 +140,7 @@ pub struct SceneExtent {
 pub struct CreateFieldRequest {
     pub farm_id: Option<String>,
     pub field_id: Option<String>,
+    pub org_id: Option<String>,
     pub owner: Option<String>,
     pub name: String,
     pub crop: Option<String>,
@@ -151,6 +152,7 @@ pub struct CreateFieldRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateFarmRequest {
     pub farm_id: Option<String>,
+    pub org_id: Option<String>,
     pub owner: Option<String>,
     pub name: String,
     pub notes: Option<String>,
@@ -1279,6 +1281,7 @@ async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<Ve
     for field in fields {
         let mut field = field.clone();
         field.owner = field_owner_for_farm(state, field.farm_id.as_deref(), &field.owner).await?;
+        field.org_id = field.owner.clone();
         sqlx::query(
             r#"
             INSERT INTO fields (field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at)
@@ -2031,6 +2034,7 @@ pub async fn create_field(
 ) -> AppResult<Json<FieldRecord>> {
     let mut field = build_field_record(request)?;
     field.owner = field_owner_for_farm(&state, field.farm_id.as_deref(), &field.owner).await?;
+    field.org_id = field.owner.clone();
 
     sqlx::query(
         r#"
@@ -2084,7 +2088,8 @@ pub async fn link_field_to_farm(
         .map_err(Error::from)?;
 
     field.farm_id = Some(farm_id);
-    field.owner = farm.owner;
+    field.owner = farm.owner.clone();
+    field.org_id = farm.owner;
     Ok(Json(field))
 }
 
@@ -2997,6 +3002,7 @@ fn build_field_record(mut request: CreateFieldRequest) -> AppResult<FieldRecord>
     if name.is_empty() {
         return Err(AppError::BadRequest("field name is required".to_string()));
     }
+    let org_id = normalize_org_id(request.org_id.take(), request.owner.take());
     request.boundary.crs = request.boundary.crs.as_deref().and_then(normalize_crs_text);
     if request.boundary.coordinates.len() < 3 {
         return Err(AppError::BadRequest(
@@ -3023,8 +3029,10 @@ fn build_field_record(mut request: CreateFieldRequest) -> AppResult<FieldRecord>
     Ok(FieldRecord {
         farm_id: request.farm_id,
         field_id,
-        owner: normalize_owner(request.owner),
+        org_id: org_id.clone(),
+        owner: org_id,
         name,
+        area_ha: None,
         crop: request.crop,
         season: request.season,
         notes: request.notes,
@@ -3039,9 +3047,11 @@ fn build_farm_record(request: CreateFarmRequest) -> AppResult<FarmRecord> {
         .farm_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let org_id = normalize_org_id(request.org_id, request.owner);
     Ok(FarmRecord {
         farm_id,
-        owner: normalize_owner(request.owner),
+        org_id: org_id.clone(),
+        owner: org_id,
         name: normalize_farm_name(request.name)?,
         notes: normalize_optional_text(request.notes),
         created_at: current_record_timestamp(),
@@ -3203,8 +3213,10 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
-fn normalize_owner(value: Option<String>) -> String {
-    normalize_optional_text(value).unwrap_or_else(|| DEFAULT_RECORD_OWNER.to_string())
+fn normalize_org_id(org_id: Option<String>, owner: Option<String>) -> String {
+    normalize_optional_text(org_id)
+        .or_else(|| normalize_optional_text(owner))
+        .unwrap_or_else(|| DEFAULT_RECORD_OWNER.to_string())
 }
 
 fn current_record_timestamp() -> String {
@@ -3277,6 +3289,7 @@ async fn fields_from_shapefile(request: ImportShapefileRequest) -> AppResult<Vec
             build_field_record(CreateFieldRequest {
                 farm_id: request.farm_id.clone(),
                 field_id: None,
+                org_id: request.owner.clone(),
                 owner: request.owner.clone(),
                 name: shape_name,
                 crop: request.crop.clone(),
@@ -3387,11 +3400,18 @@ fn feature_from_field(field: FieldRecord) -> Feature {
         serde_json::Value::String(field.owner.clone()),
     );
     properties.insert(
+        "org_id".to_string(),
+        serde_json::Value::String(field.org_id.clone()),
+    );
+    properties.insert(
         "created_at".to_string(),
         serde_json::Value::String(field.created_at.clone()),
     );
     if let Some(farm_id) = field.farm_id {
         properties.insert("farm_id".to_string(), serde_json::Value::String(farm_id));
+    }
+    if let Some(area_ha) = field.area_ha {
+        properties.insert("area_ha".to_string(), serde_json::Value::from(area_ha));
     }
     properties.insert("name".to_string(), serde_json::Value::String(field.name));
     if let Some(crs) = field.boundary.crs.as_ref() {
@@ -3597,6 +3617,7 @@ fn build_field_from_feature(feature: geojson::Feature, index: usize) -> AppResul
         Some(CreateFieldRequest {
             farm_id: None,
             field_id,
+            org_id: property_string(&properties, "org_id"),
             owner: property_string(&properties, "owner"),
             name,
             crop: property_string(&properties, "crop"),
@@ -3621,6 +3642,7 @@ fn build_field_from_geometry(
     let template = template.unwrap_or(CreateFieldRequest {
         farm_id: None,
         field_id: None,
+        org_id: None,
         owner: None,
         name: format!("Imported Field {}", index + 1),
         crop: None,
@@ -3636,6 +3658,7 @@ fn build_field_from_geometry(
     build_field_record(CreateFieldRequest {
         farm_id: template.farm_id,
         field_id: template.field_id,
+        org_id: template.org_id,
         owner: template.owner,
         name: template.name,
         crop: template.crop,
@@ -3751,8 +3774,10 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
     Ok(FieldRecord {
         farm_id: row.get("farm_id"),
         field_id: row.get("field_id"),
+        org_id: row.get("owner"),
         owner: row.get("owner"),
         name: row.get("name"),
+        area_ha: None,
         crop: row.get("crop"),
         season: row.get("season"),
         notes: row.get("notes"),
@@ -3765,6 +3790,7 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
 fn decode_farm_record(row: &sqlx::sqlite::SqliteRow) -> FarmRecord {
     FarmRecord {
         farm_id: row.get("farm_id"),
+        org_id: row.get("owner"),
         owner: row.get("owner"),
         name: row.get("name"),
         notes: row.get("notes"),
@@ -4654,6 +4680,7 @@ mod tests {
         let field = build_field_record(CreateFieldRequest {
             farm_id: None,
             field_id: Some("north-80".to_string()),
+            org_id: None,
             owner: None,
             name: "North 80".to_string(),
             crop: Some("corn".to_string()),
@@ -4697,6 +4724,7 @@ mod tests {
         let err = build_field_record(CreateFieldRequest {
             farm_id: None,
             field_id: None,
+            org_id: None,
             owner: None,
             name: "Short boundary".to_string(),
             crop: None,
@@ -4726,6 +4754,7 @@ mod tests {
         let err = build_field_record(CreateFieldRequest {
             farm_id: None,
             field_id: None,
+            org_id: None,
             owner: None,
             name: "Bad coordinates".to_string(),
             crop: None,

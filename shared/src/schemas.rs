@@ -40,6 +40,8 @@ fn default_record_owner() -> String {
 pub struct FarmRecord {
     pub farm_id: String,
     #[serde(default = "default_record_owner")]
+    pub org_id: String,
+    #[serde(default = "default_record_owner")]
     pub owner: String,
     pub name: String,
     pub notes: Option<String>,
@@ -53,8 +55,12 @@ pub struct FieldRecord {
     pub farm_id: Option<String>,
     pub field_id: String,
     #[serde(default = "default_record_owner")]
+    pub org_id: String,
+    #[serde(default = "default_record_owner")]
     pub owner: String,
     pub name: String,
+    #[serde(default)]
+    pub area_ha: Option<f64>,
     pub crop: Option<String>,
     pub season: Option<String>,
     pub notes: Option<String>,
@@ -62,6 +68,135 @@ pub struct FieldRecord {
     pub extent: GeoBounds,
     #[serde(default)]
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FarmFieldError {
+    #[error("farm_id cannot be empty")]
+    EmptyFarmId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("name cannot be empty")]
+    EmptyName,
+    #[error("field requires a farm_id: {field_id}")]
+    MissingFarmId { field_id: String },
+    #[error("farm not found: {farm_id}")]
+    FarmNotFound { farm_id: String },
+    #[error("farm {farm_id} belongs to {farm_org_id}, not {field_org_id}")]
+    TenantBoundary {
+        farm_id: String,
+        farm_org_id: String,
+        field_org_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FarmFieldRegistry {
+    farms: HashMap<String, FarmRecord>,
+    fields: HashMap<String, FieldRecord>,
+}
+
+impl FarmFieldRegistry {
+    pub fn insert_farm(&mut self, farm: FarmRecord) -> Result<FarmRecord, FarmFieldError> {
+        let mut farm = normalize_farm_record(farm)?;
+        farm.owner = farm.org_id.clone();
+        self.farms.insert(farm.farm_id.clone(), farm.clone());
+        Ok(farm)
+    }
+
+    pub fn insert_field(&mut self, field: FieldRecord) -> Result<FieldRecord, FarmFieldError> {
+        let mut field = normalize_field_record(field)?;
+        let farm_id = field
+            .farm_id
+            .clone()
+            .ok_or_else(|| FarmFieldError::MissingFarmId {
+                field_id: field.field_id.clone(),
+            })?;
+        let farm = self
+            .farms
+            .get(&farm_id)
+            .ok_or_else(|| FarmFieldError::FarmNotFound {
+                farm_id: farm_id.clone(),
+            })?;
+        if farm.org_id != field.org_id {
+            return Err(FarmFieldError::TenantBoundary {
+                farm_id,
+                farm_org_id: farm.org_id.clone(),
+                field_org_id: field.org_id,
+            });
+        }
+
+        field.owner = field.org_id.clone();
+        self.fields.insert(field.field_id.clone(), field.clone());
+        Ok(field)
+    }
+
+    pub fn farms_for_org(&self, org_id: &str) -> Vec<FarmRecord> {
+        let mut farms = self
+            .farms
+            .values()
+            .filter(|farm| farm.org_id == org_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        farms.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.farm_id.cmp(&right.farm_id))
+        });
+        farms
+    }
+
+    pub fn fields_for_org(&self, org_id: &str) -> Vec<FieldRecord> {
+        let mut fields = self
+            .fields
+            .values()
+            .filter(|field| field.org_id == org_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        fields.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.field_id.cmp(&right.field_id))
+        });
+        fields
+    }
+
+    pub fn farm_for_org(&self, org_id: &str, farm_id: &str) -> Option<FarmRecord> {
+        self.farms
+            .get(farm_id)
+            .filter(|farm| farm.org_id == org_id)
+            .cloned()
+    }
+
+    pub fn field_for_org(&self, org_id: &str, field_id: &str) -> Option<FieldRecord> {
+        self.fields
+            .get(field_id)
+            .filter(|field| field.org_id == org_id)
+            .cloned()
+    }
+}
+
+fn normalize_farm_record(mut farm: FarmRecord) -> Result<FarmRecord, FarmFieldError> {
+    farm.farm_id = normalize_farm_field_text(farm.farm_id).ok_or(FarmFieldError::EmptyFarmId)?;
+    farm.org_id = normalize_farm_field_text(farm.org_id).ok_or(FarmFieldError::EmptyOrgId)?;
+    farm.name = normalize_farm_field_text(farm.name).ok_or(FarmFieldError::EmptyName)?;
+    Ok(farm)
+}
+
+fn normalize_field_record(mut field: FieldRecord) -> Result<FieldRecord, FarmFieldError> {
+    field.field_id =
+        normalize_farm_field_text(field.field_id).ok_or(FarmFieldError::EmptyFieldId)?;
+    field.org_id = normalize_farm_field_text(field.org_id).ok_or(FarmFieldError::EmptyOrgId)?;
+    field.name = normalize_farm_field_text(field.name).ok_or(FarmFieldError::EmptyName)?;
+    field.farm_id = field.farm_id.and_then(normalize_farm_field_text);
+    Ok(field)
+}
+
+fn normalize_farm_field_text(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -509,9 +644,10 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 mod tests {
     use super::{
         assert_raster_spatial_ref, bounds_from_points, AnnotationGeometry, AnnotationRecord,
-        FieldBoundary, FieldRecord, GeoBounds, GeoPoint, MultispectralImage, RasterResolution,
-        RasterSpatialRef, RasterSpatialRefError, RecommendationPriority, RecommendationRecord,
-        RecommendationStatus, ReportFormat, ReportRecord,
+        FarmFieldError, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord, GeoBounds,
+        GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat,
+        ReportRecord,
     };
 
     #[test]
@@ -691,8 +827,10 @@ mod tests {
         let field = FieldRecord {
             farm_id: Some("farm-1".to_string()),
             field_id: "field-1".to_string(),
+            org_id: "org-1".to_string(),
             owner: "org-1".to_string(),
             name: "North 80".to_string(),
+            area_ha: Some(32.4),
             crop: Some("corn".to_string()),
             season: Some("2026".to_string()),
             notes: Some("pivot irrigation".to_string()),
@@ -726,6 +864,117 @@ mod tests {
         let decoded: FieldRecord = serde_json::from_value(value).expect("field should deserialize");
 
         assert_eq!(decoded, field);
+    }
+
+    #[test]
+    fn farm_field_registry_lists_records_under_org_only() {
+        let mut registry = FarmFieldRegistry::default();
+        let farm = FarmRecord {
+            farm_id: "farm-a".to_string(),
+            org_id: "org-a".to_string(),
+            owner: "org-a".to_string(),
+            name: "Prairie Farm".to_string(),
+            notes: None,
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+        let field = FieldRecord {
+            farm_id: Some(farm.farm_id.clone()),
+            field_id: "field-a".to_string(),
+            org_id: "org-a".to_string(),
+            owner: "org-a".to_string(),
+            name: "North 80".to_string(),
+            area_ha: Some(32.4),
+            crop: Some("corn".to_string()),
+            season: Some("2026".to_string()),
+            notes: None,
+            boundary: test_boundary(),
+            extent: test_extent(),
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+
+        registry.insert_farm(farm).expect("farm persists");
+        registry.insert_field(field).expect("field persists");
+
+        let farms = registry.farms_for_org("org-a");
+        let fields = registry.fields_for_org("org-a");
+
+        assert_eq!(farms.len(), 1);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].farm_id.as_deref(), Some("farm-a"));
+        assert_eq!(fields[0].org_id, "org-a");
+        assert!(registry.farms_for_org("org-b").is_empty());
+        assert!(registry.fields_for_org("org-b").is_empty());
+    }
+
+    #[test]
+    fn field_with_cross_org_farm_is_rejected_without_writing() {
+        let mut registry = FarmFieldRegistry::default();
+        registry
+            .insert_farm(FarmRecord {
+                farm_id: "farm-a".to_string(),
+                org_id: "org-a".to_string(),
+                owner: "org-a".to_string(),
+                name: "Prairie Farm".to_string(),
+                notes: None,
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect("farm persists");
+
+        let error = registry
+            .insert_field(FieldRecord {
+                farm_id: Some("farm-a".to_string()),
+                field_id: "field-b".to_string(),
+                org_id: "org-b".to_string(),
+                owner: "org-b".to_string(),
+                name: "Other Org Field".to_string(),
+                area_ha: None,
+                crop: None,
+                season: None,
+                notes: None,
+                boundary: test_boundary(),
+                extent: test_extent(),
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect_err("cross-org farm link is rejected");
+
+        assert_eq!(
+            error,
+            FarmFieldError::TenantBoundary {
+                farm_id: "farm-a".to_string(),
+                farm_org_id: "org-a".to_string(),
+                field_org_id: "org-b".to_string()
+            }
+        );
+        assert!(registry.fields_for_org("org-b").is_empty());
+    }
+
+    fn test_boundary() -> FieldBoundary {
+        FieldBoundary {
+            crs: Some("EPSG:4326".to_string()),
+            coordinates: vec![
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.2,
+                },
+                GeoPoint {
+                    longitude: -96.2,
+                    latitude: 41.2,
+                },
+                GeoPoint {
+                    longitude: -96.2,
+                    latitude: 41.4,
+                },
+            ],
+        }
+    }
+
+    fn test_extent() -> GeoBounds {
+        GeoBounds {
+            min_lon: -96.5,
+            min_lat: 41.2,
+            max_lon: -96.2,
+            max_lat: 41.4,
+        }
     }
 
     #[test]
