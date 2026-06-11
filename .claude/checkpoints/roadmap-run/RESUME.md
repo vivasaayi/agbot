@@ -2,9 +2,9 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: 457e3842748483d3 (docs/product-roadmap/02-simulation-digital-twin/*.md + tolerance-profiles.md)
-- **Last commit**: d7203dd (`batch-02-01` committed)
-- **Current batch**: `batch-02-02` — implemented and verified, awaiting commit
-- **Completed batches**: 1 committed
+- **Last commit**: 594c05d (`batch-02-02` committed)
+- **Current batch**: none — ready to start `batch-02-03`
+- **Completed batches**: 2 committed
 
 ## Architecture decision (2026-06-11)
 Consolidated to a SINGLE simulator: C++ `flight_sim_cpp` is canonical for both interactive AND headless CI regression. Rust `drone_simulator` crate RETIRED (git rm'd, removed from workspace). Orphaned Bevy `simulator/` dir deleted. "Cross-runner parity" → single-runner cross-build determinism.
@@ -17,9 +17,6 @@ Consolidated to a SINGLE simulator: C++ `flight_sim_cpp` is canonical for both i
 - Verify: `just flight-sim-test` -> 100% pass; `cargo check` -> pass with pre-existing warnings
 
 ## Next action
-Commit `batch-02-02` after staging reviewed FlightSim reliability changes:
-- 02-26 safety parity harness (`SafetyRules`, required-rule coverage, `DroneSimulation` failsafe integration)
-- 02-27 terrain no-data model (`TerrainTileState`, `TerrainTileStatus`, `flat_fallback` composite evidence)
-- 02-29 trace diff CLI (`agbot-sim diff`)
+Start `batch-02-03`: continue the P0 reliability foundation by completing `TwinContractV1` schema work for 02-24 and expanding scenario manifest schema/hash coverage for 02-28.
 
-Verified: `just flight-sim-test`; `agbot-sim diff` smoke checks for identical and divergent traces.
+Latest verified batch: `batch-02-02` committed as 594c05d. It added 02-26 safety parity harness (`SafetyRules`, required-rule coverage, `DroneSimulation` failsafe integration), 02-27 terrain no-data state evidence (`TerrainTileState`, `TerrainTileStatus`, `flat_fallback` composites), and 02-29 trace diff CLI (`agbot-sim diff`). Verified with `just flight-sim-test` plus `agbot-sim diff` smoke checks for identical and divergent traces.
