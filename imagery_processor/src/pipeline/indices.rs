@@ -801,14 +801,17 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                         ))
                     })?;
                 }
-                // Try to copy georeferencing from one of the source bands
-                let src_ref = image
-                    .file_paths
-                    .get(&nir_name)
-                    .or_else(|| image.file_paths.get(&red_name));
-                if let Some(src) = src_ref {
-                    let _ = crate::io::gdal_util::copy_geo_from(src, p.to_string_lossy().as_ref());
-                }
+                crate::io::gdal_util::apply_spatial_ref(
+                    p.to_string_lossy().as_ref(),
+                    &ingest.evidence.spatial_ref,
+                )
+                .map_err(|e| {
+                    shared::error::AgroError::Processing(format!(
+                        "Apply GeoTIFF spatial reference failed: {}",
+                        e
+                    ))
+                })?;
+                crate::io::write_geotiff_spatial_sidecar(&p, &ingest.evidence.spatial_ref).await?;
                 p
             }
             #[cfg(not(feature = "gdal-io"))]

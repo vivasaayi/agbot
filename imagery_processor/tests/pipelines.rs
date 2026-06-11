@@ -2,11 +2,15 @@
 
 use image::{GrayImage, ImageBuffer, Luma};
 use imagery_processor::{
-    io::{BandIngestEvidence, CalibrationStatus},
+    io::{
+        geotiff_spatial_sidecar_path, write_geotiff_spatial_sidecar, BandIngestEvidence,
+        CalibrationStatus, GeoTiffSpatialSidecar,
+    },
     pipeline::{indices::run_indices, masks::run_masks},
     IndexKind, IndicesArgs, MasksArgs, OutputFormat, SensorPreset,
 };
 use serde_json::Value;
+use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -120,6 +124,13 @@ fn assert_close(actual: f64, expected: f64) {
         (actual - expected).abs() < 1e-9,
         "expected {actual} to be within GEO tolerance of {expected}"
     );
+}
+
+fn valid_asserted_spatial_ref(width: u32, height: u32) -> RasterSpatialRef {
+    let spatial_ref: RasterSpatialRef = serde_json::from_value(valid_spatial_ref(width, height))
+        .expect("spatial ref fixture should deserialize");
+    assert_raster_spatial_ref(Some(&spatial_ref), width, height)
+        .expect("spatial ref fixture should assert")
 }
 
 fn base_indices_args(input_dir: PathBuf, output_dir: PathBuf) -> IndicesArgs {
@@ -410,6 +421,76 @@ async fn indices_reject_zero_resolution_spatial_ref() {
     let error = run_indices(&args).await.unwrap_err().to_string();
     assert!(error.contains("georeferencing"));
     assert!(error.contains("positive resolution"));
+}
+
+#[test]
+fn geotiff_sidecar_records_asserted_transform() {
+    let spatial_ref = valid_asserted_spatial_ref(2, 1);
+
+    let sidecar = GeoTiffSpatialSidecar::from_spatial_ref(&spatial_ref).unwrap();
+    let sidecar_path = geotiff_spatial_sidecar_path(Path::new("/tmp/product.tif"));
+
+    assert_eq!(sidecar.format_version, 1);
+    assert_eq!(sidecar.crs, "EPSG:4326");
+    assert_eq!(
+        sidecar.geo_transform,
+        [-74.1, 0.0001, 0.0, 40.8, 0.0, -0.0001]
+    );
+    assert_eq!(sidecar.resolution.x, 0.0001);
+    assert_eq!(sidecar.resolution.y, 0.0001);
+    assert_eq!(sidecar.bbox.min_lon, -74.1);
+    assert_close(sidecar.bbox.max_lon, -74.0998);
+    assert!(sidecar_path.ends_with("product.tif.spatial_ref.json"));
+}
+
+#[tokio::test]
+async fn geotiff_sidecar_write_round_trips_transform() {
+    let root = temp_test_dir("geotiff_sidecar_write");
+    let product_path = root.join("product.tif");
+    let spatial_ref = valid_asserted_spatial_ref(2, 1);
+
+    let sidecar_path = write_geotiff_spatial_sidecar(&product_path, &spatial_ref)
+        .await
+        .unwrap();
+    let sidecar: GeoTiffSpatialSidecar =
+        serde_json::from_str(&fs::read_to_string(sidecar_path).unwrap()).unwrap();
+
+    assert_eq!(sidecar.crs, "EPSG:4326");
+    assert_eq!(
+        sidecar.geo_transform,
+        [-74.1, 0.0001, 0.0, 40.8, 0.0, -0.0001]
+    );
+    assert_eq!(sidecar.resolution.x, 0.0001);
+    assert_eq!(sidecar.resolution.y, 0.0001);
+}
+
+#[cfg(not(feature = "gdal-io"))]
+#[tokio::test]
+async fn indices_geotiff_fails_without_gdal_feature() {
+    let root = temp_test_dir("indices_no_gdal_geotiff");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    write_gray_image(&red_path, 1, 1, &[10]);
+    write_gray_image(&nir_path, 1, 1, &[30]);
+    write_metadata(
+        &input_dir,
+        1,
+        1,
+        &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.out_format = OutputFormat::Geotiff;
+
+    let error = run_indices(&args).await.unwrap_err().to_string();
+
+    assert!(error.contains("gdal-io feature is not enabled"));
+    let outputs = fs::read_dir(output_dir).unwrap().count();
+    assert_eq!(outputs, 1, "only band ingest evidence should be written");
 }
 
 #[tokio::test]

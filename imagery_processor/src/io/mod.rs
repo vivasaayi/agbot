@@ -3,7 +3,14 @@ pub mod gdal_util;
 
 use crate::{IndicesArgs, SensorPreset};
 use serde::{Deserialize, Serialize};
-use shared::schemas::{assert_raster_spatial_ref, MultispectralImage, RasterSpatialRef};
+use shared::{
+    error::AgroError,
+    schemas::{
+        assert_raster_spatial_ref, GeoBounds, MultispectralImage, RasterResolution,
+        RasterSpatialRef,
+    },
+    AgroResult,
+};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -71,6 +78,60 @@ pub struct BandGridEvidence {
     pub height: u32,
     pub dtype: String,
     pub nodata: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GeoTiffSpatialSidecar {
+    pub format_version: u8,
+    pub crs: String,
+    pub bbox: GeoBounds,
+    pub resolution: RasterResolution,
+    pub geo_transform: [f64; 6],
+}
+
+impl GeoTiffSpatialSidecar {
+    pub fn from_spatial_ref(spatial_ref: &RasterSpatialRef) -> AgroResult<Self> {
+        Ok(Self {
+            format_version: 1,
+            crs: spatial_ref
+                .crs
+                .clone()
+                .ok_or_else(|| geotiff_spatial_ref_error("missing CRS"))?,
+            bbox: spatial_ref
+                .bbox
+                .clone()
+                .ok_or_else(|| geotiff_spatial_ref_error("missing extent bbox"))?,
+            resolution: spatial_ref
+                .resolution
+                .ok_or_else(|| geotiff_spatial_ref_error("missing resolution"))?,
+            geo_transform: spatial_ref
+                .geo_transform
+                .ok_or_else(|| geotiff_spatial_ref_error("missing transform"))?,
+        })
+    }
+}
+
+pub fn geotiff_spatial_sidecar_path(product_path: &Path) -> PathBuf {
+    let file_name = product_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.spatial_ref.json"))
+        .unwrap_or_else(|| "product.tif.spatial_ref.json".to_string());
+    product_path.with_file_name(file_name)
+}
+
+pub async fn write_geotiff_spatial_sidecar(
+    product_path: &Path,
+    spatial_ref: &RasterSpatialRef,
+) -> AgroResult<PathBuf> {
+    let sidecar = GeoTiffSpatialSidecar::from_spatial_ref(spatial_ref)?;
+    let sidecar_path = geotiff_spatial_sidecar_path(product_path);
+    tokio::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar)?).await?;
+    Ok(sidecar_path)
+}
+
+fn geotiff_spatial_ref_error(message: &str) -> AgroError {
+    AgroError::Processing(format!("GeoTIFF spatial sidecar error: {message}"))
 }
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]

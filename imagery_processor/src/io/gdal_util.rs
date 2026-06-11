@@ -1,5 +1,7 @@
 #[cfg(feature = "gdal-io")]
-use gdal::{Dataset, DriverManager};
+use gdal::{spatial_ref::SpatialRef, Dataset, DriverManager};
+#[cfg(feature = "gdal-io")]
+use shared::schemas::RasterSpatialRef;
 
 #[cfg(feature = "gdal-io")]
 pub fn write_u8_geotiff_basic(
@@ -30,6 +32,27 @@ pub fn copy_geo_from(src_path: &str, dst_path: &str) -> Result<(), gdal::errors:
     if let Ok(sref) = src.spatial_ref() {
         let wkt = sref.to_wkt()?;
         let _ = dst.set_projection(&wkt);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gdal-io")]
+pub fn apply_spatial_ref(
+    dst_path: &str,
+    spatial_ref: &RasterSpatialRef,
+) -> Result<(), gdal::errors::GdalError> {
+    let mut dst = Dataset::open_ex(
+        dst_path,
+        gdal::DatasetOptions {
+            ..Default::default()
+        },
+    )?;
+    if let Some(transform) = spatial_ref.geo_transform {
+        dst.set_geo_transform(&transform)?;
+    }
+    if let Some(crs) = spatial_ref.crs.as_deref() {
+        let sref = SpatialRef::from_definition(crs)?;
+        dst.set_projection(&sref.to_wkt()?)?;
     }
     Ok(())
 }
