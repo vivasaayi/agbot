@@ -13,8 +13,10 @@ use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::mavlink_integration::{MAVLinkConverter, MAVLinkMission};
-use crate::{Mission, MissionPlannerService};
+use crate::mavlink_integration::MAVLinkConverter;
+use crate::{
+    Mission, MissionPlannerService, MissionTelemetrySample, TelemetryFreshness, TelemetryHistory,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -27,6 +29,9 @@ pub enum WebSocketMessage {
         data: String,
     },
     SubscribeToUpdates,
+    SubscribeToTelemetry {
+        mission_id: Uuid,
+    },
     GetMissionStatus {
         mission_id: Uuid,
     },
@@ -45,6 +50,16 @@ pub enum WebSocketMessage {
     DroneTelemetry {
         drone_id: String,
         telemetry: DroneTelemettry,
+    },
+    MissionTelemetry {
+        sample: MissionTelemetrySample,
+    },
+    TelemetryReplay {
+        mission_id: Uuid,
+        samples: Vec<MissionTelemetrySample>,
+    },
+    TelemetryFreshness {
+        freshness: TelemetryFreshness,
     },
     SystemStatus {
         connected_drones: Vec<String>,
@@ -69,6 +84,7 @@ pub struct DroneTelemettry {
 
 pub struct WebSocketHandler {
     mission_service: Arc<Mutex<MissionPlannerService>>,
+    telemetry_history: Arc<Mutex<TelemetryHistory>>,
     broadcast_tx: broadcast::Sender<WebSocketMessage>,
 }
 
@@ -77,6 +93,7 @@ impl WebSocketHandler {
         let (broadcast_tx, _) = broadcast::channel(100);
         Self {
             mission_service,
+            telemetry_history: Arc::new(Mutex::new(TelemetryHistory::default())),
             broadcast_tx,
         }
     }
@@ -181,6 +198,19 @@ impl WebSocketHandler {
                 let json_msg = serde_json::to_string(&status_msg)?;
                 sender.send(Message::Text(json_msg))?;
             }
+            WebSocketMessage::SubscribeToTelemetry { mission_id } => {
+                let samples = self
+                    .telemetry_history
+                    .lock()
+                    .await
+                    .replay_mission(mission_id);
+                let replay_msg = WebSocketMessage::TelemetryReplay {
+                    mission_id,
+                    samples,
+                };
+                let json_msg = serde_json::to_string(&replay_msg)?;
+                sender.send(Message::Text(json_msg))?;
+            }
             WebSocketMessage::GetMissionStatus { mission_id } => {
                 // Mock mission status
                 let status_msg = WebSocketMessage::MissionStatus {
@@ -215,7 +245,7 @@ impl WebSocketHandler {
         let waypoint_file = MAVLinkConverter::to_waypoint_file(&mavlink_mission);
 
         // Save mission
-        let mut service = self.mission_service.lock().await;
+        let service = self.mission_service.lock().await;
         service.create_mission(mission.clone()).await?;
 
         // TODO: Send to actual drone system
@@ -286,6 +316,19 @@ impl WebSocketHandler {
         let _ = self.broadcast_tx.send(msg);
     }
 
+    pub async fn record_and_broadcast_mission_telemetry(
+        &self,
+        sample: MissionTelemetrySample,
+    ) -> Result<()> {
+        self.telemetry_history
+            .lock()
+            .await
+            .record_sample(sample.clone())?;
+        let msg = WebSocketMessage::MissionTelemetry { sample };
+        let _ = self.broadcast_tx.send(msg);
+        Ok(())
+    }
+
     pub async fn broadcast_mission_status(&self, mission_id: Uuid, status: String, progress: f32) {
         let msg = WebSocketMessage::MissionStatus {
             mission_id,
@@ -293,5 +336,50 @@ impl WebSocketHandler {
             progress,
         };
         let _ = self.broadcast_tx.send(msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use shared::schemas::{GpsCoords, Telemetry};
+
+    fn sample_for_message(mission_id: Uuid) -> MissionTelemetrySample {
+        MissionTelemetrySample {
+            mission_id,
+            drone_id: "drone-1".to_string(),
+            telemetry: Telemetry {
+                timestamp: Utc.timestamp_opt(100, 0).unwrap(),
+                position: GpsCoords {
+                    latitude: 41.0,
+                    longitude: -96.0,
+                    altitude: 400.0,
+                },
+                battery_voltage: 15.8,
+                battery_percentage: 82,
+                armed: true,
+                mode: "AUTO".to_string(),
+                ground_speed: 6.0,
+                air_speed: 6.5,
+                heading: 90.0,
+                altitude_relative: 40.0,
+            },
+        }
+    }
+
+    #[test]
+    fn telemetry_replay_message_serializes_mission_samples() {
+        let mission_id = Uuid::new_v4();
+        let message = WebSocketMessage::TelemetryReplay {
+            mission_id,
+            samples: vec![sample_for_message(mission_id)],
+        };
+
+        let json = serde_json::to_string(&message).expect("message should serialize");
+
+        assert!(json.contains("TelemetryReplay"));
+        assert!(json.contains(&mission_id.to_string()));
+        assert!(json.contains("drone-1"));
     }
 }
