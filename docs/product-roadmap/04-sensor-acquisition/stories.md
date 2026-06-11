@@ -115,10 +115,10 @@ Capture is the input layer for imagery (`05`), LiDAR mapping (`06`), and the adv
 - **Depends on**: 04-09.
 
 ### STORY 04-11 · M3 · S · P1 — Session aggregates from telemetry
-- **Story**: As `DSP`, I want flight duration/distance/area/battery computed from the telemetry track, so that session metrics are real, not `0.0` placeholders.
+- **Story**: As `DSP`, I want flight duration/distance/area/battery computed from the telemetry track, so that session metrics are real, not fixed `0.0` values.
 - **Deterministic / evidence**: replace the `0.0`-returning `calculate_flight_duration/distance_covered/area_covered/battery_consumption` with telemetry-derived computation; each value cites the track it used.
 - **Acceptance**:
-  - Given a session with a telemetry track, when aggregates compute, then duration/distance/area/battery are non-placeholder values derived from the track.
+  - Given a session with a telemetry track, when aggregates compute, then duration/distance/area/battery are non-zero or explicitly zero values derived from the track, with the source track cited.
   - Given a session with no telemetry, when aggregates compute, then they return an explicit "no track" result, not a misleading `0.0`.
 - **Tests**: unit (aggregate math from track), failure path (no track → explicit absence), fixture.
 - **Depends on**: 04-09, `01` (telemetry track).
@@ -138,7 +138,7 @@ Capture is the input layer for imagery (`05`), LiDAR mapping (`06`), and the adv
 
 ### STORY 04-13 · M4 · M · P0 — JSON/CSV export loading real session records
 - **Story**: As `DSP`, I want session export to load and emit the real records, so that clients receive actual captured data, not an empty file.
-- **Deterministic / evidence**: fix the `export_session` TODO to load records before exporting (currently passes an empty vec); JSON and CSV exports validate against a schema and round-trip provenance.
+- **Deterministic / evidence**: complete `export_session` so it loads records before exporting (currently passes an empty vec); JSON and CSV exports validate against a schema and round-trip provenance.
 - **Acceptance**:
   - Given a captured session, when exported to CSV/JSON, then the export contains the real records with provenance and validates against the schema.
   - Given a session with no records, when exported, then a valid empty export is produced, not a crash or a stale buffer.
@@ -180,4 +180,4 @@ Capture is the input layer for imagery (`05`), LiDAR mapping (`06`), and the adv
 
 ## Coverage note
 
-~16 stories cover the 12 capabilities in `capability-map.md`, ordered by phase with the heaviest weight on M2 capture and M3 storage/indexing per `release-plan.md` (provenance and correctness over format breadth). The curated counts in `release-plan.md` (≈72 rows) expand several of these — per-sensor capture variants, per-format exports, additional QA rules, and per-index-type rebuilds — into sibling stories when implemented. Every captured record carries provenance and links to a flight (`01`) and field/scene (`10`); no session is "captured" without freshness, coverage, and a collection-failure path; storage/index/aggregate stories operate over persisted records and replace the `0.0` and `unimplemented!` placeholders.
+~16 stories cover the 12 capabilities in `capability-map.md`, ordered by phase with the heaviest weight on M2 capture and M3 storage/indexing per `release-plan.md` (provenance and correctness over format breadth). The curated counts in `release-plan.md` (≈72 rows) expand several of these — per-sensor capture variants, per-format exports, additional QA rules, and per-index-type rebuilds — into sibling stories when implemented. Every captured record carries provenance and links to a flight (`01`) and field/scene (`10`); no session is "captured" without freshness, coverage, and a collection-failure path; storage/index/aggregate stories operate over persisted records and replace fixed `0.0` returns and `unimplemented!` branches.

@@ -69,6 +69,20 @@ Each backlog row is intended to be shippable as one slice, carrying:
 - **Audit/provenance behavior**: what is logged, what is immutable, and who can read it.
 - **Docs/runbook**: setup, permissions, limits, known failures, triage, and verification.
 
+## Traceability and Dependency Review
+
+Before a story moves from roadmap to implementation, it must pass a dependency and traceability review:
+
+- **Stable identity**: keep the story ID stable; if an ID is split or retired, document the mapping in the domain coverage note.
+- **Owner boundary**: name the crate, component, or planned service that owns the behavior. If a greenfield service is still unnamed, use "planned new crate to be named during activation" and define the name before coding.
+- **Prerequisite ordering**: every `Depends on` entry must point to an earlier-phase prerequisite, a same-phase foundation story, or an explicitly threaded backbone. If an M2 story depends on an M3 capability, move one of them or document the exception.
+- **Versioned contracts**: any output consumed by another domain must name the versioned contract and compatibility expectation.
+- **Named tolerances**: any geospatial, raster, point-cloud, image, or telemetry assertion must name a profile from `tolerance-profiles.md`.
+- **Failure evidence**: each story must include at least one tested failure path with a reason code or explicit user-visible state.
+- **Observability and audit**: operational stories must state the health signal, metric, audit event, and alert/failure behavior they emit.
+- **Retention and replay**: telemetry, traces, imagery, LiDAR scans, reports, and advisory turns must name the retained evidence needed to reproduce or audit the result.
+- **CI gate**: deterministic products need a fixture, golden file, or contract test that fails on regression and names the divergence.
+
 ## Safety Parity — Flight-Adjacent Domains (M1/M2 P0)
 
 For any domain adjacent to flight execution (01, 02, 03, 04, 12, 24, 25), safety guardrails are not M3 polish — they are M1/M2 P0 prerequisites:
@@ -91,13 +105,14 @@ Required contracts to define before deep implementation:
 | --- | --- | --- |
 | `TelemetryV1` | 01, 02, 03, 04, 11, 12 | Position, attitude, battery, link state, timestamps. Already partially defined in `shared`; needs versioning and drift tests. |
 | `FlightCommandV1` | 01, 02, 03, 11 | Command enum, payload, ack scheme, timeout behavior. |
-| `SimulationTraceV1` | 02 (both runners) | JSONL telemetry trace format; used by trace diff CLI and golden fixtures. |
+| `SimulationTraceV1` | 02 (`flight_sim_cpp` canonical runner) | JSONL telemetry trace format; used by trace diff CLI and golden fixtures. |
 | `ScenarioManifestV1` | 02 | Per-run metadata and hash registry; format for replay and audit. |
 | `RasterSpatialRefV1` | 05, 06, 07, 08, 22, 28, 32 | CRS, extent, resolution, transform, nodata value. Prevents silent CRS drift. |
 | `CaptureRecordV1` | 04, 02, 06, 22 | Flight session, sensor stream, provenance fields. |
 | `ProvenanceEventV1` | 30, 04, 05, 06, 09, 22, 23, 28 | Append-only audit event; hash-chained. |
 | `AlertEventV1` | 29, 09, 15, 17, 24, 25, 27 | Alert type, severity, source, rule ID, evidence reference, per-alert explanation. |
 | `ImportExportJobV1` | 32, 07, 09, 10 | Job state, format, source/target references, CRS, error codes. |
+| `SafetyRuleV1` | 01, 02, 03, 12, 24, 25 | Rule ID, threshold, source authority, enforcement mode, violation event, and parity-test coverage. |
 
 For each contract:
 1. Define the type in `shared/src/` with a version suffix (e.g. `telemetry_v1.rs`).
@@ -147,7 +162,7 @@ Do not start M2 or M3 work in a globally-P2 domain before its local P0 foundatio
 
 ## Greenfield Domain Activation Checklist
 
-"New crate TBD" is acceptable at M0 vision level. Before any implementation work begins on a greenfield domain, the following must be defined:
+"Planned new crate to be named during activation" is acceptable at M0 vision level. Before any implementation work begins on a greenfield domain, the following must be defined:
 
 - [ ] **Owning crate or service name**: the Rust crate (or C++ component) that owns this domain's logic. Name it and add it to `Cargo.toml` as a workspace member.
 - [ ] **Source-of-truth data model**: the core entities, their fields, and their relationships. Must be code (a Rust `struct` or SQLx migration), not just prose.

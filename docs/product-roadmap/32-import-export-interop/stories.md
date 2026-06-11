@@ -28,9 +28,9 @@ Roles: `AG` agronomist, `DSP` drone service provider, `GR` grower, `OPS` operato
 
 ### STORY 32-02 · M3 · M · P0 — Vector import/export round-trip (Shapefile/KML/GeoJSON/GeoPackage)
 - **Story**: As `AG`, I want vector layers to import and export without losing geometry or CRS, so that my data survives a trip through other tools.
-- **Deterministic / evidence**: import → store → export each format; assert the exported CRS, extent, and geometry match the original within tolerance; KMZ is unzipped to KML.
+- **Deterministic / evidence**: import → store → export each format; assert the exported CRS, extent, and geometry match the original within **GEO** tolerance; KMZ is unzipped to KML.
 - **Acceptance**:
-  - Given a Shapefile or GeoJSON layer, when round-tripped (import then export), then the output preserves CRS, extent, and geometry with no coordinate drift beyond tolerance.
+  - Given a Shapefile or GeoJSON layer, when round-tripped (import then export), then the output preserves CRS, extent, and geometry with no coordinate drift beyond **GEO** tolerance.
   - Given a GeoPackage with multiple layers, when imported, then each layer is read with its own CRS; a layer with an undeclared CRS is flagged, not assumed.
 - **Tests**: round-trip (per format), geospatial (CRS/extent preserved), failure path (undeclared-CRS layer flagged).
 - **Depends on**: 32-01.
@@ -129,14 +129,14 @@ Roles: `AG` agronomist, `DSP` drone service provider, `GR` grower, `OPS` operato
 - **Story**: As `PA`, I want to migrate an entire org's boundaries and prescriptions from an external platform and verify nothing was lost, so that a customer can switch with confidence.
 - **Deterministic / evidence**: pull all boundaries/prescriptions via a connector, import through the validated pipeline, and produce a reconciliation report comparing source vs imported counts, areas, and CRS.
 - **Acceptance**:
-  - Given a mock source platform, when migrated, then every boundary/prescription is imported and the reconciliation report shows matching counts and areas within tolerance.
+  - Given a mock source platform, when migrated, then every boundary/prescription is imported and the reconciliation report shows exact matching counts and areas within **GEO** polygon-area tolerance.
   - Given a source item that fails validation, when migrated, then it is listed as unmigrated with a reason and the reconciliation report flags the discrepancy (no silently dropped field).
 - **Tests**: integration (mock platform migration), unit (reconciliation), failure path (invalid item flagged in reconciliation).
 - **Depends on**: 32-09, 32-12.
 
 ### STORY 32-14 · M5 · S · P2 — Round-trip fidelity certification suite
 - **Story**: As `PA`, I want a standing certification suite that proves every supported format round-trips with CRS fidelity, so that interop fidelity is continuously guaranteed.
-- **Deterministic / evidence**: a suite runs import→export→re-import across all supported formats and asserts CRS/extent/geometry equality within tolerance; failures name the format and the divergence.
+- **Deterministic / evidence**: a suite runs import→export→re-import across all supported formats and asserts CRS/extent/geometry equality within **GEO** tolerance; failures name the format and the divergence.
 - **Acceptance**: the suite passes for all supported formats; an introduced CRS-dropping regression in any format fails the suite and names the offending format (fidelity is enforced, not assumed).
 - **Tests**: certification suite (all formats), failure path (injected CRS-drop regression fails and is named).
 - **Depends on**: 32-02, 32-03, 32-07, 32-08.

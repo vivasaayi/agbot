@@ -9,7 +9,7 @@ This map is service/domain-first. Each capability expands across the relevant pi
 | WebSocket client and message dispatch | strong partial | 6 | Reconnect/backoff with connection-state surfaced to UI |
 | Live telemetry display and binding | early partial | 8 | Bind dashboard tiles to live telemetry with freshness |
 | Connection and link-health indicators | missing | 5 | Show connected/stale/lost with last-update age |
-| Map rendering (basemap, position, path) | missing (placeholders) | 9 | Render a basemap with drone position and flight path |
+| Map rendering (basemap, position, path) | missing (static map scaffolds only) | 9 | Render a basemap with drone position and flight path |
 | Mission overlay (waypoints, geofence, no-fly) | missing | 7 | Draw mission waypoints and geofence on the map |
 | Capture event timeline (LiDAR/image/NDVI) | early partial | 6 | Collect capture events into an ordered, filterable feed |
 | System alerts and status panel | early partial | 5 | Severity-ranked alert list from system-status events |

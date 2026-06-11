@@ -33,15 +33,15 @@ These are aspirational modules from `../reference/product-summary.md` with no im
 
 | Folder | Domain | Primary Crates | Maturity |
 | --- | --- | --- | --- |
-| `13-farmers-portal` | Farmers Portal | new crate TBD; builds on `09`, `10`, `07`, `08` | greenfield (M0): grower-facing dashboard + mobile app; report inbox, recommendation tracking, marketplace/community entry |
-| `14-autonomous-tractor` | Autonomous Tractor (AruviTrac) | new crate TBD; parallels `01`, `03`; builds on `07`, `10`, `05`, `09` | greenfield (M0): self-driving tractor with GPS guidance, implement and prescription-map execution; reuses flight mission/safety patterns |
-| `15-weather-advisory` | Weather Advisory | new crate TBD; builds on `10`; feeds `01`, `14`, `16`, `17` | greenfield (M0): hyper-local per-field forecast, spray/flight windows, frost/heat/wind risk alerts |
-| `16-water-management` | Water Management | new crate TBD; builds on `05`, `15`, `09`, `10`, `07` | greenfield (M0): soil-moisture, evapotranspiration, irrigation scheduling, and water-use reporting |
-| `17-drought-management` | Drought Management | new crate TBD; builds on `05`, `07`, `15`, `16`, `09` | greenfield (M0): drought indices, satellite+weather fusion, early warning, and mitigation strategy |
-| `18-supply-chain-marketplace` | Supply Chain and Marketplace | new crate TBD; builds on `10`, `13`, `09` | greenfield (M0): input/produce marketplace, procurement, inventory, and demand forecasting; furthest from current code |
-| `19-carbon-sustainability` | Carbon and Sustainability | new crate TBD; builds on `05`, `06`, `07`, `09`, `10` | greenfield (M0): carbon footprint, biomass/biodiversity, MRV and certification evidence packs |
-| `20-content-management` | Content Management | new crate TBD; builds on `13`, `10` | greenfield (M0): blog, knowledge base, and community content; most decoupled from the drone/geo stack |
-| `21-realtime-collaboration` | Real-time Collaboration | new crate TBD; builds on `01`, `04`, `08`, `11`, `10`, `12` | greenfield (M0): team messaging, live drone video, collaborative mission planning, and emergency alerts |
+| `13-farmers-portal` | Farmers Portal | planned `portal` crate; builds on `09`, `10`, `07`, `08` | greenfield (M0): grower-facing dashboard + mobile app; report inbox, recommendation tracking, marketplace/community entry |
+| `14-autonomous-tractor` | Autonomous Tractor (AruviTrac) | planned `tractor_control` crate; parallels `01`, `03`; builds on `07`, `10`, `05`, `09` | greenfield (M0): self-driving tractor with GPS guidance, implement and prescription-map execution; reuses flight mission/safety patterns |
+| `15-weather-advisory` | Weather Advisory | planned `weather_advisory` crate; builds on `10`; feeds `01`, `14`, `16`, `17` | greenfield (M0): hyper-local per-field forecast, spray/flight windows, frost/heat/wind risk alerts |
+| `16-water-management` | Water Management | planned `water_management` crate; builds on `05`, `15`, `09`, `10`, `07` | greenfield (M0): soil-moisture, evapotranspiration, irrigation scheduling, and water-use reporting |
+| `17-drought-management` | Drought Management | planned `drought_management` crate; builds on `05`, `07`, `15`, `16`, `09` | greenfield (M0): drought indices, satellite+weather fusion, early warning, and mitigation strategy |
+| `18-supply-chain-marketplace` | Supply Chain and Marketplace | planned `marketplace` crate; builds on `10`, `13`, `09` | greenfield (M0): input/produce marketplace, procurement, inventory, and demand forecasting; furthest from current code |
+| `19-carbon-sustainability` | Carbon and Sustainability | planned `sustainability` crate; builds on `05`, `06`, `07`, `09`, `10` | greenfield (M0): carbon footprint, biomass/biodiversity, MRV and certification evidence packs |
+| `20-content-management` | Content Management | planned `content` crate; builds on `13`, `10` | greenfield (M0): blog, knowledge base, and community content; most decoupled from the drone/geo stack |
+| `21-realtime-collaboration` | Real-time Collaboration | planned `collaboration` crate; builds on `01`, `04`, `08`, `11`, `10`, `12` | greenfield (M0): team messaging, live drone video, collaborative mission planning, and emergency alerts |
 
 ### MVP-Adjacent Capability Extensions (added 2026-06-11)
 

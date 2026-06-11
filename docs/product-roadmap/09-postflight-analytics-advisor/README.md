@@ -6,7 +6,7 @@ Turn deterministic remote-sensing products into anomalies, findings, recommendat
 
 - `post_processor` has a real job queue (Queued/Processing/Completed/Failed) with NDVI, LiDAR, thermal, multispectral, composite, health, and yield job types.
 - `AnalysisResult` carries rich statistics (min/max/mean/std/percentiles/coverage) and grid/point/zonal/time-series result data with priority-ranked recommendations.
-- The hard analysis (multispectral, health, yield) returns placeholder data, anomaly detection and zone delineation are not real, and the report generator is scaffolding with four TODOs.
+- The hard analysis (multispectral, health, yield) returns synthetic sample data, anomaly detection and zone delineation are not real, and the report generator has scaffolded encoder paths that need real implementations.
 
 ## Where We Should Be
 

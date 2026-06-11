@@ -33,4 +33,4 @@ An integrated communication platform for farm teams, stakeholders, and remote ex
 
 ## Primary Crates
 
-New crate(s) TBD (a collaboration/signaling service plus a new media/streaming pipeline). Builds on domains `01` (telemetry/missions), `04` (camera/video), `08` (shared annotation), `11` (operator console), `12` (alerts), and `10` (roles). Sequenced after the core drone platform (`01`-`12`) and gated by the advisor MVP; the live-video pipeline is its own infrastructure track.
+Planned `collaboration` crate (a collaboration/signaling service plus a new media/streaming pipeline). Builds on domains `01` (telemetry/missions), `04` (camera/video), `08` (shared annotation), `11` (operator console), `12` (alerts), and `10` (roles). Sequenced after the core drone platform (`01`-`12`) and gated by the advisor MVP; the live-video pipeline is its own infrastructure track.

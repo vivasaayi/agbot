@@ -33,4 +33,4 @@ Natural-language Q&A over a field's data that only asserts claims it can cite ba
 
 ## Primary Crates
 
-New crate `copilot` with the LLM behind a mockable interface, `shared` for schemas. Grounds on `09` (findings/recommendations), `30` (provenance/evidence ledger — citations resolve here), `07`/`10` (field context), and `05`/`06`/`28` (products and trends). For model choice it references the latest Claude models (e.g. `claude-opus-4-8`) behind that interface, but the architecture, not a specific model, is the point.
+New crate `copilot` with the LLM behind a mockable interface, `shared` for schemas. Grounds on `09` (findings/recommendations), `30` (provenance/evidence ledger — citations resolve here), `07`/`10` (field context), and `05`/`06`/`28` (products and trends). Model/provider choice is deployment configuration recorded as `model_provider`, `model_id`, and `model_version`; the roadmap contract is the versioned boundary, deterministic test double, evidence citations, refusal behavior, and audit trail.

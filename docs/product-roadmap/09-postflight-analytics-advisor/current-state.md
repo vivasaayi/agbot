@@ -6,7 +6,7 @@ Turn deterministic remote-sensing products into anomalies, findings, recommendat
 
 ## Current Maturity
 
-medium partial: `post_processor` has a real job queue, rich result statistics, a recommendation model, and a report-generator scaffold, but the core analysis algorithms are simplified or dummy and the report encoders are unimplemented (TODOs).
+medium partial: `post_processor` has a real job queue, rich result statistics, a recommendation model, and a report-generator scaffold, but the core analysis algorithms are simplified or synthetic and the report encoders are unimplemented.
 
 ## What Exists Now
 
@@ -19,9 +19,9 @@ medium partial: `post_processor` has a real job queue, rich result statistics, a
 
 ## Gaps to Close
 
-- `process_multispectral`, `assess_crop_health`, and `predict_yield` return placeholder data (`lib.rs:306/392/444`).
-- `ReportGenerator` has TODOs for data collection, content generation, format-specific encoding, page count, quality scoring, and delivery (`report_generator.rs:528/544/559/572/577/586`).
-- Anomaly detection and zone delineation are not real (thermal `TODO: Implement anomaly detection`, `thermal_analysis.rs:699`; thermal patterns empty).
+- `process_multispectral`, `assess_crop_health`, and `predict_yield` return synthetic sample data instead of products derived from `05`/`06` (`lib.rs:306/392/444`).
+- `ReportGenerator` has unimplemented paths for data collection, content generation, format-specific encoding, page count, quality scoring, and delivery (`report_generator.rs:528/544/559/572/577/586`).
+- Anomaly detection and zone delineation are not real (thermal anomaly detection is not implemented at `thermal_analysis.rs:699`; thermal patterns empty).
 - Confidence/quality scores are hardcoded constants (`ndvi_analysis.rs:309`, `lidar_analysis.rs:188`).
 - No consumption of real georeferenced products from `05`/`06` or field/season context from `10`.
 - Recommendations are not yet persisted into the `10` domain model or linked to annotations.
@@ -31,7 +31,7 @@ medium partial: `post_processor` has a real job queue, rich result statistics, a
 
 - `post_processor/src/lib.rs` (job queue, JobType, AnalysisResult, ResultData, process/assess/predict stubs)
 - `post_processor/src/ndvi_analysis.rs`, `thermal_analysis.rs`, `lidar_analysis.rs`
-- `post_processor/src/report_generator.rs` (PDF/HTML/JSON/CSV/KML/Shapefile scaffold, TODOs)
+- `post_processor/src/report_generator.rs` (PDF/HTML/JSON/CSV/KML/Shapefile scaffold with unimplemented encoders)
 - `shared/src/schemas.rs` (RecommendationRecord, ReportRecord, FieldRecord)
 
 ## Target Operating Model

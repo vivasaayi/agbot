@@ -48,5 +48,5 @@ Ship in maturity order. Capture identity and provenance (M1) come first so every
 - Every captured record must carry provenance (sensor, GPS, timestamp, calibration) and link to a flight (`01`) and field/scene (`10`).
 - No session is "captured" without freshness, coverage, and a collection-failure path.
 - Storage and indexing P0s must operate over persisted records, not just in-memory state.
-- Replace 0.0 aggregate placeholders with telemetry-derived values before claiming session metrics.
+- Replace fixed 0.0 aggregate returns with telemetry-derived values before claiming session metrics.
 - Do not ship export breadth before `export_session` correctly loads records and CSV/JSON pass contract tests; feature-gate `unimplemented!` formats.

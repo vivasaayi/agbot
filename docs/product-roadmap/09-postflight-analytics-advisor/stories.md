@@ -102,10 +102,10 @@ Roles: `AG` agronomist, `DSP` drone service provider, `GR` grower, `OPS` operato
 
 ### STORY 09-11 · M4 · L · P0 — Grower-ready PDF report
 - **Story**: As `GR`, I want a clear PDF with field metadata, map views, findings, and recommendations, so that I understand what changed and what to do — without logging in.
-- **Deterministic / evidence**: report encoder asserts field/scene metadata and layer source details before rendering; replaces the current `report_generator.rs` TODOs.
+- **Deterministic / evidence**: report encoder asserts field/scene metadata and layer source details before rendering; replaces the current unimplemented `report_generator.rs` encoder paths.
 - **Acceptance**:
   - Given a completed analysis, when a report is generated, then a PDF is produced containing field metadata, ≥1 map view, the findings table, and recommendations.
-  - Given missing field metadata, when generation runs, then it fails with a clear error rather than emitting a blank/placeholder report.
+  - Given missing field metadata, when generation runs, then it fails with a clear error rather than emitting a blank or partial report.
 - **Tests**: unit (section assembly), golden-file (structure), failure path (missing metadata).
 - **Depends on**: 09-03..09-09, `10`, `08` (map views).
 

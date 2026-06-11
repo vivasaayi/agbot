@@ -18,7 +18,7 @@ strong partial (planning) + early partial (control): `mission_planner` has real 
 
 ## Gaps to Close
 
-- MAVLink message handling, parameter validation, and ack/timeout logic are incomplete and untested (TODOs in the websocket handler).
+- MAVLink message handling, parameter validation, and ack/timeout logic are incomplete and untested in the websocket handler.
 - No persisted live telemetry history, freshness tracking, or link-health/failsafe state.
 - Weather and airspace constraint integration is scaffolded but minimal.
 - No arming/pre-flight checklist, geofence enforcement at dispatch, or return-to-home/failsafe workflow.

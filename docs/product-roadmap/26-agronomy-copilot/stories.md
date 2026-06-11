@@ -1,6 +1,6 @@
 # Agronomy Copilot: Detailed Stories
 
-> Greenfield domain (M0 named): no code exists yet. Every story below is **built from scratch** and is gated behind the advisor MVP (`09`) and the provenance/evidence ledger (`30`) — citations must resolve to real evidence objects before any answer ships. The **explainability/trust pillar dominates every phase**: the copilot may only assert a claim that cites a real evidence object, never replaces or precedes deterministic products, always surfaces uncertainty, refuses rather than speculates when ungrounded, and audits every turn via `30`. The LLM is a true external boundary behind a mockable interface (deterministic-evidence-grounded RAG); for model choice it references the latest Claude models (e.g. `claude-opus-4-8`) behind that interface, but the architecture — not a specific model — is the contract, and tests run against a deterministic double.
+> Greenfield domain (M0 named): no code exists yet. Every story below is **built from scratch** and is gated behind the advisor MVP (`09`) and the provenance/evidence ledger (`30`) — citations must resolve to real evidence objects before any answer ships. The **explainability/trust pillar dominates every phase**: the copilot may only assert a claim that cites a real evidence object, never replaces or precedes deterministic products, always surfaces uncertainty, refuses rather than speculates when ungrounded, and audits every turn via `30`. The LLM is a true external boundary behind a mockable interface (deterministic-evidence-grounded RAG); model/provider choice is deployment configuration recorded as `model_provider`, `model_id`, and `model_version`, while the architecture, evidence contract, refusal behavior, and audit trail are the roadmap contract. Tests run against a deterministic double.
 
 Story-level breakdown of the capabilities in `capability-map.md`, ordered by release phase. Each story is one shippable vertical slice. Format:
 
@@ -27,7 +27,7 @@ Roles: `AG` agronomist, `DSP` drone service provider, `GR` grower, `OPS` operato
 
 ### STORY 26-02 · M1 · M · P0 — LLM boundary as a mockable interface
 - **Story**: As `PA`, I want the LLM behind a single grounded-RAG interface with a deterministic test double, so that the platform is not coupled to one model and is testable without a live model.
-- **Deterministic / evidence**: define `CopilotModel { answer(question, retrieved_evidence) -> {text, cited_evidence_ids[], confidence} }`; a deterministic double returns fixed answers for fixtures; the live adapter targets the latest Claude models (e.g. `claude-opus-4-8`) but the interface, not the model, is the contract; the interface version is recorded.
+- **Deterministic / evidence**: define `CopilotModel { answer(question, retrieved_evidence) -> {text, cited_evidence_ids[], confidence, model_provider, model_id, model_version} }`; a deterministic double returns fixed answers for fixtures; the live adapter is selected by deployment configuration, but the interface, not a specific model, is the contract; the interface and model versions are recorded.
 - **Acceptance**:
   - Given the test double, when the interface is called, then a deterministic answer with citation IDs and confidence is returned.
   - Given the live adapter is unavailable/times out, when called, then the failure is surfaced cleanly (no fabricated answer).

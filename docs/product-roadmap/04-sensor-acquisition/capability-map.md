@@ -13,8 +13,8 @@ This map is service/domain-first. Each capability expands across the relevant pi
 | Data record model and provenance | strong partial | 8 | Persist provenance (sensor/GPS/time/calibration) |
 | File-based storage and retention | medium partial (load stubbed) | 8 | Make load/list/cleanup/stats query-complete |
 | Spatial/temporal/type indexing | medium partial (in-memory only) | 7 | Index persisted records and answer `SearchQuery` |
-| Session aggregates (distance/area/battery) | missing (0.0 placeholders) | 6 | Compute aggregates from telemetry track |
-| Data export (JSON/CSV) | medium partial | 6 | Load session records before export (`export_session` TODO) |
+| Session aggregates (distance/area/battery) | missing (`0.0` return values) | 6 | Compute aggregates from telemetry track |
+| Data export (JSON/CSV) | medium partial | 6 | Load session records before export (`export_session` currently exports empty record sets) |
 | Geospatial export (GeoTIFF/KML/Shapefile) | missing | 6 | One geospatial export with CRS/extent preserved |
 | Freshness, coverage, and failure handling | early partial | 6 | Track capture freshness and collection failures |
 | Integrity and QA masking | missing | 5 | Checksum records and flag low-quality scans |

@@ -34,4 +34,4 @@ Hyper-local weather forecasting and advisory per field: spray/flight windows, fr
 
 ## Primary Crates
 
-New crate(s) TBD (a weather ingestion/forecast service plus an advisory/alerting engine). Builds on domain `10` (field identity); feeds `01`/`14` (operational windows), `16`/`17` (GDD/ET inputs), and `11`/`13` (alerting).
+Planned `weather_advisory` crate (a weather ingestion/forecast service plus an advisory/alerting engine). Builds on domain `10` (field identity); feeds `01`/`14` (operational windows), `16`/`17` (GDD/ET inputs), and `11`/`13` (alerting).

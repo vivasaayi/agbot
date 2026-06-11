@@ -62,9 +62,9 @@ This domain is the **core advisor MVP surface**: the field GIS viewer that rende
 
 ### STORY 08-05 · M3 · M · P0 — Georeferenced layer placement
 - **Story**: As `OPS`, I want a layer placed on the correct ground only after its CRS/extent are asserted against the `07` manifest, so that no overlay is ever drawn in the wrong place.
-- **Deterministic / evidence**: before drawing, assert the layer's CRS/extent/resolution match the `07` `SceneGeospatialMetadata`; place the layer by its transform so corner pixels map to the manifest corners within tolerance.
+- **Deterministic / evidence**: before drawing, assert the layer's CRS/extent/resolution match the `07` `SceneGeospatialMetadata`; place the layer by its transform so corner pixels map to the manifest corners within **GEO** tolerance.
 - **Acceptance**:
-  - Given a layer whose CRS/extent match the manifest, when it is placed, then its corners align to the manifest extent within tolerance.
+  - Given a layer whose CRS/extent match the manifest, when it is placed, then its corners align to the manifest extent within **GEO** tolerance.
   - Given a layer whose CRS/extent disagree with the manifest, when placement is attempted, then it is refused with a mismatch error rather than drawn approximately.
 - **Tests**: unit (corner alignment), geospatial (CRS/extent assertion vs manifest), failure path (mismatch refused).
 - **Depends on**: 08-04, `07` (manifest), `05`/`06` (products).

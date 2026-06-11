@@ -89,7 +89,7 @@ This domain is the **core advisor MVP geospatial spine**: it ingests scenes, gua
 
 ### STORY 07-08 · M3 · L · P0 — Raster metadata correctness (CRS/extent/resolution assertion)
 - **Story**: As `OPS`, I want every ingested scene to assert and persist its CRS, extent, resolution, and transform, so that a wrong overlay can never reach the viewer.
-- **Deterministic / evidence**: on ingest, populate `RasterSpatialRef` from the source and assert non-empty CRS, positive resolution, and `extent == origin + dims·resolution` within tolerance; reject on violation.
+- **Deterministic / evidence**: on ingest, populate `RasterSpatialRef` from the source and assert non-empty CRS, positive resolution, and `extent == origin + dims·resolution` within **GEO** tolerance; reject on violation.
 - **Acceptance**:
   - Given a georeferenced scene, when ingest runs, then its `RasterSpatialRef` is persisted and the extent↔dims↔resolution relation is asserted.
   - Given a scene with a missing CRS or non-positive resolution, when ingest runs, then it is rejected with a georeferencing error rather than stored as an unreferenced layer.
@@ -98,9 +98,9 @@ This domain is the **core advisor MVP geospatial spine**: it ingests scenes, gua
 
 ### STORY 07-09 · M3 · M · P0 — Georeferenced transform round-trip
 - **Story**: As `OPS`, I want a scene's transform to round-trip from store to served layer, so that what the viewer fetches is provably the same ground as what was ingested.
-- **Deterministic / evidence**: store→serve the CRS/extent/resolution/transform; on a write→serve→read round-trip the values must match within tolerance; a pixel↔world reprojection at the corners must agree.
+- **Deterministic / evidence**: store→serve the CRS/extent/resolution/transform; on a write→serve→read round-trip the values must match within **GEO** tolerance; a pixel↔world reprojection at the corners must agree.
 - **Acceptance**:
-  - Given an ingested scene, when it is served and read back, then CRS/extent/resolution/transform round-trip within tolerance and corner pixel↔world coordinates agree.
+  - Given an ingested scene, when it is served and read back, then CRS/extent/resolution/transform round-trip within **GEO** tolerance and corner pixel↔world coordinates agree.
   - Given a stored transform that fails the round-trip check, when the layer is requested, then it is withheld with a metadata-integrity error rather than served wrong.
 - **Tests**: geospatial round-trip (store→serve→read equality, corner reprojection), failure path (transform integrity failure → withheld).
 - **Depends on**: 07-08.

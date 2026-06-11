@@ -25,7 +25,7 @@ strong partial: `lidar_mapper` has a working scan-ingest → occupancy-grid → 
 - No clustering or segmentation (obstacles, canopy objects, ground plane).
 - No true 3D reconstruction: no DSM/DTM, no meshing, no canopy-height model.
 - Georeferencing (CRS/extent/resolution) of occupancy and elevation grids is not asserted or round-tripped.
-- The `02` simulator LiDAR feed that would drive this in simulation is a TODO, so real captures from `04` are the only input.
+- The `02` simulator LiDAR feed that would drive this in simulation is not implemented yet, so real captures from `04` are the only input.
 - No canopy-height or obstacle product handoff to the advisor (`09`).
 
 ## Source Modules Reviewed

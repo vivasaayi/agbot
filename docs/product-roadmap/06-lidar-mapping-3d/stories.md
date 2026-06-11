@@ -91,7 +91,7 @@ Real crates: `lidar_mapper` (`lib.rs`, `main.rs` — RPLIDAR JSON ingest, `GridC
 - **Story**: As `OPS`, I want per-point surface normals estimated, so that surface orientation and downstream ground/non-ground separation are possible.
 - **Deterministic / evidence**: estimate per-point normals from a local neighborhood (e.g. PCA over k-nearest neighbors); record neighborhood size; normals are deterministic for a fixed neighborhood.
 - **Acceptance**:
-  - Given a planar patch, when normal estimation runs, then estimated normals are consistent and orthogonal to the plane within tolerance.
+  - Given a planar patch, when normal estimation runs, then estimated normals are consistent and orthogonal to the plane within **CLOUD** tolerance.
   - Given a point with fewer than k neighbors, when estimation runs, then that point is marked undefined-normal rather than producing a garbage vector.
 - **Tests**: unit (normals on synthetic plane), failure path (insufficient neighbors → undefined).
 - **Depends on**: 06-06.
@@ -118,7 +118,7 @@ Real crates: `lidar_mapper` (`lib.rs`, `main.rs` — RPLIDAR JSON ingest, `GridC
 - **Story**: As `OPS`, I want the cleaned cloud rasterized into georeferenced DSM and DTM grids, so that elevation surfaces round-trip correctly for the viewer.
 - **Deterministic / evidence**: rasterize all returns → DSM and ground returns → DTM at a set resolution; populate and assert `RasterSpatialRef` (CRS/extent/resolution/transform); empty cells carry nodata.
 - **Acceptance**:
-  - Given a segmented cloud and a resolution, when DSM/DTM build, then both rasters are produced with asserted CRS/extent/resolution and round-trip on write→read within tolerance.
+  - Given a segmented cloud and a resolution, when DSM/DTM build, then both rasters are produced with asserted CRS/extent/resolution and round-trip on write→read within **GEO** and **RASTER** tolerance.
   - Given a region with no ground returns, when the DTM builds, then those cells are nodata, not interpolated as zero elevation.
 - **Tests**: unit (rasterization), geospatial round-trip (write→read CRS/extent equality), failure path (no-ground cells → nodata).
 - **Depends on**: 06-09, `shared` `RasterSpatialRef`.

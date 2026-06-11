@@ -57,7 +57,7 @@ On top of that foundation, ship a deterministic physics/sensor twin with golden 
 | M1 foundation | M | PID flight controller and command modes | safety | regression |
 | M3 explainable | S | Sensor suite (GPS/IMU/baro/mag) | data quality | evaluator |
 | M3 explainable | M | Wind and aerodynamic disturbance | performance and scale | physics |
-| M2 captured | L | LiDAR sensor simulation | data quality | capture |
+| M3 explainable | L | LiDAR sensor simulation | data quality | capture |
 | M3 explainable | M | OSM map-tile and terrain loading | geospatial correctness | terrain |
 | M4 interactive | M | Globe navigation and flight UI (`flight_sim_cpp`) | agronomic value | preview |
 | M4 interactive | M | Twin-as-backend for flight/coordination | safety | operations |

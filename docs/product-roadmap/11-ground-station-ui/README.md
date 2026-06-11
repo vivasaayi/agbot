@@ -6,12 +6,12 @@ The real-time operations console: show live telemetry, mission status, and captu
 
 - Dual-mode binary: `--web` serves an HTML dashboard; default runs an async CLI console (`ground_station_ui/src/lib.rs`).
 - WebSocket client connects to `mission_control`, parses `WebSocketMessage`, and dispatches telemetry, mission status, LiDAR, image, NDVI, and system-status events.
-- Web surface (`web_server.rs`) renders dashboard/telemetry/maps pages with `.map-placeholder` divs; CLI surface (`cli_interface.rs`) handles `help`/`status`/`quit`.
+- Web surface (`web_server.rs`) renders dashboard/telemetry/maps pages with static map containers; CLI surface (`cli_interface.rs`) handles `help`/`status`/`quit`.
 
 ## Where We Should Be
 
 - A live operations console with real map rendering, the drone's position, flight path, and geofence drawn on it.
-- Telemetry and status bound to live data with freshness, gap, and link-health indicators, not static placeholders.
+- Telemetry and status bound to live data with freshness, gap, and link-health indicators, not static scaffold content.
 - Operator actions (arm, dispatch, pause, RTH, abort) routed back to `mission_control` through guardrails, behind auth, with an audit trail.
 
 ## Files

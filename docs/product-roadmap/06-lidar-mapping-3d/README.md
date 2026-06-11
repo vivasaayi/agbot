@@ -32,4 +32,4 @@ Turn LiDAR captures into occupancy grids, elevation and obstacle products, and 3
 
 ## Primary Crates
 
-`lidar_mapper`, `sensor_overlay_engine` (LiDAR overlay portions), with `shared` for config and `LidarScan`/`LidarPoint` schemas. Consumes captures from domain `04`; the `02` simulator LiDAR feed is still a TODO. Feeds the viewer (`08`) and agronomy (`09`).
+`lidar_mapper`, `sensor_overlay_engine` (LiDAR overlay portions), with `shared` for config and `LidarScan`/`LidarPoint` schemas. Consumes captures from domain `04`; the `02` simulator LiDAR feed is not implemented yet. Feeds the viewer (`08`) and agronomy (`09`).

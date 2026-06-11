@@ -6,11 +6,11 @@ Be the bridge from insight to action: interchange geospatial formats with CRS-pr
 
 ## Current Maturity
 
-greenfield-leaning with scattered partials: export logic exists in three places but is unconsolidated and has no CRS-preservation guarantee. `09`'s `report_generator` targets PDF/HTML/JSON/CSV/KML/Shapefile but its encoders are TODO scaffolding; `geo_hub` imports and exports GeoJSON/shapefile; `geo_viewer` has exports. There is no `interop` crate, no round-trip CRS test, and no prescription/VRA export in a machine-executable format.
+greenfield-leaning with scattered partials: export logic exists in three places but is unconsolidated and has no CRS-preservation guarantee. `09`'s `report_generator` targets PDF/HTML/JSON/CSV/KML/Shapefile but its format-specific encoders are unimplemented scaffolding; `geo_hub` imports and exports GeoJSON/shapefile; `geo_viewer` has exports. There is no `interop` crate, no round-trip CRS test, and no prescription/VRA export in a machine-executable format.
 
 ## What Exists Now
 
-- `09` (`post_processor/src/report_generator.rs`): a `ReportGenerator` targeting PDF/HTML/JSON/CSV/KML/Shapefile, but the format-specific encoders are unimplemented TODOs.
+- `09` (`post_processor/src/report_generator.rs`): a `ReportGenerator` targeting PDF/HTML/JSON/CSV/KML/Shapefile, but the format-specific encoders are unimplemented.
 - `geo_hub` (`src/{routes.rs,shapefile.rs,db.rs}`): GeoJSON/shapefile import and CSV/GeoJSON export routes, plus shapefile storage in the spatial DB.
 - `geo_viewer`: export surfaces in the viewer.
 - `07` (GIS hub): the CRS/extent/resolution contracts and reprojection groundwork that an import/export pipeline must reuse.

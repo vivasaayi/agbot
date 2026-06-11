@@ -6,7 +6,7 @@ Coordinate multiple drones to cover large fields faster than one aircraft can, w
 
 ## Current Maturity
 
-early partial: `multi_drone_control` has a strong type model, swarm registry, global constraints, and working point-in-polygon geofence/no-fly detection; but formation optimization, coordinated-action execution, collision-maneuver targets, and most assignment strategies are TODO stubs with almost no test coverage.
+early partial: `multi_drone_control` has a strong type model, swarm registry, global constraints, and working point-in-polygon geofence/no-fly detection; but formation optimization, coordinated-action execution, collision-maneuver targets, and most assignment strategies are no-op or skeleton implementations with almost no test coverage.
 
 ## What Exists Now
 
@@ -20,11 +20,11 @@ early partial: `multi_drone_control` has a strong type model, swarm registry, gl
 
 ## Gaps to Close
 
-- Formation optimization is a no-op: `optimize_formations()` and `execute_action()` return `Ok(())` with TODOs (`coordination.rs`).
+- Formation optimization is a no-op: `optimize_formations()` and `execute_action()` return `Ok(())` without assigning slots or executing the requested action (`coordination.rs`).
 - Coordinated-action execution (synchronized survey, pattern search, coverage optimization) is defined but not executed.
-- Collision avoidance computes risk but never sets a maneuver target — `target_position: None // TODO` (`collision_avoidance.rs`).
+- Collision avoidance computes risk but never sets a maneuver target — `target_position: None` (`collision_avoidance.rs`).
 - Assignment beyond FirstAvailable/BestFit is stubbed: LoadBalanced, PriorityBased, and Auction return `Ok(None)` (`mission_assignment.rs`).
-- Coordination rules detect conditions (weather, custom) but rule actions are not executed (TODOs in `coordination.rs`).
+- Coordination rules detect conditions (weather, custom) but rule actions are not executed (`coordination.rs`).
 - Almost no test coverage: a handful of construction/registration smoke tests, none for geofence violations, formation geometry, assignment, or maneuver planning.
 
 ## Source Modules Reviewed

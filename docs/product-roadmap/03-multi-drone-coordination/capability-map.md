@@ -10,7 +10,7 @@ This map is service/domain-first. Each capability expands across the relevant pi
 | Global constraints (geofence/altitude/no-fly) | strong partial | 8 | Reject any swarm action outside geofence/no-fly |
 | Safety violation detection and audit | medium partial | 7 | Raise and persist `SafetyViolation` with severity |
 | Formation definition (Line/Grid/Circle/V) | partial (types only) | 7 | One formation that holds geometry end to end |
-| Formation optimization | missing (TODO stub) | 6 | Deterministic slot assignment for a Grid formation |
+| Formation optimization | missing (current no-op scaffold) | 6 | Deterministic slot assignment for a Grid formation |
 | Collision risk assessment | medium partial | 8 | Predict trajectories and flag separation breaches |
 | Collision-avoidance maneuvers | early partial (target stubbed) | 8 | Compute maneuver target and verify separation |
 | Coordinated actions (survey/coverage) | early partial (no-op) | 8 | Execute a synchronized survey over a boundary |

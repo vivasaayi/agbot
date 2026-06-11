@@ -33,4 +33,4 @@ Intelligent irrigation: monitor soil moisture, compute evapotranspiration, and s
 
 ## Primary Crates
 
-New crate(s) TBD (a water-management/irrigation engine plus a moisture data store). Builds on domains `05` (moisture indices), `15` (weather/ET inputs), `09` (management zones), `10` (field identity), and `07` (geospatial correctness).
+Planned `water_management` crate (a water-management/irrigation engine plus a moisture data store). Builds on domains `05` (moisture indices), `15` (weather/ET inputs), `09` (management zones), `10` (field identity), and `07` (geospatial correctness).

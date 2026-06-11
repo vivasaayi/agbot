@@ -38,4 +38,4 @@ A digital marketplace connecting farmers to input suppliers and buyers: catalog,
 
 ## Primary Crates
 
-New crate(s) TBD (a marketplace backend, catalog/order store, and forecasting service). Builds on domains `10` (orgs/identity, supplier/buyer/grower accounts), `13` (portal front door), and `09` (yield/demand signals). Payments/escrow and logistics are external integrations with compliance requirements.
+Planned `marketplace` crate (a marketplace backend, catalog/order store, and forecasting service). Builds on domains `10` (orgs/identity, supplier/buyer/grower accounts), `13` (portal front door), and `09` (yield/demand signals). Payments/escrow and logistics are external integrations with compliance requirements.

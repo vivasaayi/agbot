@@ -26,7 +26,7 @@ Capture LiDAR and multispectral data during a flight and persist it with provena
 1. Define the capture contract and link a session to flight (`01`) and field/scene (`10`).
 2. Persist `FlightDataRecord`s with full provenance, freshness, and coverage.
 3. Make spatial/temporal/type indexing query-complete (load/list/search).
-4. Compute real session aggregates (distance, area, battery) instead of 0.0 placeholders.
+4. Compute real session aggregates (distance, area, battery) instead of fixed 0.0 returns.
 5. Finish the export path (CSV/JSON working; add geospatial formats, replace `unimplemented!`).
 6. Exercise and validate the real-hardware LiDAR/camera paths against the sim.
 

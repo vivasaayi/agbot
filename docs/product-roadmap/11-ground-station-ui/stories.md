@@ -86,8 +86,8 @@ Roles: `AG` agronomist, `DSP` drone service provider, `GR` grower, `OPS` operato
 ## M3 — Explainable (correct map and mission overlays)
 
 ### STORY 11-08 · M3 · L · P0 — Map rendering: basemap, position, flight path
-- **Story**: As `OPS`, I want a real basemap with the drone's live position and flight path, so that I can see where the aircraft is in the field — the current maps page is empty placeholders.
-- **Deterministic / evidence**: replace the three `.map-placeholder` divs with a real rendering engine; assert the basemap and overlay CRS/extent match before drawing; plot position from telemetry and accumulate the path; a wrong-CRS overlay is refused, not drawn misaligned.
+- **Story**: As `OPS`, I want a real basemap with the drone's live position and flight path, so that I can see where the aircraft is in the field — the current maps page has empty static map containers.
+- **Deterministic / evidence**: replace the three static map containers with a real rendering engine; assert the basemap and overlay CRS/extent match before drawing; plot position from telemetry and accumulate the path; a wrong-CRS overlay is refused, not drawn misaligned.
 - **Acceptance**:
   - Given live telemetry, when the map renders, then the drone marker and accumulated path appear at the correct geographic position in the asserted CRS.
   - Given an overlay whose CRS/extent does not match the basemap, when rendering is attempted, then it is refused with an error rather than drawn misaligned.

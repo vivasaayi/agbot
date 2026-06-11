@@ -6,7 +6,7 @@ Simulate drone physics, sensors, and terrain so flight, coordination, and captur
 
 - `flight_sim_cpp` (C++20) is the single canonical simulator for both the interactive viewer and headless CI regression: a real per-drone physics loop (gravity/drag/thrust), fixed-timestep waypoint follower, mission JSON loader/editor, JSONL telemetry recorder/replay, OSM/Terrarium terrain, globe picker, a macOS OpenGL viewer, and a deterministic headless runner (`DeterministicRunner`) that emits byte-identical traces plus a per-run manifest.
 - The Rust/Bevy `simulator` crate and, more recently, the Rust `drone_simulator` crate were both retired in favor of `flight_sim_cpp`; there is now one runner, not two.
-- Wind/aerodynamics, the LiDAR sim, scene synthesis, and the ray-traced camera are missing or stubbed.
+- Wind/aerodynamics, the LiDAR sim, scene synthesis, and the ray-traced camera remain unimplemented or thinly scaffolded on the canonical C++ path.
 
 ## Where We Should Be
 
@@ -54,7 +54,7 @@ Simulate drone physics, sensors, and terrain so flight, coordination, and captur
 7. Add the fault injection library (seeded wind gusts, GPS drift, IMU noise, sensor dropout, comm loss, low battery, bad tile, actuator lag) and simulation health/operability checks.
 8. Add capture replay adapter (sim sensor output → domain `04` ingestion path), sensor calibration profiles, mission validation report, and single-runner deterministic regression (golden + manifest hash reproducibility across builds/platforms).
 9. Add wind/aerodynamic disturbance and sensor noise to the physics/sensor loop.
-10. Replace placeholder Earth textures with georeferenced DEM + map-tile terrain.
+10. Replace procedural fallback Earth textures with georeferenced DEM + map-tile terrain.
 11. Implement the LiDAR sim (raycast point cloud) and camera sim so capture (`04`) has inputs.
 12. Synthesize georeferenced scene objects (buildings, farm vegetation) and the ray-traced drone camera; stream telemetry + video to an external collector.
 13. Wire the twin as the simulation-mode backend for flight (`01`) and coordination (`03`).

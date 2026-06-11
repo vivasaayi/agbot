@@ -7,7 +7,7 @@ Coordinate a swarm of drones to cover large fields safely: formations, collision
 - `multi_drone_control` has a strong type model: `MultiDroneController` with a swarm registry and global constraints, `DroneSwarm` with formations (Line/Grid/Circle/V/Custom), and a `CoordinationEngine`.
 - Safety primitives exist: ray-casting point-in-polygon geofence and no-fly-zone detection, altitude limits, and `SafetyViolation` tracking.
 - Command handling covers `EmergencyLand`, `ReturnToBase`, and `FormSwarm`; `CollisionAvoidanceSystem` does risk assessment and trajectory prediction.
-- The hard algorithms are skeletons: formation optimization, coordinated-action execution, collision-maneuver targets, and most assignment strategies are TODO stubs, with almost no test coverage.
+- The hard algorithms are skeletons: formation optimization, coordinated-action execution, collision-maneuver targets, and most assignment strategies are no-op or partial implementations, with almost no test coverage.
 
 ## Where We Should Be
 

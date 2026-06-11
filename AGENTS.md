@@ -22,7 +22,7 @@ The active Cargo workspace members are: `mission_planner`, `sensor_overlay_engin
 
 When the task is to execute the AGBot roadmap, do not ask the user which item to start with.
 
-- Start from `docs/product-roadmap/` including `README.md`, `product-doctrine.md`, `requirements-rigor.md`, `implementation-sequencing.md`, and the domain folders; also inspect `docs/reference/product-requirements.md` and the `prompts/` directory (`init.md`, `simulation.md`, `visualization.md`) when present.
+- Start from `docs/product-roadmap/` including `README.md`, `product-doctrine.md`, `requirements-rigor.md`, `implementation-sequencing.md`, and the domain folders; also inspect `docs/reference/product-requirements.md` and the `prompts/` directory (`init.md`, `simulation.md`, `visualization.md`, `codex-one-shot-roadmap.md`) when present.
 - Enumerate all milestone and backlog items before selecting work.
 - Process the backlog in deterministic batches. Do not attempt to load all items into context at once.
 - Prioritize P0, then P1, then P2. Within each priority, prefer foundational inventory and observable-foundation work before later milestones.
@@ -54,6 +54,8 @@ Checkpoint location for Codex runs:
 
 - Database: `.codex/checkpoints/roadmap-run/checkpoint.sqlite`
 - Human/model resume file: `.codex/checkpoints/roadmap-run/RESUME.md`
+
+If resuming a legacy Claude-run roadmap task, first inspect `.claude/checkpoints/roadmap-run/RESUME.md` and `.claude/checkpoints/roadmap-run/checkpoint.sqlite`, then continue from the freshest valid checkpoint. Prefer `.codex` for new Codex runs; mirror a legacy `.claude` checkpoint into `.codex` only when doing so is safe and useful for future Codex resumes. If both locations exist, compare `runs.last_commit`, `current_batch_id`, and `next_action`, record the chosen source in `events`, and avoid overwriting a newer checkpoint with an older one.
 
 Initialize SQLite with:
 
@@ -168,6 +170,14 @@ Warnings may already exist. Treat command exit codes and new failures as the sig
 - Before committing, run `git status --short` and review the intended diff.
 - Use clear, specific commit messages.
 - Leave the working tree clean after a commit when possible.
+
+## Sandbox-Aware Git Handling
+
+- Read-only git commands such as `git status`, `git diff`, `git log`, `git show`, and `git branch --show-current` should run normally in the sandbox.
+- Mutating git commands such as `git add`, `git commit`, `git tag`, `git merge`, `git rebase`, `git cherry-pick`, `git stash`, and `git reset` write to `.git` and may require escalated permissions in restricted workspaces.
+- If a required mutating git command fails with a sandbox-style error such as `Permission denied`, `Operation not permitted`, or `Unable to create .git/index.lock`, rerun only the necessary git command with escalated permissions and a concise justification.
+- Do not work around git sandbox failures by copying the repository, manually editing `.git`, using `sudo`, or running destructive cleanup.
+- Stage explicitly with `git add <path>...`, review `git status --short`, then commit with a clear message.
 
 ## Context Budget and Resume Discipline
 

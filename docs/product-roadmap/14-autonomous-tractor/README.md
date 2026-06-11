@@ -34,4 +34,4 @@ A self-driving tractor (AruviTrac): GPS/RTK-guided navigation, automated impleme
 
 ## Primary Crates
 
-New crate(s) TBD (a ground-vehicle control plane plus guidance/implement adapters). Builds on and parallels domains `01` (mission/control), `03` (coordination/safety), `07`/`10` (boundaries/prescriptions), and `05`/`09` (management zones).
+Planned `tractor_control` crate (a ground-vehicle control plane plus guidance/implement adapters). Builds on and parallels domains `01` (mission/control), `03` (coordination/safety), `07`/`10` (boundaries/prescriptions), and `05`/`09` (management zones).

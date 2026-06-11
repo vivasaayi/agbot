@@ -109,16 +109,16 @@ This domain is the **core advisor MVP** alongside `07`/`08`/`09`: deterministic,
 - **Story**: As `OPS`, I want every product to carry an asserted CRS, extent, resolution, and transform, so that an overlay is provably on the right ground.
 - **Deterministic / evidence**: populate `RasterSpatialRef` (CRS, extent, resolution, transform) from source metadata; assert non-empty CRS, positive resolution, and extent consistent with width×height×resolution before any product is written.
 - **Acceptance**:
-  - Given a georeferenced source, when a product is built, then its `RasterSpatialRef` is asserted and `extent == origin + dims·resolution` within tolerance.
+  - Given a georeferenced source, when a product is built, then its `RasterSpatialRef` is asserted and `extent == origin + dims·resolution` within **GEO** tolerance.
   - Given a source with a missing/zero CRS or non-positive resolution, when assertion runs, then product write is rejected with a georeferencing error rather than emitting an unreferenced raster.
 - **Tests**: unit (extent↔dims↔resolution consistency), geospatial assertion (CRS/resolution validity), failure path (missing CRS / zero resolution).
 - **Depends on**: 05-01, `shared` `RasterSpatialRef`.
 
 ### STORY 05-11 · M3 · L · P0 — GeoTIFF write with lossless transform round-trip
 - **Story**: As `OPS`, I want products written as GeoTIFF whose CRS/extent/resolution round-trip without drift, so that the viewer and advisor read back exactly what was computed.
-- **Deterministic / evidence**: harden the `gdal-io` GeoTIFF path with sidecar transform; on write-then-read the CRS, extent, resolution, transform, and pixel values must match within tolerance.
+- **Deterministic / evidence**: harden the `gdal-io` GeoTIFF path with sidecar transform; on write-then-read the CRS, extent, resolution, transform, and pixel values must match within **GEO** and **RASTER** tolerance as applicable.
 - **Acceptance**:
-  - Given a product with an asserted `RasterSpatialRef`, when it is written to GeoTIFF and re-read, then CRS/extent/resolution/transform and pixel values round-trip within tolerance.
+  - Given a product with an asserted `RasterSpatialRef`, when it is written to GeoTIFF and re-read, then CRS/extent/resolution/transform round-trip within **GEO** tolerance and pixel values round-trip within **RASTER** tolerance.
   - Given the `gdal-io` feature is unavailable, when GeoTIFF write is requested, then it fails with a clear "feature not enabled" error rather than writing a PNG mislabeled as georeferenced.
 - **Tests**: geospatial round-trip (write→read equality), unit (sidecar transform), failure path (`gdal-io` disabled).
 - **Depends on**: 05-10.

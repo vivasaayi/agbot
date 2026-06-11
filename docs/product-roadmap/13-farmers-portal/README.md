@@ -33,4 +33,4 @@ The grower-facing front door: a web dashboard and mobile app that give a farmer 
 
 ## Primary Crates
 
-New crate(s) TBD (a portal backend-for-frontend plus web/mobile clients). Builds on domains `10` (field/farm/data, org/roles), `09` (advisor reports), `07` (GIS layers), `08` (viewer patterns), and later `18`/`20`.
+Planned `portal` crate (a portal backend-for-frontend plus web/mobile clients). Builds on domains `10` (field/farm/data, org/roles), `09` (advisor reports), `07` (GIS layers), `08` (viewer patterns), and later `18`/`20`.

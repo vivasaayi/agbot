@@ -15,6 +15,6 @@ This map is service/domain-first. Each capability expands across the relevant pi
 | Crop health assessment | dummy | 6 | Evidence-gated health index with uncertainty |
 | Yield prediction | dummy | 5 | Bounded yield estimate behind uncertainty flag |
 | Recommendation generation | partial | 8 | Priority-ranked recommendation from a zone |
-| Report generation (PDF) | scaffold (TODOs) | 8 | Farmer-friendly PDF with metadata and findings |
-| Findings export (CSV/GeoJSON) | scaffold (TODOs) | 6 | Export findings and zones as CSV/GeoJSON |
+| Report generation (PDF) | scaffold with unimplemented encoders | 8 | Farmer-friendly PDF with metadata and findings |
+| Findings export (CSV/GeoJSON) | scaffold with unimplemented encoders | 6 | Export findings and zones as CSV/GeoJSON |
 | Reproducibility and evidence retention | partial | 5 | Persist raw evidence and reason codes per finding |

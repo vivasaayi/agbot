@@ -33,4 +33,4 @@ Turn the platform's drone and satellite data into defensible environmental evide
 
 ## Primary Crates
 
-New crate(s) TBD (a sustainability/MRV service plus report encoders). Builds on domains `05` (indices), `06` (biomass/canopy), `07` (geospatial), `09` (analytics/reports), and `10` (field/season identity). Sequenced after the core drone platform (`01`-`12`) and gated by the advisor MVP.
+Planned `sustainability` crate (a sustainability/MRV service plus report encoders). Builds on domains `05` (indices), `06` (biomass/canopy), `07` (geospatial), `09` (analytics/reports), and `10` (field/season identity). Sequenced after the core drone platform (`01`-`12`) and gated by the advisor MVP.

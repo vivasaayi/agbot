@@ -35,11 +35,11 @@ This map is service/domain-first. Each capability expands across the relevant pi
 | PID flight controller and command modes | strong partial | 7 | Deterministic takeoff/land/goto/orbit golden traces |
 | Status state machine and event broadcast | strong partial | 6 | Assert lifecycle transitions and emergency events |
 | Wind and aerodynamic disturbance | missing | 6 | Add a wind field and integrate force into physics |
-| LiDAR sensor simulation | missing (1-line TODO) | 8 | Raycast point cloud into capture-shaped output for `04` |
+| LiDAR sensor simulation | missing (not implemented on the canonical C++ path) | 8 | Raycast point cloud into capture-shaped output for `04` |
 | Camera / multispectral simulation | early partial | 6 | Emit georeferenced band images for `04`/`05` |
 | Globe navigation and flight UI (`flight_sim_cpp`) | strong partial | 7 | Mission preview overlay tied to a field boundary |
 | OSM map-tile and terrain loading | medium partial | 8 | Real DEM elevation with CRS/extent assertions |
-| Earth textures and 3D terrain rendering | early partial (placeholder) | 6 | Replace procedural textures with georeferenced tiles |
+| Earth textures and 3D terrain rendering | early partial (procedural fallback textures) | 6 | Replace procedural textures with georeferenced tiles |
 | C++ headless runner and telemetry replay | medium partial (deterministic runner landed) | 6 | One mission/telemetry contract (TwinContractV1) on the single canonical runner |
 | Twin-as-backend for flight/coordination | early partial | 7 | Drive `01`/`03` simulation mode through one twin API |
 | Georeferenced 3D scene synthesis (buildings, farm vegetation) | missing | 6 | Seeded scene manifest from OSM footprints + land-cover classes |

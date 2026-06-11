@@ -10,8 +10,10 @@ Shared contracts that every domain depends on. Mostly lives in `shared` and a ne
 - Establish geospatial primitives: CRS, extent, resolution, transform, and georeferenced product metadata (domains `07`, `10`). Tolerance classes for acceptance tests go in `tolerance-profiles.md`; stories must reference named profiles, not inline constants.
 - Establish capture provenance: flight session, sensor stream, and scene→field→season linkage (domains `04`, `07`).
 - **Decide and document the authoritative storage backend** (see "Storage Authority Decision" in `requirements-rigor.md`). Recommendation: PostgreSQL/PostGIS for operational data, file store for large binary assets, SQLite for edge cache only. This decision blocks domains `04`, `07`, `10`, `28`, and `30`. Do not begin new migration work in those domains until confirmed.
-- Define versioned shared contracts (`TelemetryV1`, `FlightCommandV1`, `CaptureRecordV1`, `RasterSpatialRefV1`, `ProvenanceEventV1`) in `shared/src/` before any second consumer is wired. See "Versioned Shared Contracts" in `requirements-rigor.md`.
+- Define versioned shared contracts (`TelemetryV1`, `FlightCommandV1`, `SimulationTraceV1`, `ScenarioManifestV1`, `CaptureRecordV1`, `RasterSpatialRefV1`, `ProvenanceEventV1`, `AlertEventV1`, `ImportExportJobV1`, `SafetyRuleV1`) in `shared/src/` before any second consumer is wired. See "Versioned Shared Contracts" in `requirements-rigor.md`.
 - Add the acceptance-test harness extended from today's `just gis-test` / `just gis-acceptance`.
+- Add a dependency-ordering check to the roadmap/backlog process: a story cannot be selected when one of its blocking contracts, producer domains, or named tolerance profiles is still absent, unless it is explicitly fixture-only and marked as such.
+- Add a safety-rule registry and parity harness before wiring new flight-adjacent command paths in `01`, `02`, `03`, `12`, `24`, or `25`.
 
 ## Phase 1: Advisor MVP Vertical (Milestones M1 → M2)
 
@@ -88,11 +90,12 @@ Direction, not scheduled work — these compose existing domains rather than add
 
 - Phase 0 spine blocks everything: without the domain model and geospatial primitives, no overlay or report is trustworthy.
 - Domain `10` (field/farm/data) and `07` (GIS hub) gate the entire advisor workflow.
-- Domain `05` (imagery) and `06` (LiDAR) depend on `04` (capture) for real inputs, but can develop against fixtures and the `02` simulator in parallel.
+- Domain `05` (imagery) and `06` (LiDAR) depend on `04` (capture) for real inputs, but can develop against fixtures and the `02` simulator in parallel. Fixture-only work must still use the same versioned contracts as real capture so it cannot become a divergent path.
 - Domain `08` (viewer) depends on `07` serving correct, georeferenced layers.
 - Domain `09` (advisor) is the first revenue milestone and should consume products from `05`/`06` and context from `10`.
 - Domain `03` (swarm) should start only after single-drone flight (`01`) and safety guardrails are reliable.
 - Domain `12` (fleet/edge) should harden once at least one full capture→report workflow runs on target hardware.
+- M5 autonomy or assistant loops may be prototyped only after the deterministic M3/M4 producer is real, replayable, and audited. No AI, swarm, or closed-loop action may bypass a human approval gate in v1.
 
 ## Resourcing Logic
 

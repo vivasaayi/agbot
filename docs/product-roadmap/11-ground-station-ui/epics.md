@@ -21,7 +21,7 @@ Each epic ships as a vertical slice:
 - Hardening: shared client state across web and CLI, recorded-frame tests, stale-telemetry failure path.
 
 ### EPIC-02: Map and Mission Overlay
-- Goal: render the flight on a real map with mission context, replacing the `.map-placeholder` scaffolds.
+- Goal: render the flight on a real map with mission context, replacing the static map scaffolds.
 - First release: basemap with drone position and flight path.
 - Expansion: waypoints, geofence, and no-fly zones drawn with correct CRS/extent; NDVI/LiDAR result overlays.
 - Hardening: coordinate round-trip assertions and overlay-correctness tests.

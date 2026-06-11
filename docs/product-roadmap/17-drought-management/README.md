@@ -37,4 +37,4 @@ Predict, monitor, and mitigate drought: fuse satellite and weather data into det
 
 ## Primary Crates
 
-New crate(s) TBD (a drought-index and risk-scoring engine plus a fused satellite/weather store). Builds on domains `05` (stress indices), `07` (satellite/GIS, Landsat), `15` (weather), `16` (mitigation via irrigation), `09` (advisor), and `10` (field/region identity).
+Planned `drought_management` crate (a drought-index and risk-scoring engine plus a fused satellite/weather store). Builds on domains `05` (stress indices), `07` (satellite/GIS, Landsat), `15` (weather), `16` (mitigation via irrigation), `09` (advisor), and `10` (field/region identity).

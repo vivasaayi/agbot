@@ -89,7 +89,7 @@ This is Phase 4, safety-critical, and gated: it depends on reliable single-drone
 
 ### STORY 03-08 · M3 · L · P0 — Collision-avoidance maneuver target and separation verification
 - **Story**: As `OPS`, I want collision avoidance to compute an actual maneuver target and verify minimum separation, so that predicted conflicts are resolved, not just flagged.
-- **Safety / deterministic**: replace the `target_position: None // TODO` stub — predict trajectories, select a maneuver (altitude/horizontal/speed/stop/RTB/hover), compute the target, and verify minimum separation holds both before and after the maneuver.
+- **Safety / deterministic**: replace the `target_position: None` maneuver gap — predict trajectories, select a maneuver (altitude/horizontal/speed/stop/RTB/hover), compute the target, and verify minimum separation holds both before and after the maneuver.
 - **Acceptance**:
   - Given two converging trajectories, when avoidance runs, then a maneuver target is computed and post-maneuver separation is ≥ the minimum.
   - Given a conflict with no maneuver that preserves separation, when avoidance runs, then it escalates to emergency stop/hover rather than returning a target that still breaches separation.
@@ -165,7 +165,7 @@ This is Phase 4, safety-critical, and gated: it depends on reliable single-drone
 
 ### STORY 03-16 · M4 · S · P2 — Comm-loss and low-battery coordination rules execution
 - **Story**: As `OPS`, I want coordination rules (comm loss, low battery, proximity) to actually execute their actions, so that the swarm responds to conditions instead of merely detecting them.
-- **Safety / deterministic**: wire the rule actions (currently TODO) to deterministic responses — comm-loss → RTB, low-battery → land at nearest site, proximity → avoidance; priority-ordered and audited.
+- **Safety / deterministic**: wire the currently unexecuted rule actions to deterministic responses — comm-loss → RTB, low-battery → land at nearest site, proximity → avoidance; priority-ordered and audited.
 - **Acceptance**:
   - Given a low-battery condition, when its rule fires, then the affected drone lands at the nearest emergency site and the action is audited.
   - Given two rules firing at once, when resolved, then the higher-priority safety action wins deterministically, not an arbitrary one.

@@ -33,4 +33,4 @@ A blog platform and knowledge base for agricultural best practices, success stor
 
 ## Primary Crates
 
-New crate(s) TBD (a CMS service plus an authoring/admin UI; web rendering reused by `13`). Builds on domains `10` (accounts/roles) and `13` (portal surface). Largely independent of `01`-`09`; sequenced after the core drone platform (`01`-`12`) and gated by the advisor MVP, but can run as a near-standalone workstream.
+Planned `content` crate (a CMS service plus an authoring/admin UI; web rendering reused by `13`). Builds on domains `10` (accounts/roles) and `13` (portal surface). Largely independent of `01`-`09`; sequenced after the core drone platform (`01`-`12`) and gated by the advisor MVP, but can run as a near-standalone workstream.

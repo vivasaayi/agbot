@@ -19,7 +19,7 @@ early partial: the WebSocket transport and message dispatch are solid and typed,
 
 ## Gaps to Close
 
-- Web telemetry/maps pages are static scaffolds: the maps page is three `.map-placeholder` divs with no rendering engine.
+- Web telemetry/maps pages are static scaffolds: the maps page has three empty map containers with no rendering engine.
 - No live data binding on the web surface beyond the inline demo script; no shared client state, reconnect, or buffering.
 - No operator actions: the UI is receive-only and cannot arm, dispatch, pause, RTH, or abort a mission.
 - No authentication, session, or role model; no audit of operator intent.

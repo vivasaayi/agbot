@@ -1,6 +1,6 @@
 # Global Tolerance Profiles
 
-Many stories across domains 02, 05, 06, 07, 08, 22, 28, and 32 use the phrase "within tolerance" without defining what that tolerance is. This document establishes the shared tolerance profiles that acceptance tests should reference by name rather than embedding magic constants inline.
+Many stories across domains 02, 05, 06, 07, 08, 22, 28, and 32 need numeric acceptance thresholds. This document establishes the shared tolerance profiles that acceptance tests should reference by name rather than embedding magic constants inline.
 
 When a story says "within tolerance," it must name which profile applies. If no profile fits, add one here.
 
@@ -15,6 +15,7 @@ Applies to: coordinate round-trips, CRS reprojection, extent assertions, georefe
 | Coordinate round-trip (lat/lon → projected → lat/lon) | ≤ 0.1 m | At the equator; tighter for RTK use cases |
 | Pixel-corner drift after reprojection | ≤ 0.5 px at native resolution | Measured in the target CRS pixel grid |
 | Extent boundary assertion | ≤ 1 m at each edge | For bounding-box assertions in acceptance tests |
+| Polygon area after vector round-trip | ≤ 0.1 % relative or ≤ 1 m² for small polygons | Use the larger tolerance only when relative error is unstable for tiny fields |
 | Tile alignment to terrain grid | ≤ 1 px at tile resolution | OSM/Terrarium z17 tiles |
 | CRS authority code round-trip | exact match | EPSG/OGC authority + code must survive serialize/deserialize |
 
@@ -55,6 +56,22 @@ Profile name: `CLOUD`
 
 ---
 
+## IMAGE — Camera Projection Tolerance
+
+Applies to: simulated camera frame projection, ray-traced image fixtures, labeled masks, and frame metadata round-trips.
+
+| Metric | Tolerance | Notes |
+| --- | --- | --- |
+| Known object projected position | ≤ 1 px | Against a deterministic scene fixture and fixed intrinsics |
+| Frame timestamp alignment to telemetry | ≤ 1 ms | Same time base as `TELEM` |
+| Intrinsics/extrinsics round-trip | exact schema match | Versioned camera profile and pose fields |
+| Segmentation mask agreement | exact pixel match | Labels are generated from geometry, not inferred by a model |
+| Frame hash under same seed | exact | Same scene, seed, pose, and profile produce identical bytes |
+
+Profile name: `IMAGE`
+
+---
+
 ## TELEM — Telemetry Tolerance
 
 Applies to: golden-telemetry fixture comparisons, cross-build/cross-platform parity tests, trace diff assertions, replay round-trips.
@@ -92,9 +109,9 @@ If a story needs a tighter tolerance for a specific field, state it explicitly a
 
 | Domain | Profiles Used |
 | --- | --- |
-| 02 — Simulation and Digital Twin | TELEM, GEO, CLOUD |
+| 02 — Simulation and Digital Twin | TELEM, GEO, CLOUD, IMAGE |
 | 05 — Imagery and Remote Sensing | RASTER, GEO |
-| 06 — LiDAR Mapping and 3D | CLOUD, GEO |
+| 06 — LiDAR Mapping and 3D | CLOUD, GEO, RASTER |
 | 07 — GIS and Geospatial Hub | GEO, RASTER |
 | 08 — Geo Viewer and Visualization | GEO, RASTER |
 | 22 — Orthomosaic and Photogrammetry | RASTER, GEO, CLOUD |

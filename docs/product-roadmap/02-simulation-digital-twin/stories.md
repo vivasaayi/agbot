@@ -18,9 +18,9 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 
 ### STORY 02-01 · M1 · M · P0 — Golden-telemetry regression for the physics loop
 - **Story**: As `DSP`, I want the per-drone physics loop pinned by a seeded golden-telemetry fixture, so that any change to gravity/drag/thrust/battery is caught before it reaches flight.
-- **Deterministic / evidence**: run `SimulationEngine`/`DronePhysics` with a fixed seed and timestep; record a golden telemetry trace; CI fails on any deviation beyond tolerance.
+- **Deterministic / evidence**: run `SimulationEngine`/`DronePhysics` with a fixed seed and timestep; record a golden telemetry trace; CI fails on any deviation beyond **TELEM** tolerance.
 - **Acceptance**:
-  - Given a fixed seed and mission, when the physics loop runs, then the trace matches the committed golden fixture within tolerance.
+  - Given a fixed seed and mission, when the physics loop runs, then the trace matches the committed golden fixture within **TELEM** tolerance, with byte identity required for deterministic-runner fields.
   - Given an unintended physics change, when CI runs, then the golden test fails and names the diverging field, not just "mismatch."
 - **Tests**: golden-file (seeded trace), unit (physics integration step), failure path (perturbed constant fails golden).
 - **Depends on**: `flight_sim_cpp/src/DroneSimulation.cpp`, `DeterministicRunner.cpp`.
@@ -63,7 +63,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Story**: As `AG`, I want the simulator to emit a real raycast point cloud, so that capture (`04`) and LiDAR mapping (`06`) can be developed and regression-tested without hardware.
 - **Deterministic / evidence**: implement deterministic raycasting against terrain/obstacles in the canonical simulator (`flight_sim_cpp`, bridged capture-shaped to Rust; the Bevy-era `lidar_simulator.rs` stub was removed with the `simulator` crate), emitting `LidarScan`/`LidarPoint` consumable by `04`; seeded so output is reproducible.
 - **Acceptance**:
-  - Given a scene with known geometry and a seed, when the LiDAR sim runs, then it emits a reproducible point cloud whose ranges match the geometry within tolerance.
+  - Given a scene with known geometry and a seed, when the LiDAR sim runs, then it emits a reproducible point cloud whose ranges match the geometry within **CLOUD** tolerance.
   - Given a degenerate empty scene, when the sim runs, then it emits an empty-but-valid scan, not a panic or garbage points.
 - **Tests**: unit (raycast ranges), golden-file (seeded cloud), failure path (empty scene).
 - **Depends on**: 02-09 (terrain geometry), `04` (capture shape), `shared` LiDAR schema.
@@ -102,10 +102,10 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 
 ### STORY 02-09 · M3 · M · P0 — Real DEM terrain with CRS/extent assertions
 - **Story**: As `OPS`, I want real georeferenced DEM terrain loaded with asserted CRS/extent/resolution, so that mission preview matches the actual field.
-- **Deterministic / evidence**: load DEM elevation tiles (OSM/Terrarium) into the terrain grid; assert CRS, extent, and resolution and round-trip a known coordinate; replace flat/placeholder elevation.
+- **Deterministic / evidence**: load DEM elevation tiles (OSM/Terrarium) into the terrain grid; assert CRS, extent, and resolution and round-trip a known coordinate; replace unannotated flat fallback elevation.
 - **Acceptance**:
-  - Given a field's DEM tiles, when terrain loads, then a known lat/lon round-trips to the correct elevation within tolerance and CRS/extent are asserted.
-  - Given a missing tile, when terrain loads, then the gap is reported and the area marked "no elevation," not silently flattened to zero.
+  - Given a field's DEM tiles, when terrain loads, then a known lat/lon round-trips to the correct elevation within **GEO** tolerance and CRS/extent are asserted.
+  - Given a missing tile, when terrain loads, then the gap is reported with a `TerrainTileState` such as `flat_fallback` or `missing` and recorded in the scenario manifest, not silently flattened to zero.
 - **Tests**: geospatial round-trip (coordinate → elevation), unit (CRS/extent assertions), failure path (missing tile reported).
 - **Depends on**: `flight_sim_cpp/src/GeoTerrain.cpp` (OSM/Terrarium tile fetch, elevation sampling, terrain mesh).
 
@@ -128,11 +128,11 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Depends on**: 02-04, `01`, `03`.
 
 ### STORY 02-12 · M3 · S · P1 — Georeferenced terrain textures
-- **Story**: As `OPS`, I want procedural placeholder textures replaced with georeferenced map tiles, so that the preview visually matches the real field.
+- **Story**: As `OPS`, I want procedural fallback textures replaced with georeferenced map tiles, so that the preview visually matches the real field.
 - **Deterministic / evidence**: load OSM map-tile textures aligned to the DEM extent; assert tile alignment to terrain CRS/extent.
 - **Acceptance**:
-  - Given a field extent, when textures load, then tiles align to the terrain grid within pixel tolerance.
-  - Given a tile fetch failure, when textures load, then the placeholder is shown with a "tile unavailable" marker, not a silent procedural fill claiming to be real.
+  - Given a field extent, when textures load, then tiles align to the terrain grid within **GEO** tolerance.
+  - Given a tile fetch failure, when textures load, then a clearly marked fallback tile is shown with a "tile unavailable" marker, not a silent procedural fill claiming to be real.
 - **Tests**: unit (tile alignment), failure path (tile fetch failure marked), fixture.
 - **Depends on**: 02-09, `flight_sim_cpp` map-tile fetching/caching (`GeoTerrain.cpp`, viewer tile compositor).
 
@@ -150,7 +150,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Story**: As `DSP`, I want the world around a chosen location populated with 3D scene objects — building footprints from OSM and farm vegetation (forest trees, bushes, crop rows by crop type) from land-cover classes — so that a simulated flight over a real farm encounters the obstacles and canopy a real flight would.
 - **Deterministic / evidence**: instantiate scene objects on the 02-09 DEM from OSM building footprints (`07`) and land-cover/vegetation classes (`05` classification products); placement is seeded and procedural per class (tree spacing, bush density, crop-row geometry); the run emits a reproducible scene manifest listing every object's class, georeferenced footprint, and height.
 - **Acceptance**:
-  - Given a location and a seed, when scene synthesis runs, then the scene manifest is byte-identical across runs and each object's footprint georeference matches its source feature within tolerance.
+  - Given a location and a seed, when scene synthesis runs, then the scene manifest is byte-identical across runs and each object's footprint georeference matches its source feature within **GEO** tolerance.
   - Given an area with no land-cover or OSM coverage, when synthesis runs, then the area is marked "unpopulated" in the manifest, not filled with invented vegetation presented as real.
 - **Tests**: golden-file (seeded scene manifest), unit (footprint → placement geometry per class), failure path (missing land cover marked unpopulated).
 - **Depends on**: 02-09, `flight_sim_cpp/src/GeoTerrain.cpp`, `05` (vegetation classes), `07` (OSM features).
@@ -159,7 +159,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Story**: As `DSP`, I want a simulated drone camera that ray-traces the synthesized scene from the drone's pose through configurable FOV/intrinsics, so that perception and capture software can be developed against realistic frames before any real-world flight — the autonomous-vehicle-style sim-first approach.
 - **Deterministic / evidence**: cast rays from the drone pose through a pinhole intrinsics model (FOV, resolution, distortion optional) against terrain plus 02-19 scene objects; emit each frame with per-pixel depth, the camera pose, and a timestamp; seeded and reproducible; frame georeference derives from pose + intrinsics.
 - **Acceptance**:
-  - Given a known scene, pose, and seed, when a frame is captured, then it is reproducible and known objects appear at projectively correct pixel positions within tolerance.
+  - Given a known scene, pose, and seed, when a frame is captured, then it is reproducible and known objects appear at projectively correct pixel positions within **IMAGE** tolerance.
   - Given a pose outside the loaded scene extent, when capture runs, then the frame is marked "no scene coverage" rather than emitting an empty frame presented as real imagery.
 - **Tests**: golden-file (seeded frame hash), unit (ray–object intersection, projection math), failure path (no coverage).
 - **Depends on**: 02-19, 02-06 (georeferenced band emission), 02-08 (optional pose noise).
@@ -190,7 +190,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Story**: As `OPS`, I want the HUD (compass/speed/altitude/battery) and flight-UI state machine validated against telemetry, so that what the operator sees in preview matches the twin state.
 - **Deterministic / evidence**: assert HUD values and UI state transitions track the underlying telemetry/status deterministically.
 - **Acceptance**:
-  - Given a running sim, when the HUD renders, then displayed altitude/speed/battery match telemetry within tolerance.
+  - Given a running sim, when the HUD renders, then displayed altitude/speed/battery match telemetry within **TELEM** tolerance.
   - Given a battery-critical state, when the UI updates, then it reflects the emergency state and does not stay green.
 - **Tests**: unit (HUD value mapping), failure path (critical state reflected), fixture.
 - **Depends on**: 02-03, 02-14, `flight_sim_cpp` viewer telemetry panel (`macos_opengl_viewer.mm`).
@@ -317,7 +317,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 
 ### STORY 02-29 · M2 · M · P0 — Trace diff CLI (`agbot-sim diff <a> <b>`)
 - **Story**: As `DSP`, I want a CLI that compares two simulation trace files and reports the exact step index, field name, and values that diverge, so that golden regression failures name the problem instead of just saying "mismatch."
-- **Deterministic / evidence**: `agbot-sim diff <trace-a.jsonl> <trace-b.jsonl>` exits 0 if traces are identical within tolerance, exits 1 with a structured JSON diff listing the first N divergent steps (step index, field path, value in A, value in B, delta if numeric).
+- **Deterministic / evidence**: `agbot-sim diff <trace-a.jsonl> <trace-b.jsonl>` exits 0 if traces are identical within **TELEM** tolerance, exits 1 with a structured JSON diff listing the first N divergent steps (step index, field path, value in A, value in B, delta if numeric).
 - **Acceptance**:
   - Given two identical traces, when `agbot-sim diff` runs, then it exits 0 with "traces identical."
   - Given two traces that diverge at step 42 on field `position.altitude_m`, when `agbot-sim diff` runs, then it exits 1 and names step 42, `position.altitude_m`, and both values.
@@ -397,7 +397,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Tests**: golden trace + manifest-hash regression on all reference missions, divergence detection (names field), cross-build/cross-platform determinism check, format-drift detected.
 - **Depends on**: 02-25 (deterministic runner), 02-24 (`TwinContractV1`), 02-28 (scenario manifest), 02-29 (trace diff CLI).
 - **Status**: partially implemented — same-seed byte-identity and per-run manifest hashing already exist on `flight_sim_cpp` with a committed golden fixture; the cross-build/cross-platform CI gate and a manifest-hash golden are still pending.
-- **Note**: this replaces the obsolete cross-runner framing (there is now one canonical runner) and folds in the regression role previously assigned to STORY 02-13. Single-runner determinism is a required reliability item, not a P2 nice-to-have.
+- **Note**: this replaces the obsolete two-runner framing (there is now one canonical runner) and folds in the regression role previously assigned to STORY 02-13. Single-runner determinism is a required reliability item, not a P2 nice-to-have.
 
 ---
 

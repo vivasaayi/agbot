@@ -23,8 +23,8 @@ medium partial: `sensor_collector` has a real hardware/sim reader abstraction wi
 - Real-hardware LiDAR and camera paths are mock/untested; the RPLIDAR parser and camera capture return mock data.
 - Simulated sensor data is thin (fixed patterns) and not yet georeferenced to a flight path.
 - `data_collector` exports are incomplete: `export_parquet()` and `export_hdf5()` are `unimplemented!()`; the broader GeoTIFF/PDF/HTML/KML/Shapefile ambition is not yet wired.
-- Session aggregates are placeholders: `calculate_flight_duration/distance_covered/area_covered/battery_consumption` all return `0.0` (`data_collector/src/lib.rs`).
-- `export_session` has a TODO — it does not yet load session records before exporting (passes an empty vec).
+- Session aggregates currently return `0.0`: `calculate_flight_duration/distance_covered/area_covered/battery_consumption` do not yet derive values from telemetry (`data_collector/src/lib.rs`).
+- `export_session` does not yet load session records before exporting (passes an empty vec).
 - Storage load/list paths are stubbed: `list_sessions`, `load_session`, `load_data`, `cleanup_before_date`, and `get_stats` return empty/None/zeroed values.
 - Indexer async methods (`index_session`, `search`, `rebuild`) are no-ops; only the in-memory lookups work.
 - Tests are thin: a few construction/lifecycle/JSON-export smoke tests, no fixture or failure-path coverage.
@@ -41,6 +41,6 @@ medium partial: `sensor_collector` has a real hardware/sim reader abstraction wi
 - Every `FlightDataRecord` carries provenance (sensor, GPS, timestamp, calibration) and links to a flight (`01`) and field/scene (`10`).
 - Storage is query-complete: load, list, search, retention, and stats all work, with integrity checks.
 - The indexer answers spatial/temporal/type queries over persisted records, not just in-memory ones.
-- Real session aggregates (distance, area, battery) computed from telemetry, not placeholders.
+- Real session aggregates (distance, area, battery) computed from telemetry, not fixed zero values.
 - Exports cover JSON/CSV and at least one geospatial format with CRS/extent preserved; `unimplemented!` paths removed or feature-gated.
 - Real-hardware LiDAR/camera paths validated against the `02` sim with calibration and QA masks.

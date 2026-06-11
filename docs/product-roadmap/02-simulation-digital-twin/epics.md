@@ -28,7 +28,7 @@ Each epic ships as a vertical slice:
 
 ### EPIC-02: Georeferenced Terrain and Sensor Simulation
 - Goal: a twin world that matches the real field with capture-shaped sensor outputs.
-- First release: real DEM terrain with CRS/extent assertions, replacing placeholder textures and flat tiles.
+- First release: real DEM terrain with CRS/extent assertions, replacing procedural fallback textures and unannotated flat tiles.
 - Expansion: LiDAR raycast point-cloud sim and camera/multispectral sim feeding domain `04`.
 - Hardening: tile streaming/LOD performance and large-area coverage on edge hardware.
 
