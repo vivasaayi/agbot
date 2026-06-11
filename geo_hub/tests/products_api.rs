@@ -2493,6 +2493,129 @@ async fn scene_manifest_lists_available_products_from_disk() -> Result<()> {
 }
 
 #[tokio::test]
+async fn scene_detail_returns_persisted_spatial_ref_roundtrip() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "spatial-roundtrip-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    });
+
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref.clone()).await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let scene_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        scene_json
+            .pointer("/geospatial/spatial_ref/crs")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        scene_json
+            .pointer("/geospatial/spatial_ref/geo_transform/1")
+            .and_then(|value| value.as_f64()),
+        Some(0.05)
+    );
+    assert_eq!(
+        scene_json
+            .pointer("/geospatial/spatial_ref/resolution/x")
+            .and_then(|value| value.as_f64()),
+        Some(0.05)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn product_request_rejects_spatial_ref_integrity_mismatch() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "spatial-integrity-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    let product_path = scene_dir.join("products").join("ndvi").join("sample.png");
+    std::fs::create_dir_all(product_path.parent().expect("product parent exists"))?;
+    std::fs::write(&product_path, TEST_PNG_BYTES)?;
+    let metadata_spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    });
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, metadata_spatial_ref).await?;
+
+    let corrupted_spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.58,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.06, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.06,
+            "y": 0.05
+        }
+    });
+    upsert_scene_spatial_ref(&ctx, scene_id, corrupted_spatial_ref).await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/products/ndvi"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("metadata-integrity"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn generates_ndvi_via_db_fallback_and_persists_product_row() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -2779,6 +2902,131 @@ async fn create_acceptance_annotation(ctx: &TestContext, scene_id: &str) -> Resu
         .await
         .expect("router should handle request");
     assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn insert_scene_with_spatial_ref(
+    ctx: &TestContext,
+    scene_id: &str,
+    scene_dir: &Path,
+    spatial_ref: serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (scene_id, owner, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(scene_id)
+    .bind("org-alpha")
+    .bind("landsat8")
+    .bind("2026-05-01T00:00:00Z")
+    .bind(scene_dir.to_string_lossy().to_string())
+    .bind(
+        json!({
+            "metadata": {
+                "timestamp": "2026-05-01T00:00:00Z",
+                "gps_position": null,
+                "bands": ["B4", "B5"],
+                "exposure_time": 1.0,
+                "gain": 1.0,
+                "width": 2,
+                "height": 2,
+                "spatial_ref": spatial_ref.clone()
+            },
+            "file_paths": {
+                "B4": "B4.png",
+                "B5": "B5.png"
+            },
+            "image_id": Uuid::new_v4()
+        })
+        .to_string(),
+    )
+    .bind(None::<f64>)
+    .bind("2026-05-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    upsert_scene_spatial_ref(ctx, scene_id, spatial_ref).await
+}
+
+async fn upsert_scene_spatial_ref(
+    ctx: &TestContext,
+    scene_id: &str,
+    spatial_ref: serde_json::Value,
+) -> Result<()> {
+    let bbox = spatial_ref
+        .get("bbox")
+        .expect("spatial_ref bbox should exist");
+    let resolution = spatial_ref
+        .get("resolution")
+        .expect("spatial_ref resolution should exist");
+    let geo_transform = spatial_ref
+        .get("geo_transform")
+        .expect("spatial_ref transform should exist");
+    sqlx::query(
+        r#"
+        INSERT INTO scene_spatial_refs (
+            scene_id, spatial_ref_json, crs, min_lon, min_lat, max_lon, max_lat,
+            resolution_x, resolution_y, geo_transform_json, asserted_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
+        ON CONFLICT(scene_id) DO UPDATE SET
+            spatial_ref_json = excluded.spatial_ref_json,
+            crs = excluded.crs,
+            min_lon = excluded.min_lon,
+            min_lat = excluded.min_lat,
+            max_lon = excluded.max_lon,
+            max_lat = excluded.max_lat,
+            resolution_x = excluded.resolution_x,
+            resolution_y = excluded.resolution_y,
+            geo_transform_json = excluded.geo_transform_json,
+            asserted_at = datetime('now')
+        "#,
+    )
+    .bind(scene_id)
+    .bind(spatial_ref.to_string())
+    .bind(
+        spatial_ref
+            .get("crs")
+            .and_then(|value| value.as_str())
+            .expect("spatial_ref CRS should exist"),
+    )
+    .bind(
+        bbox.get("min_lon")
+            .and_then(|value| value.as_f64())
+            .expect("min_lon should exist"),
+    )
+    .bind(
+        bbox.get("min_lat")
+            .and_then(|value| value.as_f64())
+            .expect("min_lat should exist"),
+    )
+    .bind(
+        bbox.get("max_lon")
+            .and_then(|value| value.as_f64())
+            .expect("max_lon should exist"),
+    )
+    .bind(
+        bbox.get("max_lat")
+            .and_then(|value| value.as_f64())
+            .expect("max_lat should exist"),
+    )
+    .bind(
+        resolution
+            .get("x")
+            .and_then(|value| value.as_f64())
+            .expect("resolution x should exist"),
+    )
+    .bind(
+        resolution
+            .get("y")
+            .and_then(|value| value.as_f64())
+            .expect("resolution y should exist"),
+    )
+    .bind(geo_transform.to_string())
+    .execute(&ctx.pool)
+    .await?;
     Ok(())
 }
 

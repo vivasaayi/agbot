@@ -18,10 +18,11 @@ use geojson::{
 use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    bounds_from_points, AnnotationGeometry, AnnotationRecord, FarmRecord, FieldBoundary,
-    FieldRecord, GeoBounds, GeoPoint, GpsCoords, ImageMetadata, MultispectralImage,
-    RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
-    RecommendationStatus, ReportFormat, ReportRecord, DEFAULT_RECORD_OWNER,
+    assert_raster_spatial_ref, bounds_from_points, AnnotationGeometry, AnnotationRecord,
+    FarmRecord, FieldBoundary, FieldRecord, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
+    MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, DEFAULT_RECORD_OWNER,
+    GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -79,6 +80,7 @@ pub struct SceneGeospatialMetadata {
     pub crs: Option<String>,
     pub center: Option<GpsCoords>,
     pub extent: Option<SceneExtent>,
+    pub spatial_ref: Option<RasterSpatialRef>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -2119,6 +2121,8 @@ pub async fn get_scene(
     let metadata = load_scene_metadata(scene_row.as_ref(), &scene_dir).await?;
     let field = load_scene_field(&state, scene_row.as_ref()).await?;
     let ingest = ingest::load_ingest_record(&state.pool, &scene_id).await?;
+    let asserted_spatial_ref = ingest::load_scene_spatial_ref(&state.pool, &scene_id).await?;
+    assert_scene_spatial_ref_integrity(metadata.as_ref(), asserted_spatial_ref.as_ref())?;
     let available_products = collect_scene_products(&state, &scene_id).await?;
 
     Ok(Json(SceneDetail {
@@ -2139,7 +2143,10 @@ pub async fn get_scene(
         data_path: scene_row.as_ref().map(|row| row.get("data_path")),
         field,
         ingest,
-        geospatial: build_geospatial_metadata(metadata.as_ref()),
+        geospatial: build_geospatial_metadata_with_asserted(
+            metadata.as_ref(),
+            asserted_spatial_ref.as_ref(),
+        ),
         available_products,
     }))
 }
@@ -2148,6 +2155,7 @@ pub async fn stream_product(
     Path((scene_id, kind)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> AppResult<Response> {
+    assert_scene_product_spatial_integrity(&state, &scene_id).await?;
     let product_path = resolve_product_path(&state, &scene_id, &kind).await?;
 
     let file = File::open(&product_path)
@@ -2183,6 +2191,7 @@ pub async fn stream_product_tile(
         .ok_or_else(|| AppError::BadRequest("tile requests must end with .png".to_string()))?
         .parse::<u32>()
         .map_err(|_| AppError::BadRequest("invalid tile y coordinate".to_string()))?;
+    assert_scene_product_spatial_integrity(&state, &scene_id).await?;
     let product_path = resolve_product_path(&state, &scene_id, &kind).await?;
     let tile_path = tile_cache_path(&state, &scene_id, &kind, &product_path, z, x, y).await?;
 
@@ -2496,8 +2505,105 @@ fn build_product_summary(scene_id: &str, kind: &str, path: &FsPath) -> ProductSu
     }
 }
 
+async fn assert_scene_product_spatial_integrity(state: &AppState, scene_id: &str) -> AppResult<()> {
+    let scene_row =
+        sqlx::query("SELECT scene_id, metadata_json, field_id FROM scenes WHERE scene_id = ?1")
+            .bind(scene_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(Error::from)?;
+    let Some(scene_row) = scene_row else {
+        return Ok(());
+    };
+    let scene_dir = state.config.data_root.join("scenes").join(scene_id);
+    let metadata = load_scene_metadata(Some(&scene_row), &scene_dir).await?;
+    let asserted_spatial_ref = ingest::load_scene_spatial_ref(&state.pool, scene_id).await?;
+    assert_scene_spatial_ref_integrity(metadata.as_ref(), asserted_spatial_ref.as_ref())
+}
+
+fn assert_scene_spatial_ref_integrity(
+    metadata: Option<&MultispectralImage>,
+    asserted_spatial_ref: Option<&RasterSpatialRef>,
+) -> AppResult<()> {
+    let (Some(image), Some(asserted_spatial_ref)) = (metadata, asserted_spatial_ref) else {
+        return Ok(());
+    };
+    let metadata_spatial_ref = assert_raster_spatial_ref(
+        image.metadata.spatial_ref.as_ref(),
+        image.metadata.width,
+        image.metadata.height,
+    )
+    .map_err(|err| AppError::BadRequest(format!("metadata-integrity: {err}")))?;
+    assert_spatial_refs_equivalent(&metadata_spatial_ref, asserted_spatial_ref)
+}
+
+fn assert_spatial_refs_equivalent(
+    metadata_spatial_ref: &RasterSpatialRef,
+    asserted_spatial_ref: &RasterSpatialRef,
+) -> AppResult<()> {
+    if metadata_spatial_ref.crs != asserted_spatial_ref.crs {
+        return Err(metadata_integrity_mismatch("CRS"));
+    }
+    match (
+        metadata_spatial_ref.bbox.as_ref(),
+        asserted_spatial_ref.bbox.as_ref(),
+    ) {
+        (Some(left), Some(right)) => {
+            assert_close("min_lon", left.min_lon, right.min_lon)?;
+            assert_close("min_lat", left.min_lat, right.min_lat)?;
+            assert_close("max_lon", left.max_lon, right.max_lon)?;
+            assert_close("max_lat", left.max_lat, right.max_lat)?;
+        }
+        _ => return Err(metadata_integrity_mismatch("extent bbox")),
+    }
+    match (
+        metadata_spatial_ref.resolution,
+        asserted_spatial_ref.resolution,
+    ) {
+        (Some(left), Some(right)) => {
+            assert_close("resolution.x", left.x, right.x)?;
+            assert_close("resolution.y", left.y, right.y)?;
+        }
+        _ => return Err(metadata_integrity_mismatch("resolution")),
+    }
+    match (
+        metadata_spatial_ref.geo_transform,
+        asserted_spatial_ref.geo_transform,
+    ) {
+        (Some(left), Some(right)) => {
+            for (index, (left, right)) in left.iter().zip(right.iter()).enumerate() {
+                assert_close(&format!("geo_transform[{index}]"), *left, *right)?;
+            }
+        }
+        _ => return Err(metadata_integrity_mismatch("transform")),
+    }
+    Ok(())
+}
+
+fn assert_close(label: &str, left: f64, right: f64) -> AppResult<()> {
+    if (left - right).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE {
+        Ok(())
+    } else {
+        Err(metadata_integrity_mismatch(label))
+    }
+}
+
+fn metadata_integrity_mismatch(label: &str) -> AppError {
+    AppError::BadRequest(format!(
+        "metadata-integrity: persisted spatial_ref does not match scene metadata at {label}"
+    ))
+}
+
 fn build_geospatial_metadata(metadata: Option<&MultispectralImage>) -> SceneGeospatialMetadata {
-    let spatial_ref = metadata.and_then(|image| image.metadata.spatial_ref.as_ref());
+    build_geospatial_metadata_with_asserted(metadata, None)
+}
+
+fn build_geospatial_metadata_with_asserted(
+    metadata: Option<&MultispectralImage>,
+    asserted_spatial_ref: Option<&RasterSpatialRef>,
+) -> SceneGeospatialMetadata {
+    let spatial_ref = asserted_spatial_ref
+        .or_else(|| metadata.and_then(|image| image.metadata.spatial_ref.as_ref()));
     let extent = spatial_ref.and_then(|spatial| {
         spatial.bbox.as_ref().map(|bbox| SceneExtent {
             min_lon: bbox.min_lon,
@@ -2520,6 +2626,7 @@ fn build_geospatial_metadata(metadata: Option<&MultispectralImage>) -> SceneGeos
         crs: spatial_ref.and_then(|spatial| spatial.crs.clone()),
         center: center.or_else(|| metadata.and_then(|image| image.metadata.gps_position.clone())),
         extent,
+        spatial_ref: spatial_ref.cloned(),
     }
 }
 
