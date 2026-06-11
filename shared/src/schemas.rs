@@ -30,6 +30,13 @@ pub struct FieldBoundary {
     pub crs: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidatedFieldBoundary {
+    pub boundary: FieldBoundary,
+    pub extent: GeoBounds,
+    pub area_ha: f64,
+}
+
 pub const DEFAULT_RECORD_OWNER: &str = "unassigned";
 
 fn default_record_owner() -> String {
@@ -90,6 +97,26 @@ pub enum FarmFieldError {
         farm_org_id: String,
         field_org_id: String,
     },
+    #[error("invalid field boundary: {reason}")]
+    BoundaryInvalid {
+        reason: FieldBoundaryValidationError,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FieldBoundaryValidationError {
+    #[error("field boundary must declare a CRS")]
+    MissingCrs,
+    #[error("field boundary must contain a closed polygon ring")]
+    TooFewCoordinates,
+    #[error("field boundary contains invalid geographic coordinates")]
+    InvalidCoordinate,
+    #[error("field boundary polygon ring is not closed")]
+    RingNotClosed,
+    #[error("field boundary polygon self-intersects")]
+    SelfIntersection,
+    #[error("field boundary area is empty")]
+    EmptyArea,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -128,6 +155,10 @@ impl FarmFieldRegistry {
             });
         }
 
+        let validated = validate_field_boundary(&field.boundary)
+            .map_err(|reason| FarmFieldError::BoundaryInvalid { reason })?;
+        field.extent = validated.extent;
+        field.area_ha = Some(validated.area_ha);
         field.owner = field.org_id.clone();
         self.fields.insert(field.field_id.clone(), field.clone());
         Ok(field)
@@ -197,6 +228,149 @@ fn normalize_field_record(mut field: FieldRecord) -> Result<FieldRecord, FarmFie
 fn normalize_farm_field_text(value: String) -> Option<String> {
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+pub fn validate_field_boundary(
+    boundary: &FieldBoundary,
+) -> Result<ValidatedFieldBoundary, FieldBoundaryValidationError> {
+    let crs = boundary
+        .crs
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(FieldBoundaryValidationError::MissingCrs)?;
+    let coordinates = &boundary.coordinates;
+    if coordinates.len() < 4 {
+        return Err(FieldBoundaryValidationError::TooFewCoordinates);
+    }
+    if coordinates.iter().any(|point| {
+        !point.longitude.is_finite()
+            || !point.latitude.is_finite()
+            || point.longitude < -180.0
+            || point.longitude > 180.0
+            || point.latitude < -90.0
+            || point.latitude > 90.0
+    }) {
+        return Err(FieldBoundaryValidationError::InvalidCoordinate);
+    }
+    if !points_approximately_equal(
+        coordinates.first().expect("coordinates length checked"),
+        coordinates.last().expect("coordinates length checked"),
+    ) {
+        return Err(FieldBoundaryValidationError::RingNotClosed);
+    }
+    if ring_self_intersects(coordinates) {
+        return Err(FieldBoundaryValidationError::SelfIntersection);
+    }
+
+    let extent =
+        bounds_from_points(coordinates).ok_or(FieldBoundaryValidationError::InvalidCoordinate)?;
+    let area_ha = polygon_area_hectares(coordinates);
+    if area_ha <= f64::EPSILON {
+        return Err(FieldBoundaryValidationError::EmptyArea);
+    }
+
+    Ok(ValidatedFieldBoundary {
+        boundary: FieldBoundary {
+            coordinates: coordinates.clone(),
+            crs: Some(crs.to_string()),
+        },
+        extent,
+        area_ha,
+    })
+}
+
+fn points_approximately_equal(left: &GeoPoint, right: &GeoPoint) -> bool {
+    const EPSILON: f64 = 1e-9;
+    (left.longitude - right.longitude).abs() <= EPSILON
+        && (left.latitude - right.latitude).abs() <= EPSILON
+}
+
+fn ring_self_intersects(points: &[GeoPoint]) -> bool {
+    let segment_count = points.len().saturating_sub(1);
+    for left in 0..segment_count {
+        for right in (left + 1)..segment_count {
+            if segments_share_ring_vertex(left, right, segment_count) {
+                continue;
+            }
+            if segments_intersect(
+                &points[left],
+                &points[left + 1],
+                &points[right],
+                &points[right + 1],
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn segments_share_ring_vertex(left: usize, right: usize, segment_count: usize) -> bool {
+    left == right || left + 1 == right || (left == 0 && right + 1 == segment_count)
+}
+
+fn segments_intersect(a: &GeoPoint, b: &GeoPoint, c: &GeoPoint, d: &GeoPoint) -> bool {
+    let o1 = orientation(a, b, c);
+    let o2 = orientation(a, b, d);
+    let o3 = orientation(c, d, a);
+    let o4 = orientation(c, d, b);
+
+    if orientation_sign(o1) != orientation_sign(o2) && orientation_sign(o3) != orientation_sign(o4)
+    {
+        return true;
+    }
+
+    (orientation_is_colinear(o1) && point_on_segment(a, c, b))
+        || (orientation_is_colinear(o2) && point_on_segment(a, d, b))
+        || (orientation_is_colinear(o3) && point_on_segment(c, a, d))
+        || (orientation_is_colinear(o4) && point_on_segment(c, b, d))
+}
+
+fn orientation(a: &GeoPoint, b: &GeoPoint, c: &GeoPoint) -> f64 {
+    (b.longitude - a.longitude) * (c.latitude - a.latitude)
+        - (b.latitude - a.latitude) * (c.longitude - a.longitude)
+}
+
+fn orientation_sign(value: f64) -> i8 {
+    if orientation_is_colinear(value) {
+        0
+    } else if value > 0.0 {
+        1
+    } else {
+        -1
+    }
+}
+
+fn orientation_is_colinear(value: f64) -> bool {
+    value.abs() <= 1e-12
+}
+
+fn point_on_segment(start: &GeoPoint, point: &GeoPoint, end: &GeoPoint) -> bool {
+    point.longitude >= start.longitude.min(end.longitude) - 1e-12
+        && point.longitude <= start.longitude.max(end.longitude) + 1e-12
+        && point.latitude >= start.latitude.min(end.latitude) - 1e-12
+        && point.latitude <= start.latitude.max(end.latitude) + 1e-12
+}
+
+fn polygon_area_hectares(points: &[GeoPoint]) -> f64 {
+    let mean_latitude =
+        points.iter().map(|point| point.latitude).sum::<f64>() / points.len() as f64;
+    let meters_per_degree_lat = 111_320.0;
+    let meters_per_degree_lon = meters_per_degree_lat * mean_latitude.to_radians().cos();
+    let area_m2 = points
+        .windows(2)
+        .map(|window| {
+            let x1 = window[0].longitude * meters_per_degree_lon;
+            let y1 = window[0].latitude * meters_per_degree_lat;
+            let x2 = window[1].longitude * meters_per_degree_lon;
+            let y2 = window[1].latitude * meters_per_degree_lat;
+            x1 * y2 - x2 * y1
+        })
+        .sum::<f64>()
+        .abs()
+        * 0.5;
+    area_m2 / 10_000.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -643,11 +817,11 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_raster_spatial_ref, bounds_from_points, AnnotationGeometry, AnnotationRecord,
-        FarmFieldError, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord, GeoBounds,
-        GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat,
-        ReportRecord,
+        assert_raster_spatial_ref, bounds_from_points, validate_field_boundary, AnnotationGeometry,
+        AnnotationRecord, FarmFieldError, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint, MultispectralImage,
+        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
     };
 
     #[test]
@@ -948,6 +1122,90 @@ mod tests {
         assert!(registry.fields_for_org("org-b").is_empty());
     }
 
+    #[test]
+    fn field_boundary_validation_computes_extent_area_and_preserves_crs() {
+        let boundary = test_boundary();
+
+        let validated = validate_field_boundary(&boundary).expect("boundary validates");
+
+        assert_eq!(validated.boundary, boundary);
+        assert_eq!(validated.extent, test_extent());
+        assert!(validated.area_ha > 0.0);
+    }
+
+    #[test]
+    fn field_registry_rejects_unclosed_boundary_without_writing() {
+        let mut registry = FarmFieldRegistry::default();
+        registry
+            .insert_farm(FarmRecord {
+                farm_id: "farm-a".to_string(),
+                org_id: "org-a".to_string(),
+                owner: "org-a".to_string(),
+                name: "Prairie Farm".to_string(),
+                notes: None,
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect("farm persists");
+
+        let error = registry
+            .insert_field(FieldRecord {
+                farm_id: Some("farm-a".to_string()),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                owner: "org-a".to_string(),
+                name: "North 80".to_string(),
+                area_ha: None,
+                crop: None,
+                season: None,
+                notes: None,
+                boundary: unclosed_test_boundary(),
+                extent: test_extent(),
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect_err("unclosed boundary is rejected");
+
+        assert_eq!(
+            error,
+            FarmFieldError::BoundaryInvalid {
+                reason: FieldBoundaryValidationError::RingNotClosed
+            }
+        );
+        assert!(registry.fields_for_org("org-a").is_empty());
+    }
+
+    #[test]
+    fn field_boundary_validation_rejects_self_intersection() {
+        let boundary = FieldBoundary {
+            crs: Some("EPSG:4326".to_string()),
+            coordinates: vec![
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.2,
+                },
+                GeoPoint {
+                    longitude: -96.2,
+                    latitude: 41.4,
+                },
+                GeoPoint {
+                    longitude: -96.2,
+                    latitude: 41.2,
+                },
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.4,
+                },
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.2,
+                },
+            ],
+        };
+
+        let error = validate_field_boundary(&boundary).expect_err("bowtie ring is rejected");
+
+        assert_eq!(error, FieldBoundaryValidationError::SelfIntersection);
+    }
+
     fn test_boundary() -> FieldBoundary {
         FieldBoundary {
             crs: Some("EPSG:4326".to_string()),
@@ -962,6 +1220,38 @@ mod tests {
                 },
                 GeoPoint {
                     longitude: -96.2,
+                    latitude: 41.4,
+                },
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.4,
+                },
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.2,
+                },
+            ],
+        }
+    }
+
+    fn unclosed_test_boundary() -> FieldBoundary {
+        FieldBoundary {
+            crs: Some("EPSG:4326".to_string()),
+            coordinates: vec![
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.2,
+                },
+                GeoPoint {
+                    longitude: -96.2,
+                    latitude: 41.2,
+                },
+                GeoPoint {
+                    longitude: -96.2,
+                    latitude: 41.4,
+                },
+                GeoPoint {
+                    longitude: -96.5,
                     latitude: 41.4,
                 },
             ],
