@@ -1,3 +1,4 @@
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -77,6 +78,32 @@ pub struct FieldRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeasonRecord {
+    pub season_id: String,
+    pub field_id: String,
+    pub org_id: String,
+    pub start: String,
+    pub end: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CropPlanRecord {
+    pub crop_plan_id: String,
+    pub season_id: String,
+    #[serde(default)]
+    pub org_id: String,
+    pub crop: String,
+    pub planting_date: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldSeasonHistory {
+    pub season: SeasonRecord,
+    pub crop_plans: Vec<CropPlanRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FarmFieldError {
     #[error("farm_id cannot be empty")]
@@ -87,10 +114,20 @@ pub enum FarmFieldError {
     EmptyOrgId,
     #[error("name cannot be empty")]
     EmptyName,
+    #[error("season_id cannot be empty")]
+    EmptySeasonId,
+    #[error("crop_plan_id cannot be empty")]
+    EmptyCropPlanId,
+    #[error("crop cannot be empty")]
+    EmptyCrop,
     #[error("field requires a farm_id: {field_id}")]
     MissingFarmId { field_id: String },
     #[error("farm not found: {farm_id}")]
     FarmNotFound { farm_id: String },
+    #[error("field not found: {field_id}")]
+    FieldNotFound { field_id: String },
+    #[error("season not found: {season_id}")]
+    SeasonNotFound { season_id: String },
     #[error("farm {farm_id} belongs to {farm_org_id}, not {field_org_id}")]
     TenantBoundary {
         farm_id: String,
@@ -100,6 +137,16 @@ pub enum FarmFieldError {
     #[error("invalid field boundary: {reason}")]
     BoundaryInvalid {
         reason: FieldBoundaryValidationError,
+    },
+    #[error("invalid date {value}")]
+    InvalidDate { value: String },
+    #[error("season date range is invalid: {start}..{end}")]
+    InvalidDateRange { start: String, end: String },
+    #[error("season {season_id} overlaps {overlapping_season_id} for field {field_id}")]
+    SeasonOverlap {
+        field_id: String,
+        season_id: String,
+        overlapping_season_id: String,
     },
 }
 
@@ -123,6 +170,10 @@ pub enum FieldBoundaryValidationError {
 pub struct FarmFieldRegistry {
     farms: HashMap<String, FarmRecord>,
     fields: HashMap<String, FieldRecord>,
+    #[serde(default)]
+    seasons: HashMap<String, SeasonRecord>,
+    #[serde(default)]
+    crop_plans: HashMap<String, CropPlanRecord>,
 }
 
 impl FarmFieldRegistry {
@@ -207,6 +258,97 @@ impl FarmFieldRegistry {
             .filter(|field| field.org_id == org_id)
             .cloned()
     }
+
+    pub fn insert_season(&mut self, season: SeasonRecord) -> Result<SeasonRecord, FarmFieldError> {
+        let season = normalize_season_record(season)?;
+        self.fields
+            .get(&season.field_id)
+            .filter(|field| field.org_id == season.org_id)
+            .ok_or_else(|| FarmFieldError::FieldNotFound {
+                field_id: season.field_id.clone(),
+            })?;
+
+        let start = parse_farm_field_date(&season.start)?;
+        let end = parse_farm_field_date(&season.end)?;
+        if end < start {
+            return Err(FarmFieldError::InvalidDateRange {
+                start: season.start,
+                end: season.end,
+            });
+        }
+
+        for existing in self.seasons.values() {
+            if existing.field_id != season.field_id || existing.org_id != season.org_id {
+                continue;
+            }
+            let existing_start = parse_farm_field_date(&existing.start)?;
+            let existing_end = parse_farm_field_date(&existing.end)?;
+            if start <= existing_end && existing_start <= end {
+                return Err(FarmFieldError::SeasonOverlap {
+                    field_id: season.field_id,
+                    season_id: season.season_id,
+                    overlapping_season_id: existing.season_id.clone(),
+                });
+            }
+        }
+
+        self.seasons
+            .insert(season.season_id.clone(), season.clone());
+        Ok(season)
+    }
+
+    pub fn insert_crop_plan(
+        &mut self,
+        crop_plan: CropPlanRecord,
+    ) -> Result<CropPlanRecord, FarmFieldError> {
+        let mut crop_plan = normalize_crop_plan_record(crop_plan)?;
+        if let Some(planting_date) = crop_plan.planting_date.as_ref() {
+            parse_farm_field_date(planting_date)?;
+        }
+        let season = self.seasons.get(&crop_plan.season_id).ok_or_else(|| {
+            FarmFieldError::SeasonNotFound {
+                season_id: crop_plan.season_id.clone(),
+            }
+        })?;
+        crop_plan.org_id = season.org_id.clone();
+
+        self.crop_plans
+            .insert(crop_plan.crop_plan_id.clone(), crop_plan.clone());
+        Ok(crop_plan)
+    }
+
+    pub fn season_history_for_field(
+        &self,
+        org_id: &str,
+        field_id: &str,
+    ) -> Vec<FieldSeasonHistory> {
+        let mut seasons = self
+            .seasons
+            .values()
+            .filter(|season| season.org_id == org_id && season.field_id == field_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        seasons.sort_by(|left, right| {
+            parse_farm_field_date(&left.start)
+                .ok()
+                .cmp(&parse_farm_field_date(&right.start).ok())
+                .then(left.season_id.cmp(&right.season_id))
+        });
+
+        seasons
+            .into_iter()
+            .map(|season| {
+                let mut crop_plans = self
+                    .crop_plans
+                    .values()
+                    .filter(|crop_plan| crop_plan.season_id == season.season_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                crop_plans.sort_by(|left, right| left.crop_plan_id.cmp(&right.crop_plan_id));
+                FieldSeasonHistory { season, crop_plans }
+            })
+            .collect()
+    }
 }
 
 fn normalize_farm_record(mut farm: FarmRecord) -> Result<FarmRecord, FarmFieldError> {
@@ -225,9 +367,46 @@ fn normalize_field_record(mut field: FieldRecord) -> Result<FieldRecord, FarmFie
     Ok(field)
 }
 
+fn normalize_season_record(mut season: SeasonRecord) -> Result<SeasonRecord, FarmFieldError> {
+    season.season_id =
+        normalize_farm_field_text(season.season_id).ok_or(FarmFieldError::EmptySeasonId)?;
+    season.field_id =
+        normalize_farm_field_text(season.field_id).ok_or(FarmFieldError::EmptyFieldId)?;
+    season.org_id = normalize_farm_field_text(season.org_id).ok_or(FarmFieldError::EmptyOrgId)?;
+    season.start =
+        normalize_farm_field_text(season.start).ok_or_else(|| FarmFieldError::InvalidDate {
+            value: String::new(),
+        })?;
+    season.end =
+        normalize_farm_field_text(season.end).ok_or_else(|| FarmFieldError::InvalidDate {
+            value: String::new(),
+        })?;
+    season.label = normalize_farm_field_text(season.label).ok_or(FarmFieldError::EmptyName)?;
+    Ok(season)
+}
+
+fn normalize_crop_plan_record(
+    mut crop_plan: CropPlanRecord,
+) -> Result<CropPlanRecord, FarmFieldError> {
+    crop_plan.crop_plan_id =
+        normalize_farm_field_text(crop_plan.crop_plan_id).ok_or(FarmFieldError::EmptyCropPlanId)?;
+    crop_plan.season_id =
+        normalize_farm_field_text(crop_plan.season_id).ok_or(FarmFieldError::EmptySeasonId)?;
+    crop_plan.org_id = normalize_farm_field_text(crop_plan.org_id).unwrap_or_default();
+    crop_plan.crop = normalize_farm_field_text(crop_plan.crop).ok_or(FarmFieldError::EmptyCrop)?;
+    crop_plan.planting_date = crop_plan.planting_date.and_then(normalize_farm_field_text);
+    Ok(crop_plan)
+}
+
 fn normalize_farm_field_text(value: String) -> Option<String> {
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+fn parse_farm_field_date(value: &str) -> Result<NaiveDate, FarmFieldError> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| FarmFieldError::InvalidDate {
+        value: value.to_string(),
+    })
 }
 
 pub fn validate_field_boundary(
@@ -818,10 +997,11 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 mod tests {
     use super::{
         assert_raster_spatial_ref, bounds_from_points, validate_field_boundary, AnnotationGeometry,
-        AnnotationRecord, FarmFieldError, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint, MultispectralImage,
-        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
+        AnnotationRecord, CropPlanRecord, FarmFieldError, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint,
+        MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat,
+        ReportRecord, SeasonRecord,
     };
 
     #[test]
@@ -1206,6 +1386,89 @@ mod tests {
         assert_eq!(error, FieldBoundaryValidationError::SelfIntersection);
     }
 
+    #[test]
+    fn season_and_crop_plan_history_is_chronological() {
+        let mut registry = registry_with_field();
+
+        registry
+            .insert_season(SeasonRecord {
+                season_id: "season-2026".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2026-03-01".to_string(),
+                end: "2026-10-31".to_string(),
+                label: "2026 Corn".to_string(),
+            })
+            .expect("2026 season persists");
+        registry
+            .insert_season(SeasonRecord {
+                season_id: "season-2025".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2025-03-01".to_string(),
+                end: "2025-10-31".to_string(),
+                label: "2025 Soy".to_string(),
+            })
+            .expect("2025 season persists");
+        registry
+            .insert_crop_plan(CropPlanRecord {
+                crop_plan_id: "plan-2026".to_string(),
+                season_id: "season-2026".to_string(),
+                org_id: String::new(),
+                crop: "corn".to_string(),
+                planting_date: Some("2026-04-15".to_string()),
+            })
+            .expect("crop plan persists");
+
+        let history = registry.season_history_for_field("org-a", "field-a");
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].season.season_id, "season-2025");
+        assert_eq!(history[1].season.season_id, "season-2026");
+        assert_eq!(history[1].crop_plans.len(), 1);
+        assert_eq!(history[1].crop_plans[0].crop, "corn");
+        assert_eq!(history[1].crop_plans[0].org_id, "org-a");
+    }
+
+    #[test]
+    fn overlapping_season_is_rejected_without_writing() {
+        let mut registry = registry_with_field();
+        registry
+            .insert_season(SeasonRecord {
+                season_id: "season-2026".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2026-03-01".to_string(),
+                end: "2026-10-31".to_string(),
+                label: "2026 Corn".to_string(),
+            })
+            .expect("season persists");
+
+        let error = registry
+            .insert_season(SeasonRecord {
+                season_id: "season-overlap".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2026-05-01".to_string(),
+                end: "2026-09-30".to_string(),
+                label: "Overlapping season".to_string(),
+            })
+            .expect_err("overlap is rejected");
+
+        assert_eq!(
+            error,
+            FarmFieldError::SeasonOverlap {
+                field_id: "field-a".to_string(),
+                season_id: "season-overlap".to_string(),
+                overlapping_season_id: "season-2026".to_string()
+            }
+        );
+        assert_eq!(
+            registry.season_history_for_field("org-a", "field-a").len(),
+            1
+        );
+    }
+
     fn test_boundary() -> FieldBoundary {
         FieldBoundary {
             crs: Some("EPSG:4326".to_string()),
@@ -1265,6 +1528,37 @@ mod tests {
             max_lon: -96.2,
             max_lat: 41.4,
         }
+    }
+
+    fn registry_with_field() -> FarmFieldRegistry {
+        let mut registry = FarmFieldRegistry::default();
+        registry
+            .insert_farm(FarmRecord {
+                farm_id: "farm-a".to_string(),
+                org_id: "org-a".to_string(),
+                owner: "org-a".to_string(),
+                name: "Prairie Farm".to_string(),
+                notes: None,
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect("farm persists");
+        registry
+            .insert_field(FieldRecord {
+                farm_id: Some("farm-a".to_string()),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                owner: "org-a".to_string(),
+                name: "North 80".to_string(),
+                area_ha: None,
+                crop: None,
+                season: None,
+                notes: None,
+                boundary: test_boundary(),
+                extent: test_extent(),
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect("field persists");
+        registry
     }
 
     #[test]
