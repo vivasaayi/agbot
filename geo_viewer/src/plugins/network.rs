@@ -3,7 +3,7 @@ use crate::plugins::map::{tile_center_world, tile_world_size, visible_tiles_for_
 use crate::plugins::recommendations::{clear_recommendations, start_recommendation_fetch};
 use crate::plugins::reports::{clear_reports, start_report_fetch};
 use crate::state::{
-    manifest_world_dimensions, product_placement_for_manifest, AnnotationFetchTask,
+    assert_manifest_layer_placement, manifest_world_dimensions, AnnotationFetchTask,
     AnnotationOverlayState, FarmFieldHistoryFetchTask, FarmListFetchTask, FetchedTile,
     FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask, FieldSceneSummary,
     FieldScenesFetchTask, FieldSeasonGroup, ManifestFetchTask, MapCamera, MapViewState,
@@ -242,22 +242,20 @@ fn poll_manifest_fetch(
                         manifest_state.width.unwrap_or_default() as f32,
                         manifest_state.height.unwrap_or_default() as f32,
                     );
+                    if let Err(err) = assert_manifest_layer_placement(
+                        &manifest_state.geospatial,
+                        manifest_state.width,
+                        manifest_state.height,
+                    ) {
+                        tile_state.status =
+                            TileStatus::Error(format!("layer placement mismatch: {err}"));
+                        return;
+                    }
                     tile_state.world_dimensions = manifest_world_dimensions(
                         &manifest_state.geospatial,
                         manifest_state.width,
                         manifest_state.height,
                     );
-
-                    let placement = product_placement_for_manifest(&manifest_state.geospatial);
-                    if !placement.is_placeable() {
-                        tile_state.status = TileStatus::Error(format!(
-                            "{}; products are unplaceable",
-                            placement
-                                .reason()
-                                .unwrap_or("scene products are unplaceable")
-                        ));
-                        return;
-                    }
 
                     tile_state.status = TileStatus::Fetching;
 
@@ -879,7 +877,13 @@ fn active_tile_source(
     manifest_state: &SceneManifestState,
     config: &TileConfig,
 ) -> Option<TileSource> {
-    if !product_placement_for_manifest(&manifest_state.geospatial).is_placeable() {
+    if assert_manifest_layer_placement(
+        &manifest_state.geospatial,
+        manifest_state.width,
+        manifest_state.height,
+    )
+    .is_err()
+    {
         return None;
     }
 

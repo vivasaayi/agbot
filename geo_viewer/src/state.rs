@@ -4,8 +4,9 @@ use bevy::tasks::Task;
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    AnnotationRecord, FarmRecord, FieldRecord, GeoPoint, GpsCoords, RecommendationPriority,
-    RecommendationRecord, RecommendationStatus, ReportRecord,
+    assert_raster_spatial_ref, AnnotationRecord, FarmRecord, FieldRecord, GeoPoint, GpsCoords,
+    RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
+    RecommendationStatus, ReportRecord, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -191,6 +192,8 @@ pub struct SceneGeospatialMetadata {
     pub crs: Option<String>,
     pub center: Option<GpsCoords>,
     pub extent: Option<SceneExtent>,
+    #[serde(default)]
+    pub spatial_ref: Option<RasterSpatialRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,28 +228,96 @@ pub fn manifest_world_dimensions(
     width: Option<u32>,
     height: Option<u32>,
 ) -> Vec2 {
-    if !product_placement_for_manifest(geospatial).is_placeable() {
-        return Vec2::ZERO;
-    }
-
-    geospatial
-        .extent
-        .as_ref()
-        .map(|extent| {
-            Vec2::new(
-                ((extent.max_lon - extent.min_lon) as f32).abs() * MAP_UNITS_PER_DEGREE,
-                ((extent.max_lat - extent.min_lat) as f32).abs() * MAP_UNITS_PER_DEGREE,
-            )
-        })
-        .or_else(|| {
-            width
-                .zip(height)
-                .map(|(width, height)| Vec2::new(width as f32, height as f32))
-        })
+    assert_manifest_layer_placement(geospatial, width, height)
+        .map(|placement| placement.world_dimensions)
         .unwrap_or(Vec2::ZERO)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerPlacement {
+    pub crs: String,
+    pub extent: SceneExtent,
+    pub resolution: RasterResolution,
+    pub world_dimensions: Vec2,
+}
+
+pub fn assert_manifest_layer_placement(
+    geospatial: &SceneGeospatialMetadata,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<LayerPlacement> {
+    let product_placement = product_placement_for_manifest(geospatial);
+    if !product_placement.is_placeable() {
+        anyhow::bail!(
+            "{}",
+            product_placement
+                .reason()
+                .unwrap_or("scene products are unplaceable")
+        );
+    }
+
+    let width = width.ok_or_else(|| anyhow::anyhow!("layer placement missing raster width"))?;
+    let height = height.ok_or_else(|| anyhow::anyhow!("layer placement missing raster height"))?;
+    let spatial_ref = geospatial
+        .spatial_ref
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer placement missing asserted spatial_ref"))?;
+    let asserted = assert_raster_spatial_ref(Some(spatial_ref), width, height)?;
+    let manifest_crs = geospatial
+        .crs
+        .as_deref()
+        .filter(|crs| !crs.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("layer placement missing manifest CRS"))?;
+    let layer_crs = asserted
+        .crs
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("layer placement missing layer CRS"))?;
+    if manifest_crs != layer_crs {
+        anyhow::bail!("layer placement CRS mismatch: manifest {manifest_crs} != layer {layer_crs}");
+    }
+
+    let manifest_extent = geospatial
+        .extent
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer placement missing manifest extent"))?;
+    let layer_extent = asserted
+        .bbox
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer placement missing layer extent"))?;
+    assert_extent_edge("min_lon", manifest_extent.min_lon, layer_extent.min_lon)?;
+    assert_extent_edge("min_lat", manifest_extent.min_lat, layer_extent.min_lat)?;
+    assert_extent_edge("max_lon", manifest_extent.max_lon, layer_extent.max_lon)?;
+    assert_extent_edge("max_lat", manifest_extent.max_lat, layer_extent.max_lat)?;
+
+    let resolution = asserted
+        .resolution
+        .ok_or_else(|| anyhow::anyhow!("layer placement missing layer resolution"))?;
+
+    Ok(LayerPlacement {
+        crs: layer_crs.to_string(),
+        extent: manifest_extent.clone(),
+        resolution,
+        world_dimensions: scene_extent_world_dimensions(manifest_extent),
+    })
+}
+
+fn assert_extent_edge(edge: &'static str, manifest: f64, layer: f64) -> Result<()> {
+    if (manifest - layer).abs() > GEO_EXTENT_ASSERTION_TOLERANCE {
+        anyhow::bail!(
+            "layer placement extent mismatch at {edge}: manifest {manifest} != layer {layer}"
+        );
+    }
+    Ok(())
+}
+
+fn scene_extent_world_dimensions(extent: &SceneExtent) -> Vec2 {
+    Vec2::new(
+        ((extent.max_lon - extent.min_lon) as f32).abs() * MAP_UNITS_PER_DEGREE,
+        ((extent.max_lat - extent.min_lat) as f32).abs() * MAP_UNITS_PER_DEGREE,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SceneExtent {
     pub min_lon: f64,
     pub min_lat: f64,
@@ -584,11 +655,12 @@ pub fn ensure_scene_id(config: &TileConfig, action: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        manifest_world_dimensions, product_placement_for_manifest, select_catalog_scene,
-        summarize_tile_presences, FieldCatalogState, FieldSceneSummary, SceneExtent,
-        SceneGeospatialMetadata, SceneManifest, SceneProduct, TileId, TilePresence,
+        assert_manifest_layer_placement, manifest_world_dimensions, product_placement_for_manifest,
+        select_catalog_scene, summarize_tile_presences, FieldCatalogState, FieldSceneSummary,
+        SceneExtent, SceneGeospatialMetadata, SceneManifest, SceneProduct, TileId, TilePresence,
     };
     use bevy::prelude::Vec2;
+    use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
     #[test]
     fn tile_source_formats_tile_url_from_template() {
@@ -710,6 +782,7 @@ mod tests {
             crs: None,
             center: None,
             extent: None,
+            spatial_ref: None,
         });
 
         assert!(!placement.is_placeable());
@@ -727,6 +800,7 @@ mod tests {
                 crs: None,
                 center: None,
                 extent: None,
+                spatial_ref: None,
             },
             Some(256),
             Some(128),
@@ -748,12 +822,99 @@ mod tests {
                     max_lon: -88.5,
                     max_lat: 41.0,
                 }),
+                spatial_ref: Some(valid_spatial_ref()),
             },
-            Some(256),
-            Some(128),
+            Some(100),
+            Some(50),
         );
 
         assert_ne!(dimensions, Vec2::ZERO);
+    }
+
+    #[test]
+    fn layer_placement_assertion_accepts_matching_manifest_spatial_ref() {
+        let placement = assert_manifest_layer_placement(
+            &SceneGeospatialMetadata {
+                georeferenced: true,
+                crs: Some("EPSG:4326".to_string()),
+                center: None,
+                extent: Some(sample_extent()),
+                spatial_ref: Some(valid_spatial_ref()),
+            },
+            Some(100),
+            Some(50),
+        )
+        .expect("matching layer spatial ref should place");
+
+        assert_eq!(placement.crs, "EPSG:4326");
+        assert_eq!(placement.extent, sample_extent());
+        assert_eq!(placement.resolution, RasterResolution { x: 0.01, y: 0.02 });
+        assert_ne!(placement.world_dimensions, Vec2::ZERO);
+    }
+
+    #[test]
+    fn layer_placement_assertion_refuses_crs_mismatch() {
+        let err = assert_manifest_layer_placement(
+            &SceneGeospatialMetadata {
+                georeferenced: true,
+                crs: Some("EPSG:3857".to_string()),
+                center: None,
+                extent: Some(sample_extent()),
+                spatial_ref: Some(valid_spatial_ref()),
+            },
+            Some(100),
+            Some(50),
+        )
+        .expect_err("CRS mismatch should be refused");
+
+        assert!(err.to_string().contains("CRS"));
+    }
+
+    #[test]
+    fn layer_placement_assertion_refuses_extent_mismatch() {
+        let err = assert_manifest_layer_placement(
+            &SceneGeospatialMetadata {
+                georeferenced: true,
+                crs: Some("EPSG:4326".to_string()),
+                center: None,
+                extent: Some(SceneExtent {
+                    min_lon: -89.5,
+                    min_lat: 40.0,
+                    max_lon: -88.4,
+                    max_lat: 41.0,
+                }),
+                spatial_ref: Some(valid_spatial_ref()),
+            },
+            Some(100),
+            Some(50),
+        )
+        .expect_err("extent mismatch should be refused");
+
+        assert!(err.to_string().contains("extent"));
+    }
+
+    fn sample_extent() -> SceneExtent {
+        SceneExtent {
+            min_lon: -89.5,
+            min_lat: 40.0,
+            max_lon: -88.5,
+            max_lat: 41.0,
+        }
+    }
+
+    fn valid_spatial_ref() -> RasterSpatialRef {
+        RasterSpatialRef {
+            georeferenced: true,
+            crs: Some("EPSG:4326".to_string()),
+            bbox: Some(GeoBounds {
+                min_lon: -89.5,
+                min_lat: 40.0,
+                max_lon: -88.5,
+                max_lat: 41.0,
+            }),
+            geo_transform: Some([-89.5, 0.01, 0.0, 41.0, 0.0, -0.02]),
+            resolution: Some(RasterResolution { x: 0.01, y: 0.02 }),
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::plugins::recommendations::{
 };
 use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
-    product_placement_for_manifest, select_catalog_scene, AnnotationCreateTask,
+    assert_manifest_layer_placement, select_catalog_scene, AnnotationCreateTask,
     AnnotationDeleteTask, AnnotationFetchTask, AnnotationOverlayState, AnnotationUpdateTask,
     CursorMapState, DraftMode, FarmFieldHistoryFetchTask, FarmListFetchTask, FieldCatalogState,
     FieldImportState, FieldImportTask, FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask,
@@ -552,8 +552,14 @@ fn render_layers_panel(
     if manifest_state.products.is_empty() {
         ui.label("No layers loaded");
     } else {
-        let placement = product_placement_for_manifest(&manifest_state.geospatial);
-        if let Some(reason) = placement.reason() {
+        let placement_error = assert_manifest_layer_placement(
+            &manifest_state.geospatial,
+            manifest_state.width,
+            manifest_state.height,
+        )
+        .err()
+        .map(|err| err.to_string());
+        if let Some(reason) = placement_error.as_ref() {
             ui.label(format!("Products unavailable for overlay: {reason}"));
         }
         for (idx, product) in manifest_state.products.iter().enumerate() {
@@ -563,7 +569,7 @@ fn render_layers_panel(
                 product.filename,
                 product.content_type
             );
-            if placement.is_placeable() {
+            if placement_error.is_none() {
                 let response = ui.radio_value(&mut viewer_state.selected_layer, idx, label);
                 if response.changed() {
                     config.product_kind = product.kind.clone();
@@ -578,7 +584,9 @@ fn render_layers_panel(
                 response.on_hover_text(format!(
                     "{}\n{}",
                     product.url_path,
-                    placement.reason().unwrap_or("product is unplaceable")
+                    placement_error
+                        .as_deref()
+                        .unwrap_or("product is unplaceable")
                 ));
             }
         }
