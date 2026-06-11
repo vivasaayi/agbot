@@ -183,6 +183,48 @@ pub struct LidarNormalEstimationResult {
     pub evidence: LidarNormalEstimationEvidence,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LidarPointClass {
+    Ground,
+    NonGround,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LidarGroundSegmentationParams {
+    pub max_ground_tilt_degrees: f64,
+    pub max_ground_height_m: f64,
+}
+
+impl Default for LidarGroundSegmentationParams {
+    fn default() -> Self {
+        Self {
+            max_ground_tilt_degrees: 30.0,
+            max_ground_height_m: 0.5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarPointClassification {
+    pub point_index: usize,
+    pub class: LidarPointClass,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarGroundSegmentationEvidence {
+    pub points_in: usize,
+    pub ground_count: usize,
+    pub non_ground_count: usize,
+    pub params: LidarGroundSegmentationParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarGroundSegmentationResult {
+    pub classifications: Vec<LidarPointClassification>,
+    pub evidence: LidarGroundSegmentationEvidence,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IndexedLidarPoint {
     scan_index: usize,
@@ -692,6 +734,80 @@ impl LidarMapper {
         Some(SurfaceNormal::from_vector(normal))
     }
 
+    pub fn segment_ground_points(
+        &self,
+        points: &[LidarPoint3],
+        normals: &[LidarNormalEstimate],
+        params: LidarGroundSegmentationParams,
+    ) -> AgroResult<LidarGroundSegmentationResult> {
+        Self::validate_ground_segmentation_params(params)?;
+        if points.len() != normals.len() {
+            return Err(shared::error::AgroError::Processing(format!(
+                "LiDAR ground segmentation expected {} normals for {} points",
+                points.len(),
+                normals.len()
+            )));
+        }
+
+        let min_ground_normal_z = params.max_ground_tilt_degrees.to_radians().cos();
+        let mut ground_count = 0;
+        let mut classifications = Vec::with_capacity(points.len());
+        for (point_index, (point, estimate)) in points.iter().zip(normals.iter()).enumerate() {
+            if estimate.point_index != point_index {
+                return Err(shared::error::AgroError::Processing(format!(
+                    "LiDAR ground segmentation normal index mismatch at point {point_index}"
+                )));
+            }
+            let is_ground = estimate
+                .normal
+                .is_some_and(|normal| normal.z.is_finite() && normal.z >= min_ground_normal_z)
+                && point.z.is_finite()
+                && point.z <= params.max_ground_height_m;
+            let class = if is_ground {
+                ground_count += 1;
+                LidarPointClass::Ground
+            } else {
+                LidarPointClass::NonGround
+            };
+            classifications.push(LidarPointClassification { point_index, class });
+        }
+
+        if ground_count == 0 {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR ground segmentation found no ground surface".into(),
+            ));
+        }
+
+        let non_ground_count = points.len() - ground_count;
+        Ok(LidarGroundSegmentationResult {
+            classifications,
+            evidence: LidarGroundSegmentationEvidence {
+                points_in: points.len(),
+                ground_count,
+                non_ground_count,
+                params,
+            },
+        })
+    }
+
+    fn validate_ground_segmentation_params(
+        params: LidarGroundSegmentationParams,
+    ) -> AgroResult<()> {
+        if !params.max_ground_tilt_degrees.is_finite()
+            || !(0.0..=90.0).contains(&params.max_ground_tilt_degrees)
+        {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR ground segmentation requires a ground tilt in [0, 90] degrees".into(),
+            ));
+        }
+        if !params.max_ground_height_m.is_finite() {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR ground segmentation requires a finite ground height".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn create_occupancy_grid(
         &self,
         scans: &[LidarScan],
@@ -1029,6 +1145,14 @@ mod tests {
         }
     }
 
+    fn normal_estimate(point_index: usize, z: f64) -> LidarNormalEstimate {
+        LidarNormalEstimate {
+            point_index,
+            neighbor_count: 4,
+            normal: Some(SurfaceNormal { x: 0.0, y: 0.0, z }),
+        }
+    }
+
     #[test]
     fn test_create_occupancy_grid_obstacle() {
         // Single point within obstacle threshold should mark cell occupied
@@ -1316,5 +1440,80 @@ mod tests {
             .estimates
             .iter()
             .all(|estimate| estimate.normal.is_none()));
+    }
+
+    #[test]
+    fn segment_ground_points_classifies_sloped_terrain_and_canopy() {
+        let mapper = test_mapper();
+        let params = LidarGroundSegmentationParams {
+            max_ground_tilt_degrees: 30.0,
+            max_ground_height_m: 0.35,
+        };
+        let points = vec![
+            LidarPoint3::new(-1.0, -1.0, 0.0),
+            LidarPoint3::new(0.0, -1.0, 0.05),
+            LidarPoint3::new(1.0, -1.0, 0.1),
+            LidarPoint3::new(0.0, 0.0, 0.15),
+            LidarPoint3::new(0.0, 0.0, 2.0),
+            LidarPoint3::new(1.0, 1.0, 2.3),
+        ];
+        let normals = vec![
+            normal_estimate(0, 0.98),
+            normal_estimate(1, 0.98),
+            normal_estimate(2, 0.98),
+            normal_estimate(3, 0.98),
+            normal_estimate(4, 0.98),
+            normal_estimate(5, 0.4),
+        ];
+
+        let result = mapper
+            .segment_ground_points(&points, &normals, params)
+            .unwrap();
+
+        assert_eq!(result.evidence.points_in, 6);
+        assert_eq!(result.evidence.ground_count, 4);
+        assert_eq!(result.evidence.non_ground_count, 2);
+        assert_eq!(result.evidence.params, params);
+        let classes: Vec<_> = result
+            .classifications
+            .iter()
+            .map(|classification| classification.class)
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                LidarPointClass::Ground,
+                LidarPointClass::Ground,
+                LidarPointClass::Ground,
+                LidarPointClass::Ground,
+                LidarPointClass::NonGround,
+                LidarPointClass::NonGround,
+            ]
+        );
+    }
+
+    #[test]
+    fn segment_ground_points_reports_no_ground_surface() {
+        let mapper = test_mapper();
+        let params = LidarGroundSegmentationParams {
+            max_ground_tilt_degrees: 30.0,
+            max_ground_height_m: 0.35,
+        };
+        let points = vec![
+            LidarPoint3::new(0.0, 0.0, 2.0),
+            LidarPoint3::new(1.0, 0.0, 2.2),
+            LidarPoint3::new(0.0, 1.0, 2.4),
+        ];
+        let normals = vec![
+            normal_estimate(0, 0.98),
+            normal_estimate(1, 0.98),
+            normal_estimate(2, 0.98),
+        ];
+
+        let err = mapper
+            .segment_ground_points(&points, &normals, params)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("no ground surface"));
     }
 }
