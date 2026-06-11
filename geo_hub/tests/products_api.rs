@@ -1789,6 +1789,9 @@ async fn create_and_list_scene_annotations_for_file_backed_scene() -> Result<()>
                         "label": "Water stress",
                         "note": "North corner looks stressed",
                         "severity": "high",
+                        "author": "operator-1",
+                        "crs": "EPSG:4326",
+                        "audit_id": "audit-ann-1",
                         "geometry": {
                             "type": "point",
                             "coordinate": {
@@ -1817,6 +1820,18 @@ async fn create_and_list_scene_annotations_for_file_backed_scene() -> Result<()>
             .and_then(|v| v.as_str()),
         Some("point")
     );
+    assert_eq!(
+        created_json.get("author").and_then(|v| v.as_str()),
+        Some("operator-1")
+    );
+    assert_eq!(
+        created_json.get("crs").and_then(|v| v.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        created_json.get("audit_id").and_then(|v| v.as_str()),
+        Some("audit-ann-1")
+    );
 
     let list_response = ctx
         .app
@@ -1844,6 +1859,18 @@ async fn create_and_list_scene_annotations_for_file_backed_scene() -> Result<()>
     assert_eq!(
         items[0].pointer("/note").and_then(|v| v.as_str()),
         Some("North corner looks stressed")
+    );
+    assert_eq!(
+        items[0].get("author").and_then(|v| v.as_str()),
+        Some("operator-1")
+    );
+    assert_eq!(
+        items[0].get("crs").and_then(|v| v.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        items[0].get("audit_id").and_then(|v| v.as_str()),
+        Some("audit-ann-1")
     );
 
     Ok(())

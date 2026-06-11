@@ -165,6 +165,10 @@ pub struct UpdateFarmRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateAnnotationRequest {
     pub annotation_id: Option<String>,
+    pub field_id: Option<String>,
+    pub author: Option<String>,
+    pub crs: Option<String>,
+    pub audit_id: Option<String>,
     pub label: String,
     pub note: Option<String>,
     pub severity: Option<String>,
@@ -173,6 +177,9 @@ pub struct CreateAnnotationRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateAnnotationRequest {
+    pub author: Option<String>,
+    pub crs: Option<String>,
+    pub audit_id: Option<String>,
     pub label: String,
     pub note: Option<String>,
     pub severity: Option<String>,
@@ -1477,7 +1484,7 @@ pub async fn list_scene_annotations(
 
     let rows = sqlx::query(
         r#"
-        SELECT annotation_id, scene_id, field_id, label, note, severity, geometry_json, created_at, updated_at
+        SELECT annotation_id, scene_id, field_id, author, crs, audit_id, label, note, severity, geometry_json, created_at, updated_at
         FROM annotations
         WHERE scene_id = ?1
         ORDER BY created_at ASC
@@ -1509,14 +1516,17 @@ pub async fn create_scene_annotation(
     sqlx::query(
         r#"
         INSERT INTO annotations (
-            annotation_id, scene_id, field_id, label, note, severity, geometry_json, created_at, updated_at
+            annotation_id, scene_id, field_id, author, crs, audit_id, label, note, severity, geometry_json, created_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#,
     )
     .bind(&annotation.annotation_id)
     .bind(&annotation.scene_id)
     .bind(&annotation.field_id)
+    .bind(&annotation.author)
+    .bind(&annotation.crs)
+    .bind(&annotation.audit_id)
     .bind(&annotation.label)
     .bind(&annotation.note)
     .bind(&annotation.severity)
@@ -1547,10 +1557,16 @@ pub async fn update_scene_annotation(
     validate_annotation_geometry(&request.geometry)?;
 
     let label = normalize_annotation_label(request.label)?;
+    let author = normalize_optional_text(request.author).or(existing.author);
+    let crs = normalize_optional_text(request.crs).or(existing.crs);
+    let audit_id = normalize_optional_text(request.audit_id).or(existing.audit_id);
     let updated = AnnotationRecord {
         annotation_id: annotation_id.clone(),
         scene_id: scene_id.clone(),
         field_id: load_scene_field_id(&state, &scene_id).await?,
+        author,
+        crs,
+        audit_id,
         label,
         note: normalize_optional_text(request.note),
         severity: normalize_optional_text(request.severity),
@@ -1562,11 +1578,14 @@ pub async fn update_scene_annotation(
     let result = sqlx::query(
         r#"
         UPDATE annotations
-        SET field_id = ?1, label = ?2, note = ?3, severity = ?4, geometry_json = ?5, updated_at = ?6
-        WHERE annotation_id = ?7 AND scene_id = ?8
+        SET field_id = ?1, author = ?2, crs = ?3, audit_id = ?4, label = ?5, note = ?6, severity = ?7, geometry_json = ?8, updated_at = ?9
+        WHERE annotation_id = ?10 AND scene_id = ?11
         "#,
     )
     .bind(&updated.field_id)
+    .bind(&updated.author)
+    .bind(&updated.crs)
+    .bind(&updated.audit_id)
     .bind(&updated.label)
     .bind(&updated.note)
     .bind(&updated.severity)
@@ -3040,13 +3059,19 @@ async fn build_annotation_record(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let label = normalize_annotation_label(request.label)?;
     validate_annotation_geometry(&request.geometry)?;
-    let field_id = load_scene_field_id(state, scene_id).await?;
+    let field_id =
+        normalize_optional_text(request.field_id).or(load_scene_field_id(state, scene_id).await?);
+    let audit_id = normalize_optional_text(request.audit_id)
+        .unwrap_or_else(|| format!("annotation-audit-{}", Uuid::new_v4()));
 
     let timestamp = chrono::Utc::now().to_rfc3339();
     Ok(AnnotationRecord {
         annotation_id,
         scene_id: scene_id.to_string(),
         field_id,
+        author: normalize_optional_text(request.author),
+        crs: normalize_optional_text(request.crs),
+        audit_id: Some(audit_id),
         label,
         note: normalize_optional_text(request.note),
         severity: normalize_optional_text(request.severity),
@@ -3757,6 +3782,9 @@ fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Annotati
         annotation_id: row.get("annotation_id"),
         scene_id: row.get("scene_id"),
         field_id: row.get("field_id"),
+        author: row.get("author"),
+        crs: row.get("crs"),
+        audit_id: row.get("audit_id"),
         label: row.get("label"),
         note: row.get("note"),
         severity: row.get("severity"),
@@ -3863,7 +3891,7 @@ async fn load_annotation(
 ) -> AppResult<Option<AnnotationRecord>> {
     let row = sqlx::query(
         r#"
-        SELECT annotation_id, scene_id, field_id, label, note, severity, geometry_json, created_at, updated_at
+        SELECT annotation_id, scene_id, field_id, author, crs, audit_id, label, note, severity, geometry_json, created_at, updated_at
         FROM annotations
         WHERE scene_id = ?1 AND annotation_id = ?2
         "#,
@@ -3951,7 +3979,7 @@ async fn load_scene_annotation_records(
 ) -> AppResult<Vec<AnnotationRecord>> {
     let rows = sqlx::query(
         r#"
-        SELECT annotation_id, scene_id, field_id, label, note, severity, geometry_json, created_at, updated_at
+        SELECT annotation_id, scene_id, field_id, author, crs, audit_id, label, note, severity, geometry_json, created_at, updated_at
         FROM annotations
         WHERE scene_id = ?1
         ORDER BY created_at ASC

@@ -1,8 +1,9 @@
 use crate::plugins::annotations::{
-    add_polygon_vertex_from_cursor, annotation_matches_filters, clear_annotation_draft_geometry,
-    clear_annotations, draft_geometry, load_annotation_into_draft, remove_polygon_vertex_at_index,
-    selected_annotation, set_draft_point_from_cursor, start_annotation_create,
-    start_annotation_delete, start_annotation_fetch, start_annotation_update,
+    add_polygon_vertex_from_cursor, annotation_matches_filters, build_annotation_commit_payload,
+    clear_annotation_draft_geometry, clear_annotations, draft_geometry, load_annotation_into_draft,
+    next_annotation_audit_id, remove_polygon_vertex_at_index, selected_annotation,
+    set_draft_point_from_cursor, start_annotation_create, start_annotation_delete,
+    start_annotation_fetch, start_annotation_update,
 };
 use crate::plugins::network::{
     clear_loaded_tiles, clear_manifest_state, start_farm_field_history_fetch,
@@ -211,6 +212,7 @@ fn render_ui(
         render_annotations_panel(
             ui,
             &config,
+            manifest_state,
             &cursor_map,
             annotations,
             annotation_fetch_task,
@@ -778,6 +780,7 @@ fn render_view_panel(
 fn render_annotations_panel(
     ui: &mut egui::Ui,
     config: &TileConfig,
+    manifest_state: &SceneManifestState,
     cursor_map: &CursorMapState,
     annotations: &mut AnnotationOverlayState,
     annotation_fetch_task: &mut AnnotationFetchTask,
@@ -802,6 +805,8 @@ fn render_annotations_panel(
     });
     ui.label("Label");
     ui.text_edit_singleline(&mut annotations.draft_label);
+    ui.label("Author");
+    ui.text_edit_singleline(&mut annotations.draft_author);
     ui.label("Severity");
     ui.text_edit_singleline(&mut annotations.draft_severity);
     ui.label("Note");
@@ -907,15 +912,22 @@ fn render_annotations_panel(
         .clicked()
     {
         if let Some(geometry) = draft_geometry(annotations) {
-            if let Err(err) = start_annotation_create(
-                annotation_create_task,
-                config,
-                annotations.draft_label.clone(),
-                annotations.draft_note.clone(),
-                annotations.draft_severity.clone(),
+            match build_annotation_commit_payload(
+                annotations,
+                manifest_state,
                 geometry,
+                next_annotation_audit_id(),
             ) {
-                tile_state.status = TileStatus::Error(err.to_string());
+                Ok(payload) => {
+                    if let Err(err) =
+                        start_annotation_create(annotation_create_task, config, payload)
+                    {
+                        tile_state.status = TileStatus::Error(err.to_string());
+                    }
+                }
+                Err(err) => {
+                    tile_state.status = TileStatus::Error(err.to_string());
+                }
             }
         }
     }
@@ -965,6 +977,15 @@ fn render_annotations_panel(
             "Load a georeferenced scene and move the cursor over the map to draft annotations.",
         );
     }
+    if let Some(error) = annotations.last_error.as_ref() {
+        ui.small(format!("Last save error: {error}"));
+    }
+    if !annotations.failed_commits.is_empty() {
+        ui.small(format!(
+            "Unsaved annotations: {}",
+            annotations.failed_commits.len()
+        ));
+    }
     ui.separator();
     if let Some(selected) = selected_annotation(annotations) {
         ui.heading("Selected Annotation");
@@ -972,6 +993,15 @@ fn render_annotations_panel(
         ui.small(format!(
             "Severity: {}",
             selected.severity.as_deref().unwrap_or("n/a")
+        ));
+        ui.small(format!(
+            "Author: {}",
+            selected.author.as_deref().unwrap_or("n/a")
+        ));
+        ui.small(format!("CRS: {}", selected.crs.as_deref().unwrap_or("n/a")));
+        ui.small(format!(
+            "Audit: {}",
+            selected.audit_id.as_deref().unwrap_or("n/a")
         ));
         ui.small(format!(
             "Geometry: {}",

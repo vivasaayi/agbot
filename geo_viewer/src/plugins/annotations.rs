@@ -1,8 +1,9 @@
 use crate::plugins::map::geo_to_scene_local;
 use crate::state::{
+    assert_manifest_layer_placement, AnnotationCommitPayload, AnnotationCreateResult,
     AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask, AnnotationOverlayState,
-    AnnotationUpdateTask, CursorMapState, DraftMode, MapCamera, SceneExtent, SceneManifestState,
-    TileConfig, TileRenderState, TileStatus,
+    AnnotationUpdateTask, CursorMapState, DraftMode, MapCamera, PendingAnnotationCommit,
+    SceneExtent, SceneManifestState, TileConfig, TileRenderState, TileStatus,
 };
 use anyhow::{Context, Result};
 use bevy::prelude::*;
@@ -70,7 +71,7 @@ pub fn poll_annotation_create(
     if let Some(mut task) = annotation_create_task.0.take() {
         if let Some(result) = future::block_on(future::poll_once(&mut task)) {
             match result {
-                Ok(annotation) => {
+                AnnotationCreateResult::Saved(annotation) => {
                     annotations.items.push(annotation);
                     annotations
                         .items
@@ -78,10 +79,15 @@ pub fn poll_annotation_create(
                     annotations.selected_annotation_id = None;
                     annotations.hovered_annotation_id = None;
                     annotations.draft_note.clear();
+                    annotations.last_error = None;
                     clear_annotation_draft_geometry(&mut annotations);
                     tile_state.status = TileStatus::Ready;
                 }
-                Err(err) => tile_state.status = TileStatus::Error(err.to_string()),
+                AnnotationCreateResult::Failed(failed) => {
+                    let error = failed.error.clone();
+                    record_failed_annotation_commit(&mut annotations, failed.payload, failed.error);
+                    tile_state.status = TileStatus::Error(error);
+                }
             }
         } else {
             annotation_create_task.0 = Some(task);
@@ -672,10 +678,71 @@ pub fn draft_geometry(annotations: &AnnotationOverlayState) -> Option<Annotation
     }
 }
 
+pub fn build_annotation_commit_payload(
+    annotations: &AnnotationOverlayState,
+    manifest_state: &SceneManifestState,
+    geometry: AnnotationGeometry,
+    audit_id: String,
+) -> Result<AnnotationCommitPayload> {
+    let placement = assert_manifest_layer_placement(
+        &manifest_state.geospatial,
+        manifest_state.width,
+        manifest_state.height,
+    )
+    .context("annotation commit requires a placed active layer")?;
+    let label = normalize_required_text(&annotations.draft_label, "annotation label")?;
+    let author = normalize_optional_text(&annotations.draft_author)
+        .unwrap_or_else(|| "geo_viewer".to_string());
+    let audit_id = normalize_required_text(&audit_id, "annotation audit ID")?;
+
+    Ok(AnnotationCommitPayload {
+        annotation_id: None,
+        field_id: manifest_state.field_id.clone(),
+        label,
+        note: normalize_optional_text(&annotations.draft_note),
+        severity: normalize_optional_text(&annotations.draft_severity),
+        geometry,
+        author,
+        crs: placement.crs,
+        audit_id,
+    })
+}
+
+pub fn record_failed_annotation_commit(
+    annotations: &mut AnnotationOverlayState,
+    payload: AnnotationCommitPayload,
+    error: String,
+) {
+    let failed = PendingAnnotationCommit { payload, error };
+    annotations.last_error = Some(failed.error.clone());
+    annotations.failed_commits.push(failed);
+}
+
+fn normalize_required_text(value: &str, label: &str) -> Result<String> {
+    normalize_optional_text(value).ok_or_else(|| anyhow::anyhow!("{label} is required"))
+}
+
+fn normalize_optional_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+pub fn next_annotation_audit_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("geo-viewer-annotation-{nanos}")
+}
+
 pub fn load_annotation_into_draft(
     annotations: &mut AnnotationOverlayState,
     annotation: &AnnotationRecord,
 ) {
+    annotations.draft_author = annotation
+        .author
+        .clone()
+        .unwrap_or_else(|| "geo_viewer".to_string());
     annotations.draft_label = annotation.label.clone();
     annotations.draft_note = annotation.note.clone().unwrap_or_default();
     annotations.draft_severity = annotation.severity.clone().unwrap_or_default();
@@ -726,38 +793,40 @@ pub fn start_annotation_fetch(
 pub fn start_annotation_create(
     annotation_create_task: &mut AnnotationCreateTask,
     config: &TileConfig,
-    label: String,
-    note: String,
-    severity: String,
-    geometry: AnnotationGeometry,
+    payload: AnnotationCommitPayload,
 ) -> Result<()> {
     let scene_id = crate::state::ensure_scene_id(config, "create annotations")?;
     let url = format!("{}/api/scenes/{}/annotations", config.base_url, scene_id);
-    let payload = serde_json::json!({
-        "label": label,
-        "note": note,
-        "severity": severity,
-        "geometry": geometry
-    })
-    .to_string();
+    let payload_json =
+        serde_json::to_string(&payload).context("failed to encode annotation payload")?;
 
     annotation_create_task.0 = Some(IoTaskPool::get().spawn(async move {
-        let client = reqwest::blocking::Client::new();
-        let response = client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(payload)
-            .send()
-            .with_context(|| format!("request failed: {}", url))?;
-        if !response.status().is_success() {
-            anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
+        let result = (|| -> Result<AnnotationRecord> {
+            let client = reqwest::blocking::Client::new();
+            let response = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(payload_json)
+                .send()
+                .with_context(|| format!("request failed: {}", url))?;
+            if !response.status().is_success() {
+                anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
+            }
+            let bytes = response
+                .bytes()
+                .context("failed to read create annotation response body")?;
+            let annotation = serde_json::from_slice::<AnnotationRecord>(&bytes)
+                .context("failed to decode created annotation")?;
+            Ok(annotation)
+        })();
+
+        match result {
+            Ok(annotation) => AnnotationCreateResult::Saved(annotation),
+            Err(err) => AnnotationCreateResult::Failed(PendingAnnotationCommit {
+                payload,
+                error: err.to_string(),
+            }),
         }
-        let bytes = response
-            .bytes()
-            .context("failed to read create annotation response body")?;
-        let annotation = serde_json::from_slice::<AnnotationRecord>(&bytes)
-            .context("failed to decode created annotation")?;
-        Ok(annotation)
     }));
 
     Ok(())
@@ -844,6 +913,8 @@ pub fn clear_annotations(
     annotations.items.clear();
     annotations.selected_annotation_id = None;
     annotations.hovered_annotation_id = None;
+    annotations.failed_commits.clear();
+    annotations.last_error = None;
     annotations.draft_note.clear();
     clear_annotation_draft_geometry(annotations);
     annotation_fetch_task.0 = None;
@@ -1107,12 +1178,19 @@ fn bevy_color_to_egui(color: Color) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        annotation_matches_filters, nearest_polygon_segment_index, point_distance_to_segment,
-        remove_polygon_vertex_at_index, severity_bucket, AnnotationOverlayState, SeverityBucket,
+        annotation_matches_filters, build_annotation_commit_payload, nearest_polygon_segment_index,
+        point_distance_to_segment, record_failed_annotation_commit, remove_polygon_vertex_at_index,
+        severity_bucket, AnnotationOverlayState, SeverityBucket,
     };
-    use crate::state::{DraftMode, SceneExtent};
+    use crate::state::{
+        AnnotationCommitPayload, DraftMode, SceneExtent, SceneGeospatialMetadata,
+        SceneManifestState,
+    };
     use bevy::prelude::Vec2;
-    use shared::schemas::{AnnotationGeometry, AnnotationRecord, GeoPoint};
+    use shared::schemas::{
+        AnnotationGeometry, AnnotationRecord, GeoBounds, GeoPoint, RasterResolution,
+        RasterSpatialRef,
+    };
 
     fn sample_polygon() -> Vec<GeoPoint> {
         vec![
@@ -1145,6 +1223,9 @@ mod tests {
             annotation_id: "annotation-1".to_string(),
             scene_id: "scene-1".to_string(),
             field_id: Some("field-1".to_string()),
+            author: Some("operator-1".to_string()),
+            crs: Some("EPSG:4326".to_string()),
+            audit_id: Some("audit-annotation-1".to_string()),
             label: "Water Stress".to_string(),
             note: Some("Check irrigation".to_string()),
             severity: Some("high".to_string()),
@@ -1211,6 +1292,72 @@ mod tests {
     }
 
     #[test]
+    fn annotation_commit_payload_captures_crs_author_and_audit_id() {
+        let annotations = AnnotationOverlayState {
+            draft_author: "operator-1".to_string(),
+            draft_label: "Water Stress".to_string(),
+            draft_note: "Check irrigation".to_string(),
+            draft_severity: "high".to_string(),
+            draft_mode: DraftMode::Polygon,
+            draft_polygon_vertices: sample_polygon(),
+            ..Default::default()
+        };
+        let manifest = sample_manifest_state();
+
+        let payload = build_annotation_commit_payload(
+            &annotations,
+            &manifest,
+            AnnotationGeometry::Polygon {
+                coordinates: sample_polygon(),
+            },
+            "audit-annotation-1".to_string(),
+        )
+        .expect("placed layer CRS should create payload");
+
+        assert_eq!(payload.label, "Water Stress");
+        assert_eq!(payload.author, "operator-1");
+        assert_eq!(payload.crs, "EPSG:4326");
+        assert_eq!(payload.audit_id, "audit-annotation-1");
+        assert_eq!(payload.field_id.as_deref(), Some("field-1"));
+        assert!(matches!(
+            payload.geometry,
+            AnnotationGeometry::Polygon { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_annotation_commit_is_retained_locally() {
+        let mut annotations = AnnotationOverlayState::default();
+        let payload = AnnotationCommitPayload {
+            annotation_id: None,
+            field_id: Some("field-1".to_string()),
+            label: "Water Stress".to_string(),
+            note: Some("Check irrigation".to_string()),
+            severity: Some("high".to_string()),
+            geometry: AnnotationGeometry::Polygon {
+                coordinates: sample_polygon(),
+            },
+            author: "operator-1".to_string(),
+            crs: "EPSG:4326".to_string(),
+            audit_id: "audit-annotation-1".to_string(),
+        };
+
+        record_failed_annotation_commit(
+            &mut annotations,
+            payload.clone(),
+            "geo_hub returned 500".to_string(),
+        );
+
+        assert_eq!(annotations.failed_commits.len(), 1);
+        assert_eq!(annotations.failed_commits[0].payload, payload);
+        assert!(annotations.failed_commits[0].error.contains("geo_hub"));
+        assert_eq!(
+            annotations.last_error.as_deref(),
+            Some("geo_hub returned 500")
+        );
+    }
+
+    #[test]
     fn point_distance_to_segment_projects_onto_edge() {
         let distance = point_distance_to_segment(
             Vec2::new(3.0, 4.0),
@@ -1218,5 +1365,33 @@ mod tests {
             Vec2::new(6.0, 0.0),
         );
         assert!((distance - 4.0).abs() < 0.001);
+    }
+
+    fn sample_manifest_state() -> SceneManifestState {
+        SceneManifestState {
+            scene_id: Some("scene-1".to_string()),
+            field_id: Some("field-1".to_string()),
+            width: Some(100),
+            height: Some(100),
+            geospatial: SceneGeospatialMetadata {
+                georeferenced: true,
+                crs: Some("EPSG:4326".to_string()),
+                center: None,
+                extent: Some(sample_extent()),
+                spatial_ref: Some(RasterSpatialRef {
+                    georeferenced: true,
+                    crs: Some("EPSG:4326".to_string()),
+                    bbox: Some(GeoBounds {
+                        min_lon: -89.0,
+                        min_lat: 40.0,
+                        max_lon: -88.0,
+                        max_lat: 41.0,
+                    }),
+                    geo_transform: Some([-89.0, 0.01, 0.0, 41.0, 0.0, -0.01]),
+                    resolution: Some(RasterResolution { x: 0.01, y: 0.01 }),
+                }),
+            },
+            ..Default::default()
+        }
     }
 }

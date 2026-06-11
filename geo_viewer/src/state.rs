@@ -5,9 +5,9 @@ use image::DynamicImage;
 use sensor_overlay_engine::{utils::OverlayValueRange, SpatialBounds};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    assert_raster_spatial_ref, AnnotationRecord, FarmRecord, FieldRecord, GeoPoint, GpsCoords,
-    RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
-    RecommendationStatus, ReportRecord, GEO_EXTENT_ASSERTION_TOLERANCE,
+    assert_raster_spatial_ref, AnnotationGeometry, AnnotationRecord, FarmRecord, FieldRecord,
+    GeoPoint, GpsCoords, RasterResolution, RasterSpatialRef, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, ReportRecord, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -56,7 +56,7 @@ pub struct TileFetchTasks(pub BTreeMap<TileId, Task<anyhow::Result<FetchedTile>>
 pub struct AnnotationFetchTask(pub Option<Task<anyhow::Result<Vec<AnnotationRecord>>>>);
 
 #[derive(Resource, Default)]
-pub struct AnnotationCreateTask(pub Option<Task<anyhow::Result<AnnotationRecord>>>);
+pub struct AnnotationCreateTask(pub Option<Task<AnnotationCreateResult>>);
 
 #[derive(Resource, Default)]
 pub struct AnnotationUpdateTask(pub Option<Task<anyhow::Result<AnnotationRecord>>>);
@@ -681,6 +681,9 @@ pub struct AnnotationOverlayState {
     pub items: Vec<AnnotationRecord>,
     pub selected_annotation_id: Option<String>,
     pub hovered_annotation_id: Option<String>,
+    pub failed_commits: Vec<PendingAnnotationCommit>,
+    pub last_error: Option<String>,
+    pub draft_author: String,
     pub draft_label: String,
     pub draft_note: String,
     pub draft_severity: String,
@@ -700,12 +703,44 @@ pub struct AnnotationOverlayState {
     pub show_other: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AnnotationCommitPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_id: Option<String>,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    pub geometry: AnnotationGeometry,
+    pub author: String,
+    pub crs: String,
+    pub audit_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingAnnotationCommit {
+    pub payload: AnnotationCommitPayload,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnnotationCreateResult {
+    Saved(AnnotationRecord),
+    Failed(PendingAnnotationCommit),
+}
+
 impl Default for AnnotationOverlayState {
     fn default() -> Self {
         Self {
             items: Vec::new(),
             selected_annotation_id: None,
             hovered_annotation_id: None,
+            failed_commits: Vec::new(),
+            last_error: None,
+            draft_author: "geo_viewer".to_string(),
             draft_label: String::new(),
             draft_note: String::new(),
             draft_severity: String::new(),

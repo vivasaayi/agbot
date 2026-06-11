@@ -76,6 +76,12 @@ pub struct AnnotationRecord {
     pub annotation_id: String,
     pub scene_id: String,
     pub field_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_id: Option<String>,
     pub label: String,
     pub note: Option<String>,
     pub severity: Option<String>,
@@ -728,6 +734,9 @@ mod tests {
             annotation_id: "ann-1".to_string(),
             scene_id: "scene-1".to_string(),
             field_id: Some("field-1".to_string()),
+            author: Some("operator-1".to_string()),
+            crs: Some("EPSG:4326".to_string()),
+            audit_id: Some("audit-ann-1".to_string()),
             label: "Water stress".to_string(),
             note: Some("Observed near pivot edge".to_string()),
             severity: Some("high".to_string()),

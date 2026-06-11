@@ -180,6 +180,9 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             annotation_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,
             field_id TEXT,
+            author TEXT,
+            crs TEXT,
+            audit_id TEXT,
             label TEXT NOT NULL,
             note TEXT,
             severity TEXT,
@@ -190,6 +193,30 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         "#,
     )
     .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "annotations",
+        "author",
+        "ALTER TABLE annotations ADD COLUMN author TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "annotations",
+        "crs",
+        "ALTER TABLE annotations ADD COLUMN crs TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "annotations",
+        "audit_id",
+        "ALTER TABLE annotations ADD COLUMN audit_id TEXT",
+    )
     .await?;
 
     sqlx::query(
