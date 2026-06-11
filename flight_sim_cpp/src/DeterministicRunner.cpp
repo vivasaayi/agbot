@@ -83,6 +83,7 @@ std::string RunManifest::to_json() const {
            << "\"simulator_version\":\"" << escape_json(simulator_version) << "\""
            << ",\"contract_version\":\"" << escape_json(contract_version) << "\""
            << ",\"contract_schema_hash\":\"" << escape_json(contract_schema_hash) << "\""
+           << ",\"run_id\":\"" << escape_json(run_id) << "\""
            << ",\"seed\":" << seed
            << ",\"timestep_s\":" << timestep_s
            << ",\"record_interval_s\":" << record_interval_s
@@ -99,6 +100,8 @@ std::string RunManifest::to_json() const {
            << ",\"sensor_config_hash\":\"" << escape_json(sensor_config_hash) << "\""
            << ",\"safety_config\":" << safety_config_json
            << ",\"safety_config_hash\":\"" << escape_json(safety_config_hash) << "\""
+           << ",\"trace_retention_keep\":" << trace_retention_keep
+           << ",\"trace_retention_deleted\":" << trace_retention_deleted_json
            << ",\"output_hash\":\"" << escape_json(output_hash) << "\""
            << ",\"completed\":" << (completed ? "true" : "false")
            << "}";
@@ -149,6 +152,19 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     manifest.record_interval_s = config.record_interval_s;
     manifest.mission_name = mission.name;
     manifest.mission_hash = sha256_hex(mission_to_json(mission));
+    {
+        std::ostringstream run_id_input;
+        run_id_input << std::fixed << std::setprecision(9)
+                     << manifest.simulator_version << "|"
+                     << manifest.contract_version << "|"
+                     << manifest.contract_schema_hash << "|"
+                     << manifest.seed << "|"
+                     << manifest.timestep_s << "|"
+                     << manifest.record_interval_s << "|"
+                     << config.max_time_s << "|"
+                     << manifest.mission_hash;
+        manifest.run_id = sha256_hex(run_id_input.str());
+    }
     manifest.step_count = step_count;
     manifest.sample_count = sample_count;
     manifest.prng_nonce = prng_nonce;

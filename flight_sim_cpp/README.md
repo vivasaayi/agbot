@@ -35,6 +35,10 @@ flight_sim_cpp/out/telemetry.jsonl
 flight_sim_cpp/out/telemetry.manifest.json
 ```
 
+Every run logs `sim`, `contract`, `seed`, `timestep_ms`, and a deterministic
+`run_id`. The same mission, seed, timestep, record interval, max time,
+simulator version, and contract schema produce the same `run_id`.
+
 Use a custom mission:
 
 ```bash
@@ -43,6 +47,43 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
   --mission flight_sim_cpp/samples/sample_field_loop.json \
   --output flight_sim_cpp/out/sample.jsonl
 ```
+
+Use explicit trace retention on a dedicated run directory:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --output flight_sim_cpp/out/runs/ci_run.jsonl \
+  --trace-retention-keep 20
+```
+
+The manifest records deleted traces in `trace_retention_deleted`.
+
+## Operational Health
+
+Run a structured health check:
+
+```bash
+flight_sim_cpp/build/agbot-sim health \
+  --seed 42 \
+  --last-manifest flight_sim_cpp/out/telemetry.manifest.json \
+  --trace-dir flight_sim_cpp/out \
+  --cache-dir flight_sim_cpp/out/map_tiles \
+  --retention-keep 20
+```
+
+The command exits 0 only when runner mode, seed state, tile cache state,
+last-run manifest presence, and trace retention compliance pass.
+
+Clear tile caches:
+
+```bash
+flight_sim_cpp/build/agbot-sim cache clear --cache-dir flight_sim_cpp/out/map_tiles
+flight_sim_cpp/build/agbot-sim cache clear --cache-dir flight_sim_cpp/out/elevation_tiles
+```
+
+See [RUNBOOK.md](RUNBOOK.md) for CI triage and operational procedures.
 
 ## Diff Traces
 

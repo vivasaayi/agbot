@@ -3,6 +3,7 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/Mission.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -41,6 +42,7 @@ struct RunManifest {
     std::string simulator_version;
     std::string contract_version;
     std::string contract_schema_hash;
+    std::string run_id;
     std::uint64_t seed = 0;
     double timestep_s = 0.0;
     double record_interval_s = 0.0;
@@ -59,6 +61,8 @@ struct RunManifest {
     std::string sensor_config_hash;
     std::string safety_config_json = "{}";
     std::string safety_config_hash;
+    std::size_t trace_retention_keep = 0;
+    std::string trace_retention_deleted_json = "[]";
     std::string output_hash;      // SHA-256 hash of the emitted JSONL trace
     bool completed = false;
 

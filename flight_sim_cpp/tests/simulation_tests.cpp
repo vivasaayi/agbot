@@ -3,16 +3,19 @@
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
+#include "agbot_flight_sim/SimulationOps.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
 #include "agbot_flight_sim/TraceDiff.hpp"
 #include "agbot_flight_sim/TwinContractV1.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -339,8 +342,12 @@ void test_run_manifest_records_contract_and_hashes() {
 
     assert(json.find("\"contract_version\":\"1.0.0\"") != std::string::npos);
     assert(json.find("\"contract_schema_hash\":\"") != std::string::npos);
+    assert(json.find("\"run_id\":\"") != std::string::npos);
     assert(result.manifest.contract_schema_hash == contract.schema_hash);
     assert(json.find("\"seed\":42") != std::string::npos);
+    assert(json.find("\"trace_retention_keep\":0") != std::string::npos);
+    assert(json.find("\"trace_retention_deleted\":[]") != std::string::npos);
+    assert(result.manifest.run_id.size() == 64);
     assert(json.find("\"terrain_tiles\":[]") != std::string::npos);
     assert(json.find("\"weather_config_hash\":\"") != std::string::npos);
     assert(json.find("\"sensor_config_hash\":\"") != std::string::npos);
@@ -369,10 +376,13 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.type_has_field("TelemetryV1", "battery_percent"));
     assert(schema.type_has_field("SimulationTraceV1", "contract_version"));
     assert(schema.type_has_field("ScenarioManifestV1", "contract_schema_hash"));
+    assert(schema.type_has_field("ScenarioManifestV1", "run_id"));
     assert(schema.type_has_field("ScenarioManifestV1", "terrain_tiles_hash"));
     assert(schema.type_has_field("ScenarioManifestV1", "safety_config_hash"));
+    assert(schema.type_has_field("ScenarioManifestV1", "trace_retention_deleted"));
     assert(schema.has_capability("deterministic_runner"));
     assert(schema.has_capability("scenario_manifest"));
+    assert(schema.has_capability("simulation_health"));
     assert(schema.to_json().find("\"schema_hash\":\"" + schema.schema_hash + "\"") != std::string::npos);
 }
 
@@ -429,6 +439,90 @@ void test_fnv1a64_is_stable_and_distinct() {
     assert(agbot::flight_sim::to_hex(255) == "00000000000000ff");
 }
 
+void test_simulation_health_reports_pass_and_seed_failure() {
+    const auto root = std::filesystem::temp_directory_path() / "agbot_flight_sim_health_test";
+    std::filesystem::remove_all(root);
+    const auto cache_dir = root / "map_tiles";
+    const auto trace_dir = root / "runs";
+    const auto manifest_path = root / "telemetry.manifest.json";
+    std::filesystem::create_directories(cache_dir);
+    std::filesystem::create_directories(trace_dir);
+    {
+        std::ofstream manifest(manifest_path);
+        manifest << "{\"completed\":true}\n";
+    }
+
+    agbot::flight_sim::HealthCheckConfig config;
+    config.seed = 42;
+    config.terrain_cache_dir = cache_dir;
+    config.trace_dir = trace_dir;
+    config.last_manifest_path = manifest_path;
+    config.trace_retention_keep = 3;
+
+    const auto healthy = agbot::flight_sim::evaluate_simulation_health(config);
+    const std::string healthy_json = healthy.to_json();
+    assert(healthy.ok());
+    assert(healthy_json.find("\"runner_mode\":{\"status\":\"pass\"") != std::string::npos);
+    assert(healthy_json.find("\"prng_seeded\":{\"status\":\"pass\"") != std::string::npos);
+    assert(healthy_json.find("\"terrain_cache_state\":{\"status\":\"pass\"") != std::string::npos);
+    assert(healthy_json.find("\"last_run_manifest_present\":{\"status\":\"pass\"") != std::string::npos);
+    assert(healthy_json.find("\"trace_retention_compliant\":{\"status\":\"pass\"") != std::string::npos);
+
+    config.seed = std::nullopt;
+    const auto unseeded = agbot::flight_sim::evaluate_simulation_health(config);
+    const std::string unseeded_json = unseeded.to_json();
+    assert(!unseeded.ok());
+    assert(unseeded_json.find("\"prng_seeded\":{\"status\":\"fail\"") != std::string::npos);
+
+    std::filesystem::remove_all(root);
+}
+
+void test_trace_retention_deletes_oldest_trace_and_records_evidence() {
+    const auto root = std::filesystem::temp_directory_path() / "agbot_flight_sim_retention_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto old_trace = root / "run_001.jsonl";
+    const auto mid_trace = root / "run_002.jsonl";
+    const auto new_trace = root / "run_003.jsonl";
+    {
+        std::ofstream(old_trace) << "{}\n";
+        std::ofstream(mid_trace) << "{}\n";
+        std::ofstream(new_trace) << "{}\n";
+    }
+
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::filesystem::last_write_time(old_trace, now - std::chrono::seconds(30));
+    std::filesystem::last_write_time(mid_trace, now - std::chrono::seconds(20));
+    std::filesystem::last_write_time(new_trace, now - std::chrono::seconds(10));
+
+    const auto result = agbot::flight_sim::enforce_trace_retention(root, 2);
+    assert(result.keep_count == 2);
+    assert(result.deleted_paths.size() == 1);
+    assert(result.deleted_json().find("run_001.jsonl") != std::string::npos);
+    assert(!std::filesystem::exists(old_trace));
+    assert(std::filesystem::exists(mid_trace));
+    assert(std::filesystem::exists(new_trace));
+
+    std::filesystem::remove_all(root);
+}
+
+void test_tile_cache_clear_removes_entries_but_keeps_directory() {
+    const auto root = std::filesystem::temp_directory_path() / "agbot_flight_sim_cache_test";
+    std::filesystem::remove_all(root);
+    const auto nested = root / "12" / "655" / "1583.tile";
+    std::filesystem::create_directories(nested.parent_path());
+    {
+        std::ofstream(nested) << "tile";
+    }
+
+    const std::uintmax_t removed = agbot::flight_sim::clear_tile_cache(root);
+    assert(removed >= 1);
+    assert(std::filesystem::exists(root));
+    assert(std::filesystem::is_empty(root));
+
+    std::filesystem::remove_all(root);
+}
+
 } // namespace
 
 int main() {
@@ -453,6 +547,9 @@ int main() {
     test_trace_diff_reports_divergent_field();
     test_deterministic_runner_matches_golden();
     test_fnv1a64_is_stable_and_distinct();
+    test_simulation_health_reports_pass_and_seed_failure();
+    test_trace_retention_deletes_oldest_trace_and_records_evidence();
+    test_tile_cache_clear_removes_entries_but_keeps_directory();
     std::cout << "agbot_flight_sim_tests passed\n";
     return 0;
 }

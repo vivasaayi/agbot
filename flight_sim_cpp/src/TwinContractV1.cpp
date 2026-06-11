@@ -149,6 +149,7 @@ TwinContractSchemaV1 build_schema() {
                 "simulator_version",
                 "contract_version",
                 "contract_schema_hash",
+                "run_id",
                 "seed",
                 "timestep_s",
                 "record_interval_s",
@@ -162,6 +163,8 @@ TwinContractSchemaV1 build_schema() {
                 "sensor_config_hash",
                 "safety_config",
                 "safety_config_hash",
+                "trace_retention_keep",
+                "trace_retention_deleted",
                 "output_hash",
                 "completed",
             },
@@ -191,6 +194,9 @@ TwinContractSchemaV1 build_schema() {
         "trace_diff",
         "safety_parity",
         "terrain_no_data_state",
+        "simulation_health",
+        "trace_retention",
+        "tile_cache_control",
     };
     schema.schema_hash = sha256_hex(schema_json_without_hash(schema));
     return schema;

@@ -1,6 +1,8 @@
 #include "agbot_flight_sim/DeterministicRunner.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/SimulationOps.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -26,6 +28,7 @@ struct Args {
     double timestep_ms = 1000.0 / 60.0;
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
+    std::optional<std::size_t> trace_retention_keep;
 };
 
 [[noreturn]] void print_usage_and_exit(int code) {
@@ -36,7 +39,9 @@ struct Args {
               << "  --mission PATH       Mission JSON to fly (default: bundled sample).\n"
               << "  --output PATH        Telemetry JSONL output (default: out/telemetry.jsonl).\n"
               << "                       A <output>.manifest.json is written alongside it.\n"
-              << "  --max-time S         Max mission seconds before giving up (default 600).\n";
+              << "  --max-time S         Max mission seconds before giving up (default 600).\n"
+              << "  --trace-retention-keep N\n"
+              << "                       Delete older JSONL traces in the output directory after keeping N newest runs.\n";
     std::exit(code);
 }
 
@@ -56,6 +61,8 @@ Args parse_args(int argc, char** argv) {
             args.record_interval_s = std::stod(argv[++index]);
         } else if (current == "--max-time" && index + 1 < argc) {
             args.max_time_s = std::stod(argv[++index]);
+        } else if (current == "--trace-retention-keep" && index + 1 < argc) {
+            args.trace_retention_keep = static_cast<std::size_t>(std::stoull(argv[++index]));
         } else if (current == "--help" || current == "-h") {
             print_usage_and_exit(0);
         } else {
@@ -67,6 +74,9 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.timestep_ms <= 0.0) {
         throw std::runtime_error("--timestep-ms must be positive");
+    }
+    if (args.trace_retention_keep.has_value() && *args.trace_retention_keep == 0) {
+        throw std::runtime_error("--trace-retention-keep must be positive");
     }
     return args;
 }
@@ -88,13 +98,6 @@ int main(int argc, char** argv) {
     try {
         const Args args = parse_args(argc, argv);
 
-        // Run header: log the determinism inputs on every run (story 02-31 seed).
-        std::cout << "agbot_flight_sim_headless"
-                  << " sim=" << kSimulatorVersion
-                  << " contract=" << kTwinContractVersion
-                  << " seed=" << *args.seed
-                  << " timestep_ms=" << args.timestep_ms << "\n";
-
         auto mission = MissionLoader::load_from_file(args.mission_path);
 
         RunConfig config;
@@ -103,11 +106,26 @@ int main(int argc, char** argv) {
         config.record_interval_s = args.record_interval_s;
         config.max_time_s = args.max_time_s;
 
-        const RunResult result = run_deterministic(mission, config);
+        RunResult result = run_deterministic(mission, config);
+
+        // Run header: log the determinism inputs on every run (story 02-31).
+        std::cout << "agbot_flight_sim_headless"
+                  << " sim=" << kSimulatorVersion
+                  << " contract=" << kTwinContractVersion
+                  << " seed=" << *args.seed
+                  << " timestep_ms=" << args.timestep_ms
+                  << " run_id=" << result.manifest.run_id << "\n";
 
         const std::filesystem::path manifest_path =
             std::filesystem::path(args.output_path).replace_extension(".manifest.json");
         write_file(args.output_path, result.trace_jsonl);
+        if (args.trace_retention_keep.has_value()) {
+            const auto retention = agbot::flight_sim::enforce_trace_retention(
+                std::filesystem::path(args.output_path).parent_path(),
+                *args.trace_retention_keep);
+            result.manifest.trace_retention_keep = retention.keep_count;
+            result.manifest.trace_retention_deleted_json = retention.deleted_json();
+        }
         write_file(manifest_path, result.manifest.to_json() + "\n");
 
         std::cout << "Mission: " << result.manifest.mission_name << "\n"

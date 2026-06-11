@@ -13,6 +13,7 @@ add_library(agbot_flight_sim_core
     src/GeoTerrain.cpp
     src/MissionLoader.cpp
     src/SafetyRules.cpp
+    src/SimulationOps.cpp
     src/TelemetryReplay.cpp
     src/TelemetryRecorder.cpp
     src/TraceDiff.cpp
