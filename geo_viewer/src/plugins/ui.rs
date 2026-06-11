@@ -17,13 +17,14 @@ use crate::plugins::recommendations::{
 };
 use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
-    AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask, AnnotationOverlayState,
-    AnnotationUpdateTask, CursorMapState, DraftMode, FarmFieldHistoryFetchTask, FarmListFetchTask,
-    FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask, FieldScenesFetchTask,
-    ManifestFetchTask, MapViewState, RecommendationCreateTask, RecommendationDeleteTask,
-    RecommendationFetchTask, RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask,
-    ReportGenerateTask, ReportOverlayState, SceneManifestState, ShapefileImportRequest, TileConfig,
-    TileFetchTasks, TileRenderState, TileStatus, ViewerState,
+    select_catalog_scene, AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask,
+    AnnotationOverlayState, AnnotationUpdateTask, CursorMapState, DraftMode,
+    FarmFieldHistoryFetchTask, FarmListFetchTask, FieldCatalogState, FieldImportState,
+    FieldImportTask, FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask, MapViewState,
+    RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
+    RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask,
+    ReportOverlayState, SceneManifestState, ShapefileImportRequest, TileConfig, TileFetchTasks,
+    TileRenderState, TileStatus, ViewerState,
 };
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -476,9 +477,15 @@ fn render_fields_panel(
                 format!("{} ({})", scene.scene_id, scene.acquired_at),
             );
             if response.clicked() {
-                field_catalog.selected_scene_id = Some(scene.scene_id.clone());
-                viewer_state.scene_id_input = scene.scene_id.clone();
-                config.scene_id = Some(scene.scene_id.clone());
+                let selection = match select_catalog_scene(field_catalog, &scene) {
+                    Ok(selection) => selection,
+                    Err(err) => {
+                        tile_state.status = TileStatus::Error(err.to_string());
+                        continue;
+                    }
+                };
+                viewer_state.scene_id_input = selection.scene_id.clone();
+                config.scene_id = Some(selection.scene_id.clone());
                 viewer_state.selected_layer = 0;
                 config.product_kind = crate::state::DEFAULT_PRODUCT_KIND.to_string();
                 clear_loaded_tiles(commands, tile_state);
@@ -503,9 +510,17 @@ fn render_fields_panel(
                 map_view.needs_fit = true;
                 if let Err(err) = start_manifest_fetch(manifest_task, manifest_state, config) {
                     tile_state.status = TileStatus::Error(err.to_string());
+                } else {
+                    tile_state.status = TileStatus::Fetching;
                 }
             }
-            response.on_hover_text(format!("Sensor: {}", scene.sensor));
+            response.on_hover_text(format!(
+                "Sensor: {}\nOwner: {}\nSeason: {}\nLinked: {}",
+                scene.sensor,
+                scene.owner.as_deref().unwrap_or("n/a"),
+                scene.season_id.as_deref().unwrap_or("n/a"),
+                scene.linked_at.as_deref().unwrap_or("unlinked")
+            ));
         }
     }
     ui.add_space(8.0);

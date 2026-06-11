@@ -102,8 +102,25 @@ impl fmt::Display for TileId {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FieldSceneSummary {
     pub scene_id: String,
+    #[serde(default)]
+    pub owner: Option<String>,
     pub sensor: String,
     pub acquired_at: String,
+    #[serde(default)]
+    pub field_id: Option<String>,
+    #[serde(default)]
+    pub season_id: Option<String>,
+    #[serde(default)]
+    pub linked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSceneSelection {
+    pub field_id: String,
+    pub scene_id: String,
+    pub season_id: String,
+    pub owner: String,
+    pub linked_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +132,7 @@ pub struct FieldSeasonGroup {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SceneManifest {
     pub scene_id: String,
+    pub owner: Option<String>,
     pub sensor: Option<String>,
     pub acquired_at: Option<String>,
     pub width: Option<u32>,
@@ -122,6 +140,9 @@ pub struct SceneManifest {
     pub bands: Vec<String>,
     pub gps_position: Option<GpsCoords>,
     pub data_path: Option<String>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub linked_at: Option<String>,
     pub field: Option<FieldRecord>,
     pub geospatial: SceneGeospatialMetadata,
     pub available_products: Vec<SceneProduct>,
@@ -183,6 +204,7 @@ pub struct SceneExtent {
 #[derive(Resource, Default)]
 pub struct SceneManifestState {
     pub scene_id: Option<String>,
+    pub owner: Option<String>,
     pub sensor: Option<String>,
     pub acquired_at: Option<String>,
     pub width: Option<u32>,
@@ -190,6 +212,9 @@ pub struct SceneManifestState {
     pub bands: Vec<String>,
     pub gps_position: Option<GpsCoords>,
     pub data_path: Option<String>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub linked_at: Option<String>,
     pub field: Option<FieldRecord>,
     pub geospatial: SceneGeospatialMetadata,
     pub products: Vec<SceneProduct>,
@@ -204,6 +229,45 @@ pub struct FieldCatalogState {
     pub selected_farm_id: Option<String>,
     pub selected_field_id: Option<String>,
     pub selected_scene_id: Option<String>,
+    pub selected_season_id: Option<String>,
+    pub selected_owner: Option<String>,
+    pub selected_linked_at: Option<String>,
+}
+
+pub fn select_catalog_scene(
+    catalog: &mut FieldCatalogState,
+    scene: &FieldSceneSummary,
+) -> Result<CatalogSceneSelection> {
+    let field_id = required_scene_context(scene, scene.field_id.as_deref(), "field_id")?;
+    let season_id = required_scene_context(scene, scene.season_id.as_deref(), "season_id")?;
+    let owner = required_scene_context(scene, scene.owner.as_deref(), "owner")?;
+    let linked_at = required_scene_context(scene, scene.linked_at.as_deref(), "linked_at")?;
+
+    catalog.selected_scene_id = Some(scene.scene_id.clone());
+    catalog.selected_field_id = Some(field_id.clone());
+    catalog.selected_season_id = Some(season_id.clone());
+    catalog.selected_owner = Some(owner.clone());
+    catalog.selected_linked_at = Some(linked_at.clone());
+
+    Ok(CatalogSceneSelection {
+        field_id,
+        scene_id: scene.scene_id.clone(),
+        season_id,
+        owner,
+        linked_at,
+    })
+}
+
+fn required_scene_context(
+    scene: &FieldSceneSummary,
+    value: Option<&str>,
+    label: &str,
+) -> Result<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("unlinked scene {} missing {label}", scene.scene_id))
 }
 
 #[derive(Resource, Default)]
@@ -435,7 +499,7 @@ pub fn ensure_scene_id(config: &TileConfig, action: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SceneProduct, TileId};
+    use super::{select_catalog_scene, FieldCatalogState, FieldSceneSummary, SceneProduct, TileId};
 
     #[test]
     fn tile_source_formats_tile_url_from_template() {
@@ -456,5 +520,82 @@ mod tests {
             url,
             "http://127.0.0.1:8080/api/scenes/scene-1/products/ndvi/tiles/2/3/1.png"
         );
+    }
+
+    #[test]
+    fn field_scene_catalog_decodes_geo_hub_linkage_context() {
+        let scenes: Vec<FieldSceneSummary> = serde_json::from_str(
+            r#"[
+                {
+                    "scene_id": "scene-1",
+                    "owner": "org-alpha",
+                    "sensor": "landsat8",
+                    "acquired_at": "2026-05-01T00:00:00Z",
+                    "field_id": "field-1",
+                    "season_id": "2026",
+                    "linked_at": "2026-05-01T00:00:00Z"
+                }
+            ]"#,
+        )
+        .expect("geo hub field scene payload should decode");
+
+        let scene = scenes
+            .first()
+            .expect("catalog payload should contain a scene");
+
+        assert_eq!(scene.scene_id, "scene-1");
+        assert_eq!(scene.owner.as_deref(), Some("org-alpha"));
+        assert_eq!(scene.field_id.as_deref(), Some("field-1"));
+        assert_eq!(scene.season_id.as_deref(), Some("2026"));
+        assert_eq!(scene.linked_at.as_deref(), Some("2026-05-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn selecting_linked_scene_records_field_season_and_owner_context() {
+        let mut catalog = FieldCatalogState::default();
+        let scene = FieldSceneSummary {
+            scene_id: "scene-1".to_string(),
+            owner: Some("org-alpha".to_string()),
+            sensor: "landsat8".to_string(),
+            acquired_at: "2026-05-01T00:00:00Z".to_string(),
+            field_id: Some("field-1".to_string()),
+            season_id: Some("2026".to_string()),
+            linked_at: Some("2026-05-01T00:00:00Z".to_string()),
+        };
+
+        let selection =
+            select_catalog_scene(&mut catalog, &scene).expect("linked scene should select");
+
+        assert_eq!(selection.scene_id, "scene-1");
+        assert_eq!(selection.field_id, "field-1");
+        assert_eq!(selection.season_id, "2026");
+        assert_eq!(selection.owner, "org-alpha");
+        assert_eq!(catalog.selected_scene_id.as_deref(), Some("scene-1"));
+        assert_eq!(catalog.selected_field_id.as_deref(), Some("field-1"));
+        assert_eq!(catalog.selected_season_id.as_deref(), Some("2026"));
+        assert_eq!(catalog.selected_owner.as_deref(), Some("org-alpha"));
+    }
+
+    #[test]
+    fn selecting_unlinked_scene_is_refused() {
+        let mut catalog = FieldCatalogState::default();
+        let scene = FieldSceneSummary {
+            scene_id: "scene-unlinked".to_string(),
+            owner: Some("org-alpha".to_string()),
+            sensor: "landsat8".to_string(),
+            acquired_at: "2026-05-01T00:00:00Z".to_string(),
+            field_id: None,
+            season_id: Some("2026".to_string()),
+            linked_at: None,
+        };
+
+        let err = select_catalog_scene(&mut catalog, &scene)
+            .expect_err("unlinked scene should be refused");
+
+        assert!(err.to_string().contains("unlinked scene"));
+        assert!(catalog.selected_scene_id.is_none());
+        assert!(catalog.selected_field_id.is_none());
+        assert!(catalog.selected_season_id.is_none());
+        assert!(catalog.selected_owner.is_none());
     }
 }

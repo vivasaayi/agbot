@@ -143,6 +143,7 @@ fn poll_manifest_fetch(
                     let linked_field = manifest.field.clone();
                     let products = manifest.available_products;
                     manifest_state.scene_id = Some(scene_id.clone());
+                    manifest_state.owner = manifest.owner.clone();
                     manifest_state.sensor = manifest.sensor;
                     manifest_state.acquired_at = manifest.acquired_at;
                     manifest_state.width = manifest.width;
@@ -150,10 +151,16 @@ fn poll_manifest_fetch(
                     manifest_state.bands = manifest.bands;
                     manifest_state.gps_position = manifest.gps_position;
                     manifest_state.data_path = manifest.data_path;
+                    manifest_state.field_id = manifest.field_id.clone();
+                    manifest_state.season_id = manifest.season_id.clone();
+                    manifest_state.linked_at = manifest.linked_at.clone();
                     manifest_state.field = linked_field.clone();
                     manifest_state.geospatial = manifest.geospatial;
                     manifest_state.products = products;
                     catalog_state.field_catalog.selected_scene_id = Some(scene_id);
+                    catalog_state.field_catalog.selected_owner = manifest.owner;
+                    catalog_state.field_catalog.selected_season_id = manifest.season_id;
+                    catalog_state.field_catalog.selected_linked_at = manifest.linked_at;
                     if let Some(field) = linked_field {
                         if let Some(farm_id) = field.farm_id.clone() {
                             let farm_changed =
@@ -694,6 +701,7 @@ pub fn start_manifest_fetch(
     };
 
     manifest_state.scene_id = Some(scene_id.clone());
+    manifest_state.owner = None;
     manifest_state.sensor = None;
     manifest_state.acquired_at = None;
     manifest_state.width = None;
@@ -701,6 +709,9 @@ pub fn start_manifest_fetch(
     manifest_state.bands.clear();
     manifest_state.gps_position = None;
     manifest_state.data_path = None;
+    manifest_state.field_id = None;
+    manifest_state.season_id = None;
+    manifest_state.linked_at = None;
     manifest_state.field = None;
     manifest_state.geospatial = Default::default();
     manifest_state.products.clear();
@@ -725,6 +736,7 @@ pub fn start_manifest_fetch(
 
 pub fn clear_manifest_state(manifest_state: &mut SceneManifestState) {
     manifest_state.scene_id = None;
+    manifest_state.owner = None;
     manifest_state.sensor = None;
     manifest_state.acquired_at = None;
     manifest_state.width = None;
@@ -732,6 +744,9 @@ pub fn clear_manifest_state(manifest_state: &mut SceneManifestState) {
     manifest_state.bands.clear();
     manifest_state.gps_position = None;
     manifest_state.data_path = None;
+    manifest_state.field_id = None;
+    manifest_state.season_id = None;
+    manifest_state.linked_at = None;
     manifest_state.field = None;
     manifest_state.geospatial = Default::default();
     manifest_state.products.clear();
