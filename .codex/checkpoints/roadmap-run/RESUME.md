@@ -1,23 +1,23 @@
 # Roadmap Run — Resume
 
 - **Run ID**: run-02-sim
-- **Roadmap hash**: f7f689d5947be4fbf236914925c1af7693d98188
-- **Last implementation commit**: d76d8c00682b7601627206b26f0436d798ea36c4 (`batch-02-05`)
-- **Latest checkpoint commit**: fe5b37513e3ee82411928f82b74ffe042e60ca2f (`batch-02-05` checkpoint)
-- **Current batch**: none — ready to start `batch-02-06`
-- **Completed batches**: 5 committed
+- **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
+- **Last implementation commit**: 6fefa3f4618f532a4b9bdc3c7856ebd57e7b2568 (`batch-02-06`)
+- **Latest checkpoint commit**: pending (`batch-02-06` checkpoint)
+- **Current batch**: none — ready to start `batch-02-07`
+- **Completed batches**: 6 committed
 - **Blocker**: none
 
 ## Latest verification
 
-- `cmake --build flight_sim_cpp/build --target agbot_flight_sim_tests agbot_sim agbot_flight_sim_headless` — pass
+- `cmake --build flight_sim_cpp/build --target agbot_flight_sim_tests agbot_sim agbot_flight_sim_headless agbot_flight_sim_viewer` — pass
 - `./flight_sim_cpp/build/agbot_flight_sim_tests` — pass
+- `ctest --test-dir flight_sim_cpp/build -R agbot_flight_sim_tests --output-on-failure` — pass
 - `just flight-sim-test` — pass
-- `agbot_flight_sim_headless --fault gps_drift:9001:0:-:2.0:gps` — pass; manifest records fault hashes/events and a fault-specific `run_id`
-- `agbot_flight_sim_headless --fault bad_tile:777:0:-:0.0:terrain/tile/z12/x655/y1583` — pass; manifest records `flat_fallback`
-- `agbot_flight_sim_headless --fault gps_drift:-:0:-:1.0:gps` — expected fail on missing fault seed
-- `agbot-sim diff` baseline vs GPS-fault trace — expected divergence at `position.x`
+- `agbot_flight_sim_headless --seed 42 --mission flight_sim_cpp/samples/sample_field_loop.json --output /tmp/agbot_terrain_smoke.jsonl` — pass; manifest records `flat_fallback`, `EPSG:4326`, bounds, meter resolution, and `terrain_tiles_hash`
+- `agbot_flight_sim_headless --fault bad_tile:777:0:-:0.0:terrain/tile/z12/x655/y1583` — pass; manifest preserves CRS terrain evidence and appends bad-tile `flat_fallback`
+- `agbot-sim diff /tmp/agbot_terrain_smoke.jsonl /tmp/agbot_terrain_smoke.jsonl` — pass
 
 ## Next action
 
-Start `batch-02-06`: claim and implement STORY `02-09` real DEM terrain with CRS/extent assertions as the next foundational P0 terrain dependency before LiDAR/camera/preview stories.
+Re-read the checkpoint, verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and roadmap hash, then select the next deterministic P0 batch after STORY `02-09`.
