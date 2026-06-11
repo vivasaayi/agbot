@@ -1,3 +1,4 @@
+#include "agbot_flight_sim/DeterministicRunner.hpp"
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
@@ -7,7 +8,10 @@
 #include <cassert>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
+#include <string>
 
 using agbot::flight_sim::DroneMode;
 using agbot::flight_sim::DroneSimulation;
@@ -246,6 +250,85 @@ void test_builds_terrain_mesh_from_heightmap() {
     assert(std::abs(mesh.vertices[4].normal.length() - 1.0) < 0.001);
 }
 
+agbot::flight_sim::RunConfig unit_run_config() {
+    agbot::flight_sim::RunConfig config;
+    config.seed = 42;
+    config.timestep_s = 1.0 / 60.0;
+    config.record_interval_s = 0.25;
+    config.max_time_s = 600.0;
+    return config;
+}
+
+// Story 02-25: the same mission + seed + timestep produces byte-identical
+// output, and the manifest hashes match (TELEM byte-identity).
+void test_deterministic_runner_is_byte_identical() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto a = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto b = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+
+    assert(a.trace_jsonl == b.trace_jsonl);
+    assert(a.manifest.output_hash == b.manifest.output_hash);
+    assert(a.manifest.mission_hash == b.manifest.mission_hash);
+    assert(a.manifest.to_json() == b.manifest.to_json());
+    assert(a.manifest.sample_count > 0);
+    assert(a.manifest.completed);
+}
+
+// Story 02-25: the seed actually drives the PRNG stream. The autopilot physics
+// is currently seed-independent, so the trace is identical while the manifest
+// nonce diverges — proving the seed is live for future noise/fault injection.
+void test_deterministic_runner_seed_drives_prng() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto config_a = unit_run_config();
+    auto config_b = unit_run_config();
+    config_b.seed = 1337;
+
+    const auto a = agbot::flight_sim::run_deterministic(mission, config_a);
+    const auto b = agbot::flight_sim::run_deterministic(mission, config_b);
+
+    assert(a.manifest.prng_nonce != b.manifest.prng_nonce);
+    assert(a.trace_jsonl == b.trace_jsonl); // physics seed-independent today
+}
+
+// Story 02-28: the manifest records the contract version and deterministic hashes.
+void test_run_manifest_records_contract_and_hashes() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const std::string json = result.manifest.to_json();
+
+    assert(json.find("\"contract_version\":\"1.0.0\"") != std::string::npos);
+    assert(json.find("\"seed\":42") != std::string::npos);
+    assert(result.manifest.output_hash.size() == 16);
+    assert(result.manifest.mission_hash.size() == 16);
+    assert(result.manifest.output_hash != result.manifest.mission_hash);
+}
+
+// Stories 02-01 / 02-02: golden-telemetry regression. The committed golden
+// trace pins physics + flight-controller behavior; any change to the step loop
+// or telemetry shape fails this test with a byte mismatch.
+void test_deterministic_runner_matches_golden() {
+    const std::filesystem::path golden_path =
+        std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "tests" / "golden" / "unit_mission.jsonl";
+
+    std::ifstream golden_stream(golden_path, std::ios::binary);
+    assert(golden_stream && "golden fixture tests/golden/unit_mission.jsonl is missing");
+    std::ostringstream buffer;
+    buffer << golden_stream.rdbuf();
+    const std::string golden = buffer.str();
+
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+
+    assert(result.trace_jsonl == golden);
+}
+
+void test_fnv1a64_is_stable_and_distinct() {
+    assert(agbot::flight_sim::fnv1a64("") == 14695981039346656037ULL);
+    assert(agbot::flight_sim::fnv1a64("agbot") == agbot::flight_sim::fnv1a64("agbot"));
+    assert(agbot::flight_sim::fnv1a64("agbot") != agbot::flight_sim::fnv1a64("agboT"));
+    assert(agbot::flight_sim::to_hex(255) == "00000000000000ff");
+}
+
 } // namespace
 
 int main() {
@@ -260,6 +343,11 @@ int main() {
     test_decodes_terrarium_elevation_without_png_dependency();
     test_composites_empty_elevation_as_flat_zero();
     test_builds_terrain_mesh_from_heightmap();
+    test_deterministic_runner_is_byte_identical();
+    test_deterministic_runner_seed_drives_prng();
+    test_run_manifest_records_contract_and_hashes();
+    test_deterministic_runner_matches_golden();
+    test_fnv1a64_is_stable_and_distinct();
     std::cout << "agbot_flight_sim_tests passed\n";
     return 0;
 }

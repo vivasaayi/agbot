@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(agbot_flight_sim_core
+    src/DeterministicRunner.cpp
     src/DroneSimulation.cpp
     src/GeoTerrain.cpp
     src/MissionLoader.cpp

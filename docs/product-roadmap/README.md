@@ -15,7 +15,7 @@ Domains `01`–`12` are the **buildable core platform**, grounded in existing cr
 | Folder | Domain | Primary Crates | Maturity |
 | --- | --- | --- | --- |
 | `01-flight-mission-control` | Flight and Mission Control | `mission_control`, `mission_planner` | strong partial: mission CRUD, waypoints, optimization, and DB exist; MAVLink command handling and telemetry are early and untested |
-| `02-simulation-digital-twin` | Simulation and Digital Twin | `drone_simulator`, `flight_sim_cpp` | medium partial: physics, multi-drone events, and the canonical C++ simulator (globe navigation, OSM/elevation terrain, OpenGL viewer) exist; scene synthesis, ray-traced camera capture, and video/telemetry streaming are planned (the Rust/Bevy `simulator` crate was removed) |
+| `02-simulation-digital-twin` | Simulation and Digital Twin | `flight_sim_cpp` | medium partial: `flight_sim_cpp` is the single canonical simulator for both the interactive viewer (globe navigation, OSM/elevation terrain, OpenGL viewer) and headless deterministic CI regression (DeterministicRunner, per-run manifest, golden traces); scene synthesis, ray-traced camera capture, and video/telemetry streaming are planned (the Rust/Bevy `simulator` crate and the Rust `drone_simulator` crate were both retired in its favor) |
 | `03-multi-drone-coordination` | Multi-Drone Coordination | `multi_drone_control` | early partial: strong type model, geofence/altitude safety checks; formation optimization and collision avoidance algorithms are stubbed |
 | `04-sensor-acquisition` | Sensor Acquisition and Data Capture | `sensor_collector`, `data_collector` | medium partial: hardware/sim abstraction, session lifecycle, storage and indexing exist; real-hardware paths untested, some exports and aggregates stubbed |
 | `05-imagery-remote-sensing` | Imagery and Remote Sensing | `imagery_processor`, `sensor_overlay_engine` | early-to-strong partial: 12 spectral indices, sensor presets, thermal/mask CLI, and overlay colormaps defined; index/thermal/classify pipelines are scaffolded |
@@ -63,7 +63,7 @@ Reusable backbones that many domains should consume instead of each reinventing 
 | Folder | Domain | Primary Crates | Maturity |
 | --- | --- | --- | --- |
 | `28-timeseries-change-detection` | Time-Series and Change Detection | new `timeseries` crate; builds on `07`, `10`, `05`, `06`; consumed by `09`, `15`, `16`, `17`, `19`, `25`, `27` | thin-partial → promote (M0/M3): a first-class, reusable scalar+raster time-series and change-detection engine; "what changed since last flight" made trustworthy via mandatory co-registration before any change map |
-| `29-alerting-notification` | Alerting and Notification | new `alerting` crate (in/alongside `shared`); fed by `15`, `17`, `24`, `25`, `27`, `09`; surfaced via `11`, `13` | greenfield (M0): one alert rule engine + multi-channel delivery backbone with severity, dedup/anti-storm, routing/escalation, and per-fire explainability |
+| `29-alerting-notification` | Alerting and Notification | new `alerting` crate (in/alongside `shared`); fed by `15`, `17`, `24`, `25`, `27`, `09`; surfaced via `11`, `13` | greenfield (M0): one alert rule engine + multi-channel delivery backbone with severity, dedup/anti-storm, routing/escalation, and per-alert explainability |
 | `30-provenance-audit-ledger` | Provenance and Audit Ledger | new `provenance` crate (in/alongside `shared`); threaded through `04`, `05`, `06`, `09`, `22`, `23`, `28` | greenfield (M0): append-only, hash-chained capture→product→finding→report lineage; reproducibility manifests and evidence packs that underpin the copilot (`26`), carbon MRV (`19`), and compliance (`24`) |
 | `31-plugin-sdk-open-data` | Plugin SDK and Open Data | new `plugin_sdk` crate; extension points in `05`, `08`, `09`, `29`, `32` | greenfield (M0): a capability-sandboxed SDK for custom indices, processors, report templates, layers, and adapters, plus open-data publishing — serves the open-source mission |
 | `32-import-export-interop` | Import/Export and Interop | new `interop` crate; consolidates `09`/`geo_hub`/`geo_viewer` exports; builds on `07`, `10`, `14`, `30` | greenfield-leaning (M0): Shapefile/KML/GeoPackage/GeoTIFF round-trip with CRS fidelity, boundary import, **VRA/prescription export** (the bridge from finding to machine action), and John Deere/FieldView/Trimble interop |
@@ -79,9 +79,12 @@ Documented as direction, not scheduled work. They compose existing domains rathe
 ## Foundational Docs
 
 - `product-doctrine.md`: product positioning, the field-to-decision promise, product surfaces, and what not to build.
-- `requirements-rigor.md`: definition of done, the M0–M5 maturity model, the seven product pillars, the acceptance bar, the vertical-slice contract, and open confirmation questions.
+- `requirements-rigor.md`: definition of done, the M0–M5 maturity model, the seven product pillars, the acceptance bar, the vertical-slice contract, versioned shared contracts, storage authority decision, operability checklist, AI/advisory gates, global vs. domain-local priority, greenfield activation checklist, and open confirmation questions.
 - `implementation-sequencing.md`: build phases mapped to the existing M1–M4 milestones and the cross-domain dependency logic.
+- `tolerance-profiles.md`: named tolerance profiles (GEO, RASTER, CLOUD, TELEM) shared across domains 02, 05, 06, 07, 08, 22, 28, and 32. Stories must reference a named profile rather than embedding inline tolerance constants.
 - Every domain folder includes `current-state.md`, `capability-map.md`, `epics.md`, `release-plan.md` (a curated, phased backlog table rather than a generated mega-CSV), and `stories.md` (the detailed, per-slice story breakdown).
+
+**Note on global vs. domain-local priority**: domains 13–21 carry a global P2 priority, meaning they are sequenced after the core platform and advisor MVP. This is a sequencing decision, not a quality bar. When any of these domains is activated, it must define its own local P0 foundation stories before any M1+ work begins. See "Global Priority vs. Domain-Local Priority" in `requirements-rigor.md`.
 
 ## Product Principles
 

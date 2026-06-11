@@ -8,7 +8,7 @@ The initial implementation is intentionally small:
 - Fixed-timestep waypoint follower
 - Mission JSON loader for a small AgBot schema
 - JSONL telemetry recording
-- Headless executable for repeatable runs
+- Deterministic headless executable for repeatable runs
 - macOS OpenGL viewer using system Cocoa/OpenGL frameworks only
 
 The renderer is isolated from the simulation core so a Vulkan backend can replace the OpenGL viewer later.
@@ -24,19 +24,22 @@ ctest --test-dir flight_sim_cpp/build --output-on-failure
 ## Run Headless
 
 ```bash
-flight_sim_cpp/build/agbot_flight_sim_headless
+flight_sim_cpp/build/agbot_flight_sim_headless --seed 42
 ```
 
-This writes telemetry to:
+The headless runner requires an explicit seed and writes telemetry plus a
+manifest to:
 
 ```text
 flight_sim_cpp/out/telemetry.jsonl
+flight_sim_cpp/out/telemetry.manifest.json
 ```
 
 Use a custom mission:
 
 ```bash
 flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
   --mission flight_sim_cpp/samples/sample_field_loop.json \
   --output flight_sim_cpp/out/sample.jsonl
 ```
@@ -101,6 +104,7 @@ Run that converted mission:
 
 ```bash
 flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
   --mission flight_sim_cpp/out/bridged_mission.json
 ```
 

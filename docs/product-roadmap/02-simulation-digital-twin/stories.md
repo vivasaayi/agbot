@@ -23,7 +23,8 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
   - Given a fixed seed and mission, when the physics loop runs, then the trace matches the committed golden fixture within tolerance.
   - Given an unintended physics change, when CI runs, then the golden test fails and names the diverging field, not just "mismatch."
 - **Tests**: golden-file (seeded trace), unit (physics integration step), failure path (perturbed constant fails golden).
-- **Depends on**: `drone_simulator/src/physics.rs`, `lib.rs`.
+- **Depends on**: `flight_sim_cpp/src/DroneSimulation.cpp`, `DeterministicRunner.cpp`.
+- **Status**: initial implementation landed in `flight_sim_cpp` (DeterministicRunner + golden fixture `tests/golden/unit_mission.jsonl`, `agbot_flight_sim_headless --seed` required).
 
 ### STORY 02-02 · M1 · M · P0 — Deterministic flight-controller golden traces
 - **Story**: As `OPS`, I want takeoff/land/goto/orbit/hover/RTH command modes pinned by golden traces, so that the PID controller behaves identically across builds.
@@ -32,7 +33,8 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
   - Given each command mode, when run seeded, then its trace and status transitions match the golden fixture.
   - Given a controller-gain change, when CI runs, then the affected mode's golden test fails with the diverging step identified.
 - **Tests**: golden-file (per mode), unit (state machine transitions), failure path (gain change fails golden).
-- **Depends on**: 02-01, `drone_simulator/src/flight_controller.rs`.
+- **Depends on**: 02-01, `flight_sim_cpp/src/DroneSimulation.cpp` (autopilot/command modes).
+- **Status**: initial implementation landed in `flight_sim_cpp` (DeterministicRunner + golden fixture `tests/golden/unit_mission.jsonl`, `agbot_flight_sim_headless --seed` required); per-command-mode golden coverage still pending.
 
 ### STORY 02-03 · M1 · S · P1 — Status state machine and event-broadcast assertions
 - **Story**: As `DSP`, I want the status state machine and `SimulationEvent` broadcast pinned, so that downstream consumers can rely on event ordering and emergency signals.
@@ -56,7 +58,8 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 
 ## M2 — Captured / Observable
 
-### STORY 02-05 · M2 · L · P0 — LiDAR raycast point-cloud simulation
+### STORY 02-05 · M3 · L · P0 — LiDAR raycast point-cloud simulation
+- **Phase moved from M2 to M3**: raycast requires terrain geometry (02-09, M3). Moved here to resolve the phase-order contradiction where an M2 story depended on an M3 prerequisite.
 - **Story**: As `AG`, I want the simulator to emit a real raycast point cloud, so that capture (`04`) and LiDAR mapping (`06`) can be developed and regression-tested without hardware.
 - **Deterministic / evidence**: implement deterministic raycasting against terrain/obstacles in the canonical simulator (`flight_sim_cpp`, bridged capture-shaped to Rust; the Bevy-era `lidar_simulator.rs` stub was removed with the `simulator` crate), emitting `LidarScan`/`LidarPoint` consumable by `04`; seeded so output is reproducible.
 - **Acceptance**:
@@ -65,7 +68,8 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Tests**: unit (raycast ranges), golden-file (seeded cloud), failure path (empty scene).
 - **Depends on**: 02-09 (terrain geometry), `04` (capture shape), `shared` LiDAR schema.
 
-### STORY 02-06 · M2 · M · P1 — Camera / multispectral simulation emitting georeferenced bands
+### STORY 02-06 · M3 · M · P1 — Camera / multispectral simulation emitting georeferenced bands
+- **Phase moved from M2 to M3**: georeferenced band emission requires terrain tile extent (02-09, M3). Moved here to resolve the phase-order contradiction.
 - **Story**: As `AG`, I want simulated multispectral band images tagged with georeference, so that imagery (`05`) processing can be tested against known inputs.
 - **Deterministic / evidence**: emit RGB/NIR/Green/Blue band images with vegetation patterns and a georeference (CRS/extent/transform) tied to the camera pose; capture-shaped for `04`/`05`.
 - **Acceptance**:
@@ -94,7 +98,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
   - Given a noise config and seed, when sensors run, then readings reproduce exactly and statistics match the configured distribution.
   - Given a zero-noise config, when sensors run, then readings are exactly the ideal values (no hidden noise).
 - **Tests**: unit (noise distribution stats), golden-file (seeded readings), failure path (zero-noise is exact).
-- **Depends on**: 02-01, `drone_simulator/src/sensors.rs`.
+- **Depends on**: 02-01; sensor simulation is currently a `flight_sim_cpp` gap (no dedicated sensor-noise module yet).
 
 ### STORY 02-09 · M3 · M · P0 — Real DEM terrain with CRS/extent assertions
 - **Story**: As `OPS`, I want real georeferenced DEM terrain loaded with asserted CRS/extent/resolution, so that mission preview matches the actual field.
@@ -107,12 +111,12 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 
 ### STORY 02-10 · M3 · M · P0 — Wind field and aerodynamic disturbance
 - **Story**: As `OPS`, I want a configurable wind field integrated into the physics, so that the twin can show whether a plan holds under realistic disturbance.
-- **Deterministic / evidence**: add a wind field and integrate the force into `DronePhysics`; deterministic given seed/config; consistent between the Rust twin and the C++ `set_wind` path.
+- **Deterministic / evidence**: add a wind field and integrate the force into the `flight_sim_cpp` physics loop via the `set_wind` path; deterministic given seed/config and reproducible through the deterministic runner.
 - **Acceptance**:
   - Given a steady crosswind and seed, when a mission flies, then the deterministic drift matches the golden trace.
   - Given zero wind, when a mission flies, then the trace is identical to the no-wind golden fixture (no spurious force).
 - **Tests**: golden-file (seeded wind trace), unit (force integration), failure path (zero wind unchanged).
-- **Depends on**: 02-01, `flight_sim_cpp` `set_wind`, `drone_simulator/src/physics.rs`.
+- **Depends on**: 02-01, `flight_sim_cpp` `set_wind`, `flight_sim_cpp/src/DroneSimulation.cpp`.
 
 ### STORY 02-11 · M3 · S · P1 — Twin enforces real geofence/altitude/battery limits
 - **Story**: As `PA`, I want the twin to enforce the same geofence, altitude, and battery limits as the real path, so that sim-first testing actually validates safety.
@@ -132,14 +136,15 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Tests**: unit (tile alignment), failure path (tile fetch failure marked), fixture.
 - **Depends on**: 02-09, `flight_sim_cpp` map-tile fetching/caching (`GeoTerrain.cpp`, viewer tile compositor).
 
-### STORY 02-13 · M3 · S · P2 — C++ headless runner shares mission/telemetry contract
-- **Story**: As `DSP`, I want the C++ headless runner to read the same mission format and emit the same telemetry as the Rust twin, so that the two simulators stay interchangeable for regression.
-- **Deterministic / evidence**: align `flight_sim_cpp` `MissionLoader`/`TelemetryRecorder` JSONL with the shared mission/telemetry contract; a cross-runner test compares traces for the same mission.
+### STORY 02-13 · M3 · S · P2 — Single mission/telemetry contract on the canonical runner
+- **Superseded by the deterministic runner**: there is now one canonical simulator (`flight_sim_cpp`), so the original "two interchangeable runners" framing no longer applies. This story folds into enforcing one mission/telemetry format (TwinContractV1) on the single runner; the cross-build/cross-platform parity role moves to STORY 02-35.
+- **Story**: As `DSP`, I want the `flight_sim_cpp` headless runner to read one mission format and emit one telemetry format bound to the shared contract, so that interactive and headless runs are interchangeable and regression-safe.
+- **Deterministic / evidence**: align `flight_sim_cpp` `MissionLoader`/`TelemetryRecorder` JSONL with the shared mission/telemetry contract (TwinContractV1); a contract test asserts the loader and recorder round-trip the contract types.
 - **Acceptance**:
-  - Given one mission, when run on both runners, then their telemetry traces agree within tolerance.
-  - Given a format mismatch, when the cross-runner test runs, then it fails identifying the diverging field.
-- **Tests**: cross-runner trace comparison, contract test (mission/telemetry format), failure path (format mismatch).
-- **Depends on**: 02-04, `flight_sim_cpp/src/MissionLoader.cpp`, `TelemetryRecorder.cpp`.
+  - Given one mission, when run headless and (conceptually) interactively, then the telemetry format is identical and bound to the same contract.
+  - Given a format drift from the contract, when the contract test runs, then it fails identifying the diverging field.
+- **Tests**: contract round-trip (mission/telemetry format), failure path (format drift named).
+- **Depends on**: 02-04, `flight_sim_cpp/src/MissionLoader.cpp`, `TelemetryRecorder.cpp`, `DeterministicRunner.cpp`.
 
 ### STORY 02-19 · M3 · L · P1 — Georeferenced 3D scene synthesis (buildings and farm vegetation)
 - **Story**: As `DSP`, I want the world around a chosen location populated with 3D scene objects — building footprints from OSM and farm vegetation (forest trees, bushes, crop rows by crop type) from land-cover classes — so that a simulated flight over a real farm encounters the obstacles and canopy a real flight would.
@@ -174,7 +179,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 
 ### STORY 02-15 · M4 · M · P0 — Twin-as-backend for `01`/`03` simulation mode
 - **Story**: As `OPS`, I want `01` and `03` to drive their `Simulation` runtime mode through one twin API, so that there is a single canonical backend for sim-first testing.
-- **Deterministic / evidence**: expose a twin API consuming `shared` commands and producing telemetry; `01`/`03` in `Simulation` mode route through it. Canonical roles are resolved: `flight_sim_cpp` is the canonical interactive simulator/viewer, `drone_simulator` is the headless Rust twin for CI regression (the Bevy `simulator` crate was removed).
+- **Deterministic / evidence**: expose a twin API consuming `shared` commands and producing telemetry; `01`/`03` in `Simulation` mode route through it. The canonical role is resolved: `flight_sim_cpp` is the single canonical simulator for both the interactive viewer and headless CI regression (the Bevy `simulator` crate and the Rust `drone_simulator` crate were both retired).
 - **Acceptance**:
   - Given `01` in `Simulation` mode, when it dispatches commands, then they execute against the twin API and stream telemetry back.
   - Given the twin API is unavailable, when `01` enters `Simulation` mode, then it fails closed (refuses to "simulate" with no backend), not silently no-op.
@@ -241,6 +246,158 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 
 ---
 
+## Reliability Backbone — M1/M2 P0 (prerequisites for all regression and safety work)
+
+> These stories are the missing backbone identified in the product review. They are listed as new M1/M2 P0 requirements and must land before the synthetic-perception stack is accepted as meaningful for regression or safety validation.
+
+### STORY 02-24 · M1 · M · P0 — TwinContractV1: versioned interface contract
+- **Story**: As `PA`, I want a versioned `TwinContractV1` that defines the wire format for commands, telemetry, trace files, scenario manifests, errors, and declared simulator capabilities, so that every consumer knows exactly what the twin promises and a breaking change is impossible to ship silently.
+- **Deterministic / evidence**: a schema file (e.g. `shared/src/twin_contract_v1.rs`) versioned by semver; a contract test asserts each consumer crate (`01`, `03`, `04`) compiles and round-trips all defined types; a version bump is required before any breaking format change.
+- **Acceptance**:
+  - Given `TwinContractV1` is defined, when any consumer sends a command or reads telemetry, then it is validated against the versioned schema at the boundary, not by convention.
+  - Given a breaking format change without a version bump, when the contract test runs, then it fails naming the type and field that broke, not just "compile error."
+  - Given a consumer built against `TwinContractV1`, when the twin version changes in a compatible way, then existing consumers continue working without recompilation.
+- **Tests**: contract round-trip (all defined types), contract version check (incompatible bump fails), failure path (schema drift without bump detected).
+- **Depends on**: `shared/src/`, `flight_sim_cpp` telemetry contract, `flight_sim_cpp/src/DeterministicRunner.cpp`.
+- **Status**: seeded — `contract_version` 1.0.0 is now emitted by the C++ runner's `RunManifest` as the seed of TwinContractV1; the full versioned schema (commands, telemetry, trace, manifest, errors, capabilities) plus consumer round-trip is still pending.
+- **Note**: this story precedes STORY 02-04 (shared command/telemetry contract); 02-04 becomes an implementation step within the TwinContractV1 envelope.
+
+### STORY 02-25 · M1 · M · P0 — Deterministic runner mode (fixed timestep, seeded PRNG, byte-identical output)
+- **Story**: As `DSP`, I want the headless twin runner to operate in a deterministic mode — fixed timestep, seeded PRNG, deterministic timestamps and IDs — so that running the same mission twice with the same seed produces byte-identical telemetry traces.
+- **Deterministic / evidence**: a `--seed N --timestep-ms N` CLI flag sets the runner; a two-run test asserts the resulting JSONL traces are byte-identical; the seed and timestep are logged in the run header.
+- **Acceptance**:
+  - Given the same seed and mission, when the runner executes twice, then the two traces are byte-identical (no clock jitter, no floating-point nondeterminism, no random IDs).
+  - Given two different seeds, when the runner executes, then the two traces differ, confirming the seed is actually driving behavior.
+  - Given no seed flag, when the runner executes, then it refuses to start with an error: "deterministic mode requires --seed".
+- **Tests**: two-run byte-identity assertion, different-seed divergence assertion, failure path (missing seed rejected).
+- **Depends on**: `flight_sim_cpp/src/headless_main.cpp`, `flight_sim_cpp/src/DeterministicRunner.cpp`.
+- **Status**: initial implementation landed in `flight_sim_cpp` (DeterministicRunner + golden fixture `tests/golden/unit_mission.jsonl`, `agbot_flight_sim_headless --seed` required; byte-identity, seed-drives-PRNG, and missing-seed-rejected paths are tested). Cross-platform byte-identity verification is still pending.
+- **Note**: this story is a prerequisite for all golden-fixture stories (02-01, 02-02, 02-05, etc.). A golden trace produced by a non-deterministic runner is not a golden trace.
+
+### STORY 02-26 · M1 · S · P0 — Safety parity harness (geofence/altitude/battery/no-fly-zone/abort rules)
+- **Story**: As `PA`, I want a CI test harness that proves the twin enforces the same geofence, altitude ceiling, battery abort, no-fly-zone exclusion, and emergency-abort rules as the real flight path, so that sim-first safety testing produces meaningful evidence.
+- **Deterministic / evidence**: for each safety rule, a parameterized harness runs both the twin and a real-path stub with an identical boundary-crossing scenario; asserts the same violation event fires with the same rule code; if the twin does not enforce a rule the real path enforces, the test fails and names the gap.
+- **Acceptance**:
+  - Given a mission that crosses the geofence, when run in the twin, then the twin raises the same `GeofenceViolation` the real path raises at the same waypoint.
+  - Given a mission that enters a no-fly zone, when run in the twin, then the twin raises the same exclusion event as the real path.
+  - Given a low-battery abort scenario, when run in the twin, then the twin triggers RTH at the same battery threshold as the real path.
+  - Given a safety rule that exists in the real path but is absent from the harness, when the coverage check runs, then it fails listing the uncovered rule.
+- **Tests**: parameterized parity test per safety rule, coverage check (unregistered rule fails), failure path (harness gap named explicitly).
+- **Depends on**: 02-25 (deterministic runner), `01` (real-path safety rules), `03` (coordination abort rules).
+- **Note**: this story upgrades and supersedes STORY 02-11, which was P1/M3. Safety parity is a P0 prerequisite for sim-first testing, not an M3 polish item.
+
+---
+
+## Reliability Backbone — M2 P0 (terrain fidelity, observability, and fault injection)
+
+### STORY 02-27 · M2 · S · P0 — Terrain no-data model (available/missing/stale/synthetic/flat_fallback)
+- **Story**: As `OPS`, I want every DEM and map tile to carry an explicit data-quality state — `available`, `missing`, `stale`, `synthetic`, or `flat_fallback` — so that a missing tile never silently becomes flat zero elevation.
+- **Deterministic / evidence**: a `TerrainTileState` enum is carried alongside every elevation sample; the scenario manifest records per-tile states; a test asserts that a missing tile produces `flat_fallback` state, not a zero-elevation sample with no annotation.
+- **Acceptance**:
+  - Given a tile that cannot be fetched, when terrain loads, then the elevation is tagged `flat_fallback` and the gap is recorded in the scenario manifest; no silent zero is emitted.
+  - Given a tile older than its staleness threshold, when terrain loads, then it is tagged `stale` and the run manifest records the staleness reason.
+  - Given a synthetic tile generated in the absence of real data, when terrain loads, then it is tagged `synthetic` and any downstream consumer sees the tag.
+  - Given a tile with all valid data, when terrain loads, then it is tagged `available`.
+- **Tests**: unit (state per condition), scenario manifest assertion (per-tile states), failure path (missing tile → flat_fallback, not silent zero).
+- **Depends on**: 02-09 (DEM terrain), `flight_sim_cpp/src/GeoTerrain.cpp`, `TwinContractV1` (manifest schema).
+- **Note**: this requirement extends STORY 02-09. The failure path in 02-09 mentions "gap is reported," but does not define explicit states. This story makes the states a first-class contract item.
+
+### STORY 02-28 · M2 · M · P0 — Scenario manifest (per-run metadata and hash registry)
+- **Story**: As `PA`, I want every simulation run to produce a scenario manifest — simulator version, seed, mission, terrain tiles used, weather config, sensor configs, safety config, source data hashes, and output hashes — so that any run can be reproduced and any trace can be audited back to its inputs.
+- **Deterministic / evidence**: the headless runner emits a `scenario_manifest.json` (schema from `TwinContractV1`) alongside the telemetry trace; the manifest includes SHA-256 hashes of all inputs and outputs; a run without a manifest is rejected by the CI harness.
+- **Acceptance**:
+  - Given a completed run, when the manifest is inspected, then it contains simulator version, seed, mission hash, terrain tile states and hashes, weather config, sensor config, safety config, and the output trace hash.
+  - Given the same seed and inputs, when the run is replayed, then the manifest hashes match the original, confirming reproducibility.
+  - Given a run that terminates without emitting a manifest, when the CI harness checks, then it fails with "missing scenario manifest," not silently passes.
+- **Tests**: manifest schema validation (all required fields), hash reproducibility (same seed → same hashes), failure path (missing manifest rejected).
+- **Depends on**: 02-25 (deterministic runner), 02-27 (terrain tile states), `TwinContractV1`.
+- **Status**: seeded — the C++ headless runner now emits a per-run `<output>.manifest.json` (`RunManifest`: simulator_version, contract_version, seed, timestep, mission_hash, output_hash via FNV-1a, prng_nonce, completed). Still pending: terrain tile states/hashes, weather/sensor/safety config, SHA-256 input/output hashing, and the full versioned schema with consumer round-trip.
+
+### STORY 02-29 · M2 · M · P0 — Trace diff CLI (`agbot-sim diff <a> <b>`)
+- **Story**: As `DSP`, I want a CLI that compares two simulation trace files and reports the exact step index, field name, and values that diverge, so that golden regression failures name the problem instead of just saying "mismatch."
+- **Deterministic / evidence**: `agbot-sim diff <trace-a.jsonl> <trace-b.jsonl>` exits 0 if traces are identical within tolerance, exits 1 with a structured JSON diff listing the first N divergent steps (step index, field path, value in A, value in B, delta if numeric).
+- **Acceptance**:
+  - Given two identical traces, when `agbot-sim diff` runs, then it exits 0 with "traces identical."
+  - Given two traces that diverge at step 42 on field `position.altitude_m`, when `agbot-sim diff` runs, then it exits 1 and names step 42, `position.altitude_m`, and both values.
+  - Given a numeric tolerance flag, when comparing traces whose values differ by less than the tolerance, then it reports them as identical.
+  - Given a trace from a different contract version, when diff runs, then it reports "incompatible contract version" and exits 2.
+- **Tests**: unit (identical → 0, divergent → named diff), tolerance assertion, failure path (incompatible version → exit 2).
+- **Depends on**: 02-25 (deterministic traces), `TwinContractV1` (trace schema).
+
+### STORY 02-30 · M2 · M · P0 — Fault injection library (seeded, reproducible fault classes)
+- **Story**: As `DSP`, I want a seeded fault injection library covering wind gusts, GPS drift, IMU noise, sensor dropout, comm loss, low battery, stale terrain, bad tile, and actuator lag, so that autonomy and failsafe behavior can be regression-tested against adverse conditions with reproducible inputs.
+- **Deterministic / evidence**: each fault class is a named, seeded generator that injects its perturbation into the physics/sensor/terrain/communication layer at a configurable schedule; the scenario manifest records which fault classes and seeds were active; a CI regression suite runs each fault class and pins the failsafe outcome.
+- **Acceptance**:
+  - Given a seeded GPS-drift fault, when the flight runs, then the GPS readings drift by the documented distribution and the trace is reproducible by seed.
+  - Given a sensor-dropout fault scheduled at step 100, when the flight runs, then the sensor emits no readings from step 100 forward until recovery, and the manifest records the dropout event.
+  - Given a bad-tile fault, when terrain loads, then the affected tile is tagged `flat_fallback` and the scenario manifest records the injection.
+  - Given the same fault seed across two runs, when traces are compared with the trace diff CLI, then they are identical.
+- **Tests**: per-fault-class seeded regression, manifest records injection, failure path (injected fault without seed → rejected), trace reproducibility (same seed → same fault trace).
+- **Depends on**: 02-25 (deterministic runner), 02-27 (terrain no-data), 02-28 (scenario manifest), 02-29 (trace diff).
+- **Note**: this story supersedes and expands STORY 02-18 (Disturbance scenario library, M5/P2). The fault injection library is a reliability backbone item, not a late-stage polish item.
+
+### STORY 02-31 · M2 · S · P0 — Simulation health/operability (health checks, seed logging, trace retention, runbook)
+- **Story**: As `PA`, I want the headless simulator to expose structured health checks, log its seed and version on every run, enforce a trace retention policy, control its tile cache, and have a runbook — so that CI failures are diagnosable and the simulator is operable without tribal knowledge.
+- **Deterministic / evidence**: `agbot-sim health` returns a structured JSON pass/fail over: runner mode, PRNG seeded, terrain cache state, last-run manifest present, trace retention compliant; every run logs a header with simulator version, contract version, seed, timestep, and run ID.
+- **Acceptance**:
+  - Given a healthy simulator, when `agbot-sim health` runs, then it exits 0 with a structured JSON listing all checked subsystems as `pass`.
+  - Given a run with no seed set, when the health check runs, then `prng_seeded` is `fail` and the runner refuses to start.
+  - Given a trace retention policy (e.g. keep last N runs), when a new run completes, then old traces beyond N are deleted and the manifest records the deletion.
+  - Given a cache-clear command, when it runs, then the tile cache is emptied and the next run fetches fresh tiles.
+- **Tests**: health check pass/fail per subsystem, seed-missing → refused, trace retention enforcement, cache-clear confirmation.
+- **Depends on**: 02-25 (deterministic runner), 02-28 (scenario manifest).
+
+---
+
+## Reliability Backbone — M2 P1 (capture fidelity and single-runner deterministic regression)
+
+### STORY 02-32 · M2 · M · P1 — Capture replay adapter (sim sensor output → domain `04` ingestion path)
+- **Story**: As `AG`, I want simulated LiDAR, camera, and multispectral sensor output to flow through the exact same domain `04` `FlightDataRecord` ingestion path as real hardware, so that the entire capture pipeline is regression-tested without physical sensors.
+- **Deterministic / evidence**: the adapter routes 02-05/02-06 sensor output through the same `04` ingestion handler (same provenance fields: sensor ID, GPS tag, timestamp, session ID) rather than a test-only bypass; a CI test compares records produced by the sim adapter to records produced by a real-hardware fixture and asserts structural identity.
+- **Acceptance**:
+  - Given a simulated flight, when sensors emit, then `04` records carry the same provenance structure as real-hardware records (sensor ID, GPS tag, timestamp, session).
+  - Given a simulated sensor that fails mid-flight, when the adapter runs, then `04` records a `collection_failure` with the same structure as a real hardware failure.
+  - Given a real-hardware ingestion test fixture and the sim adapter, when both are run with the same data shape, then the resulting `FlightDataRecord` schemas are identical.
+- **Tests**: integration (sim → `04` records match schema), provenance completeness, failure path (sim sensor failure → `collection_failure` record).
+- **Depends on**: 02-05 (LiDAR sim), 02-06 (camera sim), `04` (capture ingestion), `TwinContractV1`.
+- **Note**: this story replaces and strengthens STORY 02-07 (Capture-shaped sensor stream into `04`). The key difference is the adapter must use the exact `04` ingestion path, not a test-only shortcut.
+
+### STORY 02-33 · M2 · S · P1 — Sensor calibration profiles (cheap GPS, RTK GPS, noisy IMU, LiDAR A3, multispectral camera)
+- **Story**: As `DSP`, I want named, versioned sensor calibration profiles that configure noise distributions, drift rates, and calibration offsets for each sensor model — so that tests are reproducibly keyed to a named sensor, not to a magic noise constant buried in a config file.
+- **Deterministic / evidence**: profiles are stored as named files (e.g. `calibration/rtk_gps_a1.toml`); loading a profile by name configures the sensor suite reproducibly; the scenario manifest records the profile name and version.
+- **Acceptance**:
+  - Given a named profile `rtk_gps_a1`, when the sensor suite loads it, then GPS readings match the documented RTK-grade noise characteristics, and the scenario manifest records `sensor_profile: rtk_gps_a1`.
+  - Given a profile `cheap_gps_b2`, when the sensor suite loads it, then GPS readings match the documented consumer-grade noise characteristics.
+  - Given an unknown profile name, when the runner starts, then it rejects the run with "unknown sensor profile," not defaults to a silent fallback.
+- **Tests**: per-profile noise-distribution check, manifest records profile name, failure path (unknown profile → rejected).
+- **Depends on**: 02-08 (sensor noise), 02-28 (scenario manifest), `TwinContractV1`.
+
+### STORY 02-34 · M2 · M · P1 — Mission validation report (pre-run deterministic check)
+- **Story**: As `OPS`, I want a deterministic mission validation report produced before each simulated run — expected coverage fraction, estimated flight duration, battery margin, terrain data gaps, safety risks, and blocked waypoints — so that a doomed or risky run is caught before it wastes resources.
+- **Deterministic / evidence**: `agbot-sim validate <mission.json>` produces a structured JSON report; blocked missions produce non-zero exit code listing the blocking reasons; the report is deterministic given the same mission and terrain state.
+- **Acceptance**:
+  - Given a valid mission over fully available terrain, when validation runs, then it produces a report with coverage, estimated duration, battery margin, and zero terrain gaps.
+  - Given a mission with waypoints over a missing-terrain tile, when validation runs, then it reports the terrain gap and classifies the mission as "runnable with gaps" or "blocked" per policy.
+  - Given a mission that would breach the geofence, when validation runs, then it reports the blocked waypoints and exits non-zero.
+  - Given the same mission and terrain state, when validation runs twice, then reports are byte-identical.
+- **Tests**: report schema validation, terrain-gap detection, geofence-blocked exit code, determinism (same input → byte-identical report).
+- **Depends on**: 02-26 (safety parity), 02-27 (terrain no-data), 02-28 (scenario manifest), `01` (mission schema).
+
+### STORY 02-35 · M2 · M · P1 — Single-runner deterministic regression parity (cross-build/cross-platform determinism)
+- **Story**: As `PA`, I want mandatory CI regression that runs a reference mission with a fixed seed on `flight_sim_cpp` and asserts the trace is byte-identical and the scenario-manifest hash matches across builds and platforms, so that the one canonical runner cannot silently drift between commits or environments.
+- **Deterministic / evidence**: a regression suite runs a set of reference missions (takeoff/land/goto/orbit) with the same seed against committed golden traces and golden manifest hashes; uses the trace diff CLI (02-29) to compare; any field divergence beyond tolerance, or any manifest-hash mismatch, fails the test and names the diverging field. Determinism is verified across debug/release builds and across supported platforms.
+- **Acceptance**:
+  - Given a reference mission and seed, when re-run against its golden trace, then `agbot-sim diff` reports "traces identical" and the manifest output_hash matches the golden hash.
+  - Given a behavior change that perturbs the trace, when the regression runs, then it fails naming the step, field, and both values.
+  - Given a build- or platform-induced nondeterminism, when the same seed is run on two environments, then the regression fails identifying the divergent step rather than passing silently.
+  - Given a format drift (different telemetry/manifest schema), when the regression runs, then it fails with "incompatible contract version," not a silent parse error.
+- **Tests**: golden trace + manifest-hash regression on all reference missions, divergence detection (names field), cross-build/cross-platform determinism check, format-drift detected.
+- **Depends on**: 02-25 (deterministic runner), 02-24 (`TwinContractV1`), 02-28 (scenario manifest), 02-29 (trace diff CLI).
+- **Status**: partially implemented — same-seed byte-identity and per-run manifest hashing already exist on `flight_sim_cpp` with a committed golden fixture; the cross-build/cross-platform CI gate and a manifest-hash golden are still pending.
+- **Note**: this replaces the obsolete cross-runner framing (there is now one canonical runner) and folds in the regression role previously assigned to STORY 02-13. Single-runner determinism is a required reliability item, not a P2 nice-to-have.
+
+---
+
 ## Coverage note
 
-~23 stories cover the 12 capabilities in `capability-map.md` plus the synthetic-perception stack (scene synthesis → ray-traced camera → video/telemetry streaming → labeled dataset export, stories 02-19 to 02-23), ordered by phase and weighted toward M3 (golden fixtures, terrain, physics) per `release-plan.md`. The curated counts in `release-plan.md` (≈91 rows) expand several of these — per-sensor noise models, per-command-mode golden traces, per-formation preview cases, per-vegetation-class scene generators, and additional terrain-tile sources — into sibling stories when implemented. Every physics/controller story carries a seeded golden fixture, and the twin enforces the same geofence/altitude/battery limits as the real flight path so sim-first testing for `01`/`03` is meaningful.
+~35 stories cover three layers: (1) the reliability backbone (02-24 to 02-35: TwinContractV1, deterministic runner, safety parity harness, terrain no-data model, scenario manifest, trace diff CLI, fault injection library, health/operability, capture replay adapter, sensor calibration profiles, mission validation report, and single-runner deterministic regression — all M1/M2); (2) the physics/sensor/terrain foundation (02-01 to 02-13, M1/M2/M3); (3) the synthetic-perception stack (02-19 to 02-23: scene synthesis → ray-traced camera → video/telemetry streaming → labeled dataset export, M3/M4/M5). There is a single canonical runner (`flight_sim_cpp`); the Rust/Bevy `simulator` and Rust `drone_simulator` crates were both retired. "Parity" now means cross-build/cross-platform determinism on that one runner — same-seed byte-identity plus scenario-manifest hash reproducibility — not agreement between two runners. Story 02-26 (safety parity) supersedes 02-11 (upgrading it from P1/M3 to P0/M1), and 02-35 (single-runner deterministic regression) folds in the regression role previously assigned to 02-13; the deterministic runner, run header logging, scenario-manifest seed, and the golden fixture `tests/golden/unit_mission.jsonl` already exist on `flight_sim_cpp`. The curated counts in `release-plan.md` expand several of these — per-sensor noise models, per-command-mode golden traces, per-formation preview cases, per-vegetation-class scene generators, and additional terrain-tile sources — into sibling stories when implemented. Every physics/controller story carries a seeded golden fixture, and the twin enforces the same geofence/altitude/battery/no-fly-zone/abort limits as the real flight path so sim-first testing for `01`/`03` is meaningful.

@@ -4,12 +4,13 @@ This sequencing reconciles the domain roadmap with the earlier milestone plan in
 
 ## Phase 0: Product Spine
 
-Shared contracts that every domain depends on. Mostly lives in `shared` and a new domain crate.
+Shared contracts that every domain depends on. Mostly lives in `shared` and a new domain crate. **None of the phase 1–4 domains should begin deep implementation before these are resolved.**
 
 - Define the core domain model: Organization, User, Farm, Field, FieldBoundary, Season, CropPlan, Scene, Layer, Annotation, Recommendation, Report, WorkOrder (domain `10`).
-- Establish geospatial primitives: CRS, extent, resolution, transform, and georeferenced product metadata (domains `07`, `10`).
+- Establish geospatial primitives: CRS, extent, resolution, transform, and georeferenced product metadata (domains `07`, `10`). Tolerance classes for acceptance tests go in `tolerance-profiles.md`; stories must reference named profiles, not inline constants.
 - Establish capture provenance: flight session, sensor stream, and scene→field→season linkage (domains `04`, `07`).
-- Pick and document the authoritative storage backend and serving API shape (see confirmation questions in `requirements-rigor.md`).
+- **Decide and document the authoritative storage backend** (see "Storage Authority Decision" in `requirements-rigor.md`). Recommendation: PostgreSQL/PostGIS for operational data, file store for large binary assets, SQLite for edge cache only. This decision blocks domains `04`, `07`, `10`, `28`, and `30`. Do not begin new migration work in those domains until confirmed.
+- Define versioned shared contracts (`TelemetryV1`, `FlightCommandV1`, `CaptureRecordV1`, `RasterSpatialRefV1`, `ProvenanceEventV1`) in `shared/src/` before any second consumer is wired. See "Versioned Shared Contracts" in `requirements-rigor.md`.
 - Add the acceptance-test harness extended from today's `just gis-test` / `just gis-acceptance`.
 
 ## Phase 1: Advisor MVP Vertical (Milestones M1 → M2)
@@ -36,7 +37,7 @@ Make the data that feeds the advisor workflow real and trustworthy.
 ## Phase 3: Collaboration and Operations (Milestone M3)
 
 - **Domain 10**: organizations, roles, assignments, work orders, status tracking, and field/season history.
-- **Domain 11**: a real operator ground station (web + CLU) with live mission and capture status.
+- **Domain 11**: a real operator ground station (web + CLI) with live mission and capture status.
 - **Domain 12**: drone enrollment, configuration, health, deployment, and edge/ARM operations.
 
 Exit: a small advisory team can manage multiple farms and maintain field history without losing traceability.

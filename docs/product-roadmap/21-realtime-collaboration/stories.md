@@ -81,7 +81,8 @@ Roles: `EXPERT` remote expert, `TEAM-MEMBER` farm-team member, `OPS` operator, `
   - Given a session, when replayed by an out-of-org user, then access is denied.
   - Given a session with a gap (e.g. dropped stream segment), when replayed, then the gap is represented explicitly rather than silently stitched over.
 - **Tests**: integration (record→replay ordering), authz (out-of-org replay denied), failure path (gap rendered explicitly).
-- **Depends on**: 21-04, 21-05, 21-07.
+- **Depends on**: 21-04, 21-05.
+- **Note**: dependency on 21-07 (collaborative mission planning, M4) removed. Session recording captures generic event streams (stream segments, edits, annotations, alerts) and does not require the mission-planning collaboration feature to exist. When 21-07 ships, its events become additional event types recorded by 21-06, but 21-06 does not depend on 21-07 to function.
 
 ---
 

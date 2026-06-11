@@ -14,9 +14,15 @@ Each epic ships as a vertical slice:
 
 ## Category Epics
 
+### EPIC-00: Twin Reliability Backbone
+- Goal: establish the non-negotiable reliability infrastructure that makes simulation-first testing trustworthy. Without this backbone, golden fixtures, safety parity claims, and regression results are not meaningful.
+- First release: `TwinContractV1` (versioned wire format for commands, telemetry, trace files, scenario manifests, errors, and simulator capabilities), deterministic runner mode (fixed timestep, seeded PRNG, byte-identical output), and the safety parity harness (CI test proving geofence/altitude/battery/no-fly-zone/abort enforcement matches the real path).
+- Expansion: terrain no-data model (`available`/`missing`/`stale`/`synthetic`/`flat_fallback`), scenario manifest per run, trace diff CLI, fault injection library (seeded wind gusts/GPS drift/IMU noise/sensor dropout/comm loss/low battery/bad tile/actuator lag), and simulation health/operability (health checks, seed logging, trace retention, cache controls, runbook).
+- Hardening: single-runner deterministic regression (same-seed byte-identity plus scenario-manifest hash reproducibility across builds/platforms on `flight_sim_cpp`), sensor calibration profiles, capture replay adapter, and mission validation reports.
+
 ### EPIC-01: Deterministic Physics and Sensor Twin
 - Goal: a reproducible per-drone twin whose telemetry can regression-test flight (`01`) and coordination (`03`).
-- First release: golden-telemetry fixtures for takeoff/land/goto/orbit and a noise-injecting sensor suite.
+- First release: golden-telemetry fixtures for takeoff/land/goto/orbit (an initial deterministic golden fixture `tests/golden/unit_mission.jsonl` already exists on `flight_sim_cpp`) and a noise-injecting sensor suite.
 - Expansion: wind and aerodynamic disturbance integrated into the physics loop.
 - Hardening: thermal/battery refinement, seed control, and CI gating.
 
@@ -27,8 +33,8 @@ Each epic ships as a vertical slice:
 - Hardening: tile streaming/LOD performance and large-area coverage on edge hardware.
 
 ### EPIC-03: Canonical Twin and Mission Preview
-- Goal: one canonical simulator backing the interactive and headless surfaces with a shared contract. Resolved: `flight_sim_cpp` is the canonical interactive simulator, `drone_simulator` the headless Rust twin (the Bevy `simulator` crate was removed).
-- First release: shared mission/telemetry format across `flight_sim_cpp` and `drone_simulator`.
+- Goal: one canonical simulator backing both the interactive and headless surfaces with a shared contract. Resolved: `flight_sim_cpp` is the single canonical simulator for both surfaces (the Bevy `simulator` crate and the Rust `drone_simulator` crate were both retired in its favor).
+- First release: one mission/telemetry format (TwinContractV1) on the single `flight_sim_cpp` runner, exercised in both interactive and headless modes.
 - Expansion: mission preview overlay tied to a field boundary, driving `01`/`03` simulation mode; location-anchored scenario loading from globe navigation.
 - Hardening: replay, audit, and export of simulated sessions for after-action review.
 

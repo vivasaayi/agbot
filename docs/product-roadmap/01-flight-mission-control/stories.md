@@ -90,7 +90,8 @@ This is a safety-critical domain. No real-flight dispatch is enabled until the f
   - Given a degrading link, when health is tracked, then loss-rate is recorded and a warning state is raised.
   - Given a failsafe flag set by the aircraft, when telemetry is parsed, then the transition is persisted and surfaced, not dropped.
 - **Tests**: unit (link-health thresholds), failure path (failsafe flag persisted), fixture.
-- **Depends on**: 01-06, 01-09.
+- **Depends on**: 01-06.
+- **Note**: dependency on 01-09 (MAVLink command ack/timeout/retry, M3) removed. Link-health and failsafe-flag tracking is passive telemetry parsing and does not require command acknowledgment infrastructure. 01-09 is a prerequisite for dispatch stories (01-15+), not for read-only health observation.
 
 ---
 
