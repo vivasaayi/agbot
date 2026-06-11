@@ -1,12 +1,13 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use geo::Polygon;
+use geo::{Point, Polygon};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt, str::FromStr};
 use uuid::Uuid;
 
 pub mod api;
 pub mod database;
+pub mod dispatch_safety;
 pub mod flight_path;
 pub mod mavlink_integration;
 pub mod mission_optimizer;
@@ -18,6 +19,10 @@ pub mod websocket_handler;
 
 pub use api::MissionApi;
 pub use database::{DatabaseService, MissionStats};
+pub use dispatch_safety::{
+    evaluate_dispatch_safety, DispatchSafetyConfig, DispatchSafetyError, DispatchSafetyReport,
+    NoFlyZone, SafetyViolation, SafetyViolationCode, SafetyViolationSeverity,
+};
 pub use flight_path::{FlightPath, PathSegment, SurveyPattern};
 pub use mission_optimizer::MissionOptimizer;
 pub use survey_template::{
@@ -308,6 +313,21 @@ impl Mission {
 
     pub fn arm(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
         self.transition_status(MissionStatus::Armed)
+    }
+
+    pub fn arm_with_dispatch_safety(
+        &mut self,
+        current_position: Option<Point<f64>>,
+        no_fly_zones: &[NoFlyZone],
+        config: DispatchSafetyConfig,
+    ) -> std::result::Result<DispatchSafetyReport, DispatchSafetyError> {
+        let report = evaluate_dispatch_safety(self, current_position, no_fly_zones, config);
+        if !report.is_clear() {
+            return Err(DispatchSafetyError::SafetyViolation(report));
+        }
+
+        self.arm()?;
+        Ok(report)
     }
 
     pub fn start(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
