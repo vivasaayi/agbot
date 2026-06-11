@@ -241,6 +241,54 @@ pub struct LayerPlacement {
     pub world_dimensions: Vec2,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerMetadataReadout {
+    pub crs: String,
+    pub extent: String,
+    pub resolution: String,
+    pub dimensions: String,
+}
+
+pub fn layer_metadata_readout(
+    geospatial: &SceneGeospatialMetadata,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> LayerMetadataReadout {
+    let crs = geospatial
+        .crs
+        .as_deref()
+        .filter(|crs| !crs.trim().is_empty())
+        .unwrap_or("missing CRS")
+        .to_string();
+    let extent = geospatial
+        .extent
+        .as_ref()
+        .map(|extent| {
+            format!(
+                "{:.5}, {:.5} -> {:.5}, {:.5}",
+                extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat
+            )
+        })
+        .unwrap_or_else(|| "missing extent".to_string());
+    let resolution = geospatial
+        .spatial_ref
+        .as_ref()
+        .and_then(|spatial_ref| spatial_ref.resolution)
+        .map(|resolution| format!("{:.8} x {:.8}", resolution.x, resolution.y))
+        .unwrap_or_else(|| "missing resolution".to_string());
+    let dimensions = width
+        .zip(height)
+        .map(|(width, height)| format!("{width}x{height} px"))
+        .unwrap_or_else(|| "missing dimensions".to_string());
+
+    LayerMetadataReadout {
+        crs,
+        extent,
+        resolution,
+        dimensions,
+    }
+}
+
 pub fn assert_manifest_layer_placement(
     geospatial: &SceneGeospatialMetadata,
     width: Option<u32>,
@@ -655,9 +703,10 @@ pub fn ensure_scene_id(config: &TileConfig, action: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_manifest_layer_placement, manifest_world_dimensions, product_placement_for_manifest,
-        select_catalog_scene, summarize_tile_presences, FieldCatalogState, FieldSceneSummary,
-        SceneExtent, SceneGeospatialMetadata, SceneManifest, SceneProduct, TileId, TilePresence,
+        assert_manifest_layer_placement, layer_metadata_readout, manifest_world_dimensions,
+        product_placement_for_manifest, select_catalog_scene, summarize_tile_presences,
+        FieldCatalogState, FieldSceneSummary, SceneExtent, SceneGeospatialMetadata, SceneManifest,
+        SceneProduct, TileId, TilePresence,
     };
     use bevy::prelude::Vec2;
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
@@ -891,6 +940,46 @@ mod tests {
         .expect_err("extent mismatch should be refused");
 
         assert!(err.to_string().contains("extent"));
+    }
+
+    #[test]
+    fn layer_metadata_readout_reports_manifest_values() {
+        let readout = layer_metadata_readout(
+            &SceneGeospatialMetadata {
+                georeferenced: true,
+                crs: Some("EPSG:4326".to_string()),
+                center: None,
+                extent: Some(sample_extent()),
+                spatial_ref: Some(valid_spatial_ref()),
+            },
+            Some(100),
+            Some(50),
+        );
+
+        assert_eq!(readout.crs, "EPSG:4326");
+        assert_eq!(readout.extent, "-89.50000, 40.00000 -> -88.50000, 41.00000");
+        assert_eq!(readout.resolution, "0.01000000 x 0.02000000");
+        assert_eq!(readout.dimensions, "100x50 px");
+    }
+
+    #[test]
+    fn layer_metadata_readout_flags_missing_fields_explicitly() {
+        let readout = layer_metadata_readout(
+            &SceneGeospatialMetadata {
+                georeferenced: false,
+                crs: None,
+                center: None,
+                extent: None,
+                spatial_ref: None,
+            },
+            None,
+            None,
+        );
+
+        assert_eq!(readout.crs, "missing CRS");
+        assert_eq!(readout.extent, "missing extent");
+        assert_eq!(readout.resolution, "missing resolution");
+        assert_eq!(readout.dimensions, "missing dimensions");
     }
 
     fn sample_extent() -> SceneExtent {

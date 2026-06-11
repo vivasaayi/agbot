@@ -17,14 +17,14 @@ use crate::plugins::recommendations::{
 };
 use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
-    assert_manifest_layer_placement, select_catalog_scene, AnnotationCreateTask,
-    AnnotationDeleteTask, AnnotationFetchTask, AnnotationOverlayState, AnnotationUpdateTask,
-    CursorMapState, DraftMode, FarmFieldHistoryFetchTask, FarmListFetchTask, FieldCatalogState,
-    FieldImportState, FieldImportTask, FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask,
-    MapViewState, RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
-    RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask,
-    ReportOverlayState, SceneManifestState, ShapefileImportRequest, TileConfig, TileFetchTasks,
-    TileRenderState, TileStatus, ViewerState,
+    assert_manifest_layer_placement, layer_metadata_readout, select_catalog_scene,
+    AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask, AnnotationOverlayState,
+    AnnotationUpdateTask, CursorMapState, DraftMode, FarmFieldHistoryFetchTask, FarmListFetchTask,
+    FieldCatalogState, FieldImportState, FieldImportTask, FieldListFetchTask, FieldScenesFetchTask,
+    ManifestFetchTask, MapViewState, RecommendationCreateTask, RecommendationDeleteTask,
+    RecommendationFetchTask, RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask,
+    ReportGenerateTask, ReportOverlayState, SceneManifestState, ShapefileImportRequest, TileConfig,
+    TileFetchTasks, TileRenderState, TileStatus, ViewerState,
 };
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -1409,10 +1409,12 @@ fn render_status_bar(
         .acquired_at
         .clone()
         .unwrap_or_else(|| "n/a".to_string());
-    let source_dimensions = match (manifest_state.width, manifest_state.height) {
-        (Some(width), Some(height)) => format!("{}x{}", width, height),
-        _ => "n/a".to_string(),
-    };
+    let layer_readout = layer_metadata_readout(
+        &manifest_state.geospatial,
+        manifest_state.width,
+        manifest_state.height,
+    );
+    let source_dimensions = layer_readout.dimensions.clone();
     let gps_text = manifest_state
         .gps_position
         .as_ref()
@@ -1423,28 +1425,15 @@ fn render_status_bar(
     } else {
         "no"
     };
-    let crs_text = manifest_state
-        .geospatial
-        .crs
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+    let crs_text = layer_readout.crs;
     let center_text = manifest_state
         .geospatial
         .center
         .as_ref()
         .map(|gps| format!("{:.5}, {:.5}", gps.latitude, gps.longitude))
         .unwrap_or_else(|| "n/a".to_string());
-    let extent_text = manifest_state
-        .geospatial
-        .extent
-        .as_ref()
-        .map(|extent| {
-            format!(
-                "{:.5}, {:.5} -> {:.5}, {:.5}",
-                extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat
-            )
-        })
-        .unwrap_or_else(|| "n/a".to_string());
+    let extent_text = layer_readout.extent;
+    let resolution_text = layer_readout.resolution;
     let cursor_text = cursor_map
         .geo_position
         .map(|(longitude, latitude)| format!("{:.5}, {:.5}", latitude, longitude))
@@ -1496,6 +1485,8 @@ fn render_status_bar(
             ui.label(format!("Center: {}", center_text));
             ui.separator();
             ui.label(format!("Extent: {}", extent_text));
+            ui.separator();
+            ui.label(format!("Resolution: {}", resolution_text));
             ui.separator();
             ui.label(format!("Cursor: {}", cursor_text));
             ui.separator();
