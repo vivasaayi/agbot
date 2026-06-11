@@ -1,6 +1,7 @@
 use anyhow::Context;
 use image::GrayImage;
 use shared::{error::AgroError, schemas::MultispectralImage, AgroResult};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tracing::{error, info};
 
@@ -84,6 +85,10 @@ fn valid_mask_at(mask_img: &Option<GrayImage>, x: u32, y: u32) -> bool {
     mask_img
         .as_ref()
         .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
+}
+
+fn record_invalid_pixel(reasons: &mut BTreeMap<String, usize>, reason: &'static str) {
+    *reasons.entry(reason.to_string()).or_insert(0) += 1;
 }
 
 async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<()> {
@@ -232,6 +237,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
     let mut stats_max = f32::NEG_INFINITY;
     let mut stats_sum = 0.0f64;
     let mut stats_count = 0usize;
+    let mut invalid_pixel_reasons = BTreeMap::new();
 
     // Optional mask: non-zero means valid pixel
     let mask_img = if let Some(mask_path) = &args.mask {
@@ -276,8 +282,14 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                     };
                 let denom = n + r;
                 let mut write_val = NODATA_F32;
-                if valid_mask && valid_data && denom.abs() > f32::EPSILON {
-                    let v = (n - r) / denom;
+                if !valid_mask {
+                    record_invalid_pixel(&mut invalid_pixel_reasons, "masked");
+                } else if !valid_data {
+                    record_invalid_pixel(&mut invalid_pixel_reasons, "nodata");
+                } else if denom.abs() <= f32::EPSILON {
+                    record_invalid_pixel(&mut invalid_pixel_reasons, "divide_by_zero");
+                } else {
+                    let v = ((n - r) / denom).clamp(-1.0, 1.0);
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
@@ -348,8 +360,14 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                     };
                 let denom = n + re;
                 let mut write_val = NODATA_F32;
-                if valid_mask && valid_data && denom.abs() > f32::EPSILON {
-                    let v = (n - re) / denom;
+                if !valid_mask {
+                    record_invalid_pixel(&mut invalid_pixel_reasons, "masked");
+                } else if !valid_data {
+                    record_invalid_pixel(&mut invalid_pixel_reasons, "nodata");
+                } else if denom.abs() <= f32::EPSILON {
+                    record_invalid_pixel(&mut invalid_pixel_reasons, "divide_by_zero");
+                } else {
+                    let v = ((n - re) / denom).clamp(-1.0, 1.0);
                     write_val = v;
                     stats_min = stats_min.min(v);
                     stats_max = stats_max.max(v);
@@ -755,6 +773,8 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         min,
         max,
         mean,
+        valid_pixel_count: stats_count,
+        invalid_pixel_reasons,
     };
 
     let meta_name = format!(

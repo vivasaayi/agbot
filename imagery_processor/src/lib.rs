@@ -1,6 +1,7 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use shared::{config::AgroConfig, AgroResult};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -277,4 +278,8 @@ pub struct IndexResultMeta {
     pub min: f32,
     pub max: f32,
     pub mean: f32,
+    #[serde(default)]
+    pub valid_pixel_count: usize,
+    #[serde(default)]
+    pub invalid_pixel_reasons: BTreeMap<String, usize>,
 }

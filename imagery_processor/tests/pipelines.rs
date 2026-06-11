@@ -177,9 +177,13 @@ async fn ndvi_stats_use_valid_masked_pixels_only() {
     let mean = meta["mean"].as_f64().unwrap();
     let min = meta["min"].as_f64().unwrap();
     let max = meta["max"].as_f64().unwrap();
+    let valid_pixel_count = meta["valid_pixel_count"].as_u64().unwrap();
+    let masked_count = meta["invalid_pixel_reasons"]["masked"].as_u64().unwrap();
     assert!((mean - 0.5).abs() < 1e-6);
     assert!((min - 0.5).abs() < 1e-6);
     assert!((max - 0.5).abs() < 1e-6);
+    assert_eq!(valid_pixel_count, 1);
+    assert_eq!(masked_count, 1);
 }
 
 #[tokio::test]
@@ -218,6 +222,39 @@ async fn indices_persist_sentinel2_band_ingest_evidence() {
     assert_eq!(evidence.resolved_bands.get("red").unwrap(), "B04");
     assert_eq!(evidence.resolved_bands.get("nir").unwrap(), "B08");
     assert_eq!(evidence.resolved_bands.get("red_edge").unwrap(), "B05");
+}
+
+#[tokio::test]
+async fn ndvi_metadata_records_divide_by_zero_reason() {
+    let root = temp_test_dir("ndvi_divide_by_zero_reason");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    write_gray_image(&red_path, 2, 1, &[0, 10]);
+    write_gray_image(&nir_path, 2, 1, &[0, 30]);
+    write_metadata(
+        &input_dir,
+        2,
+        1,
+        &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+    );
+
+    let args = base_indices_args(input_dir, output_dir.clone());
+
+    run_indices(&args).await.unwrap();
+
+    let meta = read_result_meta(&output_dir);
+    assert_eq!(meta["valid_pixel_count"].as_u64().unwrap(), 1);
+    assert_eq!(
+        meta["invalid_pixel_reasons"]["divide_by_zero"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert!((meta["mean"].as_f64().unwrap() - 0.5).abs() < 1e-6);
 }
 
 #[tokio::test]
