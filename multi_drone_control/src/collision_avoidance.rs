@@ -510,17 +510,18 @@ mod tests {
     #[test]
     fn test_distance_calculation() {
         let system = CollisionAvoidanceSystem::new();
+        let three_meters_lon_deg = (3.0_f64 / 6_371_000.0).to_degrees();
 
         let pos1 = Position3D {
-            latitude: 40.7128,
-            longitude: -74.0060,
+            latitude: 0.0,
+            longitude: 0.0,
             altitude_m: 0.0,
         };
 
         let pos2 = Position3D {
-            latitude: 40.7129,
-            longitude: -74.0061,
-            altitude_m: 0.0,
+            latitude: 0.0,
+            longitude: three_meters_lon_deg,
+            altitude_m: 4.0,
         };
 
         let distance = system.calculate_3d_distance(&pos1, &pos2);

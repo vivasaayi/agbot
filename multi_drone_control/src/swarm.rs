@@ -11,6 +11,8 @@ use uuid::Uuid;
 pub struct DroneSwarm {
     pub id: Uuid,
     pub name: String,
+    #[serde(default = "default_owner_id")]
+    pub owner_id: String,
     pub drones: HashMap<Uuid, DroneInfo>,
     pub formation: FormationType,
     pub leader_id: Option<Uuid>,
@@ -22,6 +24,10 @@ pub struct DroneSwarm {
 fn default_broadcast_channel() -> broadcast::Sender<SwarmMessage> {
     let (sender, _) = broadcast::channel(100);
     sender
+}
+
+fn default_owner_id() -> String {
+    "unassigned".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +93,7 @@ pub enum DroneStatus {
     Offline,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SwarmStatus {
     Inactive,
     Forming,
@@ -168,6 +174,7 @@ impl SwarmController {
         let swarm = DroneSwarm {
             id: swarm_id,
             name,
+            owner_id: default_owner_id(),
             drones: HashMap::new(),
             formation,
             leader_id: None,
@@ -327,12 +334,30 @@ impl DroneSwarm {
         Self {
             id: Uuid::new_v4(),
             name,
+            owner_id: default_owner_id(),
             drones,
             formation,
             leader_id: None,
             communication_channel: sender,
             status: SwarmStatus::Inactive,
         }
+    }
+
+    pub fn new_owned(
+        name: String,
+        drone_ids: Vec<Uuid>,
+        formation: FormationType,
+        owner_id: String,
+    ) -> Self {
+        let mut swarm = Self::new(name, drone_ids, formation);
+        swarm.owner_id = owner_id;
+        swarm
+    }
+
+    pub fn drone_ids(&self) -> Vec<Uuid> {
+        let mut drone_ids: Vec<Uuid> = self.drones.keys().copied().collect();
+        drone_ids.sort();
+        drone_ids
     }
 }
 

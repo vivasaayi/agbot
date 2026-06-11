@@ -14,7 +14,7 @@ pub mod swarm;
 pub use collision_avoidance::{AvoidanceManeuver, CollisionAvoidanceSystem};
 pub use coordination::{CoordinationEngine, CoordinationStatus};
 pub use mission_assignment::{DroneAssignment, MissionAssignmentEngine};
-pub use swarm::{DroneSwarm, SwarmController};
+pub use swarm::{DroneSwarm, SwarmController, SwarmStatus};
 
 /// Multi-drone control system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +25,36 @@ pub struct MultiDroneController {
     pub global_constraints: GlobalConstraints,
     pub communication_range_m: f32,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmRegistryEntry {
+    pub swarm_id: Uuid,
+    pub drone_ids: Vec<Uuid>,
+    pub owner_id: String,
+    pub status: SwarmStatus,
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum SwarmRegistryError {
+    #[error("swarm already exists: {swarm_id}")]
+    SwarmAlreadyExists { swarm_id: Uuid },
+    #[error("swarm not found: {swarm_id}")]
+    SwarmNotFound { swarm_id: Uuid },
+    #[error(
+        "drone {drone_id} is already in active swarm {existing_swarm_id}; requested swarm {requested_swarm_id}"
+    )]
+    ActiveDroneMembershipConflict {
+        drone_id: Uuid,
+        existing_swarm_id: Uuid,
+        requested_swarm_id: Uuid,
+    },
+    #[error("invalid swarm transition for {swarm_id}: {from:?} -> {to:?}")]
+    InvalidStatusTransition {
+        swarm_id: Uuid,
+        from: SwarmStatus,
+        to: SwarmStatus,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,28 +177,183 @@ impl MultiDroneController {
         }
     }
 
-    pub fn add_swarm(&mut self, swarm: DroneSwarm) {
-        self.swarms.insert(swarm.id, swarm);
+    pub fn register_swarm(
+        &mut self,
+        swarm: DroneSwarm,
+    ) -> std::result::Result<(), SwarmRegistryError> {
+        let swarm_id = swarm.id;
+
+        if self.swarms.contains_key(&swarm_id) {
+            return Err(SwarmRegistryError::SwarmAlreadyExists { swarm_id });
+        }
+
+        if Self::status_participates_in_active_membership(swarm.status) {
+            let drone_ids = swarm.drone_ids();
+            if let Some((drone_id, existing_swarm_id)) =
+                self.active_membership_conflict(swarm_id, &drone_ids)
+            {
+                return Err(SwarmRegistryError::ActiveDroneMembershipConflict {
+                    drone_id,
+                    existing_swarm_id,
+                    requested_swarm_id: swarm_id,
+                });
+            }
+        }
+
+        self.swarms.insert(swarm_id, swarm);
+        Ok(())
     }
 
-    pub fn remove_swarm(&mut self, swarm_id: &Uuid) -> Option<DroneSwarm> {
-        self.swarms.remove(swarm_id)
+    pub fn add_swarm(&mut self, swarm: DroneSwarm) -> std::result::Result<(), SwarmRegistryError> {
+        self.register_swarm(swarm)
+    }
+
+    pub fn remove_swarm(
+        &mut self,
+        swarm_id: &Uuid,
+    ) -> std::result::Result<DroneSwarm, SwarmRegistryError> {
+        self.swarms
+            .remove(swarm_id)
+            .ok_or(SwarmRegistryError::SwarmNotFound {
+                swarm_id: *swarm_id,
+            })
     }
 
     pub fn get_swarm(&self, swarm_id: &Uuid) -> Option<&DroneSwarm> {
         self.swarms.get(swarm_id)
     }
 
+    pub fn list_swarm_registry(&self) -> Vec<SwarmRegistryEntry> {
+        let mut entries: Vec<SwarmRegistryEntry> = self
+            .swarms
+            .values()
+            .map(|swarm| SwarmRegistryEntry {
+                swarm_id: swarm.id,
+                drone_ids: swarm.drone_ids(),
+                owner_id: swarm.owner_id.clone(),
+                status: swarm.status,
+            })
+            .collect();
+        entries.sort_by_key(|entry| entry.swarm_id);
+        entries
+    }
+
+    pub fn transition_swarm_status(
+        &mut self,
+        swarm_id: Uuid,
+        next_status: SwarmStatus,
+    ) -> std::result::Result<SwarmStatus, SwarmRegistryError> {
+        let current_status = self
+            .swarms
+            .get(&swarm_id)
+            .ok_or(SwarmRegistryError::SwarmNotFound { swarm_id })?
+            .status;
+
+        if current_status == next_status {
+            return Ok(next_status);
+        }
+
+        if !Self::is_valid_swarm_transition(current_status, next_status) {
+            return Err(SwarmRegistryError::InvalidStatusTransition {
+                swarm_id,
+                from: current_status,
+                to: next_status,
+            });
+        }
+
+        if Self::status_participates_in_active_membership(next_status) {
+            let drone_ids = self
+                .swarms
+                .get(&swarm_id)
+                .ok_or(SwarmRegistryError::SwarmNotFound { swarm_id })?
+                .drone_ids();
+            if let Some((drone_id, existing_swarm_id)) =
+                self.active_membership_conflict(swarm_id, &drone_ids)
+            {
+                return Err(SwarmRegistryError::ActiveDroneMembershipConflict {
+                    drone_id,
+                    existing_swarm_id,
+                    requested_swarm_id: swarm_id,
+                });
+            }
+        }
+
+        let swarm = self
+            .swarms
+            .get_mut(&swarm_id)
+            .ok_or(SwarmRegistryError::SwarmNotFound { swarm_id })?;
+        swarm.status = next_status;
+        Ok(next_status)
+    }
+
     pub fn list_all_drones(&self) -> Vec<Uuid> {
-        self.swarms
+        let mut drone_ids: Vec<Uuid> = self
+            .swarms
             .values()
             .flat_map(|swarm| swarm.drones.keys())
             .cloned()
-            .collect()
+            .collect();
+        drone_ids.sort();
+        drone_ids
     }
 
     pub fn update_constraints(&mut self, constraints: GlobalConstraints) {
         self.global_constraints = constraints;
+    }
+
+    fn active_membership_conflict(
+        &self,
+        requested_swarm_id: Uuid,
+        requested_drone_ids: &[Uuid],
+    ) -> Option<(Uuid, Uuid)> {
+        let mut existing_swarms: Vec<(&Uuid, &DroneSwarm)> = self
+            .swarms
+            .iter()
+            .filter(|(swarm_id, swarm)| {
+                **swarm_id != requested_swarm_id
+                    && Self::status_participates_in_active_membership(swarm.status)
+            })
+            .collect();
+        existing_swarms.sort_by_key(|(swarm_id, _)| **swarm_id);
+
+        let mut requested_ids = requested_drone_ids.to_vec();
+        requested_ids.sort();
+
+        for (existing_swarm_id, existing_swarm) in existing_swarms {
+            for drone_id in &requested_ids {
+                if existing_swarm.drones.contains_key(drone_id) {
+                    return Some((*drone_id, *existing_swarm_id));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn status_participates_in_active_membership(status: SwarmStatus) -> bool {
+        matches!(
+            status,
+            SwarmStatus::Forming
+                | SwarmStatus::Active
+                | SwarmStatus::Dispersing
+                | SwarmStatus::Emergency
+        )
+    }
+
+    fn is_valid_swarm_transition(from: SwarmStatus, to: SwarmStatus) -> bool {
+        matches!(
+            (from, to),
+            (SwarmStatus::Inactive, SwarmStatus::Forming)
+                | (SwarmStatus::Forming, SwarmStatus::Active)
+                | (SwarmStatus::Forming, SwarmStatus::Inactive)
+                | (SwarmStatus::Forming, SwarmStatus::Emergency)
+                | (SwarmStatus::Active, SwarmStatus::Dispersing)
+                | (SwarmStatus::Active, SwarmStatus::Emergency)
+                | (SwarmStatus::Dispersing, SwarmStatus::Inactive)
+                | (SwarmStatus::Dispersing, SwarmStatus::Emergency)
+                | (SwarmStatus::Emergency, SwarmStatus::Dispersing)
+                | (SwarmStatus::Emergency, SwarmStatus::Inactive)
+        )
     }
 }
 
@@ -267,9 +452,11 @@ impl MultiDroneControlService {
                             .collect(),
                     ),
                 };
-                let swarm = DroneSwarm::new("Auto-Swarm".to_string(), drone_ids, formation_type);
+                let mut swarm =
+                    DroneSwarm::new("Auto-Swarm".to_string(), drone_ids, formation_type);
+                swarm.status = swarm::SwarmStatus::Forming;
                 let mut controller = self.controller.write().await;
-                controller.add_swarm(swarm);
+                controller.register_swarm(swarm)?;
             }
             ControlCommand::ExecuteCoordinatedAction { swarm_id, action } => {
                 let action_str = format!("{:?}", action);
@@ -448,6 +635,127 @@ mod tests {
         assert!(controller.swarms.is_empty());
     }
 
+    #[test]
+    fn test_register_swarm_persists_owner_drone_ids_and_status() {
+        let mut controller = MultiDroneController::new("Test Controller".to_string());
+        let mut drone_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let mut expected_drone_ids = drone_ids.clone();
+        expected_drone_ids.sort();
+
+        let mut swarm = DroneSwarm::new_owned(
+            "North Block".to_string(),
+            std::mem::take(&mut drone_ids),
+            swarm::FormationType::Line,
+            "ops-team".to_string(),
+        );
+        swarm.status = swarm::SwarmStatus::Forming;
+        let swarm_id = swarm.id;
+
+        controller.register_swarm(swarm).unwrap();
+
+        let entries = controller.list_swarm_registry();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].swarm_id, swarm_id);
+        assert_eq!(entries[0].owner_id, "ops-team");
+        assert_eq!(entries[0].drone_ids, expected_drone_ids);
+        assert_eq!(entries[0].status, swarm::SwarmStatus::Forming);
+    }
+
+    #[test]
+    fn test_swarm_lifecycle_transitions_are_deterministic() {
+        let mut controller = MultiDroneController::new("Test Controller".to_string());
+        let swarm = DroneSwarm::new_owned(
+            "Lifecycle".to_string(),
+            vec![Uuid::new_v4()],
+            swarm::FormationType::Grid,
+            "ops-team".to_string(),
+        );
+        let swarm_id = swarm.id;
+        controller.register_swarm(swarm).unwrap();
+
+        let invalid = controller
+            .transition_swarm_status(swarm_id, swarm::SwarmStatus::Active)
+            .unwrap_err();
+        assert!(matches!(
+            invalid,
+            SwarmRegistryError::InvalidStatusTransition {
+                from: swarm::SwarmStatus::Inactive,
+                to: swarm::SwarmStatus::Active,
+                ..
+            }
+        ));
+
+        controller
+            .transition_swarm_status(swarm_id, swarm::SwarmStatus::Forming)
+            .unwrap();
+        controller
+            .transition_swarm_status(swarm_id, swarm::SwarmStatus::Active)
+            .unwrap();
+
+        assert_eq!(
+            controller.get_swarm(&swarm_id).unwrap().status,
+            swarm::SwarmStatus::Active
+        );
+    }
+
+    #[test]
+    fn test_active_drone_double_membership_is_rejected() {
+        let mut controller = MultiDroneController::new("Test Controller".to_string());
+        let shared_drone_id = Uuid::new_v4();
+
+        let mut first = DroneSwarm::new_owned(
+            "First".to_string(),
+            vec![shared_drone_id],
+            swarm::FormationType::Line,
+            "ops-team".to_string(),
+        );
+        first.status = swarm::SwarmStatus::Active;
+        let first_swarm_id = first.id;
+        controller.register_swarm(first).unwrap();
+
+        let mut second = DroneSwarm::new_owned(
+            "Second".to_string(),
+            vec![shared_drone_id],
+            swarm::FormationType::Line,
+            "ops-team".to_string(),
+        );
+        second.status = swarm::SwarmStatus::Active;
+        let second_swarm_id = second.id;
+
+        let err = controller.register_swarm(second).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SwarmRegistryError::ActiveDroneMembershipConflict {
+                drone_id,
+                existing_swarm_id,
+                requested_swarm_id,
+            } if drone_id == shared_drone_id
+                && existing_swarm_id == first_swarm_id
+                && requested_swarm_id == second_swarm_id
+        ));
+        assert!(controller.get_swarm(&second_swarm_id).is_none());
+    }
+
+    #[test]
+    fn test_register_list_remove_contract() {
+        let mut controller = MultiDroneController::new("Test Controller".to_string());
+        let swarm = DroneSwarm::new_owned(
+            "Contract".to_string(),
+            vec![Uuid::new_v4()],
+            swarm::FormationType::Circle,
+            "ops-team".to_string(),
+        );
+        let swarm_id = swarm.id;
+
+        controller.register_swarm(swarm).unwrap();
+        assert_eq!(controller.list_swarm_registry().len(), 1);
+
+        let removed = controller.remove_swarm(&swarm_id).unwrap();
+        assert_eq!(removed.id, swarm_id);
+        assert!(controller.list_swarm_registry().is_empty());
+    }
+
     #[tokio::test]
     async fn test_service_creation() {
         let service = MultiDroneControlService::new("Test Service".to_string());
@@ -463,5 +771,43 @@ mod tests {
         };
         let result = service.send_command(command).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_form_swarm_command_rejects_duplicate_active_membership() {
+        let service = MultiDroneControlService::new("Test Service".to_string());
+        let drone_id = Uuid::new_v4();
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: vec![drone_id],
+                formation: Formation::Line {
+                    spacing_m: 5.0,
+                    heading_deg: 0.0,
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: vec![drone_id],
+                formation: Formation::Grid {
+                    rows: 1,
+                    cols: 1,
+                    spacing_m: 5.0,
+                },
+            })
+            .await
+            .unwrap();
+        let err = service.process_commands().await.unwrap_err();
+
+        assert!(err.to_string().contains("already in active swarm"));
+        let controller = service.controller.read().await;
+        let registry = controller.list_swarm_registry();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0].drone_ids, vec![drone_id]);
+        assert_eq!(registry[0].status, swarm::SwarmStatus::Forming);
     }
 }
