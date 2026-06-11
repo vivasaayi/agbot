@@ -2,7 +2,13 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
-use shared::{config::AgroConfig, schemas::LidarScan, AgroResult};
+use shared::{
+    config::AgroConfig,
+    schemas::{
+        assert_raster_spatial_ref, GeoBounds, LidarScan, RasterResolution, RasterSpatialRef,
+    },
+    AgroResult,
+};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -65,6 +71,19 @@ pub struct LidarScanIngest {
     pub summary: LidarScanIngestSummary,
 }
 
+pub const OCCUPANCY_GRID_LOCAL_CRS: &str = "LOCAL_LIDAR_METERS";
+
+#[derive(Debug, Clone)]
+pub struct LidarOccupancyGrid {
+    pub cells: HashMap<(i32, i32), GridCell>,
+    pub spatial_ref: RasterSpatialRef,
+    pub resolution: RasterResolution,
+    pub width: u32,
+    pub height: u32,
+    pub min_grid_x: i32,
+    pub min_grid_y: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct GridCell {
     pub occupied: bool,
@@ -116,16 +135,17 @@ impl LidarMapper {
         let all_scans = ingest.scans;
 
         // Create occupancy grid
-        let grid = self.create_occupancy_grid(&all_scans)?;
+        let grid = self.build_occupancy_grid(&all_scans)?;
+        self.save_occupancy_spatial_ref(&grid, output_dir).await?;
 
         // Save grid as image
-        self.save_grid_image(&grid, output_dir).await?;
+        self.save_grid_image(&grid.cells, output_dir).await?;
 
         // Save point cloud
         self.save_point_cloud(&all_scans, output_dir).await?;
 
         // Generate obstacle heatmap
-        self.save_obstacle_heatmap(&grid, output_dir).await?;
+        self.save_obstacle_heatmap(&grid.cells, output_dir).await?;
 
         info!("LiDAR mapping completed");
         Ok(())
@@ -275,7 +295,12 @@ impl LidarMapper {
         &self,
         scans: &[LidarScan],
     ) -> AgroResult<HashMap<(i32, i32), GridCell>> {
+        Ok(self.build_occupancy_grid(scans)?.cells)
+    }
+
+    pub fn build_occupancy_grid(&self, scans: &[LidarScan]) -> AgroResult<LidarOccupancyGrid> {
         let resolution = self.config.processing.lidar_grid_resolution;
+        let spatial_resolution = Self::assert_positive_grid_resolution(resolution)?;
         let dist_thresh = self.config.processing.lidar_obstacle_distance_threshold;
         let qual_thresh = self.config.processing.lidar_quality_threshold;
         let mut grid: HashMap<(i32, i32), GridCell> = HashMap::new();
@@ -314,7 +339,95 @@ impl LidarMapper {
             }
         }
         info!("Generated occupancy grid with {} cells", grid.len());
-        Ok(grid)
+        let (min_grid_x, min_grid_y, width, height) = Self::occupancy_grid_dimensions(&grid);
+        let spatial_ref =
+            Self::occupancy_grid_spatial_ref(min_grid_x, min_grid_y, width, height, resolution)?;
+        Ok(LidarOccupancyGrid {
+            cells: grid,
+            spatial_ref,
+            resolution: spatial_resolution,
+            width,
+            height,
+            min_grid_x,
+            min_grid_y,
+        })
+    }
+
+    fn assert_positive_grid_resolution(resolution: f32) -> AgroResult<RasterResolution> {
+        if resolution.is_finite() && resolution > 0.0 {
+            Ok(RasterResolution {
+                x: resolution as f64,
+                y: resolution as f64,
+            })
+        } else {
+            Err(shared::error::AgroError::Processing(
+                "LiDAR occupancy grid requires a positive resolution".into(),
+            ))
+        }
+    }
+
+    fn occupancy_grid_dimensions(grid: &HashMap<(i32, i32), GridCell>) -> (i32, i32, u32, u32) {
+        if grid.is_empty() {
+            return (0, 0, 1, 1);
+        }
+
+        let min_x = grid.keys().map(|(x, _)| *x).min().unwrap_or(0);
+        let max_x = grid.keys().map(|(x, _)| *x).max().unwrap_or(0);
+        let min_y = grid.keys().map(|(_, y)| *y).min().unwrap_or(0);
+        let max_y = grid.keys().map(|(_, y)| *y).max().unwrap_or(0);
+
+        (
+            min_x,
+            min_y,
+            (max_x - min_x + 1) as u32,
+            (max_y - min_y + 1) as u32,
+        )
+    }
+
+    fn occupancy_grid_spatial_ref(
+        min_grid_x: i32,
+        min_grid_y: i32,
+        width: u32,
+        height: u32,
+        resolution: f32,
+    ) -> AgroResult<RasterSpatialRef> {
+        let resolution = Self::assert_positive_grid_resolution(resolution)?;
+        let origin_x = min_grid_x as f64 * resolution.x;
+        let origin_y = min_grid_y as f64 * resolution.y;
+        let bbox = GeoBounds {
+            min_lon: origin_x,
+            min_lat: origin_y,
+            max_lon: origin_x + width as f64 * resolution.x,
+            max_lat: origin_y + height as f64 * resolution.y,
+        };
+        let spatial_ref = RasterSpatialRef {
+            georeferenced: true,
+            crs: Some(OCCUPANCY_GRID_LOCAL_CRS.to_string()),
+            bbox: Some(bbox),
+            geo_transform: Some([origin_x, resolution.x, 0.0, origin_y, 0.0, resolution.y]),
+            resolution: Some(resolution),
+        };
+
+        assert_raster_spatial_ref(Some(&spatial_ref), width, height).map_err(|e| {
+            shared::error::AgroError::Processing(format!(
+                "LiDAR occupancy grid spatial reference assertion failed: {e}"
+            ))
+        })
+    }
+
+    async fn save_occupancy_spatial_ref(
+        &self,
+        grid: &LidarOccupancyGrid,
+        output_dir: &PathBuf,
+    ) -> AgroResult<()> {
+        let output_path = output_dir.join("occupancy_grid_spatial_ref.json");
+        let content = serde_json::to_vec_pretty(&grid.spatial_ref)?;
+        tokio::fs::write(&output_path, content).await?;
+        info!(
+            "Saved occupancy grid spatial reference to: {:?}",
+            output_path
+        );
+        Ok(())
     }
 
     async fn save_grid_image(
@@ -471,6 +584,14 @@ mod tests {
         }
     }
 
+    fn test_mapper_with_resolution(resolution: f32) -> LidarMapper {
+        let mut config = AgroConfig::load().unwrap();
+        config.processing.lidar_grid_resolution = resolution;
+        LidarMapper {
+            config: Arc::new(config),
+        }
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("agbot_lidar_{name}_{}", Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
@@ -495,6 +616,15 @@ mod tests {
             timestamp: captured_at,
             points,
             scan_id,
+        }
+    }
+
+    fn point(angle: f32, distance: f32) -> LidarPoint {
+        LidarPoint {
+            timestamp: Utc::now(),
+            angle,
+            distance,
+            quality: 30,
         }
     }
 
@@ -601,5 +731,57 @@ mod tests {
         let persisted: LidarScanIngestSummary =
             serde_json::from_str(&fs::read_to_string(persisted_path).unwrap()).unwrap();
         assert_eq!(persisted, ingest.summary);
+    }
+
+    #[test]
+    fn build_occupancy_grid_asserts_spatial_ref_from_cell_extent() {
+        let mapper = test_mapper_with_resolution(1.0);
+        let scan = LidarScan {
+            timestamp: Utc::now(),
+            points: vec![point(0.0, 1000.0), point(90.0, 2000.0)],
+            scan_id: Uuid::new_v4(),
+        };
+
+        let product = mapper.build_occupancy_grid(&[scan]).unwrap();
+
+        assert_eq!(product.cells.len(), 2);
+        assert_eq!(product.width, 2);
+        assert_eq!(product.height, 3);
+        assert_eq!(product.min_grid_x, 0);
+        assert_eq!(product.min_grid_y, 0);
+        assert_eq!(
+            product.spatial_ref.crs.as_deref(),
+            Some("LOCAL_LIDAR_METERS")
+        );
+        assert_eq!(
+            product.spatial_ref.resolution,
+            Some(RasterResolution { x: 1.0, y: 1.0 })
+        );
+        assert_eq!(
+            product.spatial_ref.bbox,
+            Some(GeoBounds {
+                min_lon: 0.0,
+                min_lat: 0.0,
+                max_lon: 2.0,
+                max_lat: 3.0,
+            })
+        );
+        let asserted =
+            assert_raster_spatial_ref(Some(&product.spatial_ref), product.width, product.height)
+                .unwrap();
+        assert_eq!(asserted, product.spatial_ref);
+
+        let first_cell = product.cells.get(&(1, 0)).unwrap();
+        assert_eq!(first_cell.total_observations, 1);
+        assert_eq!(first_cell.obstacle_count, 1);
+    }
+
+    #[test]
+    fn build_occupancy_grid_rejects_non_positive_resolution() {
+        for resolution in [0.0, -1.0] {
+            let mapper = test_mapper_with_resolution(resolution);
+            let err = mapper.build_occupancy_grid(&[]).unwrap_err();
+            assert!(err.to_string().contains("positive resolution"));
+        }
     }
 }
