@@ -8,10 +8,14 @@ use uuid::Uuid;
 
 pub mod export;
 pub mod indexing;
+pub mod rplidar;
 pub mod storage;
 
 pub use export::{DataExporter, ExportFormat};
 pub use indexing::{DataIndexer, IndexConfig, SearchQuery};
+pub use rplidar::{
+    lidar_scan_to_record, parse_rplidar_a3_measurements, LidarRecordError, RplidarParseError,
+};
 pub use storage::{StorageConfig, StorageEngine};
 
 /// Data collection and storage system
