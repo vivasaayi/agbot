@@ -10,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 using agbot::flight_sim::MissionLoader;
 using agbot::flight_sim::RunConfig;
@@ -31,6 +32,7 @@ struct Args {
     std::optional<std::size_t> trace_retention_keep;
     agbot::flight_sim::Vec3 steady_wind_mps;
     agbot::flight_sim::SensorCalibrationProfile sensor_profile = agbot::flight_sim::ideal_sensor_profile();
+    agbot::flight_sim::LidarRaycastConfig lidar;
     agbot::flight_sim::FaultInjectionPlan faults;
 };
 
@@ -51,6 +53,17 @@ agbot::flight_sim::Vec3 parse_vec3_csv(const std::string& text, const std::strin
     };
 }
 
+std::pair<std::uint32_t, std::uint32_t> parse_u32_pair_csv(const std::string& text, const std::string& field) {
+    const std::size_t comma = text.find(',');
+    if (comma == std::string::npos || text.find(',', comma + 1) != std::string::npos) {
+        throw std::runtime_error(field + " must be formatted as H,V");
+    }
+
+    const auto horizontal = static_cast<std::uint32_t>(std::stoul(text.substr(0, comma)));
+    const auto vertical = static_cast<std::uint32_t>(std::stoul(text.substr(comma + 1)));
+    return {horizontal, vertical};
+}
+
 [[noreturn]] void print_usage_and_exit(int code) {
     std::cout << "Usage: agbot_flight_sim_headless --seed N [options]\n"
               << "  --seed N             REQUIRED. Seed for deterministic run (refuses to start without it).\n"
@@ -63,6 +76,11 @@ agbot::flight_sim::Vec3 parse_vec3_csv(const std::string& text, const std::strin
               << "  --wind-mps X,Y,Z     Steady wind vector in m/s applied to airborne ground track.\n"
               << "  --sensor-profile NAME\n"
               << "                       Sensor calibration/noise profile: ideal, cheap_gps, rtk_gps, noisy_imu.\n"
+              << "  --disable-lidar      Do not emit the deterministic LiDAR JSONL sidecar.\n"
+              << "  --lidar-samples H,V  Horizontal samples and vertical rings (default 36,3).\n"
+              << "  --lidar-max-range M  Maximum LiDAR raycast range in meters (default 80).\n"
+              << "  --lidar-range-noise M\n"
+              << "                       Seeded uniform range noise in meters (default 0).\n"
               << "  --trace-retention-keep N\n"
               << "                       Delete older JSONL traces in the output directory after keeping N newest runs.\n"
               << "  --fault SPEC         Add seeded fault: class:seed:start_step:end_step:magnitude[:target].\n"
@@ -91,6 +109,16 @@ Args parse_args(int argc, char** argv) {
             args.steady_wind_mps = parse_vec3_csv(argv[++index], "--wind-mps");
         } else if (current == "--sensor-profile" && index + 1 < argc) {
             args.sensor_profile = agbot::flight_sim::sensor_profile_by_name(argv[++index]);
+        } else if (current == "--disable-lidar") {
+            args.lidar.enabled = false;
+        } else if (current == "--lidar-samples" && index + 1 < argc) {
+            const auto [horizontal, vertical] = parse_u32_pair_csv(argv[++index], "--lidar-samples");
+            args.lidar.horizontal_samples = horizontal;
+            args.lidar.vertical_samples = vertical;
+        } else if (current == "--lidar-max-range" && index + 1 < argc) {
+            args.lidar.max_range_m = std::stod(argv[++index]);
+        } else if (current == "--lidar-range-noise" && index + 1 < argc) {
+            args.lidar.range_noise_m = std::stod(argv[++index]);
         } else if (current == "--trace-retention-keep" && index + 1 < argc) {
             args.trace_retention_keep = static_cast<std::size_t>(std::stoull(argv[++index]));
         } else if (current == "--fault" && index + 1 < argc) {
@@ -109,6 +137,15 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.trace_retention_keep.has_value() && *args.trace_retention_keep == 0) {
         throw std::runtime_error("--trace-retention-keep must be positive");
+    }
+    if (args.lidar.enabled && (args.lidar.horizontal_samples == 0 || args.lidar.vertical_samples == 0)) {
+        throw std::runtime_error("--lidar-samples values must be positive");
+    }
+    if (args.lidar.max_range_m <= 0.0) {
+        throw std::runtime_error("--lidar-max-range must be positive");
+    }
+    if (args.lidar.range_noise_m < 0.0) {
+        throw std::runtime_error("--lidar-range-noise must be non-negative");
     }
     agbot::flight_sim::validate_fault_plan(args.faults);
     return args;
@@ -140,6 +177,7 @@ int main(int argc, char** argv) {
         config.max_time_s = args.max_time_s;
         config.steady_wind_mps = args.steady_wind_mps;
         config.sensor_profile = args.sensor_profile;
+        config.lidar = args.lidar;
         config.faults = args.faults;
 
         RunResult result = run_deterministic(mission, config);
@@ -154,7 +192,12 @@ int main(int argc, char** argv) {
 
         const std::filesystem::path manifest_path =
             std::filesystem::path(args.output_path).replace_extension(".manifest.json");
+        const std::filesystem::path lidar_path =
+            std::filesystem::path(args.output_path).replace_extension(".lidar.jsonl");
         write_file(args.output_path, result.trace_jsonl);
+        if (args.lidar.enabled) {
+            write_file(lidar_path, result.lidar_scans_jsonl);
+        }
         if (args.trace_retention_keep.has_value()) {
             const auto retention = agbot::flight_sim::enforce_trace_retention(
                 std::filesystem::path(args.output_path).parent_path(),
@@ -167,8 +210,10 @@ int main(int argc, char** argv) {
         std::cout << "Mission: " << result.manifest.mission_name << "\n"
                   << "Completed: " << (result.manifest.completed ? "yes" : "no") << "\n"
                   << "Samples: " << result.manifest.sample_count << "\n"
+                  << "LiDAR scans: " << result.manifest.lidar_scan_count << "\n"
                   << "Output hash: " << result.manifest.output_hash << "\n"
                   << "Telemetry: " << args.output_path << "\n"
+                  << "LiDAR: " << (args.lidar.enabled ? lidar_path.string() : "disabled") << "\n"
                   << "Manifest: " << manifest_path << "\n";
 
         return result.manifest.completed ? 0 : 2;

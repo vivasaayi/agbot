@@ -59,6 +59,30 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
 
 Supported profiles are `ideal`, `cheap_gps`, `rtk_gps`, and `noisy_imu`. The manifest records the selected profile under `sensor_config` with `deterministic_uniform` noise distribution and `sensor_config_hash`.
 
+## LiDAR Raycast
+
+Headless runs emit a deterministic LiDAR sidecar by default. If telemetry is
+written to `flight_sim_cpp/out/sample.jsonl`, the LiDAR scans are written to
+`flight_sim_cpp/out/sample.lidar.jsonl`.
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --lidar-samples 72,4 \
+  --lidar-max-range 100 \
+  --lidar-range-noise 0.01 \
+  --output flight_sim_cpp/out/lidar.jsonl
+```
+
+Each line is a capture-shaped `LidarScan` JSON object consumable by the Rust
+`shared::schemas::LidarScan` contract: scan-level `timestamp`, `points`, and
+`scan_id`, with point-level `timestamp`, `angle`, `distance`, and `quality`.
+Extra point-cloud fields record hit coordinates and ray evidence for regression
+tests. The manifest records `lidar_config`, `lidar_config_hash`,
+`lidar_scan_count`, and `lidar_output_hash`. Use `--disable-lidar` for
+telemetry-only runs.
+
 ## Trace Retention
 
 Use retention only on a dedicated run output directory:

@@ -144,6 +144,23 @@ TwinContractSchemaV1 build_schema() {
             },
         },
         {
+            "LidarPointV1",
+            {
+                "timestamp",
+                "angle",
+                "distance",
+                "quality",
+            },
+        },
+        {
+            "LidarScanV1",
+            {
+                "timestamp",
+                "points",
+                "scan_id",
+            },
+        },
+        {
             "ScenarioManifestV1",
             {
                 "simulator_version",
@@ -161,6 +178,10 @@ TwinContractSchemaV1 build_schema() {
                 "weather_config_hash",
                 "sensor_config",
                 "sensor_config_hash",
+                "lidar_config",
+                "lidar_config_hash",
+                "lidar_scan_count",
+                "lidar_output_hash",
                 "safety_config",
                 "safety_config_hash",
                 "trace_retention_keep",
@@ -205,6 +226,7 @@ TwinContractSchemaV1 build_schema() {
         "terrain_crs_extent_assertions",
         "wind_field",
         "sensor_noise_calibration",
+        "lidar_raycast",
     };
     schema.schema_hash = sha256_hex(schema_json_without_hash(schema));
     return schema;

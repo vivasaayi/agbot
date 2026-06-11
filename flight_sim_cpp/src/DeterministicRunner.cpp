@@ -1,6 +1,7 @@
 #include "agbot_flight_sim/DeterministicRunner.hpp"
 
 #include "agbot_flight_sim/GeoTerrain.hpp"
+#include "agbot_flight_sim/LidarSimulator.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TwinContractV1.hpp"
 
@@ -118,6 +119,10 @@ std::string RunManifest::to_json() const {
            << ",\"weather_config_hash\":\"" << escape_json(weather_config_hash) << "\""
            << ",\"sensor_config\":" << sensor_config_json
            << ",\"sensor_config_hash\":\"" << escape_json(sensor_config_hash) << "\""
+           << ",\"lidar_config\":" << lidar_config_json
+           << ",\"lidar_config_hash\":\"" << escape_json(lidar_config_hash) << "\""
+           << ",\"lidar_scan_count\":" << lidar_scan_count
+           << ",\"lidar_output_hash\":\"" << escape_json(lidar_output_hash) << "\""
            << ",\"safety_config\":" << safety_config_json
            << ",\"safety_config_hash\":\"" << escape_json(safety_config_hash) << "\""
            << ",\"trace_retention_keep\":" << trace_retention_keep
@@ -146,10 +151,13 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     DroneSimulation simulation(mission);
 
     std::ostringstream trace;
+    std::ostringstream lidar_trace;
     std::uint64_t step_count = 0;
     std::uint64_t sample_count = 0;
+    std::uint64_t lidar_scan_count = 0;
     double next_record_s = 0.0;
     std::vector<FaultEvent> fault_events;
+    const TerrainMesh lidar_terrain = build_lidar_flat_terrain_for_mission(mission);
 
     const auto record = [&](const DroneState& state, std::uint64_t step) {
         if (sensor_stream_suppressed(config.faults, step)) {
@@ -158,6 +166,11 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
         const DroneState observed = apply_observation_faults(state, config.faults, step);
         trace << format_telemetry_sample(observed) << "\n";
         ++sample_count;
+        if (config.lidar.enabled) {
+            const LidarScan scan = raycast_lidar_scan(observed, lidar_terrain, config.lidar, config.seed, step);
+            lidar_trace << scan.to_json() << "\n";
+            ++lidar_scan_count;
+        }
     };
 
     while (!simulation.is_complete() && simulation.state().mission_time_s < config.max_time_s) {
@@ -176,6 +189,7 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
 
     RunResult result;
     result.trace_jsonl = trace.str();
+    result.lidar_scans_jsonl = lidar_trace.str();
 
     RunManifest& manifest = result.manifest;
     manifest.simulator_version = kSimulatorVersion;
@@ -196,6 +210,8 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     manifest.weather_config_hash = sha256_hex(manifest.weather_config_json);
     manifest.sensor_config_json = sensor_config_json(config.sensor_profile);
     manifest.sensor_config_hash = sha256_hex(manifest.sensor_config_json);
+    manifest.lidar_config_json = lidar_config_json(config.lidar);
+    manifest.lidar_config_hash = sha256_hex(manifest.lidar_config_json);
     {
         std::ostringstream run_id_input;
         run_id_input << std::fixed << std::setprecision(9)
@@ -210,17 +226,20 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
                      << manifest.faults_hash << "|"
                      << manifest.terrain_tiles_hash << "|"
                      << manifest.weather_config_hash << "|"
-                     << manifest.sensor_config_hash;
+                     << manifest.sensor_config_hash << "|"
+                     << manifest.lidar_config_hash;
         manifest.run_id = sha256_hex(run_id_input.str());
     }
     manifest.step_count = step_count;
     manifest.sample_count = sample_count;
+    manifest.lidar_scan_count = lidar_scan_count;
     manifest.prng_nonce = prng_nonce;
     manifest.safety_config_json = default_safety_config_json();
     manifest.safety_config_hash = sha256_hex(manifest.safety_config_json);
     manifest.fault_events_json = fault_events_to_json(fault_events);
     manifest.fault_events_hash = sha256_hex(manifest.fault_events_json);
     manifest.output_hash = sha256_hex(result.trace_jsonl);
+    manifest.lidar_output_hash = sha256_hex(result.lidar_scans_jsonl);
     manifest.completed = simulation.is_complete();
 
     return result;

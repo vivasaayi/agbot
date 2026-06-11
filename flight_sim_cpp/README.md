@@ -87,6 +87,31 @@ Supported profiles are `ideal`, `cheap_gps`, `rtk_gps`, and `noisy_imu`. The
 manifest records profile noise/bias settings under `sensor_config` and includes
 `sensor_config_hash` in the deterministic run identity.
 
+Every headless run also emits a capture-shaped LiDAR sidecar next to telemetry:
+`sample.jsonl` produces `sample.lidar.jsonl`. Each line is a deterministic
+`LidarScan` JSON object with `timestamp`, `scan_id`, and `points`; each point
+keeps the Rust capture fields `timestamp`, `angle`, `distance`, and `quality`,
+plus raycast point-cloud evidence (`x`, `y`, `z`, `range_m`, direction, ring).
+The manifest records `lidar_config`, `lidar_config_hash`, `lidar_scan_count`,
+and `lidar_output_hash`.
+
+Tune the deterministic raycast:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --lidar-samples 72,4 \
+  --lidar-max-range 100 \
+  --lidar-range-noise 0.01 \
+  --output flight_sim_cpp/out/lidar.jsonl
+```
+
+Use `--disable-lidar` when only the telemetry trace is needed. The first slice
+raycasts against the simulator terrain heightfield or a flat fallback terrain
+mesh derived from the mission footprint, so output remains reproducible without
+hardware or network access.
+
 Inject a seeded fault:
 
 ```bash
@@ -253,7 +278,7 @@ Supported actions:
 ## Next Milestones
 
 1. Move the viewer from immediate-mode OpenGL calls to the `Renderer` frame boundary.
-2. Add terrain/crop-row geometry and field polygons.
+2. Add crop-row and obstacle geometry to the LiDAR raycast scene.
 3. Replace the file-based mission bridge with live Rust service streaming.
 4. Add a Vulkan renderer backend with explicit swapchain, GPU buffers, and debug overlays.
 5. Add PX4/ArduPilot SITL visualization through MAVLink telemetry.

@@ -2,6 +2,7 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/FaultInjection.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
+#include "agbot_flight_sim/LidarSimulator.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/SensorModel.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
@@ -367,6 +368,92 @@ void test_builds_terrain_mesh_from_heightmap() {
     assert(std::abs(mesh.vertices[4].normal.length() - 1.0) < 0.001);
 }
 
+void test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance() {
+    const std::vector<float> heightmap(9, 0.0f);
+    const auto terrain = agbot::flight_sim::build_terrain_mesh(heightmap, 3, 40.0, 40.0);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {0.0, 10.0, 0.0};
+    state.mission_time_s = 0.25;
+
+    agbot::flight_sim::LidarRaycastConfig config;
+    config.horizontal_samples = 4;
+    config.vertical_samples = 2;
+    config.vertical_fov_deg = 90.0;
+    config.max_range_m = 30.0;
+    config.range_noise_m = 0.0;
+
+    const auto scan = agbot::flight_sim::raycast_lidar_scan(state, terrain, config, 42, 3);
+
+    assert(scan.status == "ok");
+    assert(scan.points.size() == 5);
+    assert(std::abs(scan.points[0].range_m - 10.0) <= 0.05);
+    for (std::size_t index = 1; index < scan.points.size(); ++index) {
+        assert(std::abs(scan.points[index].range_m - 14.1421) <= 0.05);
+        assert(std::abs(scan.points[index].position_m.y) <= 0.05);
+    }
+}
+
+void test_lidar_raycast_seeded_cloud_json_is_reproducible() {
+    const std::vector<float> heightmap(9, 0.0f);
+    const auto terrain = agbot::flight_sim::build_terrain_mesh(heightmap, 3, 40.0, 40.0);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {0.0, 10.0, 0.0};
+
+    agbot::flight_sim::LidarRaycastConfig config;
+    config.horizontal_samples = 4;
+    config.vertical_samples = 2;
+    config.vertical_fov_deg = 90.0;
+    config.max_range_m = 30.0;
+    config.range_noise_m = 0.02;
+
+    const auto a = agbot::flight_sim::raycast_lidar_scan(state, terrain, config, 9001, 7);
+    const auto b = agbot::flight_sim::raycast_lidar_scan(state, terrain, config, 9001, 7);
+    const auto c = agbot::flight_sim::raycast_lidar_scan(state, terrain, config, 9002, 7);
+
+    assert(a.to_json() == b.to_json());
+    assert(a.to_json() != c.to_json());
+    assert(a.to_json().find("\"scan_id\":\"") != std::string::npos);
+    assert(a.to_json().find("\"timestamp\":\"1970-01-01T00:00:00.000Z\"") != std::string::npos);
+    assert(a.to_json().find("\"distance\":") != std::string::npos);
+    assert(a.to_json().find("\"quality\":") != std::string::npos);
+    assert(agbot::flight_sim::lidar_config_json(config).find("\"profile\":\"sim_lidar_a3\"") != std::string::npos);
+}
+
+void test_lidar_raycast_empty_scene_returns_empty_capture_scan() {
+    agbot::flight_sim::DroneState state;
+    state.position = {0.0, 10.0, 0.0};
+
+    agbot::flight_sim::LidarRaycastConfig config;
+    const agbot::flight_sim::TerrainMesh empty_terrain;
+    const auto scan = agbot::flight_sim::raycast_lidar_scan(state, empty_terrain, config, 42, 0);
+
+    assert(scan.status == "empty_scene");
+    assert(scan.points.empty());
+    assert(scan.to_json().find("\"points\":[]") != std::string::npos);
+}
+
+void test_lidar_flat_fallback_terrain_covers_offset_mission_footprint() {
+    agbot::flight_sim::Mission mission;
+    mission.home = {100.0, 0.0, -50.0};
+    mission.waypoints.push_back({"offset_takeoff", {100.0, 10.0, -50.0}});
+    mission.waypoints.push_back({"offset_leg", {140.0, 10.0, -20.0}});
+
+    const auto terrain = agbot::flight_sim::build_lidar_flat_terrain_for_mission(mission, 8, 20.0);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {120.0, 10.0, -35.0};
+    agbot::flight_sim::LidarRaycastConfig config;
+    config.horizontal_samples = 4;
+    config.vertical_samples = 2;
+    config.max_range_m = 30.0;
+
+    const auto scan = agbot::flight_sim::raycast_lidar_scan(state, terrain, config, 42, 1);
+    assert(scan.status == "ok");
+    assert(!scan.points.empty());
+}
+
 agbot::flight_sim::RunConfig unit_run_config() {
     agbot::flight_sim::RunConfig config;
     config.seed = 42;
@@ -407,6 +494,24 @@ void test_deterministic_runner_seed_drives_prng() {
     assert(a.trace_jsonl == b.trace_jsonl); // physics seed-independent today
 }
 
+void test_deterministic_runner_emits_capture_shaped_lidar_jsonl() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto a = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto b = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+
+    assert(!a.lidar_scans_jsonl.empty());
+    assert(a.lidar_scans_jsonl == b.lidar_scans_jsonl);
+    assert(a.manifest.lidar_scan_count == a.manifest.sample_count);
+    assert(a.manifest.lidar_output_hash == agbot::flight_sim::sha256_hex(a.lidar_scans_jsonl));
+    assert(a.manifest.lidar_config_hash == agbot::flight_sim::sha256_hex(a.manifest.lidar_config_json));
+    assert(a.lidar_scans_jsonl.find("\"scan_id\":\"") != std::string::npos);
+    assert(a.lidar_scans_jsonl.find("\"timestamp\":\"") != std::string::npos);
+    assert(a.lidar_scans_jsonl.find("\"points\":[") != std::string::npos);
+    assert(a.lidar_scans_jsonl.find("\"angle\":") != std::string::npos);
+    assert(a.lidar_scans_jsonl.find("\"distance\":") != std::string::npos);
+    assert(a.lidar_scans_jsonl.find("\"quality\":") != std::string::npos);
+}
+
 // Story 02-28: the manifest records the contract version and deterministic hashes.
 void test_run_manifest_records_contract_and_hashes() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
@@ -427,11 +532,15 @@ void test_run_manifest_records_contract_and_hashes() {
     assert(json.find("\"terrain_tiles\":[]") != std::string::npos);
     assert(json.find("\"weather_config_hash\":\"") != std::string::npos);
     assert(json.find("\"sensor_config_hash\":\"") != std::string::npos);
+    assert(json.find("\"lidar_config_hash\":\"") != std::string::npos);
+    assert(json.find("\"lidar_scan_count\":") != std::string::npos);
+    assert(json.find("\"lidar_output_hash\":\"") != std::string::npos);
     assert(json.find("\"safety_config_hash\":\"") != std::string::npos);
     assert(result.manifest.output_hash.size() == 64);
     assert(result.manifest.mission_hash.size() == 64);
     assert(result.manifest.terrain_tiles_hash == agbot::flight_sim::sha256_hex("[]"));
     assert(result.manifest.output_hash == agbot::flight_sim::sha256_hex(result.trace_jsonl));
+    assert(result.manifest.lidar_output_hash == agbot::flight_sim::sha256_hex(result.lidar_scans_jsonl));
     assert(result.manifest.mission_hash == agbot::flight_sim::sha256_hex(agbot::flight_sim::mission_to_json(mission)));
     assert(result.manifest.output_hash != result.manifest.mission_hash);
 }
@@ -564,6 +673,7 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.has_capability("terrain_crs_extent_assertions"));
     assert(schema.has_capability("wind_field"));
     assert(schema.has_capability("sensor_noise_calibration"));
+    assert(schema.has_capability("lidar_raycast"));
     assert(schema.to_json().find("\"schema_hash\":\"" + schema.schema_hash + "\"") != std::string::npos);
 }
 
@@ -811,8 +921,13 @@ int main() {
     test_terrain_profile_asserts_crs_extent_resolution_and_samples_elevation();
     test_missing_terrain_tile_is_sampled_and_manifested_as_flat_fallback();
     test_builds_terrain_mesh_from_heightmap();
+    test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance();
+    test_lidar_raycast_seeded_cloud_json_is_reproducible();
+    test_lidar_raycast_empty_scene_returns_empty_capture_scan();
+    test_lidar_flat_fallback_terrain_covers_offset_mission_footprint();
     test_deterministic_runner_is_byte_identical();
     test_deterministic_runner_seed_drives_prng();
+    test_deterministic_runner_emits_capture_shaped_lidar_jsonl();
     test_run_manifest_records_contract_and_hashes();
     test_run_manifest_records_geodetic_terrain_fallback_evidence();
     test_zero_wind_keeps_deterministic_trace_identical();

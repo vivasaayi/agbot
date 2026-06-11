@@ -2,6 +2,7 @@
 
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/FaultInjection.hpp"
+#include "agbot_flight_sim/LidarSimulator.hpp"
 #include "agbot_flight_sim/Mission.hpp"
 #include "agbot_flight_sim/SensorModel.hpp"
 
@@ -38,6 +39,7 @@ struct RunConfig {
     double max_time_s = 600.0;
     Vec3 steady_wind_mps;
     SensorCalibrationProfile sensor_profile = ideal_sensor_profile();
+    LidarRaycastConfig lidar;
     FaultInjectionPlan faults;
 };
 
@@ -64,6 +66,10 @@ struct RunManifest {
     std::string weather_config_hash;
     std::string sensor_config_json = "{}";
     std::string sensor_config_hash;
+    std::string lidar_config_json = "{}";
+    std::string lidar_config_hash;
+    std::uint64_t lidar_scan_count = 0;
+    std::string lidar_output_hash;
     std::string safety_config_json = "{}";
     std::string safety_config_hash;
     std::size_t trace_retention_keep = 0;
@@ -80,6 +86,7 @@ struct RunManifest {
 
 struct RunResult {
     std::string trace_jsonl; // full telemetry trace, one JSON object per line
+    std::string lidar_scans_jsonl; // capture-shaped LidarScan JSONL, one scan per recorded sample
     RunManifest manifest;
 };
 
