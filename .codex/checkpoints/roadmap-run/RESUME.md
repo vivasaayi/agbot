@@ -2,17 +2,17 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 871070be5d4769d6599a635c0be60c4e4cb5a728 (`batch-04-10`)
-- **Latest checkpoint commit**: pending checkpoint commit for `batch-04-10`
-- **Current batch**: none — ready to select the next deterministic P0 batch after STORY `04-10`
-- **Completed batches**: 25 committed; 473 pending rows remain in the full-roadmap inventory
+- **Last implementation commit**: cf1fced7256af90294ac64db6b5f74b3c48e8c14 (`batch-04-13`)
+- **Latest checkpoint commit**: pending checkpoint commit for `batch-04-13`
+- **Current batch**: none — ready to select the next deterministic P0 batch after STORY `04-13`
+- **Completed batches**: 26 committed; 472 pending rows remain in the full-roadmap inventory
 - **Blocker**: none
 
 ## Latest verification
 
-- `cargo test -p data_collector indexing::tests::search_filters_indexed_records_by_space_time_type_and_drone` — pass
-- `cargo test -p data_collector indexing::tests::rebuild_from_records_recovers_stale_index` — pass
-- `cargo test -p data_collector tests::test_search_data_returns_persisted_records_after_restart` — pass
+- `cargo test -p data_collector tests::test_export_session_json_loads_real_records` — pass
+- `cargo test -p data_collector tests::test_export_session_csv_loads_real_records` — pass
+- `cargo test -p data_collector tests::test_export_session_json_allows_empty_session` — pass
 - `cargo test -p data_collector` — pass
 - `cargo check -p data_collector` — pass
 - `cargo fmt` — pass
@@ -20,4 +20,4 @@
 
 ## Next action
 
-Re-read the checkpoint, verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and roadmap hash, then select the next deterministic P0 batch after STORY `04-10`.
+Re-read the checkpoint, verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and roadmap hash, then select the next deterministic P0 batch after STORY `04-13`.
