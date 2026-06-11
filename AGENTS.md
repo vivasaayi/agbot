@@ -31,6 +31,18 @@ When the task is to execute the AGBot roadmap, do not ask the user which item to
 - Commit each completed, verified batch when the task definition requires commits.
 - Never claim the whole roadmap is complete unless every item has been processed and verified.
 
+## Roadmap Batch Loop Mode
+
+Use this mode only when the user or one-shot prompt explicitly asks the agent to continue through multiple roadmap batches in a loop. Keep the loop bounded; do not run indefinitely.
+
+- Default loop budget: up to 3 completed and committed batches per run unless the user specifies a different limit.
+- After each verified commit, update `checkpoint.sqlite` and `RESUME.md`, then re-read the active checkpoint before selecting the next batch.
+- Before starting each next batch, verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and the roadmap hash. If the roadmap hash changed, re-evaluate selection before claiming work.
+- Select, claim, implement, validate, commit, and checkpoint the next batch using the same P0 -> P1 -> P2 priority rules.
+- Stop the loop when there are no pending items, the configured batch limit is reached, validation fails and cannot be fixed within the current batch, unrelated worktree changes create a conflict, a real blocker prevents progress, or context/rate-limit pressure makes more implementation unsafe.
+- Before stopping, write a durable checkpoint with the current batch, feature IDs, changed files, commands run, verification state, last commit, blocker if any, and exact next action.
+- Codex cannot restart itself after API token, context, or rate limits. A truly continuous loop must be driven by an external harness that relaunches Codex with the one-shot prompt; SQLite and `RESUME.md` are the handoff contract.
+
 ## Parallel Batch Execution
 
 Speed matters, but parallelism must not corrupt the worktree.

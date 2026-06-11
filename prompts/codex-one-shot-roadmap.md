@@ -27,6 +27,24 @@ Task selection:
   - Choose related items that can be implemented and verified together without broad refactors.
 - Atomically claim selected feature IDs in SQLite before editing.
 
+Batch loop:
+- Continue through up to 3 completed and committed batches in this run unless the user provides a different batch limit.
+- After each verified commit:
+  - Update `checkpoint.sqlite` and `RESUME.md`.
+  - Re-read the active checkpoint.
+  - Verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and the roadmap hash.
+  - Select and atomically claim the next deterministic batch using the same P0 -> P1 -> P2 priority rules.
+  - Implement, validate, checkpoint, commit, and repeat.
+- Stop the loop when any stop condition is hit:
+  - no pending roadmap items remain
+  - the configured batch limit is reached
+  - validation fails and cannot be fixed within the current batch
+  - unrelated worktree changes conflict with the next batch
+  - a real blocker prevents progress
+  - context, token, rate-limit, or timeout pressure makes another implementation batch unsafe
+- Before stopping, write a complete checkpoint with the current batch, feature IDs, changed files, commands run, verification state, last commit, blocker if any, and exact next action.
+- Codex cannot restart itself after API token, context, or rate limits. For a truly continuous loop, rely on an external harness to relaunch Codex with this prompt; SQLite and `RESUME.md` are the handoff contract.
+
 Architecture guardrails:
 - `flight_sim_cpp` is the single canonical simulator for both interactive viewing and headless deterministic regression.
 - Do not revive or reintroduce the retired Rust/Bevy `simulator` crate or Rust `drone_simulator` crate unless the user explicitly asks for that architectural change.
