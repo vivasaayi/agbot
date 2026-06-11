@@ -831,6 +831,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         valid_pixel_count: stats_count,
         invalid_pixel_reasons,
         radiometric_calibration: ingest.evidence.radiometric_calibration.clone(),
+        spatial_ref: ingest.evidence.spatial_ref.clone(),
     };
 
     let meta_name = format!(

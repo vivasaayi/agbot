@@ -3,7 +3,7 @@ pub mod gdal_util;
 
 use crate::{IndicesArgs, SensorPreset};
 use serde::{Deserialize, Serialize};
-use shared::schemas::MultispectralImage;
+use shared::schemas::{assert_raster_spatial_ref, MultispectralImage, RasterSpatialRef};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -40,6 +40,7 @@ pub struct BandIngestEvidence {
     pub resolved_bands: BTreeMap<String, String>,
     pub band_grids: BTreeMap<String, BandGridEvidence>,
     pub radiometric_calibration: RadiometricCalibrationEvidence,
+    pub spatial_ref: RasterSpatialRef,
     pub width: u32,
     pub height: u32,
 }
@@ -96,6 +97,8 @@ pub enum BandIngestError {
         actual_width: u32,
         actual_height: u32,
     },
+    #[error("{message}")]
+    SpatialRefInvalid { message: String },
     #[error("failed to write band ingest evidence {path}: {message}")]
     EvidenceWrite { path: PathBuf, message: String },
 }
@@ -206,6 +209,14 @@ pub fn resolve_band_ingest_evidence(
 
     let band_grids = inspect_band_grids(&image, image.metadata.width, image.metadata.height)?;
     let radiometric_calibration = radiometric_calibration_evidence(sensor, &band_index_to_name);
+    let spatial_ref = assert_raster_spatial_ref(
+        image.metadata.spatial_ref.as_ref(),
+        image.metadata.width,
+        image.metadata.height,
+    )
+    .map_err(|err| BandIngestError::SpatialRefInvalid {
+        message: err.to_string(),
+    })?;
 
     Ok(BandIngestEvidence {
         image_id: image.image_id,
@@ -214,6 +225,7 @@ pub fn resolve_band_ingest_evidence(
         resolved_bands,
         band_grids,
         radiometric_calibration,
+        spatial_ref,
         width: image.metadata.width,
         height: image.metadata.height,
     })
@@ -335,6 +347,25 @@ mod tests {
         image.save(path).unwrap();
     }
 
+    fn valid_spatial_ref(width: u32, height: u32) -> Value {
+        let origin_x = -74.1;
+        let origin_y = 40.8;
+        let pixel_x = 0.0001;
+        let pixel_y = -0.0001;
+
+        serde_json::json!({
+            "georeferenced": true,
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": origin_x,
+                "min_lat": origin_y + pixel_y * height as f64,
+                "max_lon": origin_x + pixel_x * width as f64,
+                "max_lat": origin_y
+            },
+            "geo_transform": [origin_x, pixel_x, 0.0, origin_y, 0.0, pixel_y]
+        })
+    }
+
     fn write_metadata(
         input_dir: &Path,
         width: u32,
@@ -359,7 +390,8 @@ mod tests {
                 "exposure_time": 1.0,
                 "gain": 1.0,
                 "width": width,
-                "height": height
+                "height": height,
+                "spatial_ref": valid_spatial_ref(width, height)
             },
             "file_paths": file_paths,
             "image_id": uuid::Uuid::new_v4()

@@ -283,4 +283,5 @@ pub struct IndexResultMeta {
     #[serde(default)]
     pub invalid_pixel_reasons: BTreeMap<String, usize>,
     pub radiometric_calibration: crate::io::RadiometricCalibrationEvidence,
+    pub spatial_ref: shared::schemas::RasterSpatialRef,
 }

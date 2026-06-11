@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use shared::schemas::{
     bounds_from_points, AnnotationGeometry, AnnotationRecord, FarmRecord, FieldBoundary,
     FieldRecord, GeoBounds, GeoPoint, GpsCoords, ImageMetadata, MultispectralImage,
-    RasterSpatialRef, RecommendationPriority, RecommendationRecord, RecommendationStatus,
-    ReportFormat, ReportRecord,
+    RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
+    RecommendationStatus, ReportFormat, ReportRecord,
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -767,6 +767,38 @@ fn extent_around(latitude: f64, longitude: f64, half_size_degrees: f64) -> Scene
     }
 }
 
+fn raster_spatial_ref_for_extent(
+    extent: &SceneExtent,
+    width: u32,
+    height: u32,
+) -> RasterSpatialRef {
+    let resolution_x = (extent.max_lon - extent.min_lon) / width as f64;
+    let resolution_y = (extent.max_lat - extent.min_lat) / height as f64;
+
+    RasterSpatialRef {
+        georeferenced: true,
+        crs: Some("EPSG:4326".to_string()),
+        bbox: Some(GeoBounds {
+            min_lon: extent.min_lon,
+            min_lat: extent.min_lat,
+            max_lon: extent.max_lon,
+            max_lat: extent.max_lat,
+        }),
+        geo_transform: Some([
+            extent.min_lon,
+            resolution_x,
+            0.0,
+            extent.max_lat,
+            0.0,
+            -resolution_y,
+        ]),
+        resolution: Some(RasterResolution {
+            x: resolution_x,
+            y: resolution_y,
+        }),
+    }
+}
+
 async fn write_synthetic_landsat_scene(
     scene_dir: &FsPath,
     latitude: f64,
@@ -809,17 +841,7 @@ async fn write_synthetic_landsat_scene(
             gain: 1.0,
             width,
             height,
-            spatial_ref: Some(RasterSpatialRef {
-                georeferenced: true,
-                crs: Some("EPSG:4326".to_string()),
-                bbox: Some(GeoBounds {
-                    min_lon: extent.min_lon,
-                    min_lat: extent.min_lat,
-                    max_lon: extent.max_lon,
-                    max_lat: extent.max_lat,
-                }),
-                geo_transform: None,
-            }),
+            spatial_ref: Some(raster_spatial_ref_for_extent(&extent, width, height)),
         },
         file_paths: file_paths.into_iter().collect(),
         image_id: Uuid::new_v4(),
@@ -849,17 +871,7 @@ fn describe_real_landsat_scene(
             gain: 1.0,
             width: 512,
             height: 512,
-            spatial_ref: Some(RasterSpatialRef {
-                georeferenced: true,
-                crs: Some("EPSG:4326".to_string()),
-                bbox: Some(GeoBounds {
-                    min_lon: extent.min_lon,
-                    min_lat: extent.min_lat,
-                    max_lon: extent.max_lon,
-                    max_lat: extent.max_lat,
-                }),
-                geo_transform: None,
-            }),
+            spatial_ref: Some(raster_spatial_ref_for_extent(&extent, 512, 512)),
         },
         file_paths: candidate.assets.clone().into_iter().collect(),
         image_id: Uuid::new_v4(),
@@ -3930,7 +3942,11 @@ mod tests {
                         max_lon: -73.9,
                         max_lat: 40.8,
                     }),
-                    geo_transform: Some([-74.1, 0.0001, 0.0, 40.8, 0.0, -0.0001]),
+                    geo_transform: Some([-74.1, 0.000390625, 0.0, 40.8, 0.0, -0.00078125]),
+                    resolution: Some(RasterResolution {
+                        x: 0.000390625,
+                        y: 0.00078125,
+                    }),
                 }),
             },
             file_paths: Default::default(),

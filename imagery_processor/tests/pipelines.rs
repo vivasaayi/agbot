@@ -40,7 +40,42 @@ fn write_gray16_image(path: &Path, width: u32, height: u32, values: &[u16]) {
     image.save(path).unwrap();
 }
 
+fn valid_spatial_ref(width: u32, height: u32) -> Value {
+    let origin_x = -74.1;
+    let origin_y = 40.8;
+    let pixel_x = 0.0001;
+    let pixel_y = -0.0001;
+
+    serde_json::json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": origin_x,
+            "min_lat": origin_y + pixel_y * height as f64,
+            "max_lon": origin_x + pixel_x * width as f64,
+            "max_lat": origin_y
+        },
+        "geo_transform": [origin_x, pixel_x, 0.0, origin_y, 0.0, pixel_y]
+    })
+}
+
 fn write_metadata(input_dir: &Path, width: u32, height: u32, bands: &[(&str, &Path)]) {
+    write_metadata_with_spatial_ref(
+        input_dir,
+        width,
+        height,
+        bands,
+        Some(valid_spatial_ref(width, height)),
+    );
+}
+
+fn write_metadata_with_spatial_ref(
+    input_dir: &Path,
+    width: u32,
+    height: u32,
+    bands: &[(&str, &Path)],
+    spatial_ref: Option<Value>,
+) {
     let file_paths = bands
         .iter()
         .map(|(name, path)| {
@@ -51,16 +86,24 @@ fn write_metadata(input_dir: &Path, width: u32, height: u32, bands: &[(&str, &Pa
         })
         .collect::<serde_json::Map<String, Value>>();
 
+    let mut image_metadata = serde_json::json!({
+        "timestamp": "2026-01-01T00:00:00Z",
+        "gps_position": null,
+        "bands": bands.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        "exposure_time": 1.0,
+        "gain": 1.0,
+        "width": width,
+        "height": height
+    });
+    if let Some(spatial_ref) = spatial_ref {
+        image_metadata
+            .as_object_mut()
+            .unwrap()
+            .insert("spatial_ref".to_string(), spatial_ref);
+    }
+
     let metadata = serde_json::json!({
-        "metadata": {
-            "timestamp": "2026-01-01T00:00:00Z",
-            "gps_position": null,
-            "bands": bands.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-            "exposure_time": 1.0,
-            "gain": 1.0,
-            "width": width,
-            "height": height
-        },
+        "metadata": image_metadata,
         "file_paths": file_paths,
         "image_id": uuid::Uuid::new_v4()
     });
@@ -70,6 +113,13 @@ fn write_metadata(input_dir: &Path, width: u32, height: u32, bands: &[(&str, &Pa
         serde_json::to_string_pretty(&metadata).unwrap(),
     )
     .unwrap();
+}
+
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-9,
+        "expected {actual} to be within GEO tolerance of {expected}"
+    );
 }
 
 fn base_indices_args(input_dir: PathBuf, output_dir: PathBuf) -> IndicesArgs {
@@ -257,6 +307,109 @@ async fn indices_persist_sentinel2_band_ingest_evidence() {
     assert_eq!(evidence.resolved_bands.get("red").unwrap(), "B04");
     assert_eq!(evidence.resolved_bands.get("nir").unwrap(), "B08");
     assert_eq!(evidence.resolved_bands.get("red_edge").unwrap(), "B05");
+}
+
+#[tokio::test]
+async fn indices_persist_asserted_spatial_ref() {
+    let root = temp_test_dir("indices_spatial_ref");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    write_gray_image(&red_path, 2, 1, &[10, 20]);
+    write_gray_image(&nir_path, 2, 1, &[30, 40]);
+    write_metadata(
+        &input_dir,
+        2,
+        1,
+        &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+    );
+
+    let args = base_indices_args(input_dir, output_dir.clone());
+
+    run_indices(&args).await.unwrap();
+
+    let meta = read_result_meta(&output_dir);
+    let spatial_ref = &meta["spatial_ref"];
+    assert_eq!(spatial_ref["crs"].as_str().unwrap(), "EPSG:4326");
+    assert_eq!(spatial_ref["georeferenced"].as_bool().unwrap(), true);
+    assert_close(spatial_ref["resolution"]["x"].as_f64().unwrap(), 0.0001);
+    assert_close(spatial_ref["resolution"]["y"].as_f64().unwrap(), 0.0001);
+    assert_close(spatial_ref["bbox"]["min_lon"].as_f64().unwrap(), -74.1);
+    assert_close(spatial_ref["bbox"]["min_lat"].as_f64().unwrap(), 40.7999);
+    assert_close(spatial_ref["bbox"]["max_lon"].as_f64().unwrap(), -74.0998);
+    assert_close(spatial_ref["bbox"]["max_lat"].as_f64().unwrap(), 40.8);
+    assert_eq!(
+        spatial_ref["geo_transform"]
+            .as_array()
+            .expect("transform should be recorded")
+            .len(),
+        6
+    );
+}
+
+#[tokio::test]
+async fn indices_reject_missing_spatial_ref() {
+    let root = temp_test_dir("indices_missing_spatial_ref");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    write_gray_image(&red_path, 1, 1, &[10]);
+    write_gray_image(&nir_path, 1, 1, &[30]);
+    write_metadata_with_spatial_ref(
+        &input_dir,
+        1,
+        1,
+        &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+        None,
+    );
+
+    let args = base_indices_args(input_dir, output_dir);
+
+    let error = run_indices(&args).await.unwrap_err().to_string();
+    assert!(error.contains("georeferencing"));
+    assert!(error.contains("missing spatial_ref"));
+}
+
+#[tokio::test]
+async fn indices_reject_zero_resolution_spatial_ref() {
+    let root = temp_test_dir("indices_zero_resolution_spatial_ref");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    write_gray_image(&red_path, 1, 1, &[10]);
+    write_gray_image(&nir_path, 1, 1, &[30]);
+    write_metadata_with_spatial_ref(
+        &input_dir,
+        1,
+        1,
+        &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+        Some(serde_json::json!({
+            "georeferenced": true,
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -74.1,
+                "min_lat": 40.7999,
+                "max_lon": -74.1,
+                "max_lat": 40.8
+            },
+            "geo_transform": [-74.1, 0.0, 0.0, 40.8, 0.0, -0.0001]
+        })),
+    );
+
+    let args = base_indices_args(input_dir, output_dir);
+
+    let error = run_indices(&args).await.unwrap_err().to_string();
+    assert!(error.contains("georeferencing"));
+    assert!(error.contains("positive resolution"));
 }
 
 #[tokio::test]
