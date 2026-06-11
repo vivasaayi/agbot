@@ -124,6 +124,26 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS scene_spatial_refs (
+            scene_id TEXT PRIMARY KEY,
+            spatial_ref_json TEXT NOT NULL,
+            crs TEXT NOT NULL,
+            min_lon REAL NOT NULL,
+            min_lat REAL NOT NULL,
+            max_lon REAL NOT NULL,
+            max_lat REAL NOT NULL,
+            resolution_x REAL NOT NULL,
+            resolution_y REAL NOT NULL,
+            geo_transform_json TEXT NOT NULL,
+            asserted_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scene_id TEXT NOT NULL,

@@ -3,7 +3,9 @@ use anyhow::{anyhow, Result};
 use clap::Args;
 use imagery_processor::{IndexKind, IndicesArgs, OutputFormat, Processor, SensorPreset};
 use serde::{Deserialize, Serialize};
-use shared::schemas::{MultispectralImage, DEFAULT_RECORD_OWNER};
+use shared::schemas::{
+    assert_raster_spatial_ref, MultispectralImage, RasterSpatialRef, DEFAULT_RECORD_OWNER,
+};
 use sqlx::Row;
 use std::{
     collections::HashMap,
@@ -192,6 +194,13 @@ async fn ingest_landsat_inner(
         .map_err(|err| ingest_step_error("download_error", err))?;
     let mut image: MultispectralImage = serde_json::from_str(&metadata_json_original)
         .map_err(|err| ingest_step_error("metadata_error", err))?;
+    let spatial_ref = assert_raster_spatial_ref(
+        image.metadata.spatial_ref.as_ref(),
+        image.metadata.width,
+        image.metadata.height,
+    )
+    .map_err(|err| ingest_step_error("georeferencing_error", err))?;
+    image.metadata.spatial_ref = Some(spatial_ref.clone());
 
     if scene_dir.exists() {
         warn!(scene = %args.scene_id, "scene already ingested, overwriting metadata only");
@@ -253,6 +262,10 @@ async fn ingest_landsat_inner(
     .execute(pool)
     .await
     .map_err(|err| ingest_step_error("store_error", err))?;
+
+    store_scene_spatial_ref(pool, &args.scene_id, &spatial_ref)
+        .await
+        .map_err(|err| ingest_step_error("store_error", err))?;
 
     let record = record_ingest_status(
         pool,
@@ -368,6 +381,86 @@ pub async fn load_ingest_record(
     .transpose()
 }
 
+pub async fn load_scene_spatial_ref(
+    pool: &DbPool,
+    scene_id: &str,
+) -> Result<Option<RasterSpatialRef>> {
+    let row = sqlx::query(
+        r#"
+        SELECT spatial_ref_json
+        FROM scene_spatial_refs
+        WHERE scene_id = ?1
+        "#,
+    )
+    .bind(scene_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|row| {
+        let spatial_ref_json: String = row.get("spatial_ref_json");
+        serde_json::from_str(&spatial_ref_json).map_err(anyhow::Error::from)
+    })
+    .transpose()
+}
+
+async fn store_scene_spatial_ref(
+    pool: &DbPool,
+    scene_id: &str,
+    spatial_ref: &RasterSpatialRef,
+) -> Result<()> {
+    let crs = spatial_ref
+        .crs
+        .as_deref()
+        .ok_or_else(|| anyhow!("asserted spatial ref missing CRS"))?;
+    let bbox = spatial_ref
+        .bbox
+        .as_ref()
+        .ok_or_else(|| anyhow!("asserted spatial ref missing extent"))?;
+    let resolution = spatial_ref
+        .resolution
+        .ok_or_else(|| anyhow!("asserted spatial ref missing resolution"))?;
+    let geo_transform = spatial_ref
+        .geo_transform
+        .ok_or_else(|| anyhow!("asserted spatial ref missing transform"))?;
+    let spatial_ref_json = serde_json::to_string(spatial_ref)?;
+    let geo_transform_json = serde_json::to_string(&geo_transform)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO scene_spatial_refs (
+            scene_id, spatial_ref_json, crs, min_lon, min_lat, max_lon, max_lat,
+            resolution_x, resolution_y, geo_transform_json, asserted_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
+        ON CONFLICT(scene_id) DO UPDATE SET
+            spatial_ref_json = excluded.spatial_ref_json,
+            crs = excluded.crs,
+            min_lon = excluded.min_lon,
+            min_lat = excluded.min_lat,
+            max_lon = excluded.max_lon,
+            max_lat = excluded.max_lat,
+            resolution_x = excluded.resolution_x,
+            resolution_y = excluded.resolution_y,
+            geo_transform_json = excluded.geo_transform_json,
+            asserted_at = datetime('now')
+        "#,
+    )
+    .bind(scene_id)
+    .bind(spatial_ref_json)
+    .bind(crs)
+    .bind(bbox.min_lon)
+    .bind(bbox.min_lat)
+    .bind(bbox.max_lon)
+    .bind(bbox.max_lat)
+    .bind(resolution.x)
+    .bind(resolution.y)
+    .bind(geo_transform_json)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 async fn record_ingest_status(
     pool: &DbPool,
     scene_id: &str,
@@ -420,6 +513,10 @@ async fn cleanup_failed_ingest(pool: &DbPool, scene_id: &str, scene_dir: &Path) 
         fs::remove_dir_all(scene_dir).await?;
     }
     sqlx::query("DELETE FROM products WHERE scene_id = ?1")
+        .bind(scene_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM scene_spatial_refs WHERE scene_id = ?1")
         .bind(scene_id)
         .execute(pool)
         .await?;
@@ -580,7 +677,9 @@ async fn find_latest_file(dir: &Path, extensions: &[&str]) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::db;
-    use shared::schemas::{ImageMetadata, MultispectralImage};
+    use shared::schemas::{
+        GeoBounds, ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -678,6 +777,97 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn ingest_landsat_asserts_and_persists_spatial_ref() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir)?;
+        write_scene_fixture_with_spatial_ref(
+            &source_dir,
+            &[("B4", "B4.png"), ("B5", "B5.png")],
+            Some(valid_spatial_ref()),
+        )?;
+
+        let config = test_config(&tmp);
+        config.ensure_data_dirs()?;
+        let pool = db::connect_pool(&config).await?;
+
+        ingest_landsat(
+            IngestLandsatArgs {
+                scene_id: "scene-georef".to_string(),
+                source_dir: source_dir.clone(),
+            },
+            &config,
+            &pool,
+        )
+        .await?;
+
+        let spatial_ref = load_scene_spatial_ref(&pool, "scene-georef")
+            .await?
+            .expect("asserted spatial ref should persist");
+        assert_eq!(spatial_ref.crs.as_deref(), Some("EPSG:4326"));
+        assert_eq!(
+            spatial_ref.resolution,
+            Some(RasterResolution { x: 0.05, y: 0.05 })
+        );
+
+        let metadata_json: String =
+            sqlx::query_scalar("SELECT metadata_json FROM scenes WHERE scene_id = ?1")
+                .bind("scene-georef")
+                .fetch_one(&pool)
+                .await?;
+        let image: MultispectralImage = serde_json::from_str(&metadata_json)?;
+        assert_eq!(image.metadata.spatial_ref, Some(spatial_ref));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_landsat_rejects_missing_crs_spatial_ref() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir)?;
+        let mut spatial_ref = valid_spatial_ref();
+        spatial_ref.crs = None;
+        write_scene_fixture_with_spatial_ref(&source_dir, &[("B4", "B4.png")], Some(spatial_ref))?;
+
+        let config = test_config(&tmp);
+        config.ensure_data_dirs()?;
+        let pool = db::connect_pool(&config).await?;
+
+        let err = ingest_landsat(
+            IngestLandsatArgs {
+                scene_id: "scene-bad-georef".to_string(),
+                source_dir: source_dir.clone(),
+            },
+            &config,
+            &pool,
+        )
+        .await
+        .expect_err("missing CRS should reject ingest");
+        assert!(err.to_string().contains("georeferencing_error"));
+
+        let record = load_ingest_record(&pool, "scene-bad-georef")
+            .await?
+            .expect("failed ingest record should persist");
+        assert_eq!(record.status, SceneIngestStatus::Failed);
+        assert_eq!(
+            record.status_reason.as_deref(),
+            Some("georeferencing_error")
+        );
+        assert!(load_scene_spatial_ref(&pool, "scene-bad-georef")
+            .await?
+            .is_none());
+
+        let scene_row: Option<i64> = sqlx::query_scalar("SELECT 1 FROM scenes WHERE scene_id = ?1")
+            .bind("scene-bad-georef")
+            .fetch_optional(&pool)
+            .await?;
+        assert!(scene_row.is_none());
+
+        Ok(())
+    }
+
     fn test_config(tmp: &TempDir) -> HubConfig {
         HubConfig {
             bind_address: "127.0.0.1:0".to_string(),
@@ -691,6 +881,14 @@ mod tests {
     }
 
     fn write_scene_fixture(source_dir: &Path, bands: &[(&str, &str)]) -> Result<()> {
+        write_scene_fixture_with_spatial_ref(source_dir, bands, Some(valid_spatial_ref()))
+    }
+
+    fn write_scene_fixture_with_spatial_ref(
+        source_dir: &Path,
+        bands: &[(&str, &str)],
+        spatial_ref: Option<RasterSpatialRef>,
+    ) -> Result<()> {
         let mut file_paths = HashMap::new();
         for (band, file_name) in bands {
             if *file_name != "bad_band" {
@@ -709,7 +907,7 @@ mod tests {
                 gain: 1.0,
                 width: 2,
                 height: 2,
-                spatial_ref: None,
+                spatial_ref,
             },
             file_paths,
             image_id: Uuid::new_v4(),
@@ -719,5 +917,20 @@ mod tests {
             serde_json::to_string_pretty(&image)?,
         )?;
         Ok(())
+    }
+
+    fn valid_spatial_ref() -> RasterSpatialRef {
+        RasterSpatialRef {
+            georeferenced: true,
+            crs: Some("EPSG:4326".to_string()),
+            bbox: Some(GeoBounds {
+                min_lon: -96.7,
+                min_lat: 41.1,
+                max_lon: -96.6,
+                max_lat: 41.2,
+            }),
+            geo_transform: Some([-96.7, 0.05, 0.0, 41.2, 0.0, -0.05]),
+            resolution: None,
+        }
     }
 }
