@@ -28,11 +28,21 @@ pub struct FieldBoundary {
     pub coordinates: Vec<GeoPoint>,
 }
 
+pub const DEFAULT_RECORD_OWNER: &str = "unassigned";
+
+fn default_record_owner() -> String {
+    DEFAULT_RECORD_OWNER.to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FarmRecord {
     pub farm_id: String,
+    #[serde(default = "default_record_owner")]
+    pub owner: String,
     pub name: String,
     pub notes: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,12 +50,16 @@ pub struct FieldRecord {
     #[serde(default)]
     pub farm_id: Option<String>,
     pub field_id: String,
+    #[serde(default = "default_record_owner")]
+    pub owner: String,
     pub name: String,
     pub crop: Option<String>,
     pub season: Option<String>,
     pub notes: Option<String>,
     pub boundary: FieldBoundary,
     pub extent: GeoBounds,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -669,6 +683,7 @@ mod tests {
         let field = FieldRecord {
             farm_id: Some("farm-1".to_string()),
             field_id: "field-1".to_string(),
+            owner: "org-1".to_string(),
             name: "North 80".to_string(),
             crop: Some("corn".to_string()),
             season: Some("2026".to_string()),
@@ -695,6 +710,7 @@ mod tests {
                 max_lon: -96.2,
                 max_lat: 41.4,
             },
+            created_at: "2026-04-01T00:00:00Z".to_string(),
         };
 
         let value = serde_json::to_value(&field).expect("field should serialize");

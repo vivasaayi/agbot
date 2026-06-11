@@ -890,6 +890,247 @@ async fn farm_crud_and_field_history_roundtrip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn farm_field_scene_identity_persists_after_restart() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create_farm = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-owned",
+                        "owner": "org-alpha",
+                        "name": "Owned Farm"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_farm.status(), StatusCode::OK);
+    let body = to_bytes(create_farm.into_body(), 64 * 1024).await?;
+    let farm_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        farm_json.get("owner").and_then(|value| value.as_str()),
+        Some("org-alpha")
+    );
+    let farm_created_at = farm_json
+        .get("created_at")
+        .and_then(|value| value.as_str())
+        .expect("farm created_at should be returned")
+        .to_string();
+    assert!(!farm_created_at.trim().is_empty());
+
+    let create_field = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-owned",
+                        "field_id": "field-owned",
+                        "name": "Owned Field",
+                        "season": "2026",
+                        "boundary": {
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_field.status(), StatusCode::OK);
+    let body = to_bytes(create_field.into_body(), 64 * 1024).await?;
+    let field_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        field_json.get("owner").and_then(|value| value.as_str()),
+        Some("org-alpha")
+    );
+    let field_created_at = field_json
+        .get("created_at")
+        .and_then(|value| value.as_str())
+        .expect("field created_at should be returned")
+        .to_string();
+    assert!(!field_created_at.trim().is_empty());
+
+    let scene_id = "scene-owned";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (scene_id, owner, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at, field_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(scene_id)
+    .bind("org-alpha")
+    .bind("landsat8")
+    .bind("2026-05-01T00:00:00Z")
+    .bind(scene_dir.to_string_lossy().to_string())
+    .bind(
+        json!({
+            "metadata": {
+                "timestamp": "2026-05-01T00:00:00Z",
+                "gps_position": null,
+                "bands": ["B4", "B5"],
+                "exposure_time": 1.0,
+                "gain": 1.0,
+                "width": 1,
+                "height": 1
+            },
+            "file_paths": {
+                "B4": "B4.png",
+                "B5": "B5.png"
+            },
+            "image_id": Uuid::new_v4()
+        })
+        .to_string(),
+    )
+    .bind(None::<f64>)
+    .bind("2026-05-01T00:00:00Z")
+    .bind("field-owned")
+    .execute(&ctx.pool)
+    .await?;
+
+    let restarted =
+        test_app_with_paths(ctx.data_root.clone(), tmp.path().join("geo_hub_test.db")).await?;
+
+    let get_farm = restarted
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/farms/farm-owned")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get_farm.status(), StatusCode::OK);
+    let body = to_bytes(get_farm.into_body(), 64 * 1024).await?;
+    let farm_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        farm_json.get("owner").and_then(|value| value.as_str()),
+        Some("org-alpha")
+    );
+    assert_eq!(
+        farm_json.get("created_at").and_then(|value| value.as_str()),
+        Some(farm_created_at.as_str())
+    );
+
+    let get_field = restarted
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/field-owned")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get_field.status(), StatusCode::OK);
+    let body = to_bytes(get_field.into_body(), 64 * 1024).await?;
+    let field_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        field_json.get("owner").and_then(|value| value.as_str()),
+        Some("org-alpha")
+    );
+    assert_eq!(
+        field_json
+            .get("created_at")
+            .and_then(|value| value.as_str()),
+        Some(field_created_at.as_str())
+    );
+
+    let get_scene = restarted
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get_scene.status(), StatusCode::OK);
+    let body = to_bytes(get_scene.into_body(), 64 * 1024).await?;
+    let scene_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        scene_json.get("owner").and_then(|value| value.as_str()),
+        Some("org-alpha")
+    );
+    assert_eq!(
+        scene_json
+            .get("created_at")
+            .and_then(|value| value.as_str()),
+        Some("2026-05-01T00:00:00Z")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_field_rejects_orphan_farm_reference() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "missing-farm",
+                        "field_id": "orphan-field",
+                        "name": "Orphan Field",
+                        "boundary": {
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("farm missing-farm does not exist"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn farm_field_scene_relationships_roundtrip() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -2542,9 +2783,10 @@ async fn create_acceptance_annotation(ctx: &TestContext, scene_id: &str) -> Resu
 }
 
 async fn test_app(tmp: &TempDir) -> Result<TestContext> {
-    let data_root = tmp.path().join("data");
-    let db_path = tmp.path().join("geo_hub_test.db");
+    test_app_with_paths(tmp.path().join("data"), tmp.path().join("geo_hub_test.db")).await
+}
 
+async fn test_app_with_paths(data_root: PathBuf, db_path: PathBuf) -> Result<TestContext> {
     let config = HubConfig {
         bind_address: "127.0.0.1:0".to_string(),
         database_url: sqlite_url(&db_path),

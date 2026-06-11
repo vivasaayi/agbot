@@ -21,7 +21,7 @@ use shared::schemas::{
     bounds_from_points, AnnotationGeometry, AnnotationRecord, FarmRecord, FieldBoundary,
     FieldRecord, GeoBounds, GeoPoint, GpsCoords, ImageMetadata, MultispectralImage,
     RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
-    RecommendationStatus, ReportFormat, ReportRecord,
+    RecommendationStatus, ReportFormat, ReportRecord, DEFAULT_RECORD_OWNER,
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -40,15 +40,19 @@ const MOBILE_APP_HTML: &str = include_str!("mobile_app.html");
 #[derive(Debug, Serialize)]
 pub struct SceneSummary {
     pub scene_id: String,
+    pub owner: String,
     pub sensor: String,
     pub acquired_at: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SceneDetail {
     pub scene_id: String,
+    pub owner: Option<String>,
     pub sensor: Option<String>,
     pub acquired_at: Option<String>,
+    pub created_at: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub bands: Vec<String>,
@@ -88,6 +92,7 @@ pub struct SceneExtent {
 pub struct CreateFieldRequest {
     pub farm_id: Option<String>,
     pub field_id: Option<String>,
+    pub owner: Option<String>,
     pub name: String,
     pub crop: Option<String>,
     pub season: Option<String>,
@@ -98,6 +103,7 @@ pub struct CreateFieldRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateFarmRequest {
     pub farm_id: Option<String>,
+    pub owner: Option<String>,
     pub name: String,
     pub notes: Option<String>,
 }
@@ -158,6 +164,7 @@ pub struct ImportShapefileRequest {
     pub path: String,
     pub name_prefix: Option<String>,
     pub farm_id: Option<String>,
+    pub owner: Option<String>,
     pub crop: Option<String>,
     pub season: Option<String>,
     pub notes: Option<String>,
@@ -477,9 +484,10 @@ pub async fn mobile_analyze(
 
     sqlx::query(
         r#"
-        INSERT INTO scenes (scene_id, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
-        ON CONFLICT(scene_id) DO UPDATE SET sensor = excluded.sensor,
+        INSERT INTO scenes (scene_id, owner, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(scene_id) DO UPDATE SET owner = excluded.owner,
+                                          sensor = excluded.sensor,
                                           acquired_at = excluded.acquired_at,
                                           data_path = excluded.data_path,
                                           metadata_json = excluded.metadata_json,
@@ -487,6 +495,7 @@ pub async fn mobile_analyze(
         "#,
     )
     .bind(&scene_id)
+    .bind(DEFAULT_RECORD_OWNER)
     .bind(
         landsat_candidate
             .as_ref()
@@ -507,6 +516,7 @@ pub async fn mobile_analyze(
             .and_then(|candidate| candidate.cloud_cover)
             .unwrap_or(8.0f64),
     )
+    .bind(current_record_timestamp())
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -1192,7 +1202,7 @@ pub async fn import_fields_geojson(
 ) -> AppResult<Json<Vec<FieldRecord>>> {
     let fields = fields_from_geojson(payload)?;
 
-    upsert_fields(&state, &fields).await?;
+    let fields = upsert_fields(&state, &fields).await?;
 
     Ok(Json(fields))
 }
@@ -1203,20 +1213,23 @@ pub async fn import_fields_shapefile(
 ) -> AppResult<Json<Vec<FieldRecord>>> {
     let fields = fields_from_shapefile(payload).await?;
 
-    upsert_fields(&state, &fields).await?;
+    let fields = upsert_fields(&state, &fields).await?;
 
     Ok(Json(fields))
 }
 
-async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<()> {
+async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<Vec<FieldRecord>> {
+    let mut persisted = Vec::with_capacity(fields.len());
     for field in fields {
-        ensure_field_farm_exists(state, field.farm_id.as_deref()).await?;
+        let mut field = field.clone();
+        field.owner = field_owner_for_farm(state, field.farm_id.as_deref(), &field.owner).await?;
         sqlx::query(
             r#"
-            INSERT INTO fields (field_id, farm_id, name, crop, season, notes, boundary_json, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+            INSERT INTO fields (field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(field_id) DO UPDATE SET
                 farm_id = excluded.farm_id,
+                owner = excluded.owner,
                 name = excluded.name,
                 crop = excluded.crop,
                 season = excluded.season,
@@ -1226,24 +1239,28 @@ async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<()
         )
         .bind(&field.field_id)
         .bind(&field.farm_id)
+        .bind(&field.owner)
         .bind(&field.name)
         .bind(&field.crop)
         .bind(&field.season)
         .bind(&field.notes)
         .bind(serde_json::to_string(&field.boundary).map_err(|err| AppError::Anyhow(err.into()))?)
+        .bind(&field.created_at)
         .execute(&state.pool)
         .await
         .map_err(Error::from)?;
+        persisted.push(field);
     }
 
-    Ok(())
+    Ok(persisted)
 }
 
 pub async fn list_farms(State(state): State<AppState>) -> AppResult<Json<Vec<FarmRecord>>> {
-    let rows = sqlx::query("SELECT farm_id, name, notes FROM farms ORDER BY name ASC")
-        .fetch_all(&state.pool)
-        .await
-        .map_err(Error::from)?;
+    let rows =
+        sqlx::query("SELECT farm_id, owner, name, notes, created_at FROM farms ORDER BY name ASC")
+            .fetch_all(&state.pool)
+            .await
+            .map_err(Error::from)?;
 
     let mut farms = Vec::with_capacity(rows.len());
     for row in rows {
@@ -1261,13 +1278,15 @@ pub async fn create_farm(
 
     sqlx::query(
         r#"
-        INSERT INTO farms (farm_id, name, notes, created_at)
-        VALUES (?1, ?2, ?3, datetime('now'))
+        INSERT INTO farms (farm_id, owner, name, notes, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
         "#,
     )
     .bind(&farm.farm_id)
+    .bind(&farm.owner)
     .bind(&farm.name)
     .bind(&farm.notes)
+    .bind(&farm.created_at)
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -1344,7 +1363,7 @@ pub async fn list_farm_fields(
     }
 
     let rows = sqlx::query(
-        "SELECT field_id, farm_id, name, crop, season, notes, boundary_json FROM fields WHERE farm_id = ?1 ORDER BY COALESCE(season, '') DESC, name ASC",
+        "SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at FROM fields WHERE farm_id = ?1 ORDER BY COALESCE(season, '') DESC, name ASC",
     )
     .bind(&farm_id)
     .fetch_all(&state.pool)
@@ -1369,7 +1388,7 @@ pub async fn list_farm_field_history(
 
 pub async fn list_fields(State(state): State<AppState>) -> AppResult<Json<Vec<FieldRecord>>> {
     let rows = sqlx::query(
-        "SELECT field_id, farm_id, name, crop, season, notes, boundary_json FROM fields ORDER BY name ASC",
+        "SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at FROM fields ORDER BY name ASC",
     )
     .fetch_all(&state.pool)
     .await
@@ -1385,7 +1404,7 @@ pub async fn list_fields(State(state): State<AppState>) -> AppResult<Json<Vec<Fi
 
 pub async fn export_fields_geojson(State(state): State<AppState>) -> AppResult<Json<GeoJson>> {
     let rows = sqlx::query(
-        "SELECT field_id, farm_id, name, crop, season, notes, boundary_json FROM fields ORDER BY name ASC",
+        "SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at FROM fields ORDER BY name ASC",
     )
     .fetch_all(&state.pool)
     .await
@@ -1942,22 +1961,24 @@ pub async fn create_field(
     State(state): State<AppState>,
     Json(request): Json<CreateFieldRequest>,
 ) -> AppResult<Json<FieldRecord>> {
-    let field = build_field_record(request)?;
-    ensure_field_farm_exists(&state, field.farm_id.as_deref()).await?;
+    let mut field = build_field_record(request)?;
+    field.owner = field_owner_for_farm(&state, field.farm_id.as_deref(), &field.owner).await?;
 
     sqlx::query(
         r#"
-        INSERT INTO fields (field_id, farm_id, name, crop, season, notes, boundary_json, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+        INSERT INTO fields (field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         "#,
     )
     .bind(&field.field_id)
     .bind(&field.farm_id)
+    .bind(&field.owner)
     .bind(&field.name)
     .bind(&field.crop)
     .bind(&field.season)
     .bind(&field.notes)
     .bind(serde_json::to_string(&field.boundary).map_err(|err| AppError::Anyhow(err.into()))?)
+    .bind(&field.created_at)
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -1982,18 +2003,20 @@ pub async fn link_field_to_farm(
     let mut field = load_field(&state, &field_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    if load_farm(&state, &farm_id).await?.is_none() {
-        return Err(AppError::NotFound);
-    }
+    let farm = load_farm(&state, &farm_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
-    sqlx::query("UPDATE fields SET farm_id = ?2 WHERE field_id = ?1")
+    sqlx::query("UPDATE fields SET farm_id = ?2, owner = ?3 WHERE field_id = ?1")
         .bind(&field_id)
         .bind(&farm_id)
+        .bind(&farm.owner)
         .execute(&state.pool)
         .await
         .map_err(Error::from)?;
 
     field.farm_id = Some(farm_id);
+    field.owner = farm.owner;
     Ok(Json(field))
 }
 
@@ -2006,7 +2029,7 @@ pub async fn list_field_scenes(
     }
 
     let rows = sqlx::query(
-        "SELECT scene_id, sensor, acquired_at FROM scenes WHERE field_id = ?1 ORDER BY acquired_at DESC",
+        "SELECT scene_id, owner, sensor, acquired_at, created_at FROM scenes WHERE field_id = ?1 ORDER BY acquired_at DESC",
     )
     .bind(&field_id)
     .fetch_all(&state.pool)
@@ -2017,8 +2040,10 @@ pub async fn list_field_scenes(
         .into_iter()
         .map(|row| SceneSummary {
             scene_id: row.get("scene_id"),
+            owner: row.get("owner"),
             sensor: row.get("sensor"),
             acquired_at: row.get("acquired_at"),
+            created_at: row.get("created_at"),
         })
         .collect();
 
@@ -2048,7 +2073,9 @@ pub async fn link_scene_to_field(
 
 pub async fn list_scenes(State(state): State<AppState>) -> AppResult<Json<Vec<SceneSummary>>> {
     let rows =
-        sqlx::query("SELECT scene_id, sensor, acquired_at FROM scenes ORDER BY acquired_at DESC")
+        sqlx::query(
+            "SELECT scene_id, owner, sensor, acquired_at, created_at FROM scenes ORDER BY acquired_at DESC",
+        )
             .fetch_all(&state.pool)
             .await
             .map_err(Error::from)?;
@@ -2057,8 +2084,10 @@ pub async fn list_scenes(State(state): State<AppState>) -> AppResult<Json<Vec<Sc
         .into_iter()
         .map(|row| SceneSummary {
             scene_id: row.get("scene_id"),
+            owner: row.get("owner"),
             sensor: row.get("sensor"),
             acquired_at: row.get("acquired_at"),
+            created_at: row.get("created_at"),
         })
         .collect();
 
@@ -2070,7 +2099,7 @@ pub async fn get_scene(
     State(state): State<AppState>,
 ) -> AppResult<Json<SceneDetail>> {
     let scene_row = sqlx::query(
-        "SELECT scene_id, sensor, acquired_at, data_path, metadata_json, field_id FROM scenes WHERE scene_id = ?1",
+        "SELECT scene_id, owner, sensor, acquired_at, data_path, metadata_json, created_at, field_id FROM scenes WHERE scene_id = ?1",
     )
             .bind(&scene_id)
             .fetch_optional(&state.pool)
@@ -2092,8 +2121,10 @@ pub async fn get_scene(
 
     Ok(Json(SceneDetail {
         scene_id,
+        owner: scene_row.as_ref().map(|row| row.get("owner")),
         sensor: scene_row.as_ref().map(|row| row.get("sensor")),
         acquired_at: scene_row.as_ref().map(|row| row.get("acquired_at")),
+        created_at: scene_row.as_ref().map(|row| row.get("created_at")),
         width: metadata.as_ref().map(|image| image.metadata.width),
         height: metadata.as_ref().map(|image| image.metadata.height),
         bands: metadata
@@ -2523,12 +2554,14 @@ fn build_field_record(request: CreateFieldRequest) -> AppResult<FieldRecord> {
     Ok(FieldRecord {
         farm_id: request.farm_id,
         field_id,
+        owner: normalize_owner(request.owner),
         name,
         crop: request.crop,
         season: request.season,
         notes: request.notes,
         boundary: request.boundary,
         extent,
+        created_at: current_record_timestamp(),
     })
 }
 
@@ -2539,8 +2572,10 @@ fn build_farm_record(request: CreateFarmRequest) -> AppResult<FarmRecord> {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     Ok(FarmRecord {
         farm_id,
+        owner: normalize_owner(request.owner),
         name: normalize_farm_name(request.name)?,
         notes: normalize_optional_text(request.notes),
+        created_at: current_record_timestamp(),
     })
 }
 
@@ -2693,6 +2728,14 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_owner(value: Option<String>) -> String {
+    normalize_optional_text(value).unwrap_or_else(|| DEFAULT_RECORD_OWNER.to_string())
+}
+
+fn current_record_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 fn fields_from_geojson(geojson: GeoJson) -> AppResult<Vec<FieldRecord>> {
     match geojson {
         GeoJson::FeatureCollection(collection) => collection
@@ -2758,6 +2801,7 @@ async fn fields_from_shapefile(request: ImportShapefileRequest) -> AppResult<Vec
             build_field_record(CreateFieldRequest {
                 farm_id: request.farm_id.clone(),
                 field_id: None,
+                owner: request.owner.clone(),
                 name: shape_name,
                 crop: request.crop.clone(),
                 season: request.season.clone(),
@@ -2821,6 +2865,14 @@ fn feature_from_field(field: FieldRecord) -> Feature {
     properties.insert(
         "field_id".to_string(),
         serde_json::Value::String(field.field_id.clone()),
+    );
+    properties.insert(
+        "owner".to_string(),
+        serde_json::Value::String(field.owner.clone()),
+    );
+    properties.insert(
+        "created_at".to_string(),
+        serde_json::Value::String(field.created_at.clone()),
     );
     if let Some(farm_id) = field.farm_id {
         properties.insert("farm_id".to_string(), serde_json::Value::String(farm_id));
@@ -3026,6 +3078,7 @@ fn build_field_from_feature(feature: geojson::Feature, index: usize) -> AppResul
         Some(CreateFieldRequest {
             farm_id: None,
             field_id,
+            owner: property_string(&properties, "owner"),
             name,
             crop: property_string(&properties, "crop"),
             season: property_string(&properties, "season"),
@@ -3047,6 +3100,7 @@ fn build_field_from_geometry(
     let template = template.unwrap_or(CreateFieldRequest {
         farm_id: None,
         field_id: None,
+        owner: None,
         name: format!("Imported Field {}", index + 1),
         crop: None,
         season: None,
@@ -3059,6 +3113,7 @@ fn build_field_from_geometry(
     build_field_record(CreateFieldRequest {
         farm_id: template.farm_id,
         field_id: template.field_id,
+        owner: template.owner,
         name: template.name,
         crop: template.crop,
         season: template.season,
@@ -3150,20 +3205,24 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
     Ok(FieldRecord {
         farm_id: row.get("farm_id"),
         field_id: row.get("field_id"),
+        owner: row.get("owner"),
         name: row.get("name"),
         crop: row.get("crop"),
         season: row.get("season"),
         notes: row.get("notes"),
         boundary,
         extent,
+        created_at: row.get("created_at"),
     })
 }
 
 fn decode_farm_record(row: &sqlx::sqlite::SqliteRow) -> FarmRecord {
     FarmRecord {
         farm_id: row.get("farm_id"),
+        owner: row.get("owner"),
         name: row.get("name"),
         notes: row.get("notes"),
+        created_at: row.get("created_at"),
     }
 }
 
@@ -3225,7 +3284,7 @@ fn decode_report_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ReportRecord
 
 async fn load_field(state: &AppState, field_id: &str) -> AppResult<Option<FieldRecord>> {
     let row = sqlx::query(
-        "SELECT field_id, farm_id, name, crop, season, notes, boundary_json FROM fields WHERE field_id = ?1",
+        "SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at FROM fields WHERE field_id = ?1",
     )
     .bind(field_id)
     .fetch_optional(&state.pool)
@@ -3236,25 +3295,33 @@ async fn load_field(state: &AppState, field_id: &str) -> AppResult<Option<FieldR
 }
 
 async fn load_farm(state: &AppState, farm_id: &str) -> AppResult<Option<FarmRecord>> {
-    let row = sqlx::query("SELECT farm_id, name, notes FROM farms WHERE farm_id = ?1")
-        .bind(farm_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(Error::from)?;
+    let row =
+        sqlx::query("SELECT farm_id, owner, name, notes, created_at FROM farms WHERE farm_id = ?1")
+            .bind(farm_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(Error::from)?;
 
     Ok(row.map(|row| decode_farm_record(&row)))
 }
 
-async fn ensure_field_farm_exists(state: &AppState, farm_id: Option<&str>) -> AppResult<()> {
+async fn field_owner_for_farm(
+    state: &AppState,
+    farm_id: Option<&str>,
+    requested_owner: &str,
+) -> AppResult<String> {
     if let Some(farm_id) = farm_id {
-        if load_farm(state, farm_id).await?.is_none() {
-            return Err(AppError::BadRequest(format!(
-                "farm {} does not exist",
-                farm_id
-            )));
-        }
+        let farm = load_farm(state, farm_id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest(format!("farm {} does not exist", farm_id)))?;
+        return Ok(farm.owner);
     }
-    Ok(())
+    let owner = requested_owner.trim();
+    Ok(if owner.is_empty() {
+        DEFAULT_RECORD_OWNER.to_string()
+    } else {
+        owner.to_string()
+    })
 }
 
 async fn load_scene_field(
@@ -4003,6 +4070,7 @@ mod tests {
         let field = build_field_record(CreateFieldRequest {
             farm_id: None,
             field_id: Some("north-80".to_string()),
+            owner: None,
             name: "North 80".to_string(),
             crop: Some("corn".to_string()),
             season: Some("2026".to_string()),
@@ -4044,6 +4112,7 @@ mod tests {
         let err = build_field_record(CreateFieldRequest {
             farm_id: None,
             field_id: None,
+            owner: None,
             name: "Short boundary".to_string(),
             crop: None,
             season: None,
@@ -4071,6 +4140,7 @@ mod tests {
         let err = build_field_record(CreateFieldRequest {
             farm_id: None,
             field_id: None,
+            owner: None,
             name: "Bad coordinates".to_string(),
             crop: None,
             season: None,

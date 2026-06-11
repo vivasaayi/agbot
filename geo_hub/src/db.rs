@@ -20,6 +20,7 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE TABLE IF NOT EXISTS farms (
             farm_id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL DEFAULT 'unassigned',
             name TEXT NOT NULL,
             notes TEXT,
             created_at TEXT NOT NULL
@@ -34,6 +35,7 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         CREATE TABLE IF NOT EXISTS fields (
             field_id TEXT PRIMARY KEY,
             farm_id TEXT,
+            owner TEXT NOT NULL DEFAULT 'unassigned',
             name TEXT NOT NULL,
             crop TEXT,
             season TEXT,
@@ -50,6 +52,7 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE TABLE IF NOT EXISTS scenes (
             scene_id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL DEFAULT 'unassigned',
             sensor TEXT NOT NULL,
             acquired_at TEXT NOT NULL,
             data_path TEXT NOT NULL,
@@ -64,9 +67,33 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     ensure_column(
         pool,
+        "farms",
+        "owner",
+        "ALTER TABLE farms ADD COLUMN owner TEXT NOT NULL DEFAULT 'unassigned'",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
         "fields",
         "farm_id",
         "ALTER TABLE fields ADD COLUMN farm_id TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "fields",
+        "owner",
+        "ALTER TABLE fields ADD COLUMN owner TEXT NOT NULL DEFAULT 'unassigned'",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "scenes",
+        "owner",
+        "ALTER TABLE scenes ADD COLUMN owner TEXT NOT NULL DEFAULT 'unassigned'",
     )
     .await?;
 

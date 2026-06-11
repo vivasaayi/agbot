@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use clap::Args;
 use imagery_processor::{IndexKind, IndicesArgs, OutputFormat, Processor, SensorPreset};
 use serde::Serialize;
-use shared::schemas::MultispectralImage;
+use shared::schemas::{MultispectralImage, DEFAULT_RECORD_OWNER};
 use sqlx::Row;
 use std::{
     collections::HashMap,
@@ -91,14 +91,16 @@ pub async fn ingest_landsat(
 
     sqlx::query(
         r#"
-        INSERT INTO scenes (scene_id, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
-        VALUES (?1, 'landsat8', ?2, ?3, ?4, NULL, datetime('now'))
-        ON CONFLICT(scene_id) DO UPDATE SET metadata_json = excluded.metadata_json,
+        INSERT INTO scenes (scene_id, owner, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
+        VALUES (?1, ?2, 'landsat8', ?3, ?4, ?5, NULL, datetime('now'))
+        ON CONFLICT(scene_id) DO UPDATE SET owner = excluded.owner,
+                                          metadata_json = excluded.metadata_json,
                                           data_path = excluded.data_path,
                                           acquired_at = excluded.acquired_at
         "#,
     )
     .bind(&args.scene_id)
+    .bind(DEFAULT_RECORD_OWNER)
     .bind(summary.timestamp.to_rfc3339())
     .bind(scene_dir.to_string_lossy().to_string())
     .bind(&metadata_json)
