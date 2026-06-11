@@ -282,4 +282,5 @@ pub struct IndexResultMeta {
     pub valid_pixel_count: usize,
     #[serde(default)]
     pub invalid_pixel_reasons: BTreeMap<String, usize>,
+    pub radiometric_calibration: crate::io::RadiometricCalibrationEvidence,
 }

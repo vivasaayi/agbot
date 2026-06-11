@@ -91,6 +91,21 @@ fn record_invalid_pixel(reasons: &mut BTreeMap<String, usize>, reason: &'static 
     *reasons.entry(reason.to_string()).or_insert(0) += 1;
 }
 
+fn calibrated_band_value(
+    raw_value: f32,
+    band_name: &str,
+    calibration: &crate::io::RadiometricCalibrationEvidence,
+) -> f32 {
+    calibration
+        .coefficients
+        .get(band_name)
+        .map(|coefficients| {
+            (raw_value * coefficients.gain + coefficients.offset)
+                .clamp(coefficients.output_min, coefficients.output_max)
+        })
+        .unwrap_or(raw_value)
+}
+
 async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<()> {
     let overrides = crate::io::BandOverrides::from_indices_args(args);
     let ingest = crate::io::ingest_multispectral_image(metadata_file, args.sensor, &overrides)
@@ -272,11 +287,31 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                             Some(nd) => n != nd,
                             None => true,
                         };
-                        (r, n, nodata_ok)
+                        (
+                            calibrated_band_value(
+                                r,
+                                &red_name,
+                                &ingest.evidence.radiometric_calibration,
+                            ),
+                            calibrated_band_value(
+                                n,
+                                &nir_name,
+                                &ingest.evidence.radiometric_calibration,
+                            ),
+                            nodata_ok,
+                        )
                     } else {
                         (
-                            red_img.get_pixel(x, y)[0] as f32,
-                            nir_img.get_pixel(x, y)[0] as f32,
+                            calibrated_band_value(
+                                red_img.get_pixel(x, y)[0] as f32,
+                                &red_name,
+                                &ingest.evidence.radiometric_calibration,
+                            ),
+                            calibrated_band_value(
+                                nir_img.get_pixel(x, y)[0] as f32,
+                                &nir_name,
+                                &ingest.evidence.radiometric_calibration,
+                            ),
                             true,
                         )
                     };
@@ -350,11 +385,31 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                             Some(nd) => n != nd,
                             None => true,
                         };
-                        (re, n, nodata_ok)
+                        (
+                            calibrated_band_value(
+                                re,
+                                &re_name,
+                                &ingest.evidence.radiometric_calibration,
+                            ),
+                            calibrated_band_value(
+                                n,
+                                &nir_name,
+                                &ingest.evidence.radiometric_calibration,
+                            ),
+                            nodata_ok,
+                        )
                     } else {
                         (
-                            re_img.get_pixel(x, y)[0] as f32,
-                            nir_img.get_pixel(x, y)[0] as f32,
+                            calibrated_band_value(
+                                re_img.get_pixel(x, y)[0] as f32,
+                                &re_name,
+                                &ingest.evidence.radiometric_calibration,
+                            ),
+                            calibrated_band_value(
+                                nir_img.get_pixel(x, y)[0] as f32,
+                                &nir_name,
+                                &ingest.evidence.radiometric_calibration,
+                            ),
                             true,
                         )
                     };
@@ -775,6 +830,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         mean,
         valid_pixel_count: stats_count,
         invalid_pixel_reasons,
+        radiometric_calibration: ingest.evidence.radiometric_calibration.clone(),
     };
 
     let meta_name = format!(

@@ -2,8 +2,9 @@
 
 use image::{GrayImage, Luma};
 use imagery_processor::{
-    io::BandIngestEvidence, pipeline::indices::run_indices, IndexKind, IndicesArgs, OutputFormat,
-    SensorPreset,
+    io::{BandIngestEvidence, CalibrationStatus},
+    pipeline::indices::run_indices,
+    IndexKind, IndicesArgs, OutputFormat, SensorPreset,
 };
 use serde_json::Value;
 use std::{
@@ -222,6 +223,106 @@ async fn indices_persist_sentinel2_band_ingest_evidence() {
     assert_eq!(evidence.resolved_bands.get("red").unwrap(), "B04");
     assert_eq!(evidence.resolved_bands.get("nir").unwrap(), "B08");
     assert_eq!(evidence.resolved_bands.get("red_edge").unwrap(), "B05");
+}
+
+#[tokio::test]
+async fn sentinel2_indices_record_radiometric_calibration_evidence() {
+    let root = temp_test_dir("sentinel2_calibration_evidence");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("b04.png");
+    let nir_path = input_dir.join("b08.png");
+    let red_edge_path = input_dir.join("b05.png");
+    write_gray_image(&red_path, 2, 1, &[64, 128]);
+    write_gray_image(&nir_path, 2, 1, &[192, 224]);
+    write_gray_image(&red_edge_path, 2, 1, &[80, 90]);
+    write_metadata(
+        &input_dir,
+        2,
+        1,
+        &[
+            ("B04", red_path.as_path()),
+            ("B08", nir_path.as_path()),
+            ("B05", red_edge_path.as_path()),
+        ],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.sensor = Some(SensorPreset::Sentinel2);
+
+    run_indices(&args).await.unwrap();
+
+    let evidence = read_band_ingest_evidence(&output_dir);
+    assert_eq!(
+        evidence.radiometric_calibration.status,
+        CalibrationStatus::CalibratedReflectance
+    );
+    let red_coefficients = evidence
+        .radiometric_calibration
+        .coefficients
+        .get("B04")
+        .unwrap();
+    assert!((red_coefficients.gain - (1.0 / 255.0)).abs() < 1e-6);
+    assert_eq!(red_coefficients.offset, 0.0);
+    assert_eq!(red_coefficients.output_min, 0.0);
+    assert_eq!(red_coefficients.output_max, 1.0);
+
+    let meta = read_result_meta(&output_dir);
+    assert_eq!(
+        meta["radiometric_calibration"]["status"].as_str().unwrap(),
+        "CalibratedReflectance"
+    );
+    assert_eq!(
+        meta["radiometric_calibration"]["coefficients"]["B04"]["offset"]
+            .as_f64()
+            .unwrap(),
+        0.0
+    );
+}
+
+#[tokio::test]
+async fn missing_calibration_coefficients_are_marked_uncalibrated_dn() {
+    let root = temp_test_dir("dji_uncalibrated_dn");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    let red_edge_path = input_dir.join("re.png");
+    write_gray_image(&red_path, 1, 1, &[64]);
+    write_gray_image(&nir_path, 1, 1, &[192]);
+    write_gray_image(&red_edge_path, 1, 1, &[80]);
+    write_metadata(
+        &input_dir,
+        1,
+        1,
+        &[
+            ("Red", red_path.as_path()),
+            ("NIR", nir_path.as_path()),
+            ("RE", red_edge_path.as_path()),
+        ],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.sensor = Some(SensorPreset::DjiMultispectral);
+
+    run_indices(&args).await.unwrap();
+
+    let evidence = read_band_ingest_evidence(&output_dir);
+    assert_eq!(
+        evidence.radiometric_calibration.status,
+        CalibrationStatus::UncalibratedDn
+    );
+    assert!(evidence.radiometric_calibration.coefficients.is_empty());
+
+    let meta = read_result_meta(&output_dir);
+    assert_eq!(
+        meta["radiometric_calibration"]["status"].as_str().unwrap(),
+        "UncalibratedDn"
+    );
 }
 
 #[tokio::test]

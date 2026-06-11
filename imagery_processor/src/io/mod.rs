@@ -32,15 +32,36 @@ pub struct IngestedMultispectralImage {
     pub evidence: BandIngestEvidence,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BandIngestEvidence {
     pub image_id: uuid::Uuid,
     pub sensor: Option<String>,
     pub band_index_to_name: BTreeMap<usize, String>,
     pub resolved_bands: BTreeMap<String, String>,
     pub band_grids: BTreeMap<String, BandGridEvidence>,
+    pub radiometric_calibration: RadiometricCalibrationEvidence,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RadiometricCalibrationEvidence {
+    pub status: CalibrationStatus,
+    pub coefficients: BTreeMap<String, BandCalibrationCoefficients>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CalibrationStatus {
+    CalibratedReflectance,
+    UncalibratedDn,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct BandCalibrationCoefficients {
+    pub gain: f32,
+    pub offset: f32,
+    pub output_min: f32,
+    pub output_max: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,6 +205,7 @@ pub fn resolve_band_ingest_evidence(
     }
 
     let band_grids = inspect_band_grids(&image, image.metadata.width, image.metadata.height)?;
+    let radiometric_calibration = radiometric_calibration_evidence(sensor, &band_index_to_name);
 
     Ok(BandIngestEvidence {
         image_id: image.image_id,
@@ -191,9 +213,43 @@ pub fn resolve_band_ingest_evidence(
         band_index_to_name,
         resolved_bands,
         band_grids,
+        radiometric_calibration,
         width: image.metadata.width,
         height: image.metadata.height,
     })
+}
+
+fn radiometric_calibration_evidence(
+    sensor: Option<SensorPreset>,
+    band_index_to_name: &BTreeMap<usize, String>,
+) -> RadiometricCalibrationEvidence {
+    match sensor {
+        Some(SensorPreset::Sentinel2) | Some(SensorPreset::Landsat8) => {
+            let coefficients = band_index_to_name
+                .values()
+                .map(|band_name| {
+                    (
+                        band_name.clone(),
+                        BandCalibrationCoefficients {
+                            gain: 1.0 / 255.0,
+                            offset: 0.0,
+                            output_min: 0.0,
+                            output_max: 1.0,
+                        },
+                    )
+                })
+                .collect();
+
+            RadiometricCalibrationEvidence {
+                status: CalibrationStatus::CalibratedReflectance,
+                coefficients,
+            }
+        }
+        Some(SensorPreset::DjiMultispectral) | None => RadiometricCalibrationEvidence {
+            status: CalibrationStatus::UncalibratedDn,
+            coefficients: BTreeMap::new(),
+        },
+    }
 }
 
 fn inspect_band_grids(
