@@ -1,9 +1,15 @@
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use shared::{config::AgroConfig, schemas::LidarScan, AgroResult};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tracing::{error, info, warn};
-// use futures::stream::{self, StreamExt};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tracing::{error, info};
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(name = "lidar_mapper")]
@@ -27,6 +33,36 @@ pub struct Args {
 
 pub struct LidarMapper {
     config: Arc<AgroConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarScanIngestRecord {
+    pub path: String,
+    pub scan_id: Uuid,
+    pub captured_at: DateTime<Utc>,
+    pub ingested_at: DateTime<Utc>,
+    pub point_count: usize,
+    pub angular_coverage: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarScanIngestFailure {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarScanIngestSummary {
+    pub loaded_count: usize,
+    pub failed_count: usize,
+    pub records: Vec<LidarScanIngestRecord>,
+    pub failures: Vec<LidarScanIngestFailure>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LidarScanIngest {
+    pub scans: Vec<LidarScan>,
+    pub summary: LidarScanIngestSummary,
 }
 
 #[derive(Debug, Clone)]
@@ -76,71 +112,8 @@ impl LidarMapper {
     ) -> AgroResult<()> {
         info!("Processing LiDAR scans in: {:?}", input_dir);
 
-        tokio::fs::create_dir_all(output_dir).await?;
-
-        // Find all scan JSON files
-        let mut scan_files = Vec::new();
-        for entry in walkdir::WalkDir::new(input_dir) {
-            let entry = entry.map_err(|e| shared::error::AgroError::Io(e.into()))?;
-            if entry.file_name().to_string_lossy().contains("scan_")
-                && entry.path().extension().map_or(false, |ext| ext == "json")
-            {
-                scan_files.push(entry.path().to_path_buf());
-            }
-        }
-
-        info!("Found {} scan files to process", scan_files.len());
-        // Initialize progress bar for loading scans
-        let pb = ProgressBar::new(scan_files.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
-                )
-                .expect("Invalid progress bar template")
-                .progress_chars("#>-"),
-        );
-
-        use futures::stream::{self, StreamExt};
-
-        // Load all scans in parallel, track successes/failures
-        let parallelism = 8;
-        let mut load_stream = stream::iter(scan_files.into_iter().map(|path| async move {
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .map_err(|e| shared::error::AgroError::Io(e.into()))?;
-            let scan: LidarScan = serde_json::from_str(&content)
-                .map_err(|e| shared::error::AgroError::Processing(e.to_string()))?;
-            Ok::<(PathBuf, LidarScan), shared::error::AgroError>((path, scan))
-        }))
-        .buffer_unordered(parallelism);
-
-        let mut all_scans = Vec::new();
-        let mut loaded = 0;
-        let mut failed = 0;
-        while let Some(res) = load_stream.next().await {
-            // Update progress
-            pb.inc(1);
-            match res {
-                Ok((_path, scan)) => {
-                    all_scans.push(scan);
-                    loaded += 1;
-                }
-                Err(e) => {
-                    error!("Failed to load scan: {}", e);
-                    failed += 1;
-                }
-            }
-        }
-        // Finish progress bar
-        pb.finish_with_message("Scan loading complete");
-        info!("Scans loaded: {}, failed: {}", loaded, failed);
-        if loaded == 0 {
-            return Err(shared::error::AgroError::Processing(
-                "No LiDAR scans were processed successfully".into(),
-            )
-            .into());
-        }
+        let ingest = self.ingest_scans(input_dir, output_dir).await?;
+        let all_scans = ingest.scans;
 
         // Create occupancy grid
         let grid = self.create_occupancy_grid(&all_scans)?;
@@ -158,7 +131,141 @@ impl LidarMapper {
         Ok(())
     }
 
-    async fn load_scan(&self, scan_file: &PathBuf) -> AgroResult<LidarScan> {
+    pub async fn ingest_scans(
+        &self,
+        input_dir: &Path,
+        output_dir: &Path,
+    ) -> AgroResult<LidarScanIngest> {
+        tokio::fs::create_dir_all(output_dir).await?;
+
+        let scan_files = Self::scan_files(input_dir)?;
+        info!("Found {} scan files to process", scan_files.len());
+
+        let pb = ProgressBar::new(scan_files.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+                )
+                .expect("Invalid progress bar template")
+                .progress_chars("#>-"),
+        );
+
+        use futures::stream::{self, StreamExt};
+
+        let parallelism = 8;
+        let mut load_stream = stream::iter(scan_files.into_iter().map(|path| async move {
+            let loaded = Self::load_scan(&path).await;
+            (path, loaded)
+        }))
+        .buffer_unordered(parallelism);
+
+        let mut loaded_scans = Vec::new();
+        let mut failures = Vec::new();
+        while let Some((path, loaded)) = load_stream.next().await {
+            pb.inc(1);
+            let path_string = path.to_string_lossy().to_string();
+            match loaded {
+                Ok(scan) => {
+                    let record = LidarScanIngestRecord {
+                        path: path_string,
+                        scan_id: scan.scan_id,
+                        captured_at: scan.timestamp,
+                        ingested_at: Utc::now(),
+                        point_count: scan.points.len(),
+                        angular_coverage: Self::angular_coverage_degrees(&scan),
+                    };
+                    loaded_scans.push((path, scan, record));
+                }
+                Err(e) => {
+                    error!("Failed to load scan {:?}: {}", path, e);
+                    failures.push(LidarScanIngestFailure {
+                        path: path_string,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        pb.finish_with_message("Scan loading complete");
+
+        loaded_scans.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+        failures.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let records: Vec<_> = loaded_scans
+            .iter()
+            .map(|(_, _, record)| record.clone())
+            .collect();
+        let scans: Vec<_> = loaded_scans.into_iter().map(|(_, scan, _)| scan).collect();
+        let summary = LidarScanIngestSummary {
+            loaded_count: records.len(),
+            failed_count: failures.len(),
+            records,
+            failures,
+        };
+
+        let summary_path = Self::scan_ingest_summary_path(output_dir);
+        let content = serde_json::to_vec_pretty(&summary)?;
+        tokio::fs::write(&summary_path, content).await?;
+        info!(
+            "Scans loaded: {}, failed: {}, summary: {:?}",
+            summary.loaded_count, summary.failed_count, summary_path
+        );
+
+        if summary.loaded_count == 0 {
+            return Err(shared::error::AgroError::Processing(
+                "No LiDAR scans were processed successfully".into(),
+            ));
+        }
+
+        Ok(LidarScanIngest { scans, summary })
+    }
+
+    fn scan_files(input_dir: &Path) -> AgroResult<Vec<PathBuf>> {
+        let mut scan_files = Vec::new();
+        for entry in walkdir::WalkDir::new(input_dir) {
+            let entry = entry.map_err(|e| shared::error::AgroError::Io(e.into()))?;
+            if entry.file_name().to_string_lossy().contains("scan_")
+                && entry.path().extension().map_or(false, |ext| ext == "json")
+            {
+                scan_files.push(entry.path().to_path_buf());
+            }
+        }
+        scan_files.sort();
+        Ok(scan_files)
+    }
+
+    pub fn scan_ingest_summary_path(output_dir: &Path) -> PathBuf {
+        output_dir.join("scan_ingest_summary.json")
+    }
+
+    pub fn angular_coverage_degrees(scan: &LidarScan) -> f32 {
+        let mut angles: Vec<f32> = scan
+            .points
+            .iter()
+            .filter_map(|point| {
+                point
+                    .angle
+                    .is_finite()
+                    .then(|| point.angle.rem_euclid(360.0))
+            })
+            .collect();
+
+        if angles.len() < 2 {
+            return 0.0;
+        }
+
+        angles.sort_by(f32::total_cmp);
+        let largest_gap = angles
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .fold(0.0_f32, f32::max);
+        let wrap_gap =
+            angles.first().copied().unwrap_or(0.0) + 360.0 - angles.last().copied().unwrap_or(0.0);
+        360.0 - largest_gap.max(wrap_gap)
+    }
+
+    async fn load_scan(scan_file: &Path) -> AgroResult<LidarScan> {
         let content = tokio::fs::read_to_string(scan_file).await?;
         let scan: LidarScan = serde_json::from_str(&content)?;
         Ok(scan)
@@ -353,16 +460,48 @@ mod tests {
     use chrono::Utc;
     use shared::config::AgroConfig;
     use shared::schemas::{LidarPoint, LidarScan};
+    use std::fs;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    fn test_mapper() -> LidarMapper {
+        let config = AgroConfig::load().unwrap();
+        LidarMapper {
+            config: Arc::new(config),
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("agbot_lidar_{name}_{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn scan_with_angles(
+        scan_id: Uuid,
+        captured_at: chrono::DateTime<Utc>,
+        angles: &[f32],
+    ) -> LidarScan {
+        let points = angles
+            .iter()
+            .map(|angle| LidarPoint {
+                timestamp: captured_at,
+                angle: *angle,
+                distance: 1500.0,
+                quality: 30,
+            })
+            .collect();
+        LidarScan {
+            timestamp: captured_at,
+            points,
+            scan_id,
+        }
+    }
 
     #[test]
     fn test_create_occupancy_grid_obstacle() {
         // Single point within obstacle threshold should mark cell occupied
-        let config = AgroConfig::load().unwrap();
-        let mapper = LidarMapper {
-            config: Arc::new(config),
-        };
+        let mapper = test_mapper();
         let point = LidarPoint {
             timestamp: Utc::now(),
             angle: 0.0,
@@ -383,10 +522,7 @@ mod tests {
     #[test]
     fn test_create_occupancy_grid_free() {
         // Single point beyond obstacle threshold should mark cell free
-        let config = AgroConfig::load().unwrap();
-        let mapper = LidarMapper {
-            config: Arc::new(config),
-        };
+        let mapper = test_mapper();
         let point = LidarPoint {
             timestamp: Utc::now(),
             angle: std::f32::consts::FRAC_PI_2,
@@ -402,5 +538,68 @@ mod tests {
         assert_eq!(grid.len(), 1);
         let cell = grid.values().next().unwrap();
         assert!(!cell.occupied, "Cell should be marked free");
+    }
+
+    #[test]
+    fn scan_angular_coverage_uses_observed_angle_span() {
+        let scan = scan_with_angles(Uuid::new_v4(), Utc::now(), &[270.0, 0.0, 180.0, 90.0]);
+        assert_eq!(LidarMapper::angular_coverage_degrees(&scan), 270.0);
+
+        let empty = scan_with_angles(Uuid::new_v4(), Utc::now(), &[]);
+        assert_eq!(LidarMapper::angular_coverage_degrees(&empty), 0.0);
+
+        let wraparound = scan_with_angles(Uuid::new_v4(), Utc::now(), &[350.0, 10.0]);
+        assert_eq!(LidarMapper::angular_coverage_degrees(&wraparound), 20.0);
+    }
+
+    #[tokio::test]
+    async fn ingest_scans_records_summary_and_skips_malformed() {
+        let mapper = test_mapper();
+        let input_dir = temp_dir("ingest_input");
+        let output_dir = temp_dir("ingest_output");
+        let captured_at = Utc::now();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let first = scan_with_angles(first_id, captured_at, &[0.0, 90.0, 180.0, 270.0]);
+        let second = scan_with_angles(second_id, captured_at, &[15.0, 45.0, 75.0]);
+
+        fs::write(
+            input_dir.join("scan_first.json"),
+            serde_json::to_string(&first).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            input_dir.join("scan_second.json"),
+            serde_json::to_string(&second).unwrap(),
+        )
+        .unwrap();
+        fs::write(input_dir.join("scan_bad.json"), "{not valid json").unwrap();
+
+        let ingest = mapper.ingest_scans(&input_dir, &output_dir).await.unwrap();
+
+        assert_eq!(ingest.scans.len(), 2);
+        assert_eq!(ingest.summary.loaded_count, 2);
+        assert_eq!(ingest.summary.failed_count, 1);
+        assert_eq!(ingest.summary.records.len(), 2);
+        assert_eq!(ingest.summary.failures.len(), 1);
+        assert!(ingest.summary.failures[0].path.ends_with("scan_bad.json"));
+        assert!(!ingest.summary.failures[0].error.is_empty());
+
+        let first_record = ingest
+            .summary
+            .records
+            .iter()
+            .find(|record| record.scan_id == first_id)
+            .unwrap();
+        assert_eq!(first_record.captured_at, captured_at);
+        assert_eq!(first_record.point_count, 4);
+        assert_eq!(first_record.angular_coverage, 270.0);
+        assert!(first_record.ingested_at >= captured_at);
+
+        let persisted_path = output_dir.join("scan_ingest_summary.json");
+        assert!(persisted_path.exists());
+        let persisted: LidarScanIngestSummary =
+            serde_json::from_str(&fs::read_to_string(persisted_path).unwrap()).unwrap();
+        assert_eq!(persisted, ingest.summary);
     }
 }
