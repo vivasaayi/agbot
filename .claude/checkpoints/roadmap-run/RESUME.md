@@ -2,7 +2,8 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: f7f689d5947be4fbf236914925c1af7693d98188
-- **Last commit**: d76d8c00682b7601627206b26f0436d798ea36c4 (`batch-02-05` implementation commit)
+- **Last implementation commit**: d76d8c00682b7601627206b26f0436d798ea36c4 (`batch-02-05`)
+- **Latest checkpoint commit**: fe5b37513e3ee82411928f82b74ffe042e60ca2f (`batch-02-05` checkpoint)
 - **Current batch**: none — ready to start `batch-02-06`
 - **Completed batches**: 5 committed
 - **Blocker**: none

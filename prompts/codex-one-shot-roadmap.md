@@ -28,22 +28,24 @@ Task selection:
 - Atomically claim selected feature IDs in SQLite before editing.
 
 Batch loop:
-- Continue through up to 3 completed and committed batches in this run unless the user provides a different batch limit.
+- Continue through successive completed and committed batches until every roadmap item is processed and verified, or until a hard stop condition is reached. Do not stop merely because a batch was completed, a checkpoint was written, a commit succeeded, or a concise status update could be reported.
 - After each verified commit:
   - Update `checkpoint.sqlite` and `RESUME.md`.
   - Re-read the active checkpoint.
   - Verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and the roadmap hash.
   - Select and atomically claim the next deterministic batch using the same P0 -> P1 -> P2 priority rules.
   - Implement, validate, checkpoint, commit, and repeat.
-- Stop the loop when any stop condition is hit:
+- Do not stop merely because a batch completed, the next batch is larger, or the worktree is clean after a checkpoint.
+- Stop the loop only when a hard stop condition is hit:
   - no pending roadmap items remain
-  - the configured batch limit is reached
   - validation fails and cannot be fixed within the current batch
   - unrelated worktree changes conflict with the next batch
   - a real blocker prevents progress
-  - context, token, rate-limit, or timeout pressure makes another implementation batch unsafe
+  - the user explicitly stops the run
+  - context, token, rate-limit, or timeout pressure makes it impossible to continue safely
+- Treat context, token, rate-limit, and timeout pressure as hard stop conditions only when there is concrete evidence that continuing another batch would likely lose work or prevent a checkpoint. Do not stop speculatively.
 - Before stopping, write a complete checkpoint with the current batch, feature IDs, changed files, commands run, verification state, last commit, blocker if any, and exact next action.
-- Codex cannot restart itself after API token, context, or rate limits. For a truly continuous loop, rely on an external harness to relaunch Codex with this prompt; SQLite and `RESUME.md` are the handoff contract.
+- Codex cannot restart itself after API token, context, or rate limits. If an external runtime reset is required, rely on a harness to relaunch Codex with this prompt; SQLite and `RESUME.md` are the handoff contract.
 
 Architecture guardrails:
 - `flight_sim_cpp` is the single canonical simulator for both interactive viewing and headless deterministic regression.
@@ -85,7 +87,7 @@ Checkpoint and commit:
   - `batches.commit_sha`
   - completed `feature_progress.commit_sha`
   - `RESUME.md`
-- Keep `RESUME.md` tiny: run ID, roadmap hash, last commit, current batch, completed batch count, blocker if any, exact next action, and latest verification evidence.
+- Keep `RESUME.md` tiny: run ID, roadmap hash, last implementation commit, latest checkpoint commit when different, current batch, completed batch count, blocker if any, exact next action, and latest verification evidence.
 
 Git sandbox handling:
 - Run read-only git commands such as `git status`, `git diff`, `git log`, and `git show` normally.
@@ -108,7 +110,8 @@ If blocked:
 
 Context and resume discipline:
 - After every committed batch, update SQLite and `RESUME.md`.
-- If context is running low, stop starting new implementation work and write a complete checkpoint first.
+- Continue to the next deterministic batch after each checkpoint unless a hard stop condition applies.
+- If context is genuinely too low to complete, validate, and checkpoint the next batch safely, stop starting new implementation work and write a complete checkpoint first.
 - On resume, read `AGENTS.md`, the active `RESUME.md`, and the SQLite checkpoint; verify roadmap hash, last commit, and `git status --short`; then continue from `runs.next_action`.
 - Do not re-enumerate the full roadmap after resume unless the roadmap hash changed or the checkpoint is invalid.
 

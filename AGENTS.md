@@ -33,15 +33,17 @@ When the task is to execute the AGBot roadmap, do not ask the user which item to
 
 ## Roadmap Batch Loop Mode
 
-Use this mode only when the user or one-shot prompt explicitly asks the agent to continue through multiple roadmap batches in a loop. Keep the loop bounded; do not run indefinitely.
+Use this mode only when the user or one-shot prompt explicitly asks the agent to continue through multiple roadmap batches in a loop. Do not impose a discretionary batch-count limit.
 
-- Default loop budget: up to 3 completed and committed batches per run unless the user specifies a different limit.
+- Continue selecting and executing deterministic batches until every roadmap item is processed and verified, or until a hard stop condition is reached.
 - After each verified commit, update `checkpoint.sqlite` and `RESUME.md`, then re-read the active checkpoint before selecting the next batch.
 - Before starting each next batch, verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and the roadmap hash. If the roadmap hash changed, re-evaluate selection before claiming work.
 - Select, claim, implement, validate, commit, and checkpoint the next batch using the same P0 -> P1 -> P2 priority rules.
-- Stop the loop when there are no pending items, the configured batch limit is reached, validation fails and cannot be fixed within the current batch, unrelated worktree changes create a conflict, a real blocker prevents progress, or context/rate-limit pressure makes more implementation unsafe.
+- Do not stop merely because a batch completed, the next batch is larger, or the worktree is clean after a checkpoint.
+- Stop the loop only when there are no pending items, validation fails and cannot be fixed within the current batch, unrelated worktree changes create a conflict, a real blocker prevents progress, the user explicitly stops the run, or context/token/rate-limit/timeout pressure makes it impossible to continue safely.
+- Treat context, token, rate-limit, and timeout pressure as hard stop conditions only when there is concrete evidence that continuing another batch would likely lose work or prevent a checkpoint. Do not stop speculatively.
 - Before stopping, write a durable checkpoint with the current batch, feature IDs, changed files, commands run, verification state, last commit, blocker if any, and exact next action.
-- Codex cannot restart itself after API token, context, or rate limits. A truly continuous loop must be driven by an external harness that relaunches Codex with the one-shot prompt; SQLite and `RESUME.md` are the handoff contract.
+- Codex cannot restart itself after API token, context, or rate limits. If an external runtime reset is required, SQLite and `RESUME.md` are the handoff contract for the harness to relaunch Codex and continue from the exact next action.
 
 ## Parallel Batch Execution
 
@@ -139,7 +141,7 @@ Rules:
 - Claim work atomically so agents do not duplicate work: update from `pending` to `claimed` only when the row is still pending.
 - Append every important action to `events`: batch selection, claim, file edit, test command, failure, verifier result, commit, pause, resume, and blocker.
 - Treat a git commit as the strongest checkpoint. After each verified batch commit, update `runs.last_commit`, `batches.commit_sha`, and all completed `feature_progress.commit_sha` values.
-- Keep `RESUME.md` tiny: current run ID, roadmap hash, last commit, current batch, completed batch count, blocker if any, and exact next action.
+- Keep `RESUME.md` tiny: current run ID, roadmap hash, last implementation commit, latest checkpoint commit when different, current batch, completed batch count, blocker if any, and exact next action.
 - On resume, read `RESUME.md`, verify `checkpoint.sqlite`, verify the roadmap hash, verify `last_commit`, check `git status --short`, then continue from `runs.next_action`.
 
 ## Evidence Rules
@@ -193,10 +195,10 @@ Warnings may already exist. Treat command exit codes and new failures as the sig
 
 ## Context Budget and Resume Discipline
 
-For long roadmap execution runs, context pressure is expected. Do not keep dragging stale context after a completed batch.
+For long roadmap execution runs, context pressure is expected. Checkpoint after each completed batch so an external runtime reset can resume exactly; do not voluntarily stop solely to get a clean context.
 
-- After every committed batch, update `checkpoint.sqlite` and `RESUME.md`, then prefer ending the current Codex session so the next run can start from a compact checkpoint.
-- If the visible token count is high, roughly above 120k tokens, or Codex enters a long context-compaction phase, stop doing new implementation work.
+- After every committed batch, update `checkpoint.sqlite` and `RESUME.md`, then select and claim the next deterministic batch unless a hard stop condition applies.
+- Do not stop solely because the context is large, a batch boundary is clean, or a context compaction may occur. Stop starting new implementation work only when the remaining context is insufficient to complete, validate, and checkpoint the next batch safely, or the runtime is about to hit a hard token/rate/timeout limit.
 - Before stopping for context pressure, write a complete checkpoint: current batch, feature IDs, changed files, commands run, verification state, last commit, blocker if any, and exact next action.
 - Do not use permissions changes as a fix for token/context pressure. Permissions affect tool access, not context size.
 - After a context reset, resume by reading this `AGENTS.md`, `.codex/checkpoints/roadmap-run/RESUME.md`, and the SQLite checkpoint. Verify roadmap hash, last commit, and `git status --short`, then continue from `runs.next_action`.
