@@ -44,6 +44,17 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
   --output flight_sim_cpp/out/sample.jsonl
 ```
 
+## Diff Traces
+
+Compare two telemetry JSONL traces:
+
+```bash
+flight_sim_cpp/build/agbot-sim diff flight_sim_cpp/out/telemetry.jsonl flight_sim_cpp/out/other.jsonl
+```
+
+Identical traces exit 0 with `traces identical`. A divergence exits 1 and
+names the first differing step and telemetry field.
+
 ## Run Viewer
 
 On macOS:

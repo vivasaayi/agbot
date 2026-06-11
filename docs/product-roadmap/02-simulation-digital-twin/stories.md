@@ -285,6 +285,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Tests**: parameterized parity test per safety rule, coverage check (unregistered rule fails), failure path (harness gap named explicitly).
 - **Depends on**: 02-25 (deterministic runner), `01` (real-path safety rules), `03` (coordination abort rules).
 - **Note**: this story upgrades and supersedes STORY 02-11, which was P1/M3. Safety parity is a P0 prerequisite for sim-first testing, not an M3 polish item.
+- **Status**: initial implementation landed in `flight_sim_cpp` (`SafetyRules`, required-rule coverage harness, `DroneSimulation` failsafe integration, and violation code tests). Still pending: direct parity against the authoritative `01`/`03` safety rule source and dispatch-path CI wiring.
 
 ---
 
@@ -301,6 +302,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
 - **Tests**: unit (state per condition), scenario manifest assertion (per-tile states), failure path (missing tile → flat_fallback, not silent zero).
 - **Depends on**: 02-09 (DEM terrain), `flight_sim_cpp/src/GeoTerrain.cpp`, `TwinContractV1` (manifest schema).
 - **Note**: this requirement extends STORY 02-09. The failure path in 02-09 mentions "gap is reported," but does not define explicit states. This story makes the states a first-class contract item.
+- **Status**: initial implementation landed in `flight_sim_cpp` (`TerrainTileState`, `TerrainTileStatus`, and `composite_elevation_with_state` mark missing expected tiles as `flat_fallback`). Still pending: stale/synthetic/missing propagation from real fetch/cache outcomes and scenario-manifest serialization.
 
 ### STORY 02-28 · M2 · M · P0 — Scenario manifest (per-run metadata and hash registry)
 - **Story**: As `PA`, I want every simulation run to produce a scenario manifest — simulator version, seed, mission, terrain tiles used, weather config, sensor configs, safety config, source data hashes, and output hashes — so that any run can be reproduced and any trace can be audited back to its inputs.
@@ -323,6 +325,7 @@ The twin is the regression and planning surface for flight (`01`) and coordinati
   - Given a trace from a different contract version, when diff runs, then it reports "incompatible contract version" and exits 2.
 - **Tests**: unit (identical → 0, divergent → named diff), tolerance assertion, failure path (incompatible version → exit 2).
 - **Depends on**: 02-25 (deterministic traces), `TwinContractV1` (trace schema).
+- **Status**: initial implementation landed in `flight_sim_cpp` (`TraceDiff` core and `agbot-sim diff` executable report first divergent step and field path; identical traces exit 0). Still pending: tolerance flags, structured multi-diff JSON output, and contract-version incompatibility checks.
 
 ### STORY 02-30 · M2 · M · P0 — Fault injection library (seeded, reproducible fault classes)
 - **Story**: As `DSP`, I want a seeded fault injection library covering wind gusts, GPS drift, IMU noise, sensor dropout, comm loss, low battery, stale terrain, bad tile, and actuator lag, so that autonomy and failsafe behavior can be regression-tested against adverse conditions with reproducible inputs.

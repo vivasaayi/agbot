@@ -6,25 +6,28 @@ Provide a trustworthy digital twin of the drone, its sensors, and the terrain so
 
 ## Current Maturity
 
-medium partial: `flight_sim_cpp` (C++20) is the single canonical simulator for both interactive and headless surfaces. It has a fixed-timestep follower with mission load/edit, telemetry record/replay, OSM/Terrarium terrain, a globe picker, a macOS OpenGL viewer, and a deterministic headless runner (`DeterministicRunner`) that emits byte-identical traces plus a per-run manifest with a committed golden fixture. The Rust/Bevy `simulator` crate and the Rust `drone_simulator` crate were both retired after the C++ path won the canonical-simulator decision; there is one runner, not two. Wind/aerodynamics, the LiDAR sim, scene synthesis, and the ray-traced camera are missing.
+medium partial: `flight_sim_cpp` (C++20) is the single canonical simulator for both interactive and headless surfaces. It has a fixed-timestep follower with mission load/edit, telemetry record/replay, OSM/Terrarium terrain, a globe picker, a macOS OpenGL viewer, a deterministic headless runner (`DeterministicRunner`) that emits byte-identical traces plus a per-run manifest with a committed golden fixture, an initial safety parity harness, terrain tile state tagging, and a first trace diff CLI. The Rust/Bevy `simulator` crate and the Rust `drone_simulator` crate were both retired after the C++ path won the canonical-simulator decision; there is one runner, not two. Wind/aerodynamics, the LiDAR sim, scene synthesis, and the ray-traced camera are missing.
 
 ## What Exists Now
 
 - C++20 `DroneSimulation` with fixed-timestep `step()`, autopilot/manual/replay control modes, a per-drone physics loop (gravity/drag/thrust/angular damping) and battery drain, `MissionLoader` (local + lat/lon JSON), `TelemetryRecorder`/`TelemetryReplay` (JSONL), `GeoTerrain` (OSM/Terrarium), and a headless CLI (`flight_sim_cpp/src/DroneSimulation.cpp`, `MissionLoader.cpp`, `TelemetryRecorder.cpp`, `headless_main.cpp`, `GeoTerrain.cpp`).
 - Deterministic headless runner: `run_deterministic(mission, RunConfig{seed, timestep_s, record_interval_s, max_time_s})` returns a byte-identical JSONL trace plus a `RunManifest` (simulator_version, contract_version `1.0.0` seeding TwinContractV1, seed, timestep, mission_hash, output_hash via FNV-1a, prng_nonce, completed). The `agbot_flight_sim_headless` CLI now requires `--seed`, accepts `--timestep-ms`, and writes `<output>.manifest.json` next to the trace (`flight_sim_cpp/include/agbot_flight_sim/DeterministicRunner.hpp`, `src/DeterministicRunner.cpp`).
+- Safety parity first slice: `SafetyRules` defines geofence, altitude ceiling, no-fly-zone, low-battery, and emergency-abort violation codes; `DroneSimulation` records the last violation and fails safe when the envelope is breached. The test harness verifies required rule coverage (`flight_sim_cpp/include/agbot_flight_sim/SafetyRules.hpp`, `src/SafetyRules.cpp`).
+- Terrain no-data first slice: `TerrainTileState`/`TerrainTileStatus` tags available and `flat_fallback` elevation composites so a missing DEM tile is no longer represented as silent zero elevation (`flight_sim_cpp/include/agbot_flight_sim/GeoTerrain.hpp`, `src/GeoTerrain.cpp`).
+- Trace diff first slice: `agbot-sim diff <trace-a.jsonl> <trace-b.jsonl>` reports the first divergent telemetry step and field path (`flight_sim_cpp/include/agbot_flight_sim/TraceDiff.hpp`, `src/TraceDiff.cpp`, `src/agbot_sim_main.cpp`).
 - Tests cover byte-identity, seed-drives-PRNG, manifest contents, and a committed golden fixture `tests/golden/unit_mission.jsonl` (`flight_sim_cpp/tests/simulation_tests.cpp`).
 - macOS OpenGL viewer with globe picking (Mercator, up to z17), chase/orbit cameras, 2D/3D terrain views, a telemetry side panel, mission editing, and replay scrubbing (`flight_sim_cpp/src/macos_opengl_viewer.mm`).
 
 ## Gaps to Close
 
-### Reliability backbone (missing — must land before synthetic-perception work is meaningful)
+### Reliability backbone (partial — must land before synthetic-perception work is meaningful)
 
 - `TwinContractV1` PARTIALLY SEEDED: the deterministic runner emits a `contract_version` of `1.0.0` as the seed of TwinContractV1, but there is not yet a full versioned wire contract for commands, telemetry, trace files, scenario manifests, errors, or declared simulator capabilities. Broader contract drift is still invisible.
 - Deterministic runner mode PARTIALLY CLOSED: `flight_sim_cpp` now has a `--seed` / `--timestep-ms` headless runner that produces byte-identical output across runs (verified by tests), refuses to start without `--seed`, and logs seed/timestep/version in the run header. Golden fixtures are now reproducible on this foundation; cross-platform byte-identity verification is still pending.
-- No safety parity harness: there is no CI test that proves the twin enforces the same geofence, altitude, battery, no-fly-zone, and abort rules as the real flight path. This makes sim-first safety testing unverifiable.
-- No terrain no-data model: missing DEM tiles are currently at risk of silently becoming flat zero elevation. There is no `available`/`missing`/`stale`/`synthetic`/`flat_fallback` state tag carried with elevation samples.
+- Safety parity harness PARTIALLY CLOSED: the C++ twin now has shared safety violation codes, a coverage harness for geofence/altitude/battery/no-fly-zone/emergency-abort rules, and simulation failsafe integration. Still pending: parity against the authoritative `01`/`03` safety rule source and mission-dispatch wiring.
+- Terrain no-data model PARTIALLY CLOSED: elevation composites can now emit explicit tile states and mark missing tiles as `flat_fallback`. Still pending: stale/synthetic/missing state propagation from actual tile fetch/cache outcomes and manifest serialization.
 - Scenario manifest PARTIALLY CLOSED: the headless runner now emits a per-run `<output>.manifest.json` (`RunManifest`: simulator version, contract version, seed, timestep, mission_hash, output_hash, prng_nonce, completed). Still missing: terrain tile states/hashes, weather config, sensor configs, safety config, and a full versioned manifest schema with consumer round-trip.
-- No trace diff CLI: there is no tool that compares two JSONL telemetry traces and reports the exact divergent step index and field name. Golden test failures are currently opaque.
+- Trace diff CLI PARTIALLY CLOSED: `agbot-sim diff` now reports the first divergent telemetry step and field. Still pending: tolerance flags, multi-diff JSON output, and incompatible contract-version handling.
 - No fault injection library: there is no seeded, reproducible mechanism to inject wind gusts, GPS drift, IMU noise, sensor dropout, comm loss, low battery, stale terrain, bad tile, or actuator lag as named, reproducible fault classes.
 - No simulation health/operability: no health-check endpoint or CLI, no per-run seed/version log header, no trace retention policy, no tile cache controls, and no runbook.
 
@@ -39,12 +42,12 @@ medium partial: `flight_sim_cpp` (C++20) is the single canonical simulator for b
 - No capture replay adapter routing simulated sensor output through the exact domain `04` ingestion path; the path currently bypasses real ingestion handlers.
 - No named sensor calibration profiles; noise constants are buried in ad-hoc config.
 - No mission validation report produced before a simulated run.
-- Single-runner deterministic regression PARTIALLY CLOSED: same-seed byte-identity and per-run manifest hashing now exist on `flight_sim_cpp`; cross-build/cross-platform determinism verification and a trace-diff-backed regression gate are still pending.
+- Single-runner deterministic regression PARTIALLY CLOSED: same-seed byte-identity, per-run manifest hashing, and a first trace diff CLI now exist on `flight_sim_cpp`; cross-build/cross-platform determinism verification and CI gating are still pending.
 
 ## Source Modules Reviewed
 
 - `flight_sim_cpp/src/DroneSimulation.cpp`, `MissionLoader.cpp`, `TelemetryRecorder.cpp`, `TelemetryReplay.cpp`, `GeoTerrain.cpp`, `headless_main.cpp`, `macos_opengl_viewer.mm`, `flight_sim_cpp/tests/simulation_tests.cpp`
-- `flight_sim_cpp/include/agbot_flight_sim/DeterministicRunner.hpp`, `flight_sim_cpp/src/DeterministicRunner.cpp`, `flight_sim_cpp/tests/golden/unit_mission.jsonl`
+- `flight_sim_cpp/include/agbot_flight_sim/DeterministicRunner.hpp`, `SafetyRules.hpp`, `TraceDiff.hpp`, `flight_sim_cpp/src/DeterministicRunner.cpp`, `SafetyRules.cpp`, `TraceDiff.cpp`, `flight_sim_cpp/tests/golden/unit_mission.jsonl`
 - (retired) the Rust `drone_simulator` crate — its physics/sensor/controller loop was superseded by `flight_sim_cpp` and the crate was removed from the workspace
 - (retired) the Rust/Bevy `simulator` crate — globe view, HUD, map loader, and LiDAR stub were superseded by `flight_sim_cpp`
 

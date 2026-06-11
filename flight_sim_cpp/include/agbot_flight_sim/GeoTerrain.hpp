@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace agbot::flight_sim {
@@ -29,8 +30,24 @@ struct TileCoordinate {
     [[nodiscard]] GeoBounds bounds() const;
 };
 
+enum class TerrainTileState {
+    Available,
+    Missing,
+    Stale,
+    Synthetic,
+    FlatFallback,
+};
+
+struct TerrainTileStatus {
+    TileCoordinate coordinate;
+    TerrainTileState state = TerrainTileState::Available;
+    std::string reason;
+};
+
 struct ElevationTile {
     TileCoordinate coordinate;
+    TerrainTileState state = TerrainTileState::Available;
+    std::string state_reason;
     int width = 0;
     int height = 0;
     std::vector<float> elevations_m;
@@ -38,6 +55,13 @@ struct ElevationTile {
     float max_elevation_m = 0.0f;
 
     [[nodiscard]] float sample_bilinear(double u, double v) const;
+};
+
+struct ElevationComposite {
+    std::vector<float> heightmap;
+    std::vector<TerrainTileStatus> tile_states;
+
+    [[nodiscard]] bool has_state(TerrainTileState state) const;
 };
 
 struct TerrainVertex {
@@ -71,11 +95,19 @@ struct TerrainMesh {
     const GeoBounds& bounds,
     int resolution);
 
+[[nodiscard]] ElevationComposite composite_elevation_with_state(
+    const std::vector<ElevationTile>& tiles,
+    const GeoBounds& bounds,
+    int resolution,
+    const std::vector<TileCoordinate>& expected_tiles);
+
 [[nodiscard]] TerrainMesh build_terrain_mesh(
     const std::vector<float>& heightmap,
     int resolution,
     double width_m,
     double depth_m,
     double vertical_scale = 1.0);
+
+[[nodiscard]] const char* to_string(TerrainTileState state);
 
 } // namespace agbot::flight_sim

@@ -30,6 +30,10 @@ float sample_heightmap(const std::vector<float>& heightmap, int resolution, int 
     return heightmap[static_cast<std::size_t>(z * resolution + x)];
 }
 
+bool same_tile(TileCoordinate a, TileCoordinate b) {
+    return a.z == b.z && a.x == b.x && a.y == b.y;
+}
+
 } // namespace
 
 GeoBounds GeoBounds::from_center(const GeoCoordinate& center, double radius_m) {
@@ -101,6 +105,28 @@ float ElevationTile::sample_bilinear(double u, double v) const {
     return static_cast<float>(top * (1.0 - ty) + bottom * ty);
 }
 
+bool ElevationComposite::has_state(TerrainTileState state) const {
+    return std::any_of(tile_states.begin(), tile_states.end(), [state](const TerrainTileStatus& status) {
+        return status.state == state;
+    });
+}
+
+const char* to_string(TerrainTileState state) {
+    switch (state) {
+        case TerrainTileState::Available:
+            return "available";
+        case TerrainTileState::Missing:
+            return "missing";
+        case TerrainTileState::Stale:
+            return "stale";
+        case TerrainTileState::Synthetic:
+            return "synthetic";
+        case TerrainTileState::FlatFallback:
+            return "flat_fallback";
+    }
+    return "unknown";
+}
+
 double radius_m_for_area_km2(double area_km2) {
     const double clamped_area = std::max(0.0, area_km2);
     return std::sqrt((clamped_area * 1'000'000.0) / kPi);
@@ -158,6 +184,8 @@ std::optional<ElevationTile> elevation_tile_from_terrarium_rgba(
 
     ElevationTile tile;
     tile.coordinate = coordinate;
+    tile.state = TerrainTileState::Available;
+    tile.state_reason = "terrarium_rgba_decoded";
     tile.width = width;
     tile.height = height;
     tile.elevations_m.reserve(static_cast<std::size_t>(width * height));
@@ -219,6 +247,38 @@ std::vector<float> composite_elevation(
     }
 
     return heightmap;
+}
+
+ElevationComposite composite_elevation_with_state(
+    const std::vector<ElevationTile>& tiles,
+    const GeoBounds& bounds,
+    int resolution,
+    const std::vector<TileCoordinate>& expected_tiles) {
+    ElevationComposite composite;
+    composite.heightmap = composite_elevation(tiles, bounds, resolution);
+
+    for (const ElevationTile& tile : tiles) {
+        composite.tile_states.push_back({
+            tile.coordinate,
+            tile.state,
+            tile.state_reason.empty() ? std::string("elevation tile available") : tile.state_reason,
+        });
+    }
+
+    for (const TileCoordinate& expected : expected_tiles) {
+        const auto found = std::find_if(tiles.begin(), tiles.end(), [expected](const ElevationTile& tile) {
+            return same_tile(tile.coordinate, expected);
+        });
+        if (found == tiles.end()) {
+            composite.tile_states.push_back({
+                expected,
+                TerrainTileState::FlatFallback,
+                "missing elevation tile; using flat fallback heightmap",
+            });
+        }
+    }
+
+    return composite;
 }
 
 TerrainMesh build_terrain_mesh(

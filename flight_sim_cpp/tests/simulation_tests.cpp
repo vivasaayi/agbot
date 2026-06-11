@@ -2,8 +2,10 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/SafetyRules.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
+#include "agbot_flight_sim/TraceDiff.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -160,6 +162,36 @@ void test_failsafe_low_battery() {
     DroneSimulation simulation(std::move(mission), config);
     simulation.step(1.0);
     assert(simulation.state().mode == DroneMode::Failsafe);
+    assert(simulation.last_safety_violation().has_value());
+    assert(simulation.last_safety_violation()->code == agbot::flight_sim::SafetyViolationCode::LowBatteryAbort);
+}
+
+void test_safety_parity_harness_covers_required_rules() {
+    const auto cases = agbot::flight_sim::default_safety_parity_cases();
+    const auto missing = agbot::flight_sim::missing_required_safety_coverage(cases);
+    assert(missing.empty());
+
+    for (const auto& parity_case : cases) {
+        const auto violation = agbot::flight_sim::evaluate_safety(parity_case.sample, parity_case.envelope);
+        assert(violation.has_value());
+        assert(violation->code == parity_case.expected_code);
+        assert(!violation->rule_id.empty());
+    }
+}
+
+void test_drone_simulation_enforces_altitude_safety_rule() {
+    auto mission = MissionLoader::load_from_text(kMissionJson);
+    agbot::flight_sim::SimulationConfig config;
+    config.safety.max_altitude_m = 5.0;
+    DroneSimulation simulation(std::move(mission), config);
+
+    for (int i = 0; i < 60 * 10 && !simulation.is_complete(); ++i) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().mode == DroneMode::Failsafe);
+    assert(simulation.last_safety_violation().has_value());
+    assert(simulation.last_safety_violation()->code == agbot::flight_sim::SafetyViolationCode::AltitudeCeilingViolation);
 }
 
 void test_telemetry_recorder_close_is_idempotent() {
@@ -220,7 +252,14 @@ void test_decodes_terrarium_elevation_without_png_dependency() {
 void test_composites_empty_elevation_as_flat_zero() {
     const GeoCoordinate center {37.7749, -122.4194, 0.0};
     const GeoBounds bounds = GeoBounds::from_center(center, 500.0);
-    const auto heightmap = agbot::flight_sim::composite_elevation({}, bounds, 4);
+    const TileCoordinate expected_tile = agbot::flight_sim::tile_for_geo(center, 14);
+    const auto composite = agbot::flight_sim::composite_elevation_with_state({}, bounds, 4, {expected_tile});
+    assert(composite.tile_states.size() == 1);
+    assert(composite.tile_states[0].state == agbot::flight_sim::TerrainTileState::FlatFallback);
+    assert(composite.tile_states[0].coordinate.x == expected_tile.x);
+    assert(std::string(agbot::flight_sim::to_string(composite.tile_states[0].state)) == "flat_fallback");
+
+    const auto& heightmap = composite.heightmap;
     assert(heightmap.size() == 16);
     for (const float elevation : heightmap) {
         assert(elevation == 0.0f);
@@ -303,6 +342,25 @@ void test_run_manifest_records_contract_and_hashes() {
     assert(result.manifest.output_hash != result.manifest.mission_hash);
 }
 
+void test_trace_diff_reports_divergent_field() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    std::string altered = result.trace_jsonl;
+    const std::size_t position = altered.find("\"x\":0.000");
+    assert(position != std::string::npos);
+    altered.replace(position, std::string("\"x\":0.000").size(), "\"x\":1.000");
+
+    const auto diff = agbot::flight_sim::diff_trace_text(result.trace_jsonl, altered);
+    assert(!diff.identical);
+    assert(diff.step_index == 0);
+    assert(diff.field_path == "position.x");
+    assert(diff.left_value == "0.000");
+    assert(diff.right_value == "1.000");
+
+    const auto identical = agbot::flight_sim::diff_trace_text(result.trace_jsonl, result.trace_jsonl);
+    assert(identical.identical);
+}
+
 // Stories 02-01 / 02-02: golden-telemetry regression. The committed golden
 // trace pins physics + flight-controller behavior; any change to the step loop
 // or telemetry shape fails this test with a byte mismatch.
@@ -338,6 +396,8 @@ int main() {
     test_manual_controls_move_drone();
     test_mission_round_trip();
     test_failsafe_low_battery();
+    test_safety_parity_harness_covers_required_rules();
+    test_drone_simulation_enforces_altitude_safety_rule();
     test_telemetry_recorder_close_is_idempotent();
     test_geo_terrain_area_and_tiles();
     test_decodes_terrarium_elevation_without_png_dependency();
@@ -346,6 +406,7 @@ int main() {
     test_deterministic_runner_is_byte_identical();
     test_deterministic_runner_seed_drives_prng();
     test_run_manifest_records_contract_and_hashes();
+    test_trace_diff_reports_divergent_field();
     test_deterministic_runner_matches_golden();
     test_fnv1a64_is_stable_and_distinct();
     std::cout << "agbot_flight_sim_tests passed\n";

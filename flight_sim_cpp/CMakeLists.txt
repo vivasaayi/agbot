@@ -12,8 +12,10 @@ add_library(agbot_flight_sim_core
     src/DroneSimulation.cpp
     src/GeoTerrain.cpp
     src/MissionLoader.cpp
+    src/SafetyRules.cpp
     src/TelemetryReplay.cpp
     src/TelemetryRecorder.cpp
+    src/TraceDiff.cpp
 )
 
 target_include_directories(agbot_flight_sim_core
@@ -44,6 +46,12 @@ add_executable(agbot_mission_bridge
     src/mission_bridge_main.cpp
 )
 target_link_libraries(agbot_mission_bridge PRIVATE agbot_flight_sim_core)
+
+add_executable(agbot_sim
+    src/agbot_sim_main.cpp
+)
+target_link_libraries(agbot_sim PRIVATE agbot_flight_sim_core)
+set_target_properties(agbot_sim PROPERTIES OUTPUT_NAME agbot-sim)
 
 enable_testing()
 add_executable(agbot_flight_sim_tests

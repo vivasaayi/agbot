@@ -1,8 +1,10 @@
 #pragma once
 
 #include "agbot_flight_sim/Mission.hpp"
+#include "agbot_flight_sim/SafetyRules.hpp"
 
 #include <cstddef>
+#include <optional>
 
 namespace agbot::flight_sim {
 
@@ -58,6 +60,7 @@ struct SimulationConfig {
     double max_acceleration_mps2 = 12.0;
     double yaw_rate_radps = 1.4;
     double manual_takeoff_altitude_m = 20.0;
+    SafetyEnvelope safety;
 };
 
 class DroneSimulation {
@@ -70,6 +73,7 @@ public:
     void set_control_mode(ControlMode mode);
     void set_manual_input(ManualControlInput input);
     void set_wind(Vec3 wind_mps);
+    void request_emergency_abort();
     void arm();
     void disarm();
 
@@ -78,6 +82,7 @@ public:
     [[nodiscard]] const DroneState& state() const;
     [[nodiscard]] ControlMode control_mode() const;
     [[nodiscard]] Vec3 wind() const;
+    [[nodiscard]] const std::optional<SafetyViolation>& last_safety_violation() const;
     [[nodiscard]] bool is_complete() const;
     [[nodiscard]] double progress() const;
 
@@ -86,6 +91,7 @@ private:
     void step_autopilot(double dt_s);
     void step_manual(double dt_s);
     void move_towards_velocity(Vec3 desired_velocity, double dt_s);
+    bool fail_if_safety_violated();
     void advance_waypoint();
     [[nodiscard]] const Waypoint* target_waypoint() const;
 
@@ -94,6 +100,8 @@ private:
     DroneState state_;
     ManualControlInput manual_input_;
     Vec3 wind_mps_;
+    bool emergency_abort_requested_ = false;
+    std::optional<SafetyViolation> last_safety_violation_;
 };
 
 [[nodiscard]] const char* to_string(DroneMode mode);

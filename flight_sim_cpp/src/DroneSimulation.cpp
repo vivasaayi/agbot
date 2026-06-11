@@ -60,6 +60,8 @@ void DroneSimulation::reset() {
     state_.mode = DroneMode::Idle;
     state_.control_mode = ControlMode::Autopilot;
     manual_input_ = {};
+    emergency_abort_requested_ = false;
+    last_safety_violation_.reset();
 }
 
 void DroneSimulation::step(double dt_s) {
@@ -100,6 +102,10 @@ void DroneSimulation::set_wind(Vec3 wind_mps) {
     wind_mps_ = wind_mps;
 }
 
+void DroneSimulation::request_emergency_abort() {
+    emergency_abort_requested_ = true;
+}
+
 void DroneSimulation::arm() {
     state_.armed = true;
     if (state_.mode == DroneMode::Idle) {
@@ -136,6 +142,10 @@ Vec3 DroneSimulation::wind() const {
     return wind_mps_;
 }
 
+const std::optional<SafetyViolation>& DroneSimulation::last_safety_violation() const {
+    return last_safety_violation_;
+}
+
 bool DroneSimulation::is_complete() const {
     if (state_.control_mode == ControlMode::Manual) {
         return state_.mode == DroneMode::Failsafe;
@@ -159,19 +169,19 @@ void DroneSimulation::step_fixed(double dt_s) {
         return;
     }
 
-    state_.mission_time_s += dt_s;
-
-    if (state_.battery_percent <= config_.min_battery_percent) {
-        state_.mode = DroneMode::Failsafe;
-        state_.velocity = {};
+    if (fail_if_safety_violated()) {
         return;
     }
+
+    state_.mission_time_s += dt_s;
 
     if (state_.control_mode == ControlMode::Manual) {
         step_manual(dt_s);
     } else {
         step_autopilot(dt_s);
     }
+
+    fail_if_safety_violated();
 }
 
 void DroneSimulation::step_autopilot(double dt_s) {
@@ -300,6 +310,26 @@ void DroneSimulation::move_towards_velocity(Vec3 desired_velocity, double dt_s) 
     const double movement_factor = std::clamp(state_.velocity.length() / std::max(0.1, mission_.cruise_speed_mps), 0.0, 2.0);
     state_.battery_percent -= (config_.flight_battery_drain_percent_per_s * std::max(0.25, movement_factor)) * dt_s;
     state_.battery_percent = std::max(0.0, state_.battery_percent);
+}
+
+bool DroneSimulation::fail_if_safety_violated() {
+    SafetyEnvelope envelope = config_.safety;
+    envelope.min_battery_percent = config_.min_battery_percent;
+    const SafetySample sample {
+        state_.position,
+        state_.battery_percent,
+        state_.target_waypoint_index,
+        emergency_abort_requested_,
+    };
+
+    if (auto violation = evaluate_safety(sample, envelope)) {
+        last_safety_violation_ = *violation;
+        state_.mode = DroneMode::Failsafe;
+        state_.velocity = {};
+        state_.armed = false;
+        return true;
+    }
+    return false;
 }
 
 void DroneSimulation::advance_waypoint() {
