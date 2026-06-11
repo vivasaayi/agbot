@@ -305,6 +305,7 @@ pub enum TilePresence {
     Loading,
     Ready,
     Missing,
+    Failed,
 }
 
 pub struct RenderedTile {
@@ -312,19 +313,49 @@ pub struct RenderedTile {
     pub presence: TilePresence,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TilePresenceSummary {
+    pub loading: usize,
+    pub ready: usize,
+    pub missing: usize,
+    pub failed: usize,
+}
+
+pub fn summarize_tile_presences<I>(presences: I) -> TilePresenceSummary
+where
+    I: IntoIterator<Item = TilePresence>,
+{
+    let mut summary = TilePresenceSummary::default();
+    for presence in presences {
+        match presence {
+            TilePresence::Loading => summary.loading += 1,
+            TilePresence::Ready => summary.ready += 1,
+            TilePresence::Missing => summary.missing += 1,
+            TilePresence::Failed => summary.failed += 1,
+        }
+    }
+    summary
+}
+
 impl TileRenderState {
+    pub fn presence_summary(&self) -> TilePresenceSummary {
+        summarize_tile_presences(self.tiles.values().map(|tile| tile.presence))
+    }
+
+    pub fn loading_tile_count(&self) -> usize {
+        self.presence_summary().loading
+    }
+
     pub fn ready_tile_count(&self) -> usize {
-        self.tiles
-            .values()
-            .filter(|tile| tile.presence == TilePresence::Ready)
-            .count()
+        self.presence_summary().ready
     }
 
     pub fn missing_tile_count(&self) -> usize {
-        self.tiles
-            .values()
-            .filter(|tile| tile.presence == TilePresence::Missing)
-            .count()
+        self.presence_summary().missing
+    }
+
+    pub fn failed_tile_count(&self) -> usize {
+        self.presence_summary().failed
     }
 }
 
@@ -499,7 +530,10 @@ pub fn ensure_scene_id(config: &TileConfig, action: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_catalog_scene, FieldCatalogState, FieldSceneSummary, SceneProduct, TileId};
+    use super::{
+        select_catalog_scene, summarize_tile_presences, FieldCatalogState, FieldSceneSummary,
+        SceneProduct, TileId, TilePresence,
+    };
 
     #[test]
     fn tile_source_formats_tile_url_from_template() {
@@ -548,6 +582,22 @@ mod tests {
         assert_eq!(scene.field_id.as_deref(), Some("field-1"));
         assert_eq!(scene.season_id.as_deref(), Some("2026"));
         assert_eq!(scene.linked_at.as_deref(), Some("2026-05-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn tile_presence_summary_distinguishes_loading_ready_missing_and_failed_tiles() {
+        let summary = summarize_tile_presences([
+            TilePresence::Loading,
+            TilePresence::Ready,
+            TilePresence::Missing,
+            TilePresence::Failed,
+            TilePresence::Ready,
+        ]);
+
+        assert_eq!(summary.loading, 1);
+        assert_eq!(summary.ready, 2);
+        assert_eq!(summary.missing, 1);
+        assert_eq!(summary.failed, 1);
     }
 
     #[test]

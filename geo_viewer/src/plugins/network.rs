@@ -429,7 +429,17 @@ pub fn poll_tile_fetch(
                     info!(tile = %fetched.tile_id, width, height, "tile loaded");
                 }
                 Err(err) => {
-                    tile_state.status = TileStatus::Error(err.to_string());
+                    let message = err.to_string();
+                    let tile_size = tile_world_size(tile_state.world_dimensions, tile_id.z);
+                    if let Some(rendered) = tile_state.tiles.get_mut(&tile_id) {
+                        rendered.presence = TilePresence::Failed;
+                        commands.entity(rendered.entity).insert(Sprite {
+                            color: failed_tile_color(tile_id),
+                            custom_size: Some(tile_size),
+                            ..default()
+                        });
+                    }
+                    tile_state.status = TileStatus::Error(message);
                 }
             }
         }
@@ -543,31 +553,32 @@ pub fn start_tile_fetch(
     let url = tile_source.tile_url(tile_id);
     tile_fetch_tasks.0.insert(
         tile_id,
-        IoTaskPool::get().spawn(async move {
-            let response =
-                reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                return Ok(FetchedTile {
-                    tile_id,
-                    image: DynamicImage::new_rgba8(1, 1),
-                    missing: true,
-                });
-            }
-            if !response.status().is_success() {
-                anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
-            }
-            let bytes = response.bytes().context("failed to read response body")?;
-            let dynamic =
-                image::load_from_memory(&bytes).context("failed to decode image bytes")?;
-            Ok(FetchedTile {
-                tile_id,
-                image: dynamic,
-                missing: false,
-            })
-        }),
+        IoTaskPool::get().spawn(async move { fetch_tile_from_url(&url, tile_id) }),
     );
 
     Ok(())
+}
+
+fn fetch_tile_from_url(url: &str, tile_id: TileId) -> Result<FetchedTile> {
+    let response =
+        reqwest::blocking::get(url).with_context(|| format!("request failed: {}", url))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(FetchedTile {
+            tile_id,
+            image: DynamicImage::new_rgba8(1, 1),
+            missing: true,
+        });
+    }
+    if !response.status().is_success() {
+        anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
+    }
+    let bytes = response.bytes().context("failed to read response body")?;
+    let dynamic = image::load_from_memory(&bytes).context("failed to decode image bytes")?;
+    Ok(FetchedTile {
+        tile_id,
+        image: dynamic,
+        missing: false,
+    })
 }
 
 pub fn start_field_list_fetch(
@@ -907,5 +918,91 @@ fn missing_tile_color(tile_id: TileId) -> Color {
         Color::srgba(0.45, 0.12, 0.12, 0.85)
     } else {
         Color::srgba(0.35, 0.10, 0.10, 0.85)
+    }
+}
+
+fn failed_tile_color(tile_id: TileId) -> Color {
+    if (tile_id.x + tile_id.y).is_multiple_of(2) {
+        Color::srgba(0.55, 0.08, 0.18, 0.9)
+    } else {
+        Color::srgba(0.42, 0.06, 0.14, 0.9)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fetch_tile_from_url;
+    use crate::state::TileId;
+    use image::{DynamicImage, ImageOutputFormat};
+    use std::io::{Cursor, Read, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
+
+    fn serve_once(status: &str, body: Vec<u8>) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
+        let addr = listener.local_addr().expect("read listener address");
+        let status = status.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&body).expect("write response body");
+        });
+
+        (format!("http://{addr}/tile.png"), handle)
+    }
+
+    fn png_tile_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut Cursor::new(&mut bytes), ImageOutputFormat::Png)
+            .expect("encode test PNG");
+        bytes
+    }
+
+    #[test]
+    fn fetch_tile_from_url_decodes_present_tile() {
+        let tile_id = TileId { z: 2, x: 1, y: 0 };
+        let (url, server) = serve_once("200 OK", png_tile_bytes());
+
+        let fetched = fetch_tile_from_url(&url, tile_id).expect("tile should fetch");
+        server.join().expect("server thread should complete");
+
+        assert_eq!(fetched.tile_id, tile_id);
+        assert!(!fetched.missing);
+        assert_eq!(fetched.image.width(), 1);
+        assert_eq!(fetched.image.height(), 1);
+    }
+
+    #[test]
+    fn fetch_tile_from_url_marks_not_found_as_missing() {
+        let tile_id = TileId { z: 2, x: 9, y: 9 };
+        let (url, server) = serve_once("404 Not Found", Vec::new());
+
+        let fetched = fetch_tile_from_url(&url, tile_id).expect("404 should be a missing tile");
+        server.join().expect("server thread should complete");
+
+        assert_eq!(fetched.tile_id, tile_id);
+        assert!(fetched.missing);
+    }
+
+    #[test]
+    fn fetch_tile_from_url_rejects_server_error() {
+        let tile_id = TileId { z: 2, x: 3, y: 1 };
+        let (url, server) = serve_once("500 Internal Server Error", Vec::new());
+
+        let err = match fetch_tile_from_url(&url, tile_id) {
+            Ok(_) => panic!("500 should fail the tile"),
+            Err(err) => err,
+        };
+        server.join().expect("server thread should complete");
+
+        assert!(err.to_string().contains("geo_hub returned 500"));
     }
 }

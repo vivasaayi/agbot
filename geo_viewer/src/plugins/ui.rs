@@ -1435,10 +1435,12 @@ fn render_status_bar(
         .filter(|recommendation| recommendation.status == RecommendationStatus::Open)
         .count();
     let tile_counts = format!(
-        "Tiles: {}/{} ready, {} missing",
+        "Tiles: {}/{} ready, {} loading, {} missing, {} failed",
         tile_state.ready_tile_count(),
         tile_state.visible_tiles.len(),
-        tile_state.missing_tile_count()
+        tile_state.loading_tile_count(),
+        tile_state.missing_tile_count(),
+        tile_state.failed_tile_count()
     );
 
     egui::TopBottomPanel::top("status_bar").show(ctx, |ui| {
