@@ -2,9 +2,9 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: 853810e95b39231a516fe324958dcbf896d0d828
-- **Last commit**: 594c05d (`batch-02-02` implementation commit)
-- **Current batch**: `batch-02-03` — tests passed, commit pending
-- **Completed batches**: 2 committed
+- **Last commit**: 5dcd84c (`batch-02-03` implementation commit)
+- **Current batch**: none — ready to start `batch-02-04`
+- **Completed batches**: 3 committed
 - **Blocker**: none
 
 ## Latest verification
@@ -16,4 +16,4 @@
 
 ## Next action
 
-Commit `batch-02-03` implementation (`02-24`, `02-28`), then update `checkpoint.sqlite` and both `RESUME.md` files with the implementation commit SHA and mark the batch committed.
+Start `batch-02-04`: claim and implement STORY `02-31` simulation health/operability as the next small P0 reliability-foundation batch; then return to STORY `02-30` fault injection.
