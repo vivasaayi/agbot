@@ -10,14 +10,20 @@ pub mod database;
 pub mod flight_path;
 pub mod mavlink_integration;
 pub mod mission_optimizer;
+pub mod survey_template;
 pub mod waypoint;
 pub mod weather_integration;
 pub mod websocket_handler;
 
 pub use api::MissionApi;
 pub use database::{DatabaseService, MissionStats};
-pub use flight_path::{FlightPath, PathSegment};
+pub use flight_path::{FlightPath, PathSegment, SurveyPattern};
 pub use mission_optimizer::MissionOptimizer;
+pub use survey_template::{
+    generate_survey_template, validate_plan_bounds, PlanBoundsConfig, PlanBoundsError,
+    PlanBoundsIssue, PlanBoundsIssueCode, SurveyTemplateConfig, SurveyTemplateError,
+    SurveyTemplateErrorCode, SurveyTemplateResult,
+};
 pub use waypoint::{
     validate_waypoint_sanity, Action, Waypoint, WaypointType, WaypointValidationCode,
     WaypointValidationConfig, WaypointValidationError, WaypointValidationIssue,
