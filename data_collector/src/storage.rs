@@ -506,6 +506,23 @@ impl StorageEngine {
         self.retrieve_record(record_id).await
     }
 
+    pub async fn load_all_data(&self) -> Result<Vec<crate::FlightDataRecord>> {
+        let mut records = Vec::new();
+
+        for record_path in self.record_json_paths()? {
+            let data = fs::read(&record_path).await?;
+            records.push(serde_json::from_slice::<DataRecord>(&data)?);
+        }
+
+        records.sort_by(|a, b| {
+            a.timestamp
+                .cmp(&b.timestamp)
+                .then_with(|| a.id.as_bytes().cmp(b.id.as_bytes()))
+        });
+
+        Ok(records)
+    }
+
     async fn append_retention_audit(
         &self,
         session: &CollectionSession,

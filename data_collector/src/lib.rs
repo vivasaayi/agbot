@@ -826,7 +826,12 @@ impl DataCollectorService {
     }
 
     pub async fn search_data(&self, query: SearchQuery) -> Result<Vec<FlightDataRecord>> {
-        self.indexer.search(query).await
+        let persisted_records = self.storage.load_all_data().await?;
+        if persisted_records.is_empty() {
+            return self.indexer.search(query).await;
+        }
+
+        Ok(DataIndexer::filter_records(&persisted_records, &query))
     }
 
     pub async fn export_session(
@@ -864,7 +869,10 @@ impl DataCollectorService {
         let removed_count = self.storage.cleanup_before_date(cutoff_date).await?;
 
         // Rebuild index after cleanup
-        self.indexer.rebuild().await?;
+        let persisted_records = self.storage.load_all_data().await?;
+        self.indexer
+            .rebuild_from_records(&persisted_records)
+            .await?;
 
         tracing::info!("Cleaned up {} old data records", removed_count);
         Ok(removed_count as u32)
@@ -1271,6 +1279,41 @@ mod tests {
             stored_session.summary.coverage.status,
             CaptureCoverageStatus::Partial
         );
+    }
+
+    #[tokio::test]
+    async fn test_search_data_returns_persisted_records_after_restart() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = service
+            .start_capture_session(capture_request())
+            .await
+            .unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let record = telemetry_record(&session);
+        let record_id = record.id;
+        let timestamp = record.timestamp;
+
+        service.collect_data(&session_id, record).await.unwrap();
+        drop(service);
+
+        let restarted = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let results = restarted
+            .search_data(SearchQuery {
+                time_range: Some((
+                    timestamp - chrono::Duration::minutes(1),
+                    timestamp + chrono::Duration::minutes(1),
+                )),
+                spatial_bounds: Some((39.9, -105.1, 40.1, -104.9)),
+                data_types: Some(vec![DataType::Telemetry]),
+                drone_ids: Some(vec![session.drone_id]),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, record_id);
     }
 
     #[tokio::test]
