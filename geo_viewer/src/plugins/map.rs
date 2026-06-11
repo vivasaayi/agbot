@@ -6,6 +6,7 @@ use bevy::{
     input::mouse::{MouseMotion, MouseWheel},
     prelude::*,
 };
+use shared::schemas::FieldRecord;
 use std::collections::BTreeSet;
 
 pub struct ViewerMapPlugin;
@@ -131,22 +132,9 @@ pub fn render_field_boundary(mut gizmos: Gizmos, manifest_state: Res<SceneManife
     let Some(field) = manifest_state.field.as_ref() else {
         return;
     };
-    let Some(extent) = manifest_state.geospatial.extent.as_ref() else {
+    let Ok(mut points) = boundary_overlay_points(field, &manifest_state.geospatial) else {
         return;
     };
-    let mut points = Vec::with_capacity(field.boundary.coordinates.len() + 1);
-
-    for coordinate in &field.boundary.coordinates {
-        points.push(geo_to_scene_local(
-            extent,
-            coordinate.longitude,
-            coordinate.latitude,
-        ));
-    }
-
-    if points.len() < 3 {
-        return;
-    }
     if let Some(first) = points.first().copied() {
         points.push(first);
     }
@@ -154,6 +142,40 @@ pub fn render_field_boundary(mut gizmos: Gizmos, manifest_state: Res<SceneManife
     for segment in points.windows(2) {
         gizmos.line_2d(segment[0], segment[1], Color::srgb(1.0, 0.85, 0.1));
     }
+}
+
+pub fn boundary_overlay_points(
+    field: &FieldRecord,
+    geospatial: &crate::state::SceneGeospatialMetadata,
+) -> anyhow::Result<Vec<Vec2>> {
+    let boundary_crs = field
+        .boundary
+        .crs
+        .as_deref()
+        .filter(|crs| !crs.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("field boundary CRS is required before drawing"))?;
+    let layer_crs = geospatial
+        .crs
+        .as_deref()
+        .filter(|crs| !crs.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("layer CRS is required before drawing boundary"))?;
+    if boundary_crs != layer_crs {
+        anyhow::bail!("boundary CRS mismatch: boundary {boundary_crs} != layer {layer_crs}");
+    }
+    let extent = geospatial
+        .extent
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer extent is required before drawing boundary"))?;
+    if field.boundary.coordinates.len() < 3 {
+        anyhow::bail!("field boundary requires at least 3 coordinates");
+    }
+
+    Ok(field
+        .boundary
+        .coordinates
+        .iter()
+        .map(|coordinate| geo_to_scene_local(extent, coordinate.longitude, coordinate.latitude))
+        .collect())
 }
 
 #[cfg(test)]
@@ -256,11 +278,12 @@ pub fn visible_tiles_for_view(
 #[cfg(test)]
 mod tests {
     use super::{
-        extent_world_size, geo_to_scene_local, scene_local_to_geo, tile_center_world,
-        tile_world_size, visible_tiles_for_view,
+        boundary_overlay_points, extent_world_size, geo_to_scene_local, scene_local_to_geo,
+        tile_center_world, tile_world_size, visible_tiles_for_view,
     };
-    use crate::state::{SceneExtent, TileId};
+    use crate::state::{SceneExtent, SceneGeospatialMetadata, TileId};
     use bevy::prelude::Vec2;
+    use shared::schemas::{FieldBoundary, FieldRecord, GeoBounds, GeoPoint};
 
     fn sample_extent() -> SceneExtent {
         SceneExtent {
@@ -353,5 +376,81 @@ mod tests {
         assert!((max_lon - -89.0).abs() < 0.000_001);
         assert!((min_lat - 40.5).abs() < 0.000_001);
         assert!((max_lat - 41.0).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn boundary_overlay_points_project_when_boundary_crs_matches_layer() {
+        let points =
+            boundary_overlay_points(&sample_field(Some("EPSG:4326")), &sample_geospatial())
+                .expect("matching CRS boundary should project");
+
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[0], Vec2::new(-5_000.0, -5_000.0));
+    }
+
+    #[test]
+    fn boundary_overlay_points_refuse_missing_boundary_crs() {
+        let err = boundary_overlay_points(&sample_field(None), &sample_geospatial())
+            .expect_err("missing boundary CRS should be refused");
+
+        assert!(err.to_string().contains("boundary CRS"));
+    }
+
+    #[test]
+    fn boundary_overlay_points_refuse_mismatched_boundary_crs() {
+        let err = boundary_overlay_points(&sample_field(Some("EPSG:3857")), &sample_geospatial())
+            .expect_err("mismatched boundary CRS should be refused");
+
+        assert!(err.to_string().contains("CRS mismatch"));
+    }
+
+    fn sample_geospatial() -> SceneGeospatialMetadata {
+        SceneGeospatialMetadata {
+            georeferenced: true,
+            crs: Some("EPSG:4326".to_string()),
+            center: None,
+            extent: Some(sample_extent()),
+            spatial_ref: None,
+        }
+    }
+
+    fn sample_field(crs: Option<&str>) -> FieldRecord {
+        FieldRecord {
+            farm_id: Some("farm-1".to_string()),
+            field_id: "field-1".to_string(),
+            owner: "org-alpha".to_string(),
+            name: "North Field".to_string(),
+            crop: Some("corn".to_string()),
+            season: Some("2026".to_string()),
+            notes: None,
+            boundary: FieldBoundary {
+                crs: crs.map(ToOwned::to_owned),
+                coordinates: vec![
+                    GeoPoint {
+                        longitude: -89.5,
+                        latitude: 40.0,
+                    },
+                    GeoPoint {
+                        longitude: -88.5,
+                        latitude: 40.0,
+                    },
+                    GeoPoint {
+                        longitude: -88.5,
+                        latitude: 41.0,
+                    },
+                    GeoPoint {
+                        longitude: -89.5,
+                        latitude: 41.0,
+                    },
+                ],
+            },
+            extent: GeoBounds {
+                min_lon: -89.5,
+                min_lat: 40.0,
+                max_lon: -88.5,
+                max_lat: 41.0,
+            },
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+        }
     }
 }
