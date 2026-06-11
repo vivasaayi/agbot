@@ -2,10 +2,38 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json;
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgRow, PgPool, Row};
+use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::{FlightPath, Mission, Waypoint};
+use crate::{FlightPath, Mission, MissionStatus, Waypoint};
+
+fn mission_from_row(
+    row: &PgRow,
+    waypoints: Vec<Waypoint>,
+    flight_paths: Vec<FlightPath>,
+) -> Result<Mission> {
+    let status = MissionStatus::from_str(&row.get::<String, _>("status"))?;
+    Ok(Mission {
+        id: row.get("id"),
+        name: row.get("name"),
+        description: row.get("description"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        session_id: row.get("session_id"),
+        owner_id: row.get("owner_id"),
+        status,
+        area_of_interest: serde_json::from_value(row.get("area_of_interest"))?,
+        waypoints,
+        flight_paths,
+        estimated_duration_minutes: row.get::<i32, _>("estimated_duration_minutes") as u32,
+        estimated_battery_usage: row.get("estimated_battery_usage"),
+        weather_constraints: serde_json::from_value(row.get("weather_constraints"))?,
+        metadata: serde_json::from_value(row.get("metadata"))?,
+    })
+}
 
 /// Database service for mission storage using PostgreSQL
 pub struct DatabaseService {
@@ -35,6 +63,11 @@ impl DatabaseService {
                 description TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
+                field_id TEXT NOT NULL DEFAULT 'unassigned',
+                season_id TEXT NOT NULL DEFAULT 'unassigned',
+                session_id TEXT,
+                owner_id TEXT NOT NULL DEFAULT 'unassigned',
+                status TEXT NOT NULL DEFAULT 'Draft',
                 area_of_interest JSONB NOT NULL,
                 estimated_duration_minutes INTEGER NOT NULL DEFAULT 0,
                 estimated_battery_usage REAL NOT NULL DEFAULT 0.0,
@@ -45,6 +78,16 @@ impl DatabaseService {
         )
         .execute(&self.pool)
         .await?;
+
+        for statement in [
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS field_id TEXT NOT NULL DEFAULT 'unassigned';",
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS season_id TEXT NOT NULL DEFAULT 'unassigned';",
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS session_id TEXT;",
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'unassigned';",
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Draft';",
+        ] {
+            sqlx::query(statement).execute(&self.pool).await?;
+        }
 
         // Create waypoints table
         sqlx::query(
@@ -113,10 +156,11 @@ impl DatabaseService {
         sqlx::query(
             r#"
             INSERT INTO missions (
-                id, name, description, created_at, updated_at, 
+                id, name, description, created_at, updated_at,
+                field_id, season_id, session_id, owner_id, status,
                 area_of_interest, estimated_duration_minutes, 
                 estimated_battery_usage, weather_constraints, metadata
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             "#,
         )
         .bind(mission.id)
@@ -124,6 +168,11 @@ impl DatabaseService {
         .bind(&mission.description)
         .bind(mission.created_at)
         .bind(mission.updated_at)
+        .bind(&mission.field_id)
+        .bind(&mission.season_id)
+        .bind(&mission.session_id)
+        .bind(&mission.owner_id)
+        .bind(mission.status.as_str())
         .bind(serde_json::to_value(&mission.area_of_interest)?)
         .bind(mission.estimated_duration_minutes as i32)
         .bind(mission.estimated_battery_usage)
@@ -238,21 +287,7 @@ impl DatabaseService {
             })
             .collect();
 
-        let mission = Mission {
-            id: mission_row.get("id"),
-            name: mission_row.get("name"),
-            description: mission_row.get("description"),
-            created_at: mission_row.get("created_at"),
-            updated_at: mission_row.get("updated_at"),
-            area_of_interest: serde_json::from_value(mission_row.get("area_of_interest"))?,
-            waypoints: waypoints?,
-            flight_paths: flight_paths?,
-            estimated_duration_minutes: mission_row.get::<i32, _>("estimated_duration_minutes")
-                as u32,
-            estimated_battery_usage: mission_row.get("estimated_battery_usage"),
-            weather_constraints: serde_json::from_value(mission_row.get("weather_constraints"))?,
-            metadata: serde_json::from_value(mission_row.get("metadata"))?,
-        };
+        let mission = mission_from_row(&mission_row, waypoints?, flight_paths?)?;
 
         Ok(Some(mission))
     }
@@ -266,8 +301,9 @@ impl DatabaseService {
             r#"
             UPDATE missions SET 
                 name = $2, description = $3, updated_at = $4,
-                area_of_interest = $5, estimated_duration_minutes = $6,
-                estimated_battery_usage = $7, weather_constraints = $8, metadata = $9
+                field_id = $5, season_id = $6, session_id = $7, owner_id = $8, status = $9,
+                area_of_interest = $10, estimated_duration_minutes = $11,
+                estimated_battery_usage = $12, weather_constraints = $13, metadata = $14
             WHERE id = $1
             "#,
         )
@@ -275,6 +311,11 @@ impl DatabaseService {
         .bind(&mission.name)
         .bind(&mission.description)
         .bind(mission.updated_at)
+        .bind(&mission.field_id)
+        .bind(&mission.season_id)
+        .bind(&mission.session_id)
+        .bind(&mission.owner_id)
+        .bind(mission.status.as_str())
         .bind(serde_json::to_value(&mission.area_of_interest)?)
         .bind(mission.estimated_duration_minutes as i32)
         .bind(mission.estimated_battery_usage)
@@ -416,20 +457,7 @@ impl DatabaseService {
                 })
                 .collect();
 
-            let mission = Mission {
-                id: mission_id,
-                name: row.get("name"),
-                description: row.get("description"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                area_of_interest: serde_json::from_value(row.get("area_of_interest"))?,
-                waypoints: waypoints?,
-                flight_paths: flight_paths?,
-                estimated_duration_minutes: row.get::<i32, _>("estimated_duration_minutes") as u32,
-                estimated_battery_usage: row.get("estimated_battery_usage"),
-                weather_constraints: serde_json::from_value(row.get("weather_constraints"))?,
-                metadata: serde_json::from_value(row.get("metadata"))?,
-            };
+            let mission = mission_from_row(&row, waypoints?, flight_paths?)?;
 
             missions.push(mission);
         }
@@ -519,20 +547,7 @@ impl DatabaseService {
                 })
                 .collect();
 
-            let mission = Mission {
-                id: mission_id,
-                name: row.get("name"),
-                description: row.get("description"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                area_of_interest: serde_json::from_value(row.get("area_of_interest"))?,
-                waypoints: waypoints?,
-                flight_paths: flight_paths?,
-                estimated_duration_minutes: row.get::<i32, _>("estimated_duration_minutes") as u32,
-                estimated_battery_usage: row.get("estimated_battery_usage"),
-                weather_constraints: serde_json::from_value(row.get("weather_constraints"))?,
-                metadata: serde_json::from_value(row.get("metadata"))?,
-            };
+            let mission = mission_from_row(&row, waypoints?, flight_paths?)?;
 
             missions.push(mission);
         }

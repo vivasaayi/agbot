@@ -83,6 +83,10 @@ async fn api_crud_search_stats_flow() -> Result<()> {
             (x: 0.0, y: 0.2),
             (x: 0.0, y: 0.0),
         ],
+        field_id: Some("field-integration".to_string()),
+        season_id: Some("season-2026".to_string()),
+        session_id: Some("session-integration".to_string()),
+        owner_id: Some("owner-integration".to_string()),
         waypoints: Some(vec![
             Waypoint::new(point!(x: 0.0, y: 0.0), 100.0, WaypointType::Takeoff),
             Waypoint::new(point!(x: 0.1, y: 0.1), 120.0, WaypointType::Navigation),
@@ -111,6 +115,10 @@ async fn api_crud_search_stats_flow() -> Result<()> {
         name: Some("API Mission Updated".to_string()),
         description: Some("Updated via API".to_string()),
         area_of_interest: None,
+        field_id: None,
+        season_id: None,
+        session_id: None,
+        owner_id: None,
         waypoints: None,
         metadata: Some(HashMap::from([(
             "source".to_string(),

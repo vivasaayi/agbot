@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use geo::{Point, Polygon};
+use geo::Polygon;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt, str::FromStr};
 use uuid::Uuid;
 
 pub mod api;
@@ -28,6 +28,16 @@ pub struct Mission {
     pub description: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default = "default_unassigned_id")]
+    pub field_id: String,
+    #[serde(default = "default_unassigned_id")]
+    pub season_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default = "default_unassigned_id")]
+    pub owner_id: String,
+    #[serde(default)]
+    pub status: MissionStatus,
     pub area_of_interest: Polygon<f64>,
     pub waypoints: Vec<Waypoint>,
     pub flight_paths: Vec<FlightPath>,
@@ -35,6 +45,43 @@ pub struct Mission {
     pub estimated_battery_usage: f32,
     pub weather_constraints: WeatherConstraints,
     pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionLinkage {
+    pub field_id: String,
+    pub season_id: String,
+    pub session_id: Option<String>,
+    pub owner_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MissionStatus {
+    Draft,
+    Validated,
+    Armed,
+    InFlight,
+    Completed,
+    Aborted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MissionStateErrorCode {
+    OutOfOrderTransition,
+    TerminalState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionStateTransitionError {
+    pub code: MissionStateErrorCode,
+    pub from: MissionStatus,
+    pub to: MissionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionStatusParseError {
+    value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +92,125 @@ pub struct WeatherConstraints {
     pub temperature_range_celsius: (f32, f32),
 }
 
+fn default_unassigned_id() -> String {
+    "unassigned".to_string()
+}
+
+impl MissionLinkage {
+    pub fn new(
+        field_id: String,
+        season_id: String,
+        session_id: Option<String>,
+        owner_id: String,
+    ) -> Self {
+        Self {
+            field_id,
+            season_id,
+            session_id,
+            owner_id,
+        }
+    }
+
+    pub fn unassigned() -> Self {
+        Self {
+            field_id: default_unassigned_id(),
+            season_id: default_unassigned_id(),
+            session_id: None,
+            owner_id: default_unassigned_id(),
+        }
+    }
+}
+
+impl Default for MissionStatus {
+    fn default() -> Self {
+        Self::Draft
+    }
+}
+
+impl MissionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "Draft",
+            Self::Validated => "Validated",
+            Self::Armed => "Armed",
+            Self::InFlight => "InFlight",
+            Self::Completed => "Completed",
+            Self::Aborted => "Aborted",
+            Self::Failed => "Failed",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Aborted | Self::Failed)
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        match (self, next) {
+            (Self::Draft, Self::Validated) => true,
+            (Self::Validated, Self::Armed) => true,
+            (Self::Armed, Self::InFlight | Self::Aborted | Self::Failed) => true,
+            (Self::InFlight, Self::Completed | Self::Aborted | Self::Failed) => true,
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for MissionStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MissionStatus {
+    type Err = MissionStatusParseError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "Draft" => Ok(Self::Draft),
+            "Validated" => Ok(Self::Validated),
+            "Armed" => Ok(Self::Armed),
+            "InFlight" => Ok(Self::InFlight),
+            "Completed" => Ok(Self::Completed),
+            "Aborted" => Ok(Self::Aborted),
+            "Failed" => Ok(Self::Failed),
+            _ => Err(MissionStatusParseError {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for MissionStatusParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unknown mission status: {}", self.value)
+    }
+}
+
+impl std::error::Error for MissionStatusParseError {}
+
+impl fmt::Display for MissionStateTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "mission state transition rejected: {} -> {} ({:?})",
+            self.from, self.to, self.code
+        )
+    }
+}
+
+impl std::error::Error for MissionStateTransitionError {}
+
 impl Mission {
     pub fn new(name: String, description: String, area: Polygon<f64>) -> Self {
+        Self::new_linked(name, description, area, MissionLinkage::unassigned())
+    }
+
+    pub fn new_linked(
+        name: String,
+        description: String,
+        area: Polygon<f64>,
+        linkage: MissionLinkage,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -54,6 +218,11 @@ impl Mission {
             description,
             created_at: now,
             updated_at: now,
+            field_id: linkage.field_id,
+            season_id: linkage.season_id,
+            session_id: linkage.session_id,
+            owner_id: linkage.owner_id,
+            status: MissionStatus::Draft,
             area_of_interest: area,
             waypoints: Vec::new(),
             flight_paths: Vec::new(),
@@ -62,6 +231,54 @@ impl Mission {
             weather_constraints: WeatherConstraints::default(),
             metadata: HashMap::new(),
         }
+    }
+
+    pub fn transition_status(
+        &mut self,
+        next: MissionStatus,
+    ) -> std::result::Result<(), MissionStateTransitionError> {
+        if self.status.is_terminal() {
+            return Err(MissionStateTransitionError {
+                code: MissionStateErrorCode::TerminalState,
+                from: self.status,
+                to: next,
+            });
+        }
+        if !self.status.can_transition_to(next) {
+            return Err(MissionStateTransitionError {
+                code: MissionStateErrorCode::OutOfOrderTransition,
+                from: self.status,
+                to: next,
+            });
+        }
+
+        self.status = next;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn validate(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::Validated)
+    }
+
+    pub fn arm(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::Armed)
+    }
+
+    pub fn start(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::InFlight)
+    }
+
+    pub fn complete(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::Completed)
+    }
+
+    pub fn abort(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::Aborted)
+    }
+
+    pub fn fail(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::Failed)
     }
 
     pub fn add_waypoint(&mut self, waypoint: Waypoint) {
@@ -202,8 +419,70 @@ mod tests {
 
         assert_eq!(mission.name, "Test Mission");
         assert_eq!(mission.description, "A test mission");
+        assert_eq!(mission.status, MissionStatus::Draft);
+        assert_eq!(mission.field_id, "unassigned");
+        assert_eq!(mission.season_id, "unassigned");
+        assert_eq!(mission.owner_id, "unassigned");
+        assert!(mission.session_id.is_none());
         assert!(mission.waypoints.is_empty());
         assert!(mission.flight_paths.is_empty());
+    }
+
+    #[test]
+    fn test_mission_creation_with_linkage_records_identity() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+
+        let mission = Mission::new_linked(
+            "Linked Mission".to_string(),
+            "A linked mission".to_string(),
+            area,
+            MissionLinkage::new(
+                "field-1".to_string(),
+                "season-2026".to_string(),
+                Some("session-1".to_string()),
+                "owner-1".to_string(),
+            ),
+        );
+
+        assert_eq!(mission.field_id, "field-1");
+        assert_eq!(mission.season_id, "season-2026");
+        assert_eq!(mission.session_id.as_deref(), Some("session-1"));
+        assert_eq!(mission.owner_id, "owner-1");
+        assert_eq!(mission.status, MissionStatus::Draft);
+    }
+
+    #[test]
+    fn test_arm_before_validate_is_rejected_with_state_code() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+        let mut mission = Mission::new(
+            "State Mission".to_string(),
+            "A state mission".to_string(),
+            area,
+        );
+
+        let error = mission.arm().expect_err("draft mission cannot arm");
+        assert_eq!(error.code, MissionStateErrorCode::OutOfOrderTransition);
+        assert_eq!(error.from, MissionStatus::Draft);
+        assert_eq!(error.to, MissionStatus::Armed);
+        assert_eq!(mission.status, MissionStatus::Draft);
+
+        mission.validate().expect("draft can validate");
+        mission.arm().expect("validated can arm");
+        mission.start().expect("armed can start");
+        mission.complete().expect("in-flight can complete");
+        assert_eq!(mission.status, MissionStatus::Completed);
     }
 
     #[tokio::test]

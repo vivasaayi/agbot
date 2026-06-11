@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{Mission, MissionPlannerService, MissionStats, Waypoint};
+use crate::{Mission, MissionLinkage, MissionPlannerService, MissionStats, Waypoint};
 
 /// REST API for mission planning
 pub struct MissionApi {
@@ -46,6 +46,10 @@ pub struct CreateMissionRequest {
     pub name: String,
     pub description: String,
     pub area_of_interest: geo::Polygon<f64>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub session_id: Option<String>,
+    pub owner_id: Option<String>,
     pub waypoints: Option<Vec<Waypoint>>,
     pub metadata: Option<HashMap<String, String>>,
 }
@@ -55,6 +59,10 @@ pub struct UpdateMissionRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub area_of_interest: Option<geo::Polygon<f64>>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub session_id: Option<String>,
+    pub owner_id: Option<String>,
     pub waypoints: Option<Vec<Waypoint>>,
     pub metadata: Option<HashMap<String, String>>,
 }
@@ -100,7 +108,20 @@ async fn create_mission(
     State(service): State<Arc<MissionPlannerService>>,
     Json(request): Json<CreateMissionRequest>,
 ) -> Result<Json<CreateMissionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut mission = Mission::new(request.name, request.description, request.area_of_interest);
+    let linkage = MissionLinkage::new(
+        request.field_id.unwrap_or_else(|| "unassigned".to_string()),
+        request
+            .season_id
+            .unwrap_or_else(|| "unassigned".to_string()),
+        request.session_id,
+        request.owner_id.unwrap_or_else(|| "unassigned".to_string()),
+    );
+    let mut mission = Mission::new_linked(
+        request.name,
+        request.description,
+        request.area_of_interest,
+        linkage,
+    );
 
     // Add waypoints if provided
     if let Some(waypoints) = request.waypoints {
@@ -191,6 +212,18 @@ async fn update_mission(
     }
     if let Some(area) = request.area_of_interest {
         mission.area_of_interest = area;
+    }
+    if let Some(field_id) = request.field_id {
+        mission.field_id = field_id;
+    }
+    if let Some(season_id) = request.season_id {
+        mission.season_id = season_id;
+    }
+    if let Some(session_id) = request.session_id {
+        mission.session_id = Some(session_id);
+    }
+    if let Some(owner_id) = request.owner_id {
+        mission.owner_id = owner_id;
     }
     if let Some(waypoints) = request.waypoints {
         mission.waypoints = waypoints;
@@ -395,6 +428,10 @@ mod tests {
             name: "Test API Mission".to_string(),
             description: "A test mission via API".to_string(),
             area_of_interest: area,
+            field_id: Some("field-api".to_string()),
+            season_id: Some("season-api".to_string()),
+            session_id: Some("session-api".to_string()),
+            owner_id: Some("owner-api".to_string()),
             waypoints: None,
             metadata: None,
         };
@@ -413,6 +450,9 @@ mod tests {
 
         let mission_response: MissionResponse = response.json();
         assert_eq!(mission_response.mission.name, "Test API Mission");
+        assert_eq!(mission_response.mission.field_id, "field-api");
+        assert_eq!(mission_response.mission.season_id, "season-api");
+        assert_eq!(mission_response.mission.owner_id, "owner-api");
 
         // Test list missions
         let response = server.get("/missions").await;
