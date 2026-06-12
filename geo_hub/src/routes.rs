@@ -19,7 +19,8 @@ use compliance::{
     build_airspace_zone_record, build_initial_compliance_record, refuse_in_place_mutation,
     AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
     AirspaceZoneRecord, AppendComplianceRecordVersionRequest, ComplianceRecord,
-    ComplianceRecordError, ComplianceRecordType, CreateComplianceRecordRequest,
+    ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
+    CreateComplianceRecordRequest,
 };
 use crop_intelligence::{
     build_model_version_record, validate_model_reference, CropModelRegistryError, CropModelTask,
@@ -2158,7 +2159,7 @@ pub async fn list_compliance_records(
     let rows = sqlx::query(
         r#"
         SELECT record_id, version, record_type, org_id, field_id, flight_id, created_at,
-               actor, provenance_ref, prior_version, change_reason
+               actor, provenance_ref, prior_version, change_reason, payload_json
         FROM compliance_records
         WHERE (?1 IS NULL OR record_id = ?1)
           AND (?2 IS NULL OR record_type = ?2)
@@ -5313,7 +5314,32 @@ fn decode_compliance_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Complian
         provenance_ref: row.get("provenance_ref"),
         prior_version: prior_version.map(|version| version as u32),
         change_reason: row.get("change_reason"),
+        payload: decode_compliance_payload(row)?,
     })
+}
+
+fn decode_compliance_payload(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<Option<ComplianceRecordPayload>> {
+    let payload_json: Option<String> = row.get("payload_json");
+    payload_json
+        .map(|payload_json| {
+            serde_json::from_str::<ComplianceRecordPayload>(&payload_json).map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode compliance payload_json"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn encode_compliance_payload(record: &ComplianceRecord) -> AppResult<Option<String>> {
+    record
+        .payload
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| AppError::Anyhow(Error::new(err)))
 }
 
 fn decode_airspace_zone(row: &sqlx::sqlite::SqliteRow) -> AppResult<AirspaceZoneRecord> {
@@ -5886,9 +5912,9 @@ async fn insert_compliance_record(state: &AppState, record: &ComplianceRecord) -
         r#"
         INSERT INTO compliance_records (
             record_id, version, record_type, org_id, field_id, flight_id, created_at,
-            actor, provenance_ref, prior_version, change_reason
+            actor, provenance_ref, prior_version, change_reason, payload_json
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#,
     )
     .bind(&record.record_id)
@@ -5902,6 +5928,7 @@ async fn insert_compliance_record(state: &AppState, record: &ComplianceRecord) -
     .bind(&record.provenance_ref)
     .bind(record.prior_version.map(i64::from))
     .bind(&record.change_reason)
+    .bind(encode_compliance_payload(record)?)
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -5916,7 +5943,7 @@ async fn load_latest_compliance_record(
     sqlx::query(
         r#"
         SELECT record_id, version, record_type, org_id, field_id, flight_id, created_at,
-               actor, provenance_ref, prior_version, change_reason
+               actor, provenance_ref, prior_version, change_reason, payload_json
         FROM compliance_records
         WHERE record_id = ?1
         ORDER BY version DESC

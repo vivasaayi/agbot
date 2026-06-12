@@ -571,11 +571,20 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             provenance_ref TEXT NOT NULL,
             prior_version INTEGER,
             change_reason TEXT,
+            payload_json TEXT,
             PRIMARY KEY (record_id, version)
         );
         "#,
     )
     .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "compliance_records",
+        "payload_json",
+        "ALTER TABLE compliance_records ADD COLUMN payload_json TEXT",
+    )
     .await?;
 
     sqlx::query(

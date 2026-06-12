@@ -2285,7 +2285,7 @@ async fn compliance_records_create_list_append_versions_and_refuse_delete() -> R
                 .body(Body::from(
                     json!({
                         "record_id": "comp-rec-1",
-                        "record_type": "chemical_application",
+                        "record_type": "compliance_report",
                         "org_id": "org-alpha",
                         "field_id": "field-north",
                         "flight_id": "flight-77",
@@ -2420,6 +2420,229 @@ async fn compliance_records_create_list_append_versions_and_refuse_delete() -> R
             .fetch_one(&ctx.pool)
             .await?;
     assert_eq!(retained_versions, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn compliance_remote_id_and_chemical_payloads_are_persisted_and_validated() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_compliance_field(&ctx, "field-north", "org-alpha").await?;
+
+    let remote_payload = json!({
+        "record_id": "remote-log-1",
+        "record_type": "remote_id_log",
+        "org_id": "org-alpha",
+        "field_id": "field-north",
+        "actor": "operator-17",
+        "provenance_ref": "provenance:remote-id/remote-log-1/v1",
+        "payload": {
+            "flight_id": "flight-77",
+            "operator_id": "operator-17",
+            "aircraft_id": "aircraft-ag-9",
+            "started_at": "2026-06-12T12:00:00Z",
+            "ended_at": "2026-06-12T12:18:00Z",
+            "track": [
+                {
+                    "observed_at": "2026-06-12T12:02:00Z",
+                    "longitude": -96.61,
+                    "latitude": 41.21,
+                    "altitude_m": 118.0
+                },
+                {
+                    "observed_at": "2026-06-12T12:10:00Z",
+                    "longitude": -96.58,
+                    "latitude": 41.24,
+                    "altitude_m": 116.0
+                }
+            ],
+            "telemetry_gaps": [
+                {
+                    "started_at": "2026-06-12T12:04:00Z",
+                    "ended_at": "2026-06-12T12:08:00Z",
+                    "reason": "remote-id-broadcast-dropout"
+                }
+            ]
+        }
+    });
+
+    let remote_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(remote_payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(remote_response.status(), StatusCode::OK);
+    let body = to_bytes(remote_response.into_body(), 64 * 1024).await?;
+    let remote_created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        remote_created
+            .get("flight_id")
+            .and_then(|value| value.as_str()),
+        Some("flight-77")
+    );
+    assert_eq!(
+        remote_created
+            .pointer("/payload/telemetry_gaps/0/reason")
+            .and_then(|value| value.as_str()),
+        Some("remote-id-broadcast-dropout")
+    );
+
+    let remote_list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/compliance/records?record_id=remote-log-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(remote_list_response.status(), StatusCode::OK);
+    let body = to_bytes(remote_list_response.into_body(), 64 * 1024).await?;
+    let remote_versions: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(
+        remote_versions[0]
+            .pointer("/payload/operator_id")
+            .and_then(|value| value.as_str()),
+        Some("operator-17")
+    );
+
+    let chemical_payload = json!({
+        "record_id": "chem-app-1",
+        "record_type": "chemical_application",
+        "org_id": "org-alpha",
+        "field_id": "field-north",
+        "flight_id": "flight-77",
+        "actor": "operator-17",
+        "provenance_ref": "provenance:application/chem-app-1/v1",
+        "payload": {
+            "application_id": "chem-app-1",
+            "product": "Example Herbicide",
+            "epa_or_label_ref": "EPA-12345-LBL",
+            "field_id": "field-north",
+            "geometry": {
+                "crs": "EPSG:4326",
+                "coordinates": [
+                    { "longitude": -96.70, "latitude": 41.10 },
+                    { "longitude": -96.20, "latitude": 41.10 },
+                    { "longitude": -96.20, "latitude": 41.40 },
+                    { "longitude": -96.70, "latitude": 41.40 },
+                    { "longitude": -96.70, "latitude": 41.10 }
+                ]
+            },
+            "applied_at": "2026-06-12T13:00:00Z",
+            "rate": 1.75,
+            "units": "L/ha",
+            "operator_id": "operator-17"
+        }
+    });
+
+    let chemical_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(chemical_payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(chemical_response.status(), StatusCode::OK);
+    let body = to_bytes(chemical_response.into_body(), 64 * 1024).await?;
+    let chemical_created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        chemical_created
+            .pointer("/payload/product")
+            .and_then(|value| value.as_str()),
+        Some("Example Herbicide")
+    );
+    assert_eq!(
+        chemical_created
+            .pointer("/payload/geometry/crs")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        chemical_created
+            .pointer("/payload/rate")
+            .and_then(|value| value.as_f64()),
+        Some(1.75)
+    );
+
+    let invalid_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "record_id": "chem-app-invalid",
+                        "record_type": "chemical_application",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "actor": "operator-17",
+                        "provenance_ref": "provenance:application/chem-app-invalid/v1",
+                        "payload": {
+                            "application_id": "chem-app-invalid",
+                            "product": " ",
+                            "epa_or_label_ref": "EPA-12345-LBL",
+                            "field_id": "field-north",
+                            "geometry": {
+                                "crs": "EPSG:4326",
+                                "coordinates": [
+                                    { "longitude": -96.70, "latitude": 41.10 },
+                                    { "longitude": -96.20, "latitude": 41.10 },
+                                    { "longitude": -96.20, "latitude": 41.40 },
+                                    { "longitude": -96.70, "latitude": 41.40 },
+                                    { "longitude": -96.70, "latitude": 41.10 }
+                                ]
+                            },
+                            "applied_at": "2026-06-12T13:00:00Z",
+                            "rate": 1.75,
+                            "units": "L/ha",
+                            "operator_id": "operator-17"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(invalid_response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&body).contains("product cannot be empty"));
+
+    let payload_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM compliance_records WHERE payload_json IS NOT NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(payload_rows, 2);
+
+    let rejected_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM compliance_records WHERE record_id = ?1")
+            .bind("chem-app-invalid")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(rejected_rows, 0);
 
     Ok(())
 }

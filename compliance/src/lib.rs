@@ -26,6 +26,12 @@ impl ComplianceRecordType {
     }
 }
 
+impl std::fmt::Display for ComplianceRecordType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for ComplianceRecordType {
     type Err = ComplianceRecordError;
 
@@ -128,6 +134,70 @@ pub struct AirspaceZoneRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ComplianceRecordPayload {
+    RemoteIdFlightLog(RemoteIdFlightLogRecord),
+    ChemicalApplication(ChemicalApplicationRecord),
+}
+
+impl ComplianceRecordPayload {
+    fn payload_type(&self) -> &'static str {
+        match self {
+            ComplianceRecordPayload::RemoteIdFlightLog(_) => "remote_id_flight_log",
+            ComplianceRecordPayload::ChemicalApplication(_) => "chemical_application",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteIdFlightLogRecord {
+    pub flight_id: String,
+    pub operator_id: String,
+    pub aircraft_id: String,
+    pub started_at: String,
+    pub ended_at: String,
+    #[serde(default)]
+    pub track: Vec<RemoteIdTrackPoint>,
+    #[serde(default)]
+    pub telemetry_gaps: Vec<TelemetryGapRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteIdTrackPoint {
+    pub observed_at: String,
+    pub longitude: f64,
+    pub latitude: f64,
+    pub altitude_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryGapRecord {
+    pub started_at: String,
+    pub ended_at: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChemicalApplicationRecord {
+    pub application_id: String,
+    pub product: String,
+    pub epa_or_label_ref: String,
+    pub field_id: String,
+    pub geometry: ApplicationGeometry,
+    pub applied_at: String,
+    pub rate: f64,
+    pub units: String,
+    pub operator_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApplicationGeometry {
+    pub crs: String,
+    #[serde(default)]
+    pub coordinates: Vec<AirspaceCoordinate>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CreateComplianceRecordRequest {
     #[serde(default)]
@@ -143,6 +213,8 @@ pub struct CreateComplianceRecordRequest {
     pub actor: String,
     #[serde(default)]
     pub provenance_ref: String,
+    #[serde(default)]
+    pub payload: Option<ComplianceRecordPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -157,6 +229,8 @@ pub struct AppendComplianceRecordVersionRequest {
     pub provenance_ref: String,
     #[serde(default)]
     pub change_reason: Option<String>,
+    #[serde(default)]
+    pub payload: Option<ComplianceRecordPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +246,8 @@ pub struct ComplianceRecord {
     pub provenance_ref: String,
     pub prior_version: Option<u32>,
     pub change_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<ComplianceRecordPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -192,6 +268,66 @@ pub enum ComplianceRecordError {
     UnsupportedRecordType { value: String },
     #[error("compliance records are append-only; {action} must create a new version")]
     AppendOnlyMutationRefused { action: String },
+    #[error("{record_type} compliance records require a typed payload")]
+    MissingTypedPayload { record_type: ComplianceRecordType },
+    #[error("{record_type} compliance records do not accept payload type {payload_type}")]
+    PayloadTypeMismatch {
+        record_type: ComplianceRecordType,
+        payload_type: String,
+    },
+    #[error("flight_id cannot be empty")]
+    EmptyFlightId,
+    #[error("operator_id cannot be empty")]
+    EmptyOperatorId,
+    #[error("aircraft_id cannot be empty")]
+    EmptyAircraftId,
+    #[error("remote ID flight log track cannot be empty")]
+    EmptyRemoteIdTrack,
+    #[error("remote ID track point timestamp cannot be empty")]
+    EmptyTrackTimestamp,
+    #[error("remote ID track point has invalid coordinate")]
+    InvalidTrackCoordinate,
+    #[error("remote ID track point has invalid altitude")]
+    InvalidTrackAltitude,
+    #[error("telemetry gap timestamp cannot be empty")]
+    EmptyTelemetryGapTimestamp,
+    #[error("telemetry gap reason cannot be empty")]
+    EmptyTelemetryGapReason,
+    #[error("{start_field} must be at or before {end_field}")]
+    InvalidTimeRange {
+        start_field: &'static str,
+        end_field: &'static str,
+    },
+    #[error("request flight_id {request_flight_id} does not match payload flight_id {payload_flight_id}")]
+    FlightIdMismatch {
+        request_flight_id: String,
+        payload_flight_id: String,
+    },
+    #[error("application_id cannot be empty")]
+    EmptyApplicationId,
+    #[error("product cannot be empty")]
+    EmptyProduct,
+    #[error("epa_or_label_ref cannot be empty")]
+    EmptyEpaOrLabelRef,
+    #[error("applied_at cannot be empty")]
+    EmptyAppliedAt,
+    #[error("application rate must be greater than zero")]
+    InvalidApplicationRate,
+    #[error("application units cannot be empty")]
+    EmptyApplicationUnits,
+    #[error("application geometry CRS cannot be empty")]
+    EmptyApplicationGeometryCrs,
+    #[error("unsupported application geometry CRS {value}; expected EPSG:4326")]
+    UnsupportedApplicationGeometryCrs { value: String },
+    #[error(
+        "application geometry polygon must contain at least four coordinates including closure"
+    )]
+    InvalidApplicationGeometry,
+    #[error("request field_id {request_field_id} does not match application field_id {payload_field_id}")]
+    ApplicationFieldMismatch {
+        request_field_id: String,
+        payload_field_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -228,13 +364,23 @@ pub fn build_initial_compliance_record(
         None => normalize_required_text(generated_record_id, ComplianceRecordError::EmptyRecordId)?,
     };
 
+    let org_id = normalize_required_text(request.org_id, ComplianceRecordError::EmptyOrgId)?;
+    let field_id = normalize_required_text(request.field_id, ComplianceRecordError::EmptyFieldId)?;
+    let request_flight_id = normalize_optional_text(request.flight_id);
+    let (flight_id, payload) = validate_compliance_payload(
+        request.record_type,
+        &field_id,
+        request_flight_id,
+        request.payload,
+    )?;
+
     Ok(ComplianceRecord {
         record_id,
         version: 1,
         record_type: request.record_type,
-        org_id: normalize_required_text(request.org_id, ComplianceRecordError::EmptyOrgId)?,
-        field_id: normalize_required_text(request.field_id, ComplianceRecordError::EmptyFieldId)?,
-        flight_id: normalize_optional_text(request.flight_id),
+        org_id,
+        field_id,
+        flight_id,
         created_at: normalize_required_text(created_at, ComplianceRecordError::EmptyCreatedAt)?,
         actor: normalize_required_text(request.actor, ComplianceRecordError::EmptyActor)?,
         provenance_ref: normalize_required_text(
@@ -243,6 +389,7 @@ pub fn build_initial_compliance_record(
         )?,
         prior_version: None,
         change_reason: None,
+        payload,
     })
 }
 
@@ -253,10 +400,17 @@ pub fn append_compliance_record_version(
 ) -> Result<ComplianceRecord, ComplianceRecordError> {
     let field_id =
         normalize_optional_text(request.field_id).unwrap_or_else(|| latest.field_id.clone());
-    let flight_id = match normalize_optional_text(request.flight_id) {
+    let request_flight_id = match normalize_optional_text(request.flight_id) {
         Some(flight_id) => Some(flight_id),
         None => latest.flight_id.clone(),
     };
+    let request_payload = request.payload.or_else(|| latest.payload.clone());
+    let (flight_id, payload) = validate_compliance_payload(
+        latest.record_type,
+        &field_id,
+        request_flight_id,
+        request_payload,
+    )?;
 
     Ok(ComplianceRecord {
         record_id: latest.record_id.clone(),
@@ -273,6 +427,7 @@ pub fn append_compliance_record_version(
         )?,
         prior_version: Some(latest.version),
         change_reason: normalize_optional_text(request.change_reason),
+        payload,
     })
 }
 
@@ -363,6 +518,273 @@ pub fn airspace_zone_is_effective_at(zone: &AirspaceZoneRecord, at: Option<&str>
 pub fn refuse_in_place_mutation(action: &str) -> ComplianceRecordError {
     ComplianceRecordError::AppendOnlyMutationRefused {
         action: action.trim().to_string(),
+    }
+}
+
+fn validate_compliance_payload(
+    record_type: ComplianceRecordType,
+    field_id: &str,
+    request_flight_id: Option<String>,
+    payload: Option<ComplianceRecordPayload>,
+) -> Result<(Option<String>, Option<ComplianceRecordPayload>), ComplianceRecordError> {
+    match record_type {
+        ComplianceRecordType::RemoteIdLog | ComplianceRecordType::FlightLog => {
+            let payload =
+                payload.ok_or(ComplianceRecordError::MissingTypedPayload { record_type })?;
+            match payload {
+                ComplianceRecordPayload::RemoteIdFlightLog(log) => {
+                    let log = validate_remote_id_flight_log(log)?;
+                    let flight_id = match request_flight_id {
+                        Some(request_flight_id) if request_flight_id == log.flight_id => {
+                            Some(request_flight_id)
+                        }
+                        Some(request_flight_id) => {
+                            return Err(ComplianceRecordError::FlightIdMismatch {
+                                request_flight_id,
+                                payload_flight_id: log.flight_id,
+                            });
+                        }
+                        None => Some(log.flight_id.clone()),
+                    };
+                    Ok((
+                        flight_id,
+                        Some(ComplianceRecordPayload::RemoteIdFlightLog(log)),
+                    ))
+                }
+                other => Err(ComplianceRecordError::PayloadTypeMismatch {
+                    record_type,
+                    payload_type: other.payload_type().to_string(),
+                }),
+            }
+        }
+        ComplianceRecordType::ChemicalApplication => {
+            let payload =
+                payload.ok_or(ComplianceRecordError::MissingTypedPayload { record_type })?;
+            match payload {
+                ComplianceRecordPayload::ChemicalApplication(application) => {
+                    let application = validate_chemical_application(application)?;
+                    if application.field_id != field_id {
+                        return Err(ComplianceRecordError::ApplicationFieldMismatch {
+                            request_field_id: field_id.to_string(),
+                            payload_field_id: application.field_id,
+                        });
+                    }
+                    Ok((
+                        request_flight_id,
+                        Some(ComplianceRecordPayload::ChemicalApplication(application)),
+                    ))
+                }
+                other => Err(ComplianceRecordError::PayloadTypeMismatch {
+                    record_type,
+                    payload_type: other.payload_type().to_string(),
+                }),
+            }
+        }
+        _ => match payload {
+            Some(payload) => Err(ComplianceRecordError::PayloadTypeMismatch {
+                record_type,
+                payload_type: payload.payload_type().to_string(),
+            }),
+            None => Ok((request_flight_id, None)),
+        },
+    }
+}
+
+fn validate_remote_id_flight_log(
+    log: RemoteIdFlightLogRecord,
+) -> Result<RemoteIdFlightLogRecord, ComplianceRecordError> {
+    let flight_id = normalize_required_text(log.flight_id, ComplianceRecordError::EmptyFlightId)?;
+    let operator_id =
+        normalize_required_text(log.operator_id, ComplianceRecordError::EmptyOperatorId)?;
+    let aircraft_id =
+        normalize_required_text(log.aircraft_id, ComplianceRecordError::EmptyAircraftId)?;
+    let started_at =
+        normalize_required_text(log.started_at, ComplianceRecordError::EmptyCreatedAt)?;
+    let ended_at = normalize_required_text(log.ended_at, ComplianceRecordError::EmptyCreatedAt)?;
+    ensure_time_range(&started_at, &ended_at, "started_at", "ended_at")?;
+
+    if log.track.is_empty() {
+        return Err(ComplianceRecordError::EmptyRemoteIdTrack);
+    }
+    let track = log
+        .track
+        .into_iter()
+        .map(validate_remote_id_track_point)
+        .collect::<Result<Vec<_>, _>>()?;
+    let telemetry_gaps = log
+        .telemetry_gaps
+        .into_iter()
+        .map(validate_telemetry_gap)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(RemoteIdFlightLogRecord {
+        flight_id,
+        operator_id,
+        aircraft_id,
+        started_at,
+        ended_at,
+        track,
+        telemetry_gaps,
+    })
+}
+
+fn validate_remote_id_track_point(
+    point: RemoteIdTrackPoint,
+) -> Result<RemoteIdTrackPoint, ComplianceRecordError> {
+    let observed_at = normalize_required_text(
+        point.observed_at,
+        ComplianceRecordError::EmptyTrackTimestamp,
+    )?;
+    if !point.longitude.is_finite()
+        || !point.latitude.is_finite()
+        || point.longitude < -180.0
+        || point.longitude > 180.0
+        || point.latitude < -90.0
+        || point.latitude > 90.0
+    {
+        return Err(ComplianceRecordError::InvalidTrackCoordinate);
+    }
+    if !point.altitude_m.is_finite() {
+        return Err(ComplianceRecordError::InvalidTrackAltitude);
+    }
+
+    Ok(RemoteIdTrackPoint {
+        observed_at,
+        longitude: point.longitude,
+        latitude: point.latitude,
+        altitude_m: point.altitude_m,
+    })
+}
+
+fn validate_telemetry_gap(
+    gap: TelemetryGapRecord,
+) -> Result<TelemetryGapRecord, ComplianceRecordError> {
+    let started_at = normalize_required_text(
+        gap.started_at,
+        ComplianceRecordError::EmptyTelemetryGapTimestamp,
+    )?;
+    let ended_at = normalize_required_text(
+        gap.ended_at,
+        ComplianceRecordError::EmptyTelemetryGapTimestamp,
+    )?;
+    let reason =
+        normalize_required_text(gap.reason, ComplianceRecordError::EmptyTelemetryGapReason)?;
+    ensure_time_range(
+        &started_at,
+        &ended_at,
+        "telemetry_gap.started_at",
+        "telemetry_gap.ended_at",
+    )?;
+
+    Ok(TelemetryGapRecord {
+        started_at,
+        ended_at,
+        reason,
+    })
+}
+
+fn validate_chemical_application(
+    application: ChemicalApplicationRecord,
+) -> Result<ChemicalApplicationRecord, ComplianceRecordError> {
+    let application_id = normalize_required_text(
+        application.application_id,
+        ComplianceRecordError::EmptyApplicationId,
+    )?;
+    let product =
+        normalize_required_text(application.product, ComplianceRecordError::EmptyProduct)?;
+    let epa_or_label_ref = normalize_required_text(
+        application.epa_or_label_ref,
+        ComplianceRecordError::EmptyEpaOrLabelRef,
+    )?;
+    let field_id =
+        normalize_required_text(application.field_id, ComplianceRecordError::EmptyFieldId)?;
+    let applied_at = normalize_required_text(
+        application.applied_at,
+        ComplianceRecordError::EmptyAppliedAt,
+    )?;
+    let units = normalize_required_text(
+        application.units,
+        ComplianceRecordError::EmptyApplicationUnits,
+    )?;
+    let operator_id = normalize_required_text(
+        application.operator_id,
+        ComplianceRecordError::EmptyOperatorId,
+    )?;
+    if !application.rate.is_finite() || application.rate <= 0.0 {
+        return Err(ComplianceRecordError::InvalidApplicationRate);
+    }
+    let geometry = validate_application_geometry(application.geometry)?;
+
+    Ok(ChemicalApplicationRecord {
+        application_id,
+        product,
+        epa_or_label_ref,
+        field_id,
+        geometry,
+        applied_at,
+        rate: application.rate,
+        units,
+        operator_id,
+    })
+}
+
+fn validate_application_geometry(
+    geometry: ApplicationGeometry,
+) -> Result<ApplicationGeometry, ComplianceRecordError> {
+    let crs = normalize_required_text(
+        geometry.crs,
+        ComplianceRecordError::EmptyApplicationGeometryCrs,
+    )?;
+    if !crs.eq_ignore_ascii_case("EPSG:4326") {
+        return Err(ComplianceRecordError::UnsupportedApplicationGeometryCrs { value: crs });
+    }
+    let coordinates = validate_application_polygon(geometry.coordinates)?;
+
+    Ok(ApplicationGeometry {
+        crs: "EPSG:4326".to_string(),
+        coordinates,
+    })
+}
+
+fn validate_application_polygon(
+    coordinates: Vec<AirspaceCoordinate>,
+) -> Result<Vec<AirspaceCoordinate>, ComplianceRecordError> {
+    if coordinates.len() < 4 {
+        return Err(ComplianceRecordError::InvalidApplicationGeometry);
+    }
+    for coordinate in &coordinates {
+        if !coordinate.longitude.is_finite()
+            || !coordinate.latitude.is_finite()
+            || coordinate.longitude < -180.0
+            || coordinate.longitude > 180.0
+            || coordinate.latitude < -90.0
+            || coordinate.latitude > 90.0
+        {
+            return Err(ComplianceRecordError::InvalidApplicationGeometry);
+        }
+    }
+    let first = coordinates[0];
+    let last = coordinates[coordinates.len() - 1];
+    if !same_coordinate(first, last) {
+        return Err(ComplianceRecordError::InvalidApplicationGeometry);
+    }
+
+    Ok(coordinates)
+}
+
+fn ensure_time_range(
+    started_at: &str,
+    ended_at: &str,
+    start_field: &'static str,
+    end_field: &'static str,
+) -> Result<(), ComplianceRecordError> {
+    if started_at > ended_at {
+        Err(ComplianceRecordError::InvalidTimeRange {
+            start_field,
+            end_field,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -538,8 +960,10 @@ mod tests {
         append_compliance_record_version, build_airspace_zone_record,
         build_initial_compliance_record, refuse_in_place_mutation, AirspaceCoordinate,
         AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
-        AppendComplianceRecordVersionRequest, ComplianceRecordError, ComplianceRecordType,
-        CreateComplianceRecordRequest,
+        AppendComplianceRecordVersionRequest, ApplicationGeometry, ChemicalApplicationRecord,
+        ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
+        CreateComplianceRecordRequest, RemoteIdFlightLogRecord, RemoteIdTrackPoint,
+        TelemetryGapRecord,
     };
 
     #[test]
@@ -547,12 +971,13 @@ mod tests {
         let record = build_initial_compliance_record(
             CreateComplianceRecordRequest {
                 record_id: Some(" comp-rec-1 ".to_string()),
-                record_type: ComplianceRecordType::ChemicalApplication,
+                record_type: ComplianceRecordType::ComplianceReport,
                 org_id: " org-alpha ".to_string(),
                 field_id: " field-north ".to_string(),
                 flight_id: Some(" flight-77 ".to_string()),
                 actor: " compliance-officer-1 ".to_string(),
                 provenance_ref: " provenance:compliance/comp-rec-1/v1 ".to_string(),
+                payload: None,
             },
             "generated-record".to_string(),
             " 2026-06-12T12:00:00Z ".to_string(),
@@ -561,10 +986,7 @@ mod tests {
 
         assert_eq!(record.record_id, "comp-rec-1");
         assert_eq!(record.version, 1);
-        assert_eq!(
-            record.record_type,
-            ComplianceRecordType::ChemicalApplication
-        );
+        assert_eq!(record.record_type, ComplianceRecordType::ComplianceReport);
         assert_eq!(record.org_id, "org-alpha");
         assert_eq!(record.field_id, "field-north");
         assert_eq!(record.flight_id.as_deref(), Some("flight-77"));
@@ -578,12 +1000,13 @@ mod tests {
         let initial = build_initial_compliance_record(
             CreateComplianceRecordRequest {
                 record_id: Some("comp-rec-1".to_string()),
-                record_type: ComplianceRecordType::ChemicalApplication,
+                record_type: ComplianceRecordType::ComplianceReport,
                 org_id: "org-alpha".to_string(),
                 field_id: "field-north".to_string(),
                 flight_id: Some("flight-77".to_string()),
                 actor: "compliance-officer-1".to_string(),
                 provenance_ref: "provenance:compliance/comp-rec-1/v1".to_string(),
+                payload: None,
             },
             "generated-record".to_string(),
             "2026-06-12T12:00:00Z".to_string(),
@@ -598,6 +1021,7 @@ mod tests {
                 actor: "compliance-officer-2".to_string(),
                 provenance_ref: "provenance:compliance/comp-rec-1/v2".to_string(),
                 change_reason: Some("corrected field linkage".to_string()),
+                payload: None,
             },
             "2026-06-12T13:00:00Z".to_string(),
         )
@@ -616,12 +1040,13 @@ mod tests {
         let error = build_initial_compliance_record(
             CreateComplianceRecordRequest {
                 record_id: Some("comp-rec-1".to_string()),
-                record_type: ComplianceRecordType::FlightLog,
+                record_type: ComplianceRecordType::ComplianceReport,
                 org_id: "org-alpha".to_string(),
                 field_id: "field-north".to_string(),
                 flight_id: None,
                 actor: "compliance-officer-1".to_string(),
                 provenance_ref: " ".to_string(),
+                payload: None,
             },
             "generated-record".to_string(),
             "2026-06-12T12:00:00Z".to_string(),
@@ -629,6 +1054,173 @@ mod tests {
         .expect_err("missing provenance should be rejected");
 
         assert_eq!(error, ComplianceRecordError::EmptyProvenanceRef);
+    }
+
+    #[test]
+    fn remote_id_flight_log_preserves_operator_aircraft_track_and_explicit_gap() {
+        let record = build_initial_compliance_record(
+            CreateComplianceRecordRequest {
+                record_id: Some("remote-log-1".to_string()),
+                record_type: ComplianceRecordType::RemoteIdLog,
+                org_id: "org-alpha".to_string(),
+                field_id: "field-north".to_string(),
+                flight_id: None,
+                actor: "operator-17".to_string(),
+                provenance_ref: "provenance:remote-id/remote-log-1/v1".to_string(),
+                payload: Some(ComplianceRecordPayload::RemoteIdFlightLog(
+                    RemoteIdFlightLogRecord {
+                        flight_id: "flight-77".to_string(),
+                        operator_id: "operator-17".to_string(),
+                        aircraft_id: "aircraft-ag-9".to_string(),
+                        started_at: "2026-06-12T12:00:00Z".to_string(),
+                        ended_at: "2026-06-12T12:18:00Z".to_string(),
+                        track: vec![
+                            RemoteIdTrackPoint {
+                                observed_at: "2026-06-12T12:02:00Z".to_string(),
+                                longitude: -96.61,
+                                latitude: 41.21,
+                                altitude_m: 118.0,
+                            },
+                            RemoteIdTrackPoint {
+                                observed_at: "2026-06-12T12:10:00Z".to_string(),
+                                longitude: -96.58,
+                                latitude: 41.24,
+                                altitude_m: 116.0,
+                            },
+                        ],
+                        telemetry_gaps: vec![TelemetryGapRecord {
+                            started_at: "2026-06-12T12:04:00Z".to_string(),
+                            ended_at: "2026-06-12T12:08:00Z".to_string(),
+                            reason: "remote-id-broadcast-dropout".to_string(),
+                        }],
+                    },
+                )),
+            },
+            "generated-record".to_string(),
+            "2026-06-12T12:19:00Z".to_string(),
+        )
+        .expect("remote id log should be valid");
+
+        assert_eq!(record.flight_id.as_deref(), Some("flight-77"));
+        let payload = record
+            .payload
+            .as_ref()
+            .expect("typed payload should be retained");
+        match payload {
+            ComplianceRecordPayload::RemoteIdFlightLog(log) => {
+                assert_eq!(log.operator_id, "operator-17");
+                assert_eq!(log.aircraft_id, "aircraft-ag-9");
+                assert_eq!(log.track.len(), 2);
+                assert_eq!(log.telemetry_gaps.len(), 1);
+                assert_eq!(log.telemetry_gaps[0].reason, "remote-id-broadcast-dropout");
+            }
+            ComplianceRecordPayload::ChemicalApplication(_) => {
+                panic!("remote id log should not become a chemical application payload")
+            }
+        }
+    }
+
+    #[test]
+    fn chemical_application_requires_product_rate_and_crs_geometry() {
+        let valid = build_initial_compliance_record(
+            CreateComplianceRecordRequest {
+                record_id: Some("chem-app-1".to_string()),
+                record_type: ComplianceRecordType::ChemicalApplication,
+                org_id: "org-alpha".to_string(),
+                field_id: "field-north".to_string(),
+                flight_id: Some("flight-77".to_string()),
+                actor: "operator-17".to_string(),
+                provenance_ref: "provenance:application/chem-app-1/v1".to_string(),
+                payload: Some(ComplianceRecordPayload::ChemicalApplication(
+                    ChemicalApplicationRecord {
+                        application_id: "chem-app-1".to_string(),
+                        product: "Example Herbicide".to_string(),
+                        epa_or_label_ref: "EPA-12345-LBL".to_string(),
+                        field_id: "field-north".to_string(),
+                        geometry: ApplicationGeometry {
+                            crs: "EPSG:4326".to_string(),
+                            coordinates: square_zone(),
+                        },
+                        applied_at: "2026-06-12T13:00:00Z".to_string(),
+                        rate: 1.75,
+                        units: "L/ha".to_string(),
+                        operator_id: "operator-17".to_string(),
+                    },
+                )),
+            },
+            "generated-record".to_string(),
+            "2026-06-12T13:01:00Z".to_string(),
+        )
+        .expect("complete chemical application should be valid");
+
+        assert!(matches!(
+            valid.payload,
+            Some(ComplianceRecordPayload::ChemicalApplication(_))
+        ));
+
+        let missing_product = build_initial_compliance_record(
+            CreateComplianceRecordRequest {
+                record_id: Some("chem-app-2".to_string()),
+                record_type: ComplianceRecordType::ChemicalApplication,
+                org_id: "org-alpha".to_string(),
+                field_id: "field-north".to_string(),
+                flight_id: None,
+                actor: "operator-17".to_string(),
+                provenance_ref: "provenance:application/chem-app-2/v1".to_string(),
+                payload: Some(ComplianceRecordPayload::ChemicalApplication(
+                    ChemicalApplicationRecord {
+                        application_id: "chem-app-2".to_string(),
+                        product: " ".to_string(),
+                        epa_or_label_ref: "EPA-12345-LBL".to_string(),
+                        field_id: "field-north".to_string(),
+                        geometry: ApplicationGeometry {
+                            crs: "EPSG:4326".to_string(),
+                            coordinates: square_zone(),
+                        },
+                        applied_at: "2026-06-12T13:00:00Z".to_string(),
+                        rate: 1.75,
+                        units: "L/ha".to_string(),
+                        operator_id: "operator-17".to_string(),
+                    },
+                )),
+            },
+            "generated-record".to_string(),
+            "2026-06-12T13:01:00Z".to_string(),
+        )
+        .expect_err("missing product should be rejected");
+        assert_eq!(missing_product, ComplianceRecordError::EmptyProduct);
+
+        let missing_rate = build_initial_compliance_record(
+            CreateComplianceRecordRequest {
+                record_id: Some("chem-app-3".to_string()),
+                record_type: ComplianceRecordType::ChemicalApplication,
+                org_id: "org-alpha".to_string(),
+                field_id: "field-north".to_string(),
+                flight_id: None,
+                actor: "operator-17".to_string(),
+                provenance_ref: "provenance:application/chem-app-3/v1".to_string(),
+                payload: Some(ComplianceRecordPayload::ChemicalApplication(
+                    ChemicalApplicationRecord {
+                        application_id: "chem-app-3".to_string(),
+                        product: "Example Herbicide".to_string(),
+                        epa_or_label_ref: "EPA-12345-LBL".to_string(),
+                        field_id: "field-north".to_string(),
+                        geometry: ApplicationGeometry {
+                            crs: "EPSG:4326".to_string(),
+                            coordinates: square_zone(),
+                        },
+                        applied_at: "2026-06-12T13:00:00Z".to_string(),
+                        rate: 0.0,
+                        units: "L/ha".to_string(),
+                        operator_id: "operator-17".to_string(),
+                    },
+                )),
+            },
+            "generated-record".to_string(),
+            "2026-06-12T13:01:00Z".to_string(),
+        )
+        .expect_err("missing rate should be rejected");
+        assert_eq!(missing_rate, ComplianceRecordError::InvalidApplicationRate);
     }
 
     #[test]
