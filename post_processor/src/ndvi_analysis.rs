@@ -345,12 +345,10 @@ impl NdviAnalysisProcessor {
             } else {
                 VegetationType::BareGround
             }
-        } else if ndvi < self.threshold_settings.sparse_vegetation {
-            VegetationType::Grass
         } else if ndvi < self.threshold_settings.moderate_vegetation {
-            VegetationType::Crop
+            VegetationType::Grass
         } else if ndvi < self.threshold_settings.dense_vegetation {
-            VegetationType::Shrub
+            VegetationType::Crop
         } else {
             VegetationType::Forest
         }

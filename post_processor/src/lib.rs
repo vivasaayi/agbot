@@ -1,8 +1,9 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use shared::schemas::FarmFieldRegistry;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub mod lidar_analysis;
@@ -31,6 +32,41 @@ pub struct ProcessingJob {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisJobIdentity {
+    pub job_id: Uuid,
+    pub scene_id: String,
+    pub field_id: String,
+    pub season_id: String,
+    pub product_refs: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub status: JobStatus,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisJobRequest {
+    pub org_id: String,
+    pub scene_id: String,
+    pub field_id: String,
+    pub season_id: String,
+    pub product_refs: Vec<String>,
+    pub job_type: JobType,
+    pub input_files: Vec<PathBuf>,
+    pub output_directory: PathBuf,
+    pub parameters: ProcessingParameters,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnalysisJobError {
+    #[error("unknown scene: {scene_id}")]
+    UnknownScene { scene_id: String },
+    #[error("analysis job not found: {job_id}")]
+    JobNotFound { job_id: Uuid },
+    #[error("analysis job queue rejected request: {reason}")]
+    QueueRejected { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobType {
     NdviAnalysis,
     LidarProcessing,
@@ -41,7 +77,7 @@ pub enum JobType {
     YieldPrediction,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobStatus {
     Queued,
     Processing,
@@ -195,6 +231,7 @@ pub struct PostProcessorService {
     job_queue: Vec<ProcessingJob>,
     completed_jobs: HashMap<Uuid, ProcessingJob>,
     results_cache: HashMap<Uuid, AnalysisResult>,
+    analysis_job_identities: HashMap<Uuid, AnalysisJobIdentity>,
     working_directory: PathBuf,
     ndvi_analyzer: NdviAnalysisProcessor,
     lidar_analyzer: LidarAnalysisProcessor,
@@ -208,6 +245,7 @@ impl PostProcessorService {
             job_queue: Vec::new(),
             completed_jobs: HashMap::new(),
             results_cache: HashMap::new(),
+            analysis_job_identities: HashMap::new(),
             working_directory,
             ndvi_analyzer: NdviAnalysisProcessor::new(NdviAnalysisConfig::default()),
             lidar_analyzer: LidarAnalysisProcessor::new(LidarAnalysisConfig::default()),
@@ -249,15 +287,77 @@ impl PostProcessorService {
         Ok(job_id)
     }
 
+    pub async fn submit_analysis_job(
+        &mut self,
+        scene_catalog: &FarmFieldRegistry,
+        request: AnalysisJobRequest,
+    ) -> std::result::Result<Uuid, AnalysisJobError> {
+        let scene_known = scene_catalog
+            .scenes_for_field_season(&request.org_id, &request.field_id, &request.season_id)
+            .iter()
+            .any(|entry| entry.scene.scene_id == request.scene_id);
+        if !scene_known {
+            return Err(AnalysisJobError::UnknownScene {
+                scene_id: request.scene_id,
+            });
+        }
+
+        let scene_id = request.scene_id;
+        let field_id = request.field_id;
+        let season_id = request.season_id;
+        let product_refs = request.product_refs;
+        let job = ProcessingJob {
+            id: Uuid::nil(),
+            job_type: request.job_type,
+            input_files: request.input_files,
+            output_directory: request.output_directory,
+            parameters: request.parameters,
+            status: JobStatus::Queued,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+        };
+        let job_id =
+            self.submit_job(job)
+                .await
+                .map_err(|error| AnalysisJobError::QueueRejected {
+                    reason: error.to_string(),
+                })?;
+        let created_at = self
+            .get_job_status(&job_id)
+            .await
+            .map(|job| job.created_at)
+            .unwrap_or_else(Utc::now);
+
+        self.analysis_job_identities.insert(
+            job_id,
+            AnalysisJobIdentity {
+                job_id,
+                scene_id,
+                field_id,
+                season_id,
+                product_refs,
+                created_at,
+                status: JobStatus::Queued,
+                failure_reason: None,
+            },
+        );
+
+        Ok(job_id)
+    }
+
     pub async fn process_next_job(&mut self) -> Result<Option<AnalysisResult>> {
         if let Some(mut job) = self.job_queue.pop() {
             job.status = JobStatus::Processing;
             job.started_at = Some(Utc::now());
+            self.sync_analysis_job_identity(&job);
 
             tracing::info!("Processing job: {} (type: {:?})", job.id, job.job_type);
 
             let result = match self.process_job(&job).await {
-                Ok(result) => {
+                Ok(mut result) => {
+                    result.job_id = job.id;
                     job.status = JobStatus::Completed;
                     job.completed_at = Some(Utc::now());
                     self.results_cache.insert(result.id, result.clone());
@@ -272,6 +372,7 @@ impl PostProcessorService {
                 }
             };
 
+            self.sync_analysis_job_identity(&job);
             self.completed_jobs.insert(job.id, job);
             Ok(result)
         } else {
@@ -493,16 +594,55 @@ impl PostProcessorService {
         self.results_cache.get(result_id)
     }
 
+    pub fn analysis_job_identity(&self, job_id: &Uuid) -> Option<&AnalysisJobIdentity> {
+        self.analysis_job_identities.get(job_id)
+    }
+
+    pub fn mark_analysis_job_failed(
+        &mut self,
+        job_id: &Uuid,
+        reason_code: impl Into<String>,
+    ) -> std::result::Result<(), AnalysisJobError> {
+        let reason_code = reason_code.into();
+        if let Some(queue_index) = self.job_queue.iter().position(|job| job.id == *job_id) {
+            let mut job = self.job_queue.remove(queue_index);
+            job.status = JobStatus::Failed;
+            job.completed_at = Some(Utc::now());
+            job.error_message = Some(reason_code.clone());
+            self.sync_analysis_job_identity(&job);
+            self.completed_jobs.insert(*job_id, job);
+            return Ok(());
+        }
+
+        if let Some(job) = self.completed_jobs.get_mut(job_id) {
+            job.status = JobStatus::Failed;
+            job.completed_at = Some(Utc::now());
+            job.error_message = Some(reason_code);
+            let job = job.clone();
+            self.sync_analysis_job_identity(&job);
+            return Ok(());
+        }
+
+        Err(AnalysisJobError::JobNotFound { job_id: *job_id })
+    }
+
     pub async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Vec<&ProcessingJob> {
         let mut jobs: Vec<&ProcessingJob> = self.job_queue.iter().collect();
         jobs.extend(self.completed_jobs.values());
 
         if let Some(status) = status_filter {
-            jobs.retain(|job| matches!(job.status, status));
+            jobs.retain(|job| job.status == status);
         }
 
         jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         jobs
+    }
+
+    fn sync_analysis_job_identity(&mut self, job: &ProcessingJob) {
+        if let Some(identity) = self.analysis_job_identities.get_mut(&job.id) {
+            identity.status = job.status;
+            identity.failure_reason = job.error_message.clone();
+        }
     }
 
     pub async fn cleanup_old_results(&mut self, older_than_days: u32) -> Result<u32> {
@@ -559,6 +699,10 @@ impl Default for ProcessingParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::schemas::{
+        FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord, GeoBounds, GeoPoint,
+        SceneRecord, SeasonRecord,
+    };
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -589,5 +733,193 @@ mod tests {
         let job_id = service.submit_job(job).await.unwrap();
         let status = service.get_job_status(&job_id).await.unwrap();
         assert!(matches!(status.status, JobStatus::Queued));
+    }
+
+    #[tokio::test]
+    async fn analysis_job_submission_links_scene_field_and_season() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let catalog = analysis_catalog();
+
+        let job_id = service
+            .submit_analysis_job(&catalog, analysis_job_request(temp_dir.path()))
+            .await
+            .expect("scene-linked job is accepted");
+
+        let identity = service
+            .analysis_job_identity(&job_id)
+            .expect("identity is persisted");
+        assert_eq!(identity.job_id, job_id);
+        assert_eq!(identity.scene_id, "scene-2026-04-15");
+        assert_eq!(identity.field_id, "field-a");
+        assert_eq!(identity.season_id, "season-2026");
+        assert_eq!(identity.product_refs, vec!["layer-ndvi".to_string()]);
+        assert!(matches!(identity.status, JobStatus::Queued));
+        assert!(identity.failure_reason.is_none());
+
+        let status = service.get_job_status(&job_id).await.unwrap();
+        assert_eq!(identity.created_at, status.created_at);
+        assert!(matches!(status.status, JobStatus::Queued));
+    }
+
+    #[tokio::test]
+    async fn analysis_job_submission_rejects_unknown_scene_without_queueing() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.scene_id = "missing-scene".to_string();
+
+        let error = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect_err("unknown scene is rejected");
+
+        assert_eq!(
+            error,
+            AnalysisJobError::UnknownScene {
+                scene_id: "missing-scene".to_string()
+            }
+        );
+        assert!(service.list_jobs(None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn analysis_job_failure_records_reason_code() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let catalog = analysis_catalog();
+        let job_id = service
+            .submit_analysis_job(&catalog, analysis_job_request(temp_dir.path()))
+            .await
+            .expect("scene-linked job is accepted");
+
+        service
+            .mark_analysis_job_failed(&job_id, "processing_error")
+            .expect("failure status is recorded");
+
+        let identity = service.analysis_job_identity(&job_id).unwrap();
+        assert!(matches!(identity.status, JobStatus::Failed));
+        assert_eq!(identity.failure_reason.as_deref(), Some("processing_error"));
+        let status = service.get_job_status(&job_id).await.unwrap();
+        assert!(matches!(status.status, JobStatus::Failed));
+        assert_eq!(status.error_message.as_deref(), Some("processing_error"));
+    }
+
+    #[tokio::test]
+    async fn completed_analysis_job_keeps_stable_job_id() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::MultiSpectralAnalysis;
+        let job_id = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("scene-linked job is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing succeeds")
+            .expect("result is produced");
+
+        assert_eq!(result.job_id, job_id);
+        let identity = service.analysis_job_identity(&job_id).unwrap();
+        assert!(matches!(identity.status, JobStatus::Completed));
+    }
+
+    fn analysis_job_request(output_directory: &std::path::Path) -> AnalysisJobRequest {
+        AnalysisJobRequest {
+            org_id: "org-a".to_string(),
+            scene_id: "scene-2026-04-15".to_string(),
+            field_id: "field-a".to_string(),
+            season_id: "season-2026".to_string(),
+            product_refs: vec!["layer-ndvi".to_string()],
+            job_type: JobType::NdviAnalysis,
+            input_files: Vec::new(),
+            output_directory: output_directory.to_path_buf(),
+            parameters: ProcessingParameters::default(),
+        }
+    }
+
+    fn analysis_catalog() -> FarmFieldRegistry {
+        let mut catalog = FarmFieldRegistry::default();
+        catalog
+            .insert_farm(FarmRecord {
+                farm_id: "farm-a".to_string(),
+                org_id: "org-a".to_string(),
+                owner: "org-a".to_string(),
+                name: "Prairie Farm".to_string(),
+                notes: None,
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect("farm persists");
+        catalog
+            .insert_field(FieldRecord {
+                farm_id: Some("farm-a".to_string()),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                owner: "org-a".to_string(),
+                name: "North 80".to_string(),
+                area_ha: None,
+                crop: None,
+                season: None,
+                notes: None,
+                boundary: FieldBoundary {
+                    crs: Some("EPSG:4326".to_string()),
+                    coordinates: vec![
+                        GeoPoint {
+                            longitude: -96.0,
+                            latitude: 41.0,
+                        },
+                        GeoPoint {
+                            longitude: -95.9,
+                            latitude: 41.0,
+                        },
+                        GeoPoint {
+                            longitude: -95.9,
+                            latitude: 41.1,
+                        },
+                        GeoPoint {
+                            longitude: -96.0,
+                            latitude: 41.1,
+                        },
+                        GeoPoint {
+                            longitude: -96.0,
+                            latitude: 41.0,
+                        },
+                    ],
+                },
+                extent: GeoBounds {
+                    min_lon: -96.0,
+                    min_lat: 41.0,
+                    max_lon: -95.9,
+                    max_lat: 41.1,
+                },
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect("field persists");
+        catalog
+            .insert_season(SeasonRecord {
+                season_id: "season-2026".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2026-03-01".to_string(),
+                end: "2026-10-31".to_string(),
+                label: "2026 Corn".to_string(),
+            })
+            .expect("season persists");
+        catalog
+            .insert_scene(SceneRecord {
+                scene_id: "scene-2026-04-15".to_string(),
+                field_id: "field-a".to_string(),
+                season_id: "season-2026".to_string(),
+                org_id: "org-a".to_string(),
+                captured_at: "2026-04-15T14:30:00Z".to_string(),
+                source: "landsat".to_string(),
+            })
+            .expect("scene persists");
+        catalog
     }
 }
