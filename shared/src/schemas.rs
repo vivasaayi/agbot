@@ -792,6 +792,234 @@ pub enum AnnotationGeometry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditedAnnotationRecord {
+    pub annotation_id: String,
+    pub field_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id: Option<String>,
+    pub org_id: String,
+    pub author_user_id: String,
+    pub geometry: AnnotationGeometry,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retracted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationChangeType {
+    Created,
+    Edited,
+    Retracted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnnotationChangeRecord {
+    pub annotation_id: String,
+    pub actor_user_id: String,
+    pub before: Option<AuditedAnnotationRecord>,
+    pub after: Option<AuditedAnnotationRecord>,
+    pub at: String,
+    pub change_type: AnnotationChangeType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnnotationPersistenceError {
+    #[error("annotation_id cannot be empty")]
+    EmptyAnnotationId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("author_user_id cannot be empty")]
+    EmptyAuthorUserId,
+    #[error("actor_user_id cannot be empty")]
+    EmptyActorUserId,
+    #[error("timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("annotation already exists: {annotation_id}")]
+    AnnotationAlreadyExists { annotation_id: String },
+    #[error("annotation not found: {annotation_id}")]
+    AnnotationNotFound { annotation_id: String },
+    #[error("annotation history hard delete is rejected: {annotation_id}")]
+    HistoryDeleteRejected { annotation_id: String },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AnnotationAuditRegistry {
+    annotations: HashMap<String, AuditedAnnotationRecord>,
+    history: Vec<AnnotationChangeRecord>,
+}
+
+impl AnnotationAuditRegistry {
+    pub fn create_annotation(
+        &mut self,
+        annotation: AuditedAnnotationRecord,
+    ) -> Result<AuditedAnnotationRecord, AnnotationPersistenceError> {
+        let annotation = normalize_audited_annotation(annotation)?;
+        if self.annotations.contains_key(&annotation.annotation_id) {
+            return Err(AnnotationPersistenceError::AnnotationAlreadyExists {
+                annotation_id: annotation.annotation_id,
+            });
+        }
+
+        self.history.push(AnnotationChangeRecord {
+            annotation_id: annotation.annotation_id.clone(),
+            actor_user_id: annotation.author_user_id.clone(),
+            before: None,
+            after: Some(annotation.clone()),
+            at: annotation.created_at.clone(),
+            change_type: AnnotationChangeType::Created,
+        });
+        self.annotations
+            .insert(annotation.annotation_id.clone(), annotation.clone());
+        Ok(annotation)
+    }
+
+    pub fn edit_annotation_geometry(
+        &mut self,
+        org_id: &str,
+        annotation_id: &str,
+        actor_user_id: &str,
+        at: &str,
+        geometry: AnnotationGeometry,
+    ) -> Result<AuditedAnnotationRecord, AnnotationPersistenceError> {
+        let org_id = normalize_annotation_arg(org_id, AnnotationPersistenceError::EmptyOrgId)?;
+        let annotation_id =
+            normalize_annotation_arg(annotation_id, AnnotationPersistenceError::EmptyAnnotationId)?;
+        let actor_user_id =
+            normalize_annotation_arg(actor_user_id, AnnotationPersistenceError::EmptyActorUserId)?;
+        let at = normalize_annotation_arg(at, AnnotationPersistenceError::EmptyTimestamp)?;
+        let before = self.annotation_for_org(&org_id, &annotation_id)?;
+        let mut after = before.clone();
+        after.geometry = geometry;
+
+        self.annotations
+            .insert(annotation_id.clone(), after.clone());
+        self.history.push(AnnotationChangeRecord {
+            annotation_id,
+            actor_user_id,
+            before: Some(before),
+            after: Some(after.clone()),
+            at,
+            change_type: AnnotationChangeType::Edited,
+        });
+        Ok(after)
+    }
+
+    pub fn retract_annotation(
+        &mut self,
+        org_id: &str,
+        annotation_id: &str,
+        actor_user_id: &str,
+        at: &str,
+    ) -> Result<AuditedAnnotationRecord, AnnotationPersistenceError> {
+        let org_id = normalize_annotation_arg(org_id, AnnotationPersistenceError::EmptyOrgId)?;
+        let annotation_id =
+            normalize_annotation_arg(annotation_id, AnnotationPersistenceError::EmptyAnnotationId)?;
+        let actor_user_id =
+            normalize_annotation_arg(actor_user_id, AnnotationPersistenceError::EmptyActorUserId)?;
+        let at = normalize_annotation_arg(at, AnnotationPersistenceError::EmptyTimestamp)?;
+        let before = self.annotation_for_org(&org_id, &annotation_id)?;
+        let mut after = before.clone();
+        after.retracted_at = Some(at.clone());
+
+        self.annotations
+            .insert(annotation_id.clone(), after.clone());
+        self.history.push(AnnotationChangeRecord {
+            annotation_id,
+            actor_user_id,
+            before: Some(before),
+            after: Some(after.clone()),
+            at,
+            change_type: AnnotationChangeType::Retracted,
+        });
+        Ok(after)
+    }
+
+    pub fn annotations_for_org(&self, org_id: &str) -> Vec<AuditedAnnotationRecord> {
+        let mut annotations = self
+            .annotations
+            .values()
+            .filter(|annotation| annotation.org_id == org_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        annotations.sort_by(|left, right| left.annotation_id.cmp(&right.annotation_id));
+        annotations
+    }
+
+    pub fn annotation_history(
+        &self,
+        org_id: &str,
+        annotation_id: &str,
+    ) -> Vec<AnnotationChangeRecord> {
+        self.history
+            .iter()
+            .filter(|change| change.annotation_id == annotation_id)
+            .filter(|change| {
+                change
+                    .after
+                    .as_ref()
+                    .or(change.before.as_ref())
+                    .is_some_and(|annotation| annotation.org_id == org_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+
+    pub fn delete_annotation_history(
+        &self,
+        org_id: &str,
+        annotation_id: &str,
+    ) -> Result<(), AnnotationPersistenceError> {
+        let org_id = normalize_annotation_arg(org_id, AnnotationPersistenceError::EmptyOrgId)?;
+        let annotation_id =
+            normalize_annotation_arg(annotation_id, AnnotationPersistenceError::EmptyAnnotationId)?;
+        self.annotation_for_org(&org_id, &annotation_id)?;
+        Err(AnnotationPersistenceError::HistoryDeleteRejected { annotation_id })
+    }
+
+    fn annotation_for_org(
+        &self,
+        org_id: &str,
+        annotation_id: &str,
+    ) -> Result<AuditedAnnotationRecord, AnnotationPersistenceError> {
+        self.annotations
+            .get(annotation_id)
+            .filter(|annotation| annotation.org_id == org_id)
+            .cloned()
+            .ok_or_else(|| AnnotationPersistenceError::AnnotationNotFound {
+                annotation_id: annotation_id.to_string(),
+            })
+    }
+}
+
+fn normalize_audited_annotation(
+    mut annotation: AuditedAnnotationRecord,
+) -> Result<AuditedAnnotationRecord, AnnotationPersistenceError> {
+    annotation.annotation_id = normalize_farm_field_text(annotation.annotation_id)
+        .ok_or(AnnotationPersistenceError::EmptyAnnotationId)?;
+    annotation.field_id = normalize_farm_field_text(annotation.field_id)
+        .ok_or(AnnotationPersistenceError::EmptyFieldId)?;
+    annotation.scene_id = annotation.scene_id.and_then(normalize_farm_field_text);
+    annotation.org_id = normalize_farm_field_text(annotation.org_id)
+        .ok_or(AnnotationPersistenceError::EmptyOrgId)?;
+    annotation.author_user_id = normalize_farm_field_text(annotation.author_user_id)
+        .ok_or(AnnotationPersistenceError::EmptyAuthorUserId)?;
+    annotation.created_at = normalize_farm_field_text(annotation.created_at)
+        .ok_or(AnnotationPersistenceError::EmptyTimestamp)?;
+    annotation.retracted_at = annotation.retracted_at.and_then(normalize_farm_field_text);
+    Ok(annotation)
+}
+
+fn normalize_annotation_arg(
+    value: &str,
+    error: AnnotationPersistenceError,
+) -> Result<String, AnnotationPersistenceError> {
+    normalize_farm_field_text(value.to_string()).ok_or(error)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnnotationRecord {
     pub annotation_id: String,
     pub scene_id: String,
@@ -1228,12 +1456,14 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_raster_spatial_ref, bounds_from_points, validate_field_boundary, AnnotationGeometry,
-        AnnotationRecord, CropPlanRecord, FarmFieldError, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint,
-        MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat,
-        ReportRecord, SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
+        assert_raster_spatial_ref, bounds_from_points, validate_field_boundary,
+        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
+        AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord, CropPlanRecord,
+        FarmFieldError, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError,
+        FieldRecord, GeoBounds, GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        ReportFormat, ReportRecord, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
+        SeasonRecord,
     };
 
     #[test]
@@ -1906,6 +2136,123 @@ mod tests {
             })
             .expect("season persists");
         registry
+    }
+
+    #[test]
+    fn annotation_create_and_edit_appends_audit_history() {
+        let mut registry = AnnotationAuditRegistry::default();
+        registry
+            .create_annotation(AuditedAnnotationRecord {
+                annotation_id: "ann-1".to_string(),
+                field_id: "field-a".to_string(),
+                scene_id: Some("scene-a".to_string()),
+                org_id: "org-a".to_string(),
+                author_user_id: "user-author".to_string(),
+                geometry: AnnotationGeometry::Point {
+                    coordinate: GeoPoint {
+                        longitude: -96.0,
+                        latitude: 41.0,
+                    },
+                },
+                created_at: "2026-05-01T00:00:00Z".to_string(),
+                retracted_at: None,
+            })
+            .expect("annotation persists");
+
+        registry
+            .edit_annotation_geometry(
+                "org-a",
+                "ann-1",
+                "user-editor",
+                "2026-04-30T00:00:00Z",
+                AnnotationGeometry::Polygon {
+                    coordinates: vec![
+                        GeoPoint {
+                            longitude: -96.0,
+                            latitude: 41.0,
+                        },
+                        GeoPoint {
+                            longitude: -95.9,
+                            latitude: 41.0,
+                        },
+                        GeoPoint {
+                            longitude: -95.9,
+                            latitude: 41.1,
+                        },
+                        GeoPoint {
+                            longitude: -96.0,
+                            latitude: 41.0,
+                        },
+                    ],
+                },
+            )
+            .expect("annotation edit persists");
+
+        let history = registry.annotation_history("org-a", "ann-1");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].change_type, AnnotationChangeType::Created);
+        assert!(history[0].before.is_none());
+        assert!(matches!(
+            history[0].after.as_ref().map(|record| &record.geometry),
+            Some(AnnotationGeometry::Point { .. })
+        ));
+        assert_eq!(history[1].change_type, AnnotationChangeType::Edited);
+        assert_eq!(history[1].actor_user_id, "user-editor");
+        assert!(matches!(
+            history[1].before.as_ref().map(|record| &record.geometry),
+            Some(AnnotationGeometry::Point { .. })
+        ));
+        assert!(matches!(
+            history[1].after.as_ref().map(|record| &record.geometry),
+            Some(AnnotationGeometry::Polygon { .. })
+        ));
+        assert_eq!(registry.annotations_for_org("org-a").len(), 1);
+        assert!(registry.annotations_for_org("org-b").is_empty());
+    }
+
+    #[test]
+    fn annotation_history_delete_is_rejected_and_retract_is_soft() {
+        let mut registry = AnnotationAuditRegistry::default();
+        registry
+            .create_annotation(AuditedAnnotationRecord {
+                annotation_id: "ann-1".to_string(),
+                field_id: "field-a".to_string(),
+                scene_id: None,
+                org_id: "org-a".to_string(),
+                author_user_id: "user-author".to_string(),
+                geometry: AnnotationGeometry::Point {
+                    coordinate: GeoPoint {
+                        longitude: -96.0,
+                        latitude: 41.0,
+                    },
+                },
+                created_at: "2026-05-01T00:00:00Z".to_string(),
+                retracted_at: None,
+            })
+            .expect("annotation persists");
+
+        let error = registry
+            .delete_annotation_history("org-a", "ann-1")
+            .expect_err("history hard delete is rejected");
+
+        assert_eq!(
+            error,
+            AnnotationPersistenceError::HistoryDeleteRejected {
+                annotation_id: "ann-1".to_string()
+            }
+        );
+
+        let retracted = registry
+            .retract_annotation("org-a", "ann-1", "user-editor", "2026-05-03T00:00:00Z")
+            .expect("soft retract persists");
+
+        assert_eq!(
+            retracted.retracted_at.as_deref(),
+            Some("2026-05-03T00:00:00Z")
+        );
+        let history = registry.annotation_history("org-a", "ann-1");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].change_type, AnnotationChangeType::Retracted);
     }
 
     #[test]
