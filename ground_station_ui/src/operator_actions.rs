@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 pub type SharedOperatorActionState = Arc<RwLock<OperatorActionState>>;
 pub type SharedMissionControlActionClient = Arc<dyn MissionControlActionClient>;
+pub type SharedOperatorActionAuditLog = Arc<RwLock<OperatorActionAuditLog>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -29,6 +30,8 @@ pub enum OperatorActionError {
     MissionControlNoAck { reason: String },
     #[error("mission_control action path is unavailable: {reason}")]
     MissionControlUnavailable { reason: String },
+    #[error("operator action audit write failed: {reason}")]
+    AuditWriteFailed { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +69,33 @@ pub struct MissionControlActionAck {
     pub acked_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorActionAuditResult {
+    Accepted,
+    Rejected,
+    TimedOut,
+    Disabled,
+    Unsupported,
+    Unavailable,
+    AuditFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorActionAuditRecord {
+    pub audit_id: Uuid,
+    pub operator_id: Uuid,
+    pub org_id: Uuid,
+    pub operator_role: MembershipRole,
+    pub action: OperatorActionKind,
+    pub target_mission_id: Uuid,
+    pub requested_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub result: OperatorActionAuditResult,
+    pub ack: Option<MissionControlActionAck>,
+    pub failure_reason: Option<String>,
+}
+
 pub trait MissionControlActionClient: Send + Sync {
     fn submit_operator_action(
         &self,
@@ -80,6 +110,12 @@ pub struct RejectingMissionControlActionClient;
 pub struct OperatorActionSubmission {
     pub request: MissionControlActionRequest,
     pub ack: MissionControlActionAck,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OperatorActionAuditLog {
+    records: Vec<OperatorActionAuditRecord>,
+    fail_next_write: Option<String>,
 }
 
 impl FromStr for OperatorActionKind {
@@ -209,6 +245,94 @@ impl MissionControlActionAck {
     }
 }
 
+impl OperatorActionAuditRecord {
+    pub fn from_ack(request: &MissionControlActionRequest, ack: &MissionControlActionAck) -> Self {
+        Self {
+            audit_id: Uuid::new_v4(),
+            operator_id: request.operator_id,
+            org_id: request.org_id,
+            operator_role: request.operator_role,
+            action: request.action,
+            target_mission_id: request.target_mission_id,
+            requested_at: request.requested_at,
+            completed_at: ack.acked_at,
+            result: match ack.status {
+                ActionAckStatus::Accepted => OperatorActionAuditResult::Accepted,
+                ActionAckStatus::Rejected => OperatorActionAuditResult::Rejected,
+                ActionAckStatus::TimedOut => OperatorActionAuditResult::TimedOut,
+            },
+            ack: Some(ack.clone()),
+            failure_reason: None,
+        }
+    }
+
+    pub fn from_error(
+        request: &MissionControlActionRequest,
+        error: &OperatorActionError,
+        completed_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            audit_id: Uuid::new_v4(),
+            operator_id: request.operator_id,
+            org_id: request.org_id,
+            operator_role: request.operator_role,
+            action: request.action,
+            target_mission_id: request.target_mission_id,
+            requested_at: request.requested_at,
+            completed_at,
+            result: match error {
+                OperatorActionError::SimulationLoopNotValidated => {
+                    OperatorActionAuditResult::Disabled
+                }
+                OperatorActionError::UnsupportedAction { .. } => {
+                    OperatorActionAuditResult::Unsupported
+                }
+                OperatorActionError::MissionControlRejected { .. } => {
+                    OperatorActionAuditResult::Rejected
+                }
+                OperatorActionError::MissionControlNoAck { .. } => {
+                    OperatorActionAuditResult::TimedOut
+                }
+                OperatorActionError::MissionControlUnavailable { .. } => {
+                    OperatorActionAuditResult::Unavailable
+                }
+                OperatorActionError::AuditWriteFailed { .. } => {
+                    OperatorActionAuditResult::AuditFailed
+                }
+            },
+            ack: None,
+            failure_reason: Some(error.to_string()),
+        }
+    }
+}
+
+impl OperatorActionAuditLog {
+    pub fn record(&mut self, record: OperatorActionAuditRecord) -> Result<(), OperatorActionError> {
+        if let Some(reason) = self.fail_next_write.take() {
+            return Err(OperatorActionError::AuditWriteFailed { reason });
+        }
+
+        self.records.push(record);
+        Ok(())
+    }
+
+    pub fn all_records(&self) -> Vec<OperatorActionAuditRecord> {
+        self.records.clone()
+    }
+
+    pub fn records_for_org(&self, org_id: Uuid) -> Vec<OperatorActionAuditRecord> {
+        self.records
+            .iter()
+            .filter(|record| record.org_id == org_id)
+            .cloned()
+            .collect()
+    }
+
+    pub fn fail_next_write(&mut self, reason: impl Into<String>) {
+        self.fail_next_write = Some(reason.into());
+    }
+}
+
 impl MissionControlActionClient for RejectingMissionControlActionClient {
     fn submit_operator_action(
         &self,
@@ -222,6 +346,12 @@ impl MissionControlActionClient for RejectingMissionControlActionClient {
 
 pub fn shared_operator_action_state(state: OperatorActionState) -> SharedOperatorActionState {
     Arc::new(RwLock::new(state))
+}
+
+pub fn shared_operator_action_audit_log(
+    log: OperatorActionAuditLog,
+) -> SharedOperatorActionAuditLog {
+    Arc::new(RwLock::new(log))
 }
 
 #[cfg(test)]
@@ -297,5 +427,117 @@ mod tests {
         assert_eq!(request.action, OperatorActionKind::Abort);
         assert_eq!(request.target_mission_id, mission_id);
         assert_eq!(request.requested_at, requested_at);
+    }
+
+    #[test]
+    fn audit_record_captures_request_and_ack_evidence() {
+        let principal = TenantPrincipal {
+            user_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            role: MembershipRole::Operator,
+        };
+        let mission_id = Uuid::new_v4();
+        let requested_at = Utc.with_ymd_and_hms(2026, 6, 12, 16, 5, 0).unwrap();
+        let acked_at = Utc.with_ymd_and_hms(2026, 6, 12, 16, 5, 1).unwrap();
+        let request = MissionControlActionRequest::new(
+            principal,
+            OperatorActionKind::Abort,
+            mission_id,
+            requested_at,
+        );
+        let ack = MissionControlActionAck::rejected(
+            OperatorActionKind::Abort,
+            mission_id,
+            "guardrail blocked abort mode",
+            acked_at,
+        );
+
+        let record = OperatorActionAuditRecord::from_ack(&request, &ack);
+
+        assert_eq!(record.operator_id, principal.user_id);
+        assert_eq!(record.org_id, principal.org_id);
+        assert_eq!(record.operator_role, MembershipRole::Operator);
+        assert_eq!(record.action, OperatorActionKind::Abort);
+        assert_eq!(record.target_mission_id, mission_id);
+        assert_eq!(record.requested_at, requested_at);
+        assert_eq!(record.completed_at, acked_at);
+        assert_eq!(record.result, OperatorActionAuditResult::Rejected);
+        assert_eq!(record.ack, Some(ack));
+        assert_eq!(record.failure_reason, None);
+    }
+
+    #[test]
+    fn audit_log_appends_records_and_filters_by_org() {
+        let org_a = Uuid::new_v4();
+        let org_b = Uuid::new_v4();
+        let record_a = OperatorActionAuditRecord::from_error(
+            &MissionControlActionRequest {
+                operator_id: Uuid::new_v4(),
+                org_id: org_a,
+                operator_role: MembershipRole::Operator,
+                action: OperatorActionKind::Pause,
+                target_mission_id: Uuid::new_v4(),
+                requested_at: Utc.with_ymd_and_hms(2026, 6, 12, 16, 7, 0).unwrap(),
+            },
+            &OperatorActionError::MissionControlNoAck {
+                reason: "ack deadline elapsed".to_string(),
+            },
+            Utc.with_ymd_and_hms(2026, 6, 12, 16, 7, 5).unwrap(),
+        );
+        let record_b = OperatorActionAuditRecord::from_error(
+            &MissionControlActionRequest {
+                operator_id: Uuid::new_v4(),
+                org_id: org_b,
+                operator_role: MembershipRole::Operator,
+                action: OperatorActionKind::Dispatch,
+                target_mission_id: Uuid::new_v4(),
+                requested_at: Utc.with_ymd_and_hms(2026, 6, 12, 16, 8, 0).unwrap(),
+            },
+            &OperatorActionError::MissionControlUnavailable {
+                reason: "bridge offline".to_string(),
+            },
+            Utc.with_ymd_and_hms(2026, 6, 12, 16, 8, 3).unwrap(),
+        );
+        let mut log = OperatorActionAuditLog::default();
+
+        log.record(record_a.clone()).unwrap();
+        log.record(record_b.clone()).unwrap();
+
+        assert_eq!(log.all_records(), vec![record_a.clone(), record_b]);
+        assert_eq!(log.records_for_org(org_a), vec![record_a]);
+    }
+
+    #[test]
+    fn audit_log_write_failure_is_reason_coded() {
+        let principal = TenantPrincipal {
+            user_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            role: MembershipRole::Operator,
+        };
+        let mission_id = Uuid::new_v4();
+        let requested_at = Utc.with_ymd_and_hms(2026, 6, 12, 16, 10, 0).unwrap();
+        let request = MissionControlActionRequest::new(
+            principal,
+            OperatorActionKind::ReturnToHome,
+            mission_id,
+            requested_at,
+        );
+        let record = OperatorActionAuditRecord::from_error(
+            &request,
+            &OperatorActionError::MissionControlNoAck {
+                reason: "ack deadline elapsed".to_string(),
+            },
+            requested_at,
+        );
+        let mut log = OperatorActionAuditLog::default();
+        log.fail_next_write("audit storage unavailable");
+
+        assert_eq!(
+            log.record(record),
+            Err(OperatorActionError::AuditWriteFailed {
+                reason: "audit storage unavailable".to_string()
+            })
+        );
+        assert!(log.all_records().is_empty());
     }
 }

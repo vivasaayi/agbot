@@ -1,13 +1,15 @@
 use crate::{
     operator_actions::{
-        shared_operator_action_state, ActionAckStatus, MissionControlActionAck,
-        MissionControlActionRequest, OperatorActionError, OperatorActionKind, OperatorActionState,
+        shared_operator_action_audit_log, shared_operator_action_state, ActionAckStatus,
+        MissionControlActionAck, MissionControlActionRequest, OperatorActionAuditLog,
+        OperatorActionAuditRecord, OperatorActionError, OperatorActionKind, OperatorActionState,
         RejectingMissionControlActionClient, SharedMissionControlActionClient,
-        SharedOperatorActionState,
+        SharedOperatorActionAuditLog, SharedOperatorActionState,
     },
     operator_session::{
-        shared_operator_session_registry, OperatorLoginRequest, OperatorSession,
-        OperatorSessionError, OperatorSessionRegistry, SharedOperatorSessionRegistry,
+        shared_operator_session_registry, AuthorizedOperatorAction, OperatorLoginRequest,
+        OperatorSession, OperatorSessionError, OperatorSessionRegistry,
+        SharedOperatorSessionRegistry,
     },
     CaptureEvent, LinkStateSnapshot, MapRenderState, SharedLinkState, SharedMessageDispatchState,
     TelemetryFreshnessSnapshot, TelemetryTileSnapshot,
@@ -33,6 +35,7 @@ pub struct WebServer {
     operator_sessions: SharedOperatorSessionRegistry,
     operator_action_state: SharedOperatorActionState,
     mission_control_actions: SharedMissionControlActionClient,
+    operator_action_audit_log: SharedOperatorActionAuditLog,
 }
 
 #[derive(Clone)]
@@ -42,6 +45,7 @@ struct WebServerState {
     operator_sessions: SharedOperatorSessionRegistry,
     operator_action_state: SharedOperatorActionState,
     mission_control_actions: SharedMissionControlActionClient,
+    operator_action_audit_log: SharedOperatorActionAuditLog,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +76,11 @@ struct OperatorActionResponse {
     status: &'static str,
     message: String,
     ack: Option<MissionControlActionAck>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OperatorActionAuditResponse {
+    records: Vec<OperatorActionAuditRecord>,
 }
 
 impl WebServer {
@@ -114,6 +123,27 @@ impl WebServer {
         operator_action_state: SharedOperatorActionState,
         mission_control_actions: SharedMissionControlActionClient,
     ) -> AgroResult<Self> {
+        Self::new_with_operator_controls_and_audit(
+            config,
+            link_state,
+            dispatch_state,
+            operator_sessions,
+            operator_action_state,
+            mission_control_actions,
+            shared_operator_action_audit_log(OperatorActionAuditLog::default()),
+        )
+        .await
+    }
+
+    pub async fn new_with_operator_controls_and_audit(
+        config: Arc<AgroConfig>,
+        link_state: SharedLinkState,
+        dispatch_state: SharedMessageDispatchState,
+        operator_sessions: SharedOperatorSessionRegistry,
+        operator_action_state: SharedOperatorActionState,
+        mission_control_actions: SharedMissionControlActionClient,
+        operator_action_audit_log: SharedOperatorActionAuditLog,
+    ) -> AgroResult<Self> {
         Ok(Self {
             config,
             link_state,
@@ -121,6 +151,7 @@ impl WebServer {
             operator_sessions,
             operator_action_state,
             mission_control_actions,
+            operator_action_audit_log,
         })
     }
 
@@ -131,6 +162,7 @@ impl WebServer {
             operator_sessions: self.operator_sessions.clone(),
             operator_action_state: self.operator_action_state.clone(),
             mission_control_actions: self.mission_control_actions.clone(),
+            operator_action_audit_log: self.operator_action_audit_log.clone(),
         });
 
         let bind_addr = "0.0.0.0:8081"; // Different port from mission control
@@ -156,6 +188,7 @@ fn build_router_with_state(state: WebServerState) -> Router {
             "/api/operator/actions/session-check",
             post(operator_action_session_check),
         )
+        .route("/api/operator/actions/audit", get(operator_action_audit))
         .route(
             "/api/operator/actions/:action",
             post(submit_operator_action),
@@ -199,13 +232,7 @@ async fn operator_action_session_check(
     State(state): State<WebServerState>,
     headers: HeaderMap,
 ) -> Result<Json<OperatorActionGateResponse>, (StatusCode, String)> {
-    let token = bearer_token(&headers)
-        .ok_or(OperatorSessionError::MissingSession)
-        .map_err(operator_session_error_response)?;
-    let sessions = state.operator_sessions.read().await;
-    let authorized = sessions
-        .authorize_action_at(token, chrono::Utc::now())
-        .map_err(operator_session_error_response)?;
+    let authorized = authorize_operator_action(&state, &headers).await?;
 
     Ok(Json(OperatorActionGateResponse {
         authorized: true,
@@ -216,21 +243,27 @@ async fn operator_action_session_check(
     }))
 }
 
+async fn operator_action_audit(
+    State(state): State<WebServerState>,
+    headers: HeaderMap,
+) -> Result<Json<OperatorActionAuditResponse>, (StatusCode, String)> {
+    let authorized = authorize_operator_action(&state, &headers).await?;
+    let records = state
+        .operator_action_audit_log
+        .read()
+        .await
+        .records_for_org(authorized.principal.org_id);
+
+    Ok(Json(OperatorActionAuditResponse { records }))
+}
+
 async fn submit_operator_action(
     State(state): State<WebServerState>,
     Path(action): Path<String>,
     headers: HeaderMap,
     Json(body): Json<OperatorActionRequestBody>,
 ) -> Result<(StatusCode, Json<OperatorActionResponse>), (StatusCode, String)> {
-    let token = bearer_token(&headers)
-        .ok_or(OperatorSessionError::MissingSession)
-        .map_err(operator_session_error_response)?;
-    let authorized = {
-        let sessions = state.operator_sessions.read().await;
-        sessions
-            .authorize_action_at(token, chrono::Utc::now())
-            .map_err(operator_session_error_response)?
-    };
+    let authorized = authorize_operator_action(&state, &headers).await?;
     let action = action
         .parse::<OperatorActionKind>()
         .map_err(operator_action_error_response)?;
@@ -252,12 +285,38 @@ async fn submit_operator_action(
     );
     let result = state
         .mission_control_actions
-        .submit_operator_action(request);
+        .submit_operator_action(request.clone());
+
+    let audit_record = match &result {
+        Ok(ack) => OperatorActionAuditRecord::from_ack(&request, ack),
+        Err(error) => OperatorActionAuditRecord::from_error(&request, error, chrono::Utc::now()),
+    };
+    if let Err(error) = state
+        .operator_action_audit_log
+        .write()
+        .await
+        .record(audit_record)
+    {
+        return Ok(operator_action_status_response(error, None));
+    }
 
     Ok(match result {
         Ok(ack) => operator_action_ack_response(ack),
         Err(error) => operator_action_status_response(error, None),
     })
+}
+
+async fn authorize_operator_action(
+    state: &WebServerState,
+    headers: &HeaderMap,
+) -> Result<AuthorizedOperatorAction, (StatusCode, String)> {
+    let token = bearer_token(headers)
+        .ok_or(OperatorSessionError::MissingSession)
+        .map_err(operator_session_error_response)?;
+    let sessions = state.operator_sessions.read().await;
+    sessions
+        .authorize_action_at(token, chrono::Utc::now())
+        .map_err(operator_session_error_response)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -289,6 +348,7 @@ fn operator_action_error_response(error: OperatorActionError) -> (StatusCode, St
         OperatorActionError::MissionControlRejected { .. } => StatusCode::CONFLICT,
         OperatorActionError::MissionControlNoAck { .. } => StatusCode::GATEWAY_TIMEOUT,
         OperatorActionError::MissionControlUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        OperatorActionError::AuditWriteFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, error.to_string())
 }
@@ -333,6 +393,9 @@ fn operator_action_status_response(
         }
         OperatorActionError::MissionControlUnavailable { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+        }
+        OperatorActionError::AuditWriteFailed { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "audit_failed")
         }
     };
     (
@@ -1164,7 +1227,8 @@ mod tests {
         let app = build_router_with_state(state);
         let token = login_token(app.clone(), "secret").await;
 
-        let (status, body) = submit_action(app, &token, "abort", mission_id).await;
+        let (status, body) = submit_action(app.clone(), &token, "abort", mission_id).await;
+        let audit_body = fetch_action_audit(app, &token).await;
 
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
@@ -1174,6 +1238,13 @@ mod tests {
         assert_eq!(
             body.get("status").and_then(|value| value.as_str()),
             Some("disabled")
+        );
+        assert_eq!(
+            audit_body
+                .get("records")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
         );
         assert!(client.recorded_requests().is_empty());
     }
@@ -1199,7 +1270,8 @@ mod tests {
         let app = build_router_with_state(state);
         let token = login_token(app.clone(), "secret").await;
 
-        let (status, body) = submit_action(app, &token, "abort", mission_id).await;
+        let (status, body) = submit_action(app.clone(), &token, "abort", mission_id).await;
+        let audit_body = fetch_action_audit(app, &token).await;
 
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
@@ -1208,6 +1280,12 @@ mod tests {
         );
         assert_eq!(
             body.pointer("/ack/status").and_then(|value| value.as_str()),
+            Some("rejected")
+        );
+        assert_eq!(
+            audit_body
+                .pointer("/records/0/result")
+                .and_then(|value| value.as_str()),
             Some("rejected")
         );
         assert_eq!(client.recorded_requests().len(), 1);
@@ -1246,6 +1324,104 @@ mod tests {
         assert_eq!(client.recorded_requests().len(), 1);
     }
 
+    #[tokio::test]
+    async fn accepted_operator_action_is_queryable_from_audit_log() {
+        let mission_id = Uuid::new_v4();
+        let audit_log = shared_operator_action_audit_log(OperatorActionAuditLog::default());
+        let client = Arc::new(RecordingMissionControlActionClient::new(vec![Ok(
+            MissionControlActionAck::accepted(
+                OperatorActionKind::ReturnToHome,
+                mission_id,
+                "rth guardrails accepted",
+                chrono::Utc::now(),
+            ),
+        )]));
+        let (state, principal) = test_state_with_operator_audit(
+            MembershipRole::Operator,
+            "secret",
+            15,
+            validated_operator_action_state(),
+            client,
+            audit_log,
+        );
+        let app = build_router_with_state(state);
+        let token = login_token(app.clone(), "secret").await;
+
+        let (status, action_body) =
+            submit_action(app.clone(), &token, "return-to-home", mission_id).await;
+        let audit_body = fetch_action_audit(app, &token).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            action_body.get("success").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            audit_body
+                .pointer("/records/0/operator_id")
+                .and_then(|value| value.as_str()),
+            Some(principal.user_id.to_string().as_str())
+        );
+        assert_eq!(
+            audit_body
+                .pointer("/records/0/action")
+                .and_then(|value| value.as_str()),
+            Some("return-to-home")
+        );
+        assert_eq!(
+            audit_body
+                .pointer("/records/0/result")
+                .and_then(|value| value.as_str()),
+            Some("accepted")
+        );
+        assert_eq!(
+            audit_body
+                .pointer("/records/0/target_mission_id")
+                .and_then(|value| value.as_str()),
+            Some(mission_id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_write_failure_blocks_success_response() {
+        let mission_id = Uuid::new_v4();
+        let mut audit = OperatorActionAuditLog::default();
+        audit.fail_next_write("audit storage unavailable");
+        let audit_log = shared_operator_action_audit_log(audit);
+        let client = Arc::new(RecordingMissionControlActionClient::new(vec![Ok(
+            MissionControlActionAck::accepted(
+                OperatorActionKind::Abort,
+                mission_id,
+                "abort guardrails accepted",
+                chrono::Utc::now(),
+            ),
+        )]));
+        let (state, _) = test_state_with_operator_audit(
+            MembershipRole::Operator,
+            "secret",
+            15,
+            validated_operator_action_state(),
+            client.clone(),
+            audit_log,
+        );
+        let app = build_router_with_state(state);
+        let token = login_token(app.clone(), "secret").await;
+
+        let (status, body) = submit_action(app, &token, "abort", mission_id).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body.get("success").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            body.get("status").and_then(|value| value.as_str()),
+            Some("audit_failed")
+        );
+        assert!(body.get("ack").is_some_and(|value| value.is_null()));
+        assert_eq!(client.recorded_requests().len(), 1);
+    }
+
     fn test_state(
         role: MembershipRole,
         credential: &str,
@@ -1267,6 +1443,24 @@ mod tests {
         operator_action_state: SharedOperatorActionState,
         mission_control_actions: SharedMissionControlActionClient,
     ) -> (WebServerState, TenantPrincipal) {
+        test_state_with_operator_audit(
+            role,
+            credential,
+            session_minutes,
+            operator_action_state,
+            mission_control_actions,
+            shared_operator_action_audit_log(OperatorActionAuditLog::default()),
+        )
+    }
+
+    fn test_state_with_operator_audit(
+        role: MembershipRole,
+        credential: &str,
+        session_minutes: i64,
+        operator_action_state: SharedOperatorActionState,
+        mission_control_actions: SharedMissionControlActionClient,
+        operator_action_audit_log: SharedOperatorActionAuditLog,
+    ) -> (WebServerState, TenantPrincipal) {
         let principal = TenantPrincipal {
             user_id: Uuid::new_v4(),
             org_id: Uuid::new_v4(),
@@ -1287,6 +1481,7 @@ mod tests {
                 operator_sessions: shared_operator_session_registry(sessions),
                 operator_action_state,
                 mission_control_actions,
+                operator_action_audit_log,
             },
             principal,
         )
@@ -1360,6 +1555,25 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&body).expect("action response should decode");
         (status, json)
+    }
+
+    async fn fetch_action_audit(app: Router, token: &str) -> serde_json::Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/operator/actions/audit")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle audit query");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body should read");
+        serde_json::from_slice(&body).expect("audit response should decode")
     }
 
     struct RecordingMissionControlActionClient {

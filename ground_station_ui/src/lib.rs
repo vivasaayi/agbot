@@ -35,11 +35,12 @@ pub use message_dispatch::{
     TelemetryFreshnessState, TelemetryTileSnapshot, TelemetryTileValues,
 };
 pub use operator_actions::{
-    shared_operator_action_state, ActionAckStatus, MissionControlActionAck,
-    MissionControlActionClient, MissionControlActionRequest, OperatorActionError,
-    OperatorActionKind, OperatorActionState, OperatorActionSubmission,
+    shared_operator_action_audit_log, shared_operator_action_state, ActionAckStatus,
+    MissionControlActionAck, MissionControlActionClient, MissionControlActionRequest,
+    OperatorActionAuditLog, OperatorActionAuditRecord, OperatorActionAuditResult,
+    OperatorActionError, OperatorActionKind, OperatorActionState, OperatorActionSubmission,
     RejectingMissionControlActionClient, SharedMissionControlActionClient,
-    SharedOperatorActionState,
+    SharedOperatorActionAuditLog, SharedOperatorActionState,
 };
 pub use operator_session::{
     shared_operator_session_registry, AuthorizedOperatorAction, OperatorCredential,
