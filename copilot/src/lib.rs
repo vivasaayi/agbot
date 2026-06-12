@@ -128,6 +128,52 @@ pub struct GroundedCopilotTurn {
     pub answer: Option<GroundedCopilotAnswer>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceFreshnessStatus {
+    Fresh,
+    Stale,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceFreshnessRecord {
+    pub evidence_id: String,
+    pub status: EvidenceFreshnessStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopilotConfidenceLevel {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UncertaintyReasonCode {
+    FullyCitedFreshEvidence,
+    PartialEvidenceCoverage,
+    StaleEvidence,
+    MissingFreshness,
+    ModelConfidenceLow,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotUncertaintyMarker {
+    pub level: CopilotConfidenceLevel,
+    pub coverage: f64,
+    pub confidence: f64,
+    pub reason_codes: Vec<UncertaintyReasonCode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UncertaintyAnnotatedAnswer {
+    pub answer: GroundedCopilotAnswer,
+    pub uncertainty: CopilotUncertaintyMarker,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeterministicAnswerFixture {
     pub question: String,
@@ -314,6 +360,71 @@ pub fn answer_grounded_question(
         refusal: None,
         answer: Some(grounded),
     })
+}
+
+pub fn annotate_answer_uncertainty(
+    answer: GroundedCopilotAnswer,
+    freshness_records: Vec<EvidenceFreshnessRecord>,
+) -> UncertaintyAnnotatedAnswer {
+    let claim_count = answer.claims.len();
+    let cited_claim_count = answer
+        .claims
+        .iter()
+        .filter(|claim| !claim.cited_evidence_ids.is_empty())
+        .count();
+    let coverage = if claim_count == 0 {
+        0.0
+    } else {
+        cited_claim_count as f64 / claim_count as f64
+    };
+    let freshness_by_evidence = freshness_records
+        .into_iter()
+        .filter_map(|record| normalize_text(record.evidence_id).map(|id| (id, record.status)))
+        .collect::<BTreeMap<_, _>>();
+    let mut reason_codes = BTreeSet::new();
+    let mut has_stale = false;
+    let mut has_missing_freshness = false;
+
+    if coverage < 1.0 {
+        reason_codes.insert(UncertaintyReasonCode::PartialEvidenceCoverage);
+    }
+
+    for evidence_id in &answer.cited_evidence_ids {
+        match freshness_by_evidence.get(evidence_id) {
+            Some(EvidenceFreshnessStatus::Fresh) => {}
+            Some(EvidenceFreshnessStatus::Stale) => {
+                has_stale = true;
+                reason_codes.insert(UncertaintyReasonCode::StaleEvidence);
+            }
+            Some(EvidenceFreshnessStatus::Unknown) | None => {
+                has_missing_freshness = true;
+                reason_codes.insert(UncertaintyReasonCode::MissingFreshness);
+            }
+        }
+    }
+
+    if answer.confidence < 0.75 {
+        reason_codes.insert(UncertaintyReasonCode::ModelConfidenceLow);
+    }
+
+    let level = if coverage < 1.0 || has_stale || has_missing_freshness || answer.confidence < 0.5 {
+        CopilotConfidenceLevel::Low
+    } else if answer.confidence < 0.75 {
+        CopilotConfidenceLevel::Medium
+    } else {
+        reason_codes.insert(UncertaintyReasonCode::FullyCitedFreshEvidence);
+        CopilotConfidenceLevel::High
+    };
+
+    UncertaintyAnnotatedAnswer {
+        uncertainty: CopilotUncertaintyMarker {
+            level,
+            coverage,
+            confidence: answer.confidence,
+            reason_codes: reason_codes.into_iter().collect(),
+        },
+        answer,
+    }
 }
 
 pub fn post_check_grounded_answer(
@@ -687,12 +798,14 @@ mod tests {
     use std::{cell::Cell, collections::BTreeSet};
 
     use super::{
-        answer_grounded_question, build_evidence_retrieval_index, post_check_grounded_answer,
-        CopilotAnswer, CopilotAnswerClaim, CopilotAnswerRequest, CopilotGroundingError,
-        CopilotIndexError, CopilotModel, CopilotModelError, CopilotRefusalReason,
-        DeterministicAnswerFixture, DeterministicCopilotModel, EvidenceCandidate,
-        EvidenceIndexEntry, EvidenceKind, EvidenceRejectionReason, GroundedCopilotQuestionRequest,
-        LedgerEvidenceResolver, UnavailableCopilotModel,
+        annotate_answer_uncertainty, answer_grounded_question, build_evidence_retrieval_index,
+        post_check_grounded_answer, CopilotAnswer, CopilotAnswerClaim, CopilotAnswerRequest,
+        CopilotConfidenceLevel, CopilotGroundingError, CopilotIndexError, CopilotModel,
+        CopilotModelError, CopilotRefusalReason, DeterministicAnswerFixture,
+        DeterministicCopilotModel, EvidenceCandidate, EvidenceFreshnessRecord,
+        EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind, EvidenceRejectionReason,
+        GroundedCopilotAnswer, GroundedCopilotQuestionRequest, LedgerEvidenceResolver,
+        UnavailableCopilotModel, UncertaintyReasonCode,
     };
 
     struct FixtureLedger {
@@ -1075,6 +1188,74 @@ mod tests {
         assert!(model.was_called());
     }
 
+    #[test]
+    fn uncertainty_marker_is_high_for_fully_cited_fresh_answer() {
+        let annotated = annotate_answer_uncertainty(
+            grounded_answer_with_claims(vec![CopilotAnswerClaim {
+                text: "The northeast zone is stressed.".to_string(),
+                cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+            }]),
+            vec![freshness(
+                "evidence-ndvi-001",
+                EvidenceFreshnessStatus::Fresh,
+            )],
+        );
+
+        assert_eq!(annotated.uncertainty.level, CopilotConfidenceLevel::High);
+        assert_eq!(annotated.uncertainty.coverage, 1.0);
+        assert!(annotated
+            .uncertainty
+            .reason_codes
+            .contains(&UncertaintyReasonCode::FullyCitedFreshEvidence));
+    }
+
+    #[test]
+    fn uncertainty_marker_is_low_for_stale_evidence() {
+        let annotated = annotate_answer_uncertainty(
+            grounded_answer_with_claims(vec![CopilotAnswerClaim {
+                text: "The northeast zone is stressed.".to_string(),
+                cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+            }]),
+            vec![freshness(
+                "evidence-ndvi-001",
+                EvidenceFreshnessStatus::Stale,
+            )],
+        );
+
+        assert_eq!(annotated.uncertainty.level, CopilotConfidenceLevel::Low);
+        assert!(annotated
+            .uncertainty
+            .reason_codes
+            .contains(&UncertaintyReasonCode::StaleEvidence));
+    }
+
+    #[test]
+    fn uncertainty_marker_is_low_for_partial_claim_coverage() {
+        let annotated = annotate_answer_uncertainty(
+            grounded_answer_with_claims(vec![
+                CopilotAnswerClaim {
+                    text: "The northeast zone is stressed.".to_string(),
+                    cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+                },
+                CopilotAnswerClaim {
+                    text: "Potassium deficiency is likely.".to_string(),
+                    cited_evidence_ids: vec![],
+                },
+            ]),
+            vec![freshness(
+                "evidence-ndvi-001",
+                EvidenceFreshnessStatus::Fresh,
+            )],
+        );
+
+        assert_eq!(annotated.uncertainty.level, CopilotConfidenceLevel::Low);
+        assert_eq!(annotated.uncertainty.coverage, 0.5);
+        assert!(annotated
+            .uncertainty
+            .reason_codes
+            .contains(&UncertaintyReasonCode::PartialEvidenceCoverage));
+    }
+
     fn retrieved_evidence(evidence_id: &str) -> EvidenceIndexEntry {
         EvidenceIndexEntry {
             evidence_id: evidence_id.to_string(),
@@ -1084,6 +1265,34 @@ mod tests {
             zone_ref: Some("zone-ne".to_string()),
             ledger_ref: format!("ledger:30:{evidence_id}"),
             summary: "NDVI in the northeast zone dropped below threshold.".to_string(),
+        }
+    }
+
+    fn grounded_answer_with_claims(claims: Vec<CopilotAnswerClaim>) -> GroundedCopilotAnswer {
+        GroundedCopilotAnswer {
+            text: claims
+                .iter()
+                .map(|claim| claim.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            cited_evidence_ids: claims
+                .iter()
+                .flat_map(|claim| claim.cited_evidence_ids.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            claims,
+            confidence: 0.82,
+            model_provider: "test-double".to_string(),
+            model_id: "fixture-rag".to_string(),
+            model_version: "2026-06-12".to_string(),
+        }
+    }
+
+    fn freshness(evidence_id: &str, status: EvidenceFreshnessStatus) -> EvidenceFreshnessRecord {
+        EvidenceFreshnessRecord {
+            evidence_id: evidence_id.to_string(),
+            status,
         }
     }
 
