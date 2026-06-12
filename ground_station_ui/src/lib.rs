@@ -12,6 +12,7 @@ pub mod cli_interface;
 pub mod link_client;
 pub mod map_state;
 pub mod message_dispatch;
+pub mod operator_session;
 pub mod web_server;
 
 pub use link_client::{
@@ -31,6 +32,11 @@ pub use message_dispatch::{
     DispatchedMessage, MessageDispatchState, MessageRoute, MissionStatusSnapshot,
     SharedMessageDispatchState, SystemStatusSnapshot, TelemetryFreshnessSnapshot,
     TelemetryFreshnessState, TelemetryTileSnapshot, TelemetryTileValues,
+};
+pub use operator_session::{
+    shared_operator_session_registry, AuthorizedOperatorAction, OperatorCredential,
+    OperatorLoginRequest, OperatorSession, OperatorSessionConfig, OperatorSessionError,
+    OperatorSessionRegistry, SharedOperatorSessionRegistry,
 };
 
 #[derive(Parser, Debug)]

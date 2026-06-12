@@ -1,9 +1,20 @@
 use crate::{
+    operator_session::{
+        shared_operator_session_registry, OperatorLoginRequest, OperatorSession,
+        OperatorSessionError, OperatorSessionRegistry, SharedOperatorSessionRegistry,
+    },
     CaptureEvent, LinkStateSnapshot, MapRenderState, SharedLinkState, SharedMessageDispatchState,
     TelemetryFreshnessSnapshot, TelemetryTileSnapshot,
 };
-use axum::{extract::State, response::Html, Json};
+use axum::{
+    extract::State,
+    http::{header, HeaderMap, StatusCode},
+    response::Html,
+    routing::{get, post},
+    Json, Router,
+};
 use serde::Serialize;
+use shared::control_plane::MembershipRole;
 use shared::{config::AgroConfig, AgroResult};
 use std::sync::Arc;
 use tracing::info;
@@ -13,12 +24,14 @@ pub struct WebServer {
     config: Arc<AgroConfig>,
     link_state: SharedLinkState,
     dispatch_state: SharedMessageDispatchState,
+    operator_sessions: SharedOperatorSessionRegistry,
 }
 
 #[derive(Clone)]
 struct WebServerState {
     link_state: SharedLinkState,
     dispatch_state: SharedMessageDispatchState,
+    operator_sessions: SharedOperatorSessionRegistry,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,35 +42,50 @@ struct DispatchStateResponse {
     capture_events: Vec<CaptureEvent>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct OperatorActionGateResponse {
+    authorized: bool,
+    operator_id: uuid::Uuid,
+    org_id: uuid::Uuid,
+    role: MembershipRole,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl WebServer {
     pub async fn new(
         config: Arc<AgroConfig>,
         link_state: SharedLinkState,
         dispatch_state: SharedMessageDispatchState,
     ) -> AgroResult<Self> {
+        Self::new_with_operator_sessions(
+            config,
+            link_state,
+            dispatch_state,
+            shared_operator_session_registry(OperatorSessionRegistry::default()),
+        )
+        .await
+    }
+
+    pub async fn new_with_operator_sessions(
+        config: Arc<AgroConfig>,
+        link_state: SharedLinkState,
+        dispatch_state: SharedMessageDispatchState,
+        operator_sessions: SharedOperatorSessionRegistry,
+    ) -> AgroResult<Self> {
         Ok(Self {
             config,
             link_state,
             dispatch_state,
+            operator_sessions,
         })
     }
 
     pub async fn run(&self) -> AgroResult<()> {
-        use axum::{routing::get, Router};
-        use tower_http::services::ServeDir;
-
-        let app = Router::new()
-            .route("/", get(dashboard_page))
-            .route("/api/link-state", get(link_state))
-            .route("/api/dispatch-state", get(dispatch_state))
-            .route("/api/map-state", get(map_state))
-            .route("/telemetry", get(telemetry_page))
-            .route("/maps", get(maps_page))
-            .nest_service("/static", ServeDir::new("static"))
-            .with_state(WebServerState {
-                link_state: self.link_state.clone(),
-                dispatch_state: self.dispatch_state.clone(),
-            });
+        let app = build_router_with_state(WebServerState {
+            link_state: self.link_state.clone(),
+            dispatch_state: self.dispatch_state.clone(),
+            operator_sessions: self.operator_sessions.clone(),
+        });
 
         let bind_addr = "0.0.0.0:8081"; // Different port from mission control
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -67,6 +95,25 @@ impl WebServer {
 
         Ok(())
     }
+}
+
+fn build_router_with_state(state: WebServerState) -> Router {
+    use tower_http::services::ServeDir;
+
+    Router::new()
+        .route("/", get(dashboard_page))
+        .route("/api/link-state", get(link_state))
+        .route("/api/dispatch-state", get(dispatch_state))
+        .route("/api/map-state", get(map_state))
+        .route("/api/operator/login", post(operator_login))
+        .route(
+            "/api/operator/actions/session-check",
+            post(operator_action_session_check),
+        )
+        .route("/telemetry", get(telemetry_page))
+        .route("/maps", get(maps_page))
+        .nest_service("/static", ServeDir::new("static"))
+        .with_state(state)
 }
 
 async fn link_state(State(state): State<WebServerState>) -> Json<LinkStateSnapshot> {
@@ -85,6 +132,60 @@ async fn dispatch_state(State(state): State<WebServerState>) -> Json<DispatchSta
 
 async fn map_state(State(state): State<WebServerState>) -> Json<MapRenderState> {
     Json(state.dispatch_state.read().await.map_render_state())
+}
+
+async fn operator_login(
+    State(state): State<WebServerState>,
+    Json(request): Json<OperatorLoginRequest>,
+) -> Result<Json<OperatorSession>, (StatusCode, String)> {
+    let mut sessions = state.operator_sessions.write().await;
+    sessions
+        .login_at(request, chrono::Utc::now())
+        .map(Json)
+        .map_err(operator_session_error_response)
+}
+
+async fn operator_action_session_check(
+    State(state): State<WebServerState>,
+    headers: HeaderMap,
+) -> Result<Json<OperatorActionGateResponse>, (StatusCode, String)> {
+    let token = bearer_token(&headers)
+        .ok_or(OperatorSessionError::MissingSession)
+        .map_err(operator_session_error_response)?;
+    let sessions = state.operator_sessions.read().await;
+    let authorized = sessions
+        .authorize_action_at(token, chrono::Utc::now())
+        .map_err(operator_session_error_response)?;
+
+    Ok(Json(OperatorActionGateResponse {
+        authorized: true,
+        operator_id: authorized.principal.user_id,
+        org_id: authorized.principal.org_id,
+        role: authorized.principal.role,
+        expires_at: authorized.expires_at,
+    }))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .trim()
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+fn operator_session_error_response(error: OperatorSessionError) -> (StatusCode, String) {
+    let status = match error {
+        OperatorSessionError::RoleNotAuthorized => StatusCode::FORBIDDEN,
+        OperatorSessionError::InvalidCredentials
+        | OperatorSessionError::MissingSession
+        | OperatorSessionError::SessionNotFound
+        | OperatorSessionError::SessionExpired => StatusCode::UNAUTHORIZED,
+    };
+    (status, error.to_string())
 }
 
 async fn dashboard_page() -> Html<&'static str> {
@@ -675,6 +776,192 @@ async fn maps_page() -> Html<&'static str> {
     </script>
 </body>
 </html>
-    "#,
+"#,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        operator_session::{
+            shared_operator_session_registry, OperatorCredential, OperatorSessionConfig,
+            OperatorSessionRegistry,
+        },
+        shared_link_state, shared_message_dispatch_state, ReconnectPolicy,
+    };
+    use axum::{
+        body::{to_bytes, Body},
+        http::{header, Request, StatusCode},
+    };
+    use serde_json::json;
+    use shared::control_plane::{MembershipRole, TenantPrincipal};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn login_establishes_session_and_action_gate_accepts_bearer_token() {
+        let (state, principal) = test_state(MembershipRole::Operator, "secret", 15);
+        let app = build_router_with_state(state);
+
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/operator/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "email": "ops@example.com",
+                            "credential": "secret"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle login");
+        assert_eq!(login_response.status(), StatusCode::OK);
+        let body = to_bytes(login_response.into_body(), 64 * 1024)
+            .await
+            .expect("body should read");
+        let login_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("login response should decode");
+        let token = login_json
+            .get("session_token")
+            .and_then(|value| value.as_str())
+            .expect("login should return a session token");
+
+        let action_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/operator/actions/session-check")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle action gate");
+        assert_eq!(action_response.status(), StatusCode::OK);
+        let body = to_bytes(action_response.into_body(), 64 * 1024)
+            .await
+            .expect("body should read");
+        let action_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("action response should decode");
+        assert_eq!(
+            action_json
+                .get("authorized")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            action_json
+                .get("operator_id")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned),
+            Some(principal.user_id.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn action_gate_rejects_missing_session_without_dispatching() {
+        let (state, _) = test_state(MembershipRole::Operator, "secret", 15);
+        let dispatch_state = state.dispatch_state.clone();
+        let app = build_router_with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/operator/actions/session-check")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle action gate");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let dispatch = dispatch_state.read().await;
+        assert!(dispatch.mission_statuses.is_empty());
+        assert!(dispatch.system_statuses.is_empty());
+        assert_eq!(dispatch.malformed_frames, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_rejected_by_action_gate() {
+        let (state, _) = test_state(MembershipRole::Operator, "secret", -1);
+        let app = build_router_with_state(state);
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/operator/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "email": "ops@example.com",
+                            "credential": "secret"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle login");
+        assert_eq!(login_response.status(), StatusCode::OK);
+        let body = to_bytes(login_response.into_body(), 64 * 1024)
+            .await
+            .expect("body should read");
+        let login_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("login response should decode");
+        let token = login_json
+            .get("session_token")
+            .and_then(|value| value.as_str())
+            .expect("login should return a session token");
+
+        let action_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/operator/actions/session-check")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle action gate");
+
+        assert_eq!(action_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn test_state(
+        role: MembershipRole,
+        credential: &str,
+        session_minutes: i64,
+    ) -> (WebServerState, TenantPrincipal) {
+        let principal = TenantPrincipal {
+            user_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            role,
+        };
+        let sessions = OperatorSessionRegistry::with_credentials(
+            OperatorSessionConfig::minutes(session_minutes),
+            vec![OperatorCredential::new(
+                "ops@example.com",
+                credential,
+                principal,
+            )],
+        );
+        (
+            WebServerState {
+                link_state: shared_link_state(ReconnectPolicy::default()),
+                dispatch_state: shared_message_dispatch_state(),
+                operator_sessions: shared_operator_session_registry(sessions),
+            },
+            principal,
+        )
+    }
 }
