@@ -3481,6 +3481,211 @@ async fn crop_intelligence_blocks_unverified_detection_finding_promotion_by_defa
 }
 
 #[tokio::test]
+async fn crop_intelligence_emits_verified_detection_finding_into_recommendations() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "crop-finding-scene";
+    seed_orthomosaic_scene(&ctx, scene_id, "crop-field-1", "season-2026").await?;
+
+    let verify_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/detections/disease:tile-1:1/verification")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "task": "disease_detection",
+                        "label": "northern_leaf_blight",
+                        "confidence": 0.82,
+                        "evidence_tile_refs": ["tile-1"],
+                        "zone_geometry": {
+                            "crs": "EPSG:4326",
+                            "bbox": {
+                                "min_lon": -96.60,
+                                "min_lat": 41.18,
+                                "max_lon": -96.55,
+                                "max_lat": 41.22
+                            }
+                        },
+                        "action": "confirmed",
+                        "actor": "agronomist-7",
+                        "verified_at": "2026-06-12T14:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(verify_response.status(), StatusCode::OK);
+
+    let emit_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/crop-intelligence/detections/disease:tile-1:1/findings"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "finding_id": "crop-finding-1",
+                        "zone_id": "zone-a",
+                        "model_id": "lesion-detector",
+                        "version": "2026.06.1",
+                        "emitted_at": "2026-06-12T15:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(emit_response.status(), StatusCode::OK);
+    let body = to_bytes(emit_response.into_body(), 64 * 1024).await?;
+    let recommendation: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        recommendation
+            .get("recommendation_id")
+            .and_then(|value| value.as_str()),
+        Some("crop-finding-1")
+    );
+    assert_eq!(
+        recommendation
+            .get("field_id")
+            .and_then(|value| value.as_str()),
+        Some("crop-field-1")
+    );
+    assert_eq!(
+        recommendation
+            .get("category")
+            .and_then(|value| value.as_str()),
+        Some("crop_intelligence_finding")
+    );
+    let evidence_refs = recommendation
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .expect("recommendation should cite evidence");
+    assert!(evidence_refs.iter().any(|value| value == "tile:tile-1"));
+    assert!(evidence_refs
+        .iter()
+        .any(|value| value == "model:lesion-detector@2026.06.1"));
+    assert_eq!(
+        recommendation
+            .pointer("/annotation_ids/0")
+            .and_then(|value| value.as_str()),
+        Some("crop-finding-1-zone")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/recommendations"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let recommendations: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(recommendations.len(), 1);
+    assert_eq!(
+        recommendations[0]
+            .pointer("/evidence_refs/0")
+            .and_then(|value| value.as_str()),
+        Some("annotation:crop-finding-1-zone")
+    );
+    assert!(recommendations[0]
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .expect("listed recommendation should cite evidence")
+        .iter()
+        .any(|value| value == "tile:tile-1"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn crop_intelligence_rejects_uncited_finding_emission() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "crop-finding-uncited";
+    seed_orthomosaic_scene(&ctx, scene_id, "crop-field-2", "season-2026").await?;
+    sqlx::query(
+        r#"
+        INSERT INTO crop_detection_verifications (
+            detection_id, task, label, confidence, evidence_tile_refs_json,
+            zone_geometry_json, verification_state, actor, verified_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind("disease:tile-empty:1")
+    .bind("disease_detection")
+    .bind("northern_leaf_blight")
+    .bind(0.82)
+    .bind("[]")
+    .bind(
+        json!({
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -96.60,
+                "min_lat": 41.18,
+                "max_lon": -96.55,
+                "max_lat": 41.22
+            }
+        })
+        .to_string(),
+    )
+    .bind("confirmed")
+    .bind("agronomist-7")
+    .bind("2026-06-12T14:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/crop-intelligence/detections/disease:tile-empty:1/findings"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "finding_id": "crop-finding-uncited",
+                        "model_id": "lesion-detector",
+                        "version": "2026.06.1",
+                        "emitted_at": "2026-06-12T15:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("finding evidence_tile_refs cannot be empty"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn compliance_records_create_list_append_versions_and_refuse_delete() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

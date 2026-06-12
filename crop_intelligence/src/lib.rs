@@ -69,7 +69,7 @@ pub struct ModelVersionRecord {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InferenceModelReference {
     #[serde(default)]
     pub model_id: String,
@@ -423,6 +423,35 @@ pub struct FindingPromotionDecision {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropDetectionFindingRequest {
+    pub finding_id: String,
+    pub field_id: String,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    pub detection: CropDetectionVerificationRecord,
+    pub model: InferenceModelReference,
+    pub emitted_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropDetectionFindingRecord {
+    pub finding_id: String,
+    pub finding_type: CropModelTask,
+    pub field_id: String,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    pub detection_id: String,
+    pub label: String,
+    pub confidence: f64,
+    pub evidence_tile_refs: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub model_version: InferenceModelReference,
+    pub verification_state: DetectionVerificationState,
+    pub zone_geometry: DetectionZoneGeometry,
+    pub emitted_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CropModelRegistryError {
     #[error("model_id cannot be empty")]
@@ -591,6 +620,28 @@ pub enum FindingPromotionError {
     UnverifiedDetectionBlocked { detection_id: String },
     #[error("rejected detection {detection_id} cannot be promoted to a finding")]
     RejectedDetectionBlocked { detection_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CropDetectionFindingError {
+    #[error("finding_id cannot be empty")]
+    EmptyFindingId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("emitted_at cannot be empty")]
+    EmptyEmittedAt,
+    #[error("model_id cannot be empty")]
+    EmptyModelId,
+    #[error("model version cannot be empty")]
+    EmptyModelVersion,
+    #[error("finding evidence_tile_refs cannot be empty")]
+    EmptyEvidence,
+    #[error("finding evidence_tile_refs cannot contain empty values")]
+    EmptyEvidenceRef,
+    #[error("detection {detection_id} is unverified and cannot be emitted as a finding")]
+    UnverifiedDetection { detection_id: String },
+    #[error("detection {detection_id} was rejected and cannot be emitted as a finding")]
+    RejectedDetection { detection_id: String },
 }
 
 pub fn build_model_version_record(
@@ -1069,6 +1120,84 @@ pub fn validate_detection_finding_promotion(
     }
 }
 
+pub fn assemble_detection_finding(
+    request: CropDetectionFindingRequest,
+) -> Result<CropDetectionFindingRecord, CropDetectionFindingError> {
+    let finding_id = normalize_finding_text(
+        request.finding_id,
+        CropDetectionFindingError::EmptyFindingId,
+    )?;
+    let field_id =
+        normalize_finding_text(request.field_id, CropDetectionFindingError::EmptyFieldId)?;
+    let zone_id = request
+        .zone_id
+        .and_then(|value| normalize_optional_finding_text(value));
+    let emitted_at = normalize_finding_text(
+        request.emitted_at,
+        CropDetectionFindingError::EmptyEmittedAt,
+    )?;
+    let model_id = normalize_finding_text(
+        request.model.model_id,
+        CropDetectionFindingError::EmptyModelId,
+    )?;
+    let version = normalize_finding_text(
+        request.model.version,
+        CropDetectionFindingError::EmptyModelVersion,
+    )?;
+    let model_version = InferenceModelReference { model_id, version };
+
+    match request.detection.verification_state {
+        DetectionVerificationState::Confirmed | DetectionVerificationState::Corrected => {}
+        DetectionVerificationState::Rejected => {
+            return Err(CropDetectionFindingError::RejectedDetection {
+                detection_id: request.detection.detection_id,
+            })
+        }
+        DetectionVerificationState::Unverified => {
+            return Err(CropDetectionFindingError::UnverifiedDetection {
+                detection_id: request.detection.detection_id,
+            })
+        }
+    }
+
+    let evidence_tile_refs = normalize_finding_evidence_refs(request.detection.evidence_tile_refs)?;
+    let mut evidence_refs = vec![
+        format!("detection:{}", request.detection.detection_id),
+        format!("model:{}@{}", model_version.model_id, model_version.version),
+    ];
+    evidence_refs.extend(
+        evidence_tile_refs
+            .iter()
+            .map(|tile_ref| format!("tile:{tile_ref}")),
+    );
+    evidence_refs.push(format!(
+        "verification:{}",
+        request.detection.verification_state.as_str()
+    ));
+
+    Ok(CropDetectionFindingRecord {
+        finding_id,
+        finding_type: request.detection.task,
+        field_id,
+        zone_id,
+        detection_id: request.detection.detection_id,
+        label: request
+            .detection
+            .corrected_label
+            .unwrap_or(request.detection.label),
+        confidence: request.detection.confidence,
+        evidence_tile_refs,
+        evidence_refs,
+        model_version,
+        verification_state: request.detection.verification_state,
+        zone_geometry: request
+            .detection
+            .corrected_geometry
+            .unwrap_or(request.detection.zone_geometry),
+        emitted_at,
+    })
+}
+
 fn normalize_required_text(
     value: String,
     error: CropModelRegistryError,
@@ -1467,6 +1596,43 @@ fn normalize_promotion_text(
     }
 }
 
+fn normalize_finding_text(
+    value: String,
+    error: CropDetectionFindingError,
+) -> Result<String, CropDetectionFindingError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_optional_finding_text(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn normalize_finding_evidence_refs(
+    values: Vec<String>,
+) -> Result<Vec<String>, CropDetectionFindingError> {
+    let mut refs = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(CropDetectionFindingError::EmptyEvidenceRef);
+        }
+        refs.push(trimmed.to_string());
+    }
+    refs.sort();
+    refs.dedup();
+    if refs.is_empty() {
+        Err(CropDetectionFindingError::EmptyEvidence)
+    } else {
+        Ok(refs)
+    }
+}
+
 fn bbox_area_m2(bbox: &GeoBounds) -> f64 {
     (bbox.max_lon - bbox.min_lon) * (bbox.max_lat - bbox.min_lat)
 }
@@ -1482,12 +1648,12 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_detection_verification, build_model_version_record, run_canopy_cover,
-        run_disease_lesion_detection, run_stand_count, run_weed_mapping,
+        apply_detection_verification, assemble_detection_finding, build_model_version_record,
+        run_canopy_cover, run_disease_lesion_detection, run_stand_count, run_weed_mapping,
         validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
-        CanopyCoverError, CanopyCoverTile, CropDetectionVerificationAction,
-        CropDetectionVerificationRequest, CropModelRegistryError, CropModelTask,
-        DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
+        CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
+        CropDetectionVerificationAction, CropDetectionVerificationRequest, CropModelRegistryError,
+        CropModelTask, DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
         FindingPromotionRequest, InferenceModelReference, ModelVersionRegistrationRequest,
         PlantCountConfig, PlantCountTile, PlantCountZeroReason, WeedMappingConfig,
@@ -2026,6 +2192,58 @@ mod tests {
         assert_eq!(decision.reason.as_deref(), Some("unverified_override"));
     }
 
+    #[test]
+    fn verified_detection_assembles_evidence_cited_finding() {
+        let finding = assemble_detection_finding(CropDetectionFindingRequest {
+            finding_id: "finding-1".to_string(),
+            field_id: "field-1".to_string(),
+            zone_id: Some("zone-a".to_string()),
+            detection: confirmed_detection(),
+            model: registered_model(),
+            emitted_at: "2026-06-12T15:00:00Z".to_string(),
+        })
+        .expect("verified detection should assemble into an advisor finding");
+
+        assert_eq!(finding.finding_id, "finding-1");
+        assert_eq!(finding.finding_type, CropModelTask::DiseaseDetection);
+        assert_eq!(finding.field_id, "field-1");
+        assert_eq!(finding.zone_id.as_deref(), Some("zone-a"));
+        assert_eq!(finding.confidence, 0.82);
+        assert_eq!(finding.evidence_tile_refs, vec!["tile-1".to_string()]);
+        assert_eq!(finding.model_version.model_id, "lesion-detector");
+        assert_eq!(
+            finding.verification_state,
+            DetectionVerificationState::Confirmed
+        );
+        assert_eq!(
+            finding.evidence_refs,
+            vec![
+                "detection:disease:tile-1:1".to_string(),
+                "model:lesion-detector@2026.06.1".to_string(),
+                "tile:tile-1".to_string(),
+                "verification:confirmed".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn finding_assembly_rejects_uncited_detection() {
+        let mut detection = confirmed_detection();
+        detection.evidence_tile_refs.clear();
+
+        let error = assemble_detection_finding(CropDetectionFindingRequest {
+            finding_id: "finding-uncited".to_string(),
+            field_id: "field-1".to_string(),
+            zone_id: None,
+            detection,
+            model: registered_model(),
+            emitted_at: "2026-06-12T15:00:00Z".to_string(),
+        })
+        .expect_err("uncited finding should be rejected");
+
+        assert_eq!(error, CropDetectionFindingError::EmptyEvidence);
+    }
+
     fn plant_tile(
         tile_id: &str,
         zone_id: Option<&str>,
@@ -2089,6 +2307,23 @@ mod tests {
             model_id: "lesion-detector".to_string(),
             version: "2026.06.1".to_string(),
         }
+    }
+
+    fn confirmed_detection() -> super::CropDetectionVerificationRecord {
+        apply_detection_verification(CropDetectionVerificationRequest {
+            detection_id: "disease:tile-1:1".to_string(),
+            task: CropModelTask::DiseaseDetection,
+            label: "northern_leaf_blight".to_string(),
+            confidence: 0.82,
+            evidence_tile_refs: vec!["tile-1".to_string()],
+            zone_geometry: detection_geometry(5.0, 5.0, 15.0, 15.0),
+            action: CropDetectionVerificationAction::Confirmed,
+            actor: "agronomist-7".to_string(),
+            verified_at: "2026-06-12T14:00:00Z".to_string(),
+            corrected_label: None,
+            corrected_geometry: None,
+        })
+        .expect("confirmed detection should be valid")
     }
 
     fn lesion_candidate(tile_id: &str, confidence: f64, bbox: GeoBounds) -> DiseaseLesionCandidate {

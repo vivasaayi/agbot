@@ -89,6 +89,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::validate_crop_detection_finding_promotion),
         )
         .route(
+            "/api/scenes/:scene_id/crop-intelligence/detections/:detection_id/findings",
+            post(routes::emit_crop_detection_finding),
+        )
+        .route(
             "/api/crop-intelligence/inference-requests/validate",
             post(routes::validate_crop_model_for_inference),
         )

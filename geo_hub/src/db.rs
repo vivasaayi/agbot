@@ -338,12 +338,21 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             category TEXT,
             priority TEXT NOT NULL,
             status TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
         "#,
     )
     .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "recommendations",
+        "evidence_refs_json",
+        "ALTER TABLE recommendations ADD COLUMN evidence_refs_json TEXT NOT NULL DEFAULT '[]'",
+    )
     .await?;
 
     sqlx::query(

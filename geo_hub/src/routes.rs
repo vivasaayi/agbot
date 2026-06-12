@@ -27,11 +27,12 @@ use compliance::{
     CreateComplianceRecordRequest,
 };
 use crop_intelligence::{
-    apply_detection_verification, build_model_version_record, validate_detection_finding_promotion,
-    validate_model_reference, CropDetectionCorrectionLabel, CropDetectionVerificationAction,
-    CropDetectionVerificationError, CropDetectionVerificationRecord,
-    CropDetectionVerificationRequest, CropModelRegistryError, CropModelTask,
-    DetectionVerificationState, DetectionZoneGeometry, FindingPromotionDecision,
+    apply_detection_verification, assemble_detection_finding, build_model_version_record,
+    validate_detection_finding_promotion, validate_model_reference, CropDetectionCorrectionLabel,
+    CropDetectionFindingError, CropDetectionFindingRecord, CropDetectionFindingRequest,
+    CropDetectionVerificationAction, CropDetectionVerificationError,
+    CropDetectionVerificationRecord, CropDetectionVerificationRequest, CropModelRegistryError,
+    CropModelTask, DetectionVerificationState, DetectionZoneGeometry, FindingPromotionDecision,
     FindingPromotionError, FindingPromotionRequest, InferenceModelReference, ModelGateResponse,
     ModelVersionRecord, ModelVersionRegistrationRequest,
 };
@@ -436,6 +437,16 @@ pub struct VerifyCropDetectionRequest {
 pub struct CropFindingPromotionValidationRequest {
     #[serde(default)]
     pub allow_unverified: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmitCropDetectionFindingRequest {
+    pub finding_id: String,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    pub model_id: String,
+    pub version: String,
+    pub emitted_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2663,6 +2674,49 @@ pub async fn validate_crop_detection_finding_promotion(
     Ok(Json(decision))
 }
 
+pub async fn emit_crop_detection_finding(
+    Path((scene_id, detection_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<EmitCropDetectionFindingRequest>,
+) -> AppResult<Json<RecommendationRecord>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+    let field_id = load_scene_field_id(&state, &scene_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "scene {scene_id} must be linked to a field before emitting crop findings"
+            ))
+        })?;
+    let detection = load_crop_detection_verification_record(&state, &detection_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "verified detection {detection_id} was not found for finding emission"
+            ))
+        })?;
+    let finding = assemble_detection_finding(CropDetectionFindingRequest {
+        finding_id: request.finding_id,
+        field_id,
+        zone_id: request.zone_id,
+        detection,
+        model: InferenceModelReference {
+            model_id: request.model_id,
+            version: request.version,
+        },
+        emitted_at: request.emitted_at,
+    })
+    .map_err(crop_detection_finding_error)?;
+
+    let annotation = annotation_from_crop_detection_finding(&scene_id, &finding)?;
+    let recommendation =
+        recommendation_from_crop_detection_finding(&scene_id, &finding, &annotation);
+    persist_crop_detection_finding_recommendation(&state, &annotation, &recommendation).await?;
+
+    Ok(Json(recommendation))
+}
+
 pub async fn create_compliance_record(
     State(state): State<AppState>,
     Json(request): Json<CreateComplianceRecordRequest>,
@@ -3181,7 +3235,7 @@ pub async fn list_scene_recommendations(
 
     let rows = sqlx::query(
         r#"
-        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, created_at, updated_at
+        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, evidence_refs_json, created_at, updated_at
         FROM recommendations
         WHERE scene_id = ?1
         ORDER BY created_at DESC
@@ -3228,9 +3282,9 @@ pub async fn create_scene_recommendation(
     sqlx::query(
         r#"
         INSERT INTO recommendations (
-            recommendation_id, scene_id, field_id, title, note, category, priority, status, created_at, updated_at
+            recommendation_id, scene_id, field_id, title, note, category, priority, status, evidence_refs_json, created_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         "#,
     )
     .bind(&recommendation.recommendation_id)
@@ -3241,6 +3295,10 @@ pub async fn create_scene_recommendation(
     .bind(&recommendation.category)
     .bind(recommendation_priority_str(recommendation.priority))
     .bind(recommendation_status_str(recommendation.status))
+    .bind(
+        serde_json::to_string(&recommendation.evidence_refs)
+            .map_err(|err| AppError::Anyhow(err.into()))?,
+    )
     .bind(&recommendation.created_at)
     .bind(&recommendation.updated_at)
     .execute(&state.pool)
@@ -3270,6 +3328,11 @@ pub async fn update_scene_recommendation(
         .await?
         .ok_or(AppError::NotFound)?;
     validate_recommendation_annotation_ids(&state, &scene_id, &request.annotation_ids).await?;
+    let explicit_evidence_refs = if request.evidence_refs.is_empty() {
+        existing.evidence_refs.clone()
+    } else {
+        request.evidence_refs
+    };
 
     let updated = RecommendationRecord {
         recommendation_id: recommendation_id.clone(),
@@ -3284,7 +3347,10 @@ pub async fn update_scene_recommendation(
             .unwrap_or(existing.action_category),
         priority: request.priority,
         status: request.status,
-        evidence_refs: normalize_text_values(request.evidence_refs, existing.evidence_refs),
+        evidence_refs: combine_text_values(
+            recommendation_evidence_from_annotations(&request.annotation_ids),
+            explicit_evidence_refs,
+        ),
         annotation_ids: request.annotation_ids,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -3293,8 +3359,8 @@ pub async fn update_scene_recommendation(
     let result = sqlx::query(
         r#"
         UPDATE recommendations
-        SET field_id = ?1, title = ?2, note = ?3, category = ?4, priority = ?5, status = ?6, updated_at = ?7
-        WHERE recommendation_id = ?8 AND scene_id = ?9
+        SET field_id = ?1, title = ?2, note = ?3, category = ?4, priority = ?5, status = ?6, evidence_refs_json = ?7, updated_at = ?8
+        WHERE recommendation_id = ?9 AND scene_id = ?10
         "#,
     )
     .bind(&updated.field_id)
@@ -3303,6 +3369,10 @@ pub async fn update_scene_recommendation(
     .bind(&updated.category)
     .bind(recommendation_priority_str(updated.priority))
     .bind(recommendation_status_str(updated.status))
+    .bind(
+        serde_json::to_string(&updated.evidence_refs)
+            .map_err(|err| AppError::Anyhow(err.into()))?,
+    )
     .bind(&updated.updated_at)
     .bind(&updated.recommendation_id)
     .bind(&updated.scene_id)
@@ -4984,9 +5054,9 @@ async fn build_recommendation_record(
     let action_category = normalize_optional_text(request.action_category)
         .or_else(|| category.clone())
         .unwrap_or_else(|| "general".to_string());
-    let evidence_refs = normalize_text_values(
-        request.evidence_refs,
+    let evidence_refs = combine_text_values(
         recommendation_evidence_from_annotations(&request.annotation_ids),
+        request.evidence_refs,
     );
 
     Ok(RecommendationRecord {
@@ -5194,6 +5264,10 @@ fn finding_promotion_error(error: FindingPromotionError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn crop_detection_finding_error(error: CropDetectionFindingError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_crop_model_task(value: String) -> AppResult<CropModelTask> {
     value
         .parse::<CropModelTask>()
@@ -5255,16 +5329,18 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
-fn normalize_text_values(values: Vec<String>, fallback: Vec<String>) -> Vec<String> {
-    let normalized = values
-        .into_iter()
-        .filter_map(|value| normalize_optional_text(Some(value)))
-        .collect::<Vec<_>>();
-    if normalized.is_empty() {
-        fallback
-    } else {
-        normalized
+fn combine_text_values(first: Vec<String>, second: Vec<String>) -> Vec<String> {
+    let mut combined = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in first.into_iter().chain(second.into_iter()) {
+        let Some(value) = normalize_optional_text(Some(value)) else {
+            continue;
+        };
+        if seen.insert(value.clone()) {
+            combined.push(value);
+        }
     }
+    combined
 }
 
 fn recommendation_evidence_from_annotations(annotation_ids: &[String]) -> Vec<String> {
@@ -6414,6 +6490,14 @@ async fn decode_recommendation_record(
 ) -> AppResult<RecommendationRecord> {
     let recommendation_id: String = row.get("recommendation_id");
     let annotation_ids = load_recommendation_annotation_ids(state, &recommendation_id).await?;
+    let stored_evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode recommendation evidence_refs_json"),
+        )
+    })?;
     let category: Option<String> = row.get("category");
     Ok(RecommendationRecord {
         recommendation_id: recommendation_id.clone(),
@@ -6429,7 +6513,10 @@ async fn decode_recommendation_record(
             .unwrap_or_else(|| "general".to_string()),
         priority: parse_recommendation_priority(row.get("priority"))?,
         status: parse_recommendation_status(row.get("status"))?,
-        evidence_refs: recommendation_evidence_from_annotations(&annotation_ids),
+        evidence_refs: combine_text_values(
+            recommendation_evidence_from_annotations(&annotation_ids),
+            stored_evidence_refs,
+        ),
         annotation_ids,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -7212,6 +7299,279 @@ async fn load_crop_detection_verification_state(
         .transpose()
 }
 
+async fn load_crop_detection_verification_record(
+    state: &AppState,
+    detection_id: &str,
+) -> AppResult<Option<CropDetectionVerificationRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT detection_id, task, label, confidence, evidence_tile_refs_json,
+               zone_geometry_json, verification_state, actor, verified_at,
+               corrected_label, corrected_geometry_json, correction_label_json
+        FROM crop_detection_verifications
+        WHERE detection_id = ?1
+        "#,
+    )
+    .bind(detection_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_crop_detection_verification_record(&row))
+        .transpose()
+}
+
+fn decode_crop_detection_verification_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CropDetectionVerificationRecord> {
+    let evidence_tile_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("evidence_tile_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err)
+                        .context("failed to decode crop detection evidence_tile_refs_json"),
+                )
+            })?;
+    let zone_geometry =
+        serde_json::from_str::<DetectionZoneGeometry>(&row.get::<String, _>("zone_geometry_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode crop detection zone_geometry_json"),
+                )
+            })?;
+    let corrected_geometry = row
+        .get::<Option<String>, _>("corrected_geometry_json")
+        .map(|json| serde_json::from_str::<DetectionZoneGeometry>(&json))
+        .transpose()
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode crop detection corrected_geometry_json"),
+            )
+        })?;
+    let correction_label = row
+        .get::<Option<String>, _>("correction_label_json")
+        .map(|json| serde_json::from_str::<CropDetectionCorrectionLabel>(&json))
+        .transpose()
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode crop detection correction_label_json"),
+            )
+        })?;
+
+    Ok(CropDetectionVerificationRecord {
+        detection_id: row.get("detection_id"),
+        task: parse_crop_model_task(row.get::<String, _>("task"))?,
+        label: row.get("label"),
+        confidence: row.get("confidence"),
+        evidence_tile_refs,
+        zone_geometry,
+        verification_state: parse_detection_verification_state(
+            row.get::<String, _>("verification_state"),
+        )?,
+        actor: row.get("actor"),
+        verified_at: row.get("verified_at"),
+        corrected_label: row.get("corrected_label"),
+        corrected_geometry,
+        correction_label,
+    })
+}
+
+fn annotation_from_crop_detection_finding(
+    scene_id: &str,
+    finding: &CropDetectionFindingRecord,
+) -> AppResult<AnnotationRecord> {
+    let geometry = annotation_geometry_from_detection(&finding.zone_geometry);
+    validate_annotation_geometry(&geometry)?;
+    Ok(AnnotationRecord {
+        annotation_id: format!("{}-zone", finding.finding_id),
+        scene_id: scene_id.to_string(),
+        field_id: Some(finding.field_id.clone()),
+        author: Some("crop_intelligence".to_string()),
+        crs: Some(finding.zone_geometry.crs.clone()),
+        audit_id: Some(format!("crop-finding:{}", finding.finding_id)),
+        label: finding.label.clone(),
+        note: Some(format!(
+            "{} finding from detection {} with confidence {:.2}",
+            finding.finding_type.as_str(),
+            finding.detection_id,
+            finding.confidence
+        )),
+        severity: Some("medium".to_string()),
+        geometry,
+        created_at: finding.emitted_at.clone(),
+        updated_at: finding.emitted_at.clone(),
+    })
+}
+
+fn annotation_geometry_from_detection(geometry: &DetectionZoneGeometry) -> AnnotationGeometry {
+    let bbox = &geometry.bbox;
+    AnnotationGeometry::Polygon {
+        coordinates: vec![
+            GeoPoint {
+                longitude: bbox.min_lon,
+                latitude: bbox.min_lat,
+            },
+            GeoPoint {
+                longitude: bbox.max_lon,
+                latitude: bbox.min_lat,
+            },
+            GeoPoint {
+                longitude: bbox.max_lon,
+                latitude: bbox.max_lat,
+            },
+            GeoPoint {
+                longitude: bbox.min_lon,
+                latitude: bbox.max_lat,
+            },
+            GeoPoint {
+                longitude: bbox.min_lon,
+                latitude: bbox.min_lat,
+            },
+        ],
+    }
+}
+
+fn recommendation_from_crop_detection_finding(
+    scene_id: &str,
+    finding: &CropDetectionFindingRecord,
+    annotation: &AnnotationRecord,
+) -> RecommendationRecord {
+    let annotation_ids = vec![annotation.annotation_id.clone()];
+    let evidence_refs = combine_text_values(
+        recommendation_evidence_from_annotations(&annotation_ids),
+        finding.evidence_refs.clone(),
+    );
+
+    RecommendationRecord {
+        recommendation_id: finding.finding_id.clone(),
+        scene_id: scene_id.to_string(),
+        field_id: Some(finding.field_id.clone()),
+        org_id: DEFAULT_RECORD_OWNER.to_string(),
+        author_user_id: "crop_intelligence".to_string(),
+        title: format!("Crop intelligence finding: {}", finding.label),
+        note: Some(format!(
+            "Detection {} confidence {:.2}; model {}@{}; verification {}.",
+            finding.detection_id,
+            finding.confidence,
+            finding.model_version.model_id,
+            finding.model_version.version,
+            finding.verification_state.as_str()
+        )),
+        category: Some("crop_intelligence_finding".to_string()),
+        action_category: "crop_intelligence_finding".to_string(),
+        priority: RecommendationPriority::Medium,
+        status: RecommendationStatus::Open,
+        evidence_refs,
+        annotation_ids,
+        created_at: finding.emitted_at.clone(),
+        updated_at: finding.emitted_at.clone(),
+    }
+}
+
+async fn persist_crop_detection_finding_recommendation(
+    state: &AppState,
+    annotation: &AnnotationRecord,
+    recommendation: &RecommendationRecord,
+) -> AppResult<()> {
+    let geometry_json =
+        serde_json::to_string(&annotation.geometry).map_err(|err| AppError::Anyhow(err.into()))?;
+    let evidence_refs_json = serde_json::to_string(&recommendation.evidence_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO annotations (
+            annotation_id, scene_id, field_id, author, crs, audit_id, label,
+            note, severity, geometry_json, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(annotation_id) DO UPDATE SET
+            scene_id = excluded.scene_id,
+            field_id = excluded.field_id,
+            author = excluded.author,
+            crs = excluded.crs,
+            audit_id = excluded.audit_id,
+            label = excluded.label,
+            note = excluded.note,
+            severity = excluded.severity,
+            geometry_json = excluded.geometry_json,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&annotation.annotation_id)
+    .bind(&annotation.scene_id)
+    .bind(&annotation.field_id)
+    .bind(&annotation.author)
+    .bind(&annotation.crs)
+    .bind(&annotation.audit_id)
+    .bind(&annotation.label)
+    .bind(&annotation.note)
+    .bind(&annotation.severity)
+    .bind(geometry_json)
+    .bind(&annotation.created_at)
+    .bind(&annotation.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO recommendations (
+            recommendation_id, scene_id, field_id, title, note, category, priority,
+            status, evidence_refs_json, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(recommendation_id) DO UPDATE SET
+            scene_id = excluded.scene_id,
+            field_id = excluded.field_id,
+            title = excluded.title,
+            note = excluded.note,
+            category = excluded.category,
+            priority = excluded.priority,
+            status = excluded.status,
+            evidence_refs_json = excluded.evidence_refs_json,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&recommendation.recommendation_id)
+    .bind(&recommendation.scene_id)
+    .bind(&recommendation.field_id)
+    .bind(&recommendation.title)
+    .bind(&recommendation.note)
+    .bind(&recommendation.category)
+    .bind(recommendation_priority_str(recommendation.priority))
+    .bind(recommendation_status_str(recommendation.status))
+    .bind(evidence_refs_json)
+    .bind(&recommendation.created_at)
+    .bind(&recommendation.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query("DELETE FROM recommendation_annotations WHERE recommendation_id = ?1")
+        .bind(&recommendation.recommendation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    for annotation_id in &recommendation.annotation_ids {
+        sqlx::query(
+            r#"
+            INSERT INTO recommendation_annotations (recommendation_id, annotation_id)
+            VALUES (?1, ?2)
+            "#,
+        )
+        .bind(&recommendation.recommendation_id)
+        .bind(annotation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
 async fn assert_field_owned_by_org(
     state: &AppState,
     org_id: &str,
@@ -7416,7 +7776,7 @@ async fn load_recommendation(
 ) -> AppResult<Option<RecommendationRecord>> {
     let row = sqlx::query(
         r#"
-        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, created_at, updated_at
+        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, evidence_refs_json, created_at, updated_at
         FROM recommendations
         WHERE scene_id = ?1 AND recommendation_id = ?2
         "#,
@@ -7592,7 +7952,7 @@ async fn load_scene_recommendation_records(
 ) -> AppResult<Vec<RecommendationRecord>> {
     let rows = sqlx::query(
         r#"
-        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, created_at, updated_at
+        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, evidence_refs_json, created_at, updated_at
         FROM recommendations
         WHERE scene_id = ?1
         ORDER BY created_at DESC
