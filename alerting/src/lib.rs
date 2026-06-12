@@ -87,6 +87,31 @@ pub struct FiredAlertRecord {
     pub explanation: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertSeverityEvidence {
+    pub metric: String,
+    pub observed_value: f64,
+    pub warning_threshold: f64,
+    pub critical_threshold: f64,
+    pub emergency_threshold: f64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertSeverityClassification {
+    pub alert_id: String,
+    pub matched_rule_id: String,
+    pub rule_severity: AlertSeverityHint,
+    pub source_severity_hint: AlertSeverityHint,
+    pub classified_severity: AlertSeverityHint,
+    pub hard_override_downstream: bool,
+    pub metric: String,
+    pub observed_value: f64,
+    pub threshold_value: Option<f64>,
+    pub method_version: String,
+    pub explanation: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlertHistoryQuery {
     pub source_domain: Option<String>,
@@ -144,6 +169,12 @@ pub enum AlertingError {
     EmptyFiredAt,
     #[error("explanation cannot be empty")]
     EmptyExplanation,
+    #[error("severity metric cannot be empty")]
+    EmptySeverityMetric,
+    #[error("severity method_version cannot be empty")]
+    EmptySeverityMethodVersion,
+    #[error("severity evidence must be finite with warning <= critical <= emergency thresholds")]
+    InvalidSeverityEvidence,
     #[error("invalid alert severity {0}")]
     InvalidSeverity(String),
 }
@@ -327,6 +358,54 @@ pub fn filter_alert_history(
     }
 }
 
+pub fn classify_alert_severity(
+    alert: &FiredAlertRecord,
+    source_severity_hint: AlertSeverityHint,
+    evidence: AlertSeverityEvidence,
+) -> Result<AlertSeverityClassification, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    let evidence = normalize_severity_evidence(evidence)?;
+    let (classified_severity, threshold_value, threshold_name) =
+        severity_from_evidence_or_rule(alert.severity, &evidence);
+    let hard_override_downstream = matches!(
+        classified_severity,
+        AlertSeverityHint::Critical | AlertSeverityHint::Emergency
+    );
+    let hint_clause = if source_severity_hint == classified_severity {
+        format!("source hint {} agreed", source_severity_hint.as_str())
+    } else {
+        format!(
+            "source hint {} ignored in favor of deterministic rule/evidence",
+            source_severity_hint.as_str()
+        )
+    };
+
+    Ok(AlertSeverityClassification {
+        alert_id: alert.alert_id,
+        matched_rule_id: alert.matched_rule_id,
+        rule_severity: alert.severity,
+        source_severity_hint,
+        classified_severity,
+        hard_override_downstream,
+        metric: evidence.metric.clone(),
+        observed_value: evidence.observed_value,
+        threshold_value,
+        method_version: evidence.method_version.clone(),
+        explanation: format!(
+            "severity classified as {} for metric {} observed={}; rule_severity={}; warning_threshold={}; critical_threshold={}; emergency_threshold={}; {}; method={}",
+            classified_severity.as_str(),
+            evidence.metric,
+            evidence.observed_value,
+            alert.severity.as_str(),
+            evidence.warning_threshold,
+            evidence.critical_threshold,
+            evidence.emergency_threshold,
+            hint_clause,
+            evidence.method_version
+        ) + threshold_name.map_or("", |name| name),
+    })
+}
+
 fn normalize_event(event: AlertEvent) -> Result<AlertEvent, AlertingError> {
     Ok(AlertEvent {
         source_domain: normalize_required_text(
@@ -349,6 +428,61 @@ fn normalize_event(event: AlertEvent) -> Result<AlertEvent, AlertingError> {
     })
 }
 
+fn normalize_severity_evidence(
+    evidence: AlertSeverityEvidence,
+) -> Result<AlertSeverityEvidence, AlertingError> {
+    let metric = normalize_required_text(evidence.metric, AlertingError::EmptySeverityMetric)?;
+    let method_version = normalize_required_text(
+        evidence.method_version,
+        AlertingError::EmptySeverityMethodVersion,
+    )?;
+    if !evidence.observed_value.is_finite()
+        || !evidence.warning_threshold.is_finite()
+        || !evidence.critical_threshold.is_finite()
+        || !evidence.emergency_threshold.is_finite()
+        || evidence.warning_threshold > evidence.critical_threshold
+        || evidence.critical_threshold > evidence.emergency_threshold
+    {
+        return Err(AlertingError::InvalidSeverityEvidence);
+    }
+
+    Ok(AlertSeverityEvidence {
+        metric,
+        observed_value: evidence.observed_value,
+        warning_threshold: evidence.warning_threshold,
+        critical_threshold: evidence.critical_threshold,
+        emergency_threshold: evidence.emergency_threshold,
+        method_version,
+    })
+}
+
+fn severity_from_evidence_or_rule(
+    rule_severity: AlertSeverityHint,
+    evidence: &AlertSeverityEvidence,
+) -> (AlertSeverityHint, Option<f64>, Option<&'static str>) {
+    if evidence.observed_value >= evidence.emergency_threshold {
+        (
+            AlertSeverityHint::Emergency,
+            Some(evidence.emergency_threshold),
+            Some("; threshold=emergency_threshold"),
+        )
+    } else if evidence.observed_value >= evidence.critical_threshold {
+        (
+            AlertSeverityHint::Critical,
+            Some(evidence.critical_threshold),
+            Some("; threshold=critical_threshold"),
+        )
+    } else if evidence.observed_value >= evidence.warning_threshold {
+        (
+            AlertSeverityHint::Warning,
+            Some(evidence.warning_threshold),
+            Some("; threshold=warning_threshold"),
+        )
+    } else {
+        (rule_severity, None, None)
+    }
+}
+
 fn normalize_required_text(value: String, error: AlertingError) -> Result<String, AlertingError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -369,8 +503,9 @@ fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluate_alert_rules, filter_alert_history, AlertEvent, AlertEventBackbone,
-        AlertHistoryQuery, AlertRule, AlertSeverityHint, AlertingError, SourceAdapter,
+        classify_alert_severity, evaluate_alert_rules, filter_alert_history, AlertEvent,
+        AlertEventBackbone, AlertHistoryQuery, AlertRule, AlertSeverityEvidence, AlertSeverityHint,
+        AlertingError, SourceAdapter,
     };
 
     #[test]
@@ -516,6 +651,67 @@ mod tests {
         assert_eq!(page.alerts[0].alert_id, "alert-2");
     }
 
+    #[test]
+    fn severity_classifier_derives_critical_from_threshold_evidence() {
+        let alert = fired_alert(
+            "alert-critical",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+
+        let classification = classify_alert_severity(
+            &alert,
+            AlertSeverityHint::Warning,
+            severity_evidence(92.0, 50.0, 90.0, 99.0),
+        )
+        .expect("severity should classify");
+
+        assert_eq!(
+            classification.classified_severity,
+            AlertSeverityHint::Critical
+        );
+        assert_eq!(classification.rule_severity, AlertSeverityHint::Warning);
+        assert_eq!(
+            classification.source_severity_hint,
+            AlertSeverityHint::Warning
+        );
+        assert_eq!(classification.threshold_value, Some(90.0));
+        assert!(classification.hard_override_downstream);
+        assert!(classification.explanation.contains("critical_threshold=90"));
+    }
+
+    #[test]
+    fn severity_classifier_resolves_hint_conflict_with_rule_and_evidence() {
+        let alert = fired_alert(
+            "alert-conflict",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+
+        let classification = classify_alert_severity(
+            &alert,
+            AlertSeverityHint::Info,
+            severity_evidence(12.0, 50.0, 90.0, 99.0),
+        )
+        .expect("severity should classify");
+
+        assert_eq!(
+            classification.classified_severity,
+            AlertSeverityHint::Critical
+        );
+        assert_eq!(classification.rule_severity, AlertSeverityHint::Critical);
+        assert_eq!(classification.source_severity_hint, AlertSeverityHint::Info);
+        assert_eq!(classification.threshold_value, None);
+        assert!(classification.hard_override_downstream);
+        assert!(classification
+            .explanation
+            .contains("source hint info ignored"));
+    }
+
     fn sensor_health_event() -> AlertEvent {
         AlertEvent {
             source_domain: "27-soil-iot-sensor-network".to_string(),
@@ -550,6 +746,22 @@ mod tests {
             channels: vec!["in_app".to_string()],
             fired_at: fired_at.to_string(),
             explanation: "deterministic rule matched evidence".to_string(),
+        }
+    }
+
+    fn severity_evidence(
+        observed_value: f64,
+        warning_threshold: f64,
+        critical_threshold: f64,
+        emergency_threshold: f64,
+    ) -> AlertSeverityEvidence {
+        AlertSeverityEvidence {
+            metric: "battery_temperature_celsius".to_string(),
+            observed_value,
+            warning_threshold,
+            critical_threshold,
+            emergency_threshold,
+            method_version: "severity-thresholds-v1".to_string(),
         }
     }
 }
