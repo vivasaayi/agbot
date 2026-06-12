@@ -168,6 +168,9 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             season_id TEXT,
             kind TEXT NOT NULL,
             path TEXT NOT NULL,
+            width_px INTEGER,
+            height_px INTEGER,
+            gsd_m_per_px REAL,
             spatial_ref_json TEXT,
             source_image_ids_json TEXT,
             created_at TEXT NOT NULL,
@@ -200,6 +203,30 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         "products",
         "season_id",
         "ALTER TABLE products ADD COLUMN season_id TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "width_px",
+        "ALTER TABLE products ADD COLUMN width_px INTEGER",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "height_px",
+        "ALTER TABLE products ADD COLUMN height_px INTEGER",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "gsd_m_per_px",
+        "ALTER TABLE products ADD COLUMN gsd_m_per_px REAL",
     )
     .await?;
 

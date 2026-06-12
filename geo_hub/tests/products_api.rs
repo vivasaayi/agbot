@@ -2797,6 +2797,274 @@ async fn orthomosaic_reconstruction_rejects_unknown_frame_set() -> Result<()> {
 }
 
 #[tokio::test]
+async fn orthomosaic_tile_handoff_publishes_geo_hub_layers() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "ortho-handoff-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let spatial_ref = orthomosaic_tile_spatial_ref_json();
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref.clone()).await?;
+    link_scene_context(&ctx, scene_id, "ortho-field-1", "season-2026").await?;
+    seed_completed_orthomosaic_reconstruction(
+        &ctx,
+        scene_id,
+        "ortho-field-1",
+        "season-2026",
+        "frame-set-handoff",
+        "recon-ortho-handoff",
+    )
+    .await?;
+
+    let mosaic_path = scene_dir
+        .join("products")
+        .join("orthomosaic")
+        .join("orthomosaic.png");
+    let dsm_path = scene_dir.join("products").join("dsm").join("dsm.png");
+    std::fs::create_dir_all(mosaic_path.parent().expect("mosaic parent exists"))?;
+    std::fs::create_dir_all(dsm_path.parent().expect("dsm parent exists"))?;
+    write_gray_png(&mosaic_path, 180)?;
+    write_gray_png(&dsm_path, 90)?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/orthomosaic/reconstructions/recon-ortho-handoff/handoff")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "scene_id": scene_id,
+                        "recon_id": "recon-ortho-handoff",
+                        "generated_at": "2026-06-01T12:08:00Z",
+                        "source_image_ids": ["frame-001", "frame-002"],
+                        "tile_size_px": 256,
+                        "mosaic": {
+                            "uri": mosaic_path.to_string_lossy().to_string(),
+                            "width_px": 2,
+                            "height_px": 2,
+                            "spatial_ref": spatial_ref.clone(),
+                            "gsd_m_per_px": 0.05
+                        },
+                        "dsm": {
+                            "uri": dsm_path.to_string_lossy().to_string(),
+                            "width_px": 2,
+                            "height_px": 2,
+                            "spatial_ref": spatial_ref.clone(),
+                            "gsd_m_per_px": 0.05
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let handoff: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        handoff
+            .pointer("/layers/0/product_kind")
+            .and_then(|value| value.as_str()),
+        Some("orthomosaic")
+    );
+    assert_eq!(
+        handoff
+            .pointer("/layers/0/tile_url_template")
+            .and_then(|value| value.as_str()),
+        Some(
+            format!("/api/scenes/{scene_id}/products/orthomosaic/tiles/{{z}}/{{x}}/{{y}}.png")
+                .as_str()
+        )
+    );
+    assert_eq!(
+        handoff
+            .pointer("/layers/0/spatial_ref/bbox/min_lon")
+            .and_then(|value| value.as_f64()),
+        Some(-96.7)
+    );
+
+    let layer_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/layers/{scene_id}/orthomosaic"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(layer_response.status(), StatusCode::OK);
+    let body = to_bytes(layer_response.into_body(), 64 * 1024).await?;
+    let layer_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        layer_json
+            .get("product_id")
+            .and_then(|value| value.as_str()),
+        Some("ortho-handoff-scene:orthomosaic")
+    );
+    assert_eq!(
+        layer_json
+            .pointer("/spatial_ref/resolution/x")
+            .and_then(|value| value.as_f64()),
+        Some(0.05)
+    );
+    assert_eq!(
+        layer_json
+            .get("gsd_m_per_px")
+            .and_then(|value| value.as_f64()),
+        Some(0.05)
+    );
+    assert_eq!(
+        layer_json
+            .get("tile_url_template")
+            .and_then(|value| value.as_str()),
+        Some(
+            format!("/api/scenes/{scene_id}/products/orthomosaic/tiles/{{z}}/{{x}}/{{y}}.png")
+                .as_str()
+        )
+    );
+
+    let tile_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/products/orthomosaic/tiles/0/0/0.png"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(tile_response.status(), StatusCode::OK);
+    assert_eq!(
+        tile_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+
+    let dsm_export_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/layers/{scene_id}/dsm/export/geotiff"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(dsm_export_response.status(), StatusCode::OK);
+    let body = to_bytes(dsm_export_response.into_body(), 64 * 1024).await?;
+    let reopened = reopen_raster_geotiff(&body)?;
+    assert_eq!(reopened.product_id, "ortho-handoff-scene:dsm");
+    assert_eq!(reopened.width, 2);
+    assert_eq!(reopened.height, 2);
+    assert_eq!(reopened.spatial_ref.crs.as_deref(), Some("EPSG:4326"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn orthomosaic_tile_handoff_refuses_missing_crs_without_product_rows() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "ortho-handoff-missing-crs";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let spatial_ref = orthomosaic_tile_spatial_ref_json();
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref.clone()).await?;
+    link_scene_context(&ctx, scene_id, "ortho-field-1", "season-2026").await?;
+    seed_completed_orthomosaic_reconstruction(
+        &ctx,
+        scene_id,
+        "ortho-field-1",
+        "season-2026",
+        "frame-set-handoff-missing-crs",
+        "recon-ortho-handoff",
+    )
+    .await?;
+
+    let mosaic_path = scene_dir
+        .join("products")
+        .join("orthomosaic")
+        .join("orthomosaic.png");
+    let dsm_path = scene_dir.join("products").join("dsm").join("dsm.png");
+    std::fs::create_dir_all(mosaic_path.parent().expect("mosaic parent exists"))?;
+    std::fs::create_dir_all(dsm_path.parent().expect("dsm parent exists"))?;
+    write_gray_png(&mosaic_path, 180)?;
+    write_gray_png(&dsm_path, 90)?;
+
+    let mut missing_crs = spatial_ref.clone();
+    missing_crs
+        .as_object_mut()
+        .expect("spatial ref should be an object")
+        .remove("crs");
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/orthomosaic/reconstructions/recon-ortho-handoff/handoff")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "scene_id": scene_id,
+                        "recon_id": "recon-ortho-handoff",
+                        "generated_at": "2026-06-01T12:08:00Z",
+                        "source_image_ids": ["frame-001", "frame-002"],
+                        "tile_size_px": 256,
+                        "mosaic": {
+                            "uri": mosaic_path.to_string_lossy().to_string(),
+                            "width_px": 2,
+                            "height_px": 2,
+                            "spatial_ref": missing_crs,
+                            "gsd_m_per_px": 0.05
+                        },
+                        "dsm": {
+                            "uri": dsm_path.to_string_lossy().to_string(),
+                            "width_px": 2,
+                            "height_px": 2,
+                            "spatial_ref": spatial_ref,
+                            "gsd_m_per_px": 0.05
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&body).contains("georeferencing missing CRS"));
+
+    let product_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM products WHERE scene_id = ?1")
+            .bind(scene_id)
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(product_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn crop_intelligence_model_registry_registers_and_lists_versions() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -6356,6 +6624,88 @@ async fn seed_orthomosaic_frame_set(
     .await?;
 
     Ok(())
+}
+
+async fn seed_completed_orthomosaic_reconstruction(
+    ctx: &TestContext,
+    scene_id: &str,
+    field_id: &str,
+    season_id: &str,
+    frame_set_id: &str,
+    recon_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO orthomosaic_frame_sets
+            (frame_set_id, scene_id, field_id, season_id, frames_json, crs_hint, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(frame_set_id)
+    .bind(scene_id)
+    .bind(field_id)
+    .bind(season_id)
+    .bind(
+        json!([
+            {
+                "frame_id": "frame-001",
+                "capture_ts": "2026-06-01T12:00:00Z",
+                "gps": {
+                    "latitude": 41.10,
+                    "longitude": -96.70,
+                    "altitude": 120.0
+                }
+            },
+            {
+                "frame_id": "frame-002",
+                "capture_ts": "2026-06-01T12:00:02Z",
+                "gps": {
+                    "latitude": 41.11,
+                    "longitude": -96.69,
+                    "altitude": 121.0
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .bind("EPSG:4326")
+    .bind("2026-06-01T12:05:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO orthomosaic_reconstructions
+            (recon_id, frame_set_id, params_json, status, failure_reason, created_at, updated_at)
+        VALUES (?1, ?2, ?3, 'completed', NULL, ?4, ?4)
+        "#,
+    )
+    .bind(recon_id)
+    .bind(frame_set_id)
+    .bind(json!({"feature_detector": "orb"}).to_string())
+    .bind("2026-06-01T12:06:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
+}
+
+fn orthomosaic_tile_spatial_ref_json() -> serde_json::Value {
+    json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    })
 }
 
 async fn setup_golden_acceptance_fixture(

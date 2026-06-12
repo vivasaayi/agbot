@@ -1,7 +1,7 @@
 use crate::{
     error::{AppError, AppResult},
     ingest, landsat,
-    product_catalog::ProductPublishError,
+    product_catalog::{publish_georeferenced_product, ProductPublishError},
     shapefile,
     state::{AppState, SceneSearchCacheKey},
 };
@@ -47,10 +47,10 @@ use geojson::{
 use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb};
 use interop::{export_raster_geotiff, RasterProduct};
 use orthomosaic::{
-    build_frame_set_record, build_reconstruction_job, transition_reconstruction_status,
-    FramePoseRecord, FrameSetIngestError, FrameSetIngestRequest, FrameSetRecord,
-    ReconstructionJobError, ReconstructionJobRecord, ReconstructionJobRequest,
-    ReconstructionStatus,
+    build_frame_set_record, build_reconstruction_job, build_tiled_output_handoff,
+    transition_reconstruction_status, FramePoseRecord, FrameSetIngestError, FrameSetIngestRequest,
+    FrameSetRecord, ReconstructionJobError, ReconstructionJobRecord, ReconstructionJobRequest,
+    ReconstructionStatus, TiledOutputHandoff, TiledOutputHandoffError, TiledOutputHandoffRequest,
 };
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
@@ -124,6 +124,9 @@ pub struct ProductSummary {
     pub season_id: Option<String>,
     pub filename: String,
     pub content_type: String,
+    pub width_px: Option<u32>,
+    pub height_px: Option<u32>,
+    pub gsd_m_per_px: Option<f64>,
     pub spatial_ref: Option<RasterSpatialRef>,
     pub source_image_ids: Vec<String>,
     pub url_path: String,
@@ -156,6 +159,9 @@ pub struct LayerMetadata {
     pub field_id: Option<String>,
     pub season_id: Option<String>,
     pub product_kind: String,
+    pub width_px: Option<u32>,
+    pub height_px: Option<u32>,
+    pub gsd_m_per_px: Option<f64>,
     pub spatial_ref: RasterSpatialRef,
     pub source_image_ids: Vec<String>,
     pub freshness: LayerFreshness,
@@ -1281,6 +1287,9 @@ async fn create_rgb_product(state: &AppState, scene_id: &str, scene_dir: &FsPath
         INSERT INTO products (scene_id, kind, path, created_at)
         VALUES (?1, 'rgb', ?2, datetime('now'))
         ON CONFLICT(scene_id, kind) DO UPDATE SET path = excluded.path,
+                                                width_px = NULL,
+                                                height_px = NULL,
+                                                gsd_m_per_px = NULL,
                                                 created_at = datetime('now')
         "#,
     )
@@ -1367,6 +1376,9 @@ async fn upsert_product_path(
         INSERT INTO products (scene_id, kind, path, created_at)
         VALUES (?1, ?2, ?3, datetime('now'))
         ON CONFLICT(scene_id, kind) DO UPDATE SET path = excluded.path,
+                                                width_px = NULL,
+                                                height_px = NULL,
+                                                gsd_m_per_px = NULL,
                                                 created_at = datetime('now')
         "#,
     )
@@ -2341,6 +2353,78 @@ pub async fn update_orthomosaic_reconstruction_status(
     .map_err(Error::from)?;
 
     Ok(Json(updated))
+}
+
+pub async fn handoff_orthomosaic_tiles(
+    Path(recon_id): Path<String>,
+    State(state): State<AppState>,
+    Json(mut request): Json<TiledOutputHandoffRequest>,
+) -> AppResult<Json<TiledOutputHandoff>> {
+    let record = load_orthomosaic_reconstruction(&state, &recon_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if record.status != ReconstructionStatus::Completed {
+        return Err(AppError::BadRequest(format!(
+            "reconstruction {recon_id} must be completed before tiled handoff"
+        )));
+    }
+    let frame_set = load_orthomosaic_frame_set(&state, &record.frame_set_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    request.recon_id = recon_id;
+    if normalize_optional_text(Some(request.scene_id.clone())).as_deref()
+        != Some(frame_set.scene_id.as_str())
+    {
+        return Err(AppError::BadRequest(format!(
+            "handoff scene_id must match frame set scene_id {}",
+            frame_set.scene_id
+        )));
+    }
+
+    let handoff = build_tiled_output_handoff(request).map_err(tiled_output_handoff_error)?;
+    if handoff.recon_id != record.recon_id {
+        return Err(AppError::BadRequest(format!(
+            "handoff recon_id must match reconstruction {}",
+            record.recon_id
+        )));
+    }
+
+    for layer in &handoff.layers {
+        let product_path = PathBuf::from(&layer.uri);
+        let exists = fs::try_exists(&product_path)
+            .await
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+        if !exists {
+            return Err(AppError::BadRequest(format!(
+                "product {} output path does not exist: {}",
+                layer.product_kind,
+                product_path.display()
+            )));
+        }
+        publish_georeferenced_product(
+            &state.pool,
+            &handoff.scene_id,
+            &frame_set.field_id,
+            &frame_set.season_id,
+            &layer.product_kind,
+            &product_path,
+            &layer.spatial_ref,
+            layer.width_px,
+            layer.height_px,
+            layer.gsd_m_per_px,
+            handoff.source_image_ids.clone(),
+        )
+        .await
+        .map_err(|err| {
+            if is_product_publish_error(&err) {
+                AppError::BadRequest(err.to_string())
+            } else {
+                AppError::Anyhow(err)
+            }
+        })?;
+    }
+
+    Ok(Json(handoff))
 }
 
 pub async fn register_crop_model(
@@ -3766,11 +3850,13 @@ pub async fn export_layer_geotiff(
             Error::new(err).context("failed to decode layer scene metadata_json from database"),
         )
     })?;
-    let cell_count = raster_cell_count(image.metadata.width, image.metadata.height)?;
+    let width = layer.width_px.unwrap_or(image.metadata.width);
+    let height = layer.height_px.unwrap_or(image.metadata.height);
+    let cell_count = raster_cell_count(width, height)?;
     let report = export_raster_geotiff(RasterProduct {
         product_id: layer.layer_id.clone(),
-        width: image.metadata.width,
-        height: image.metadata.height,
+        width,
+        height,
         spatial_ref: layer.spatial_ref,
         cells: vec![0.0; cell_count],
     })
@@ -4033,7 +4119,8 @@ async fn collect_scene_products(
 
     let rows = sqlx::query(
         r#"
-        SELECT product_id, field_id, season_id, kind, path, spatial_ref_json, source_image_ids_json
+        SELECT product_id, field_id, season_id, kind, path, width_px, height_px, gsd_m_per_px,
+               spatial_ref_json, source_image_ids_json
         FROM products
         WHERE scene_id = ?1
         "#,
@@ -4070,6 +4157,9 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
             p.path,
             p.field_id AS product_field_id,
             p.season_id AS product_season_id,
+            p.width_px AS product_width_px,
+            p.height_px AS product_height_px,
+            p.gsd_m_per_px AS product_gsd_m_per_px,
             p.spatial_ref_json AS product_spatial_ref_json,
             p.source_image_ids_json,
             s.scene_id,
@@ -4108,6 +4198,9 @@ async fn load_layer_row(
             p.path,
             p.field_id AS product_field_id,
             p.season_id AS product_season_id,
+            p.width_px AS product_width_px,
+            p.height_px AS product_height_px,
+            p.gsd_m_per_px AS product_gsd_m_per_px,
             p.spatial_ref_json AS product_spatial_ref_json,
             p.source_image_ids_json,
             s.scene_id,
@@ -4199,31 +4292,50 @@ async fn layer_from_row(
 
     let scene_id: String = row.get("scene_id");
     let product_kind: String = row.get("kind");
-    let Some(spatial_ref_json) = row
-        .get::<Option<String>, _>("product_spatial_ref_json")
-        .or_else(|| row.get::<Option<String>, _>("scene_spatial_ref_json"))
-    else {
-        return if strict {
-            Err(AppError::BadRequest(format!(
-                "metadata-integrity: layer {scene_id}:{product_kind} has no asserted spatial_ref"
-            )))
-        } else {
-            Ok(None)
-        };
-    };
-    let spatial_ref =
-        serde_json::from_str::<RasterSpatialRef>(&spatial_ref_json).map_err(|err| {
-            AppError::Anyhow(Error::new(err).context("failed to decode layer spatial_ref"))
-        })?;
     let metadata_json: String = row.get("metadata_json");
     let image = serde_json::from_str::<MultispectralImage>(&metadata_json).map_err(|err| {
         AppError::Anyhow(
             Error::new(err).context("failed to decode layer scene metadata_json from database"),
         )
     })?;
-    if let Err(err) = assert_scene_spatial_ref_integrity(Some(&image), Some(&spatial_ref)) {
-        return if strict { Err(err) } else { Ok(None) };
-    }
+    let width_px = optional_u32(row.get("product_width_px"))?;
+    let height_px = optional_u32(row.get("product_height_px"))?;
+    let gsd_m_per_px = row.get("product_gsd_m_per_px");
+    let spatial_ref = match row.get::<Option<String>, _>("product_spatial_ref_json") {
+        Some(spatial_ref_json) => {
+            let decoded =
+                serde_json::from_str::<RasterSpatialRef>(&spatial_ref_json).map_err(|err| {
+                    AppError::Anyhow(Error::new(err).context("failed to decode layer spatial_ref"))
+                })?;
+            match (width_px, height_px) {
+                (Some(width), Some(height)) => {
+                    assert_raster_spatial_ref(Some(&decoded), width, height)
+                        .map_err(|err| AppError::BadRequest(format!("metadata-integrity: {err}")))?
+                }
+                _ => decoded,
+            }
+        }
+        None => {
+            let Some(spatial_ref_json) = row.get::<Option<String>, _>("scene_spatial_ref_json")
+            else {
+                return if strict {
+                    Err(AppError::BadRequest(format!(
+                        "metadata-integrity: layer {scene_id}:{product_kind} has no asserted spatial_ref"
+                    )))
+                } else {
+                    Ok(None)
+                };
+            };
+            let spatial_ref =
+                serde_json::from_str::<RasterSpatialRef>(&spatial_ref_json).map_err(|err| {
+                    AppError::Anyhow(Error::new(err).context("failed to decode layer spatial_ref"))
+                })?;
+            if let Err(err) = assert_scene_spatial_ref_integrity(Some(&image), Some(&spatial_ref)) {
+                return if strict { Err(err) } else { Ok(None) };
+            }
+            spatial_ref
+        }
+    };
 
     let source = row
         .get::<Option<String>, _>("source_path")
@@ -4247,6 +4359,9 @@ async fn layer_from_row(
         field_id,
         season_id,
         product_kind,
+        width_px,
+        height_px,
+        gsd_m_per_px,
         spatial_ref,
         source_image_ids: decode_source_image_ids(row.get("source_image_ids_json"))?,
         freshness: LayerFreshness {
@@ -4351,6 +4466,9 @@ fn build_product_summary(scene_id: &str, kind: &str, path: &FsPath) -> ProductSu
             .unwrap_or("unknown")
             .to_string(),
         content_type: content_type_for_path(path).to_string(),
+        width_px: None,
+        height_px: None,
+        gsd_m_per_px: None,
         spatial_ref: None,
         source_image_ids: Vec::new(),
         url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
@@ -4394,6 +4512,9 @@ fn product_summary_from_row(
             .unwrap_or("unknown")
             .to_string(),
         content_type: content_type_for_path(path).to_string(),
+        width_px: optional_u32(row.get("width_px"))?,
+        height_px: optional_u32(row.get("height_px"))?,
+        gsd_m_per_px: row.get("gsd_m_per_px"),
         spatial_ref,
         source_image_ids: decode_source_image_ids(row.get("source_image_ids_json"))?,
         url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
@@ -4410,6 +4531,16 @@ fn decode_source_image_ids(value: Option<String>) -> AppResult<Vec<String>> {
     serde_json::from_str::<Vec<String>>(&json).map_err(|err| {
         AppError::Anyhow(Error::new(err).context("failed to decode product source_image_ids_json"))
     })
+}
+
+fn optional_u32(value: Option<i64>) -> AppResult<Option<u32>> {
+    value
+        .map(|value| {
+            u32::try_from(value).map_err(|_| {
+                AppError::BadRequest("product raster dimensions are invalid".to_string())
+            })
+        })
+        .transpose()
 }
 
 async fn assert_scene_product_spatial_integrity(state: &AppState, scene_id: &str) -> AppResult<()> {
@@ -4860,6 +4991,10 @@ fn orthomosaic_ingest_error(error: FrameSetIngestError) -> AppError {
 }
 
 fn reconstruction_job_error(error: ReconstructionJobError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn tiled_output_handoff_error(error: TiledOutputHandoffError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
@@ -6683,6 +6818,26 @@ async fn orthomosaic_frame_set_exists(state: &AppState, frame_set_id: &str) -> A
             .map_err(Error::from)?;
 
     Ok(count > 0)
+}
+
+async fn load_orthomosaic_frame_set(
+    state: &AppState,
+    frame_set_id: &str,
+) -> AppResult<Option<FrameSetRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT frame_set_id, scene_id, field_id, season_id, frames_json, crs_hint, created_at
+        FROM orthomosaic_frame_sets
+        WHERE frame_set_id = ?1
+        "#,
+    )
+    .bind(frame_set_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_orthomosaic_frame_set_record(&row))
+        .transpose()
 }
 
 async fn load_orthomosaic_reconstruction(

@@ -521,6 +521,56 @@ pub struct GcpAccuracyReport {
     pub overall_rmse_m: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledRasterProductRequest {
+    pub uri: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    #[serde(default)]
+    pub spatial_ref: Option<RasterSpatialRef>,
+    pub gsd_m_per_px: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledOutputHandoffRequest {
+    pub scene_id: String,
+    pub recon_id: String,
+    pub generated_at: String,
+    pub source_image_ids: Vec<String>,
+    pub tile_size_px: u32,
+    pub mosaic: TiledRasterProductRequest,
+    pub dsm: TiledRasterProductRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TilePyramidLevel {
+    pub z: u8,
+    pub tile_columns: u32,
+    pub tile_rows: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledOutputLayer {
+    pub product_kind: String,
+    pub uri: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub gsd_m_per_px: f64,
+    pub tile_url_template: String,
+    pub tile_pyramid: Vec<TilePyramidLevel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledOutputHandoff {
+    pub scene_id: String,
+    pub recon_id: String,
+    pub generated_at: String,
+    pub source_image_ids: Vec<String>,
+    pub tile_size_px: u32,
+    pub layers: Vec<TiledOutputLayer>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FeatureMatchingError {
     #[error("frame set must include at least one frame")]
@@ -636,6 +686,31 @@ pub enum GcpRegistrationError {
     },
     #[error("GCP {gcp_id} contains a non-finite coordinate")]
     NonFiniteCoordinate { gcp_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum TiledOutputHandoffError {
+    #[error("scene_id cannot be empty")]
+    EmptySceneId,
+    #[error("recon_id cannot be empty")]
+    EmptyReconId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("source_image_ids must include at least one frame id")]
+    EmptySourceImageIds,
+    #[error("tile_size_px must be positive")]
+    InvalidTileSize,
+    #[error("product {product_kind} uri cannot be empty")]
+    EmptyUri { product_kind: String },
+    #[error("product {product_kind} raster dimensions must be positive")]
+    InvalidDimensions { product_kind: String },
+    #[error("product {product_kind} gsd_m_per_px must be finite and positive")]
+    InvalidGsd { product_kind: String },
+    #[error("product {product_kind} spatial_ref is invalid: {reason}")]
+    InvalidSpatialRef {
+        product_kind: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1358,6 +1433,47 @@ pub fn register_ground_control_points(
     })
 }
 
+pub fn build_tiled_output_handoff(
+    request: TiledOutputHandoffRequest,
+) -> Result<TiledOutputHandoff, TiledOutputHandoffError> {
+    let scene_id = normalize_optional_text(Some(request.scene_id))
+        .ok_or(TiledOutputHandoffError::EmptySceneId)?;
+    let recon_id = normalize_optional_text(Some(request.recon_id))
+        .ok_or(TiledOutputHandoffError::EmptyReconId)?;
+    let generated_at = normalize_optional_text(Some(request.generated_at))
+        .ok_or(TiledOutputHandoffError::EmptyGeneratedAt)?;
+    if request.tile_size_px == 0 {
+        return Err(TiledOutputHandoffError::InvalidTileSize);
+    }
+    let source_image_ids = request
+        .source_image_ids
+        .into_iter()
+        .filter_map(|source_id| normalize_optional_text(Some(source_id)))
+        .collect::<Vec<_>>();
+    if source_image_ids.is_empty() {
+        return Err(TiledOutputHandoffError::EmptySourceImageIds);
+    }
+
+    let layers = vec![
+        tiled_output_layer(
+            "orthomosaic",
+            &scene_id,
+            request.tile_size_px,
+            request.mosaic,
+        )?,
+        tiled_output_layer("dsm", &scene_id, request.tile_size_px, request.dsm)?,
+    ];
+
+    Ok(TiledOutputHandoff {
+        scene_id,
+        recon_id,
+        generated_at,
+        source_image_ids,
+        tile_size_px: request.tile_size_px,
+        layers,
+    })
+}
+
 impl FrameQaRecord {
     fn rect(&self) -> Rect {
         Rect {
@@ -1727,6 +1843,77 @@ fn gcp_residual(
         horizontal_residual_m: (dx_m.powi(2) + dy_m.powi(2)).sqrt(),
         vertical_residual_m: dz_m.abs(),
     })
+}
+
+fn tiled_output_layer(
+    product_kind: &str,
+    scene_id: &str,
+    tile_size_px: u32,
+    product: TiledRasterProductRequest,
+) -> Result<TiledOutputLayer, TiledOutputHandoffError> {
+    let product_kind = product_kind.to_string();
+    let uri = normalize_optional_text(Some(product.uri)).ok_or_else(|| {
+        TiledOutputHandoffError::EmptyUri {
+            product_kind: product_kind.clone(),
+        }
+    })?;
+    if product.width_px == 0 || product.height_px == 0 {
+        return Err(TiledOutputHandoffError::InvalidDimensions { product_kind });
+    }
+    if !product.gsd_m_per_px.is_finite() || product.gsd_m_per_px <= 0.0 {
+        return Err(TiledOutputHandoffError::InvalidGsd { product_kind });
+    }
+    let spatial_ref = assert_raster_spatial_ref(
+        product.spatial_ref.as_ref(),
+        product.width_px,
+        product.height_px,
+    )
+    .map_err(|error| TiledOutputHandoffError::InvalidSpatialRef {
+        product_kind: product_kind.clone(),
+        reason: error.to_string(),
+    })?;
+    let tile_url_template =
+        format!("/api/scenes/{scene_id}/products/{product_kind}/tiles/{{z}}/{{x}}/{{y}}.png");
+    let tile_pyramid = tile_pyramid(product.width_px, product.height_px, tile_size_px);
+
+    Ok(TiledOutputLayer {
+        product_kind,
+        uri,
+        width_px: product.width_px,
+        height_px: product.height_px,
+        spatial_ref,
+        gsd_m_per_px: product.gsd_m_per_px,
+        tile_url_template,
+        tile_pyramid,
+    })
+}
+
+fn tile_pyramid(width_px: u32, height_px: u32, tile_size_px: u32) -> Vec<TilePyramidLevel> {
+    let full_columns = width_px.div_ceil(tile_size_px).max(1);
+    let full_rows = height_px.div_ceil(tile_size_px).max(1);
+    let max_axis = full_columns.max(full_rows);
+    let mut levels = Vec::new();
+    let mut z = 0_u8;
+    let mut tiles_per_axis = 1_u32;
+    loop {
+        levels.push(TilePyramidLevel {
+            z,
+            tile_columns: tiles_per_axis.min(full_columns),
+            tile_rows: tiles_per_axis.min(full_rows),
+        });
+        if tiles_per_axis >= max_axis {
+            break;
+        }
+        let Some(next) = tiles_per_axis.checked_mul(2) else {
+            break;
+        };
+        let Some(next_z) = z.checked_add(1) else {
+            break;
+        };
+        tiles_per_axis = next;
+        z = next_z;
+    }
+    levels
 }
 
 fn dsm_cell_index(
@@ -2124,17 +2311,19 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 mod tests {
     use super::{
         build_frame_set_record, build_reconstruction_job, build_reprojection_error_report,
-        generate_dsm, run_feature_matching, run_frame_set_qa, run_orthorectified_mosaic,
-        run_sparse_sfm, transition_reconstruction_status, CameraExif, CameraImuPose, DensePoint,
-        DensePointCloud, DsmConfig, FeatureMatchingConfig, FieldCoverageExtent, FrameIngestRequest,
-        FrameQaReasonCode, FrameSetIngestError, FrameSetIngestRequest, FrameSetQaConfig,
-        GcpMarkedImagePoint, GcpRegistrationError, GcpRegistrationRequest, GcpSurveyedCoordinate,
-        GroundControlPoint, OrthomosaicConfig, OrthomosaicError, ReconstructionJobError,
-        ReconstructionJobRequest, ReconstructionStatus, ReprojectionReportConfig, SparseSfmConfig,
-        SparseSfmError, SparseSfmFailureReason,
+        build_tiled_output_handoff, generate_dsm, run_feature_matching, run_frame_set_qa,
+        run_orthorectified_mosaic, run_sparse_sfm, transition_reconstruction_status, CameraExif,
+        CameraImuPose, DensePoint, DensePointCloud, DsmConfig, FeatureMatchingConfig,
+        FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
+        FrameSetIngestRequest, FrameSetQaConfig, GcpMarkedImagePoint, GcpRegistrationError,
+        GcpRegistrationRequest, GcpSurveyedCoordinate, GroundControlPoint, OrthomosaicConfig,
+        OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest, ReconstructionStatus,
+        ReprojectionReportConfig, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
+        TiledOutputHandoffError, TiledOutputHandoffRequest, TiledRasterProductRequest,
     };
-    use shared::schemas::assert_raster_spatial_ref;
-    use shared::schemas::GpsCoords;
+    use shared::schemas::{
+        assert_raster_spatial_ref, GeoBounds, GpsCoords, RasterResolution, RasterSpatialRef,
+    };
 
     #[test]
     fn frame_metadata_input_parses_exif_gps_imu_pose() {
@@ -2729,6 +2918,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tiled_output_handoff_reports_pyramid_metadata_for_mosaic_and_dsm() {
+        let handoff = build_tiled_output_handoff(tiled_handoff_request(
+            Some(tile_spatial_ref()),
+            Some(tile_spatial_ref()),
+        ))
+        .expect("handoff should build for asserted rasters");
+
+        assert_eq!(handoff.scene_id, "ortho-scene-1");
+        assert_eq!(handoff.recon_id, "recon-ortho-1");
+        assert_eq!(handoff.source_image_ids, vec!["frame-001", "frame-002"]);
+        assert_eq!(handoff.tile_size_px, 1);
+        assert_eq!(handoff.layers.len(), 2);
+        assert_eq!(handoff.layers[0].product_kind, "orthomosaic");
+        assert_eq!(
+            handoff.layers[0].spatial_ref.crs.as_deref(),
+            Some("EPSG:4326")
+        );
+        assert_close(handoff.layers[0].gsd_m_per_px, 0.05);
+        assert_eq!(handoff.layers[0].tile_pyramid.len(), 2);
+        assert_eq!(handoff.layers[0].tile_pyramid[1].z, 1);
+        assert_eq!(handoff.layers[0].tile_pyramid[1].tile_columns, 2);
+        assert_eq!(handoff.layers[1].product_kind, "dsm");
+    }
+
+    #[test]
+    fn tiled_output_handoff_refuses_missing_raster_crs() {
+        let mut missing_crs = tile_spatial_ref();
+        missing_crs.crs = None;
+
+        let error = build_tiled_output_handoff(tiled_handoff_request(
+            Some(missing_crs),
+            Some(tile_spatial_ref()),
+        ))
+        .expect_err("handoff must refuse untraceable rasters");
+
+        assert_eq!(
+            error,
+            TiledOutputHandoffError::InvalidSpatialRef {
+                product_kind: "orthomosaic".to_string(),
+                reason: "georeferencing missing CRS".to_string()
+            }
+        );
+    }
+
     fn qa_frame_set(frames: Vec<FrameIngestRequest>) -> super::FrameSetRecord {
         build_frame_set_record(
             FrameSetIngestRequest {
@@ -2935,6 +3169,48 @@ mod tests {
             estimated_x_m,
             estimated_y_m,
             estimated_z_m,
+        }
+    }
+
+    fn tiled_handoff_request(
+        mosaic_spatial_ref: Option<RasterSpatialRef>,
+        dsm_spatial_ref: Option<RasterSpatialRef>,
+    ) -> TiledOutputHandoffRequest {
+        TiledOutputHandoffRequest {
+            scene_id: " ortho-scene-1 ".to_string(),
+            recon_id: " recon-ortho-1 ".to_string(),
+            generated_at: " 2026-06-01T12:08:00Z ".to_string(),
+            source_image_ids: vec![" frame-001 ".to_string(), " frame-002 ".to_string()],
+            tile_size_px: 1,
+            mosaic: TiledRasterProductRequest {
+                uri: " /data/ortho-scene-1/products/orthomosaic/orthomosaic.png ".to_string(),
+                width_px: 2,
+                height_px: 2,
+                spatial_ref: mosaic_spatial_ref,
+                gsd_m_per_px: 0.05,
+            },
+            dsm: TiledRasterProductRequest {
+                uri: " /data/ortho-scene-1/products/dsm/dsm.png ".to_string(),
+                width_px: 2,
+                height_px: 2,
+                spatial_ref: dsm_spatial_ref,
+                gsd_m_per_px: 0.05,
+            },
+        }
+    }
+
+    fn tile_spatial_ref() -> RasterSpatialRef {
+        RasterSpatialRef {
+            georeferenced: true,
+            crs: Some("EPSG:4326".to_string()),
+            bbox: Some(GeoBounds {
+                min_lon: -96.7,
+                min_lat: 41.1,
+                max_lon: -96.6,
+                max_lat: 41.2,
+            }),
+            geo_transform: Some([-96.7, 0.05, 0.0, 41.2, 0.0, -0.05]),
+            resolution: Some(RasterResolution { x: 0.05, y: 0.05 }),
         }
     }
 

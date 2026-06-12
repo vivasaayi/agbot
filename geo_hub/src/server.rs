@@ -69,6 +69,10 @@ pub fn build_router(state: AppState) -> Router {
             put(routes::update_orthomosaic_reconstruction_status),
         )
         .route(
+            "/api/orthomosaic/reconstructions/:recon_id/handoff",
+            post(routes::handoff_orthomosaic_tiles),
+        )
+        .route(
             "/api/crop-intelligence/models",
             get(routes::list_crop_models).post(routes::register_crop_model),
         )
