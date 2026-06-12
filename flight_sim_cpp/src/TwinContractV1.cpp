@@ -204,6 +204,16 @@ TwinContractSchemaV1 build_schema() {
             },
         },
         {
+            "TwinCommandAckV1",
+            {
+                "contract_version",
+                "command_id",
+                "accepted",
+                "error",
+                "telemetry",
+            },
+        },
+        {
             "TwinCapabilitiesV1",
             {
                 "contract_version",
@@ -227,6 +237,7 @@ TwinContractSchemaV1 build_schema() {
         "wind_field",
         "sensor_noise_calibration",
         "lidar_raycast",
+        "twin_backend_api",
     };
     schema.schema_hash = sha256_hex(schema_json_without_hash(schema));
     return schema;

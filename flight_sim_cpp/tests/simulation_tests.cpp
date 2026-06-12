@@ -11,6 +11,7 @@
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
 #include "agbot_flight_sim/TraceDiff.hpp"
+#include "agbot_flight_sim/TwinBackend.hpp"
 #include "agbot_flight_sim/TwinContractV1.hpp"
 
 #include <cassert>
@@ -239,6 +240,57 @@ void test_mission_round_trip() {
     const auto reloaded = MissionLoader::load_from_text(json);
     assert(reloaded.name == mission.name);
     assert(reloaded.waypoints.size() == mission.waypoints.size());
+}
+
+void test_twin_backend_executes_shared_command_and_returns_telemetry() {
+    auto mission = MissionLoader::load_from_text(kMissionJson);
+    agbot::flight_sim::TwinBackend backend(std::move(mission));
+
+    agbot::flight_sim::FlightCommandV1 arm_command;
+    arm_command.command_id = "cmd-arm-1";
+    arm_command.command_type = agbot::flight_sim::TwinCommandType::Arm;
+    arm_command.issued_at_unix_ms = 1'800'000'000'000;
+
+    const auto arm_ack = backend.dispatch(arm_command);
+    assert(arm_ack.accepted);
+    assert(!arm_ack.error.has_value());
+    assert(arm_ack.telemetry.has_value());
+    assert(arm_ack.telemetry->armed);
+    assert(arm_ack.telemetry->contract_version == agbot::flight_sim::kTwinContractVersion);
+    assert(arm_ack.telemetry->command_id == "cmd-arm-1");
+
+    agbot::flight_sim::FlightCommandV1 step_command;
+    step_command.command_id = "cmd-step-1";
+    step_command.command_type = agbot::flight_sim::TwinCommandType::Step;
+    step_command.issued_at_unix_ms = 1'800'000'000'250;
+    step_command.step_duration_s = 0.25;
+
+    const auto step_ack = backend.dispatch(step_command);
+    assert(step_ack.accepted);
+    assert(step_ack.telemetry.has_value());
+    assert(step_ack.telemetry->time_s > 0.0);
+    assert(step_ack.telemetry->target_waypoint_index == backend.simulation().state().target_waypoint_index);
+    assert(step_ack.to_json().find("\"command_id\":\"cmd-step-1\"") != std::string::npos);
+    assert(step_ack.to_json().find("\"telemetry\":{") != std::string::npos);
+}
+
+void test_twin_backend_unavailable_fails_closed_without_telemetry() {
+    auto mission = MissionLoader::load_from_text(kMissionJson);
+    agbot::flight_sim::TwinBackendConfig config;
+    config.available = false;
+    agbot::flight_sim::TwinBackend backend(std::move(mission), config);
+
+    agbot::flight_sim::FlightCommandV1 command;
+    command.command_id = "cmd-no-backend";
+    command.command_type = agbot::flight_sim::TwinCommandType::Arm;
+    command.issued_at_unix_ms = 1'800'000'000'000;
+
+    const auto ack = backend.dispatch(command);
+    assert(!ack.accepted);
+    assert(ack.error.has_value());
+    assert(ack.error->code == "twin_unavailable");
+    assert(!ack.telemetry.has_value());
+    assert(!backend.simulation().state().armed);
 }
 
 void test_failsafe_low_battery() {
@@ -721,8 +773,10 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.has_type("SimulationTraceV1"));
     assert(schema.has_type("ScenarioManifestV1"));
     assert(schema.has_type("TwinErrorV1"));
+    assert(schema.has_type("TwinCommandAckV1"));
     assert(schema.has_type("TwinCapabilitiesV1"));
     assert(schema.type_has_field("TelemetryV1", "battery_percent"));
+    assert(schema.type_has_field("TwinCommandAckV1", "telemetry"));
     assert(schema.type_has_field("SimulationTraceV1", "contract_version"));
     assert(schema.type_has_field("ScenarioManifestV1", "contract_schema_hash"));
     assert(schema.type_has_field("ScenarioManifestV1", "run_id"));
@@ -739,6 +793,7 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.has_capability("wind_field"));
     assert(schema.has_capability("sensor_noise_calibration"));
     assert(schema.has_capability("lidar_raycast"));
+    assert(schema.has_capability("twin_backend_api"));
     assert(schema.to_json().find("\"schema_hash\":\"" + schema.schema_hash + "\"") != std::string::npos);
 }
 
@@ -978,6 +1033,8 @@ int main() {
     test_manual_controls_move_drone();
     test_steady_wind_disturbs_ground_track();
     test_mission_round_trip();
+    test_twin_backend_executes_shared_command_and_returns_telemetry();
+    test_twin_backend_unavailable_fails_closed_without_telemetry();
     test_failsafe_low_battery();
     test_safety_parity_harness_covers_required_rules();
     test_drone_simulation_enforces_altitude_safety_rule();

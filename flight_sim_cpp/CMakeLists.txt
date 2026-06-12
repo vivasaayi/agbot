@@ -21,6 +21,7 @@ add_library(agbot_flight_sim_core
     src/TelemetryReplay.cpp
     src/TelemetryRecorder.cpp
     src/TraceDiff.cpp
+    src/TwinBackend.cpp
     src/TwinContractV1.cpp
 )
 
