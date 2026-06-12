@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod config;
 pub mod control_plane;
 pub mod error;
+pub mod fleet_alerts;
 pub mod logging;
 pub mod observability;
 pub mod plugin_extensions;
@@ -14,6 +15,7 @@ pub mod schemas;
 pub mod types;
 
 pub use control_plane::*;
+pub use fleet_alerts::*;
 pub use logging::{
     active_logging_context, current_operation_span, init_logging, init_logging_with_context,
     logging_operation_span, with_correlation_id, LoggingContext, LoggingNodeIdSource,
