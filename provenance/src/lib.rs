@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+const EVIDENCE_DIGEST_ALGORITHM: &str = "sha256";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,9 +47,35 @@ pub struct LineageRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceObject {
+    pub evidence_kind: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredEvidence {
+    pub digest: String,
+    pub algorithm: String,
+    pub object: EvidenceObject,
+    pub canonical_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceIntegrityProof {
+    pub digest: String,
+    pub algorithm: String,
+    pub byte_len: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LineageLedger {
     records: BTreeMap<String, LineageRecord>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EvidenceStore {
+    objects: BTreeMap<String, StoredEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -61,6 +90,10 @@ pub enum ProvenanceError {
     EmptyOperator { artifact_id: String },
     #[error("created_at cannot be empty for {artifact_id}")]
     EmptyCreatedAt { artifact_id: String },
+    #[error("evidence_kind cannot be empty")]
+    EmptyEvidenceKind,
+    #[error("evidence digest cannot be empty")]
+    EmptyEvidenceDigest,
     #[error("lineage already exists for artifact {artifact_id}")]
     DuplicateArtifactId { artifact_id: String },
     #[error("unknown input artifact {input_artifact_id} for {artifact_id}")]
@@ -68,6 +101,15 @@ pub enum ProvenanceError {
         artifact_id: String,
         input_artifact_id: String,
     },
+    #[error("unknown evidence digest {digest}")]
+    UnknownEvidenceDigest { digest: String },
+    #[error("evidence digest mismatch expected {expected_digest} actual {actual_digest}")]
+    EvidenceDigestMismatch {
+        expected_digest: String,
+        actual_digest: String,
+    },
+    #[error("evidence serialization failed: {details}")]
+    EvidenceSerializationFailed { details: String },
 }
 
 impl LineageLedger {
@@ -103,6 +145,67 @@ impl LineageLedger {
 
     pub fn artifact_count(&self) -> usize {
         self.records.len()
+    }
+}
+
+impl EvidenceStore {
+    pub fn store_evidence(
+        &mut self,
+        object: EvidenceObject,
+    ) -> Result<StoredEvidence, ProvenanceError> {
+        let object = normalize_evidence_object(object)?;
+        let canonical_bytes = canonical_evidence_bytes(&object)?;
+        let digest = evidence_digest_for_bytes(&canonical_bytes);
+
+        if let Some(existing) = self.objects.get(&digest) {
+            return Ok(existing.clone());
+        }
+
+        let stored = StoredEvidence {
+            digest: digest.clone(),
+            algorithm: EVIDENCE_DIGEST_ALGORITHM.to_string(),
+            object,
+            canonical_bytes,
+        };
+        self.objects.insert(digest, stored.clone());
+        Ok(stored)
+    }
+
+    pub fn fetch_evidence(&self, digest: &str) -> Option<StoredEvidence> {
+        let digest = normalize_optional_text(digest)?;
+        self.objects.get(&digest).cloned()
+    }
+
+    pub fn verify_evidence_bytes(
+        &self,
+        digest: &str,
+        bytes: &[u8],
+    ) -> Result<EvidenceIntegrityProof, ProvenanceError> {
+        let expected_digest =
+            normalize_required_text(digest.to_string(), ProvenanceError::EmptyEvidenceDigest)?;
+        if !self.objects.contains_key(&expected_digest) {
+            return Err(ProvenanceError::UnknownEvidenceDigest {
+                digest: expected_digest,
+            });
+        }
+
+        let actual_digest = evidence_digest_for_bytes(bytes);
+        if actual_digest != expected_digest {
+            return Err(ProvenanceError::EvidenceDigestMismatch {
+                expected_digest,
+                actual_digest,
+            });
+        }
+
+        Ok(EvidenceIntegrityProof {
+            digest: actual_digest,
+            algorithm: EVIDENCE_DIGEST_ALGORITHM.to_string(),
+            byte_len: bytes.len(),
+        })
+    }
+
+    pub fn evidence_count(&self) -> usize {
+        self.objects.len()
     }
 }
 
@@ -142,6 +245,41 @@ fn normalize_lineage_record(mut record: LineageRecord) -> Result<LineageRecord, 
     Ok(record)
 }
 
+fn normalize_evidence_object(
+    mut object: EvidenceObject,
+) -> Result<EvidenceObject, ProvenanceError> {
+    object.evidence_kind =
+        normalize_required_text(object.evidence_kind, ProvenanceError::EmptyEvidenceKind)?;
+    Ok(object)
+}
+
+fn canonical_evidence_bytes(object: &EvidenceObject) -> Result<Vec<u8>, ProvenanceError> {
+    serde_json::to_vec(object).map_err(|error| ProvenanceError::EvidenceSerializationFailed {
+        details: error.to_string(),
+    })
+}
+
+fn evidence_digest_for_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    format!(
+        "{}:{}",
+        EVIDENCE_DIGEST_ALGORITHM,
+        lowercase_hex(digest.as_slice())
+    )
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
+}
+
 fn normalize_required_text(
     value: String,
     error: ProvenanceError,
@@ -162,7 +300,8 @@ fn normalize_optional_text(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactKind, LineageLedger, LineageRecord, ProvenanceError, ProvenanceParameters,
+        ArtifactKind, EvidenceObject, EvidenceStore, LineageLedger, LineageRecord, ProvenanceError,
+        ProvenanceParameters,
     };
 
     #[test]
@@ -238,6 +377,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn evidence_store_addresses_object_by_digest_and_retrieves_it() {
+        let mut store = EvidenceStore::default();
+
+        let stored = store
+            .store_evidence(sample_evidence())
+            .expect("evidence should be stored by digest");
+
+        assert_eq!(stored.algorithm, "sha256");
+        assert!(stored.digest.starts_with("sha256:"));
+        assert_eq!(store.evidence_count(), 1);
+        assert_eq!(store.fetch_evidence(&stored.digest), Some(stored.clone()));
+        let proof = store
+            .verify_evidence_bytes(&stored.digest, &stored.canonical_bytes)
+            .expect("stored bytes should verify");
+        assert_eq!(proof.digest, stored.digest);
+        assert_eq!(proof.byte_len, stored.canonical_bytes.len());
+    }
+
+    #[test]
+    fn evidence_store_deduplicates_identical_objects() {
+        let mut store = EvidenceStore::default();
+
+        let first = store
+            .store_evidence(sample_evidence())
+            .expect("first evidence should store");
+        let second = store
+            .store_evidence(sample_evidence())
+            .expect("duplicate evidence should deduplicate");
+
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(store.evidence_count(), 1);
+    }
+
+    #[test]
+    fn altered_evidence_bytes_fail_integrity_check_with_reason() {
+        let mut store = EvidenceStore::default();
+        let stored = store
+            .store_evidence(sample_evidence())
+            .expect("evidence should store");
+        let mut altered_bytes = stored.canonical_bytes.clone();
+        altered_bytes.push(b'\n');
+
+        let error = store
+            .verify_evidence_bytes(&stored.digest, &altered_bytes)
+            .expect_err("altered bytes should fail digest verification");
+
+        match error {
+            ProvenanceError::EvidenceDigestMismatch {
+                expected_digest,
+                actual_digest,
+            } => {
+                assert_eq!(expected_digest, stored.digest);
+                assert_ne!(actual_digest, expected_digest);
+            }
+            other => panic!("expected digest mismatch, got {other:?}"),
+        }
+    }
+
     fn seed_product(ledger: &mut LineageLedger) {
         ledger
             .record_lineage(scene_lineage())
@@ -290,6 +488,21 @@ mod tests {
             })),
             operator: "operator:dsp-7".to_string(),
             created_at: "2026-06-12T13:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_evidence() -> EvidenceObject {
+        EvidenceObject {
+            evidence_kind: "finding_evidence".to_string(),
+            payload: serde_json::json!({
+                "finding_id": "finding:09:stress-ne-zone",
+                "raster_ref": "raster:ndvi:alpha-2026-06-12",
+                "mask_ref": "mask:stress-ne-zone",
+                "counts": {
+                    "pixels_flagged": 1842,
+                    "pixels_total": 12000
+                }
+            }),
         }
     }
 }
