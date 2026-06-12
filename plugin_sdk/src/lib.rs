@@ -92,6 +92,48 @@ pub struct CapabilityAuditEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginExecutionLimits {
+    pub max_runtime_ms: u64,
+    pub max_memory_mb: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginExecutionPlan {
+    pub plugin_id: String,
+    pub required_capabilities: Vec<String>,
+    pub estimated_runtime_ms: u64,
+    pub estimated_memory_mb: u64,
+    pub result: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxExecutionStatus {
+    Completed,
+    Terminated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxTerminationReason {
+    CapabilityViolation,
+    TimeLimitExceeded,
+    MemoryLimitExceeded,
+    UnknownPlugin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxExecutionOutcome {
+    pub plugin_id: String,
+    pub status: SandboxExecutionStatus,
+    pub termination_reason: Option<SandboxTerminationReason>,
+    pub result: Option<String>,
+    pub estimated_runtime_ms: u64,
+    pub estimated_memory_mb: u64,
+    pub capability_audit: Vec<CapabilityAuditEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestViolation {
     pub field: ManifestField,
     pub reason: ManifestRejectionReason,
@@ -181,6 +223,78 @@ impl PluginHost {
 
     pub fn capability_audit_entries(&self) -> Vec<CapabilityAuditEntry> {
         self.capability_audit.clone()
+    }
+
+    pub fn execute_sandboxed(
+        &mut self,
+        plan: PluginExecutionPlan,
+        limits: PluginExecutionLimits,
+        attempted_at: &str,
+    ) -> SandboxExecutionOutcome {
+        let plugin_id = normalize_optional_text(plan.plugin_id).unwrap_or_default();
+        if !self.registrations.contains_key(&plugin_id) {
+            return SandboxExecutionOutcome {
+                plugin_id,
+                status: SandboxExecutionStatus::Terminated,
+                termination_reason: Some(SandboxTerminationReason::UnknownPlugin),
+                result: None,
+                estimated_runtime_ms: plan.estimated_runtime_ms,
+                estimated_memory_mb: plan.estimated_memory_mb,
+                capability_audit: Vec::new(),
+            };
+        }
+
+        let mut capability_audit = Vec::new();
+        for capability in plan.required_capabilities {
+            let entry = self.check_capability(&plugin_id, &capability, attempted_at);
+            let denied = entry.decision == CapabilityDecision::Denied;
+            capability_audit.push(entry);
+            if denied {
+                return SandboxExecutionOutcome {
+                    plugin_id,
+                    status: SandboxExecutionStatus::Terminated,
+                    termination_reason: Some(SandboxTerminationReason::CapabilityViolation),
+                    result: None,
+                    estimated_runtime_ms: plan.estimated_runtime_ms,
+                    estimated_memory_mb: plan.estimated_memory_mb,
+                    capability_audit,
+                };
+            }
+        }
+
+        if plan.estimated_runtime_ms > limits.max_runtime_ms {
+            return SandboxExecutionOutcome {
+                plugin_id,
+                status: SandboxExecutionStatus::Terminated,
+                termination_reason: Some(SandboxTerminationReason::TimeLimitExceeded),
+                result: None,
+                estimated_runtime_ms: plan.estimated_runtime_ms,
+                estimated_memory_mb: plan.estimated_memory_mb,
+                capability_audit,
+            };
+        }
+
+        if plan.estimated_memory_mb > limits.max_memory_mb {
+            return SandboxExecutionOutcome {
+                plugin_id,
+                status: SandboxExecutionStatus::Terminated,
+                termination_reason: Some(SandboxTerminationReason::MemoryLimitExceeded),
+                result: None,
+                estimated_runtime_ms: plan.estimated_runtime_ms,
+                estimated_memory_mb: plan.estimated_memory_mb,
+                capability_audit,
+            };
+        }
+
+        SandboxExecutionOutcome {
+            plugin_id,
+            status: SandboxExecutionStatus::Completed,
+            termination_reason: None,
+            result: Some(plan.result),
+            estimated_runtime_ms: plan.estimated_runtime_ms,
+            estimated_memory_mb: plan.estimated_memory_mb,
+            capability_audit,
+        }
     }
 }
 
@@ -329,7 +443,8 @@ fn normalize_optional_text(value: String) -> Option<String> {
 mod tests {
     use super::{
         CapabilityDecision, CapabilityViolationReason, ManifestField, ManifestRejectionReason,
-        PluginHost, PluginRegistrationError, RawPluginManifest,
+        PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginRegistrationError,
+        RawPluginManifest, SandboxExecutionStatus, SandboxTerminationReason,
     };
     use shared::plugin_extensions::ExtensionPointKind;
 
@@ -494,6 +609,72 @@ mod tests {
         assert_eq!(host.capability_audit_entries().len(), 1);
     }
 
+    #[test]
+    fn sandbox_executes_well_behaved_plugin_within_limits() {
+        let mut host = PluginHost::default();
+        host.register_plugin(read_scene_manifest())
+            .expect("plugin should register");
+
+        let outcome = host.execute_sandboxed(
+            sandbox_plan("plugin.scene_reader", vec!["read:scene"], 25, 64),
+            sandbox_limits(),
+            "2026-06-12T12:10:00Z",
+        );
+
+        assert_eq!(outcome.status, SandboxExecutionStatus::Completed);
+        assert_eq!(outcome.termination_reason, None);
+        assert_eq!(outcome.result, Some("scene stats complete".to_string()));
+        assert_eq!(
+            outcome.capability_audit[0].decision,
+            CapabilityDecision::Permitted
+        );
+    }
+
+    #[test]
+    fn sandbox_terminates_resource_limit_breach_and_host_survives() {
+        let mut host = PluginHost::default();
+        host.register_plugin(read_scene_manifest())
+            .expect("plugin should register");
+
+        let outcome = host.execute_sandboxed(
+            sandbox_plan("plugin.scene_reader", vec!["read:scene"], 250, 64),
+            sandbox_limits(),
+            "2026-06-12T12:11:00Z",
+        );
+
+        assert_eq!(outcome.status, SandboxExecutionStatus::Terminated);
+        assert_eq!(
+            outcome.termination_reason,
+            Some(SandboxTerminationReason::TimeLimitExceeded)
+        );
+        assert_eq!(host.list_plugins().len(), 1);
+        assert_eq!(host.capability_audit_entries().len(), 1);
+    }
+
+    #[test]
+    fn sandbox_terminates_undeclared_capability_before_execution() {
+        let mut host = PluginHost::default();
+        host.register_plugin(read_scene_manifest())
+            .expect("plugin should register");
+
+        let outcome = host.execute_sandboxed(
+            sandbox_plan("plugin.scene_reader", vec!["write:field"], 25, 64),
+            sandbox_limits(),
+            "2026-06-12T12:12:00Z",
+        );
+
+        assert_eq!(outcome.status, SandboxExecutionStatus::Terminated);
+        assert_eq!(
+            outcome.termination_reason,
+            Some(SandboxTerminationReason::CapabilityViolation)
+        );
+        assert_eq!(
+            outcome.capability_audit[0].reason,
+            Some(CapabilityViolationReason::UndeclaredCapability)
+        );
+        assert_eq!(outcome.result, None);
+    }
+
     fn custom_index_manifest() -> RawPluginManifest {
         RawPluginManifest {
             plugin_id: "plugin.custom_ndvi".to_string(),
@@ -515,6 +696,31 @@ mod tests {
             host_api_version: "2026.1".to_string(),
             capabilities: vec!["read:scene".to_string()],
             entrypoint: "scene_reader::run".to_string(),
+        }
+    }
+
+    fn sandbox_limits() -> PluginExecutionLimits {
+        PluginExecutionLimits {
+            max_runtime_ms: 100,
+            max_memory_mb: 128,
+        }
+    }
+
+    fn sandbox_plan(
+        plugin_id: &str,
+        required_capabilities: Vec<&str>,
+        estimated_runtime_ms: u64,
+        estimated_memory_mb: u64,
+    ) -> PluginExecutionPlan {
+        PluginExecutionPlan {
+            plugin_id: plugin_id.to_string(),
+            required_capabilities: required_capabilities
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            estimated_runtime_ms,
+            estimated_memory_mb,
+            result: "scene stats complete".to_string(),
         }
     }
 }
