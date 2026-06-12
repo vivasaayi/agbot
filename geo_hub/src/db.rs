@@ -622,6 +622,28 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS alert_fired_alerts (
+            alert_id TEXT PRIMARY KEY,
+            matched_rule_id TEXT NOT NULL,
+            source_event_ref TEXT NOT NULL,
+            source_domain TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            subject_ref TEXT NOT NULL,
+            field_id TEXT,
+            evidence_refs_json TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            channels_json TEXT NOT NULL,
+            fired_at TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS compliance_records (
             record_id TEXT NOT NULL,
             version INTEGER NOT NULL,
@@ -880,6 +902,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_crop_model_events_model_version
         ON crop_model_events(model_id, version);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_alert_fired_alerts_source_field
+        ON alert_fired_alerts(source_domain, field_id, fired_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_alert_fired_alerts_severity_time
+        ON alert_fired_alerts(severity, fired_at);
         "#,
     )
     .execute(pool)

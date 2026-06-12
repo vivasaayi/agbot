@@ -20,6 +20,7 @@ chrono = { workspace = true }
 geojson = { workspace = true }
 sqlx = { version = "0.7", default-features = false, features = ["sqlite", "runtime-tokio-rustls", "macros"] }
 shared = { path = "../shared" }
+alerting = { path = "../alerting" }
 imagery_processor = { path = "../imagery_processor" }
 orthomosaic = { path = "../orthomosaic" }
 crop_intelligence = { path = "../crop_intelligence" }

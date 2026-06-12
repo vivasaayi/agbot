@@ -1879,6 +1879,186 @@ async fn fleet_health_indicators_persist_timeseries_and_explicit_gaps() -> Resul
 }
 
 #[tokio::test]
+async fn fired_alert_history_is_filterable_paginable_and_not_fabricated() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    post_fired_alert(
+        &ctx,
+        json!({
+            "alert_id": "alert-field-critical-001",
+            "matched_rule_id": "rule-sensor-stale-critical",
+            "source_event_ref": "alert-candidate-000010",
+            "source_domain": "27-soil-iot-sensor-network",
+            "event_type": "sensor_stale",
+            "subject_ref": "field:field-alert-001",
+            "field_id": "field-alert-001",
+            "evidence_refs": [
+                "reading:soil-probe-001:latest",
+                "gap:mavlink:2026-06-12T10:00:00Z"
+            ],
+            "severity": "critical",
+            "channels": ["in_app"],
+            "fired_at": "2026-06-12T10:00:00Z",
+            "explanation": "rule-sensor-stale-critical matched sensor_stale; evidence refs: reading:soil-probe-001:latest,gap:mavlink:2026-06-12T10:00:00Z"
+        }),
+    )
+    .await?;
+    post_fired_alert(
+        &ctx,
+        json!({
+            "alert_id": "alert-field-critical-002",
+            "matched_rule_id": "rule-sensor-stale-critical",
+            "source_event_ref": "alert-candidate-000011",
+            "source_domain": "27-soil-iot-sensor-network",
+            "event_type": "sensor_stale",
+            "subject_ref": "field:field-alert-001",
+            "field_id": "field-alert-001",
+            "evidence_refs": ["reading:soil-probe-002:latest"],
+            "severity": "critical",
+            "channels": ["in_app"],
+            "fired_at": "2026-06-12T10:05:00Z",
+            "explanation": "rule-sensor-stale-critical matched sensor_stale; evidence refs: reading:soil-probe-002:latest"
+        }),
+    )
+    .await?;
+    post_fired_alert(
+        &ctx,
+        json!({
+            "alert_id": "alert-field-warning-001",
+            "matched_rule_id": "rule-sensor-stale-warning",
+            "source_event_ref": "alert-candidate-000012",
+            "source_domain": "25-predictive-maintenance-fleet-health",
+            "event_type": "component_stale",
+            "subject_ref": "component:battery-pack-001",
+            "field_id": null,
+            "evidence_refs": ["component:battery-pack-001"],
+            "severity": "warning",
+            "channels": ["in_app"],
+            "fired_at": "2026-06-12T10:10:00Z",
+            "explanation": "rule-sensor-stale-warning matched component_stale"
+        }),
+    )
+    .await?;
+
+    let page_one = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/api/alerting/fired-alerts?source_domain=27-soil-iot-sensor-network&field_id=field-alert-001&severity=critical&start=2026-06-12T09:59:00Z&end=2026-06-12T10:06:00Z&page=1&page_size=1",
+                )
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(page_one.status(), StatusCode::OK);
+    let body = to_bytes(page_one.into_body(), 64 * 1024).await?;
+    let page_one_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        page_one_json.get("total").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        page_one_json.get("page").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        page_one_json
+            .pointer("/alerts/0/alert_id")
+            .and_then(|value| value.as_str()),
+        Some("alert-field-critical-002")
+    );
+    assert_eq!(
+        page_one_json
+            .pointer("/alerts/0/matched_rule_id")
+            .and_then(|value| value.as_str()),
+        Some("rule-sensor-stale-critical")
+    );
+    assert_eq!(
+        page_one_json
+            .pointer("/alerts/0/evidence_refs/0")
+            .and_then(|value| value.as_str()),
+        Some("reading:soil-probe-002:latest")
+    );
+    assert!(page_one_json
+        .pointer("/alerts/0/explanation")
+        .and_then(|value| value.as_str())
+        .is_some_and(|explanation| explanation.contains("rule-sensor-stale-critical")));
+
+    let page_two = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/api/alerting/fired-alerts?source_domain=27-soil-iot-sensor-network&field_id=field-alert-001&severity=critical&start=2026-06-12T09:59:00Z&end=2026-06-12T10:06:00Z&page=2&page_size=1",
+                )
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(page_two.status(), StatusCode::OK);
+    let body = to_bytes(page_two.into_body(), 64 * 1024).await?;
+    let page_two_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        page_two_json
+            .pointer("/alerts/0/alert_id")
+            .and_then(|value| value.as_str()),
+        Some("alert-field-critical-001")
+    );
+
+    let unknown_source = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/alerting/fired-alerts?source_domain=15-weather&page=1&page_size=10")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(unknown_source.status(), StatusCode::OK);
+    let body = to_bytes(unknown_source.into_body(), 64 * 1024).await?;
+    let empty_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        empty_json
+            .get("alerts")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let missing_alert = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/alerting/fired-alerts/never-fired")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(missing_alert.status(), StatusCode::NOT_FOUND);
+
+    let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alert_fired_alerts")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(stored_count, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn soil_iot_device_registry_registers_and_lists_geolocated_devices() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -5530,6 +5710,24 @@ async fn register_soil_iot_test_device(ctx: &TestContext, device_id: &str) -> Re
                     })
                     .to_string(),
                 ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn post_fired_alert(ctx: &TestContext, payload: serde_json::Value) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerting/fired-alerts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
                 .expect("request should build"),
         )
         .await

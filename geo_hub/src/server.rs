@@ -130,6 +130,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_time_series_points),
         )
         .route(
+            "/api/alerting/fired-alerts",
+            get(routes::list_fired_alerts).post(routes::store_fired_alert),
+        )
+        .route(
+            "/api/alerting/fired-alerts/:alert_id",
+            get(routes::get_fired_alert),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

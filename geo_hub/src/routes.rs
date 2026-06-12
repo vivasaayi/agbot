@@ -5,6 +5,10 @@ use crate::{
     shapefile,
     state::{AppState, SceneSearchCacheKey},
 };
+use alerting::{
+    normalize_fired_alert_record, AlertHistoryPage, AlertSeverityHint, AlertingError,
+    FiredAlertRecord,
+};
 use anyhow::Error;
 use axum::response::Html;
 use axum::response::{IntoResponse, Response};
@@ -346,6 +350,17 @@ pub struct TimeSeriesPointListQuery {
     pub metric: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AlertHistoryListQuery {
+    pub source_domain: Option<String>,
+    pub field_id: Option<String>,
+    pub severity: Option<AlertSeverityHint>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2015,6 +2030,111 @@ pub async fn list_time_series_points(
         .map(|row| decode_time_series_point_response(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
+}
+
+pub async fn store_fired_alert(
+    State(state): State<AppState>,
+    Json(record): Json<FiredAlertRecord>,
+) -> AppResult<Json<FiredAlertRecord>> {
+    let record = normalize_fired_alert_record(record).map_err(alerting_error)?;
+    insert_fired_alert_record(&state, &record).await?;
+    Ok(Json(record))
+}
+
+pub async fn list_fired_alerts(
+    Query(query): Query<AlertHistoryListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<AlertHistoryPage>> {
+    let source_domain = normalize_optional_text(query.source_domain);
+    let field_id = normalize_optional_text(query.field_id);
+    let severity = query.severity.map(|severity| severity.as_str().to_string());
+    let start = normalize_optional_text(query.start);
+    let end = normalize_optional_text(query.end);
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * page_size;
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM alert_fired_alerts
+        WHERE (?1 IS NULL OR source_domain = ?1)
+          AND (?2 IS NULL OR field_id = ?2)
+          AND (?3 IS NULL OR severity = ?3)
+          AND (?4 IS NULL OR fired_at >= ?4)
+          AND (?5 IS NULL OR fired_at <= ?5)
+        "#,
+    )
+    .bind(&source_domain)
+    .bind(&field_id)
+    .bind(&severity)
+    .bind(&start)
+    .bind(&end)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT alert_id, matched_rule_id, source_event_ref, source_domain, event_type, subject_ref,
+               field_id, evidence_refs_json, severity, channels_json, fired_at, explanation
+        FROM alert_fired_alerts
+        WHERE (?1 IS NULL OR source_domain = ?1)
+          AND (?2 IS NULL OR field_id = ?2)
+          AND (?3 IS NULL OR severity = ?3)
+          AND (?4 IS NULL OR fired_at >= ?4)
+          AND (?5 IS NULL OR fired_at <= ?5)
+        ORDER BY fired_at DESC, alert_id ASC
+        LIMIT ?6 OFFSET ?7
+        "#,
+    )
+    .bind(source_domain)
+    .bind(field_id)
+    .bind(severity)
+    .bind(start)
+    .bind(end)
+    .bind(page_size as i64)
+    .bind(offset as i64)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let alerts = rows
+        .into_iter()
+        .map(|row| decode_fired_alert_record(&row))
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(Json(AlertHistoryPage {
+        page,
+        page_size,
+        total: total as usize,
+        alerts,
+    }))
+}
+
+pub async fn get_fired_alert(
+    Path(alert_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<FiredAlertRecord>> {
+    let alert_id = normalize_optional_text(Some(alert_id))
+        .ok_or_else(|| AppError::BadRequest("alert_id is required".to_string()))?;
+    let row = sqlx::query(
+        r#"
+        SELECT alert_id, matched_rule_id, source_event_ref, source_domain, event_type, subject_ref,
+               field_id, evidence_refs_json, severity, channels_json, fired_at, explanation
+        FROM alert_fired_alerts
+        WHERE alert_id = ?1
+        "#,
+    )
+    .bind(alert_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_fired_alert_record(&row))
+        .transpose()?
+        .map(Json)
+        .ok_or(AppError::NotFound)
 }
 
 pub async fn ingest_orthomosaic_frame_set(
@@ -4680,6 +4800,10 @@ fn parse_compliance_record_type(value: String) -> AppResult<ComplianceRecordType
         .map_err(compliance_record_error)
 }
 
+fn alerting_error(error: AlertingError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn airspace_zone_error(error: AirspaceZoneError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -5451,6 +5575,38 @@ fn decode_time_series_point_response(
     })
 }
 
+fn decode_fired_alert_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FiredAlertRecord> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode alert evidence_refs_json"))
+    })?;
+    let channels = serde_json::from_str::<Vec<String>>(&row.get::<String, _>("channels_json"))
+        .map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode alert channels_json"))
+        })?;
+    let severity = row
+        .get::<String, _>("severity")
+        .parse::<AlertSeverityHint>()
+        .map_err(alerting_error)?;
+
+    Ok(FiredAlertRecord {
+        alert_id: row.get("alert_id"),
+        matched_rule_id: row.get("matched_rule_id"),
+        source_event_ref: row.get("source_event_ref"),
+        source_domain: row.get("source_domain"),
+        event_type: row.get("event_type"),
+        subject_ref: row.get("subject_ref"),
+        field_id: row.get("field_id"),
+        evidence_refs,
+        severity,
+        channels,
+        fired_at: row.get("fired_at"),
+        explanation: row.get("explanation"),
+    })
+}
+
 fn soil_reading_time_series_metadata(reading: &GeolocatedSoilReading) -> AppResult<String> {
     serde_json::to_string(&serde_json::json!({
         "payload_id": &reading.payload_id,
@@ -5961,6 +6117,50 @@ async fn insert_time_series_point_record(
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_fired_alert_record(state: &AppState, record: &FiredAlertRecord) -> AppResult<()> {
+    let evidence_refs_json =
+        serde_json::to_string(&record.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    let channels_json =
+        serde_json::to_string(&record.channels).map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO alert_fired_alerts (
+            alert_id, matched_rule_id, source_event_ref, source_domain, event_type, subject_ref,
+            field_id, evidence_refs_json, severity, channels_json, fired_at, explanation, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+    )
+    .bind(&record.alert_id)
+    .bind(&record.matched_rule_id)
+    .bind(&record.source_event_ref)
+    .bind(&record.source_domain)
+    .bind(&record.event_type)
+    .bind(&record.subject_ref)
+    .bind(&record.field_id)
+    .bind(evidence_refs_json)
+    .bind(record.severity.as_str())
+    .bind(channels_json)
+    .bind(&record.fired_at)
+    .bind(&record.explanation)
+    .bind(current_record_timestamp())
+    .execute(&state.pool)
+    .await
+    .map_err(|err| {
+        if err.to_string().contains("UNIQUE constraint failed") {
+            AppError::BadRequest(format!(
+                "fired alert {} already exists and history is immutable",
+                record.alert_id
+            ))
+        } else {
+            AppError::Anyhow(err.into())
+        }
+    })?;
 
     Ok(())
 }
