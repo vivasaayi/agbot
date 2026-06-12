@@ -263,6 +263,40 @@ pub struct DiseaseDetectionReport {
     pub detections: Vec<DiseaseLesionDetection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WeedMappingConfig {
+    pub low_confidence_threshold: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeedZoneCandidate {
+    pub tile_id: String,
+    pub confidence: f64,
+    pub bbox: GeoBounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeedMapZone {
+    pub zone_id: String,
+    pub confidence: f64,
+    pub low_confidence: bool,
+    pub evidence_tile_ref: String,
+    pub area_m2: f64,
+    pub geometry: DetectionZoneGeometry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeedMapReport {
+    pub field_id: String,
+    pub crs: String,
+    pub generated_at: String,
+    pub model: ModelGateResponse,
+    pub deterministic_cover_valid_pixels: usize,
+    pub total_weed_area_m2: f64,
+    pub low_confidence_count: usize,
+    pub zones: Vec<WeedMapZone>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CropModelRegistryError {
     #[error("model_id cannot be empty")]
@@ -340,6 +374,35 @@ pub enum DiseaseDetectionError {
     #[error("deterministic canopy cover is required before disease detection")]
     DeterministicCoverRequired,
     #[error("disease model gate failed: {source}")]
+    ModelGate {
+        #[source]
+        source: CropModelRegistryError,
+    },
+    #[error("low_confidence_threshold must be finite and between 0 and 1")]
+    InvalidThreshold,
+    #[error("tile_id cannot be empty")]
+    EmptyTileId,
+    #[error("candidate on tile {tile_id} has invalid confidence")]
+    InvalidConfidence { tile_id: String },
+    #[error("candidate on tile {tile_id} has invalid zone geometry")]
+    InvalidZoneGeometry { tile_id: String },
+    #[error("candidate references tile {tile_id} without deterministic cover evidence")]
+    MissingCoverTile { tile_id: String },
+    #[error("cover report field {actual} does not match requested field {expected}")]
+    CoverFieldMismatch { expected: String, actual: String },
+    #[error("candidate on tile {tile_id} falls outside the deterministic cover tile extent")]
+    ZoneOutsideTileExtent { tile_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum WeedMappingError {
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("deterministic canopy cover is required before weed mapping")]
+    DeterministicCoverRequired,
+    #[error("weed model gate failed: {source}")]
     ModelGate {
         #[source]
         source: CropModelRegistryError,
@@ -631,6 +694,92 @@ pub fn run_disease_lesion_detection(
         deterministic_cover_valid_pixels: cover.valid_pixels,
         low_confidence_count,
         detections,
+    })
+}
+
+pub fn run_weed_mapping(
+    field_id: String,
+    model: InferenceModelReference,
+    model_registered: bool,
+    deterministic_cover: Option<&CanopyCoverReport>,
+    candidates: Vec<WeedZoneCandidate>,
+    config: WeedMappingConfig,
+    generated_at: String,
+) -> Result<WeedMapReport, WeedMappingError> {
+    let field_id = normalize_weed_text(field_id, WeedMappingError::EmptyFieldId)?;
+    let generated_at = normalize_weed_text(generated_at, WeedMappingError::EmptyGeneratedAt)?;
+    if !is_unit_fraction(config.low_confidence_threshold) {
+        return Err(WeedMappingError::InvalidThreshold);
+    }
+    let model = validate_model_reference(model, model_registered)
+        .map_err(|source| WeedMappingError::ModelGate { source })?;
+    let cover = deterministic_cover.ok_or(WeedMappingError::DeterministicCoverRequired)?;
+    if cover.field_id != field_id {
+        return Err(WeedMappingError::CoverFieldMismatch {
+            expected: field_id,
+            actual: cover.field_id.clone(),
+        });
+    }
+
+    let cover_tiles = cover
+        .tiles
+        .iter()
+        .map(|tile| (tile.tile_id.as_str(), tile))
+        .collect::<BTreeMap<_, _>>();
+    let mut zones = Vec::new();
+    let mut tile_zone_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for candidate in candidates {
+        let tile_id =
+            normalize_weed_text(candidate.tile_id.clone(), WeedMappingError::EmptyTileId)?;
+        if !is_unit_fraction(candidate.confidence) {
+            return Err(WeedMappingError::InvalidConfidence { tile_id });
+        }
+        let cover_tile = cover_tiles.get(tile_id.as_str()).ok_or_else(|| {
+            WeedMappingError::MissingCoverTile {
+                tile_id: tile_id.clone(),
+            }
+        })?;
+        let tile_bbox = cover_tile.spatial_ref.bbox.as_ref().ok_or_else(|| {
+            WeedMappingError::MissingCoverTile {
+                tile_id: tile_id.clone(),
+            }
+        })?;
+        if !valid_bbox(&candidate.bbox) {
+            return Err(WeedMappingError::InvalidZoneGeometry { tile_id });
+        }
+        if !bbox_within(&candidate.bbox, tile_bbox) {
+            return Err(WeedMappingError::ZoneOutsideTileExtent { tile_id });
+        }
+
+        let sequence = tile_zone_counts.entry(tile_id.clone()).or_insert(0);
+        *sequence += 1;
+        zones.push(WeedMapZone {
+            zone_id: format!("weed:{tile_id}:{}", *sequence),
+            confidence: candidate.confidence,
+            low_confidence: candidate.confidence < config.low_confidence_threshold,
+            evidence_tile_ref: tile_id,
+            area_m2: bbox_area_m2(&candidate.bbox),
+            geometry: DetectionZoneGeometry {
+                crs: cover.crs.clone(),
+                bbox: candidate.bbox,
+            },
+        });
+    }
+
+    zones.sort_by(|left, right| left.zone_id.cmp(&right.zone_id));
+    let total_weed_area_m2 = zones.iter().map(|zone| zone.area_m2).sum();
+    let low_confidence_count = zones.iter().filter(|zone| zone.low_confidence).count();
+
+    Ok(WeedMapReport {
+        field_id,
+        crs: cover.crs.clone(),
+        generated_at,
+        model,
+        deterministic_cover_valid_pixels: cover.valid_pixels,
+        total_weed_area_m2,
+        low_confidence_count,
+        zones,
     })
 }
 
@@ -956,6 +1105,19 @@ fn bbox_within(inner: &GeoBounds, outer: &GeoBounds) -> bool {
         && inner.max_lat <= outer.max_lat + TOLERANCE
 }
 
+fn normalize_weed_text(value: String, error: WeedMappingError) -> Result<String, WeedMappingError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn bbox_area_m2(bbox: &GeoBounds) -> f64 {
+    (bbox.max_lon - bbox.min_lon) * (bbox.max_lat - bbox.min_lat)
+}
+
 fn density_per_ha(count: usize, area_m2: f64) -> f64 {
     if area_m2 > 0.0 {
         count as f64 / (area_m2 / 10_000.0)
@@ -968,10 +1130,11 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 mod tests {
     use super::{
         build_model_version_record, run_canopy_cover, run_disease_lesion_detection,
-        run_stand_count, validate_model_reference, CanopyCoverConfig, CanopyCoverError,
-        CanopyCoverTile, CropModelRegistryError, CropModelTask, DiseaseDetectionConfig,
-        DiseaseDetectionError, DiseaseLesionCandidate, InferenceModelReference,
-        ModelVersionRegistrationRequest, PlantCountConfig, PlantCountTile, PlantCountZeroReason,
+        run_stand_count, run_weed_mapping, validate_model_reference, CanopyCoverConfig,
+        CanopyCoverError, CanopyCoverTile, CropModelRegistryError, CropModelTask,
+        DiseaseDetectionConfig, DiseaseDetectionError, DiseaseLesionCandidate,
+        InferenceModelReference, ModelVersionRegistrationRequest, PlantCountConfig, PlantCountTile,
+        PlantCountZeroReason, WeedMappingConfig, WeedMappingError, WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -1341,6 +1504,92 @@ mod tests {
         assert_eq!(error, DiseaseDetectionError::DeterministicCoverRequired);
     }
 
+    #[test]
+    fn weed_mapping_returns_georeferenced_confidence_zones_and_area() {
+        let cover = cover_report();
+        let report = run_weed_mapping(
+            "field-1".to_string(),
+            weed_model(),
+            true,
+            Some(&cover),
+            vec![weed_candidate(
+                "tile-1",
+                0.76,
+                GeoBounds {
+                    min_lon: 0.0,
+                    min_lat: 0.0,
+                    max_lon: 10.0,
+                    max_lat: 10.0,
+                },
+            )],
+            WeedMappingConfig {
+                low_confidence_threshold: 0.65,
+            },
+            "2026-06-01T12:20:00Z".to_string(),
+        )
+        .expect("weed mapping should run");
+
+        assert_eq!(report.field_id, "field-1");
+        assert_eq!(report.crs, "EPSG:32614");
+        assert_eq!(report.model.model_id, "weed-detector");
+        assert_eq!(report.zones.len(), 1);
+        assert_eq!(report.total_weed_area_m2, 100.0);
+        let zone = &report.zones[0];
+        assert_eq!(zone.evidence_tile_ref, "tile-1");
+        assert_eq!(zone.confidence, 0.76);
+        assert_eq!(zone.area_m2, 100.0);
+        assert!(!zone.low_confidence);
+        assert_eq!(zone.geometry.crs, "EPSG:32614");
+        assert_eq!(
+            zone.geometry.bbox,
+            GeoBounds {
+                min_lon: 0.0,
+                min_lat: 0.0,
+                max_lon: 10.0,
+                max_lat: 10.0,
+            }
+        );
+    }
+
+    #[test]
+    fn weed_mapping_returns_no_zones_for_weed_free_field() {
+        let cover = cover_report();
+        let report = run_weed_mapping(
+            "field-1".to_string(),
+            weed_model(),
+            true,
+            Some(&cover),
+            Vec::new(),
+            WeedMappingConfig {
+                low_confidence_threshold: 0.65,
+            },
+            "2026-06-01T12:20:00Z".to_string(),
+        )
+        .expect("weed-free mapping should run");
+
+        assert!(report.zones.is_empty());
+        assert_eq!(report.total_weed_area_m2, 0.0);
+        assert_eq!(report.low_confidence_count, 0);
+    }
+
+    #[test]
+    fn weed_mapping_refuses_to_run_without_deterministic_cover() {
+        let error = run_weed_mapping(
+            "field-1".to_string(),
+            weed_model(),
+            true,
+            None,
+            Vec::new(),
+            WeedMappingConfig {
+                low_confidence_threshold: 0.65,
+            },
+            "2026-06-01T12:20:00Z".to_string(),
+        )
+        .expect_err("deterministic cover is required");
+
+        assert_eq!(error, WeedMappingError::DeterministicCoverRequired);
+    }
+
     fn plant_tile(
         tile_id: &str,
         zone_id: Option<&str>,
@@ -1408,6 +1657,21 @@ mod tests {
 
     fn lesion_candidate(tile_id: &str, confidence: f64, bbox: GeoBounds) -> DiseaseLesionCandidate {
         DiseaseLesionCandidate {
+            tile_id: tile_id.to_string(),
+            confidence,
+            bbox,
+        }
+    }
+
+    fn weed_model() -> InferenceModelReference {
+        InferenceModelReference {
+            model_id: "weed-detector".to_string(),
+            version: "2026.06.1".to_string(),
+        }
+    }
+
+    fn weed_candidate(tile_id: &str, confidence: f64, bbox: GeoBounds) -> WeedZoneCandidate {
+        WeedZoneCandidate {
             tile_id: tile_id.to_string(),
             confidence,
             bbox,
