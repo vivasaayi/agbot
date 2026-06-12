@@ -1,5 +1,6 @@
+use alerting::{AlertCandidateRecord, AlertEvent, AlertSeverityHint, AlertingError, SourceAdapter};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use timeseries::{SeriesPoint, SeriesValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +299,140 @@ pub struct StuckSensorDetection {
     pub evidence_payload_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensorHealthReasonCode {
+    Disconnected,
+    LowBattery,
+    StaleReading,
+}
+
+impl SensorHealthReasonCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SensorHealthReasonCode::Disconnected => "disconnected",
+            SensorHealthReasonCode::LowBattery => "low_battery",
+            SensorHealthReasonCode::StaleReading => "stale_reading",
+        }
+    }
+
+    fn metric_name(self) -> &'static str {
+        match self {
+            SensorHealthReasonCode::Disconnected => "link_status",
+            SensorHealthReasonCode::LowBattery => "battery_voltage",
+            SensorHealthReasonCode::StaleReading => "freshness_age_seconds",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensorHealthLinkStatus {
+    Connected,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensorHealthEventKind {
+    Fired,
+    Resolved,
+}
+
+impl SensorHealthEventKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            SensorHealthEventKind::Fired => "fired",
+            SensorHealthEventKind::Resolved => "resolved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensorHealthThresholds {
+    pub low_battery_voltage: f64,
+    pub stale_after_seconds: u64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensorHealthSnapshot {
+    pub device_id: String,
+    pub field_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_voltage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_age_seconds: Option<u64>,
+    pub link_status: SensorHealthLinkStatus,
+    pub evidence_ref: String,
+    pub evaluated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensorHealthEvidence {
+    pub evidence_ref: String,
+    pub metric: String,
+    pub observed_value: f64,
+    pub threshold_value: f64,
+    pub rule_ref: String,
+}
+
+impl SensorHealthEvidence {
+    pub fn ref_string(&self) -> String {
+        format!(
+            "{}:{}={}:threshold={}:rule={}",
+            self.evidence_ref,
+            self.metric,
+            self.observed_value,
+            self.threshold_value,
+            self.rule_ref
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensorHealthEvent {
+    pub device_id: String,
+    pub field_id: String,
+    pub reason_code: SensorHealthReasonCode,
+    pub kind: SensorHealthEventKind,
+    pub severity_hint: AlertSeverityHint,
+    pub evidence: SensorHealthEvidence,
+    pub occurred_at: String,
+    pub idempotency_key: String,
+}
+
+impl SensorHealthEvent {
+    pub fn to_alert_event(&self) -> AlertEvent {
+        AlertEvent {
+            source_domain: "soil_iot".to_string(),
+            event_type: sensor_health_event_type(self.reason_code, self.kind),
+            subject_ref: format!("field:{}:device:{}", self.field_id, self.device_id),
+            severity_hint: self.severity_hint,
+            evidence_refs: vec![self.evidence.ref_string()],
+            occurred_at: self.occurred_at.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SensorHealthMonitorState {
+    active_conditions: BTreeSet<SensorHealthConditionKey>,
+}
+
+impl SensorHealthMonitorState {
+    pub fn active_condition_count(&self) -> usize {
+        self.active_conditions.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct SensorHealthConditionKey {
+    device_id: String,
+    reason_code: SensorHealthReasonCode,
+}
+
 impl GeolocatedSoilReading {
     pub fn to_series_point(&self) -> SeriesPoint {
         SeriesPoint {
@@ -428,10 +563,18 @@ pub enum SoilIotError {
     },
     #[error("stuck-sensor method_version cannot be empty")]
     EmptyStuckWindowMethodVersion,
+    #[error("sensor-health method_version cannot be empty")]
+    EmptySensorHealthMethodVersion,
+    #[error("sensor-health evaluated_at cannot be empty")]
+    EmptySensorHealthEvaluatedAt,
+    #[error("sensor-health evidence_ref cannot be empty")]
+    EmptySensorHealthEvidenceRef,
     #[error(
         "stuck-sensor window config must be finite with min_samples > 1 and valid_min <= valid_max"
     )]
     InvalidStuckWindowConfig,
+    #[error("sensor-health thresholds must be finite with low_battery_voltage >= 0")]
+    InvalidSensorHealthThresholds,
     #[error("stuck-sensor window must contain one device and metric")]
     MixedStuckWindowSeries,
 }
@@ -768,6 +911,62 @@ pub fn detect_stuck_sensor_window(
     }
 }
 
+pub fn evaluate_sensor_health_snapshot(
+    snapshot: SensorHealthSnapshot,
+    thresholds: SensorHealthThresholds,
+    state: &mut SensorHealthMonitorState,
+) -> Result<Vec<SensorHealthEvent>, SoilIotError> {
+    let snapshot = normalize_sensor_health_snapshot(snapshot)?;
+    let thresholds = normalize_sensor_health_thresholds(thresholds)?;
+    let observations = sensor_health_observations(&snapshot, &thresholds)?;
+    let mut events = Vec::new();
+
+    for (reason_code, observation) in observations {
+        let key = SensorHealthConditionKey {
+            device_id: snapshot.device_id.clone(),
+            reason_code,
+        };
+        let active = state.active_conditions.contains(&key);
+
+        match (observation.breached, active) {
+            (true, false) => {
+                state.active_conditions.insert(key);
+                events.push(sensor_health_event(
+                    &snapshot,
+                    &thresholds,
+                    reason_code,
+                    SensorHealthEventKind::Fired,
+                    observation,
+                ));
+            }
+            (true, true) => {}
+            (false, true) => {
+                state.active_conditions.remove(&key);
+                events.push(sensor_health_event(
+                    &snapshot,
+                    &thresholds,
+                    reason_code,
+                    SensorHealthEventKind::Resolved,
+                    observation,
+                ));
+            }
+            (false, false) => {}
+        }
+    }
+
+    Ok(events)
+}
+
+pub fn emit_sensor_health_alert_events(
+    adapter: &mut impl SourceAdapter,
+    events: &[SensorHealthEvent],
+) -> Result<Vec<AlertCandidateRecord>, AlertingError> {
+    events
+        .iter()
+        .map(|event| adapter.emit(event.to_alert_event()))
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct GatewayPayloadBody {
     device_id: String,
@@ -887,6 +1086,155 @@ fn normalize_stuck_window_config(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SensorHealthObservation {
+    breached: bool,
+    observed_value: f64,
+    threshold_value: f64,
+}
+
+fn sensor_health_observations(
+    snapshot: &SensorHealthSnapshot,
+    thresholds: &SensorHealthThresholds,
+) -> Result<Vec<(SensorHealthReasonCode, SensorHealthObservation)>, SoilIotError> {
+    let mut observations = Vec::new();
+
+    if let Some(battery_voltage) = snapshot.battery_voltage {
+        if !battery_voltage.is_finite() {
+            return Err(SoilIotError::InvalidReadingValue);
+        }
+        observations.push((
+            SensorHealthReasonCode::LowBattery,
+            SensorHealthObservation {
+                breached: battery_voltage < thresholds.low_battery_voltage,
+                observed_value: battery_voltage,
+                threshold_value: thresholds.low_battery_voltage,
+            },
+        ));
+    }
+
+    if let Some(freshness_age_seconds) = snapshot.freshness_age_seconds {
+        observations.push((
+            SensorHealthReasonCode::StaleReading,
+            SensorHealthObservation {
+                breached: freshness_age_seconds > thresholds.stale_after_seconds,
+                observed_value: freshness_age_seconds as f64,
+                threshold_value: thresholds.stale_after_seconds as f64,
+            },
+        ));
+    }
+
+    let disconnected = snapshot.link_status == SensorHealthLinkStatus::Disconnected;
+    observations.push((
+        SensorHealthReasonCode::Disconnected,
+        SensorHealthObservation {
+            breached: disconnected,
+            observed_value: if disconnected { 0.0 } else { 1.0 },
+            threshold_value: 1.0,
+        },
+    ));
+
+    observations.sort_by_key(|(reason_code, _)| *reason_code);
+    Ok(observations)
+}
+
+fn sensor_health_event(
+    snapshot: &SensorHealthSnapshot,
+    thresholds: &SensorHealthThresholds,
+    reason_code: SensorHealthReasonCode,
+    kind: SensorHealthEventKind,
+    observation: SensorHealthObservation,
+) -> SensorHealthEvent {
+    SensorHealthEvent {
+        device_id: snapshot.device_id.clone(),
+        field_id: snapshot.field_id.clone(),
+        reason_code,
+        kind,
+        severity_hint: sensor_health_severity(reason_code, kind),
+        evidence: SensorHealthEvidence {
+            evidence_ref: snapshot.evidence_ref.clone(),
+            metric: reason_code.metric_name().to_string(),
+            observed_value: observation.observed_value,
+            threshold_value: observation.threshold_value,
+            rule_ref: thresholds.method_version.clone(),
+        },
+        occurred_at: snapshot.evaluated_at.clone(),
+        idempotency_key: format!(
+            "soil_iot:sensor_health:{}:{}:{}:{}",
+            snapshot.device_id,
+            reason_code.as_str(),
+            kind.as_str(),
+            snapshot.evaluated_at
+        ),
+    }
+}
+
+fn sensor_health_event_type(
+    reason_code: SensorHealthReasonCode,
+    kind: SensorHealthEventKind,
+) -> String {
+    match kind {
+        SensorHealthEventKind::Fired => format!("soil_sensor_health_{}", reason_code.as_str()),
+        SensorHealthEventKind::Resolved => {
+            format!("soil_sensor_health_{}_resolved", reason_code.as_str())
+        }
+    }
+}
+
+fn sensor_health_severity(
+    reason_code: SensorHealthReasonCode,
+    kind: SensorHealthEventKind,
+) -> AlertSeverityHint {
+    if kind == SensorHealthEventKind::Resolved {
+        AlertSeverityHint::Info
+    } else {
+        match reason_code {
+            SensorHealthReasonCode::Disconnected => AlertSeverityHint::Critical,
+            SensorHealthReasonCode::LowBattery | SensorHealthReasonCode::StaleReading => {
+                AlertSeverityHint::Warning
+            }
+        }
+    }
+}
+
+fn normalize_sensor_health_snapshot(
+    snapshot: SensorHealthSnapshot,
+) -> Result<SensorHealthSnapshot, SoilIotError> {
+    Ok(SensorHealthSnapshot {
+        device_id: normalize_required_text(snapshot.device_id, SoilIotError::EmptyDeviceId)?,
+        field_id: normalize_required_text(snapshot.field_id, SoilIotError::EmptyFieldId)?,
+        battery_voltage: snapshot.battery_voltage,
+        freshness_age_seconds: snapshot.freshness_age_seconds,
+        link_status: snapshot.link_status,
+        evidence_ref: normalize_required_text(
+            snapshot.evidence_ref,
+            SoilIotError::EmptySensorHealthEvidenceRef,
+        )?,
+        evaluated_at: normalize_required_text(
+            snapshot.evaluated_at,
+            SoilIotError::EmptySensorHealthEvaluatedAt,
+        )?,
+    })
+}
+
+fn normalize_sensor_health_thresholds(
+    thresholds: SensorHealthThresholds,
+) -> Result<SensorHealthThresholds, SoilIotError> {
+    let method_version = normalize_required_text(
+        thresholds.method_version,
+        SoilIotError::EmptySensorHealthMethodVersion,
+    )?;
+    if !thresholds.low_battery_voltage.is_finite() || thresholds.low_battery_voltage < 0.0 {
+        return Err(SoilIotError::InvalidSensorHealthThresholds);
+    }
+
+    Ok(SensorHealthThresholds {
+        low_battery_voltage: thresholds.low_battery_voltage,
+        stale_after_seconds: thresholds.stale_after_seconds,
+        method_version,
+    })
+}
+
 fn pinned_rail(values: &[f64], config: &StuckSensorWindowConfig) -> Option<StuckSensorRail> {
     if values
         .iter()
@@ -959,14 +1307,17 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::{
         build_geolocated_soil_reading, build_soil_device_record, decode_gateway_payload,
-        detect_stuck_sensor_window, ingest_gateway_readings, reading_rejection_for_device,
+        detect_stuck_sensor_window, emit_sensor_health_alert_events,
+        evaluate_sensor_health_snapshot, ingest_gateway_readings, reading_rejection_for_device,
         transition_soil_device_status, validate_and_calibrate_reading, CalibrationProfile,
         GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
         GatewayReadingRecord, GeoPosition, RawGatewayReading, ReadingGeolocationStatus,
         ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
-        SimulatedGateway, SoilDeviceStatus, SoilIotError, SoilSensorType, StuckSensorRail,
-        StuckSensorWindowConfig,
+        SensorHealthEventKind, SensorHealthLinkStatus, SensorHealthMonitorState,
+        SensorHealthReasonCode, SensorHealthSnapshot, SensorHealthThresholds, SimulatedGateway,
+        SoilDeviceStatus, SoilIotError, SoilSensorType, StuckSensorRail, StuckSensorWindowConfig,
     };
+    use alerting::{AlertEventBackbone, AlertSeverityHint};
     use timeseries::SeriesValue;
 
     #[test]
@@ -1352,6 +1703,108 @@ mod tests {
         assert_eq!(error, SoilIotError::MixedStuckWindowSeries);
     }
 
+    #[test]
+    fn sensor_health_monitor_emits_low_battery_alert_with_evidence() {
+        let mut monitor = SensorHealthMonitorState::default();
+
+        let events = evaluate_sensor_health_snapshot(
+            sensor_health_snapshot(Some(3.1), Some(45), SensorHealthLinkStatus::Connected),
+            sensor_health_thresholds(),
+            &mut monitor,
+        )
+        .expect("health snapshot should evaluate");
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind, SensorHealthEventKind::Fired);
+        assert_eq!(event.reason_code, SensorHealthReasonCode::LowBattery);
+        assert_eq!(event.severity_hint, AlertSeverityHint::Warning);
+        assert_eq!(event.evidence.metric, "battery_voltage");
+        assert_eq!(event.evidence.observed_value, 3.1);
+        assert_eq!(event.evidence.threshold_value, 3.3);
+        assert_eq!(event.evidence.rule_ref, "soil-sensor-health-thresholds-v1");
+
+        let mut backbone = AlertEventBackbone::default();
+        let candidates = emit_sensor_health_alert_events(&mut backbone, &events)
+            .expect("sensor health event should match alerting contract");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_domain, "soil_iot");
+        assert_eq!(candidates[0].event_type, "soil_sensor_health_low_battery");
+        assert_eq!(
+            candidates[0].subject_ref,
+            "field:field-001:device:soil-probe-001"
+        );
+        assert_eq!(
+            candidates[0].evidence_refs,
+            vec![event.evidence.ref_string()]
+        );
+        assert_eq!(backbone.list_candidates().len(), 1);
+    }
+
+    #[test]
+    fn sensor_health_monitor_resolves_recovered_condition_without_refiring() {
+        let mut monitor = SensorHealthMonitorState::default();
+        let thresholds = sensor_health_thresholds();
+
+        let first = evaluate_sensor_health_snapshot(
+            sensor_health_snapshot(Some(3.1), Some(45), SensorHealthLinkStatus::Connected),
+            thresholds.clone(),
+            &mut monitor,
+        )
+        .expect("low battery should evaluate");
+        assert_eq!(first.len(), 1);
+
+        let repeated = evaluate_sensor_health_snapshot(
+            sensor_health_snapshot(Some(3.0), Some(46), SensorHealthLinkStatus::Connected),
+            thresholds.clone(),
+            &mut monitor,
+        )
+        .expect("repeated low battery should evaluate");
+        assert!(repeated.is_empty());
+
+        let recovered = evaluate_sensor_health_snapshot(
+            sensor_health_snapshot(Some(3.7), Some(47), SensorHealthLinkStatus::Connected),
+            thresholds,
+            &mut monitor,
+        )
+        .expect("recovery should evaluate");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].kind, SensorHealthEventKind::Resolved);
+        assert_eq!(recovered[0].reason_code, SensorHealthReasonCode::LowBattery);
+        assert_eq!(monitor.active_condition_count(), 0);
+    }
+
+    #[test]
+    fn sensor_health_monitor_detects_stale_and_disconnected_without_spam() {
+        let mut monitor = SensorHealthMonitorState::default();
+
+        let first = evaluate_sensor_health_snapshot(
+            sensor_health_snapshot(Some(3.8), Some(900), SensorHealthLinkStatus::Disconnected),
+            sensor_health_thresholds(),
+            &mut monitor,
+        )
+        .expect("stale disconnected device should evaluate");
+
+        assert_eq!(first.len(), 2);
+        assert!(first
+            .iter()
+            .any(|event| event.reason_code == SensorHealthReasonCode::StaleReading));
+        assert!(first
+            .iter()
+            .any(|event| event.reason_code == SensorHealthReasonCode::Disconnected));
+
+        let repeated = evaluate_sensor_health_snapshot(
+            sensor_health_snapshot(Some(3.8), Some(901), SensorHealthLinkStatus::Disconnected),
+            sensor_health_thresholds(),
+            &mut monitor,
+        )
+        .expect("repeated stale disconnected device should evaluate");
+
+        assert!(repeated.is_empty());
+        assert_eq!(monitor.active_condition_count(), 2);
+    }
+
     fn valid_device() -> super::SoilDeviceRecord {
         build_soil_device_record(
             RegisterSoilDeviceRequest {
@@ -1437,6 +1890,30 @@ mod tests {
             valid_max: 100.0,
             rail_tolerance: 0.05,
             method_version: "stuck-window-v1".to_string(),
+        }
+    }
+
+    fn sensor_health_snapshot(
+        battery_voltage: Option<f64>,
+        freshness_age_seconds: Option<u64>,
+        link_status: SensorHealthLinkStatus,
+    ) -> SensorHealthSnapshot {
+        SensorHealthSnapshot {
+            device_id: "soil-probe-001".to_string(),
+            field_id: "field-001".to_string(),
+            battery_voltage,
+            freshness_age_seconds,
+            link_status,
+            evidence_ref: "soil-iot:payload-001".to_string(),
+            evaluated_at: "2026-06-12T11:00:00Z".to_string(),
+        }
+    }
+
+    fn sensor_health_thresholds() -> SensorHealthThresholds {
+        SensorHealthThresholds {
+            low_battery_voltage: 3.3,
+            stale_after_seconds: 300,
+            method_version: "soil-sensor-health-thresholds-v1".to_string(),
         }
     }
 }
