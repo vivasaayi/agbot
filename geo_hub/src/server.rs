@@ -122,6 +122,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_soil_iot_devices).post(routes::register_soil_iot_device),
         )
         .route(
+            "/api/soil-iot/readings",
+            post(routes::ingest_soil_iot_reading),
+        )
+        .route(
+            "/api/time-series/points",
+            get(routes::list_time_series_points),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

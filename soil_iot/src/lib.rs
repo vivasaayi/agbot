@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use timeseries::{SeriesPoint, SeriesValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +179,45 @@ pub struct GatewayReadingRecord {
     pub raw_value: f64,
     pub gateway_ts: String,
     pub received_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadingGeolocationStatus {
+    Located,
+    NoGeolocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeolocatedSoilReading {
+    pub payload_id: String,
+    pub device_id: String,
+    pub metric: GatewayReadingMetric,
+    pub raw_value: f64,
+    pub ts: String,
+    pub received_at: String,
+    pub field_id: String,
+    pub zone_id: Option<String>,
+    pub position: Option<GeoPosition>,
+    pub geolocation_status: ReadingGeolocationStatus,
+    pub excluded_from_geospatial_products: bool,
+    #[serde(default)]
+    pub qa_flags: Vec<String>,
+}
+
+impl GeolocatedSoilReading {
+    pub fn to_series_point(&self) -> SeriesPoint {
+        SeriesPoint {
+            entity_ref: format!("device:{}", self.device_id),
+            metric: self.metric.as_str().to_string(),
+            t: self.ts.clone(),
+            value: SeriesValue::Scalar {
+                value: self.raw_value,
+            },
+            source_ref: format!("soil-iot:{}", self.payload_id),
+            created_at: self.received_at.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,6 +483,54 @@ pub fn ingest_gateway_readings(
     })
 }
 
+pub fn build_geolocated_soil_reading(
+    device: &SoilDeviceRecord,
+    reading: GatewayReadingRecord,
+) -> Result<GeolocatedSoilReading, GatewayIngestError> {
+    let payload_id =
+        normalize_gateway_text(reading.payload_id, GatewayIngestError::EmptyPayloadId)?;
+    let device_id =
+        normalize_gateway_text(reading.device_id, GatewayIngestError::EmptyGatewayDeviceId)?;
+    let ts = normalize_gateway_text(
+        reading.gateway_ts,
+        GatewayIngestError::EmptyGatewayTimestamp,
+    )?;
+    let received_at =
+        normalize_gateway_text(reading.received_at, GatewayIngestError::EmptyReceivedAt)?;
+    if !reading.raw_value.is_finite() {
+        return Err(GatewayIngestError::InvalidRawValue);
+    }
+
+    let position = normalize_position(device.position.clone()).ok();
+    let geolocation_status = if position.is_some() {
+        ReadingGeolocationStatus::Located
+    } else {
+        ReadingGeolocationStatus::NoGeolocation
+    };
+    let excluded_from_geospatial_products =
+        geolocation_status == ReadingGeolocationStatus::NoGeolocation;
+    let qa_flags = if excluded_from_geospatial_products {
+        vec!["no_geolocation".to_string()]
+    } else {
+        Vec::new()
+    };
+
+    Ok(GeolocatedSoilReading {
+        payload_id,
+        device_id,
+        metric: reading.metric,
+        raw_value: reading.raw_value,
+        ts,
+        received_at,
+        field_id: device.field_id.clone(),
+        zone_id: device.zone_id.clone(),
+        position,
+        geolocation_status,
+        excluded_from_geospatial_products,
+        qa_flags,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct GatewayPayloadBody {
     device_id: String,
@@ -552,12 +640,14 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_soil_device_record, decode_gateway_payload, ingest_gateway_readings,
-        reading_rejection_for_device, transition_soil_device_status, GatewayIngestError,
-        GatewayPayloadRejectionReason, GatewayReadingMetric, GeoPosition, RawGatewayReading,
+        build_geolocated_soil_reading, build_soil_device_record, decode_gateway_payload,
+        ingest_gateway_readings, reading_rejection_for_device, transition_soil_device_status,
+        GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
+        GatewayReadingRecord, GeoPosition, RawGatewayReading, ReadingGeolocationStatus,
         ReadingRejectionReason, RegisterSoilDeviceRequest, SimulatedGateway, SoilDeviceStatus,
         SoilIotError, SoilSensorType,
     };
+    use timeseries::SeriesValue;
 
     #[test]
     fn device_registry_builds_active_geolocated_record() {
@@ -720,6 +810,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn geolocated_reading_inherits_device_position_and_series_contract() {
+        let reading = build_geolocated_soil_reading(&valid_device(), valid_gateway_record())
+            .expect("reading should geolocate");
+
+        assert_eq!(reading.device_id, "soil-probe-001");
+        assert_eq!(reading.field_id, "field-001");
+        assert_eq!(reading.zone_id.as_deref(), Some("zone-ne"));
+        assert_eq!(
+            reading.geolocation_status,
+            ReadingGeolocationStatus::Located
+        );
+        assert!(!reading.excluded_from_geospatial_products);
+        assert_eq!(
+            reading
+                .position
+                .as_ref()
+                .map(|position| position.crs.as_str()),
+            Some("EPSG:4326")
+        );
+
+        let point = reading.to_series_point();
+        assert_eq!(point.entity_ref, "device:soil-probe-001");
+        assert_eq!(point.metric, "soil_moisture_percent");
+        assert_eq!(point.t, "2026-06-12T10:00:00Z");
+        match point.value {
+            SeriesValue::Scalar { value } => assert_eq!(value, 34.5),
+            SeriesValue::Raster(_) => panic!("soil readings should be scalar"),
+        }
+    }
+
+    #[test]
+    fn reading_with_invalid_device_position_is_flagged_no_geolocation_without_default_point() {
+        let mut device = valid_device();
+        device.position.latitude = 120.0;
+
+        let reading = build_geolocated_soil_reading(&device, valid_gateway_record())
+            .expect("reading should be retained with no-geolocation flag");
+
+        assert_eq!(
+            reading.geolocation_status,
+            ReadingGeolocationStatus::NoGeolocation
+        );
+        assert!(reading.position.is_none());
+        assert!(reading.excluded_from_geospatial_products);
+    }
+
     fn valid_device() -> super::SoilDeviceRecord {
         build_soil_device_record(
             RegisterSoilDeviceRequest {
@@ -739,5 +876,16 @@ mod tests {
             "2026-06-12T10:00:00Z".to_string(),
         )
         .expect("device should be valid")
+    }
+
+    fn valid_gateway_record() -> GatewayReadingRecord {
+        GatewayReadingRecord {
+            payload_id: "payload-001".to_string(),
+            device_id: "soil-probe-001".to_string(),
+            metric: GatewayReadingMetric::SoilMoisturePercent,
+            raw_value: 34.5,
+            gateway_ts: "2026-06-12T10:00:00Z".to_string(),
+            received_at: "2026-06-12T10:00:03Z".to_string(),
+        }
     }
 }

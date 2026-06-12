@@ -56,8 +56,9 @@ use shared::schemas::{
     DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
-    build_soil_device_record, GeoPosition, RegisterSoilDeviceRequest, SoilDeviceRecord,
-    SoilDeviceStatus, SoilIotError, SoilSensorType,
+    build_geolocated_soil_reading, build_soil_device_record, GatewayIngestError,
+    GatewayReadingRecord, GeoPosition, GeolocatedSoilReading, RegisterSoilDeviceRequest,
+    SoilDeviceRecord, SoilDeviceStatus, SoilIotError, SoilSensorType,
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -66,7 +67,7 @@ use std::io::Cursor;
 use std::io::ErrorKind;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::SystemTime;
-use timeseries::SeriesValue;
+use timeseries::{SeriesPoint, SeriesValue};
 use tokio::fs::File;
 use tokio::fs::{self, DirEntry};
 use tokio_util::io::ReaderStream;
@@ -337,6 +338,26 @@ pub struct SoilDeviceListQuery {
     pub field_id: Option<String>,
     pub zone_id: Option<String>,
     pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TimeSeriesPointListQuery {
+    pub entity_ref: Option<String>,
+    pub metric: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimeSeriesPointResponse {
+    pub entity_ref: String,
+    pub metric: String,
+    pub t: String,
+    pub value: SeriesValue,
+    pub source_ref: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1940,6 +1961,58 @@ pub async fn list_soil_iot_devices(
 
     rows.into_iter()
         .map(|row| decode_soil_iot_device(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn ingest_soil_iot_reading(
+    State(state): State<AppState>,
+    Json(request): Json<GatewayReadingRecord>,
+) -> AppResult<Json<GeolocatedSoilReading>> {
+    let device = load_soil_iot_device(&state, &request.device_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("device {} is not registered", request.device_id))
+        })?;
+    let reading = build_geolocated_soil_reading(&device, request).map_err(gateway_ingest_error)?;
+    if !reading.excluded_from_geospatial_products {
+        let metadata = soil_reading_time_series_metadata(&reading)?;
+        insert_time_series_point_record(&state, &reading.to_series_point(), Some(metadata)).await?;
+    }
+
+    Ok(Json(reading))
+}
+
+pub async fn list_time_series_points(
+    Query(query): Query<TimeSeriesPointListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<TimeSeriesPointResponse>>> {
+    let entity_ref = normalize_optional_text(query.entity_ref)
+        .ok_or_else(|| AppError::BadRequest("entity_ref is required".to_string()))?;
+    let metric = normalize_optional_text(query.metric);
+    let start = normalize_optional_text(query.start);
+    let end = normalize_optional_text(query.end);
+    let rows = sqlx::query(
+        r#"
+        SELECT entity_ref, metric, t, value_kind, scalar_value, source_ref, created_at, metadata_json
+        FROM time_series_points
+        WHERE entity_ref = ?1
+          AND (?2 IS NULL OR metric = ?2)
+          AND (?3 IS NULL OR t >= ?3)
+          AND (?4 IS NULL OR t <= ?4)
+        ORDER BY t ASC, metric ASC, source_ref ASC
+        "#,
+    )
+    .bind(entity_ref)
+    .bind(metric)
+    .bind(start)
+    .bind(end)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_time_series_point_response(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
 }
@@ -4561,6 +4634,10 @@ fn soil_iot_error(error: SoilIotError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn gateway_ingest_error(error: GatewayIngestError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
     value.parse::<SoilSensorType>().map_err(soil_iot_error)
 }
@@ -5341,6 +5418,53 @@ fn decode_fleet_health_indicator_sample(
     })
 }
 
+fn decode_time_series_point_response(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<TimeSeriesPointResponse> {
+    let value_kind: String = row.get("value_kind");
+    let value = match value_kind.as_str() {
+        "scalar" => SeriesValue::Scalar {
+            value: row.get("scalar_value"),
+        },
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported time-series value kind {other}"
+            )));
+        }
+    };
+    let metadata_json: Option<String> = row.get("metadata_json");
+    let metadata = metadata_json
+        .map(|metadata_json| serde_json::from_str::<serde_json::Value>(&metadata_json))
+        .transpose()
+        .map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode time-series metadata_json"))
+        })?;
+
+    Ok(TimeSeriesPointResponse {
+        entity_ref: row.get("entity_ref"),
+        metric: row.get("metric"),
+        t: row.get("t"),
+        value,
+        source_ref: row.get("source_ref"),
+        created_at: row.get("created_at"),
+        metadata,
+    })
+}
+
+fn soil_reading_time_series_metadata(reading: &GeolocatedSoilReading) -> AppResult<String> {
+    serde_json::to_string(&serde_json::json!({
+        "payload_id": &reading.payload_id,
+        "device_id": &reading.device_id,
+        "field_id": &reading.field_id,
+        "zone_id": &reading.zone_id,
+        "position": &reading.position,
+        "geolocation_status": reading.geolocation_status,
+        "excluded_from_geospatial_products": reading.excluded_from_geospatial_products,
+        "qa_flags": &reading.qa_flags,
+    }))
+    .map_err(|err| AppError::Anyhow(Error::new(err)))
+}
+
 fn decode_soil_iot_device(row: &sqlx::sqlite::SqliteRow) -> AppResult<SoilDeviceRecord> {
     Ok(SoilDeviceRecord {
         device_id: row.get("device_id"),
@@ -5801,12 +5925,19 @@ async fn insert_time_series_point(
     state: &AppState,
     sample: &FleetHealthIndicatorSample,
 ) -> AppResult<()> {
-    let point = sample.to_series_point();
-    let scalar_value = match point.value {
-        SeriesValue::Scalar { value } => value,
+    insert_time_series_point_record(state, &sample.to_series_point(), None).await
+}
+
+async fn insert_time_series_point_record(
+    state: &AppState,
+    point: &SeriesPoint,
+    metadata_json: Option<String>,
+) -> AppResult<()> {
+    let scalar_value = match &point.value {
+        SeriesValue::Scalar { value } => *value,
         SeriesValue::Raster(_) => {
             return Err(AppError::BadRequest(
-                "fleet health indicators must write scalar time-series points".to_string(),
+                "only scalar time-series points are supported by geo_hub persistence".to_string(),
             ));
         }
     };
@@ -5814,9 +5945,9 @@ async fn insert_time_series_point(
     sqlx::query(
         r#"
         INSERT OR IGNORE INTO time_series_points (
-            entity_ref, metric, t, value_kind, scalar_value, source_ref, created_at
+            entity_ref, metric, t, value_kind, scalar_value, source_ref, created_at, metadata_json
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         "#,
     )
     .bind(&point.entity_ref)
@@ -5826,6 +5957,7 @@ async fn insert_time_series_point(
     .bind(scalar_value)
     .bind(&point.source_ref)
     .bind(&point.created_at)
+    .bind(metadata_json)
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -5891,6 +6023,26 @@ async fn insert_soil_iot_device(state: &AppState, record: &SoilDeviceRecord) -> 
     .map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn load_soil_iot_device(
+    state: &AppState,
+    device_id: &str,
+) -> AppResult<Option<SoilDeviceRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT device_id, org_id, field_id, zone_id, sensor_type, latitude, longitude, crs,
+               calibration_profile_ref, status, created_at, updated_at
+        FROM soil_iot_devices
+        WHERE device_id = ?1
+        "#,
+    )
+    .bind(device_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_soil_iot_device(&row)).transpose()
 }
 
 async fn append_fleet_component_event(

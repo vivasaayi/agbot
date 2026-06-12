@@ -468,11 +468,20 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             scalar_value REAL,
             source_ref TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            metadata_json TEXT,
             PRIMARY KEY (entity_ref, metric, t, source_ref)
         );
         "#,
     )
     .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "time_series_points",
+        "metadata_json",
+        "ALTER TABLE time_series_points ADD COLUMN metadata_json TEXT",
+    )
     .await?;
 
     sqlx::query(

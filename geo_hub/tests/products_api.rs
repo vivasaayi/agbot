@@ -1955,6 +1955,170 @@ async fn soil_iot_device_registry_registers_and_lists_geolocated_devices() -> Re
 }
 
 #[tokio::test]
+async fn soil_iot_readings_inherit_geolocation_and_persist_via_timeseries() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    register_soil_iot_test_device(&ctx, "soil-probe-001").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/soil-iot/readings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "payload_id": "payload-soil-001",
+                        "device_id": "soil-probe-001",
+                        "metric": "soil_moisture_percent",
+                        "raw_value": 34.5,
+                        "gateway_ts": "2026-06-12T10:00:00Z",
+                        "received_at": "2026-06-12T10:00:03Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let reading: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        reading.get("field_id").and_then(|value| value.as_str()),
+        Some("field-soil-001")
+    );
+    assert_eq!(
+        reading.get("zone_id").and_then(|value| value.as_str()),
+        Some("zone-ne")
+    );
+    assert_eq!(
+        reading
+            .get("geolocation_status")
+            .and_then(|value| value.as_str()),
+        Some("located")
+    );
+    assert_eq!(
+        reading
+            .pointer("/position/crs")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+
+    let series_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/api/time-series/points?entity_ref=device:soil-probe-001&metric=soil_moisture_percent",
+                )
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(series_response.status(), StatusCode::OK);
+    let body = to_bytes(series_response.into_body(), 64 * 1024).await?;
+    let points: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(points.len(), 1);
+    assert_eq!(
+        points[0].get("entity_ref").and_then(|value| value.as_str()),
+        Some("device:soil-probe-001")
+    );
+    assert_eq!(
+        points[0]
+            .pointer("/value/value")
+            .and_then(|value| value.as_f64()),
+        Some(34.5)
+    );
+    assert_eq!(
+        points[0]
+            .pointer("/metadata/field_id")
+            .and_then(|value| value.as_str()),
+        Some("field-soil-001")
+    );
+    assert_eq!(
+        points[0]
+            .pointer("/metadata/position/crs")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn soil_iot_reading_with_invalid_device_position_is_flagged_not_defaulted() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    register_soil_iot_test_device(&ctx, "soil-probe-bad-geo").await?;
+    sqlx::query("UPDATE soil_iot_devices SET latitude = ?1 WHERE device_id = ?2")
+        .bind(120.0)
+        .bind("soil-probe-bad-geo")
+        .execute(&ctx.pool)
+        .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/soil-iot/readings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "payload_id": "payload-soil-bad-geo",
+                        "device_id": "soil-probe-bad-geo",
+                        "metric": "soil_moisture_percent",
+                        "raw_value": 34.5,
+                        "gateway_ts": "2026-06-12T10:00:00Z",
+                        "received_at": "2026-06-12T10:00:03Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let reading: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        reading
+            .get("geolocation_status")
+            .and_then(|value| value.as_str()),
+        Some("no_geolocation")
+    );
+    assert!(reading.get("position").is_some_and(|value| value.is_null()));
+    assert_eq!(
+        reading
+            .get("excluded_from_geospatial_products")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        reading
+            .pointer("/qa_flags/0")
+            .and_then(|value| value.as_str()),
+        Some("no_geolocation")
+    );
+
+    let point_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM time_series_points WHERE entity_ref = ?1")
+            .bind("device:soil-probe-bad-geo")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(point_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn orthomosaic_frame_set_ingest_lists_pose_metadata() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -5330,6 +5494,39 @@ async fn register_test_component_type(
                         "serial": format!("SERIAL-{component_id}"),
                         "airframe_id": airframe_id,
                         "installed_at": "2026-06-01T10:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn register_soil_iot_test_device(ctx: &TestContext, device_id: &str) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/soil-iot/devices")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "device_id": device_id,
+                        "org_id": "org-soil-001",
+                        "field_id": "field-soil-001",
+                        "zone_id": "zone-ne",
+                        "sensor_type": "soil_moisture",
+                        "position": {
+                            "latitude": 38.5816,
+                            "longitude": -121.4944,
+                            "crs": "EPSG:4326"
+                        },
+                        "calibration_profile_ref": format!("calibration:{device_id}:v1")
                     })
                     .to_string(),
                 ))
