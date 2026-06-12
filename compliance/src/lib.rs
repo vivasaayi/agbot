@@ -252,6 +252,53 @@ pub struct CertificationCheckResult {
     pub reason_code: Option<CertificationBlockReason>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightAirspaceStatus {
+    Fresh,
+    Missing,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationDecisionStatus {
+    Permitted,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationBlockReason {
+    NoFlyZoneIntersection,
+    MissingAirspaceData,
+    StaleAirspaceData,
+    MissingCertification,
+    ExpiredCertification,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreflightAuthorizationRequest {
+    pub flight_id: String,
+    pub operator_id: String,
+    pub required_cert_type: String,
+    pub planned_at: String,
+    #[serde(default)]
+    pub planned_area: Vec<AirspaceCoordinate>,
+    pub airspace_status: PreflightAirspaceStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreflightAuthorizationDecision {
+    pub flight_id: String,
+    pub operator_id: String,
+    pub checked_at: String,
+    pub status: AuthorizationDecisionStatus,
+    pub reason_code: Option<AuthorizationBlockReason>,
+    pub zone_ref: Option<String>,
+    pub cert_ref: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CreateComplianceRecordRequest {
     #[serde(default)]
@@ -430,6 +477,33 @@ pub enum OperatorCertificationError {
     InvalidTimeRange {
         start_field: &'static str,
         end_field: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum PreflightAuthorizationError {
+    #[error("flight_id cannot be empty")]
+    EmptyFlightId,
+    #[error("operator_id cannot be empty")]
+    EmptyOperatorId,
+    #[error("required_cert_type cannot be empty")]
+    EmptyRequiredCertType,
+    #[error("planned_at cannot be empty")]
+    EmptyPlannedAt,
+    #[error("planned flight area is invalid: {source}")]
+    InvalidFlightArea {
+        #[source]
+        source: AirspaceZoneError,
+    },
+    #[error("operator certification check failed: {source}")]
+    Certification {
+        #[source]
+        source: OperatorCertificationError,
+    },
+    #[error("airspace intersection check failed: {source}")]
+    Airspace {
+        #[source]
+        source: AirspaceZoneError,
     },
 }
 
@@ -650,6 +724,109 @@ pub fn check_operator_certification(
             reason_code: None,
         })
     }
+}
+
+pub fn evaluate_preflight_authorization(
+    request: PreflightAuthorizationRequest,
+    airspace_zones: &[AirspaceZoneRecord],
+    certifications: &[OperatorCertificationRecord],
+) -> Result<PreflightAuthorizationDecision, PreflightAuthorizationError> {
+    let flight_id = normalize_required_preflight_text(
+        request.flight_id,
+        PreflightAuthorizationError::EmptyFlightId,
+    )?;
+    let operator_id = normalize_required_preflight_text(
+        request.operator_id,
+        PreflightAuthorizationError::EmptyOperatorId,
+    )?;
+    let required_cert_type = normalize_required_preflight_text(
+        request.required_cert_type,
+        PreflightAuthorizationError::EmptyRequiredCertType,
+    )?;
+    let planned_at = normalize_required_preflight_text(
+        request.planned_at,
+        PreflightAuthorizationError::EmptyPlannedAt,
+    )?;
+    let planned_area = validate_airspace_polygon(request.planned_area)
+        .map_err(|source| PreflightAuthorizationError::InvalidFlightArea { source })?;
+
+    match request.airspace_status {
+        PreflightAirspaceStatus::Missing => {
+            return Ok(blocked_authorization(
+                flight_id,
+                operator_id,
+                planned_at,
+                AuthorizationBlockReason::MissingAirspaceData,
+                None,
+                None,
+            ));
+        }
+        PreflightAirspaceStatus::Stale => {
+            return Ok(blocked_authorization(
+                flight_id,
+                operator_id,
+                planned_at,
+                AuthorizationBlockReason::StaleAirspaceData,
+                None,
+                None,
+            ));
+        }
+        PreflightAirspaceStatus::Fresh => {}
+    }
+
+    let cert_check = check_operator_certification(
+        operator_id.clone(),
+        required_cert_type,
+        planned_at.clone(),
+        certifications,
+    )
+    .map_err(|source| PreflightAuthorizationError::Certification { source })?;
+    if cert_check.block_flight {
+        let reason_code = match cert_check.reason_code {
+            Some(CertificationBlockReason::ExpiredCertification) => {
+                AuthorizationBlockReason::ExpiredCertification
+            }
+            Some(CertificationBlockReason::MissingCertification) | None => {
+                AuthorizationBlockReason::MissingCertification
+            }
+        };
+        return Ok(blocked_authorization(
+            flight_id,
+            operator_id,
+            planned_at,
+            reason_code,
+            None,
+            cert_check.cert_id,
+        ));
+    }
+
+    for zone in airspace_zones {
+        if !hard_blocking_zone(zone) || !airspace_zone_is_effective_at(zone, Some(&planned_at)) {
+            continue;
+        }
+        let intersects = airspace_zone_intersects_polygon(zone, &planned_area)
+            .map_err(|source| PreflightAuthorizationError::Airspace { source })?;
+        if intersects {
+            return Ok(blocked_authorization(
+                flight_id,
+                operator_id,
+                planned_at,
+                AuthorizationBlockReason::NoFlyZoneIntersection,
+                Some(zone.zone_id.clone()),
+                cert_check.cert_id,
+            ));
+        }
+    }
+
+    Ok(PreflightAuthorizationDecision {
+        flight_id,
+        operator_id,
+        checked_at: planned_at,
+        status: AuthorizationDecisionStatus::Permitted,
+        reason_code: None,
+        zone_ref: None,
+        cert_ref: cert_check.cert_id,
+    })
 }
 
 pub fn airspace_zone_contains_point(zone: &AirspaceZoneRecord, point: AirspaceCoordinate) -> bool {
@@ -1028,6 +1205,46 @@ fn ensure_operator_time_range(
     }
 }
 
+fn normalize_required_preflight_text(
+    value: String,
+    error: PreflightAuthorizationError,
+) -> Result<String, PreflightAuthorizationError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn blocked_authorization(
+    flight_id: String,
+    operator_id: String,
+    checked_at: String,
+    reason_code: AuthorizationBlockReason,
+    zone_ref: Option<String>,
+    cert_ref: Option<String>,
+) -> PreflightAuthorizationDecision {
+    PreflightAuthorizationDecision {
+        flight_id,
+        operator_id,
+        checked_at,
+        status: AuthorizationDecisionStatus::Blocked,
+        reason_code: Some(reason_code),
+        zone_ref,
+        cert_ref,
+    }
+}
+
+fn hard_blocking_zone(zone: &AirspaceZoneRecord) -> bool {
+    matches!(
+        zone.zone_class,
+        AirspaceZoneClass::NoFly
+            | AirspaceZoneClass::Restricted
+            | AirspaceZoneClass::TemporaryFlightRestriction
+    )
+}
+
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -1175,12 +1392,14 @@ mod tests {
         airspace_zone_contains_point, airspace_zone_intersects_polygon,
         append_compliance_record_version, build_airspace_zone_record,
         build_initial_compliance_record, build_operator_certification_record,
-        check_operator_certification, refuse_in_place_mutation, AirspaceCoordinate,
-        AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
-        AppendComplianceRecordVersionRequest, ApplicationGeometry, CertificationBlockReason,
-        CertificationStatus, ChemicalApplicationRecord, ComplianceRecordError,
-        ComplianceRecordPayload, ComplianceRecordType, CreateComplianceRecordRequest,
-        OperatorCertificationRegistrationRequest, RemoteIdFlightLogRecord, RemoteIdTrackPoint,
+        check_operator_certification, evaluate_preflight_authorization, refuse_in_place_mutation,
+        AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
+        AppendComplianceRecordVersionRequest, ApplicationGeometry, AuthorizationBlockReason,
+        AuthorizationDecisionStatus, CertificationBlockReason, CertificationStatus,
+        ChemicalApplicationRecord, ComplianceRecordError, ComplianceRecordPayload,
+        ComplianceRecordType, CreateComplianceRecordRequest,
+        OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
+        PreflightAuthorizationRequest, RemoteIdFlightLogRecord, RemoteIdTrackPoint,
         TelemetryGapRecord,
     };
 
@@ -1339,6 +1558,107 @@ mod tests {
         assert_eq!(
             result.reason_code,
             Some(CertificationBlockReason::MissingCertification)
+        );
+    }
+
+    #[test]
+    fn preflight_authorization_permits_clear_flight_with_valid_cert() {
+        let cert = operator_cert(
+            "cert-107-valid",
+            "operator-17",
+            "part-107",
+            "2026-01-01T00:00:00Z",
+            "2026-12-31T23:59:59Z",
+        );
+
+        let decision = evaluate_preflight_authorization(
+            preflight_request(PreflightAirspaceStatus::Fresh, clear_flight_area()),
+            &[],
+            &[cert],
+        )
+        .expect("authorization should evaluate");
+
+        assert_eq!(decision.status, AuthorizationDecisionStatus::Permitted);
+        assert_eq!(decision.reason_code, None);
+        assert_eq!(decision.cert_ref.as_deref(), Some("cert-107-valid"));
+    }
+
+    #[test]
+    fn preflight_authorization_blocks_active_no_fly_intersection() {
+        let cert = operator_cert(
+            "cert-107-valid",
+            "operator-17",
+            "part-107",
+            "2026-01-01T00:00:00Z",
+            "2026-12-31T23:59:59Z",
+        );
+        let zone = build_airspace_zone_record(
+            base_zone_request(),
+            "generated-zone".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+        )
+        .expect("zone should be valid");
+
+        let decision = evaluate_preflight_authorization(
+            preflight_request(PreflightAirspaceStatus::Fresh, intersecting_flight_area()),
+            &[zone],
+            &[cert],
+        )
+        .expect("authorization should evaluate");
+
+        assert_eq!(decision.status, AuthorizationDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(AuthorizationBlockReason::NoFlyZoneIntersection)
+        );
+        assert_eq!(decision.zone_ref.as_deref(), Some("zone-1"));
+    }
+
+    #[test]
+    fn preflight_authorization_denies_on_missing_airspace_data() {
+        let cert = operator_cert(
+            "cert-107-valid",
+            "operator-17",
+            "part-107",
+            "2026-01-01T00:00:00Z",
+            "2026-12-31T23:59:59Z",
+        );
+
+        let decision = evaluate_preflight_authorization(
+            preflight_request(PreflightAirspaceStatus::Missing, clear_flight_area()),
+            &[],
+            &[cert],
+        )
+        .expect("authorization should evaluate");
+
+        assert_eq!(decision.status, AuthorizationDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(AuthorizationBlockReason::MissingAirspaceData)
+        );
+    }
+
+    #[test]
+    fn preflight_authorization_denies_on_stale_airspace_data() {
+        let cert = operator_cert(
+            "cert-107-valid",
+            "operator-17",
+            "part-107",
+            "2026-01-01T00:00:00Z",
+            "2026-12-31T23:59:59Z",
+        );
+
+        let decision = evaluate_preflight_authorization(
+            preflight_request(PreflightAirspaceStatus::Stale, clear_flight_area()),
+            &[],
+            &[cert],
+        )
+        .expect("authorization should evaluate");
+
+        assert_eq!(decision.status, AuthorizationDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(AuthorizationBlockReason::StaleAirspaceData)
         );
     }
 
@@ -1646,6 +1966,74 @@ mod tests {
             "2026-06-12T12:00:00Z".to_string(),
         )
         .expect("operator cert should be valid")
+    }
+
+    fn preflight_request(
+        airspace_status: PreflightAirspaceStatus,
+        planned_area: Vec<AirspaceCoordinate>,
+    ) -> PreflightAuthorizationRequest {
+        PreflightAuthorizationRequest {
+            flight_id: "flight-77".to_string(),
+            operator_id: "operator-17".to_string(),
+            required_cert_type: "part-107".to_string(),
+            planned_at: "2026-06-12T12:00:00Z".to_string(),
+            planned_area,
+            airspace_status,
+        }
+    }
+
+    fn base_zone_request() -> AirspaceZoneIngestRequest {
+        AirspaceZoneIngestRequest {
+            zone_id: Some("zone-1".to_string()),
+            zone_class: AirspaceZoneClass::NoFly,
+            crs: "EPSG:4326".to_string(),
+            coordinates: square_zone(),
+            effective_from: "2026-06-01T00:00:00Z".to_string(),
+            effective_to: None,
+            source: "faa-uasfm-2026-06".to_string(),
+        }
+    }
+
+    fn clear_flight_area() -> Vec<AirspaceCoordinate> {
+        vec![
+            AirspaceCoordinate {
+                longitude: -97.20,
+                latitude: 41.00,
+            },
+            AirspaceCoordinate {
+                longitude: -97.10,
+                latitude: 41.00,
+            },
+            AirspaceCoordinate {
+                longitude: -97.10,
+                latitude: 41.10,
+            },
+            AirspaceCoordinate {
+                longitude: -97.20,
+                latitude: 41.00,
+            },
+        ]
+    }
+
+    fn intersecting_flight_area() -> Vec<AirspaceCoordinate> {
+        vec![
+            AirspaceCoordinate {
+                longitude: -96.50,
+                latitude: 41.20,
+            },
+            AirspaceCoordinate {
+                longitude: -96.10,
+                latitude: 41.20,
+            },
+            AirspaceCoordinate {
+                longitude: -96.10,
+                latitude: 41.50,
+            },
+            AirspaceCoordinate {
+                longitude: -96.50,
+                latitude: 41.20,
+            },
+        ]
     }
 
     fn square_zone() -> Vec<AirspaceCoordinate> {
