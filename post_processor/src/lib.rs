@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+pub mod findings_export;
 pub mod lidar_analysis;
 pub mod ndvi_analysis;
 pub mod product_anomalies;
@@ -15,6 +16,10 @@ pub mod zonal_statistics;
 pub mod zone_delineation;
 pub mod zone_recommendations;
 
+pub use findings_export::{
+    export_findings_csv, export_findings_geojson, FindingExportRecord, FindingsExportError,
+    FINDINGS_CSV_HEADER,
+};
 pub use lidar_analysis::{LidarAnalysisConfig, LidarAnalysisProcessor};
 pub use ndvi_analysis::{NdviAnalysisConfig, NdviAnalysisProcessor};
 pub use product_anomalies::{
