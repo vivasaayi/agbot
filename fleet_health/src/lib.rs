@@ -486,6 +486,80 @@ pub struct OtaRolloutDecision {
     pub evaluated_node_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutControlAction {
+    Start,
+    Pause,
+    Abort,
+}
+
+impl RolloutControlAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Pause => "pause",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutControlStatus {
+    Started,
+    Paused,
+    Aborted,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutControlReason {
+    StartedByOperator,
+    PausedByOperator,
+    AbortedByOperator,
+    SimulationValidationRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutControlRequest {
+    pub rollout_id: String,
+    pub actor: String,
+    pub action: RolloutControlAction,
+    pub version: String,
+    pub stage: OtaRolloutStage,
+    pub requested_at: String,
+    pub simulation_validated: bool,
+    pub targets_flight_nodes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutControlAuditRecord {
+    pub audit_id: String,
+    pub rollout_id: String,
+    pub actor: String,
+    pub action: RolloutControlAction,
+    pub version: String,
+    pub stage: OtaRolloutStage,
+    pub at: String,
+    pub result: RolloutControlStatus,
+    pub reason_code: RolloutControlReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutControlDecision {
+    pub rollout_id: String,
+    pub actor: String,
+    pub action: RolloutControlAction,
+    pub version: String,
+    pub stage: OtaRolloutStage,
+    pub requested_at: String,
+    pub status: RolloutControlStatus,
+    pub reason_code: RolloutControlReason,
+    pub audit: RolloutControlAuditRecord,
+}
+
 impl FleetReadinessDecision {
     pub fn is_clear(&self) -> bool {
         self.status == FleetReadinessDecisionStatus::Permitted && self.blockers.is_empty()
@@ -605,6 +679,8 @@ pub enum FleetHealthError {
     },
     #[error("rollout_id cannot be empty")]
     EmptyRolloutId,
+    #[error("rollout actor cannot be empty")]
+    EmptyRolloutActor,
     #[error("fleet node_id cannot be empty")]
     EmptyFleetNodeId,
     #[error("artifact name cannot be empty")]
@@ -1135,6 +1211,66 @@ pub fn evaluate_ota_rollout(
     ))
 }
 
+pub fn apply_rollout_control(
+    request: RolloutControlRequest,
+) -> Result<RolloutControlDecision, FleetHealthError> {
+    let rollout_id = normalize_required_text(request.rollout_id, FleetHealthError::EmptyRolloutId)?;
+    let actor = normalize_required_text(request.actor, FleetHealthError::EmptyRolloutActor)?;
+    let version = normalize_required_text(request.version, FleetHealthError::EmptyArtifactVersion)?;
+    let requested_at =
+        normalize_required_text(request.requested_at, FleetHealthError::EmptyCreatedAt)?;
+    let (status, reason_code) = if request.targets_flight_nodes && !request.simulation_validated {
+        (
+            RolloutControlStatus::Refused,
+            RolloutControlReason::SimulationValidationRequired,
+        )
+    } else {
+        match request.action {
+            RolloutControlAction::Start => (
+                RolloutControlStatus::Started,
+                RolloutControlReason::StartedByOperator,
+            ),
+            RolloutControlAction::Pause => (
+                RolloutControlStatus::Paused,
+                RolloutControlReason::PausedByOperator,
+            ),
+            RolloutControlAction::Abort => (
+                RolloutControlStatus::Aborted,
+                RolloutControlReason::AbortedByOperator,
+            ),
+        }
+    };
+    let audit = RolloutControlAuditRecord {
+        audit_id: format!(
+            "rollout-control:{}:{}:{}:{}",
+            rollout_id,
+            actor,
+            request.action.as_str(),
+            requested_at
+        ),
+        rollout_id: rollout_id.clone(),
+        actor: actor.clone(),
+        action: request.action,
+        version: version.clone(),
+        stage: request.stage,
+        at: requested_at.clone(),
+        result: status,
+        reason_code,
+    };
+
+    Ok(RolloutControlDecision {
+        rollout_id,
+        actor,
+        action: request.action,
+        version,
+        stage: request.stage,
+        requested_at,
+        status,
+        reason_code,
+        audit,
+    })
+}
+
 pub fn component_event(
     component_id: &str,
     event_type: &str,
@@ -1485,17 +1621,20 @@ fn validate_nonnegative_finite(
 #[cfg(test)]
 mod tests {
     use super::{
-        accrue_component_duty, build_component_duty_accruals, build_component_record,
-        component_event, derive_health_indicators, evaluate_component_health_verdict,
-        evaluate_fleet_readiness, evaluate_ota_rollout, install_component, ComponentHealthVerdict,
-        ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
-        DutyAccrualRequest, FleetComponentRecord, FleetComponentType, FleetHealthError,
-        FleetHealthIndicator, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
-        FleetReadinessRequest, HealthIndicatorFreshness, HealthIndicatorThreshold,
-        HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
+        accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
+        build_component_record, component_event, derive_health_indicators,
+        evaluate_component_health_verdict, evaluate_fleet_readiness, evaluate_ota_rollout,
+        install_component, ComponentHealthVerdict, ComponentHealthVerdictRequest,
+        ComponentHealthVerdictStatus, ComponentServiceLimit, DutyAccrualRequest,
+        FleetComponentRecord, FleetComponentType, FleetHealthError, FleetHealthIndicator,
+        FleetReadinessBlockReason, FleetReadinessDecisionStatus, FleetReadinessRequest,
+        HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
+        HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
         InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
         OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
-        RegisterComponentRequest, ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
+        RegisterComponentRequest, RolloutControlAction, RolloutControlReason,
+        RolloutControlRequest, RolloutControlStatus, ServiceHistoryEntry,
+        TelemetryHealthIndicatorRequest,
     };
     use timeseries::SeriesValue;
 
@@ -2159,6 +2298,61 @@ mod tests {
         assert!(decision.rollback_actions.is_empty());
     }
 
+    #[test]
+    fn rollout_control_pause_takes_effect_and_records_audit() {
+        let decision = apply_rollout_control(rollout_control_request(
+            RolloutControlAction::Pause,
+            true,
+            true,
+        ))
+        .expect("control action should evaluate");
+
+        assert_eq!(decision.status, RolloutControlStatus::Paused);
+        assert_eq!(decision.reason_code, RolloutControlReason::PausedByOperator);
+        assert_eq!(decision.audit.actor, "ops@example.com");
+        assert_eq!(decision.audit.action, RolloutControlAction::Pause);
+        assert_eq!(decision.audit.version, "2.0.0");
+        assert_eq!(decision.audit.stage, OtaRolloutStage::Staged);
+        assert_eq!(decision.audit.result, RolloutControlStatus::Paused);
+    }
+
+    #[test]
+    fn rollout_control_abort_takes_effect_and_records_audit() {
+        let decision = apply_rollout_control(rollout_control_request(
+            RolloutControlAction::Abort,
+            true,
+            true,
+        ))
+        .expect("control action should evaluate");
+
+        assert_eq!(decision.status, RolloutControlStatus::Aborted);
+        assert_eq!(
+            decision.reason_code,
+            RolloutControlReason::AbortedByOperator
+        );
+        assert_eq!(decision.audit.actor, "ops@example.com");
+        assert_eq!(decision.audit.stage, OtaRolloutStage::Staged);
+        assert_eq!(decision.audit.result, RolloutControlStatus::Aborted);
+    }
+
+    #[test]
+    fn rollout_control_refuses_flight_targets_until_simulation_validates() {
+        let decision = apply_rollout_control(rollout_control_request(
+            RolloutControlAction::Start,
+            false,
+            true,
+        ))
+        .expect("control action should evaluate");
+
+        assert_eq!(decision.status, RolloutControlStatus::Refused);
+        assert_eq!(
+            decision.reason_code,
+            RolloutControlReason::SimulationValidationRequired
+        );
+        assert_eq!(decision.audit.actor, "ops@example.com");
+        assert_eq!(decision.audit.result, RolloutControlStatus::Refused);
+    }
+
     fn indicator_sample(
         component_id: &str,
         indicator: FleetHealthIndicator,
@@ -2219,6 +2413,23 @@ mod tests {
             status,
             blocking_alerts: blocking_alerts.into_iter().map(ToOwned::to_owned).collect(),
             checked_at: "2026-06-12T13:02:00Z".to_string(),
+        }
+    }
+
+    fn rollout_control_request(
+        action: RolloutControlAction,
+        simulation_validated: bool,
+        targets_flight_nodes: bool,
+    ) -> RolloutControlRequest {
+        RolloutControlRequest {
+            rollout_id: "rollout-2026-06-12".to_string(),
+            actor: "ops@example.com".to_string(),
+            action,
+            version: "2.0.0".to_string(),
+            stage: OtaRolloutStage::Staged,
+            requested_at: "2026-06-12T14:00:00Z".to_string(),
+            simulation_validated,
+            targets_flight_nodes,
         }
     }
 

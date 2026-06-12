@@ -1971,6 +1971,74 @@ async fn fleet_health_ota_rollout_evaluates_stage_and_rollback() -> Result<()> {
 }
 
 #[tokio::test]
+async fn fleet_health_rollout_control_actions_return_audit() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let start = post_rollout_control(&ctx, "start", true, true).await?;
+    let pause = post_rollout_control(&ctx, "pause", true, true).await?;
+    let abort = post_rollout_control(&ctx, "abort", true, true).await?;
+
+    assert_eq!(
+        start.get("status").and_then(|value| value.as_str()),
+        Some("started")
+    );
+    assert_eq!(
+        pause.get("status").and_then(|value| value.as_str()),
+        Some("paused")
+    );
+    assert_eq!(
+        abort.get("status").and_then(|value| value.as_str()),
+        Some("aborted")
+    );
+    assert_eq!(
+        abort
+            .pointer("/audit/actor")
+            .and_then(|value| value.as_str()),
+        Some("ops@example.com")
+    );
+    assert_eq!(
+        abort
+            .pointer("/audit/action")
+            .and_then(|value| value.as_str()),
+        Some("abort")
+    );
+    assert_eq!(
+        abort
+            .pointer("/audit/stage")
+            .and_then(|value| value.as_str()),
+        Some("staged")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fleet_health_rollout_control_refuses_unsimulated_flight_target() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let decision = post_rollout_control(&ctx, "start", false, true).await?;
+
+    assert_eq!(
+        decision.get("status").and_then(|value| value.as_str()),
+        Some("refused")
+    );
+    assert_eq!(
+        decision.get("reason_code").and_then(|value| value.as_str()),
+        Some("simulation_validation_required")
+    );
+    assert_eq!(
+        decision
+            .pointer("/audit/result")
+            .and_then(|value| value.as_str()),
+        Some("refused")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fired_alert_history_is_filterable_paginable_and_not_fabricated() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -6008,6 +6076,42 @@ async fn register_test_component(
     airframe_id: &str,
 ) -> Result<()> {
     register_test_component_type(ctx, component_id, "battery", airframe_id).await
+}
+
+async fn post_rollout_control(
+    ctx: &TestContext,
+    action: &str,
+    simulation_validated: bool,
+    targets_flight_nodes: bool,
+) -> Result<serde_json::Value> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet-health/ota-rollouts/control")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "rollout_id": "rollout-2026-06-12",
+                        "actor": "ops@example.com",
+                        "action": action,
+                        "version": "2.0.0",
+                        "stage": "staged",
+                        "requested_at": "2026-06-12T14:00:00Z",
+                        "simulation_validated": simulation_validated,
+                        "targets_flight_nodes": targets_flight_nodes
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    serde_json::from_slice(&body).map_err(Into::into)
 }
 
 async fn register_test_component_type(

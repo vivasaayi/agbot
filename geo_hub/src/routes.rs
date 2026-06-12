@@ -32,13 +32,14 @@ use crop_intelligence::{
     ModelVersionRegistrationRequest,
 };
 use fleet_health::{
-    accrue_component_duty, build_component_duty_accruals, build_component_record, component_event,
-    derive_health_indicators, evaluate_ota_rollout, install_component, ComponentDutyAccrualRecord,
-    DutyAccrualRequest, FleetComponentEventRecord, FleetComponentRecord, FleetComponentType,
-    FleetHealthError, FleetHealthIndicator, FleetHealthIndicatorDerivation,
-    FleetHealthIndicatorSample, HealthIndicatorFreshness, HealthTelemetryGap,
-    InstallComponentRequest, OtaRolloutDecision, OtaRolloutRequest, RegisterComponentRequest,
-    ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
+    accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
+    build_component_record, component_event, derive_health_indicators, evaluate_ota_rollout,
+    install_component, ComponentDutyAccrualRecord, DutyAccrualRequest, FleetComponentEventRecord,
+    FleetComponentRecord, FleetComponentType, FleetHealthError, FleetHealthIndicator,
+    FleetHealthIndicatorDerivation, FleetHealthIndicatorSample, HealthIndicatorFreshness,
+    HealthTelemetryGap, InstallComponentRequest, OtaRolloutDecision, OtaRolloutRequest,
+    RegisterComponentRequest, RolloutControlDecision, RolloutControlRequest, ServiceHistoryEntry,
+    TelemetryHealthIndicatorRequest,
 };
 use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
@@ -1933,6 +1934,14 @@ pub async fn evaluate_ota_rollout_route(
     Json(request): Json<OtaRolloutRequest>,
 ) -> AppResult<Json<OtaRolloutDecision>> {
     evaluate_ota_rollout(request)
+        .map(Json)
+        .map_err(fleet_health_error)
+}
+
+pub async fn apply_rollout_control_route(
+    Json(request): Json<RolloutControlRequest>,
+) -> AppResult<Json<RolloutControlDecision>> {
+    apply_rollout_control(request)
         .map(Json)
         .map_err(fleet_health_error)
 }
