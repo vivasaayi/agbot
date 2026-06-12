@@ -4,6 +4,7 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/MissionPreview.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
 
@@ -31,6 +32,7 @@ using agbot::flight_sim::ElevationTile;
 using agbot::flight_sim::ManualControlInput;
 using agbot::flight_sim::Mission;
 using agbot::flight_sim::MissionLoader;
+using agbot::flight_sim::MissionPreviewOverlay;
 using agbot::flight_sim::TerrainMesh;
 using agbot::flight_sim::TelemetryRecorder;
 using agbot::flight_sim::TelemetryReplay;
@@ -44,6 +46,7 @@ using agbot::flight_sim::composite_elevation_with_state;
 using agbot::flight_sim::elevation_tile_from_terrarium_rgba;
 using agbot::flight_sim::geo_from_local;
 using agbot::flight_sim::local_from_geo;
+using agbot::flight_sim::build_mission_preview_overlay;
 using agbot::flight_sim::radius_m_for_area_km2;
 using agbot::flight_sim::tile_for_geo;
 using agbot::flight_sim::tiles_for_bounds;
@@ -143,6 +146,17 @@ std::string timestamp_for_filename() {
 
 std::filesystem::path telemetry_run_path() {
     return telemetry_runs_dir() / ("flight_" + timestamp_for_filename() + ".jsonl");
+}
+
+std::string preview_status_line(const MissionPreviewOverlay& overlay) {
+    if (!overlay.has_boundary) {
+        return overlay.status;
+    }
+
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(0)
+           << "coverage " << (overlay.coverage_fraction * 100.0) << "%";
+    return output.str();
 }
 
 NSTextField* make_label(NSString* text, NSFont* font, NSColor* color) {
@@ -1221,6 +1235,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     const double speed = state.velocity.length();
     const std::size_t waypoint_count = simulation_->mission().waypoints.size();
     const std::size_t waypoint_index = std::min(state.target_waypoint_index + 1, waypoint_count);
+    const MissionPreviewOverlay preview = build_mission_preview_overlay(simulation_->mission());
 
     std::ostringstream telemetry;
     telemetry << std::fixed << std::setprecision(1)
@@ -1243,6 +1258,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     std::ostringstream mission;
     mission << "Mission   " << simulation_->mission().name << "\n"
             << "Waypoint  " << waypoint_index << " / " << waypoint_count << "\n"
+            << "Preview   " << preview_status_line(preview) << "\n"
             << "Selected  ";
     if (selected_waypoint_ >= 0) {
         mission << (selected_waypoint_ + 1);
@@ -1284,11 +1300,12 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
             }
             overlay_text << globe_map_status_ << "   View "
                          << std::fixed << std::setprecision(1) << globe_view_zoom_
-                         << "x   Wheel/+/- zoom, drag rotate, click to load";
+                         << "x   " << preview_status_line(preview)
+                         << "   Wheel/+/- zoom, drag rotate, click to load";
         } else if (terrain_3d_mode_) {
             overlay_text << "3D terrain  distance "
                          << std::fixed << std::setprecision(0) << terrain3d_distance_m_ << " m"
-                         << "   " << terrain_status_ << "\n"
+                         << "   " << terrain_status_ << "   " << preview_status_line(preview) << "\n"
                          << "Drag orbit, wheel/+/- zoom, arrows pan, C chase, V return to 2D";
         } else {
             overlay_text << "";
@@ -1761,6 +1778,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         max_z = std::max(max_z, waypoint.position.z);
     }
 
+    const MissionPreviewOverlay overlay = build_mission_preview_overlay(mission);
+    for (const Vec3& point : overlay.boundary_local) {
+        min_x = std::min(min_x, point.x);
+        max_x = std::max(max_x, point.x);
+        min_z = std::min(min_z, point.z);
+        max_z = std::max(max_z, point.z);
+    }
+
     for (const Vec3& point : trail_) {
         min_x = std::min(min_x, point.x);
         max_x = std::max(max_x, point.x);
@@ -2025,6 +2050,17 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
 
     const auto& mission = simulation_->mission();
+    const MissionPreviewOverlay preview = build_mission_preview_overlay(mission);
+    if (preview.has_boundary && preview.boundary_local.size() >= 2) {
+        set_color(0.12, 0.90, 0.48, 0.72);
+        glLineWidth(2.5f);
+        glBegin(GL_LINE_STRIP);
+        for (const Vec3& point : preview.boundary_local) {
+            glVertex2d(point.x, point.z);
+        }
+        glEnd();
+    }
+
     set_color(0.72, 0.78, 0.88, 0.45);
     glLineWidth(3.0f);
     glBegin(GL_LINE_STRIP);
@@ -2230,6 +2266,18 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
 
     const auto& mission = simulation_->mission();
+    const MissionPreviewOverlay preview = build_mission_preview_overlay(mission);
+    if (preview.has_boundary && preview.boundary_local.size() >= 2) {
+        set_color(0.18, 0.96, 0.54, 0.78);
+        glLineWidth(2.5f);
+        glBegin(GL_LINE_STRIP);
+        for (const Vec3& boundary_point : preview.boundary_local) {
+            const Vec3 point = [self renderPositionForFlightPosition:Vec3(boundary_point.x, 0.0, boundary_point.z)];
+            glVertex3d(point.x, point.y + 0.8, point.z);
+        }
+        glEnd();
+    }
+
     set_color(0.86, 0.90, 1.0, 0.92);
     glLineWidth(3.0f);
     glBegin(GL_LINE_STRIP);
@@ -2439,6 +2487,36 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
     for (double lon = -180.0; lon < 180.0; lon += 30.0) {
         [self drawGlobeLineLongitude:lon frame:frame];
+    }
+
+    if (simulation_) {
+        const MissionPreviewOverlay preview = build_mission_preview_overlay(simulation_->mission());
+        if (preview.has_boundary && preview.boundary_geo.size() >= 2) {
+            set_color(0.22, 0.94, 0.58, 0.88);
+            glLineWidth(2.5f);
+            bool drawing = false;
+            glBegin(GL_LINE_STRIP);
+            for (const GeoCoordinate& coordinate : preview.boundary_geo) {
+                const GlobePoint point = project_globe_point(
+                    coordinate.latitude,
+                    coordinate.longitude,
+                    globe_center_latitude_,
+                    globe_center_longitude_
+                );
+                if (!point.visible) {
+                    if (drawing) {
+                        glEnd();
+                        glBegin(GL_LINE_STRIP);
+                        drawing = false;
+                    }
+                    continue;
+                }
+                const NSPoint screen = [self screenPointForGlobePoint:point frame:frame];
+                glVertex2d(screen.x, screen.y);
+                drawing = true;
+            }
+            glEnd();
+        }
     }
 
     set_color(0.84, 0.92, 1.0, 0.9);

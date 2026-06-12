@@ -4,6 +4,7 @@
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/LidarSimulator.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/MissionPreview.hpp"
 #include "agbot_flight_sim/SensorModel.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
 #include "agbot_flight_sim/SimulationOps.hpp"
@@ -82,6 +83,47 @@ const char* kGeoMissionJson = R"json(
 }
 )json";
 
+const char* kFieldPreviewMissionJson = R"json(
+{
+  "name": "Field Preview Mission",
+  "home_position": {
+    "latitude": 40.0005,
+    "longitude": -96.0005,
+    "altitude": 0.0
+  },
+  "field_boundary": {
+    "field_id": "north-field",
+    "coordinates": [
+      { "latitude": 40.0000, "longitude": -96.0010 },
+      { "latitude": 40.0000, "longitude": -96.0000 },
+      { "latitude": 40.0010, "longitude": -96.0000 },
+      { "latitude": 40.0010, "longitude": -96.0010 },
+      { "latitude": 40.0000, "longitude": -96.0010 }
+    ]
+  },
+  "waypoints": [
+    {
+      "sequence": 0,
+      "position": {
+        "latitude": 40.00025,
+        "longitude": -96.00075,
+        "altitude": 25.0
+      },
+      "command": 22
+    },
+    {
+      "sequence": 1,
+      "position": {
+        "latitude": 40.00075,
+        "longitude": -96.00025,
+        "altitude": 25.0
+      },
+      "command": 16
+    }
+  ]
+}
+)json";
+
 void write_terrarium_pixel(std::vector<std::uint8_t>& pixels, int index, float elevation_m) {
     const double encoded = static_cast<double>(elevation_m) + 32768.0;
     const auto r = static_cast<std::uint8_t>(std::floor(encoded / 256.0));
@@ -117,6 +159,29 @@ void test_loads_geodetic_mission() {
     assert(reloaded.home_geo.has_value());
     assert(reloaded.waypoints[0].geo.has_value());
     assert(std::abs(reloaded.waypoints[0].geo->latitude - 37.7750) < 1e-6);
+}
+
+void test_mission_preview_overlay_aligns_field_boundary_and_coverage() {
+    const auto mission = MissionLoader::load_from_text(kFieldPreviewMissionJson);
+    const auto overlay = agbot::flight_sim::build_mission_preview_overlay(mission);
+
+    assert(overlay.has_boundary);
+    assert(overlay.status == "field boundary aligned");
+    assert(overlay.boundary_local.size() == 5);
+    assert(overlay.mission_path_local.size() == 3);
+    assert(overlay.coverage_fraction > 0.99);
+    assert(std::abs(overlay.boundary_local.front().x - overlay.boundary_local.back().x) < 1e-6);
+    assert(std::abs(overlay.boundary_local.front().z - overlay.boundary_local.back().z) < 1e-6);
+}
+
+void test_mission_preview_overlay_reports_missing_boundary() {
+    const auto mission = MissionLoader::load_from_text(kGeoMissionJson);
+    const auto overlay = agbot::flight_sim::build_mission_preview_overlay(mission);
+
+    assert(!overlay.has_boundary);
+    assert(overlay.status == "no boundary");
+    assert(overlay.boundary_local.empty());
+    assert(overlay.coverage_fraction == 0.0);
 }
 
 void test_mission_completes() {
@@ -907,6 +972,8 @@ void test_fault_injection_rejects_fault_without_seed() {
 int main() {
     test_loads_mission();
     test_loads_geodetic_mission();
+    test_mission_preview_overlay_aligns_field_boundary_and_coverage();
+    test_mission_preview_overlay_reports_missing_boundary();
     test_mission_completes();
     test_manual_controls_move_drone();
     test_steady_wind_disturbs_ground_track();

@@ -135,6 +135,14 @@ std::string array_for_key(const std::string& text, const std::string& key) {
     return text.substr(value_start, end - value_start + 1);
 }
 
+std::optional<std::string> optional_array_for_key(const std::string& text, const std::string& key) {
+    try {
+        return array_for_key(text, key);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 std::vector<std::string> top_level_objects(const std::string& array_text) {
     std::vector<std::string> objects;
     for (std::size_t index = 0; index < array_text.size(); ++index) {
@@ -286,6 +294,28 @@ Waypoint waypoint_from_object(const std::string& object, const Mission& mission)
     return waypoint;
 }
 
+std::optional<FieldBoundary> field_boundary_from_object(const std::string& object) {
+    auto coordinates_array = optional_array_for_key(object, "coordinates");
+    if (!coordinates_array) {
+        coordinates_array = optional_array_for_key(object, "points");
+    }
+    if (!coordinates_array) {
+        return std::nullopt;
+    }
+
+    FieldBoundary boundary;
+    boundary.field_id = string_for_key(object, "field_id", string_for_key(object, "id", "field"));
+    for (const std::string& coordinate_object : top_level_objects(*coordinates_array)) {
+        if (const auto coordinate = geo_from_object(coordinate_object)) {
+            boundary.coordinates.push_back(*coordinate);
+        }
+    }
+    if (boundary.coordinates.size() < 4) {
+        return std::nullopt;
+    }
+    return boundary;
+}
+
 } // namespace
 
 Vec3 local_from_geo(const GeoCoordinate& coordinate, const GeoCoordinate& origin) {
@@ -370,6 +400,9 @@ Mission MissionLoader::load_from_text(const std::string& text) {
 
     mission.cruise_speed_mps = optional_number_for_key(text, "cruise_speed_mps", mission.cruise_speed_mps);
     mission.acceptance_radius_m = optional_number_for_key(text, "acceptance_radius_m", mission.acceptance_radius_m);
+    if (const auto boundary_object = optional_object_for_key(text, "field_boundary")) {
+        mission.field_boundary = field_boundary_from_object(*boundary_object);
+    }
 
     const std::vector<std::string> waypoint_objects = top_level_objects(array_for_key(text, "waypoints"));
     if (waypoint_objects.empty()) {
@@ -416,6 +449,22 @@ std::string mission_to_json(const Mission& mission) {
     output << "  },\n";
     output << "  \"cruise_speed_mps\": " << mission.cruise_speed_mps << ",\n";
     output << "  \"acceptance_radius_m\": " << mission.acceptance_radius_m << ",\n";
+    if (mission.field_boundary) {
+        output << "  \"field_boundary\": {\n";
+        output << "    \"field_id\": \"" << escape_json(mission.field_boundary->field_id) << "\",\n";
+        output << "    \"coordinates\": [\n";
+        for (std::size_t index = 0; index < mission.field_boundary->coordinates.size(); ++index) {
+            const GeoCoordinate& coordinate = mission.field_boundary->coordinates[index];
+            output << "      { \"latitude\": " << coordinate.latitude
+                   << ", \"longitude\": " << coordinate.longitude << " }";
+            if (index + 1 < mission.field_boundary->coordinates.size()) {
+                output << ",";
+            }
+            output << "\n";
+        }
+        output << "    ]\n";
+        output << "  },\n";
+    }
     output << "  \"waypoints\": [\n";
 
     for (std::size_t index = 0; index < mission.waypoints.size(); ++index) {

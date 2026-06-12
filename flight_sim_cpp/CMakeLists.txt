@@ -14,6 +14,7 @@ add_library(agbot_flight_sim_core
     src/GeoTerrain.cpp
     src/LidarSimulator.cpp
     src/MissionLoader.cpp
+    src/MissionPreview.cpp
     src/SafetyRules.cpp
     src/SensorModel.cpp
     src/SimulationOps.cpp

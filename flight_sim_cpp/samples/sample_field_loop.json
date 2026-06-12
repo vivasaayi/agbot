@@ -10,6 +10,16 @@
   },
   "cruise_speed_mps": 12.0,
   "acceptance_radius_m": 1.5,
+  "field_boundary": {
+    "field_id": "sandbox-field",
+    "coordinates": [
+      { "latitude": 36.777312, "longitude": -119.419582 },
+      { "latitude": 36.777312, "longitude": -119.415769 },
+      { "latitude": 36.779647, "longitude": -119.415769 },
+      { "latitude": 36.779647, "longitude": -119.419582 },
+      { "latitude": 36.777312, "longitude": -119.419582 }
+    ]
+  },
   "waypoints": [
     {
       "name": "takeoff_to_30m",

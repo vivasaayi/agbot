@@ -31,12 +31,18 @@ struct Waypoint {
     double hold_seconds = 0.0;
 };
 
+struct FieldBoundary {
+    std::string field_id;
+    std::vector<GeoCoordinate> coordinates;
+};
+
 struct Mission {
     std::string name = "Untitled Flight";
     Vec3 home;
     std::optional<GeoCoordinate> home_geo;
     double cruise_speed_mps = 8.0;
     double acceptance_radius_m = 2.0;
+    std::optional<FieldBoundary> field_boundary;
     std::vector<Waypoint> waypoints;
 };
 
