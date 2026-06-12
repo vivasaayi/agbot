@@ -43,6 +43,7 @@ use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
 };
 use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb};
+use interop::{export_raster_geotiff, RasterProduct};
 use orthomosaic::{
     build_frame_set_record, build_reconstruction_job, transition_reconstruction_status,
     FramePoseRecord, FrameSetIngestError, FrameSetIngestRequest, FrameSetRecord,
@@ -3296,23 +3297,39 @@ pub async fn export_scene_annotations_csv(
     writer
         .write_record([
             "annotation_id",
+            "scene_id",
+            "field_id",
+            "author",
+            "crs",
+            "audit_id",
             "label",
             "severity",
             "note",
             "geometry_type",
+            "geometry_json",
+            "created_at",
+            "updated_at",
         ])
         .map_err(|err| AppError::Anyhow(err.into()))?;
     for annotation in annotations {
+        let geometry_type = annotation_geometry_type(&annotation.geometry).to_string();
+        let geometry_json = serde_json::to_string(&annotation.geometry)
+            .map_err(|err| AppError::Anyhow(err.into()))?;
         writer
-            .write_record([
+            .write_record(vec![
                 annotation.annotation_id,
+                annotation.scene_id,
+                annotation.field_id.unwrap_or_default(),
+                annotation.author.unwrap_or_default(),
+                annotation.crs.unwrap_or_default(),
+                annotation.audit_id.unwrap_or_default(),
                 annotation.label,
                 annotation.severity.unwrap_or_default(),
                 annotation.note.unwrap_or_default(),
-                match annotation.geometry {
-                    AnnotationGeometry::Point { .. } => "point".to_string(),
-                    AnnotationGeometry::Polygon { .. } => "polygon".to_string(),
-                },
+                geometry_type,
+                geometry_json,
+                annotation.created_at,
+                annotation.updated_at,
             ])
             .map_err(|err| AppError::Anyhow(err.into()))?;
     }
@@ -3332,28 +3349,46 @@ pub async fn export_scene_recommendations_csv(
     }
 
     let recommendations = load_scene_recommendation_records(&state, &scene_id).await?;
+    let annotations = load_scene_annotation_records(&state, &scene_id).await?;
     let mut writer = csv::Writer::from_writer(Vec::new());
     writer
         .write_record([
             "recommendation_id",
+            "scene_id",
+            "field_id",
+            "org_id",
+            "author_user_id",
             "title",
             "category",
+            "action_category",
             "priority",
             "status",
+            "evidence_refs",
             "annotation_ids",
             "note",
+            "created_at",
+            "updated_at",
         ])
         .map_err(|err| AppError::Anyhow(err.into()))?;
     for recommendation in recommendations {
+        let export_field_id = recommendation_export_field_id(&recommendation, &annotations);
         writer
-            .write_record([
+            .write_record(vec![
                 recommendation.recommendation_id,
+                recommendation.scene_id,
+                export_field_id.unwrap_or_default(),
+                recommendation.org_id,
+                recommendation.author_user_id,
                 recommendation.title,
                 recommendation.category.unwrap_or_default(),
+                recommendation.action_category,
                 recommendation_priority_str(recommendation.priority).to_string(),
                 recommendation_status_str(recommendation.status).to_string(),
+                recommendation.evidence_refs.join("|"),
                 recommendation.annotation_ids.join("|"),
                 recommendation.note.unwrap_or_default(),
+                recommendation.created_at,
+                recommendation.updated_at,
             ])
             .map_err(|err| AppError::Anyhow(err.into()))?;
     }
@@ -3373,14 +3408,14 @@ pub async fn export_scene_annotations_geojson(
     }
 
     let annotations = load_scene_annotation_records(&state, &scene_id).await?;
-    let geojson = GeoJson::FeatureCollection(FeatureCollection {
-        bbox: None,
-        foreign_members: None,
-        features: annotations
+    let crs = collection_crs_from_annotations(&annotations)?;
+    let geojson = feature_collection_with_crs(
+        annotations
             .iter()
             .map(feature_from_annotation)
             .collect::<AppResult<Vec<_>>>()?,
-    });
+        &crs,
+    );
 
     response_with_bytes(
         serde_json::to_vec(&geojson).map_err(|err| AppError::Anyhow(err.into()))?,
@@ -3399,16 +3434,13 @@ pub async fn export_scene_recommendations_geojson(
 
     let recommendations = load_scene_recommendation_records(&state, &scene_id).await?;
     let annotations = load_scene_annotation_records(&state, &scene_id).await?;
+    let crs = collection_crs_from_annotations(&annotations)?;
     let mut features = Vec::new();
     for recommendation in &recommendations {
         features.extend(recommendation_features(recommendation, &annotations)?);
     }
 
-    let geojson = GeoJson::FeatureCollection(FeatureCollection {
-        bbox: None,
-        foreign_members: None,
-        features,
-    });
+    let geojson = feature_collection_with_crs(features, &crs);
 
     response_with_bytes(
         serde_json::to_vec(&geojson).map_err(|err| AppError::Anyhow(err.into()))?,
@@ -3698,6 +3730,45 @@ pub async fn get_layer_metadata(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(layer))
+}
+
+pub async fn export_layer_geotiff(
+    Path((scene_id, kind)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let row = load_layer_row(&state, &scene_id, &kind)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let layer = layer_from_row(&row, true)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let metadata_json: String = row.get("metadata_json");
+    let image = serde_json::from_str::<MultispectralImage>(&metadata_json).map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode layer scene metadata_json from database"),
+        )
+    })?;
+    let cell_count = raster_cell_count(image.metadata.width, image.metadata.height)?;
+    let report = export_raster_geotiff(RasterProduct {
+        product_id: layer.layer_id.clone(),
+        width: image.metadata.width,
+        height: image.metadata.height,
+        spatial_ref: layer.spatial_ref,
+        cells: vec![0.0; cell_count],
+    })
+    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+
+    response_with_bytes(
+        report.exported_bytes,
+        "image/tiff",
+        &format!("{}-{}.tif", scene_id, layer.product_kind),
+    )
+}
+
+fn raster_cell_count(width: u32, height: u32) -> AppResult<usize> {
+    usize::try_from(u64::from(width) * u64::from(height)).map_err(|_| {
+        AppError::BadRequest("raster dimensions are too large for GeoTIFF export".to_string())
+    })
 }
 
 pub async fn stream_product(
@@ -5091,8 +5162,37 @@ fn feature_from_annotation(annotation: &AnnotationRecord) -> AppResult<Feature> 
         serde_json::Value::String(annotation.annotation_id.clone()),
     );
     properties.insert(
+        "scene_id".to_string(),
+        serde_json::Value::String(annotation.scene_id.clone()),
+    );
+    if let Some(field_id) = annotation.field_id.as_ref() {
+        properties.insert(
+            "field_id".to_string(),
+            serde_json::Value::String(field_id.clone()),
+        );
+    }
+    if let Some(author) = annotation.author.as_ref() {
+        properties.insert(
+            "author".to_string(),
+            serde_json::Value::String(author.clone()),
+        );
+    }
+    if let Some(crs) = annotation.crs.as_ref() {
+        properties.insert("crs".to_string(), serde_json::Value::String(crs.clone()));
+    }
+    if let Some(audit_id) = annotation.audit_id.as_ref() {
+        properties.insert(
+            "audit_id".to_string(),
+            serde_json::Value::String(audit_id.clone()),
+        );
+    }
+    properties.insert(
         "label".to_string(),
         serde_json::Value::String(annotation.label.clone()),
+    );
+    properties.insert(
+        "geometry_type".to_string(),
+        serde_json::Value::String(annotation_geometry_type(&annotation.geometry).to_string()),
     );
     if let Some(severity) = annotation.severity.as_ref() {
         properties.insert(
@@ -5103,6 +5203,14 @@ fn feature_from_annotation(annotation: &AnnotationRecord) -> AppResult<Feature> 
     if let Some(note) = annotation.note.as_ref() {
         properties.insert("note".to_string(), serde_json::Value::String(note.clone()));
     }
+    properties.insert(
+        "created_at".to_string(),
+        serde_json::Value::String(annotation.created_at.clone()),
+    );
+    properties.insert(
+        "updated_at".to_string(),
+        serde_json::Value::String(annotation.updated_at.clone()),
+    );
 
     Ok(Feature {
         bbox: None,
@@ -5141,6 +5249,17 @@ fn recommendation_features(
                 "annotation_id".to_string(),
                 serde_json::Value::String(annotation.annotation_id.clone()),
             );
+            if !properties.contains_key("field_id") {
+                if let Some(field_id) = annotation.field_id.as_ref() {
+                    properties.insert(
+                        "field_id".to_string(),
+                        serde_json::Value::String(field_id.clone()),
+                    );
+                }
+            }
+            if let Some(crs) = annotation.crs.as_ref() {
+                properties.insert("crs".to_string(), serde_json::Value::String(crs.clone()));
+            }
             features.push(Feature {
                 bbox: None,
                 geometry: Some(geometry_from_annotation(&annotation.geometry)?),
@@ -5157,6 +5276,37 @@ fn recommendation_features(
     Ok(features)
 }
 
+fn recommendation_export_field_id(
+    recommendation: &RecommendationRecord,
+    annotations: &[AnnotationRecord],
+) -> Option<String> {
+    if let Some(field_id) = recommendation
+        .field_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(field_id.clone());
+    }
+
+    let mut linked_field_ids = BTreeSet::new();
+    for annotation_id in &recommendation.annotation_ids {
+        if let Some(field_id) = annotations
+            .iter()
+            .find(|annotation| annotation.annotation_id == *annotation_id)
+            .and_then(|annotation| annotation.field_id.as_ref())
+            .filter(|value| !value.trim().is_empty())
+        {
+            linked_field_ids.insert(field_id.clone());
+        }
+    }
+
+    if linked_field_ids.len() == 1 {
+        linked_field_ids.into_iter().next()
+    } else {
+        None
+    }
+}
+
 fn populate_recommendation_properties(
     properties: &mut serde_json::Map<String, serde_json::Value>,
     recommendation: &RecommendationRecord,
@@ -5164,6 +5314,24 @@ fn populate_recommendation_properties(
     properties.insert(
         "recommendation_id".to_string(),
         serde_json::Value::String(recommendation.recommendation_id.clone()),
+    );
+    properties.insert(
+        "scene_id".to_string(),
+        serde_json::Value::String(recommendation.scene_id.clone()),
+    );
+    if let Some(field_id) = recommendation.field_id.as_ref() {
+        properties.insert(
+            "field_id".to_string(),
+            serde_json::Value::String(field_id.clone()),
+        );
+    }
+    properties.insert(
+        "org_id".to_string(),
+        serde_json::Value::String(recommendation.org_id.clone()),
+    );
+    properties.insert(
+        "author_user_id".to_string(),
+        serde_json::Value::String(recommendation.author_user_id.clone()),
     );
     properties.insert(
         "title".to_string(),
@@ -5177,6 +5345,32 @@ fn populate_recommendation_properties(
         "status".to_string(),
         serde_json::Value::String(recommendation_status_str(recommendation.status).to_string()),
     );
+    properties.insert(
+        "action_category".to_string(),
+        serde_json::Value::String(recommendation.action_category.clone()),
+    );
+    properties.insert(
+        "evidence_refs".to_string(),
+        serde_json::Value::Array(
+            recommendation
+                .evidence_refs
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    properties.insert(
+        "annotation_ids".to_string(),
+        serde_json::Value::Array(
+            recommendation
+                .annotation_ids
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
     if let Some(category) = recommendation.category.as_ref() {
         properties.insert(
             "category".to_string(),
@@ -5185,6 +5379,72 @@ fn populate_recommendation_properties(
     }
     if let Some(note) = recommendation.note.as_ref() {
         properties.insert("note".to_string(), serde_json::Value::String(note.clone()));
+    }
+    properties.insert(
+        "created_at".to_string(),
+        serde_json::Value::String(recommendation.created_at.clone()),
+    );
+    properties.insert(
+        "updated_at".to_string(),
+        serde_json::Value::String(recommendation.updated_at.clone()),
+    );
+}
+
+fn feature_collection_with_crs(features: Vec<Feature>, crs: &str) -> GeoJson {
+    let mut crs_properties = serde_json::Map::new();
+    crs_properties.insert(
+        "name".to_string(),
+        serde_json::Value::String(crs.to_string()),
+    );
+    let mut crs_object = serde_json::Map::new();
+    crs_object.insert(
+        "type".to_string(),
+        serde_json::Value::String("name".to_string()),
+    );
+    crs_object.insert(
+        "properties".to_string(),
+        serde_json::Value::Object(crs_properties),
+    );
+    let mut foreign_members = serde_json::Map::new();
+    foreign_members.insert("crs".to_string(), serde_json::Value::Object(crs_object));
+
+    GeoJson::FeatureCollection(FeatureCollection {
+        bbox: None,
+        foreign_members: Some(foreign_members),
+        features,
+    })
+}
+
+fn collection_crs_from_annotations(annotations: &[AnnotationRecord]) -> AppResult<String> {
+    let mut collection_crs = None;
+    for annotation in annotations {
+        let Some(raw_crs) = annotation
+            .crs
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let normalized = normalize_geojson_crs(Some(raw_crs.to_string()))?;
+        if let Some(existing) = collection_crs.as_ref() {
+            if existing != &normalized {
+                return Err(AppError::BadRequest(
+                    "GeoJSON export requires a single annotation CRS".to_string(),
+                ));
+            }
+        } else {
+            collection_crs = Some(normalized);
+        }
+    }
+
+    Ok(collection_crs.unwrap_or_else(|| "EPSG:4326".to_string()))
+}
+
+fn annotation_geometry_type(geometry: &AnnotationGeometry) -> &'static str {
+    match geometry {
+        AnnotationGeometry::Point { .. } => "point",
+        AnnotationGeometry::Polygon { .. } => "polygon",
     }
 }
 

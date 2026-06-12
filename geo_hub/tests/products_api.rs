@@ -6,6 +6,7 @@ use axum::{
 use geo_hub::state::AppState;
 use geo_hub::{db, server, HubConfig};
 use image::{GrayImage, Luma};
+use interop::reopen_raster_geotiff;
 use serde_json::json;
 use sqlx::Row;
 use std::{path::Path, path::PathBuf, sync::Arc};
@@ -4241,6 +4242,10 @@ async fn annotation_exports_return_csv_and_geojson() -> Result<()> {
                 .body(Body::from(
                     json!({
                         "annotation_id": "ann-export-1",
+                        "field_id": "field-alpha",
+                        "author": "agronomist@example.com",
+                        "crs": "EPSG:4326",
+                        "audit_id": "audit-ann-export-1",
                         "label": "Stress pocket",
                         "note": "West edge looks dry",
                         "severity": "high",
@@ -4290,8 +4295,44 @@ async fn annotation_exports_return_csv_and_geojson() -> Result<()> {
     );
     let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
     let csv_text = String::from_utf8(body.to_vec())?;
-    assert!(csv_text.contains("annotation_id,label,severity,note,geometry_type"));
-    assert!(csv_text.contains("ann-export-1,Stress pocket,high,West edge looks dry,polygon"));
+    let mut csv_reader = csv::Reader::from_reader(csv_text.as_bytes());
+    assert_eq!(
+        csv_reader.headers()?.iter().collect::<Vec<_>>(),
+        vec![
+            "annotation_id",
+            "scene_id",
+            "field_id",
+            "author",
+            "crs",
+            "audit_id",
+            "label",
+            "severity",
+            "note",
+            "geometry_type",
+            "geometry_json",
+            "created_at",
+            "updated_at"
+        ]
+    );
+    let rows = csv_reader.records().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.get(0), Some("ann-export-1"));
+    assert_eq!(row.get(1), Some(scene_id));
+    assert_eq!(row.get(2), Some("field-alpha"));
+    assert_eq!(row.get(3), Some("agronomist@example.com"));
+    assert_eq!(row.get(4), Some("EPSG:4326"));
+    assert_eq!(row.get(5), Some("audit-ann-export-1"));
+    assert_eq!(row.get(6), Some("Stress pocket"));
+    assert_eq!(row.get(7), Some("high"));
+    assert_eq!(row.get(8), Some("West edge looks dry"));
+    assert_eq!(row.get(9), Some("polygon"));
+    let geometry_json: serde_json::Value =
+        serde_json::from_str(row.get(10).expect("geometry json should be present"))?;
+    assert_eq!(
+        geometry_json.get("type").and_then(|value| value.as_str()),
+        Some("polygon")
+    );
 
     let geojson_response = ctx
         .app
@@ -4322,6 +4363,12 @@ async fn annotation_exports_return_csv_and_geojson() -> Result<()> {
     );
     assert_eq!(
         geojson
+            .pointer("/crs/properties/name")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        geojson
             .pointer("/features/0/id")
             .and_then(|value| value.as_str()),
         Some("ann-export-1")
@@ -4331,6 +4378,110 @@ async fn annotation_exports_return_csv_and_geojson() -> Result<()> {
             .pointer("/features/0/geometry/type")
             .and_then(|value| value.as_str()),
         Some("Polygon")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/field_id")
+            .and_then(|value| value.as_str()),
+        Some("field-alpha")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/author")
+            .and_then(|value| value.as_str()),
+        Some("agronomist@example.com")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/crs")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/audit_id")
+            .and_then(|value| value.as_str()),
+        Some("audit-ann-export-1")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_annotation_exports_are_schema_valid() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "empty-annotation-export-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/exports/annotations.csv"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(
+        csv_reader.headers()?.iter().collect::<Vec<_>>(),
+        vec![
+            "annotation_id",
+            "scene_id",
+            "field_id",
+            "author",
+            "crs",
+            "audit_id",
+            "label",
+            "severity",
+            "note",
+            "geometry_type",
+            "geometry_json",
+            "created_at",
+            "updated_at"
+        ]
+    );
+    assert_eq!(csv_reader.records().count(), 0);
+
+    let geojson_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/exports/annotations.geojson"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson.get("type").and_then(|value| value.as_str()),
+        Some("FeatureCollection")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/crs/properties/name")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        geojson
+            .get("features")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0)
     );
 
     Ok(())
@@ -4354,6 +4505,8 @@ async fn recommendation_exports_return_csv_and_geojson() -> Result<()> {
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
+                        "field_id": "field-alpha",
+                        "crs": "EPSG:4326",
                         "annotation_id": "ann-export-rec-1",
                         "label": "Irrigation gap",
                         "severity": "medium",
@@ -4423,12 +4576,41 @@ async fn recommendation_exports_return_csv_and_geojson() -> Result<()> {
     );
     let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
     let csv_text = String::from_utf8(body.to_vec())?;
-    assert!(
-        csv_text.contains("recommendation_id,title,category,priority,status,annotation_ids,note")
+    let mut csv_reader = csv::Reader::from_reader(csv_text.as_bytes());
+    assert_eq!(
+        csv_reader.headers()?.iter().collect::<Vec<_>>(),
+        vec![
+            "recommendation_id",
+            "scene_id",
+            "field_id",
+            "org_id",
+            "author_user_id",
+            "title",
+            "category",
+            "action_category",
+            "priority",
+            "status",
+            "evidence_refs",
+            "annotation_ids",
+            "note",
+            "created_at",
+            "updated_at"
+        ]
     );
-    assert!(csv_text.contains(
-        "rec-export-1,Inspect irrigation line,irrigation,critical,open,ann-export-rec-1,Dispatch operator before noon"
-    ));
+    let rows = csv_reader.records().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.get(0), Some("rec-export-1"));
+    assert_eq!(row.get(1), Some(scene_id));
+    assert_eq!(row.get(2), Some("field-alpha"));
+    assert_eq!(row.get(5), Some("Inspect irrigation line"));
+    assert_eq!(row.get(6), Some("irrigation"));
+    assert_eq!(row.get(7), Some("irrigation"));
+    assert_eq!(row.get(8), Some("critical"));
+    assert_eq!(row.get(9), Some("open"));
+    assert_eq!(row.get(10), Some("annotation:ann-export-rec-1"));
+    assert_eq!(row.get(11), Some("ann-export-rec-1"));
+    assert_eq!(row.get(12), Some("Dispatch operator before noon"));
 
     let geojson_response = ctx
         .app
@@ -4459,6 +4641,12 @@ async fn recommendation_exports_return_csv_and_geojson() -> Result<()> {
     );
     assert_eq!(
         geojson
+            .pointer("/crs/properties/name")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        geojson
             .pointer("/features/0/properties/recommendation_id")
             .and_then(|value| value.as_str()),
         Some("rec-export-1")
@@ -4474,6 +4662,84 @@ async fn recommendation_exports_return_csv_and_geojson() -> Result<()> {
             .pointer("/features/0/geometry/type")
             .and_then(|value| value.as_str()),
         Some("Point")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/field_id")
+            .and_then(|value| value.as_str()),
+        Some("field-alpha")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/evidence_refs/0")
+            .and_then(|value| value.as_str()),
+        Some("annotation:ann-export-rec-1")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn layer_geotiff_export_round_trips_spatial_metadata() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "geotiff-export-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    });
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref).await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/layers/{scene_id}/ndvi/export/geotiff"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/tiff")
+    );
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let reopened = reopen_raster_geotiff(&body)?;
+
+    assert_eq!(reopened.product_id, "geotiff-export-scene:ndvi");
+    assert_eq!(reopened.width, 2);
+    assert_eq!(reopened.height, 2);
+    assert_eq!(reopened.cells.len(), 4);
+    assert_eq!(reopened.spatial_ref.crs.as_deref(), Some("EPSG:4326"));
+    assert_eq!(
+        reopened.spatial_ref.bbox.as_ref().map(|bbox| (
+            bbox.min_lon,
+            bbox.min_lat,
+            bbox.max_lon,
+            bbox.max_lat
+        )),
+        Some((-96.7, 41.1, -96.6, 41.2))
     );
 
     Ok(())
