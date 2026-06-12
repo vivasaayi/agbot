@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +114,55 @@ pub struct AlertSeverityClassification {
     pub explanation: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertDedupKey {
+    pub source_domain: String,
+    pub subject_ref: String,
+    pub rule_id: String,
+}
+
+impl AlertDedupKey {
+    pub fn stable_key(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.source_domain, self.subject_ref, self.rule_id
+        )
+    }
+}
+
+impl fmt::Display for AlertDedupKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.stable_key())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertDedupWindow {
+    pub window_start: String,
+    pub window_end: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertDedupSummary {
+    pub dedup_key: AlertDedupKey,
+    pub surfaced_alert_id: String,
+    pub occurrence_count: usize,
+    pub suppressed_alert_ids: Vec<String>,
+    pub first_fired_at: String,
+    pub last_fired_at: String,
+    pub severity: AlertSeverityHint,
+    pub bypassed_suppression: bool,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AlertDedupResult {
+    pub surfaced_alerts: Vec<FiredAlertRecord>,
+    pub summaries: Vec<AlertDedupSummary>,
+    pub suppressed_count: usize,
+    pub bypassed_alert_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlertHistoryQuery {
     pub source_domain: Option<String>,
@@ -175,6 +226,8 @@ pub enum AlertingError {
     EmptySeverityMethodVersion,
     #[error("severity evidence must be finite with warning <= critical <= emergency thresholds")]
     InvalidSeverityEvidence,
+    #[error("dedup window requires non-empty window_start <= window_end")]
+    InvalidDedupWindow,
     #[error("invalid alert severity {0}")]
     InvalidSeverity(String),
 }
@@ -406,6 +459,79 @@ pub fn classify_alert_severity(
     })
 }
 
+pub fn compute_alert_dedup_key(alert: &FiredAlertRecord) -> Result<AlertDedupKey, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    Ok(AlertDedupKey {
+        source_domain: alert.source_domain,
+        subject_ref: alert.subject_ref,
+        rule_id: alert.matched_rule_id,
+    })
+}
+
+pub fn deduplicate_alert_stream(
+    alerts: &[FiredAlertRecord],
+    window: AlertDedupWindow,
+) -> Result<AlertDedupResult, AlertingError> {
+    let window = normalize_dedup_window(window)?;
+    let mut ordered_alerts = alerts
+        .iter()
+        .cloned()
+        .map(normalize_fired_alert_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    ordered_alerts.sort_by(|left, right| {
+        left.fired_at
+            .cmp(&right.fired_at)
+            .then_with(|| left.alert_id.cmp(&right.alert_id))
+    });
+
+    let mut result = AlertDedupResult::default();
+    let mut active_summary_by_key: BTreeMap<String, usize> = BTreeMap::new();
+
+    for alert in ordered_alerts {
+        let dedup_key = compute_alert_dedup_key(&alert)?;
+        if outside_dedup_window(&alert, &window) {
+            result.surfaced_alerts.push(alert.clone());
+            result.summaries.push(single_alert_summary(
+                dedup_key,
+                &alert,
+                false,
+                "outside dedup window",
+            ));
+            continue;
+        }
+
+        if alert_bypasses_dedup_suppression(&alert) {
+            result.bypassed_alert_ids.push(alert.alert_id.clone());
+            result.surfaced_alerts.push(alert.clone());
+            result.summaries.push(single_alert_summary(
+                dedup_key,
+                &alert,
+                true,
+                "severity bypassed dedup suppression",
+            ));
+            continue;
+        }
+
+        let key_value = dedup_key.stable_key();
+        if let Some(summary_index) = active_summary_by_key.get(&key_value).copied() {
+            let summary = &mut result.summaries[summary_index];
+            summary.occurrence_count += 1;
+            summary.suppressed_alert_ids.push(alert.alert_id.clone());
+            summary.last_fired_at = alert.fired_at.clone();
+            summary.summary = aggregation_summary_text(summary);
+            result.suppressed_count += 1;
+        } else {
+            result.surfaced_alerts.push(alert.clone());
+            result
+                .summaries
+                .push(single_alert_summary(dedup_key, &alert, false, "surfaced"));
+            active_summary_by_key.insert(key_value, result.summaries.len() - 1);
+        }
+    }
+
+    Ok(result)
+}
+
 fn normalize_event(event: AlertEvent) -> Result<AlertEvent, AlertingError> {
     Ok(AlertEvent {
         source_domain: normalize_required_text(
@@ -456,6 +582,20 @@ fn normalize_severity_evidence(
     })
 }
 
+fn normalize_dedup_window(window: AlertDedupWindow) -> Result<AlertDedupWindow, AlertingError> {
+    let window_start =
+        normalize_required_text(window.window_start, AlertingError::InvalidDedupWindow)?;
+    let window_end = normalize_required_text(window.window_end, AlertingError::InvalidDedupWindow)?;
+    if window_start > window_end {
+        return Err(AlertingError::InvalidDedupWindow);
+    }
+
+    Ok(AlertDedupWindow {
+        window_start,
+        window_end,
+    })
+}
+
 fn severity_from_evidence_or_rule(
     rule_severity: AlertSeverityHint,
     evidence: &AlertSeverityEvidence,
@@ -483,6 +623,57 @@ fn severity_from_evidence_or_rule(
     }
 }
 
+fn outside_dedup_window(alert: &FiredAlertRecord, window: &AlertDedupWindow) -> bool {
+    alert.fired_at < window.window_start || alert.fired_at > window.window_end
+}
+
+fn alert_bypasses_dedup_suppression(alert: &FiredAlertRecord) -> bool {
+    matches!(
+        alert.severity,
+        AlertSeverityHint::Critical | AlertSeverityHint::Emergency
+    )
+}
+
+fn single_alert_summary(
+    dedup_key: AlertDedupKey,
+    alert: &FiredAlertRecord,
+    bypassed_suppression: bool,
+    reason: &str,
+) -> AlertDedupSummary {
+    let mut summary = AlertDedupSummary {
+        dedup_key,
+        surfaced_alert_id: alert.alert_id.clone(),
+        occurrence_count: 1,
+        suppressed_alert_ids: Vec::new(),
+        first_fired_at: alert.fired_at.clone(),
+        last_fired_at: alert.fired_at.clone(),
+        severity: alert.severity,
+        bypassed_suppression,
+        summary: String::new(),
+    };
+    summary.summary = if bypassed_suppression {
+        format!(
+            "alert {} surfaced immediately; {}",
+            summary.surfaced_alert_id, reason
+        )
+    } else {
+        aggregation_summary_text(&summary)
+    };
+    summary
+}
+
+fn aggregation_summary_text(summary: &AlertDedupSummary) -> String {
+    format!(
+        "{} occurrences aggregated for {}; surfaced {}; suppressed {} repeats from {} through {}",
+        summary.occurrence_count,
+        summary.dedup_key.stable_key(),
+        summary.surfaced_alert_id,
+        summary.suppressed_alert_ids.len(),
+        summary.first_fired_at,
+        summary.last_fired_at
+    )
+}
+
 fn normalize_required_text(value: String, error: AlertingError) -> Result<String, AlertingError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -503,7 +694,8 @@ fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_alert_severity, evaluate_alert_rules, filter_alert_history, AlertEvent,
+        classify_alert_severity, compute_alert_dedup_key, deduplicate_alert_stream,
+        evaluate_alert_rules, filter_alert_history, AlertDedupWindow, AlertEvent,
         AlertEventBackbone, AlertHistoryQuery, AlertRule, AlertSeverityEvidence, AlertSeverityHint,
         AlertingError, SourceAdapter,
     };
@@ -712,6 +904,127 @@ mod tests {
             .contains("source hint info ignored"));
     }
 
+    #[test]
+    fn dedup_key_uses_source_subject_and_rule() {
+        let alert = fired_alert(
+            "alert-dedup-key",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+
+        let key = compute_alert_dedup_key(&alert).expect("dedup key should compute");
+
+        assert_eq!(key.source_domain, "27-soil-iot-sensor-network");
+        assert_eq!(key.subject_ref, "field:field-alpha");
+        assert_eq!(key.rule_id, "rule-sensor-stale-critical");
+        assert_eq!(
+            key.stable_key(),
+            "27-soil-iot-sensor-network|field:field-alpha|rule-sensor-stale-critical"
+        );
+    }
+
+    #[test]
+    fn dedup_window_counts_repeats_on_one_surfaced_alert() {
+        let alerts = vec![
+            fired_alert(
+                "alert-repeat-001",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Warning,
+                "2026-06-12T10:00:00Z",
+            ),
+            fired_alert(
+                "alert-repeat-002",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Warning,
+                "2026-06-12T10:01:00Z",
+            ),
+            fired_alert(
+                "alert-repeat-003",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Warning,
+                "2026-06-12T10:02:00Z",
+            ),
+        ];
+
+        let result = deduplicate_alert_stream(&alerts, dedup_window())
+            .expect("warning repeats should aggregate");
+
+        assert_eq!(result.surfaced_alerts.len(), 1);
+        assert_eq!(result.surfaced_alerts[0].alert_id, "alert-repeat-001");
+        assert_eq!(result.suppressed_count, 2);
+        assert_eq!(result.summaries.len(), 1);
+        assert_eq!(result.summaries[0].occurrence_count, 3);
+        assert_eq!(
+            result.summaries[0].suppressed_alert_ids,
+            vec!["alert-repeat-002", "alert-repeat-003"]
+        );
+        assert!(result.summaries[0]
+            .summary
+            .contains("3 occurrences aggregated"));
+    }
+
+    #[test]
+    fn storm_stream_surfaces_one_alert_with_occurrence_count() {
+        let mut alerts = Vec::new();
+        for index in 0..100 {
+            alerts.push(fired_alert(
+                &format!("alert-storm-{index:03}"),
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Warning,
+                &format!("2026-06-12T10:{:02}:00Z", index % 60),
+            ));
+        }
+
+        let result = deduplicate_alert_stream(&alerts, dedup_window())
+            .expect("storm stream should aggregate");
+
+        assert_eq!(result.surfaced_alerts.len(), 1);
+        assert_eq!(result.summaries[0].occurrence_count, 100);
+        assert_eq!(result.suppressed_count, 99);
+    }
+
+    #[test]
+    fn critical_alert_bypasses_dedup_suppression() {
+        let alerts = vec![
+            fired_alert(
+                "alert-warning-001",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Warning,
+                "2026-06-12T10:00:00Z",
+            ),
+            fired_alert(
+                "alert-critical-bypass",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Critical,
+                "2026-06-12T10:01:00Z",
+            ),
+            fired_alert(
+                "alert-warning-002",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Warning,
+                "2026-06-12T10:02:00Z",
+            ),
+        ];
+
+        let result = deduplicate_alert_stream(&alerts, dedup_window())
+            .expect("critical alert should bypass suppression");
+
+        assert_eq!(result.surfaced_alerts.len(), 2);
+        assert_eq!(result.surfaced_alerts[0].alert_id, "alert-warning-001");
+        assert_eq!(result.surfaced_alerts[1].alert_id, "alert-critical-bypass");
+        assert_eq!(result.suppressed_count, 1);
+        assert_eq!(result.bypassed_alert_ids, vec!["alert-critical-bypass"]);
+    }
+
     fn sensor_health_event() -> AlertEvent {
         AlertEvent {
             source_domain: "27-soil-iot-sensor-network".to_string(),
@@ -762,6 +1075,13 @@ mod tests {
             critical_threshold,
             emergency_threshold,
             method_version: "severity-thresholds-v1".to_string(),
+        }
+    }
+
+    fn dedup_window() -> AlertDedupWindow {
+        AlertDedupWindow {
+            window_start: "2026-06-12T10:00:00Z".to_string(),
+            window_end: "2026-06-12T10:59:59Z".to_string(),
         }
     }
 }
