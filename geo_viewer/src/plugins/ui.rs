@@ -674,17 +674,23 @@ fn render_scene_panel(
         .iter()
         .filter(|recommendation| recommendation.status == RecommendationStatus::Reviewed)
         .count();
-    let closed_recommendations = recommendations
+    let completed_recommendations = recommendations
         .items
         .iter()
-        .filter(|recommendation| recommendation.status == RecommendationStatus::Closed)
+        .filter(|recommendation| recommendation.status == RecommendationStatus::Completed)
+        .count();
+    let dismissed_recommendations = recommendations
+        .items
+        .iter()
+        .filter(|recommendation| recommendation.status == RecommendationStatus::Dismissed)
         .count();
     ui.small(format!(
-        "Recommendations: {} total, {} open, {} reviewed, {} closed",
+        "Recommendations: {} total, {} open, {} reviewed, {} completed, {} dismissed",
         recommendations.items.len(),
         open_recommendations,
         reviewed_recommendations,
-        closed_recommendations
+        completed_recommendations,
+        dismissed_recommendations
     ));
     ui.label("Scene ID");
     let mut load_requested = false;
@@ -1100,8 +1106,13 @@ fn render_recommendations_panel(
             );
             ui.selectable_value(
                 &mut recommendations.status_filter,
-                Some(RecommendationStatus::Closed),
-                "Closed",
+                Some(RecommendationStatus::Completed),
+                "Completed",
+            );
+            ui.selectable_value(
+                &mut recommendations.status_filter,
+                Some(RecommendationStatus::Dismissed),
+                "Dismissed",
             );
         });
         ui.label("Priority");
@@ -1180,8 +1191,13 @@ fn render_recommendations_panel(
                 );
                 ui.selectable_value(
                     &mut recommendations.draft_status,
-                    RecommendationStatus::Closed,
-                    "Closed",
+                    RecommendationStatus::Completed,
+                    "Completed",
+                );
+                ui.selectable_value(
+                    &mut recommendations.draft_status,
+                    RecommendationStatus::Dismissed,
+                    "Dismissed",
                 );
             });
     });
@@ -1283,7 +1299,7 @@ fn render_recommendations_panel(
                     recommendations.draft_note.clone(),
                     recommendations.draft_category.clone(),
                     recommendations.draft_priority,
-                    RecommendationStatus::Closed,
+                    RecommendationStatus::Completed,
                     recommendations.linked_annotation_ids.clone(),
                 ) {
                     tile_state.status = TileStatus::Error(err.to_string());
@@ -1591,6 +1607,8 @@ fn status_label(status: RecommendationStatus) -> &'static str {
     match status {
         RecommendationStatus::Open => "Open",
         RecommendationStatus::Reviewed => "Reviewed",
+        RecommendationStatus::Completed => "Completed",
+        RecommendationStatus::Dismissed => "Dismissed",
         RecommendationStatus::Closed => "Closed",
     }
 }

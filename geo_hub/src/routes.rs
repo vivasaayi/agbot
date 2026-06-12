@@ -191,11 +191,15 @@ pub struct UpdateAnnotationRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateRecommendationRequest {
     pub recommendation_id: Option<String>,
+    pub author_user_id: Option<String>,
     pub title: String,
     pub note: Option<String>,
     pub category: Option<String>,
+    pub action_category: Option<String>,
     pub priority: Option<RecommendationPriority>,
     pub status: Option<RecommendationStatus>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
     #[serde(default)]
     pub annotation_ids: Vec<String>,
 }
@@ -205,8 +209,11 @@ pub struct UpdateRecommendationRequest {
     pub title: String,
     pub note: Option<String>,
     pub category: Option<String>,
+    pub action_category: Option<String>,
     pub priority: RecommendationPriority,
     pub status: RecommendationStatus,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
     #[serde(default)]
     pub annotation_ids: Vec<String>,
 }
@@ -1732,11 +1739,16 @@ pub async fn update_scene_recommendation(
         recommendation_id: recommendation_id.clone(),
         scene_id: scene_id.clone(),
         field_id: load_scene_field_id(&state, &scene_id).await?,
+        org_id: existing.org_id,
+        author_user_id: existing.author_user_id,
         title: normalize_recommendation_title(request.title)?,
         note: normalize_optional_text(request.note),
         category: normalize_optional_text(request.category),
+        action_category: normalize_optional_text(request.action_category)
+            .unwrap_or(existing.action_category),
         priority: request.priority,
         status: request.status,
+        evidence_refs: normalize_text_values(request.evidence_refs, existing.evidence_refs),
         annotation_ids: request.annotation_ids,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -3103,16 +3115,29 @@ async fn build_recommendation_record(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let timestamp = chrono::Utc::now().to_rfc3339();
+    let category = normalize_optional_text(request.category);
+    let action_category = normalize_optional_text(request.action_category)
+        .or_else(|| category.clone())
+        .unwrap_or_else(|| "general".to_string());
+    let evidence_refs = normalize_text_values(
+        request.evidence_refs,
+        recommendation_evidence_from_annotations(&request.annotation_ids),
+    );
 
     Ok(RecommendationRecord {
         recommendation_id,
         scene_id: scene_id.to_string(),
         field_id: load_scene_field_id(state, scene_id).await?,
+        org_id: DEFAULT_RECORD_OWNER.to_string(),
+        author_user_id: normalize_optional_text(request.author_user_id)
+            .unwrap_or_else(|| DEFAULT_RECORD_OWNER.to_string()),
         title: normalize_recommendation_title(request.title)?,
         note: normalize_optional_text(request.note),
-        category: normalize_optional_text(request.category),
+        category,
+        action_category,
         priority: request.priority.unwrap_or_default(),
         status: request.status.unwrap_or_default(),
+        evidence_refs,
         annotation_ids: request.annotation_ids,
         created_at: timestamp.clone(),
         updated_at: timestamp,
@@ -3211,6 +3236,26 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
         let trimmed = text.trim().to_string();
         (!trimmed.is_empty()).then_some(trimmed)
     })
+}
+
+fn normalize_text_values(values: Vec<String>, fallback: Vec<String>) -> Vec<String> {
+    let normalized = values
+        .into_iter()
+        .filter_map(|value| normalize_optional_text(Some(value)))
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        fallback
+    } else {
+        normalized
+    }
+}
+
+fn recommendation_evidence_from_annotations(annotation_ids: &[String]) -> Vec<String> {
+    annotation_ids
+        .iter()
+        .filter_map(|annotation_id| normalize_optional_text(Some(annotation_id.clone())))
+        .map(|annotation_id| format!("annotation:{}", annotation_id))
+        .collect::<Vec<_>>()
 }
 
 fn normalize_org_id(org_id: Option<String>, owner: Option<String>) -> String {
@@ -3849,16 +3894,24 @@ async fn decode_recommendation_record(
     row: &sqlx::sqlite::SqliteRow,
 ) -> AppResult<RecommendationRecord> {
     let recommendation_id: String = row.get("recommendation_id");
+    let annotation_ids = load_recommendation_annotation_ids(state, &recommendation_id).await?;
+    let category: Option<String> = row.get("category");
     Ok(RecommendationRecord {
         recommendation_id: recommendation_id.clone(),
         scene_id: row.get("scene_id"),
         field_id: row.get("field_id"),
+        org_id: DEFAULT_RECORD_OWNER.to_string(),
+        author_user_id: DEFAULT_RECORD_OWNER.to_string(),
         title: row.get("title"),
         note: row.get("note"),
-        category: row.get("category"),
+        category: category.clone(),
+        action_category: category
+            .and_then(|value| normalize_optional_text(Some(value)))
+            .unwrap_or_else(|| "general".to_string()),
         priority: parse_recommendation_priority(row.get("priority"))?,
         status: parse_recommendation_status(row.get("status"))?,
-        annotation_ids: load_recommendation_annotation_ids(state, &recommendation_id).await?,
+        evidence_refs: recommendation_evidence_from_annotations(&annotation_ids),
+        annotation_ids,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -4157,6 +4210,8 @@ fn recommendation_status_str(status: RecommendationStatus) -> &'static str {
     match status {
         RecommendationStatus::Open => "open",
         RecommendationStatus::Reviewed => "reviewed",
+        RecommendationStatus::Completed => "completed",
+        RecommendationStatus::Dismissed => "dismissed",
         RecommendationStatus::Closed => "closed",
     }
 }
@@ -4178,6 +4233,8 @@ fn parse_recommendation_status(value: String) -> AppResult<RecommendationStatus>
     match value.as_str() {
         "open" => Ok(RecommendationStatus::Open),
         "reviewed" => Ok(RecommendationStatus::Reviewed),
+        "completed" => Ok(RecommendationStatus::Completed),
+        "dismissed" => Ok(RecommendationStatus::Dismissed),
         "closed" => Ok(RecommendationStatus::Closed),
         _ => Err(AppError::Anyhow(anyhow::anyhow!(
             "invalid recommendation status {}",

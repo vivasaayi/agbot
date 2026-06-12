@@ -1043,6 +1043,8 @@ pub struct AnnotationRecord {
 pub enum RecommendationStatus {
     Open,
     Reviewed,
+    Completed,
+    Dismissed,
     Closed,
 }
 
@@ -1072,15 +1074,274 @@ pub struct RecommendationRecord {
     pub recommendation_id: String,
     pub scene_id: String,
     pub field_id: Option<String>,
+    #[serde(default = "default_record_owner")]
+    pub org_id: String,
+    #[serde(default = "default_record_owner")]
+    pub author_user_id: String,
     pub title: String,
     pub note: Option<String>,
     pub category: Option<String>,
+    #[serde(default)]
+    pub action_category: String,
     pub priority: RecommendationPriority,
     pub status: RecommendationStatus,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
     #[serde(default)]
     pub annotation_ids: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendationStatusChangeType {
+    Created,
+    StatusChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecommendationStatusChangeRecord {
+    pub recommendation_id: String,
+    pub actor_user_id: String,
+    pub before: Option<RecommendationStatus>,
+    pub after: RecommendationStatus,
+    pub at: String,
+    pub change_type: RecommendationStatusChangeType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecommendationPersistenceError {
+    #[error("recommendation_id cannot be empty")]
+    EmptyRecommendationId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("author_user_id cannot be empty")]
+    EmptyAuthorUserId,
+    #[error("actor_user_id cannot be empty")]
+    EmptyActorUserId,
+    #[error("action_category cannot be empty")]
+    EmptyActionCategory,
+    #[error("timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("recommendation must cite at least one evidence ref: {recommendation_id}")]
+    EvidenceRequired { recommendation_id: String },
+    #[error("recommendation must start open: {recommendation_id}")]
+    InvalidInitialStatus { recommendation_id: String },
+    #[error("recommendation already exists: {recommendation_id}")]
+    RecommendationAlreadyExists { recommendation_id: String },
+    #[error("recommendation not found: {recommendation_id}")]
+    RecommendationNotFound { recommendation_id: String },
+    #[error("invalid recommendation status transition: {from:?} -> {to:?}")]
+    InvalidStatusTransition {
+        from: RecommendationStatus,
+        to: RecommendationStatus,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecommendationLifecycleRegistry {
+    recommendations: HashMap<String, RecommendationRecord>,
+    history: Vec<RecommendationStatusChangeRecord>,
+}
+
+impl RecommendationLifecycleRegistry {
+    pub fn create_recommendation(
+        &mut self,
+        recommendation: RecommendationRecord,
+    ) -> Result<RecommendationRecord, RecommendationPersistenceError> {
+        let recommendation = normalize_recommendation_record(recommendation)?;
+        if self
+            .recommendations
+            .contains_key(&recommendation.recommendation_id)
+        {
+            return Err(
+                RecommendationPersistenceError::RecommendationAlreadyExists {
+                    recommendation_id: recommendation.recommendation_id,
+                },
+            );
+        }
+
+        self.history.push(RecommendationStatusChangeRecord {
+            recommendation_id: recommendation.recommendation_id.clone(),
+            actor_user_id: recommendation.author_user_id.clone(),
+            before: None,
+            after: recommendation.status,
+            at: recommendation.created_at.clone(),
+            change_type: RecommendationStatusChangeType::Created,
+        });
+        self.recommendations.insert(
+            recommendation.recommendation_id.clone(),
+            recommendation.clone(),
+        );
+        Ok(recommendation)
+    }
+
+    pub fn transition_recommendation_status(
+        &mut self,
+        org_id: &str,
+        recommendation_id: &str,
+        actor_user_id: &str,
+        at: &str,
+        status: RecommendationStatus,
+    ) -> Result<RecommendationRecord, RecommendationPersistenceError> {
+        let org_id =
+            normalize_recommendation_arg(org_id, RecommendationPersistenceError::EmptyOrgId)?;
+        let recommendation_id = normalize_recommendation_arg(
+            recommendation_id,
+            RecommendationPersistenceError::EmptyRecommendationId,
+        )?;
+        let actor_user_id = normalize_recommendation_arg(
+            actor_user_id,
+            RecommendationPersistenceError::EmptyActorUserId,
+        )?;
+        let at = normalize_recommendation_arg(at, RecommendationPersistenceError::EmptyTimestamp)?;
+        let before = self.recommendation_for_org(&org_id, &recommendation_id)?;
+        if !is_valid_recommendation_status_transition(before.status, status) {
+            return Err(RecommendationPersistenceError::InvalidStatusTransition {
+                from: before.status,
+                to: status,
+            });
+        }
+
+        let mut after = before.clone();
+        after.status = status;
+        after.updated_at = at.clone();
+        self.recommendations
+            .insert(recommendation_id.clone(), after.clone());
+        self.history.push(RecommendationStatusChangeRecord {
+            recommendation_id,
+            actor_user_id,
+            before: Some(before.status),
+            after: status,
+            at,
+            change_type: RecommendationStatusChangeType::StatusChanged,
+        });
+        Ok(after)
+    }
+
+    pub fn recommendations_for_org(&self, org_id: &str) -> Vec<RecommendationRecord> {
+        let Some(org_id) = normalize_farm_field_text(org_id.to_string()) else {
+            return Vec::new();
+        };
+        let mut recommendations = self
+            .recommendations
+            .values()
+            .filter(|recommendation| recommendation.org_id == org_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        recommendations.sort_by(|left, right| left.recommendation_id.cmp(&right.recommendation_id));
+        recommendations
+    }
+
+    pub fn recommendation_history(
+        &self,
+        org_id: &str,
+        recommendation_id: &str,
+    ) -> Vec<RecommendationStatusChangeRecord> {
+        let Some(org_id) = normalize_farm_field_text(org_id.to_string()) else {
+            return Vec::new();
+        };
+        let Some(recommendation_id) = normalize_farm_field_text(recommendation_id.to_string())
+        else {
+            return Vec::new();
+        };
+
+        self.history
+            .iter()
+            .filter(|change| change.recommendation_id == recommendation_id)
+            .filter(|change| {
+                self.recommendations
+                    .get(&change.recommendation_id)
+                    .is_some_and(|recommendation| recommendation.org_id == org_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+
+    fn recommendation_for_org(
+        &self,
+        org_id: &str,
+        recommendation_id: &str,
+    ) -> Result<RecommendationRecord, RecommendationPersistenceError> {
+        self.recommendations
+            .get(recommendation_id)
+            .filter(|recommendation| recommendation.org_id == org_id)
+            .cloned()
+            .ok_or_else(|| RecommendationPersistenceError::RecommendationNotFound {
+                recommendation_id: recommendation_id.to_string(),
+            })
+    }
+}
+
+fn normalize_recommendation_record(
+    mut recommendation: RecommendationRecord,
+) -> Result<RecommendationRecord, RecommendationPersistenceError> {
+    recommendation.recommendation_id = normalize_farm_field_text(recommendation.recommendation_id)
+        .ok_or(RecommendationPersistenceError::EmptyRecommendationId)?;
+    recommendation.field_id = Some(
+        recommendation
+            .field_id
+            .and_then(normalize_farm_field_text)
+            .ok_or(RecommendationPersistenceError::EmptyFieldId)?,
+    );
+    recommendation.org_id = normalize_farm_field_text(recommendation.org_id)
+        .ok_or(RecommendationPersistenceError::EmptyOrgId)?;
+    recommendation.author_user_id = normalize_farm_field_text(recommendation.author_user_id)
+        .ok_or(RecommendationPersistenceError::EmptyAuthorUserId)?;
+    recommendation.action_category = normalize_farm_field_text(recommendation.action_category)
+        .ok_or(RecommendationPersistenceError::EmptyActionCategory)?;
+    recommendation.category = recommendation
+        .category
+        .and_then(normalize_farm_field_text)
+        .or_else(|| Some(recommendation.action_category.clone()));
+    recommendation.evidence_refs = normalize_recommendation_refs(recommendation.evidence_refs);
+    if recommendation.evidence_refs.is_empty() {
+        return Err(RecommendationPersistenceError::EvidenceRequired {
+            recommendation_id: recommendation.recommendation_id,
+        });
+    }
+    if recommendation.status != RecommendationStatus::Open {
+        return Err(RecommendationPersistenceError::InvalidInitialStatus {
+            recommendation_id: recommendation.recommendation_id,
+        });
+    }
+    recommendation.created_at = normalize_farm_field_text(recommendation.created_at)
+        .ok_or(RecommendationPersistenceError::EmptyTimestamp)?;
+    recommendation.updated_at = normalize_farm_field_text(recommendation.updated_at)
+        .ok_or(RecommendationPersistenceError::EmptyTimestamp)?;
+    recommendation.annotation_ids = normalize_recommendation_refs(recommendation.annotation_ids);
+    Ok(recommendation)
+}
+
+fn normalize_recommendation_refs(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .filter_map(normalize_farm_field_text)
+        .collect::<Vec<_>>()
+}
+
+fn normalize_recommendation_arg(
+    value: &str,
+    error: RecommendationPersistenceError,
+) -> Result<String, RecommendationPersistenceError> {
+    normalize_farm_field_text(value.to_string()).ok_or(error)
+}
+
+fn is_valid_recommendation_status_transition(
+    from: RecommendationStatus,
+    to: RecommendationStatus,
+) -> bool {
+    matches!(
+        (from, to),
+        (RecommendationStatus::Open, RecommendationStatus::Reviewed)
+            | (
+                RecommendationStatus::Reviewed,
+                RecommendationStatus::Completed | RecommendationStatus::Dismissed
+            )
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1461,9 +1722,10 @@ mod tests {
         AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord, CropPlanRecord,
         FarmFieldError, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError,
         FieldRecord, GeoBounds, GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        ReportFormat, ReportRecord, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
-        SeasonRecord,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, ReportFormat, ReportRecord, SceneLayerMetadataError,
+        SceneLayerRecord, SceneRecord, SeasonRecord,
     };
 
     #[test]
@@ -2290,11 +2552,15 @@ mod tests {
             recommendation_id: "rec-1".to_string(),
             scene_id: "scene-1".to_string(),
             field_id: Some("field-1".to_string()),
+            org_id: "org-a".to_string(),
+            author_user_id: "user-author".to_string(),
             title: "Inspect water stress zone".to_string(),
             note: Some("Check irrigation and re-scout in 48h".to_string()),
             category: Some("irrigation".to_string()),
+            action_category: "irrigation".to_string(),
             priority: RecommendationPriority::High,
             status: RecommendationStatus::Reviewed,
+            evidence_refs: vec!["zone:zone-1".to_string()],
             annotation_ids: vec!["ann-1".to_string(), "ann-2".to_string()],
             created_at: "2026-04-19T00:00:00Z".to_string(),
             updated_at: "2026-04-19T01:00:00Z".to_string(),
@@ -2305,6 +2571,173 @@ mod tests {
             serde_json::from_value(value).expect("recommendation should deserialize");
 
         assert_eq!(decoded, recommendation);
+    }
+
+    #[test]
+    fn recommendation_create_and_transitions_append_audit_history() {
+        let mut registry = RecommendationLifecycleRegistry::default();
+        registry
+            .create_recommendation(RecommendationRecord {
+                recommendation_id: "rec-1".to_string(),
+                scene_id: "scene-1".to_string(),
+                field_id: Some("field-1".to_string()),
+                org_id: "org-a".to_string(),
+                author_user_id: "user-author".to_string(),
+                title: "Inspect water stress zone".to_string(),
+                note: Some("Check irrigation and re-scout in 48h".to_string()),
+                category: Some("irrigation".to_string()),
+                action_category: "irrigation".to_string(),
+                priority: RecommendationPriority::High,
+                status: RecommendationStatus::Open,
+                evidence_refs: vec!["zone:zone-1".to_string()],
+                annotation_ids: vec!["ann-1".to_string()],
+                created_at: "2026-05-01T00:00:00Z".to_string(),
+                updated_at: "2026-05-01T00:00:00Z".to_string(),
+            })
+            .expect("recommendation persists");
+
+        registry
+            .transition_recommendation_status(
+                "org-a",
+                "rec-1",
+                "user-reviewer",
+                "2026-05-02T00:00:00Z",
+                RecommendationStatus::Reviewed,
+            )
+            .expect("review transition persists");
+        let completed = registry
+            .transition_recommendation_status(
+                "org-a",
+                "rec-1",
+                "user-reviewer",
+                "2026-05-03T00:00:00Z",
+                RecommendationStatus::Completed,
+            )
+            .expect("completion transition persists");
+
+        assert_eq!(completed.status, RecommendationStatus::Completed);
+        let history = registry.recommendation_history("org-a", "rec-1");
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history[0].change_type,
+            RecommendationStatusChangeType::Created
+        );
+        assert_eq!(history[0].before, None);
+        assert_eq!(history[0].after, RecommendationStatus::Open);
+        assert_eq!(
+            history[1].change_type,
+            RecommendationStatusChangeType::StatusChanged
+        );
+        assert_eq!(history[1].actor_user_id, "user-reviewer");
+        assert_eq!(history[1].before, Some(RecommendationStatus::Open));
+        assert_eq!(history[1].after, RecommendationStatus::Reviewed);
+        assert_eq!(history[2].before, Some(RecommendationStatus::Reviewed));
+        assert_eq!(history[2].after, RecommendationStatus::Completed);
+        assert_eq!(registry.recommendations_for_org("org-a").len(), 1);
+        assert!(registry.recommendations_for_org("org-b").is_empty());
+        assert!(registry.recommendation_history("org-b", "rec-1").is_empty());
+    }
+
+    #[test]
+    fn recommendation_rejects_missing_evidence_and_invalid_transition() {
+        let mut registry = RecommendationLifecycleRegistry::default();
+        let missing_evidence = registry
+            .create_recommendation(RecommendationRecord {
+                recommendation_id: "rec-1".to_string(),
+                scene_id: "scene-1".to_string(),
+                field_id: Some("field-1".to_string()),
+                org_id: "org-a".to_string(),
+                author_user_id: "user-author".to_string(),
+                title: "Inspect water stress zone".to_string(),
+                note: None,
+                category: Some("irrigation".to_string()),
+                action_category: "irrigation".to_string(),
+                priority: RecommendationPriority::High,
+                status: RecommendationStatus::Open,
+                evidence_refs: Vec::new(),
+                annotation_ids: Vec::new(),
+                created_at: "2026-05-01T00:00:00Z".to_string(),
+                updated_at: "2026-05-01T00:00:00Z".to_string(),
+            })
+            .expect_err("recommendation without evidence is rejected");
+        assert_eq!(
+            missing_evidence,
+            RecommendationPersistenceError::EvidenceRequired {
+                recommendation_id: "rec-1".to_string()
+            }
+        );
+
+        registry
+            .create_recommendation(RecommendationRecord {
+                recommendation_id: "rec-1".to_string(),
+                scene_id: "scene-1".to_string(),
+                field_id: Some("field-1".to_string()),
+                org_id: "org-a".to_string(),
+                author_user_id: "user-author".to_string(),
+                title: "Inspect water stress zone".to_string(),
+                note: None,
+                category: Some("irrigation".to_string()),
+                action_category: "irrigation".to_string(),
+                priority: RecommendationPriority::High,
+                status: RecommendationStatus::Open,
+                evidence_refs: vec!["zone:zone-1".to_string()],
+                annotation_ids: Vec::new(),
+                created_at: "2026-05-01T00:00:00Z".to_string(),
+                updated_at: "2026-05-01T00:00:00Z".to_string(),
+            })
+            .expect("recommendation persists");
+
+        let invalid = registry
+            .transition_recommendation_status(
+                "org-a",
+                "rec-1",
+                "user-reviewer",
+                "2026-05-02T00:00:00Z",
+                RecommendationStatus::Completed,
+            )
+            .expect_err("open cannot move directly to completed");
+        assert_eq!(
+            invalid,
+            RecommendationPersistenceError::InvalidStatusTransition {
+                from: RecommendationStatus::Open,
+                to: RecommendationStatus::Completed
+            }
+        );
+
+        registry
+            .transition_recommendation_status(
+                "org-a",
+                "rec-1",
+                "user-reviewer",
+                "2026-05-02T00:00:00Z",
+                RecommendationStatus::Reviewed,
+            )
+            .expect("review transition persists");
+        registry
+            .transition_recommendation_status(
+                "org-a",
+                "rec-1",
+                "user-reviewer",
+                "2026-05-03T00:00:00Z",
+                RecommendationStatus::Completed,
+            )
+            .expect("completion transition persists");
+        let reopened = registry
+            .transition_recommendation_status(
+                "org-a",
+                "rec-1",
+                "user-reviewer",
+                "2026-05-04T00:00:00Z",
+                RecommendationStatus::Open,
+            )
+            .expect_err("completed cannot reopen");
+        assert_eq!(
+            reopened,
+            RecommendationPersistenceError::InvalidStatusTransition {
+                from: RecommendationStatus::Completed,
+                to: RecommendationStatus::Open
+            }
+        );
     }
 
     #[test]

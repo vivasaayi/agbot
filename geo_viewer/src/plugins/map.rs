@@ -418,8 +418,10 @@ mod tests {
         FieldRecord {
             farm_id: Some("farm-1".to_string()),
             field_id: "field-1".to_string(),
+            org_id: "org-alpha".to_string(),
             owner: "org-alpha".to_string(),
             name: "North Field".to_string(),
+            area_ha: Some(12.4),
             crop: Some("corn".to_string()),
             season: Some("2026".to_string()),
             notes: None,
