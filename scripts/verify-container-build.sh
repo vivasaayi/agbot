@@ -3,6 +3,8 @@ set -euo pipefail
 
 dockerfile="${1:-Dockerfile}"
 failures=0
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
 
 fail() {
     echo "container-build-check: $*" >&2
@@ -13,6 +15,8 @@ if [[ ! -f "$dockerfile" ]]; then
     fail "Dockerfile not found: $dockerfile"
     exit 1
 fi
+
+bash "$repo_root/scripts/verify-secrets.sh"
 
 while read -r image; do
     if [[ "$image" != *:* ]]; then

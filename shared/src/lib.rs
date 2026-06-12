@@ -12,6 +12,7 @@ pub mod logging;
 pub mod observability;
 pub mod plugin_extensions;
 pub mod schemas;
+pub mod secrets;
 pub mod types;
 
 pub use control_plane::*;
@@ -21,6 +22,7 @@ pub use logging::{
     logging_operation_span, with_correlation_id, LoggingContext, LoggingNodeIdSource,
 };
 pub use observability::*;
+pub use secrets::*;
 pub use types::*;
 
 /// Common result type used across the workspace
