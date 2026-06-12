@@ -350,6 +350,62 @@ pub struct ChangeEventDerivationInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompareViewFeed {
+    pub schema_version: String,
+    pub entity_ref: String,
+    pub metric: String,
+    pub alignment_ref: String,
+    pub alignment_proof_ref: String,
+    pub alignment_proof: AlignmentGuardProof,
+    pub shared_view: CompareSharedView,
+    pub earlier: CompareViewLayer,
+    pub later: CompareViewLayer,
+    pub change_mask: CompareViewChangeMask,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompareSharedView {
+    pub crs: String,
+    pub extent: GeoExtent,
+    pub resolution: RasterResolution,
+    pub grid_columns: u32,
+    pub grid_rows: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompareViewLayer {
+    pub raster_ref: String,
+    pub source_ref: String,
+    pub t: String,
+    pub crs: String,
+    pub extent: GeoExtent,
+    pub resolution: RasterResolution,
+    pub grid_columns: u32,
+    pub grid_rows: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompareViewChangeMask {
+    pub delta_raster_ref: String,
+    pub mask_raster_ref: String,
+    pub changed_cell_count: u32,
+    pub absolute_threshold: f64,
+    pub method_version: String,
+    pub change_mask: Vec<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompareViewRefusal {
+    pub schema_version: String,
+    pub reason_code: AlignmentRefusalReason,
+    pub mismatch_detail: String,
+    pub earlier_raster_ref: Option<String>,
+    pub later_raster_ref: Option<String>,
+    pub alignment_proof_ref: Option<String>,
+    pub no_misaligned_panes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeriesCsvExport {
     pub content_type: String,
     pub schema_version: String,
@@ -1193,6 +1249,74 @@ pub fn export_change_zones_geojson(
     })
 }
 
+pub fn build_compare_view_feed(
+    proof: &AlignmentGuardProof,
+    evidence: &RasterAlignmentEvidence,
+    change: &RasterChangeResult,
+) -> Result<CompareViewFeed, CompareViewRefusal> {
+    validate_compare_view_inputs(proof, evidence, change)?;
+    let shared_view = CompareSharedView {
+        crs: evidence.target_crs.clone(),
+        extent: evidence.aligned_extent,
+        resolution: RasterResolution {
+            x: evidence.target_resolution_x,
+            y: evidence.target_resolution_y,
+        },
+        grid_columns: evidence.grid_columns,
+        grid_rows: evidence.grid_rows,
+    };
+
+    Ok(CompareViewFeed {
+        schema_version: "timeseries.compare_view_feed.v1".to_string(),
+        entity_ref: evidence.entity_ref.clone(),
+        metric: evidence.metric.clone(),
+        alignment_ref: evidence.alignment_ref.clone(),
+        alignment_proof_ref: proof.alignment_proof_ref.clone(),
+        alignment_proof: proof.clone(),
+        earlier: CompareViewLayer {
+            raster_ref: evidence.aligned_earlier_ref.clone(),
+            source_ref: evidence.earlier_source_ref.clone(),
+            t: evidence.earlier_t.clone(),
+            crs: shared_view.crs.clone(),
+            extent: shared_view.extent,
+            resolution: shared_view.resolution,
+            grid_columns: shared_view.grid_columns,
+            grid_rows: shared_view.grid_rows,
+        },
+        later: CompareViewLayer {
+            raster_ref: evidence.aligned_later_ref.clone(),
+            source_ref: evidence.later_source_ref.clone(),
+            t: evidence.later_t.clone(),
+            crs: shared_view.crs.clone(),
+            extent: shared_view.extent,
+            resolution: shared_view.resolution,
+            grid_columns: shared_view.grid_columns,
+            grid_rows: shared_view.grid_rows,
+        },
+        change_mask: CompareViewChangeMask {
+            delta_raster_ref: change.delta_raster_ref.clone(),
+            mask_raster_ref: change.mask_raster_ref.clone(),
+            changed_cell_count: change.changed_cell_count,
+            absolute_threshold: change.absolute_threshold,
+            method_version: change.method_version.clone(),
+            change_mask: change.change_mask.clone(),
+        },
+        shared_view,
+    })
+}
+
+pub fn compare_view_refusal_from_guard(refusal: AlignmentGuardRefusal) -> CompareViewRefusal {
+    CompareViewRefusal {
+        schema_version: "timeseries.compare_view_refusal.v1".to_string(),
+        reason_code: refusal.reason_code,
+        mismatch_detail: refusal.mismatch_detail,
+        earlier_raster_ref: refusal.earlier_raster_ref,
+        later_raster_ref: refusal.later_raster_ref,
+        alignment_proof_ref: refusal.alignment_proof_ref,
+        no_misaligned_panes: true,
+    }
+}
+
 pub fn align_raster_pair(
     earlier: &SeriesPoint,
     later: &SeriesPoint,
@@ -1883,6 +2007,137 @@ fn validate_raster_change_result(change: &RasterChangeResult) -> Result<(), Time
     Ok(())
 }
 
+fn validate_compare_view_inputs(
+    proof: &AlignmentGuardProof,
+    evidence: &RasterAlignmentEvidence,
+    change: &RasterChangeResult,
+) -> Result<(), CompareViewRefusal> {
+    validate_raster_change_result(change)
+        .map_err(|error| compare_view_input_refusal(proof, evidence, error.to_string()))?;
+    normalize_required_text(
+        change.delta_raster_ref.clone(),
+        TimeSeriesError::EmptyDeltaRasterRef,
+    )
+    .map_err(|error| compare_view_input_refusal(proof, evidence, error.to_string()))?;
+
+    let expected_resolution = RasterResolution {
+        x: evidence.target_resolution_x,
+        y: evidence.target_resolution_y,
+    };
+    let changed_cell_count = change
+        .change_mask
+        .iter()
+        .filter(|changed| **changed)
+        .count();
+    let mut mismatches = Vec::new();
+
+    if proof.entity_ref != evidence.entity_ref {
+        mismatches.push(format!(
+            "entity_ref proof={} evidence={}",
+            proof.entity_ref, evidence.entity_ref
+        ));
+    }
+    if proof.metric != evidence.metric {
+        mismatches.push(format!(
+            "metric proof={} evidence={}",
+            proof.metric, evidence.metric
+        ));
+    }
+    if proof.earlier_t != evidence.earlier_t || proof.later_t != evidence.later_t {
+        mismatches.push(format!(
+            "time pair proof={}/{} evidence={}/{}",
+            proof.earlier_t, proof.later_t, evidence.earlier_t, evidence.later_t
+        ));
+    }
+    if proof.earlier_raster_ref != evidence.earlier_raster_ref
+        || proof.later_raster_ref != evidence.later_raster_ref
+    {
+        mismatches.push(format!(
+            "source rasters proof={}/{} evidence={}/{}",
+            proof.earlier_raster_ref,
+            proof.later_raster_ref,
+            evidence.earlier_raster_ref,
+            evidence.later_raster_ref
+        ));
+    }
+    if proof.target_crs != evidence.target_crs || evidence.target_crs != change.crs {
+        mismatches.push(format!(
+            "crs proof={} evidence={} change={}",
+            proof.target_crs, evidence.target_crs, change.crs
+        ));
+    }
+    if proof.alignment_proof_ref != change.alignment_proof_ref {
+        mismatches.push(format!(
+            "alignment_proof_ref proof={} change={}",
+            proof.alignment_proof_ref, change.alignment_proof_ref
+        ));
+    }
+    if evidence.alignment_ref != change.alignment_ref {
+        mismatches.push(format!(
+            "alignment_ref evidence={} change={}",
+            evidence.alignment_ref, change.alignment_ref
+        ));
+    }
+    if proof.overlap_ratio_basis_points != evidence.overlap_ratio_basis_points {
+        mismatches.push(format!(
+            "overlap proof={}bp evidence={}bp",
+            proof.overlap_ratio_basis_points, evidence.overlap_ratio_basis_points
+        ));
+    }
+    if proof.earlier_resolution != evidence.source_earlier_resolution
+        || proof.later_resolution != evidence.source_later_resolution
+    {
+        mismatches.push("source resolution proof/evidence mismatch".to_string());
+    }
+    if evidence.aligned_extent != change.extent {
+        mismatches.push("aligned_extent evidence/change mismatch".to_string());
+    }
+    if expected_resolution != change.resolution {
+        mismatches.push("resolution evidence/change mismatch".to_string());
+    }
+    if evidence.grid_columns != change.grid_columns || evidence.grid_rows != change.grid_rows {
+        mismatches.push(format!(
+            "grid evidence={}x{} change={}x{}",
+            evidence.grid_columns, evidence.grid_rows, change.grid_columns, change.grid_rows
+        ));
+    }
+    if changed_cell_count != change.changed_cell_count as usize {
+        mismatches.push(format!(
+            "changed_cell_count mask={} metadata={}",
+            changed_cell_count, change.changed_cell_count
+        ));
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(compare_view_input_refusal(
+            proof,
+            evidence,
+            format!(
+                "compare-view inputs are not one co-registered grid: {}",
+                mismatches.join("; ")
+            ),
+        ))
+    }
+}
+
+fn compare_view_input_refusal(
+    proof: &AlignmentGuardProof,
+    evidence: &RasterAlignmentEvidence,
+    mismatch_detail: String,
+) -> CompareViewRefusal {
+    CompareViewRefusal {
+        schema_version: "timeseries.compare_view_refusal.v1".to_string(),
+        reason_code: AlignmentRefusalReason::InvalidGuardConfig,
+        mismatch_detail,
+        earlier_raster_ref: Some(evidence.earlier_raster_ref.clone()),
+        later_raster_ref: Some(evidence.later_raster_ref.clone()),
+        alignment_proof_ref: Some(proof.alignment_proof_ref.clone()),
+        no_misaligned_panes: true,
+    }
+}
+
 fn normalize_change_zone_polygon(
     polygon: ChangeZonePolygon,
     expected_crs: &str,
@@ -2129,12 +2384,13 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        align_raster_pair, compute_aligned_raster_change, derive_ranked_change_events,
-        export_change_mask_geotiff, export_change_zones_geojson, export_series_csv,
-        guard_coregisterable_pair, AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof,
-        AlignmentRefusalReason, ChangeEvent, ChangeEventConfig, ChangeEventDerivationInput,
-        ChangeEventDirection, ChangeEventReasonCode, ChangeZoneExportFeature, ChangeZonePolygon,
-        GeoExtent, MetricDefinition, MetricKind, RasterAlignmentConfig, RasterAlignmentEvidence,
+        align_raster_pair, build_compare_view_feed, compare_view_refusal_from_guard,
+        compute_aligned_raster_change, derive_ranked_change_events, export_change_mask_geotiff,
+        export_change_zones_geojson, export_series_csv, guard_coregisterable_pair,
+        AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason,
+        ChangeEvent, ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection,
+        ChangeEventReasonCode, ChangeZoneExportFeature, ChangeZonePolygon, GeoExtent,
+        MetricDefinition, MetricKind, RasterAlignmentConfig, RasterAlignmentEvidence,
         RasterChangeConfig, RasterChangeResult, RasterResolution, RasterSeriesValue,
         RollingBaselineConfig, SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesPoint,
         SeriesProductIngest, SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine,
@@ -3273,6 +3529,87 @@ mod tests {
             .expect("empty change-zone export should be valid");
         assert_eq!(empty.feature_collection.features.len(), 0);
         assert_eq!(empty.feature_collection.crs, "EPSG:4326");
+    }
+
+    #[test]
+    fn compare_view_feed_locks_aligned_pair_and_change_mask_to_shared_view() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let change = sample_drop_change_result();
+
+        let feed =
+            build_compare_view_feed(&proof, &evidence, &change).expect("compare feed should build");
+
+        assert_eq!(feed.schema_version, "timeseries.compare_view_feed.v1");
+        assert_eq!(feed.entity_ref, "field:alpha");
+        assert_eq!(feed.metric, "ndvi_raster");
+        assert_eq!(feed.alignment_ref, evidence.alignment_ref);
+        assert_eq!(feed.alignment_proof_ref, proof.alignment_proof_ref);
+        assert_eq!(feed.shared_view.crs, "EPSG:32610");
+        assert_eq!(feed.shared_view.extent, evidence.aligned_extent);
+        assert_eq!(feed.earlier.raster_ref, evidence.aligned_earlier_ref);
+        assert_eq!(feed.later.raster_ref, evidence.aligned_later_ref);
+        assert_eq!(feed.change_mask.mask_raster_ref, change.mask_raster_ref);
+        assert_eq!(feed.change_mask.change_mask, change.change_mask);
+        assert_eq!(feed.alignment_proof.target_crs, feed.shared_view.crs);
+    }
+
+    #[test]
+    fn compare_view_feed_refuses_mismatched_change_grid_without_panes() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let mut change = sample_drop_change_result();
+        change.crs = "EPSG:4326".to_string();
+
+        let refusal = build_compare_view_feed(&proof, &evidence, &change)
+            .expect_err("mismatched change grid should not build compare feed");
+
+        assert_eq!(
+            refusal.reason_code,
+            AlignmentRefusalReason::InvalidGuardConfig
+        );
+        assert!(refusal.mismatch_detail.contains("crs"));
+        assert_eq!(
+            refusal.earlier_raster_ref,
+            Some(evidence.earlier_raster_ref)
+        );
+        assert!(refusal.no_misaligned_panes);
+    }
+
+    #[test]
+    fn compare_view_refusal_passes_uncoregistered_pair_mismatch_to_viewer() {
+        let earlier = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-10T10:00:00Z",
+            "product:scene-001:ndvi",
+            default_extent(),
+        );
+        let mut later = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-12T10:00:00Z",
+            "product:scene-002:ndvi",
+            default_extent(),
+        );
+        if let SeriesValue::Raster(value) = &mut later.value {
+            value.crs = Some("EPSG:4326".to_string());
+        }
+
+        let guard_refusal = guard_coregisterable_pair(
+            &earlier,
+            &later,
+            guard_config(0.75, 0.0),
+            "alignment-proof:field-alpha:ndvi".to_string(),
+        )
+        .expect_err("CRS mismatch should refuse guard");
+        let viewer_refusal = compare_view_refusal_from_guard(guard_refusal);
+
+        assert_eq!(
+            viewer_refusal.reason_code,
+            AlignmentRefusalReason::CrsMismatch
+        );
+        assert!(viewer_refusal.mismatch_detail.contains("EPSG:32610"));
+        assert!(viewer_refusal.mismatch_detail.contains("EPSG:4326"));
+        assert!(viewer_refusal.no_misaligned_panes);
     }
 
     fn scalar_point(entity_ref: &str, metric: &str, t: &str, value: f64) -> SeriesPoint {
