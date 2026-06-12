@@ -163,6 +163,75 @@ pub struct AlertDedupResult {
     pub bypassed_alert_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertChannel {
+    InApp,
+    Email,
+    Sms,
+    Webhook,
+    Push,
+}
+
+impl AlertChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlertChannel::InApp => "in_app",
+            AlertChannel::Email => "email",
+            AlertChannel::Sms => "sms",
+            AlertChannel::Webhook => "webhook",
+            AlertChannel::Push => "push",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertRecipient {
+    pub recipient_id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryOutcome {
+    pub delivery_id: String,
+    pub alert_id: String,
+    pub recipient_id: String,
+    pub channel: AlertChannel,
+    pub status: DeliveryStatus,
+    pub attempted_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InAppFeedItem {
+    pub recipient_id: String,
+    pub alert_id: String,
+    pub delivered_at: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InAppChannelAdapter {
+    feed_items: Vec<InAppFeedItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockChannelAdapter {
+    channel: AlertChannel,
+    failure: Option<String>,
+    outcomes: Vec<DeliveryOutcome>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlertHistoryQuery {
     pub source_domain: Option<String>,
@@ -224,6 +293,10 @@ pub enum AlertingError {
     EmptySeverityMetric,
     #[error("severity method_version cannot be empty")]
     EmptySeverityMethodVersion,
+    #[error("recipient_id cannot be empty")]
+    EmptyRecipientId,
+    #[error("recipient role cannot be empty")]
+    EmptyRecipientRole,
     #[error("severity evidence must be finite with warning <= critical <= emergency thresholds")]
     InvalidSeverityEvidence,
     #[error("dedup window requires non-empty window_start <= window_end")]
@@ -234,6 +307,12 @@ pub enum AlertingError {
 
 pub trait SourceAdapter {
     fn emit(&mut self, event: AlertEvent) -> Result<AlertCandidateRecord, AlertingError>;
+}
+
+pub trait ChannelAdapter {
+    fn channel(&self) -> AlertChannel;
+
+    fn send(&mut self, alert: &FiredAlertRecord, recipient: &AlertRecipient) -> DeliveryOutcome;
 }
 
 impl SourceAdapter for AlertEventBackbone {
@@ -262,6 +341,74 @@ impl SourceAdapter for AlertEventBackbone {
                 Err(error)
             }
         }
+    }
+}
+
+impl ChannelAdapter for InAppChannelAdapter {
+    fn channel(&self) -> AlertChannel {
+        AlertChannel::InApp
+    }
+
+    fn send(&mut self, alert: &FiredAlertRecord, recipient: &AlertRecipient) -> DeliveryOutcome {
+        let outcome = delivered_outcome(self.channel(), alert, recipient);
+        self.feed_items.push(InAppFeedItem {
+            recipient_id: recipient.recipient_id.clone(),
+            alert_id: alert.alert_id.clone(),
+            delivered_at: outcome
+                .delivered_at
+                .clone()
+                .unwrap_or_else(|| alert.fired_at.clone()),
+            summary: alert.explanation.clone(),
+        });
+        outcome
+    }
+}
+
+impl InAppChannelAdapter {
+    pub fn feed_for(&self, recipient_id: &str) -> Vec<InAppFeedItem> {
+        self.feed_items
+            .iter()
+            .filter(|item| item.recipient_id == recipient_id)
+            .cloned()
+            .collect()
+    }
+}
+
+impl MockChannelAdapter {
+    pub fn succeeding(channel: AlertChannel) -> Self {
+        Self {
+            channel,
+            failure: None,
+            outcomes: Vec::new(),
+        }
+    }
+
+    pub fn failing(channel: AlertChannel, error: String) -> Self {
+        Self {
+            channel,
+            failure: Some(error),
+            outcomes: Vec::new(),
+        }
+    }
+
+    pub fn recorded_outcomes(&self) -> Vec<DeliveryOutcome> {
+        self.outcomes.clone()
+    }
+}
+
+impl ChannelAdapter for MockChannelAdapter {
+    fn channel(&self) -> AlertChannel {
+        self.channel
+    }
+
+    fn send(&mut self, alert: &FiredAlertRecord, recipient: &AlertRecipient) -> DeliveryOutcome {
+        let outcome = if let Some(error) = &self.failure {
+            failed_outcome(self.channel, alert, recipient, error)
+        } else {
+            delivered_outcome(self.channel, alert, recipient)
+        };
+        self.outcomes.push(outcome.clone());
+        outcome
     }
 }
 
@@ -532,6 +679,16 @@ pub fn deduplicate_alert_stream(
     Ok(result)
 }
 
+pub fn deliver_alert<A: ChannelAdapter>(
+    adapter: &mut A,
+    alert: &FiredAlertRecord,
+    recipient: AlertRecipient,
+) -> Result<DeliveryOutcome, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    let recipient = normalize_alert_recipient(recipient)?;
+    Ok(adapter.send(&alert, &recipient))
+}
+
 fn normalize_event(event: AlertEvent) -> Result<AlertEvent, AlertingError> {
     Ok(AlertEvent {
         source_domain: normalize_required_text(
@@ -596,6 +753,16 @@ fn normalize_dedup_window(window: AlertDedupWindow) -> Result<AlertDedupWindow, 
     })
 }
 
+fn normalize_alert_recipient(recipient: AlertRecipient) -> Result<AlertRecipient, AlertingError> {
+    Ok(AlertRecipient {
+        recipient_id: normalize_required_text(
+            recipient.recipient_id,
+            AlertingError::EmptyRecipientId,
+        )?,
+        role: normalize_required_text(recipient.role, AlertingError::EmptyRecipientRole)?,
+    })
+}
+
 fn severity_from_evidence_or_rule(
     rule_severity: AlertSeverityHint,
     evidence: &AlertSeverityEvidence,
@@ -631,6 +798,59 @@ fn alert_bypasses_dedup_suppression(alert: &FiredAlertRecord) -> bool {
     matches!(
         alert.severity,
         AlertSeverityHint::Critical | AlertSeverityHint::Emergency
+    )
+}
+
+fn delivered_outcome(
+    channel: AlertChannel,
+    alert: &FiredAlertRecord,
+    recipient: &AlertRecipient,
+) -> DeliveryOutcome {
+    DeliveryOutcome {
+        delivery_id: delivery_id(channel, alert, recipient),
+        alert_id: alert.alert_id.clone(),
+        recipient_id: recipient.recipient_id.clone(),
+        channel,
+        status: DeliveryStatus::Delivered,
+        attempted_at: alert.fired_at.clone(),
+        delivered_at: Some(alert.fired_at.clone()),
+        error: None,
+    }
+}
+
+fn failed_outcome(
+    channel: AlertChannel,
+    alert: &FiredAlertRecord,
+    recipient: &AlertRecipient,
+    error: &str,
+) -> DeliveryOutcome {
+    let normalized_error = error.trim();
+    DeliveryOutcome {
+        delivery_id: delivery_id(channel, alert, recipient),
+        alert_id: alert.alert_id.clone(),
+        recipient_id: recipient.recipient_id.clone(),
+        channel,
+        status: DeliveryStatus::Failed,
+        attempted_at: alert.fired_at.clone(),
+        delivered_at: None,
+        error: Some(if normalized_error.is_empty() {
+            "channel delivery failed".to_string()
+        } else {
+            normalized_error.to_string()
+        }),
+    }
+}
+
+fn delivery_id(
+    channel: AlertChannel,
+    alert: &FiredAlertRecord,
+    recipient: &AlertRecipient,
+) -> String {
+    format!(
+        "delivery:{}:{}:{}",
+        channel.as_str(),
+        recipient.recipient_id,
+        alert.alert_id
     )
 }
 
@@ -694,10 +914,11 @@ fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_alert_severity, compute_alert_dedup_key, deduplicate_alert_stream,
-        evaluate_alert_rules, filter_alert_history, AlertDedupWindow, AlertEvent,
-        AlertEventBackbone, AlertHistoryQuery, AlertRule, AlertSeverityEvidence, AlertSeverityHint,
-        AlertingError, SourceAdapter,
+        classify_alert_severity, compute_alert_dedup_key, deduplicate_alert_stream, deliver_alert,
+        evaluate_alert_rules, filter_alert_history, AlertChannel, AlertDedupWindow, AlertEvent,
+        AlertEventBackbone, AlertHistoryQuery, AlertRecipient, AlertRule, AlertSeverityEvidence,
+        AlertSeverityHint, AlertingError, DeliveryStatus, InAppChannelAdapter, MockChannelAdapter,
+        SourceAdapter,
     };
 
     #[test]
@@ -1025,6 +1246,76 @@ mod tests {
         assert_eq!(result.bypassed_alert_ids, vec!["alert-critical-bypass"]);
     }
 
+    #[test]
+    fn in_app_delivery_records_outcome_and_feed_item() {
+        let alert = fired_alert(
+            "alert-in-app",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+        let recipient = alert_recipient("ops-001");
+        let mut adapter = InAppChannelAdapter::default();
+
+        let outcome =
+            deliver_alert(&mut adapter, &alert, recipient).expect("in-app delivery should run");
+
+        assert_eq!(outcome.delivery_id, "delivery:in_app:ops-001:alert-in-app");
+        assert_eq!(outcome.alert_id, "alert-in-app");
+        assert_eq!(outcome.recipient_id, "ops-001");
+        assert_eq!(outcome.channel, AlertChannel::InApp);
+        assert_eq!(outcome.status, DeliveryStatus::Delivered);
+        assert_eq!(outcome.error, None);
+
+        let feed = adapter.feed_for("ops-001");
+        assert_eq!(feed.len(), 1);
+        assert_eq!(feed[0].alert_id, "alert-in-app");
+        assert_eq!(feed[0].recipient_id, "ops-001");
+        assert_eq!(feed[0].delivered_at, "2026-06-12T10:00:00Z");
+    }
+
+    #[test]
+    fn mock_channel_adapter_records_successful_delivery_outcome() {
+        let alert = fired_alert(
+            "alert-email",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut adapter = MockChannelAdapter::succeeding(AlertChannel::Email);
+
+        let outcome = deliver_alert(&mut adapter, &alert, alert_recipient("ag-001"))
+            .expect("mock channel should run");
+
+        assert_eq!(outcome.channel, AlertChannel::Email);
+        assert_eq!(outcome.status, DeliveryStatus::Delivered);
+        assert_eq!(adapter.recorded_outcomes(), vec![outcome]);
+    }
+
+    #[test]
+    fn channel_adapter_error_is_recorded_as_failed_delivery_outcome() {
+        let alert = fired_alert(
+            "alert-webhook",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut adapter =
+            MockChannelAdapter::failing(AlertChannel::Webhook, "provider timeout".to_string());
+
+        let outcome = deliver_alert(&mut adapter, &alert, alert_recipient("ops-001"))
+            .expect("adapter failure should be recorded, not returned as an error");
+
+        assert_eq!(outcome.channel, AlertChannel::Webhook);
+        assert_eq!(outcome.status, DeliveryStatus::Failed);
+        assert_eq!(outcome.error, Some("provider timeout".to_string()));
+        assert_eq!(adapter.recorded_outcomes().len(), 1);
+        assert_eq!(adapter.recorded_outcomes()[0], outcome);
+    }
+
     fn sensor_health_event() -> AlertEvent {
         AlertEvent {
             source_domain: "27-soil-iot-sensor-network".to_string(),
@@ -1082,6 +1373,13 @@ mod tests {
         AlertDedupWindow {
             window_start: "2026-06-12T10:00:00Z".to_string(),
             window_end: "2026-06-12T10:59:59Z".to_string(),
+        }
+    }
+
+    fn alert_recipient(recipient_id: &str) -> AlertRecipient {
+        AlertRecipient {
+            recipient_id: recipient_id.to_string(),
+            role: "operator".to_string(),
         }
     }
 }
