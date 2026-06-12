@@ -10,6 +10,7 @@ pub mod api;
 pub mod database;
 pub mod dispatch_safety;
 pub mod flight_path;
+pub mod guarded_dispatch;
 pub mod mavlink_integration;
 pub mod mission_optimizer;
 pub mod preflight_checklist;
@@ -31,6 +32,10 @@ pub use dispatch_safety::{
     NoFlyZone, SafetyViolation, SafetyViolationCode, SafetyViolationSeverity,
 };
 pub use flight_path::{FlightPath, PathSegment, SurveyPattern};
+pub use guarded_dispatch::{
+    dispatch_guarded_simulation_command, GuardedDispatchAuditEvent, GuardedDispatchAuditEventKind,
+    GuardedDispatchCommand, GuardedDispatchContext, GuardedDispatchError, GuardedDispatchOutcome,
+};
 pub use mission_optimizer::MissionOptimizer;
 pub use preflight_checklist::{
     evaluate_preflight_checklist, GpsFixStatus, GpsFixType, PreflightArmError, PreflightCheckName,
