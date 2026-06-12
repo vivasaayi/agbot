@@ -349,6 +349,89 @@ pub struct ChangeEventDerivationInput {
     pub baseline: RollingBaselineResult,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeriesCsvExport {
+    pub content_type: String,
+    pub schema_version: String,
+    pub csv: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeMaskGeoTiffMetadata {
+    pub mask_raster_ref: String,
+    pub alignment_ref: String,
+    pub alignment_proof_ref: String,
+    pub crs: String,
+    pub extent: GeoExtent,
+    pub resolution: RasterResolution,
+    pub grid_columns: u32,
+    pub grid_rows: u32,
+    pub changed_cell_count: u32,
+    pub absolute_threshold: f64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeMaskGeoTiffExport {
+    pub content_type: String,
+    pub schema_version: String,
+    pub metadata: ChangeMaskGeoTiffMetadata,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeZonePolygon {
+    pub crs: String,
+    pub rings: Vec<Vec<[f64; 2]>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeZoneExportFeature {
+    pub event: ChangeEvent,
+    pub geometry: ChangeZonePolygon,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeZonesGeoJsonExport {
+    pub content_type: String,
+    pub schema_version: String,
+    pub feature_collection: ChangeZoneFeatureCollection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeZoneFeatureCollection {
+    pub geojson_type: String,
+    pub crs: String,
+    pub features: Vec<ChangeZoneGeoJsonFeature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeZoneGeoJsonFeature {
+    pub geojson_type: String,
+    pub geometry: ChangeZoneGeoJsonGeometry,
+    pub properties: ChangeZoneGeoJsonProperties,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeZoneGeoJsonGeometry {
+    pub geojson_type: String,
+    pub coordinates: Vec<Vec<[f64; 2]>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeZoneGeoJsonProperties {
+    pub zone_ref: String,
+    pub metric: String,
+    pub magnitude: f64,
+    pub direction: ChangeEventDirection,
+    pub since_date: String,
+    pub reason_code: ChangeEventReasonCode,
+    pub changed_cell_count: u32,
+    pub severity_score: f64,
+    pub evidence_refs: Vec<String>,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TimeSeriesStore {
     points: BTreeMap<SeriesKey, SeriesPoint>,
@@ -488,6 +571,15 @@ pub enum TimeSeriesError {
     },
     #[error("change event config must have finite non-negative threshold")]
     InvalidChangeEventConfig,
+    #[error("export CRS cannot be empty")]
+    EmptyExportCrs,
+    #[error("change zone export CRS mismatch: expected {expected_crs}, got {actual_crs}")]
+    ChangeZoneCrsMismatch {
+        expected_crs: String,
+        actual_crs: String,
+    },
+    #[error("change zone geometry must contain finite closed polygon rings")]
+    InvalidChangeZoneGeometry,
 }
 
 impl TimeSeriesStore {
@@ -986,6 +1078,119 @@ pub fn derive_ranked_change_events(
             .then_with(|| left.zone_ref.cmp(&right.zone_ref))
     });
     Ok(events)
+}
+
+pub fn export_series_csv(points: &[SeriesPoint]) -> Result<SeriesCsvExport, TimeSeriesError> {
+    let mut csv = "entity_ref,metric,t,unit,value,source_ref,created_at\n".to_string();
+    for point in points {
+        let point = normalize_point(point.clone())?;
+        let value = match &point.value {
+            SeriesValue::Scalar { value } => value.to_string(),
+            SeriesValue::Raster(raster) => raster.raster_ref.clone(),
+        };
+        csv.push_str(&csv_row([
+            point.entity_ref.as_str(),
+            point.metric.as_str(),
+            point.t.as_str(),
+            point.unit.as_str(),
+            value.as_str(),
+            point.source_ref.as_str(),
+            point.created_at.as_str(),
+        ]));
+    }
+
+    Ok(SeriesCsvExport {
+        content_type: "text/csv".to_string(),
+        schema_version: "timeseries.series_csv.v1".to_string(),
+        csv,
+    })
+}
+
+pub fn export_change_mask_geotiff(
+    change: &RasterChangeResult,
+) -> Result<ChangeMaskGeoTiffExport, TimeSeriesError> {
+    validate_raster_change_result(change)?;
+    let metadata = ChangeMaskGeoTiffMetadata {
+        mask_raster_ref: change.mask_raster_ref.clone(),
+        alignment_ref: change.alignment_ref.clone(),
+        alignment_proof_ref: change.alignment_proof_ref.clone(),
+        crs: change.crs.clone(),
+        extent: change.extent,
+        resolution: change.resolution,
+        grid_columns: change.grid_columns,
+        grid_rows: change.grid_rows,
+        changed_cell_count: change.changed_cell_count,
+        absolute_threshold: change.absolute_threshold,
+        method_version: change.method_version.clone(),
+    };
+    let metadata_line = format!(
+        "mask_raster_ref={};alignment_ref={};alignment_proof_ref={};crs={};extent={},{},{},{};resolution={},{};grid={}x{};changed_cell_count={};threshold={};method={}\n",
+        metadata.mask_raster_ref,
+        metadata.alignment_ref,
+        metadata.alignment_proof_ref,
+        metadata.crs,
+        metadata.extent.min_x,
+        metadata.extent.min_y,
+        metadata.extent.max_x,
+        metadata.extent.max_y,
+        metadata.resolution.x,
+        metadata.resolution.y,
+        metadata.grid_columns,
+        metadata.grid_rows,
+        metadata.changed_cell_count,
+        metadata.absolute_threshold,
+        metadata.method_version
+    );
+    let mut bytes = b"AGBOT_TIMESERIES_GEOTIFF_METADATA\n".to_vec();
+    bytes.extend(metadata_line.as_bytes());
+
+    Ok(ChangeMaskGeoTiffExport {
+        content_type: "image/tiff".to_string(),
+        schema_version: "timeseries.change_mask_geotiff.v1".to_string(),
+        metadata,
+        bytes,
+    })
+}
+
+pub fn export_change_zones_geojson(
+    features: Vec<ChangeZoneExportFeature>,
+    crs: String,
+) -> Result<ChangeZonesGeoJsonExport, TimeSeriesError> {
+    let crs = normalize_required_text(crs, TimeSeriesError::EmptyExportCrs)?;
+    let mut geojson_features = Vec::with_capacity(features.len());
+    for feature in features {
+        let geometry = normalize_change_zone_polygon(feature.geometry, &crs)?;
+        let event = feature.event;
+        geojson_features.push(ChangeZoneGeoJsonFeature {
+            geojson_type: "Feature".to_string(),
+            geometry: ChangeZoneGeoJsonGeometry {
+                geojson_type: "Polygon".to_string(),
+                coordinates: geometry.rings,
+            },
+            properties: ChangeZoneGeoJsonProperties {
+                zone_ref: event.zone_ref,
+                metric: event.metric,
+                magnitude: event.magnitude,
+                direction: event.direction,
+                since_date: event.since_date,
+                reason_code: event.reason_code,
+                changed_cell_count: event.changed_cell_count,
+                severity_score: event.severity_score,
+                evidence_refs: event.evidence_refs,
+                summary: event.summary,
+            },
+        });
+    }
+
+    Ok(ChangeZonesGeoJsonExport {
+        content_type: "application/geo+json".to_string(),
+        schema_version: "timeseries.change_zones_geojson.v1".to_string(),
+        feature_collection: ChangeZoneFeatureCollection {
+            geojson_type: "FeatureCollection".to_string(),
+            crs,
+            features: geojson_features,
+        },
+    })
 }
 
 pub fn align_raster_pair(
@@ -1616,6 +1821,97 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
+fn csv_row<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
+    let mut row = fields
+        .into_iter()
+        .map(csv_escape)
+        .collect::<Vec<_>>()
+        .join(",");
+    row.push('\n');
+    row
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn validate_raster_change_result(change: &RasterChangeResult) -> Result<(), TimeSeriesError> {
+    normalize_required_text(
+        change.mask_raster_ref.clone(),
+        TimeSeriesError::EmptyMaskRasterRef,
+    )?;
+    normalize_required_text(
+        change.alignment_ref.clone(),
+        TimeSeriesError::EmptyAlignmentRef,
+    )?;
+    normalize_required_text(
+        change.alignment_proof_ref.clone(),
+        TimeSeriesError::EmptyAlignmentRef,
+    )?;
+    normalize_required_text(change.crs.clone(), TimeSeriesError::MissingRasterCrs)?;
+    normalize_raster_resolution(change.resolution)?;
+    if !change.absolute_threshold.is_finite() || change.absolute_threshold < 0.0 {
+        return Err(TimeSeriesError::InvalidChangeConfig);
+    }
+    normalize_required_text(
+        change.method_version.clone(),
+        TimeSeriesError::EmptyChangeMethodVersion,
+    )?;
+    let expected_len = usize::try_from(change.grid_columns)
+        .ok()
+        .and_then(|columns| {
+            usize::try_from(change.grid_rows)
+                .ok()
+                .and_then(|rows| columns.checked_mul(rows))
+        })
+        .ok_or(TimeSeriesError::InvalidRasterCellCount)?;
+    if change.change_mask.len() != expected_len || change.delta_values.len() != expected_len {
+        return Err(TimeSeriesError::InvalidRasterCellCount);
+    }
+    if change
+        .delta_values
+        .iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+    {
+        return Err(TimeSeriesError::InvalidRasterCellValue);
+    }
+    Ok(())
+}
+
+fn normalize_change_zone_polygon(
+    polygon: ChangeZonePolygon,
+    expected_crs: &str,
+) -> Result<ChangeZonePolygon, TimeSeriesError> {
+    let actual_crs = normalize_required_text(polygon.crs, TimeSeriesError::EmptyZoneCrs)?;
+    if actual_crs != expected_crs {
+        return Err(TimeSeriesError::ChangeZoneCrsMismatch {
+            expected_crs: expected_crs.to_string(),
+            actual_crs,
+        });
+    }
+    if polygon.rings.is_empty() || !polygon.rings.iter().all(valid_polygon_ring) {
+        return Err(TimeSeriesError::InvalidChangeZoneGeometry);
+    }
+
+    Ok(ChangeZonePolygon {
+        crs: expected_crs.to_string(),
+        rings: polygon.rings,
+    })
+}
+
+fn valid_polygon_ring(ring: &Vec<[f64; 2]>) -> bool {
+    ring.len() >= 4
+        && ring
+            .iter()
+            .all(|coordinate| coordinate[0].is_finite() && coordinate[1].is_finite())
+        && ring.first() == ring.last()
+}
+
 fn validate_change_alignment(
     guard_proof: &AlignmentGuardProof,
     evidence: &RasterAlignmentEvidence,
@@ -1834,14 +2130,15 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::{
         align_raster_pair, compute_aligned_raster_change, derive_ranked_change_events,
+        export_change_mask_geotiff, export_change_zones_geojson, export_series_csv,
         guard_coregisterable_pair, AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof,
-        AlignmentRefusalReason, ChangeEventConfig, ChangeEventDerivationInput,
-        ChangeEventDirection, ChangeEventReasonCode, GeoExtent, MetricDefinition, MetricKind,
-        RasterAlignmentConfig, RasterAlignmentEvidence, RasterChangeConfig, RasterChangeResult,
-        RasterResolution, RasterSeriesValue, RollingBaselineConfig, SeasonalComparisonConfig,
-        SeasonalComparisonTarget, SeriesPoint, SeriesProductIngest, SeriesQuery, SeriesValue,
-        TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore, TrendDirection,
-        ZonalTrendConfig, ZonalTrendTarget,
+        AlignmentRefusalReason, ChangeEvent, ChangeEventConfig, ChangeEventDerivationInput,
+        ChangeEventDirection, ChangeEventReasonCode, ChangeZoneExportFeature, ChangeZonePolygon,
+        GeoExtent, MetricDefinition, MetricKind, RasterAlignmentConfig, RasterAlignmentEvidence,
+        RasterChangeConfig, RasterChangeResult, RasterResolution, RasterSeriesValue,
+        RollingBaselineConfig, SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesPoint,
+        SeriesProductIngest, SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine,
+        TimeSeriesError, TimeSeriesStore, TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
     };
 
     #[test]
@@ -2904,6 +3201,80 @@ mod tests {
         assert!(refusal.alignment_proof_ref.is_none());
     }
 
+    #[test]
+    fn series_csv_export_carries_entity_metric_time_value_and_empty_header() {
+        let export = export_series_csv(&[
+            scalar_point("field:alpha", "ndvi_mean", "2026-06-10T10:00:00Z", 0.68),
+            scalar_point("field:alpha", "ndvi_mean", "2026-06-12T10:00:00Z", 0.72),
+        ])
+        .expect("series CSV should export");
+
+        assert_eq!(export.content_type, "text/csv");
+        assert!(export
+            .csv
+            .starts_with("entity_ref,metric,t,unit,value,source_ref,created_at\n"));
+        assert!(export.csv.contains(
+            "field:alpha,ndvi_mean,2026-06-10T10:00:00Z,index,0.68,source:field:alpha:ndvi_mean:2026-06-10T10:00:00Z,2026-06-12T12:00:00Z"
+        ));
+
+        let empty = export_series_csv(&[]).expect("empty series CSV should still export");
+        assert_eq!(
+            empty.csv,
+            "entity_ref,metric,t,unit,value,source_ref,created_at\n"
+        );
+    }
+
+    #[test]
+    fn change_mask_geotiff_export_preserves_aligned_grid_metadata() {
+        let change = sample_drop_change_result();
+
+        let export = export_change_mask_geotiff(&change).expect("change mask should export");
+
+        assert_eq!(export.content_type, "image/tiff");
+        assert_eq!(export.metadata.mask_raster_ref, "change:field-alpha:mask");
+        assert_eq!(export.metadata.crs, "EPSG:32610");
+        assert_eq!(export.metadata.extent, change.extent);
+        assert_eq!(export.metadata.resolution, change.resolution);
+        assert_eq!(export.metadata.grid_columns, change.grid_columns);
+        assert_eq!(export.metadata.grid_rows, change.grid_rows);
+        assert!(export
+            .bytes
+            .starts_with(b"AGBOT_TIMESERIES_GEOTIFF_METADATA\n"));
+    }
+
+    #[test]
+    fn change_zone_geojson_export_preserves_crs_properties_and_empty_result() {
+        let event = sample_change_event();
+        let export = export_change_zones_geojson(
+            vec![ChangeZoneExportFeature {
+                event: event.clone(),
+                geometry: sample_zone_polygon("EPSG:4326"),
+            }],
+            "EPSG:4326".to_string(),
+        )
+        .expect("change zones should export");
+
+        assert_eq!(export.content_type, "application/geo+json");
+        assert_eq!(export.feature_collection.geojson_type, "FeatureCollection");
+        assert_eq!(export.feature_collection.crs, "EPSG:4326");
+        assert_eq!(export.feature_collection.features.len(), 1);
+        let feature = &export.feature_collection.features[0];
+        assert_eq!(feature.geojson_type, "Feature");
+        assert_eq!(feature.geometry.geojson_type, "Polygon");
+        assert_eq!(feature.properties.zone_ref, "zone-ne");
+        assert_eq!(feature.properties.magnitude, event.magnitude);
+        assert_eq!(feature.properties.direction, ChangeEventDirection::Dropped);
+        assert_eq!(
+            feature.properties.reason_code,
+            ChangeEventReasonCode::BaselineDrop
+        );
+
+        let empty = export_change_zones_geojson(Vec::new(), "EPSG:4326".to_string())
+            .expect("empty change-zone export should be valid");
+        assert_eq!(empty.feature_collection.features.len(), 0);
+        assert_eq!(empty.feature_collection.crs, "EPSG:4326");
+    }
+
     fn scalar_point(entity_ref: &str, metric: &str, t: &str, value: f64) -> SeriesPoint {
         scalar_point_with_unit(entity_ref, metric, "index", t, value)
     }
@@ -3014,6 +3385,37 @@ mod tests {
             "change:field-alpha:mask".to_string(),
         )
         .expect("sample drop should produce change result")
+    }
+
+    fn sample_change_event() -> ChangeEvent {
+        ChangeEvent {
+            zone_ref: "zone-ne".to_string(),
+            metric: "ndvi_mean".to_string(),
+            magnitude: 0.18,
+            direction: ChangeEventDirection::Dropped,
+            since_date: "2026-06-01T10:00:00Z".to_string(),
+            reason_code: ChangeEventReasonCode::BaselineDrop,
+            changed_cell_count: 3,
+            severity_score: 0.54,
+            evidence_refs: vec![
+                "alignment:alpha:ndvi".to_string(),
+                "change:field-alpha:mask".to_string(),
+            ],
+            summary: "ndvi_mean dropped 0.18 in zone-ne since 2026-06-01T10:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_zone_polygon(crs: &str) -> ChangeZonePolygon {
+        ChangeZonePolygon {
+            crs: crs.to_string(),
+            rings: vec![vec![
+                [-121.50, 38.50],
+                [-121.40, 38.50],
+                [-121.40, 38.60],
+                [-121.50, 38.60],
+                [-121.50, 38.50],
+            ]],
+        }
     }
 
     fn sample_product_ingest(
