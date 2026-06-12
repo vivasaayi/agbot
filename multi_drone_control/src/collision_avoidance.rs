@@ -70,8 +70,17 @@ pub struct AvoidanceManeuver {
     pub start_time: DateTime<Utc>,
     pub estimated_duration: std::time::Duration,
     pub target_position: Option<Position3D>,
+    pub separation_verification: Option<SeparationVerification>,
     pub priority: u8,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeparationVerification {
+    pub pre_maneuver_distance_m: f64,
+    pub post_maneuver_distance_m: f64,
+    pub minimum_required_m: f64,
+    pub verified: bool,
 }
 
 impl CollisionAvoidanceSystem {
@@ -298,22 +307,51 @@ impl CollisionAvoidanceSystem {
     async fn plan_avoidance_maneuver(
         &mut self,
         drone_id: Uuid,
-        _conflicting_drone_id: Uuid,
+        conflicting_drone_id: Uuid,
     ) -> Result<()> {
+        let drone = self
+            .tracked_drones
+            .get(&drone_id)
+            .ok_or_else(|| anyhow::anyhow!("Drone not found: {}", drone_id))?
+            .clone();
+        let conflicting_drone = self
+            .tracked_drones
+            .get(&conflicting_drone_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Conflicting drone not found: {}", conflicting_drone_id)
+            })?
+            .clone();
+        let current_distance =
+            self.calculate_3d_distance(&drone.position, &conflicting_drone.position);
+
         // Find appropriate avoidance rule
         let applicable_rule = self
             .avoidance_rules
             .iter()
-            .filter(|rule| rule.enabled)
+            .filter(|rule| rule.enabled && current_distance <= rule.trigger_distance)
             .min_by_key(|rule| rule.priority)
-            .cloned();
+            .cloned()
+            .or_else(|| {
+                self.avoidance_rules
+                    .iter()
+                    .filter(|rule| rule.enabled)
+                    .max_by(|left, right| {
+                        left.trigger_distance
+                            .partial_cmp(&right.trigger_distance)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .cloned()
+            });
 
         if let Some(rule) = applicable_rule {
+            let (maneuver_type, target_position, verification) =
+                self.plan_verified_target(&rule.maneuver_type, &drone, &conflicting_drone);
             let maneuver = AvoidanceManeuver {
-                maneuver_type: rule.maneuver_type.clone(),
+                maneuver_type,
                 start_time: Utc::now(),
                 estimated_duration: std::time::Duration::from_secs(30),
-                target_position: None, // TODO: Calculate target position
+                target_position,
+                separation_verification: Some(verification),
                 priority: rule.priority,
                 reason: format!("Collision avoidance: {}", rule.name),
             };
@@ -325,6 +363,194 @@ impl CollisionAvoidanceSystem {
         }
 
         Ok(())
+    }
+
+    fn plan_verified_target(
+        &self,
+        maneuver_type: &ManeuverType,
+        drone: &DroneTrackingInfo,
+        conflicting_drone: &DroneTrackingInfo,
+    ) -> (ManeuverType, Option<Position3D>, SeparationVerification) {
+        let pre_distance = self.calculate_3d_distance(&drone.position, &conflicting_drone.position);
+
+        if matches!(
+            maneuver_type,
+            ManeuverType::EmergencyStop | ManeuverType::Hover
+        ) && pre_distance < self.min_separation_distance
+        {
+            return (
+                ManeuverType::EmergencyStop,
+                None,
+                self.verify_target(pre_distance, None, conflicting_drone),
+            );
+        }
+
+        let mut candidate =
+            self.candidate_target_for_maneuver(maneuver_type, drone, conflicting_drone);
+        let mut verification =
+            self.verify_target(pre_distance, candidate.as_ref(), conflicting_drone);
+
+        if !verification.verified {
+            candidate = Some(self.safe_altitude_target(drone, conflicting_drone));
+            verification = self.verify_target(pre_distance, candidate.as_ref(), conflicting_drone);
+        }
+
+        if !verification.verified {
+            candidate = Some(self.safe_horizontal_target(drone, conflicting_drone, 0.0, 0.0));
+            verification = self.verify_target(pre_distance, candidate.as_ref(), conflicting_drone);
+        }
+
+        if verification.verified {
+            (maneuver_type.clone(), candidate, verification)
+        } else {
+            (
+                ManeuverType::EmergencyStop,
+                None,
+                self.verify_target(pre_distance, None, conflicting_drone),
+            )
+        }
+    }
+
+    fn candidate_target_for_maneuver(
+        &self,
+        maneuver_type: &ManeuverType,
+        drone: &DroneTrackingInfo,
+        conflicting_drone: &DroneTrackingInfo,
+    ) -> Option<Position3D> {
+        match maneuver_type {
+            ManeuverType::AltitudeChange { delta } => {
+                Some(self.safe_altitude_target_with_delta(drone, conflicting_drone, *delta))
+            }
+            ManeuverType::HorizontalDeviation {
+                angle_deg,
+                distance,
+            } => Some(self.safe_horizontal_target(drone, conflicting_drone, *angle_deg, *distance)),
+            ManeuverType::SpeedReduction { factor } => {
+                Some(self.speed_reduction_target(drone, *factor))
+            }
+            ManeuverType::EmergencyStop | ManeuverType::Hover | ManeuverType::ReturnToBase => {
+                Some(drone.position.clone())
+            }
+        }
+    }
+
+    fn verify_target(
+        &self,
+        pre_distance: f64,
+        target: Option<&Position3D>,
+        conflicting_drone: &DroneTrackingInfo,
+    ) -> SeparationVerification {
+        let post_distance = target
+            .map(|target| self.calculate_3d_distance(target, &conflicting_drone.position))
+            .unwrap_or(pre_distance);
+
+        SeparationVerification {
+            pre_maneuver_distance_m: pre_distance,
+            post_maneuver_distance_m: post_distance,
+            minimum_required_m: self.min_separation_distance,
+            verified: post_distance >= self.min_separation_distance,
+        }
+    }
+
+    fn safe_altitude_target(
+        &self,
+        drone: &DroneTrackingInfo,
+        conflicting_drone: &DroneTrackingInfo,
+    ) -> Position3D {
+        self.safe_altitude_target_with_delta(drone, conflicting_drone, 0.0)
+    }
+
+    fn safe_altitude_target_with_delta(
+        &self,
+        drone: &DroneTrackingInfo,
+        conflicting_drone: &DroneTrackingInfo,
+        requested_delta: f32,
+    ) -> Position3D {
+        let horizontal_distance =
+            self.calculate_horizontal_distance_m(&drone.position, &conflicting_drone.position);
+        let required_vertical = if horizontal_distance >= self.min_separation_distance {
+            requested_delta.abs() as f64
+        } else {
+            (self.min_separation_distance.powi(2) - horizontal_distance.powi(2)).sqrt() + 1.0
+        };
+        let altitude_delta = requested_delta.abs().max(required_vertical as f32).max(1.0);
+        let sign = if drone.position.altitude_m >= conflicting_drone.position.altitude_m {
+            1.0
+        } else {
+            -1.0
+        };
+
+        let mut target = drone.position.clone();
+        target.altitude_m += sign * altitude_delta;
+        target
+    }
+
+    fn safe_horizontal_target(
+        &self,
+        drone: &DroneTrackingInfo,
+        conflicting_drone: &DroneTrackingInfo,
+        angle_deg: f32,
+        requested_distance: f32,
+    ) -> Position3D {
+        let (east_m, north_m) =
+            self.horizontal_vector_m(&conflicting_drone.position, &drone.position);
+        let norm = (east_m.powi(2) + north_m.powi(2)).sqrt();
+        let (unit_east, unit_north) = if norm > f64::EPSILON {
+            (east_m / norm, north_m / norm)
+        } else {
+            let angle = (angle_deg as f64).to_radians();
+            (angle.sin(), angle.cos())
+        };
+        let required_distance =
+            requested_distance.max((self.min_separation_distance + 1.0) as f32) as f64;
+
+        self.offset_position_m(
+            &drone.position,
+            unit_east * required_distance,
+            unit_north * required_distance,
+            0.0,
+        )
+    }
+
+    fn speed_reduction_target(&self, drone: &DroneTrackingInfo, factor: f32) -> Position3D {
+        self.offset_position_m(
+            &drone.position,
+            drone.velocity.vx as f64 * factor as f64,
+            drone.velocity.vy as f64 * factor as f64,
+            drone.velocity.vz * factor,
+        )
+    }
+
+    fn calculate_horizontal_distance_m(&self, pos1: &Position3D, pos2: &Position3D) -> f64 {
+        let (east_m, north_m) = self.horizontal_vector_m(pos1, pos2);
+        (east_m.powi(2) + north_m.powi(2)).sqrt()
+    }
+
+    fn horizontal_vector_m(&self, from: &Position3D, to: &Position3D) -> (f64, f64) {
+        let mean_lat_rad = ((from.latitude + to.latitude) / 2.0).to_radians();
+        let meters_per_lat_degree = 111_111.0;
+        let meters_per_lon_degree = (111_111.0 * mean_lat_rad.cos().abs()).max(1.0);
+        (
+            (to.longitude - from.longitude) * meters_per_lon_degree,
+            (to.latitude - from.latitude) * meters_per_lat_degree,
+        )
+    }
+
+    fn offset_position_m(
+        &self,
+        position: &Position3D,
+        east_m: f64,
+        north_m: f64,
+        altitude_delta_m: f32,
+    ) -> Position3D {
+        let lat_rad = position.latitude.to_radians();
+        let meters_per_lat_degree = 111_111.0;
+        let meters_per_lon_degree = (111_111.0 * lat_rad.cos().abs()).max(1.0);
+        Position3D {
+            latitude: position.latitude + north_m / meters_per_lat_degree,
+            longitude: position.longitude + east_m / meters_per_lon_degree,
+            altitude_m: position.altitude_m + altitude_delta_m,
+        }
     }
 
     pub async fn get_avoidance_command(&self, drone_id: Uuid) -> Result<Option<AvoidanceCommand>> {
@@ -526,5 +752,125 @@ mod tests {
 
         let distance = system.calculate_3d_distance(&pos1, &pos2);
         assert!((distance - 5.0).abs() < 0.1); // Should be 5m (3-4-5 triangle)
+    }
+
+    #[tokio::test]
+    async fn converging_close_approach_plans_target_and_verifies_minimum_separation() {
+        let mut system = CollisionAvoidanceSystem::new();
+        let drone1_id = Uuid::new_v4();
+        let drone2_id = Uuid::new_v4();
+        let thirty_meters_lat_deg = (30.0_f64 / 6_371_000.0).to_degrees();
+        let pos1 = Position3D {
+            latitude: 0.0,
+            longitude: 0.0,
+            altitude_m: 100.0,
+        };
+        let pos2 = Position3D {
+            latitude: thirty_meters_lat_deg,
+            longitude: 0.0,
+            altitude_m: 100.0,
+        };
+
+        system
+            .register_drone(drone1_id, pos1.clone())
+            .await
+            .unwrap();
+        system
+            .register_drone(drone2_id, pos2.clone())
+            .await
+            .unwrap();
+        system
+            .update_drone_state(
+                drone1_id,
+                pos1,
+                Velocity3D {
+                    vx: 0.0,
+                    vy: 5.0,
+                    vz: 0.0,
+                    speed: 5.0,
+                },
+                0.0,
+            )
+            .await
+            .unwrap();
+        system
+            .update_drone_state(
+                drone2_id,
+                pos2,
+                Velocity3D {
+                    vx: 0.0,
+                    vy: -5.0,
+                    vz: 0.0,
+                    speed: 5.0,
+                },
+                180.0,
+            )
+            .await
+            .unwrap();
+
+        let maneuver = system
+            .tracked_drones
+            .values()
+            .filter_map(|tracking| tracking.avoidance_maneuver.as_ref())
+            .find(|maneuver| maneuver.target_position.is_some())
+            .expect("close approach should produce a safe maneuver target");
+        let verification = maneuver
+            .separation_verification
+            .as_ref()
+            .expect("maneuver should record separation verification");
+
+        assert!(maneuver.target_position.is_some());
+        assert!(verification.verified);
+        assert!(verification.post_maneuver_distance_m >= verification.minimum_required_m);
+    }
+
+    #[tokio::test]
+    async fn unresolved_overlap_escalates_without_returning_unsafe_target() {
+        let mut system = CollisionAvoidanceSystem::new();
+        let drone1_id = Uuid::new_v4();
+        let drone2_id = Uuid::new_v4();
+        let shared_pos = Position3D {
+            latitude: 0.0,
+            longitude: 0.0,
+            altitude_m: 100.0,
+        };
+        let stationary = Velocity3D {
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            speed: 0.0,
+        };
+
+        system
+            .register_drone(drone1_id, shared_pos.clone())
+            .await
+            .unwrap();
+        system
+            .register_drone(drone2_id, shared_pos.clone())
+            .await
+            .unwrap();
+        system
+            .update_drone_state(drone1_id, shared_pos.clone(), stationary.clone(), 0.0)
+            .await
+            .unwrap();
+        system
+            .update_drone_state(drone2_id, shared_pos, stationary, 0.0)
+            .await
+            .unwrap();
+
+        let maneuver = system
+            .tracked_drones
+            .values()
+            .filter_map(|tracking| tracking.avoidance_maneuver.as_ref())
+            .find(|maneuver| matches!(maneuver.maneuver_type, ManeuverType::EmergencyStop))
+            .expect("unresolved overlap should escalate to emergency stop");
+        let verification = maneuver
+            .separation_verification
+            .as_ref()
+            .expect("emergency escalation should record failed verification");
+
+        assert!(maneuver.target_position.is_none());
+        assert!(!verification.verified);
+        assert!(verification.post_maneuver_distance_m < verification.minimum_required_m);
     }
 }
