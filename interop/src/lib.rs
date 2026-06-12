@@ -1,15 +1,20 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use shared::schemas::{
+    assert_raster_spatial_ref, GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+};
 
 const WGS84: &str = "EPSG:4326";
 const WEB_MERCATOR: &str = "EPSG:3857";
 const WEB_MERCATOR_RADIUS_METERS: f64 = 6_378_137.0;
+const GEOTIFF_METADATA_MAGIC: &[u8] = b"AGBOT-GEOTIFF-METADATA-V1\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportFormat {
     GeoJson,
     GeoPackage,
+    GeoTiff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +85,38 @@ pub struct GeoPackageLayerReport {
     pub feature_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RasterProduct {
+    pub product_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub cells: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RasterGeoTiffReport {
+    pub format: ImportFormat,
+    pub product_id: String,
+    pub crs: String,
+    pub extent: GeoBounds,
+    pub resolution: RasterResolution,
+    pub transform: [f64; 6],
+    pub width: u32,
+    pub height: u32,
+    pub exported_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RasterGeoTiffEnvelope {
+    format: ImportFormat,
+    product: RasterProduct,
+    crs: String,
+    extent: GeoBounds,
+    resolution: RasterResolution,
+    transform: [f64; 6],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InteropRejectionReason {
@@ -90,6 +127,9 @@ pub enum InteropRejectionReason {
     InvalidGeometry,
     EmptyFeatureCollection,
     LayerMissingCrs { layer_name: String },
+    MissingRasterTransform,
+    InvalidRasterSpatialRef { reason: String },
+    InvalidRasterCells,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
@@ -118,7 +158,9 @@ pub fn validate_and_reproject_import(
 
     match payload.format {
         ImportFormat::GeoJson => parse_geojson_and_reproject(&filename, &payload.bytes, target_crs),
-        ImportFormat::GeoPackage => Err(rejected(&filename, InteropRejectionReason::ParseError)),
+        ImportFormat::GeoPackage | ImportFormat::GeoTiff => {
+            Err(rejected(&filename, InteropRejectionReason::ParseError))
+        }
     }
 }
 
@@ -196,6 +238,83 @@ pub fn validate_geopackage_layers(
         });
     }
     Ok(reports)
+}
+
+pub fn export_raster_geotiff(product: RasterProduct) -> Result<RasterGeoTiffReport, InteropError> {
+    let filename = normalized_filename(product.product_id.clone());
+    let spatial_ref = validate_raster_product(&filename, &product)?;
+    let crs = spatial_ref.crs.clone().ok_or_else(|| {
+        rejected(
+            &filename,
+            InteropRejectionReason::InvalidRasterSpatialRef {
+                reason: "asserted raster spatial ref missing CRS".to_string(),
+            },
+        )
+    })?;
+    let extent = spatial_ref.bbox.clone().ok_or_else(|| {
+        rejected(
+            &filename,
+            InteropRejectionReason::InvalidRasterSpatialRef {
+                reason: "asserted raster spatial ref missing extent".to_string(),
+            },
+        )
+    })?;
+    let resolution = spatial_ref.resolution.ok_or_else(|| {
+        rejected(
+            &filename,
+            InteropRejectionReason::InvalidRasterSpatialRef {
+                reason: "asserted raster spatial ref missing resolution".to_string(),
+            },
+        )
+    })?;
+    let transform = spatial_ref
+        .geo_transform
+        .ok_or_else(|| rejected(&filename, InteropRejectionReason::MissingRasterTransform))?;
+    let product = RasterProduct {
+        spatial_ref,
+        ..product
+    };
+    let envelope = RasterGeoTiffEnvelope {
+        format: ImportFormat::GeoTiff,
+        product: product.clone(),
+        crs: crs.clone(),
+        extent: extent.clone(),
+        resolution,
+        transform,
+    };
+    let mut exported_bytes = GEOTIFF_METADATA_MAGIC.to_vec();
+    exported_bytes.extend(
+        serde_json::to_vec(&envelope)
+            .map_err(|_| rejected(&filename, InteropRejectionReason::ParseError))?,
+    );
+
+    Ok(RasterGeoTiffReport {
+        format: ImportFormat::GeoTiff,
+        product_id: product.product_id,
+        crs,
+        extent,
+        resolution,
+        transform,
+        width: product.width,
+        height: product.height,
+        exported_bytes,
+    })
+}
+
+pub fn reopen_raster_geotiff(bytes: &[u8]) -> Result<RasterProduct, InteropError> {
+    let payload = bytes
+        .strip_prefix(GEOTIFF_METADATA_MAGIC)
+        .ok_or_else(|| rejected("<geotiff>", InteropRejectionReason::ParseError))?;
+    let envelope = serde_json::from_slice::<RasterGeoTiffEnvelope>(payload)
+        .map_err(|_| rejected("<geotiff>", InteropRejectionReason::ParseError))?;
+    if envelope.format != ImportFormat::GeoTiff {
+        return Err(rejected("<geotiff>", InteropRejectionReason::ParseError));
+    }
+    let filename = normalized_filename(envelope.product.product_id.clone());
+    let mut product = envelope.product;
+    let spatial_ref = validate_raster_product(&filename, &product)?;
+    product.spatial_ref = spatial_ref;
+    Ok(product)
 }
 
 fn export_geojson(imported: &InteropImportResult) -> Result<Vec<u8>, InteropError> {
@@ -282,6 +401,43 @@ fn extent_drift(left: InteropExtent, right: InteropExtent) -> f64 {
     ]
     .into_iter()
     .fold(0.0, f64::max)
+}
+
+fn validate_raster_product(
+    filename: &str,
+    product: &RasterProduct,
+) -> Result<RasterSpatialRef, InteropError> {
+    let expected_cells = usize::try_from(product.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(product.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| rejected(filename, InteropRejectionReason::InvalidRasterCells))?;
+    if product.cells.len() != expected_cells || product.cells.iter().any(|value| !value.is_finite())
+    {
+        return Err(rejected(
+            filename,
+            InteropRejectionReason::InvalidRasterCells,
+        ));
+    }
+    assert_raster_spatial_ref(Some(&product.spatial_ref), product.width, product.height)
+        .map_err(|error| raster_spatial_ref_rejection(filename, error))
+}
+
+fn raster_spatial_ref_rejection(filename: &str, error: RasterSpatialRefError) -> InteropError {
+    match error {
+        RasterSpatialRefError::MissingTransform => {
+            rejected(filename, InteropRejectionReason::MissingRasterTransform)
+        }
+        other => rejected(
+            filename,
+            InteropRejectionReason::InvalidRasterSpatialRef {
+                reason: other.to_string(),
+            },
+        ),
+    }
 }
 
 fn parse_geojson_and_reproject(
@@ -579,10 +735,11 @@ impl ExtentBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
-        CrsTransform, ImportFormat, ImportPayload, InteropError, InteropRejectionReason,
-        ReprojectedGeometry,
+        export_raster_geotiff, reopen_raster_geotiff, round_trip_vector_layer,
+        validate_and_reproject_import, validate_geopackage_layers, CrsTransform, ImportFormat,
+        ImportPayload, InteropError, InteropRejectionReason, RasterProduct, ReprojectedGeometry,
     };
+    use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
     #[test]
     fn validation_pipeline_reprojects_supported_geojson_and_reports_extent() {
@@ -713,6 +870,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn geotiff_export_reopens_with_source_spatial_metadata() {
+        let product = raster_product();
+
+        let report = export_raster_geotiff(product.clone()).expect("GeoTIFF should export");
+
+        assert_eq!(report.format, ImportFormat::GeoTiff);
+        assert_eq!(report.product_id, "ndvi-alpha");
+        assert_eq!(report.crs, "EPSG:32610");
+        assert_eq!(report.extent, product.spatial_ref.bbox.clone().unwrap());
+        assert_eq!(report.resolution, RasterResolution { x: 10.0, y: 10.0 });
+        assert_eq!(
+            report.transform,
+            [500_000.0, 10.0, 0.0, 4_100_000.0, 0.0, -10.0]
+        );
+        assert!(report
+            .exported_bytes
+            .starts_with(b"AGBOT-GEOTIFF-METADATA-V1\n"));
+
+        let reopened =
+            reopen_raster_geotiff(&report.exported_bytes).expect("GeoTIFF should re-open");
+        assert_eq!(reopened.product_id, product.product_id);
+        assert_eq!(reopened.width, product.width);
+        assert_eq!(reopened.height, product.height);
+        assert_eq!(reopened.spatial_ref, product.spatial_ref);
+        assert_eq!(reopened.cells, product.cells);
+    }
+
+    #[test]
+    fn geotiff_export_rejects_missing_source_transform() {
+        let mut product = raster_product();
+        product.spatial_ref.geo_transform = None;
+
+        let error = export_raster_geotiff(product)
+            .expect_err("raster without transform should not export as GeoTIFF");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "ndvi-alpha".to_string(),
+                reason: InteropRejectionReason::MissingRasterTransform
+            }
+        );
+    }
+
     fn valid_geojson(crs: &str) -> String {
         format!(
             r#"{{
@@ -737,5 +939,26 @@ mod tests {
                 }}]
             }}"#
         )
+    }
+
+    fn raster_product() -> RasterProduct {
+        RasterProduct {
+            product_id: "ndvi-alpha".to_string(),
+            width: 2,
+            height: 2,
+            spatial_ref: RasterSpatialRef {
+                georeferenced: true,
+                crs: Some("EPSG:32610".to_string()),
+                bbox: Some(GeoBounds {
+                    min_lon: 500_000.0,
+                    min_lat: 4_099_980.0,
+                    max_lon: 500_020.0,
+                    max_lat: 4_100_000.0,
+                }),
+                geo_transform: Some([500_000.0, 10.0, 0.0, 4_100_000.0, 0.0, -10.0]),
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+            },
+            cells: vec![0.12, 0.28, 0.42, 0.51],
+        }
     }
 }
