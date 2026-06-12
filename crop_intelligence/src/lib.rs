@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef, RasterSpatialRefError};
+use shared::schemas::{
+    assert_raster_spatial_ref, GeoBounds, RasterSpatialRef, RasterSpatialRefError,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +225,44 @@ pub struct CanopyCoverReport {
     pub zones: Vec<ZoneCanopyCover>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DiseaseDetectionConfig {
+    pub low_confidence_threshold: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiseaseLesionCandidate {
+    pub tile_id: String,
+    pub confidence: f64,
+    pub bbox: GeoBounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetectionZoneGeometry {
+    pub crs: String,
+    pub bbox: GeoBounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiseaseLesionDetection {
+    pub detection_id: String,
+    pub confidence: f64,
+    pub low_confidence: bool,
+    pub evidence_tile_ref: String,
+    pub zone_geometry: DetectionZoneGeometry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiseaseDetectionReport {
+    pub field_id: String,
+    pub crs: String,
+    pub generated_at: String,
+    pub model: ModelGateResponse,
+    pub deterministic_cover_valid_pixels: usize,
+    pub low_confidence_count: usize,
+    pub detections: Vec<DiseaseLesionDetection>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CropModelRegistryError {
     #[error("model_id cannot be empty")]
@@ -289,6 +329,35 @@ pub enum CanopyCoverError {
         expected: String,
         actual: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DiseaseDetectionError {
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("deterministic canopy cover is required before disease detection")]
+    DeterministicCoverRequired,
+    #[error("disease model gate failed: {source}")]
+    ModelGate {
+        #[source]
+        source: CropModelRegistryError,
+    },
+    #[error("low_confidence_threshold must be finite and between 0 and 1")]
+    InvalidThreshold,
+    #[error("tile_id cannot be empty")]
+    EmptyTileId,
+    #[error("candidate on tile {tile_id} has invalid confidence")]
+    InvalidConfidence { tile_id: String },
+    #[error("candidate on tile {tile_id} has invalid zone geometry")]
+    InvalidZoneGeometry { tile_id: String },
+    #[error("candidate references tile {tile_id} without deterministic cover evidence")]
+    MissingCoverTile { tile_id: String },
+    #[error("cover report field {actual} does not match requested field {expected}")]
+    CoverFieldMismatch { expected: String, actual: String },
+    #[error("candidate on tile {tile_id} falls outside the deterministic cover tile extent")]
+    ZoneOutsideTileExtent { tile_id: String },
 }
 
 pub fn build_model_version_record(
@@ -473,6 +542,95 @@ pub fn run_canopy_cover(
         cover_fraction: cover_fraction(vegetation_pixels, valid_pixels),
         tiles: tile_reports,
         zones,
+    })
+}
+
+pub fn run_disease_lesion_detection(
+    field_id: String,
+    model: InferenceModelReference,
+    model_registered: bool,
+    deterministic_cover: Option<&CanopyCoverReport>,
+    candidates: Vec<DiseaseLesionCandidate>,
+    config: DiseaseDetectionConfig,
+    generated_at: String,
+) -> Result<DiseaseDetectionReport, DiseaseDetectionError> {
+    let field_id = normalize_disease_text(field_id, DiseaseDetectionError::EmptyFieldId)?;
+    let generated_at =
+        normalize_disease_text(generated_at, DiseaseDetectionError::EmptyGeneratedAt)?;
+    if !is_unit_fraction(config.low_confidence_threshold) {
+        return Err(DiseaseDetectionError::InvalidThreshold);
+    }
+    let model = validate_model_reference(model, model_registered)
+        .map_err(|source| DiseaseDetectionError::ModelGate { source })?;
+    let cover = deterministic_cover.ok_or(DiseaseDetectionError::DeterministicCoverRequired)?;
+    if cover.field_id != field_id {
+        return Err(DiseaseDetectionError::CoverFieldMismatch {
+            expected: field_id,
+            actual: cover.field_id.clone(),
+        });
+    }
+
+    let cover_tiles = cover
+        .tiles
+        .iter()
+        .map(|tile| (tile.tile_id.as_str(), tile))
+        .collect::<BTreeMap<_, _>>();
+    let mut detections = Vec::new();
+    let mut tile_detection_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for candidate in candidates {
+        let tile_id = normalize_disease_text(
+            candidate.tile_id.clone(),
+            DiseaseDetectionError::EmptyTileId,
+        )?;
+        if !is_unit_fraction(candidate.confidence) {
+            return Err(DiseaseDetectionError::InvalidConfidence { tile_id });
+        }
+        let cover_tile = cover_tiles.get(tile_id.as_str()).ok_or_else(|| {
+            DiseaseDetectionError::MissingCoverTile {
+                tile_id: tile_id.clone(),
+            }
+        })?;
+        let tile_bbox = cover_tile.spatial_ref.bbox.as_ref().ok_or_else(|| {
+            DiseaseDetectionError::MissingCoverTile {
+                tile_id: tile_id.clone(),
+            }
+        })?;
+        if !valid_bbox(&candidate.bbox) {
+            return Err(DiseaseDetectionError::InvalidZoneGeometry { tile_id });
+        }
+        if !bbox_within(&candidate.bbox, tile_bbox) {
+            return Err(DiseaseDetectionError::ZoneOutsideTileExtent { tile_id });
+        }
+
+        let sequence = tile_detection_counts.entry(tile_id.clone()).or_insert(0);
+        *sequence += 1;
+        detections.push(DiseaseLesionDetection {
+            detection_id: format!("disease:{tile_id}:{}", *sequence),
+            confidence: candidate.confidence,
+            low_confidence: candidate.confidence < config.low_confidence_threshold,
+            evidence_tile_ref: tile_id,
+            zone_geometry: DetectionZoneGeometry {
+                crs: cover.crs.clone(),
+                bbox: candidate.bbox,
+            },
+        });
+    }
+
+    detections.sort_by(|left, right| left.detection_id.cmp(&right.detection_id));
+    let low_confidence_count = detections
+        .iter()
+        .filter(|detection| detection.low_confidence)
+        .count();
+
+    Ok(DiseaseDetectionReport {
+        field_id,
+        crs: cover.crs.clone(),
+        generated_at,
+        model,
+        deterministic_cover_valid_pixels: cover.valid_pixels,
+        low_confidence_count,
+        detections,
     })
 }
 
@@ -765,6 +923,39 @@ fn cover_fraction(vegetation_pixels: usize, valid_pixels: usize) -> f64 {
     }
 }
 
+fn normalize_disease_text(
+    value: String,
+    error: DiseaseDetectionError,
+) -> Result<String, DiseaseDetectionError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn is_unit_fraction(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+fn valid_bbox(bbox: &GeoBounds) -> bool {
+    bbox.min_lon.is_finite()
+        && bbox.min_lat.is_finite()
+        && bbox.max_lon.is_finite()
+        && bbox.max_lat.is_finite()
+        && bbox.max_lon > bbox.min_lon
+        && bbox.max_lat > bbox.min_lat
+}
+
+fn bbox_within(inner: &GeoBounds, outer: &GeoBounds) -> bool {
+    const TOLERANCE: f64 = 1.0e-9;
+    inner.min_lon + TOLERANCE >= outer.min_lon
+        && inner.min_lat + TOLERANCE >= outer.min_lat
+        && inner.max_lon <= outer.max_lon + TOLERANCE
+        && inner.max_lat <= outer.max_lat + TOLERANCE
+}
+
 fn density_per_ha(count: usize, area_m2: f64) -> f64 {
     if area_m2 > 0.0 {
         count as f64 / (area_m2 / 10_000.0)
@@ -776,10 +967,11 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_model_version_record, run_canopy_cover, run_stand_count, validate_model_reference,
-        CanopyCoverConfig, CanopyCoverError, CanopyCoverTile, CropModelRegistryError,
-        CropModelTask, InferenceModelReference, ModelVersionRegistrationRequest, PlantCountConfig,
-        PlantCountTile, PlantCountZeroReason,
+        build_model_version_record, run_canopy_cover, run_disease_lesion_detection,
+        run_stand_count, validate_model_reference, CanopyCoverConfig, CanopyCoverError,
+        CanopyCoverTile, CropModelRegistryError, CropModelTask, DiseaseDetectionConfig,
+        DiseaseDetectionError, DiseaseLesionCandidate, InferenceModelReference,
+        ModelVersionRegistrationRequest, PlantCountConfig, PlantCountTile, PlantCountZeroReason,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -1046,6 +1238,109 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn disease_detection_returns_confidence_evidence_and_bounded_zone() {
+        let cover = cover_report();
+        let report = run_disease_lesion_detection(
+            "field-1".to_string(),
+            registered_model(),
+            true,
+            Some(&cover),
+            vec![lesion_candidate(
+                "tile-1",
+                0.82,
+                GeoBounds {
+                    min_lon: 5.0,
+                    min_lat: 5.0,
+                    max_lon: 15.0,
+                    max_lat: 15.0,
+                },
+            )],
+            DiseaseDetectionConfig {
+                low_confidence_threshold: 0.7,
+            },
+            "2026-06-01T12:15:00Z".to_string(),
+        )
+        .expect("disease detection should run");
+
+        assert_eq!(report.field_id, "field-1");
+        assert_eq!(report.crs, "EPSG:32614");
+        assert_eq!(report.model.model_id, "lesion-detector");
+        assert_eq!(report.deterministic_cover_valid_pixels, cover.valid_pixels);
+        assert_eq!(report.detections.len(), 1);
+        let detection = &report.detections[0];
+        assert_eq!(detection.evidence_tile_ref, "tile-1");
+        assert_eq!(detection.confidence, 0.82);
+        assert!(!detection.low_confidence);
+        assert_eq!(detection.zone_geometry.crs, "EPSG:32614");
+        assert_eq!(
+            detection.zone_geometry.bbox,
+            GeoBounds {
+                min_lon: 5.0,
+                min_lat: 5.0,
+                max_lon: 15.0,
+                max_lat: 15.0,
+            }
+        );
+    }
+
+    #[test]
+    fn disease_detection_marks_low_confidence_without_hiding_detection() {
+        let cover = cover_report();
+        let report = run_disease_lesion_detection(
+            "field-1".to_string(),
+            registered_model(),
+            true,
+            Some(&cover),
+            vec![lesion_candidate(
+                "tile-1",
+                0.42,
+                GeoBounds {
+                    min_lon: 5.0,
+                    min_lat: 5.0,
+                    max_lon: 15.0,
+                    max_lat: 15.0,
+                },
+            )],
+            DiseaseDetectionConfig {
+                low_confidence_threshold: 0.7,
+            },
+            "2026-06-01T12:15:00Z".to_string(),
+        )
+        .expect("low-confidence detection should be retained");
+
+        assert_eq!(report.detections.len(), 1);
+        assert_eq!(report.low_confidence_count, 1);
+        assert!(report.detections[0].low_confidence);
+    }
+
+    #[test]
+    fn disease_detection_refuses_to_run_without_deterministic_cover() {
+        let error = run_disease_lesion_detection(
+            "field-1".to_string(),
+            registered_model(),
+            true,
+            None,
+            vec![lesion_candidate(
+                "tile-1",
+                0.82,
+                GeoBounds {
+                    min_lon: 5.0,
+                    min_lat: 5.0,
+                    max_lon: 15.0,
+                    max_lat: 15.0,
+                },
+            )],
+            DiseaseDetectionConfig {
+                low_confidence_threshold: 0.7,
+            },
+            "2026-06-01T12:15:00Z".to_string(),
+        )
+        .expect_err("deterministic cover is required");
+
+        assert_eq!(error, DiseaseDetectionError::DeterministicCoverRequired);
+    }
+
     fn plant_tile(
         tile_id: &str,
         zone_id: Option<&str>,
@@ -1082,6 +1377,40 @@ mod tests {
             spatial_ref: spatial_ref(width_px, height_px),
             index_values,
             valid_mask,
+        }
+    }
+
+    fn cover_report() -> super::CanopyCoverReport {
+        run_canopy_cover(
+            "field-1".to_string(),
+            vec![canopy_tile(
+                "tile-1",
+                Some("zone-a"),
+                3,
+                2,
+                vec![0.7, 0.2, 0.5, 0.1, 0.8, 0.4],
+                vec![true; 6],
+            )],
+            CanopyCoverConfig {
+                vegetation_index_threshold: 0.5,
+            },
+            "2026-06-01T12:10:00Z".to_string(),
+        )
+        .expect("cover report should be valid")
+    }
+
+    fn registered_model() -> InferenceModelReference {
+        InferenceModelReference {
+            model_id: "lesion-detector".to_string(),
+            version: "2026.06.1".to_string(),
+        }
+    }
+
+    fn lesion_candidate(tile_id: &str, confidence: f64, bbox: GeoBounds) -> DiseaseLesionCandidate {
+        DiseaseLesionCandidate {
+            tile_id: tile_id.to_string(),
+            confidence,
+            bbox,
         }
     }
 
