@@ -2,22 +2,20 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 02f2123f253bd7116303aa35a0a9fddbaa77288c (`batch-07-15`)
-- **Latest checkpoint commit**: pending for `batch-07-15` metadata
-- **Current batch**: none — STORY `07-15` is implemented, validated, and marked committed in SQLite
-- **Completed feature rows**: 188 committed; 1 blocked; 309 pending rows remain in the full-roadmap inventory
+- **Last implementation commit**: 2548513aaeb644e4d70a34ce9ac0ed1e52901d2c (`batch-11-11`)
+- **Latest checkpoint commit**: pending for `batch-11-11` metadata
+- **Current batch**: none — STORY `11-11` is implemented, validated, and marked committed in SQLite
+- **Completed feature rows**: 189 committed; 1 blocked; 308 pending rows remain in the full-roadmap inventory
 - **Blocker**: STORY `07-11` is blocked on the documented storage-authority confirmation question.
 
 ## Latest verification
 
-- `cargo test -p geo_hub export` — failed before implementation on incomplete CSV/GeoJSON exports and missing GeoTIFF route; pass after implementation with 6 tests
-- `cargo test -p geo_hub` — pass with 29 unit tests and 61 API tests
-- `cargo check -p geo_hub` — pass
+- `cargo test -p ground_station_ui operator_session` — failed before implementation with missing session APIs; pass after implementation with 3 focused tests
+- `cargo test -p ground_station_ui` — pass with 20 lib tests, 0 bin tests, and 0 doc tests
+- `cargo check -p ground_station_ui` — pass
 - `cargo fmt --check` — pass
 - `git diff --check` — pass
-- `just gis-test` — sandboxed run failed on local HTTP bind permission; escalated rerun passed for `shared`, `geo_hub`, and `geo_viewer`
-- `cargo clean` — run after validation to free 38.4 GiB because filesystem was full and SQLite checkpoint writes failed
 
 ## Next action
 
-Commit the checkpoint metadata for `batch-07-15`, then re-read the checkpoint and select the next deterministic roadmap batch.
+Commit the checkpoint metadata for `batch-11-11`, then re-read the checkpoint and select the next deterministic roadmap batch.
