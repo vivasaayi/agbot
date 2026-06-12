@@ -371,9 +371,68 @@ pub struct FleetNodeComponentStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetConfigBundle {
+    pub node_id: String,
+    pub version: u64,
+    pub payload: String,
+    #[serde(default)]
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetConfigState {
+    pub node_id: String,
+    pub applied_version: u64,
+    pub payload: String,
+    pub applied_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetConfigApplyStatus {
+    Applied,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetConfigRejectionReason {
+    MissingSignature,
+    InvalidSignature,
+    OlderOrEqualVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetConfigApplyOutcome {
+    pub node_id: String,
+    pub previous_version: u64,
+    pub requested_version: u64,
+    pub status: FleetConfigApplyStatus,
+    #[serde(default)]
+    pub rejection_reason: Option<FleetConfigRejectionReason>,
+    pub updated_state: FleetConfigState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FleetConfigDistributionError {
+    #[error("config node_id cannot be empty")]
+    EmptyNodeId,
+    #[error("config payload cannot be empty")]
+    EmptyPayload,
+    #[error("config applied_at cannot be empty")]
+    EmptyAppliedAt,
+    #[error("config signing key cannot be empty")]
+    EmptySigningKey,
+    #[error("config bundle node_id {actual} does not match node {expected}")]
+    NodeIdMismatch { expected: String, actual: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetNodeHeartbeat {
     pub node_id: String,
     pub version: String,
+    #[serde(default)]
+    pub config_version: u64,
     #[serde(default)]
     pub components: Vec<FleetNodeComponentStatus>,
     pub uptime_seconds: u64,
@@ -395,6 +454,7 @@ pub enum FleetNodeHealthState {
 pub struct FleetNodeHealthSnapshot {
     pub node_id: String,
     pub version: String,
+    pub config_version: u64,
     pub components: Vec<FleetNodeComponentStatus>,
     pub capabilities: Vec<String>,
     pub runtime_mode: FleetNodeRuntimeMode,
@@ -489,6 +549,7 @@ pub fn apply_fleet_node_heartbeat(
         health: FleetNodeHealthSnapshot {
             node_id: heartbeat.node_id,
             version: heartbeat.version,
+            config_version: heartbeat.config_version,
             components: heartbeat.components,
             capabilities: heartbeat.capabilities,
             runtime_mode: heartbeat.runtime_mode,
@@ -533,12 +594,166 @@ fn normalize_fleet_node_heartbeat(
     Ok(FleetNodeHeartbeat {
         node_id,
         version,
+        config_version: heartbeat.config_version,
         components,
         uptime_seconds: heartbeat.uptime_seconds,
         at: heartbeat.at,
         capabilities,
         runtime_mode: heartbeat.runtime_mode,
     })
+}
+
+pub fn sign_fleet_config_bundle(
+    node_id: &str,
+    version: u64,
+    payload: &str,
+    signing_key: &str,
+) -> String {
+    let canonical = format!(
+        "{}|{}|{}|{}",
+        node_id.trim(),
+        version,
+        payload,
+        signing_key.trim()
+    );
+    format!("agbot-config-v1:{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+pub fn verify_and_apply_fleet_config_bundle(
+    current: &FleetConfigState,
+    bundle: FleetConfigBundle,
+    verifying_key: &str,
+    applied_at: String,
+) -> Result<FleetConfigApplyOutcome, FleetConfigDistributionError> {
+    let current_state = normalize_config_state(current)?;
+    let bundle = normalize_config_bundle(bundle)?;
+    let verifying_key = normalize_config_text(
+        verifying_key.to_string(),
+        FleetConfigDistributionError::EmptySigningKey,
+    )?;
+
+    if bundle.node_id != current_state.node_id {
+        return Err(FleetConfigDistributionError::NodeIdMismatch {
+            expected: current_state.node_id,
+            actual: bundle.node_id,
+        });
+    }
+
+    if bundle.signature.is_empty() {
+        return Ok(rejected_config_outcome(
+            current_state,
+            bundle.version,
+            FleetConfigRejectionReason::MissingSignature,
+        ));
+    }
+
+    let expected_signature = sign_fleet_config_bundle(
+        &bundle.node_id,
+        bundle.version,
+        &bundle.payload,
+        &verifying_key,
+    );
+    if bundle.signature != expected_signature {
+        return Ok(rejected_config_outcome(
+            current_state,
+            bundle.version,
+            FleetConfigRejectionReason::InvalidSignature,
+        ));
+    }
+
+    if bundle.version <= current_state.applied_version {
+        return Ok(rejected_config_outcome(
+            current_state,
+            bundle.version,
+            FleetConfigRejectionReason::OlderOrEqualVersion,
+        ));
+    }
+
+    let applied_at =
+        normalize_config_text(applied_at, FleetConfigDistributionError::EmptyAppliedAt)?;
+    let previous_version = current_state.applied_version;
+    let updated_state = FleetConfigState {
+        node_id: current_state.node_id.clone(),
+        applied_version: bundle.version,
+        payload: bundle.payload,
+        applied_at,
+    };
+
+    Ok(FleetConfigApplyOutcome {
+        node_id: updated_state.node_id.clone(),
+        previous_version,
+        requested_version: updated_state.applied_version,
+        status: FleetConfigApplyStatus::Applied,
+        rejection_reason: None,
+        updated_state,
+    })
+}
+
+fn rejected_config_outcome(
+    current_state: FleetConfigState,
+    requested_version: u64,
+    reason: FleetConfigRejectionReason,
+) -> FleetConfigApplyOutcome {
+    FleetConfigApplyOutcome {
+        node_id: current_state.node_id.clone(),
+        previous_version: current_state.applied_version,
+        requested_version,
+        status: FleetConfigApplyStatus::Rejected,
+        rejection_reason: Some(reason),
+        updated_state: current_state,
+    }
+}
+
+fn normalize_config_state(
+    state: &FleetConfigState,
+) -> Result<FleetConfigState, FleetConfigDistributionError> {
+    Ok(FleetConfigState {
+        node_id: normalize_config_text(
+            state.node_id.clone(),
+            FleetConfigDistributionError::EmptyNodeId,
+        )?,
+        applied_version: state.applied_version,
+        payload: normalize_config_text(
+            state.payload.clone(),
+            FleetConfigDistributionError::EmptyPayload,
+        )?,
+        applied_at: normalize_config_text(
+            state.applied_at.clone(),
+            FleetConfigDistributionError::EmptyAppliedAt,
+        )?,
+    })
+}
+
+fn normalize_config_bundle(
+    bundle: FleetConfigBundle,
+) -> Result<FleetConfigBundle, FleetConfigDistributionError> {
+    Ok(FleetConfigBundle {
+        node_id: normalize_config_text(bundle.node_id, FleetConfigDistributionError::EmptyNodeId)?,
+        version: bundle.version,
+        payload: normalize_config_text(bundle.payload, FleetConfigDistributionError::EmptyPayload)?,
+        signature: bundle.signature.trim().to_string(),
+    })
+}
+
+fn normalize_config_text(
+    value: String,
+    error: FleetConfigDistributionError,
+) -> Result<String, FleetConfigDistributionError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn normalize_heartbeat_component(
@@ -2606,20 +2821,22 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 mod tests {
     use super::{
         apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
-        bind_fleet_node_identity, bounds_from_points, validate_field_boundary,
-        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
-        AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord, CropPlanRecord,
-        FarmFieldError, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError,
-        FieldRecord, FleetHeartbeatEvaluation, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, MultispectralImage,
-        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
-        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
-        RecommendationStatus, RecommendationStatusChangeType, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
+        bind_fleet_node_identity, bounds_from_points, sign_fleet_config_bundle,
+        validate_field_boundary, verify_and_apply_fleet_config_bundle, AnnotationAuditRegistry,
+        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
+        AuditedAnnotationRecord, CropPlanRecord, FarmFieldError, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeEnrollmentError,
+        FleetNodeEnrollmentRequest, FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind,
+        FleetNodeOperationError, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds,
+        GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
+        ReportDeliverableRegistry, ReportFormat, ReportPersistenceError, ReportRecord,
+        ReportVisibility, SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
+        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry,
+        WorkOrderStatus,
     };
 
     #[test]
@@ -2730,6 +2947,7 @@ mod tests {
         );
         assert_eq!(evaluation.health.state, FleetNodeHealthState::Fresh);
         assert_eq!(evaluation.health.version, "agbot-node 1.4.0");
+        assert_eq!(evaluation.health.config_version, 7);
         assert_eq!(evaluation.health.heartbeat_age_seconds, 5);
         assert_eq!(evaluation.health.components.len(), 2);
     }
@@ -2761,6 +2979,119 @@ mod tests {
         assert_eq!(stale.health.heartbeat_age_seconds, 20);
         assert_eq!(down.health.state, FleetNodeHealthState::Down);
         assert_eq!(down.health.heartbeat_age_seconds, 70);
+    }
+
+    #[test]
+    fn signed_newer_config_bundle_applies_and_heartbeat_reports_version() {
+        let current = FleetConfigState {
+            node_id: "node-001".to_string(),
+            applied_version: 2,
+            payload: "mavlink.rate_hz=1".to_string(),
+            applied_at: "2026-06-12T11:00:00Z".to_string(),
+        };
+        let bundle = FleetConfigBundle {
+            node_id: "node-001".to_string(),
+            version: 3,
+            payload: "mavlink.rate_hz=2".to_string(),
+            signature: sign_fleet_config_bundle("node-001", 3, "mavlink.rate_hz=2", "fleet-key"),
+        };
+
+        let outcome = verify_and_apply_fleet_config_bundle(
+            &current,
+            bundle,
+            "fleet-key",
+            "2026-06-12T12:00:00Z".to_string(),
+        )
+        .expect("config bundle should be evaluated");
+
+        assert_eq!(outcome.status, FleetConfigApplyStatus::Applied);
+        assert_eq!(outcome.updated_state.applied_version, 3);
+        assert_eq!(outcome.updated_state.payload, "mavlink.rate_hz=2");
+
+        let record = sample_fleet_node(FleetNodeRuntimeMode::Flight);
+        let mut heartbeat =
+            sample_fleet_heartbeat("2026-06-12T12:00:00Z", FleetNodeRuntimeMode::Flight);
+        heartbeat.config_version = outcome.updated_state.applied_version;
+        let evaluation = FleetHeartbeatEvaluation::from_heartbeat(
+            &record,
+            &heartbeat,
+            dt("2026-06-12T12:00:05Z"),
+            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("heartbeat should evaluate");
+
+        assert_eq!(evaluation.health.config_version, 3);
+    }
+
+    #[test]
+    fn unsigned_or_downgrade_config_bundle_is_rejected_without_mutation() {
+        let current = FleetConfigState {
+            node_id: "node-001".to_string(),
+            applied_version: 3,
+            payload: "mavlink.rate_hz=2".to_string(),
+            applied_at: "2026-06-12T12:00:00Z".to_string(),
+        };
+        let unsigned = FleetConfigBundle {
+            node_id: "node-001".to_string(),
+            version: 4,
+            payload: "mavlink.rate_hz=4".to_string(),
+            signature: String::new(),
+        };
+
+        let unsigned_outcome = verify_and_apply_fleet_config_bundle(
+            &current,
+            unsigned,
+            "fleet-key",
+            "2026-06-12T12:05:00Z".to_string(),
+        )
+        .expect("unsigned bundle should be reported as a rejection");
+        assert_eq!(unsigned_outcome.status, FleetConfigApplyStatus::Rejected);
+        assert_eq!(
+            unsigned_outcome.rejection_reason,
+            Some(FleetConfigRejectionReason::MissingSignature)
+        );
+        assert_eq!(unsigned_outcome.updated_state, current);
+
+        let invalid_signature = FleetConfigBundle {
+            node_id: "node-001".to_string(),
+            version: 4,
+            payload: "mavlink.rate_hz=4".to_string(),
+            signature: "agbot-config-v1:bad-signature".to_string(),
+        };
+        let invalid_signature_outcome = verify_and_apply_fleet_config_bundle(
+            &current,
+            invalid_signature,
+            "fleet-key",
+            "2026-06-12T12:05:00Z".to_string(),
+        )
+        .expect("invalid signature should be reported as a rejection");
+        assert_eq!(
+            invalid_signature_outcome.rejection_reason,
+            Some(FleetConfigRejectionReason::InvalidSignature)
+        );
+        assert_eq!(invalid_signature_outcome.updated_state, current);
+
+        let downgrade = FleetConfigBundle {
+            node_id: "node-001".to_string(),
+            version: 2,
+            payload: "mavlink.rate_hz=1".to_string(),
+            signature: sign_fleet_config_bundle("node-001", 2, "mavlink.rate_hz=1", "fleet-key"),
+        };
+        let downgrade_outcome = verify_and_apply_fleet_config_bundle(
+            &current,
+            downgrade,
+            "fleet-key",
+            "2026-06-12T12:05:00Z".to_string(),
+        )
+        .expect("downgrade should be reported as a rejection");
+
+        assert_eq!(downgrade_outcome.status, FleetConfigApplyStatus::Rejected);
+        assert_eq!(
+            downgrade_outcome.rejection_reason,
+            Some(FleetConfigRejectionReason::OlderOrEqualVersion)
+        );
+        assert_eq!(downgrade_outcome.updated_state, current);
     }
 
     #[test]
@@ -2796,6 +3127,7 @@ mod tests {
         FleetNodeHeartbeat {
             node_id: "node-001".to_string(),
             version: "agbot-node 1.4.0".to_string(),
+            config_version: 7,
             components: vec![
                 FleetNodeComponentStatus {
                     component: "flight_controller".to_string(),

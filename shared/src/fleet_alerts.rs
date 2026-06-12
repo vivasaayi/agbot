@@ -378,6 +378,7 @@ mod tests {
         FleetNodeHealthSnapshot {
             node_id: node_id.to_string(),
             version: "agbot-node 1.4.0".to_string(),
+            config_version: 7,
             components: Vec::new(),
             capabilities: vec!["multispectral".to_string()],
             runtime_mode: FleetNodeRuntimeMode::Flight,
