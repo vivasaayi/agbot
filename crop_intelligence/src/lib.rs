@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef, RasterSpatialRefError};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +155,74 @@ pub struct StandCountReport {
     pub plant_locations: Vec<PlantLocation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CanopyCoverConfig {
+    pub vegetation_index_threshold: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanopyCoverTile {
+    pub tile_id: String,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub index_values: Vec<f64>,
+    pub valid_mask: Vec<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanopyCoverMask {
+    pub width_px: u32,
+    pub height_px: u32,
+    pub vegetation_mask: Vec<bool>,
+    pub valid_mask: Vec<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TileCanopyCover {
+    pub tile_id: String,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    pub spatial_ref: RasterSpatialRef,
+    pub total_pixels: usize,
+    pub valid_pixels: usize,
+    pub vegetation_pixels: usize,
+    pub excluded_pixels: usize,
+    pub pixel_area_m2: f64,
+    pub valid_area_m2: f64,
+    pub excluded_area_m2: f64,
+    pub cover_fraction: f64,
+    pub mask: CanopyCoverMask,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoneCanopyCover {
+    pub zone_id: String,
+    pub valid_pixels: usize,
+    pub vegetation_pixels: usize,
+    pub excluded_pixels: usize,
+    pub valid_area_m2: f64,
+    pub excluded_area_m2: f64,
+    pub cover_fraction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanopyCoverReport {
+    pub field_id: String,
+    pub crs: String,
+    pub generated_at: String,
+    pub valid_pixels: usize,
+    pub vegetation_pixels: usize,
+    pub excluded_pixels: usize,
+    pub valid_area_m2: f64,
+    pub excluded_area_m2: f64,
+    pub cover_fraction: f64,
+    pub tiles: Vec<TileCanopyCover>,
+    pub zones: Vec<ZoneCanopyCover>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CropModelRegistryError {
     #[error("model_id cannot be empty")]
@@ -190,6 +259,36 @@ pub enum StandCountError {
     InvalidTileGeometry { tile_id: String },
     #[error("tile {tile_id} crop mask length does not match dimensions")]
     CropMaskSizeMismatch { tile_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum CanopyCoverError {
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("canopy cover requires at least one tile")]
+    EmptyTiles,
+    #[error("vegetation_index_threshold must be finite")]
+    InvalidThreshold,
+    #[error("tile_id cannot be empty")]
+    EmptyTileId,
+    #[error("tile {tile_id} has invalid spatial reference: {source}")]
+    SpatialRefInvalid {
+        tile_id: String,
+        #[source]
+        source: RasterSpatialRefError,
+    },
+    #[error("tile {tile_id} index values length does not match dimensions")]
+    IndexSizeMismatch { tile_id: String },
+    #[error("tile {tile_id} valid mask length does not match dimensions")]
+    ValidMaskSizeMismatch { tile_id: String },
+    #[error("tile {tile_id} CRS {actual} does not match field CRS {expected}")]
+    CrsMismatch {
+        tile_id: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 pub fn build_model_version_record(
@@ -299,6 +398,84 @@ pub fn run_stand_count(
     })
 }
 
+pub fn run_canopy_cover(
+    field_id: String,
+    tiles: Vec<CanopyCoverTile>,
+    config: CanopyCoverConfig,
+    generated_at: String,
+) -> Result<CanopyCoverReport, CanopyCoverError> {
+    let field_id = normalize_canopy_text(field_id, CanopyCoverError::EmptyFieldId)?;
+    let generated_at = normalize_canopy_text(generated_at, CanopyCoverError::EmptyGeneratedAt)?;
+    if tiles.is_empty() {
+        return Err(CanopyCoverError::EmptyTiles);
+    }
+    if !config.vegetation_index_threshold.is_finite() {
+        return Err(CanopyCoverError::InvalidThreshold);
+    }
+
+    let mut field_crs: Option<String> = None;
+    let mut tile_reports = Vec::new();
+    let mut zone_rollups: BTreeMap<String, CanopyZoneAccumulator> = BTreeMap::new();
+
+    for tile in tiles {
+        let tile_report = evaluate_canopy_tile(tile, config)?;
+        let tile_crs = tile_report.spatial_ref.crs.clone().unwrap_or_default();
+        match field_crs.as_ref() {
+            Some(expected) if expected != &tile_crs => {
+                return Err(CanopyCoverError::CrsMismatch {
+                    tile_id: tile_report.tile_id,
+                    expected: expected.clone(),
+                    actual: tile_crs,
+                });
+            }
+            None => field_crs = Some(tile_crs),
+            _ => {}
+        }
+        if let Some(zone_id) = tile_report.zone_id.as_ref() {
+            let entry = zone_rollups.entry(zone_id.clone()).or_default();
+            entry.valid_pixels += tile_report.valid_pixels;
+            entry.vegetation_pixels += tile_report.vegetation_pixels;
+            entry.excluded_pixels += tile_report.excluded_pixels;
+            entry.valid_area_m2 += tile_report.valid_area_m2;
+            entry.excluded_area_m2 += tile_report.excluded_area_m2;
+        }
+        tile_reports.push(tile_report);
+    }
+
+    tile_reports.sort_by(|left, right| left.tile_id.cmp(&right.tile_id));
+    let valid_pixels = tile_reports.iter().map(|tile| tile.valid_pixels).sum();
+    let vegetation_pixels = tile_reports.iter().map(|tile| tile.vegetation_pixels).sum();
+    let excluded_pixels = tile_reports.iter().map(|tile| tile.excluded_pixels).sum();
+    let valid_area_m2 = tile_reports.iter().map(|tile| tile.valid_area_m2).sum();
+    let excluded_area_m2 = tile_reports.iter().map(|tile| tile.excluded_area_m2).sum();
+    let zones = zone_rollups
+        .into_iter()
+        .map(|(zone_id, rollup)| ZoneCanopyCover {
+            zone_id,
+            valid_pixels: rollup.valid_pixels,
+            vegetation_pixels: rollup.vegetation_pixels,
+            excluded_pixels: rollup.excluded_pixels,
+            valid_area_m2: rollup.valid_area_m2,
+            excluded_area_m2: rollup.excluded_area_m2,
+            cover_fraction: cover_fraction(rollup.vegetation_pixels, rollup.valid_pixels),
+        })
+        .collect();
+
+    Ok(CanopyCoverReport {
+        field_id,
+        crs: field_crs.unwrap_or_default(),
+        generated_at,
+        valid_pixels,
+        vegetation_pixels,
+        excluded_pixels,
+        valid_area_m2,
+        excluded_area_m2,
+        cover_fraction: cover_fraction(vegetation_pixels, valid_pixels),
+        tiles: tile_reports,
+        zones,
+    })
+}
+
 fn normalize_required_text(
     value: String,
     error: CropModelRegistryError,
@@ -320,6 +497,86 @@ fn validate_metrics(metrics: &serde_json::Value) -> Result<(), CropModelRegistry
 
 fn default_model_metrics() -> serde_json::Value {
     serde_json::json!({})
+}
+
+#[derive(Default)]
+struct CanopyZoneAccumulator {
+    valid_pixels: usize,
+    vegetation_pixels: usize,
+    excluded_pixels: usize,
+    valid_area_m2: f64,
+    excluded_area_m2: f64,
+}
+
+fn evaluate_canopy_tile(
+    tile: CanopyCoverTile,
+    config: CanopyCoverConfig,
+) -> Result<TileCanopyCover, CanopyCoverError> {
+    let tile_id = normalize_canopy_text(tile.tile_id.clone(), CanopyCoverError::EmptyTileId)?;
+    let zone_id = tile
+        .zone_id
+        .as_ref()
+        .and_then(|zone_id| normalize_optional_stand_text(zone_id.clone()));
+    let spatial_ref =
+        assert_raster_spatial_ref(Some(&tile.spatial_ref), tile.width_px, tile.height_px).map_err(
+            |source| CanopyCoverError::SpatialRefInvalid {
+                tile_id: tile_id.clone(),
+                source,
+            },
+        )?;
+    let pixel_count = tile.width_px as usize * tile.height_px as usize;
+    if tile.index_values.len() != pixel_count {
+        return Err(CanopyCoverError::IndexSizeMismatch { tile_id });
+    }
+    if tile.valid_mask.len() != pixel_count {
+        return Err(CanopyCoverError::ValidMaskSizeMismatch { tile_id });
+    }
+
+    let pixel_area_m2 = spatial_ref
+        .resolution
+        .map(|resolution| resolution.x * resolution.y)
+        .unwrap_or(0.0);
+    let mut valid_mask = Vec::with_capacity(pixel_count);
+    let mut vegetation_mask = Vec::with_capacity(pixel_count);
+    let mut valid_pixels = 0;
+    let mut vegetation_pixels = 0;
+
+    for (index_value, qa_valid) in tile.index_values.iter().zip(tile.valid_mask.iter()) {
+        let valid = *qa_valid && index_value.is_finite();
+        let vegetation = valid && *index_value >= config.vegetation_index_threshold;
+        valid_mask.push(valid);
+        vegetation_mask.push(vegetation);
+        if valid {
+            valid_pixels += 1;
+        }
+        if vegetation {
+            vegetation_pixels += 1;
+        }
+    }
+
+    let excluded_pixels = pixel_count - valid_pixels;
+    let valid_area_m2 = valid_pixels as f64 * pixel_area_m2;
+    let excluded_area_m2 = excluded_pixels as f64 * pixel_area_m2;
+
+    Ok(TileCanopyCover {
+        tile_id,
+        zone_id,
+        spatial_ref,
+        total_pixels: pixel_count,
+        valid_pixels,
+        vegetation_pixels,
+        excluded_pixels,
+        pixel_area_m2,
+        valid_area_m2,
+        excluded_area_m2,
+        cover_fraction: cover_fraction(vegetation_pixels, valid_pixels),
+        mask: CanopyCoverMask {
+            width_px: tile.width_px,
+            height_px: tile.height_px,
+            vegetation_mask,
+            valid_mask,
+        },
+    })
 }
 
 fn count_tile_plants(
@@ -488,6 +745,26 @@ fn normalize_optional_stand_text(value: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn normalize_canopy_text(
+    value: String,
+    error: CanopyCoverError,
+) -> Result<String, CanopyCoverError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn cover_fraction(vegetation_pixels: usize, valid_pixels: usize) -> f64 {
+    if valid_pixels > 0 {
+        vegetation_pixels as f64 / valid_pixels as f64
+    } else {
+        0.0
+    }
+}
+
 fn density_per_ha(count: usize, area_m2: f64) -> f64 {
     if area_m2 > 0.0 {
         count as f64 / (area_m2 / 10_000.0)
@@ -499,10 +776,12 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_model_version_record, run_stand_count, validate_model_reference,
-        CropModelRegistryError, CropModelTask, InferenceModelReference,
-        ModelVersionRegistrationRequest, PlantCountConfig, PlantCountTile, PlantCountZeroReason,
+        build_model_version_record, run_canopy_cover, run_stand_count, validate_model_reference,
+        CanopyCoverConfig, CanopyCoverError, CanopyCoverTile, CropModelRegistryError,
+        CropModelTask, InferenceModelReference, ModelVersionRegistrationRequest, PlantCountConfig,
+        PlantCountTile, PlantCountZeroReason,
     };
+    use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
     #[test]
     fn model_version_record_requires_versioned_provenance() {
@@ -667,6 +946,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canopy_cover_returns_georeferenced_masks_and_zone_fractions() {
+        let report = run_canopy_cover(
+            "field-1".to_string(),
+            vec![canopy_tile(
+                "tile-1",
+                Some("zone-a"),
+                3,
+                2,
+                vec![0.7, 0.2, 0.5, 0.1, 0.8, 0.4],
+                vec![true; 6],
+            )],
+            CanopyCoverConfig {
+                vegetation_index_threshold: 0.5,
+            },
+            "2026-06-01T12:10:00Z".to_string(),
+        )
+        .expect("canopy cover should run");
+
+        assert_eq!(report.field_id, "field-1");
+        assert_eq!(report.crs, "EPSG:32614");
+        assert_eq!(report.valid_pixels, 6);
+        assert_eq!(report.vegetation_pixels, 3);
+        assert_eq!(report.excluded_pixels, 0);
+        assert_eq!(report.cover_fraction, 0.5);
+        assert_eq!(report.zones[0].zone_id, "zone-a");
+        assert_eq!(report.zones[0].cover_fraction, 0.5);
+        assert_eq!(
+            report.tiles[0].mask.vegetation_mask,
+            vec![true, false, true, false, true, false]
+        );
+        assert_eq!(report.tiles[0].mask.valid_mask, vec![true; 6]);
+        assert_eq!(
+            report.tiles[0].spatial_ref.crs.as_deref(),
+            Some("EPSG:32614")
+        );
+        assert_eq!(report.tiles[0].spatial_ref, spatial_ref(3, 2));
+    }
+
+    #[test]
+    fn canopy_cover_excludes_cloud_nodata_pixels_from_fraction() {
+        let report = run_canopy_cover(
+            "field-1".to_string(),
+            vec![canopy_tile(
+                "tile-cloud",
+                Some("zone-a"),
+                2,
+                2,
+                vec![0.8, 0.0, 0.1, 0.9],
+                vec![true, false, true, false],
+            )],
+            CanopyCoverConfig {
+                vegetation_index_threshold: 0.5,
+            },
+            "2026-06-01T12:10:00Z".to_string(),
+        )
+        .expect("canopy cover should run");
+
+        assert_eq!(report.valid_pixels, 2);
+        assert_eq!(report.vegetation_pixels, 1);
+        assert_eq!(report.excluded_pixels, 2);
+        assert_eq!(report.cover_fraction, 0.5);
+        assert_eq!(
+            report.tiles[0].mask.vegetation_mask,
+            vec![true, false, false, false]
+        );
+        assert_eq!(
+            report.tiles[0].mask.valid_mask,
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn canopy_cover_rejects_bad_spatial_ref() {
+        let mut tile = canopy_tile(
+            "tile-bad-ref",
+            Some("zone-a"),
+            2,
+            2,
+            vec![0.8, 0.0, 0.1, 0.9],
+            vec![true; 4],
+        );
+        tile.spatial_ref.georeferenced = false;
+
+        let error = run_canopy_cover(
+            "field-1".to_string(),
+            vec![tile],
+            CanopyCoverConfig {
+                vegetation_index_threshold: 0.5,
+            },
+            "2026-06-01T12:10:00Z".to_string(),
+        )
+        .expect_err("bad spatial ref should be rejected");
+
+        assert!(matches!(
+            error,
+            CanopyCoverError::SpatialRefInvalid { tile_id, .. } if tile_id == "tile-bad-ref"
+        ));
+    }
+
     fn plant_tile(
         tile_id: &str,
         zone_id: Option<&str>,
@@ -684,6 +1063,42 @@ mod tests {
             max_x_m: 40.0,
             max_y_m: 40.0,
             crop_mask,
+        }
+    }
+
+    fn canopy_tile(
+        tile_id: &str,
+        zone_id: Option<&str>,
+        width_px: u32,
+        height_px: u32,
+        index_values: Vec<f64>,
+        valid_mask: Vec<bool>,
+    ) -> CanopyCoverTile {
+        CanopyCoverTile {
+            tile_id: tile_id.to_string(),
+            zone_id: zone_id.map(ToOwned::to_owned),
+            width_px,
+            height_px,
+            spatial_ref: spatial_ref(width_px, height_px),
+            index_values,
+            valid_mask,
+        }
+    }
+
+    fn spatial_ref(width_px: u32, height_px: u32) -> RasterSpatialRef {
+        let max_x = width_px as f64 * 10.0;
+        let max_y = height_px as f64 * 10.0;
+        RasterSpatialRef {
+            georeferenced: true,
+            crs: Some("EPSG:32614".to_string()),
+            bbox: Some(GeoBounds {
+                min_lon: 0.0,
+                min_lat: 0.0,
+                max_lon: max_x,
+                max_lat: max_y,
+            }),
+            geo_transform: Some([0.0, 10.0, 0.0, max_y, 0.0, -10.0]),
+            resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
         }
     }
 }
