@@ -4066,6 +4066,129 @@ async fn compliance_remote_id_and_chemical_payloads_are_persisted_and_validated(
 }
 
 #[tokio::test]
+async fn compliance_audit_report_export_includes_records_and_provenance() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_compliance_field(&ctx, "field-north", "org-alpha").await?;
+    seed_compliance_export_records(&ctx).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/reports/export")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "report_id": "report-field-north",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:00:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application",
+                            "operator_certification",
+                            "authorization_decision"
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 128 * 1024).await?;
+    let report: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        report
+            .get("schema_version")
+            .and_then(|value| value.as_str()),
+        Some("compliance.audit_report.v1")
+    );
+    assert_eq!(
+        report.get("record_count").and_then(|value| value.as_u64()),
+        Some(4)
+    );
+    assert_eq!(
+        report
+            .pointer("/record_type_counts/remote_id_log")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert!(report
+        .get("provenance_refs")
+        .and_then(|value| value.as_array())
+        .expect("report should include provenance refs")
+        .iter()
+        .any(|value| value == "provenance:application/chem-app-1/v1"));
+    assert_eq!(
+        report
+            .pointer("/records/0/org_id")
+            .and_then(|value| value.as_str()),
+        Some("org-alpha")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn compliance_audit_report_export_rejects_missing_mandatory_records() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_compliance_field(&ctx, "field-north", "org-alpha").await?;
+    post_compliance_record(
+        &ctx,
+        json!({
+            "record_id": "remote-log-1",
+            "record_type": "remote_id_log",
+            "org_id": "org-alpha",
+            "field_id": "field-north",
+            "actor": "operator-17",
+            "provenance_ref": "provenance:remote-id/remote-log-1/v1",
+            "payload": remote_id_payload()
+        }),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/reports/export")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "report_id": "report-field-north",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:00:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application"
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("missing mandatory compliance records: chemical_application"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn compliance_airspace_zones_ingest_query_and_reject_invalid_crs() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -6995,6 +7118,128 @@ async fn seed_compliance_field(ctx: &TestContext, field_id: &str, owner: &str) -
     .await?;
 
     Ok(())
+}
+
+async fn seed_compliance_export_records(ctx: &TestContext) -> Result<()> {
+    post_compliance_record(
+        ctx,
+        json!({
+            "record_id": "remote-log-1",
+            "record_type": "remote_id_log",
+            "org_id": "org-alpha",
+            "field_id": "field-north",
+            "actor": "operator-17",
+            "provenance_ref": "provenance:remote-id/remote-log-1/v1",
+            "payload": remote_id_payload()
+        }),
+    )
+    .await?;
+    post_compliance_record(
+        ctx,
+        json!({
+            "record_id": "chem-app-1",
+            "record_type": "chemical_application",
+            "org_id": "org-alpha",
+            "field_id": "field-north",
+            "flight_id": "flight-77",
+            "actor": "operator-17",
+            "provenance_ref": "provenance:application/chem-app-1/v1",
+            "payload": chemical_application_payload()
+        }),
+    )
+    .await?;
+    post_compliance_record(
+        ctx,
+        json!({
+            "record_id": "cert-operator-17",
+            "record_type": "operator_certification",
+            "org_id": "org-alpha",
+            "field_id": "field-north",
+            "actor": "compliance-officer-1",
+            "provenance_ref": "provenance:cert/operator-17/v1"
+        }),
+    )
+    .await?;
+    post_compliance_record(
+        ctx,
+        json!({
+            "record_id": "auth-flight-77",
+            "record_type": "authorization_decision",
+            "org_id": "org-alpha",
+            "field_id": "field-north",
+            "flight_id": "flight-77",
+            "actor": "compliance-officer-1",
+            "provenance_ref": "provenance:authorization/flight-77/v1"
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn post_compliance_record(ctx: &TestContext, payload: serde_json::Value) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+fn remote_id_payload() -> serde_json::Value {
+    json!({
+        "flight_id": "flight-77",
+        "operator_id": "operator-17",
+        "aircraft_id": "aircraft-ag-9",
+        "started_at": "2026-06-12T12:00:00Z",
+        "ended_at": "2026-06-12T12:18:00Z",
+        "track": [
+            {
+                "observed_at": "2026-06-12T12:02:00Z",
+                "longitude": -96.61,
+                "latitude": 41.21,
+                "altitude_m": 118.0
+            }
+        ],
+        "telemetry_gaps": [
+            {
+                "started_at": "2026-06-12T12:04:00Z",
+                "ended_at": "2026-06-12T12:08:00Z",
+                "reason": "remote-id-broadcast-dropout"
+            }
+        ]
+    })
+}
+
+fn chemical_application_payload() -> serde_json::Value {
+    json!({
+        "application_id": "chem-app-1",
+        "product": "Example Herbicide",
+        "epa_or_label_ref": "EPA-12345-LBL",
+        "field_id": "field-north",
+        "geometry": {
+            "crs": "EPSG:4326",
+            "coordinates": [
+                { "longitude": -96.70, "latitude": 41.10 },
+                { "longitude": -96.20, "latitude": 41.10 },
+                { "longitude": -96.20, "latitude": 41.40 },
+                { "longitude": -96.70, "latitude": 41.40 },
+                { "longitude": -96.70, "latitude": 41.10 }
+            ]
+        },
+        "applied_at": "2026-06-12T13:00:00Z",
+        "rate": 1.75,
+        "units": "L/ha",
+        "operator_id": "operator-17"
+    })
 }
 
 async fn seed_orthomosaic_scene(

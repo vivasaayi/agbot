@@ -105,6 +105,10 @@ pub fn build_router(state: AppState) -> Router {
             delete(routes::refuse_delete_compliance_record),
         )
         .route(
+            "/api/compliance/reports/export",
+            post(routes::export_compliance_audit_report),
+        )
+        .route(
             "/api/compliance/records/:record_id/versions",
             post(routes::append_compliance_record_version_route),
         )

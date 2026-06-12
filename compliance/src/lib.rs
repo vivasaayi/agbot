@@ -1,7 +1,8 @@
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComplianceRecordType {
     AirspaceZone,
@@ -411,6 +412,84 @@ pub struct ComplianceRecord {
     pub payload: Option<ComplianceRecordPayload>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuditReportRequest {
+    pub report_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub generated_at: String,
+    #[serde(default)]
+    pub records: Vec<ComplianceRecord>,
+    #[serde(default)]
+    pub mandatory_record_types: Vec<ComplianceRecordType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuditReport {
+    pub schema_version: String,
+    pub report_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub generated_at: String,
+    pub record_count: usize,
+    pub record_type_counts: BTreeMap<String, usize>,
+    pub provenance_refs: Vec<String>,
+    pub records: Vec<ComplianceRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComplianceAuditReportError {
+    EmptyReportId,
+    EmptyOrgId,
+    EmptyFieldId,
+    EmptyGeneratedAt,
+    EmptyRecords,
+    MissingMandatoryRecords {
+        missing: Vec<ComplianceRecordType>,
+    },
+    RecordScopeMismatch {
+        record_id: String,
+        expected_org_id: String,
+        actual_org_id: String,
+        expected_field_id: String,
+        actual_field_id: String,
+    },
+}
+
+impl std::fmt::Display for ComplianceAuditReportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ComplianceAuditReportError::EmptyReportId => formatter.write_str("report_id cannot be empty"),
+            ComplianceAuditReportError::EmptyOrgId => formatter.write_str("org_id cannot be empty"),
+            ComplianceAuditReportError::EmptyFieldId => formatter.write_str("field_id cannot be empty"),
+            ComplianceAuditReportError::EmptyGeneratedAt => formatter.write_str("generated_at cannot be empty"),
+            ComplianceAuditReportError::EmptyRecords => {
+                formatter.write_str("compliance audit report requires at least one record")
+            }
+            ComplianceAuditReportError::MissingMandatoryRecords { missing } => {
+                let missing = missing
+                    .iter()
+                    .map(|record_type| record_type.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(formatter, "missing mandatory compliance records: {missing}")
+            }
+            ComplianceAuditReportError::RecordScopeMismatch {
+                record_id,
+                expected_org_id,
+                actual_org_id,
+                expected_field_id,
+                actual_field_id,
+            } => write!(
+                formatter,
+                "record {record_id} scope mismatch: expected org {expected_org_id}/field {expected_field_id}, got org {actual_org_id}/field {actual_field_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ComplianceAuditReportError {}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ComplianceRecordError {
     #[error("record_id cannot be empty")]
@@ -657,6 +736,79 @@ pub fn append_compliance_record_version(
         prior_version: Some(latest.version),
         change_reason: normalize_optional_text(request.change_reason),
         payload,
+    })
+}
+
+pub fn build_compliance_audit_report(
+    request: ComplianceAuditReportRequest,
+) -> Result<ComplianceAuditReport, ComplianceAuditReportError> {
+    let report_id = normalize_required_report_text(
+        request.report_id,
+        ComplianceAuditReportError::EmptyReportId,
+    )?;
+    let org_id =
+        normalize_required_report_text(request.org_id, ComplianceAuditReportError::EmptyOrgId)?;
+    let field_id =
+        normalize_required_report_text(request.field_id, ComplianceAuditReportError::EmptyFieldId)?;
+    let generated_at = normalize_required_report_text(
+        request.generated_at,
+        ComplianceAuditReportError::EmptyGeneratedAt,
+    )?;
+    if request.records.is_empty() {
+        return Err(ComplianceAuditReportError::EmptyRecords);
+    }
+
+    let present_types = request
+        .records
+        .iter()
+        .map(|record| record.record_type)
+        .collect::<BTreeSet<_>>();
+    let missing = request
+        .mandatory_record_types
+        .iter()
+        .copied()
+        .filter(|record_type| !present_types.contains(record_type))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(ComplianceAuditReportError::MissingMandatoryRecords { missing });
+    }
+
+    let mut record_type_counts = BTreeMap::new();
+    let mut provenance_refs = BTreeSet::new();
+    let mut records = request.records;
+    for record in &records {
+        if record.org_id != org_id || record.field_id != field_id {
+            return Err(ComplianceAuditReportError::RecordScopeMismatch {
+                record_id: record.record_id.clone(),
+                expected_org_id: org_id.clone(),
+                actual_org_id: record.org_id.clone(),
+                expected_field_id: field_id.clone(),
+                actual_field_id: record.field_id.clone(),
+            });
+        }
+        *record_type_counts
+            .entry(record.record_type.as_str().to_string())
+            .or_insert(0) += 1;
+        provenance_refs.insert(record.provenance_ref.clone());
+    }
+    records.sort_by(|left, right| {
+        left.record_type
+            .as_str()
+            .cmp(right.record_type.as_str())
+            .then_with(|| left.record_id.cmp(&right.record_id))
+            .then_with(|| left.version.cmp(&right.version))
+    });
+
+    Ok(ComplianceAuditReport {
+        schema_version: "compliance.audit_report.v1".to_string(),
+        report_id,
+        org_id,
+        field_id,
+        generated_at,
+        record_count: records.len(),
+        record_type_counts,
+        provenance_refs: provenance_refs.into_iter().collect(),
+        records,
     })
 }
 
@@ -1330,6 +1482,18 @@ fn normalize_required_text(
     }
 }
 
+fn normalize_required_report_text(
+    value: String,
+    error: ComplianceAuditReportError,
+) -> Result<String, ComplianceAuditReportError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn normalize_required_airspace_text(
     value: String,
     error: AirspaceZoneError,
@@ -1592,13 +1756,14 @@ mod tests {
     use super::{
         airspace_zone_contains_point, airspace_zone_intersects_polygon,
         append_compliance_record_version, build_airspace_zone_record,
-        build_initial_compliance_record, build_operator_certification_record,
-        check_operator_certification, compute_rei_phi_window, evaluate_entry_harvest_clearance,
-        evaluate_preflight_authorization, refuse_in_place_mutation, AirspaceCoordinate,
-        AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
-        AppendComplianceRecordVersionRequest, ApplicationGeometry, AuthorizationBlockReason,
-        AuthorizationDecisionStatus, CertificationBlockReason, CertificationStatus,
-        ChemicalApplicationRecord, ComplianceRecordError, ComplianceRecordPayload,
+        build_compliance_audit_report, build_initial_compliance_record,
+        build_operator_certification_record, check_operator_certification, compute_rei_phi_window,
+        evaluate_entry_harvest_clearance, evaluate_preflight_authorization,
+        refuse_in_place_mutation, AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError,
+        AirspaceZoneIngestRequest, AppendComplianceRecordVersionRequest, ApplicationGeometry,
+        AuthorizationBlockReason, AuthorizationDecisionStatus, CertificationBlockReason,
+        CertificationStatus, ChemicalApplicationRecord, ComplianceAuditReportError,
+        ComplianceAuditReportRequest, ComplianceRecordError, ComplianceRecordPayload,
         ComplianceRecordType, CreateComplianceRecordRequest, EntryHarvestAction,
         EntryHarvestBlockReason, EntryHarvestDecisionStatus, IntervalWindowStatus,
         OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
@@ -2225,6 +2390,144 @@ mod tests {
                 value: "EPSG:3857".to_string()
             }
         );
+    }
+
+    #[test]
+    fn audit_report_includes_required_records_and_provenance() {
+        let records = vec![
+            compliance_record(
+                "remote-log-1",
+                ComplianceRecordType::RemoteIdLog,
+                Some("flight-77"),
+                "provenance:remote-id/remote-log-1/v1",
+                Some(ComplianceRecordPayload::RemoteIdFlightLog(remote_id_log())),
+            ),
+            compliance_record(
+                "chem-app-1",
+                ComplianceRecordType::ChemicalApplication,
+                Some("flight-77"),
+                "provenance:application/chem-app-1/v1",
+                Some(ComplianceRecordPayload::ChemicalApplication(
+                    application_record(),
+                )),
+            ),
+            compliance_record(
+                "cert-operator-17",
+                ComplianceRecordType::OperatorCertification,
+                None,
+                "provenance:cert/operator-17/v1",
+                None,
+            ),
+            compliance_record(
+                "auth-flight-77",
+                ComplianceRecordType::AuthorizationDecision,
+                Some("flight-77"),
+                "provenance:authorization/flight-77/v1",
+                None,
+            ),
+        ];
+
+        let report = build_compliance_audit_report(ComplianceAuditReportRequest {
+            report_id: "report-field-north".to_string(),
+            org_id: "org-alpha".to_string(),
+            field_id: "field-north".to_string(),
+            generated_at: "2026-06-13T12:00:00Z".to_string(),
+            records,
+            mandatory_record_types: vec![
+                ComplianceRecordType::RemoteIdLog,
+                ComplianceRecordType::ChemicalApplication,
+                ComplianceRecordType::OperatorCertification,
+                ComplianceRecordType::AuthorizationDecision,
+            ],
+        })
+        .expect("complete record set should produce an audit report");
+
+        assert_eq!(report.schema_version, "compliance.audit_report.v1");
+        assert_eq!(report.report_id, "report-field-north");
+        assert_eq!(report.record_count, 4);
+        assert_eq!(
+            report.record_type_counts.get("remote_id_log").copied(),
+            Some(1)
+        );
+        assert!(report
+            .provenance_refs
+            .contains(&"provenance:application/chem-app-1/v1".to_string()));
+        assert_eq!(report.records[0].org_id, "org-alpha");
+        assert_eq!(report.records[0].field_id, "field-north");
+    }
+
+    #[test]
+    fn audit_report_rejects_missing_mandatory_records() {
+        let error = build_compliance_audit_report(ComplianceAuditReportRequest {
+            report_id: "report-field-north".to_string(),
+            org_id: "org-alpha".to_string(),
+            field_id: "field-north".to_string(),
+            generated_at: "2026-06-13T12:00:00Z".to_string(),
+            records: vec![compliance_record(
+                "remote-log-1",
+                ComplianceRecordType::RemoteIdLog,
+                Some("flight-77"),
+                "provenance:remote-id/remote-log-1/v1",
+                Some(ComplianceRecordPayload::RemoteIdFlightLog(remote_id_log())),
+            )],
+            mandatory_record_types: vec![
+                ComplianceRecordType::RemoteIdLog,
+                ComplianceRecordType::ChemicalApplication,
+            ],
+        })
+        .expect_err("missing mandatory records should fail export");
+
+        assert_eq!(
+            error,
+            ComplianceAuditReportError::MissingMandatoryRecords {
+                missing: vec![ComplianceRecordType::ChemicalApplication]
+            }
+        );
+    }
+
+    fn compliance_record(
+        record_id: &str,
+        record_type: ComplianceRecordType,
+        flight_id: Option<&str>,
+        provenance_ref: &str,
+        payload: Option<ComplianceRecordPayload>,
+    ) -> super::ComplianceRecord {
+        build_initial_compliance_record(
+            CreateComplianceRecordRequest {
+                record_id: Some(record_id.to_string()),
+                record_type,
+                org_id: "org-alpha".to_string(),
+                field_id: "field-north".to_string(),
+                flight_id: flight_id.map(ToOwned::to_owned),
+                actor: "compliance-officer-1".to_string(),
+                provenance_ref: provenance_ref.to_string(),
+                payload,
+            },
+            "generated-record".to_string(),
+            "2026-06-13T12:00:00Z".to_string(),
+        )
+        .expect("compliance record should be valid")
+    }
+
+    fn remote_id_log() -> RemoteIdFlightLogRecord {
+        RemoteIdFlightLogRecord {
+            flight_id: "flight-77".to_string(),
+            operator_id: "operator-17".to_string(),
+            aircraft_id: "aircraft-ag-9".to_string(),
+            started_at: "2026-06-12T12:00:00Z".to_string(),
+            ended_at: "2026-06-12T12:18:00Z".to_string(),
+            track: vec![RemoteIdTrackPoint {
+                observed_at: "2026-06-12T12:02:00Z".to_string(),
+                longitude: -96.61,
+                latitude: 41.21,
+                altitude_m: 118.0,
+            }],
+            telemetry_gaps: vec![TelemetryGapRecord {
+                started_at: "2026-06-12T12:04:00Z".to_string(),
+                ended_at: "2026-06-12T12:08:00Z".to_string(),
+                reason: "remote-id-broadcast-dropout".to_string(),
+            }],
+        }
     }
 
     fn operator_cert(

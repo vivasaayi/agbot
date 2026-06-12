@@ -20,10 +20,11 @@ use axum::{
 };
 use compliance::{
     airspace_zone_contains_point, airspace_zone_is_effective_at, append_compliance_record_version,
-    build_airspace_zone_record, build_initial_compliance_record, refuse_in_place_mutation,
-    AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
-    AirspaceZoneRecord, AppendComplianceRecordVersionRequest, ComplianceRecord,
-    ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
+    build_airspace_zone_record, build_compliance_audit_report, build_initial_compliance_record,
+    refuse_in_place_mutation, AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError,
+    AirspaceZoneIngestRequest, AirspaceZoneRecord, AppendComplianceRecordVersionRequest,
+    ComplianceAuditReport, ComplianceAuditReportError, ComplianceAuditReportRequest,
+    ComplianceRecord, ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
     CreateComplianceRecordRequest,
 };
 use crop_intelligence::{
@@ -455,6 +456,20 @@ pub struct ComplianceRecordListQuery {
     pub record_type: Option<String>,
     pub org_id: Option<String>,
     pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceAuditReportExportRequest {
+    #[serde(default)]
+    pub report_id: Option<String>,
+    #[serde(default)]
+    pub org_id: String,
+    #[serde(default)]
+    pub field_id: String,
+    #[serde(default)]
+    pub generated_at: Option<String>,
+    #[serde(default)]
+    pub mandatory_record_types: Vec<ComplianceRecordType>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2826,6 +2841,36 @@ pub async fn refuse_delete_compliance_record(
     .await?;
 
     Err(compliance_record_error(refuse_in_place_mutation("delete")))
+}
+
+pub async fn export_compliance_audit_report(
+    State(state): State<AppState>,
+    Json(request): Json<ComplianceAuditReportExportRequest>,
+) -> AppResult<Json<ComplianceAuditReport>> {
+    let records =
+        load_compliance_records_for_report(&state, &request.org_id, &request.field_id).await?;
+    let mandatory_record_types = if request.mandatory_record_types.is_empty() {
+        default_compliance_report_mandatory_types()
+    } else {
+        request.mandatory_record_types
+    };
+    let report = build_compliance_audit_report(ComplianceAuditReportRequest {
+        report_id: request
+            .report_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("compliance-report-{}", Uuid::new_v4())),
+        org_id: request.org_id,
+        field_id: request.field_id,
+        generated_at: request
+            .generated_at
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(current_record_timestamp),
+        records,
+        mandatory_record_types,
+    })
+    .map_err(compliance_audit_report_error)?;
+
+    Ok(Json(report))
 }
 
 pub async fn ingest_airspace_zone(
@@ -5284,6 +5329,10 @@ fn compliance_record_error(error: ComplianceRecordError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn compliance_audit_report_error(error: ComplianceAuditReportError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_compliance_record_type(value: String) -> AppResult<ComplianceRecordType> {
     value
         .parse::<ComplianceRecordType>()
@@ -7643,6 +7692,39 @@ async fn load_latest_compliance_record(
     .map_err(Error::from)?
     .map(|row| decode_compliance_record(&row))
     .transpose()
+}
+
+async fn load_compliance_records_for_report(
+    state: &AppState,
+    org_id: &str,
+    field_id: &str,
+) -> AppResult<Vec<ComplianceRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT record_id, version, record_type, org_id, field_id, flight_id, created_at, actor, provenance_ref, prior_version, change_reason, payload_json
+        FROM compliance_records
+        WHERE org_id = ?1 AND field_id = ?2
+        ORDER BY record_type ASC, record_id ASC, version ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_compliance_record(&row))
+        .collect()
+}
+
+fn default_compliance_report_mandatory_types() -> Vec<ComplianceRecordType> {
+    vec![
+        ComplianceRecordType::RemoteIdLog,
+        ComplianceRecordType::ChemicalApplication,
+        ComplianceRecordType::OperatorCertification,
+        ComplianceRecordType::AuthorizationDecision,
+    ]
 }
 
 async fn audit_compliance_record_event(
