@@ -319,6 +319,78 @@ pub struct ComponentHealthVerdict {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentServiceLimit {
+    #[serde(default)]
+    pub component_id: String,
+    #[serde(default)]
+    pub max_flight_hours: Option<f64>,
+    #[serde(default)]
+    pub max_cycles: Option<u32>,
+    #[serde(default)]
+    pub max_duty_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FleetReadinessRequest {
+    #[serde(default)]
+    pub airframe_id: String,
+    #[serde(default)]
+    pub checked_at: String,
+    #[serde(default)]
+    pub installed_components: Vec<FleetComponentRecord>,
+    #[serde(default)]
+    pub service_limits: Vec<ComponentServiceLimit>,
+    #[serde(default)]
+    pub health_verdicts: Vec<ComponentHealthVerdict>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetReadinessDecisionStatus {
+    Permitted,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetReadinessBlockReason {
+    MissingInstalledComponent,
+    MissingServiceLimit,
+    OverdueServiceHours,
+    OverdueServiceCycles,
+    OverdueDutyScore,
+    MissingHealthData,
+    StaleHealthData,
+    CriticalHealthVerdict,
+    BatteryHealthBelowThreshold,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetReadinessBlocker {
+    pub reason_code: FleetReadinessBlockReason,
+    pub component_ref: Option<String>,
+    pub indicator: Option<FleetHealthIndicator>,
+    pub observed_value: Option<f64>,
+    pub threshold: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetReadinessDecision {
+    pub airframe_id: String,
+    pub checked_at: String,
+    pub status: FleetReadinessDecisionStatus,
+    pub blockers: Vec<FleetReadinessBlocker>,
+    pub component_count: usize,
+    pub verdict_count: usize,
+}
+
+impl FleetReadinessDecision {
+    pub fn is_clear(&self) -> bool {
+        self.status == FleetReadinessDecisionStatus::Permitted && self.blockers.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetComponentRecord {
     pub component_id: String,
     pub component_type: FleetComponentType,
@@ -400,6 +472,8 @@ pub enum FleetHealthError {
         component_id: String,
         sample_component_id: String,
     },
+    #[error("service limit must have a component_id and at least one finite non-negative limit")]
+    InvalidServiceLimit { component_id: String },
     #[error("battery current must be finite and non-zero")]
     InvalidBatteryCurrent,
     #[error("telemetry gap timestamp cannot be empty")]
@@ -713,6 +787,115 @@ pub fn evaluate_component_health_verdict(
     })
 }
 
+pub fn evaluate_fleet_readiness(
+    request: FleetReadinessRequest,
+) -> Result<FleetReadinessDecision, FleetHealthError> {
+    let airframe_id =
+        normalize_required_text(request.airframe_id, FleetHealthError::EmptyAirframeId)?;
+    let checked_at = normalize_required_text(request.checked_at, FleetHealthError::EmptyCreatedAt)?;
+    let service_limits = request
+        .service_limits
+        .into_iter()
+        .map(normalize_component_service_limit)
+        .collect::<Result<Vec<_>, _>>()?;
+    let installed_components = request
+        .installed_components
+        .into_iter()
+        .filter(|component| {
+            component.airframe_id.as_deref() == Some(airframe_id.as_str())
+                && component.removed_at.is_none()
+        })
+        .collect::<Vec<_>>();
+    let mut blockers = Vec::new();
+
+    if installed_components.is_empty() {
+        blockers.push(readiness_blocker(
+            FleetReadinessBlockReason::MissingInstalledComponent,
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    for component in &installed_components {
+        match service_limits
+            .iter()
+            .find(|limit| limit.component_id == component.component_id)
+        {
+            Some(limit) => append_service_limit_blockers(component, limit, &mut blockers),
+            None => blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::MissingServiceLimit,
+                Some(component.component_id.clone()),
+                None,
+                None,
+                None,
+            )),
+        }
+
+        let Some(verdict) = request
+            .health_verdicts
+            .iter()
+            .find(|verdict| verdict.component_id.trim() == component.component_id)
+        else {
+            blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::MissingHealthData,
+                Some(component.component_id.clone()),
+                None,
+                None,
+                None,
+            ));
+            continue;
+        };
+
+        if verdict.freshness == HealthIndicatorFreshness::Stale {
+            blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::StaleHealthData,
+                Some(component.component_id.clone()),
+                verdict.indicator,
+                verdict.value,
+                verdict.threshold,
+            ));
+            continue;
+        }
+
+        if verdict.status == ComponentHealthVerdictStatus::Critical {
+            blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::CriticalHealthVerdict,
+                Some(component.component_id.clone()),
+                verdict.indicator,
+                verdict.value,
+                verdict.threshold,
+            ));
+        } else if component.component_type == FleetComponentType::Battery
+            && verdict.status == ComponentHealthVerdictStatus::Degraded
+        {
+            blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::BatteryHealthBelowThreshold,
+                Some(component.component_id.clone()),
+                verdict.indicator,
+                verdict.value,
+                verdict.threshold,
+            ));
+        }
+    }
+
+    let status = if blockers.is_empty() {
+        FleetReadinessDecisionStatus::Permitted
+    } else {
+        FleetReadinessDecisionStatus::Blocked
+    };
+
+    Ok(FleetReadinessDecision {
+        airframe_id,
+        checked_at,
+        status,
+        blockers,
+        component_count: installed_components.len(),
+        verdict_count: request.health_verdicts.len(),
+    })
+}
+
 pub fn component_event(
     component_id: &str,
     event_type: &str,
@@ -852,6 +1035,92 @@ fn compare_verdict_evidence(
         })
 }
 
+fn normalize_component_service_limit(
+    limit: ComponentServiceLimit,
+) -> Result<ComponentServiceLimit, FleetHealthError> {
+    let component_id =
+        normalize_required_text(limit.component_id, FleetHealthError::EmptyComponentId)?;
+    let has_limit = limit.max_flight_hours.is_some()
+        || limit.max_cycles.is_some()
+        || limit.max_duty_score.is_some();
+    let valid = has_limit
+        && optional_nonnegative_finite(limit.max_flight_hours)
+        && optional_nonnegative_finite(limit.max_duty_score);
+
+    if valid {
+        Ok(ComponentServiceLimit {
+            component_id,
+            max_flight_hours: limit.max_flight_hours,
+            max_cycles: limit.max_cycles,
+            max_duty_score: limit.max_duty_score,
+        })
+    } else {
+        Err(FleetHealthError::InvalidServiceLimit { component_id })
+    }
+}
+
+fn optional_nonnegative_finite(value: Option<f64>) -> bool {
+    value.is_none_or(|value| value.is_finite() && value >= 0.0)
+}
+
+fn append_service_limit_blockers(
+    component: &FleetComponentRecord,
+    limit: &ComponentServiceLimit,
+    blockers: &mut Vec<FleetReadinessBlocker>,
+) {
+    if let Some(max_flight_hours) = limit.max_flight_hours {
+        if component.flight_hours > max_flight_hours {
+            blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::OverdueServiceHours,
+                Some(component.component_id.clone()),
+                None,
+                Some(component.flight_hours),
+                Some(max_flight_hours),
+            ));
+        }
+    }
+
+    if let Some(max_cycles) = limit.max_cycles {
+        if component.cycles > max_cycles {
+            blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::OverdueServiceCycles,
+                Some(component.component_id.clone()),
+                None,
+                Some(component.cycles as f64),
+                Some(max_cycles as f64),
+            ));
+        }
+    }
+
+    if let Some(max_duty_score) = limit.max_duty_score {
+        if component.duty_score > max_duty_score {
+            blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::OverdueDutyScore,
+                Some(component.component_id.clone()),
+                None,
+                Some(component.duty_score),
+                Some(max_duty_score),
+            ));
+        }
+    }
+}
+
+fn readiness_blocker(
+    reason_code: FleetReadinessBlockReason,
+    component_ref: Option<String>,
+    indicator: Option<FleetHealthIndicator>,
+    observed_value: Option<f64>,
+    threshold: Option<f64>,
+) -> FleetReadinessBlocker {
+    FleetReadinessBlocker {
+        reason_code,
+        component_ref,
+        indicator,
+        observed_value,
+        threshold,
+    }
+}
+
 fn normalize_service_history_entry(
     entry: ServiceHistoryEntry,
 ) -> Result<ServiceHistoryEntry, FleetHealthError> {
@@ -909,11 +1178,14 @@ mod tests {
     use super::{
         accrue_component_duty, build_component_duty_accruals, build_component_record,
         component_event, derive_health_indicators, evaluate_component_health_verdict,
-        install_component, ComponentHealthVerdictRequest, ComponentHealthVerdictStatus,
-        DutyAccrualRequest, FleetComponentType, FleetHealthError, FleetHealthIndicator,
-        HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
-        HealthTelemetrySample, HealthVerdictReasonCode, InstallComponentRequest,
-        RegisterComponentRequest, ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
+        evaluate_fleet_readiness, install_component, ComponentHealthVerdict,
+        ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
+        DutyAccrualRequest, FleetComponentRecord, FleetComponentType, FleetHealthError,
+        FleetHealthIndicator, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
+        FleetReadinessRequest, HealthIndicatorFreshness, HealthIndicatorThreshold,
+        HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
+        InstallComponentRequest, RegisterComponentRequest, ServiceHistoryEntry,
+        TelemetryHealthIndicatorRequest,
     };
     use timeseries::SeriesValue;
 
@@ -1286,6 +1558,211 @@ mod tests {
         );
     }
 
+    #[test]
+    fn readiness_allows_airframe_with_fresh_verdicts_and_service_in_limits() {
+        let decision = evaluate_fleet_readiness(readiness_request(
+            vec![
+                component_for_readiness(
+                    "battery-pack-001",
+                    FleetComponentType::Battery,
+                    15.0,
+                    20,
+                    10.0,
+                ),
+                component_for_readiness(
+                    "motor-front-left",
+                    FleetComponentType::Motor,
+                    15.0,
+                    20,
+                    10.0,
+                ),
+            ],
+            vec![
+                service_limit("battery-pack-001", Some(100.0), Some(200), Some(100.0)),
+                service_limit("motor-front-left", Some(100.0), Some(200), Some(100.0)),
+            ],
+            vec![
+                component_verdict(
+                    "battery-pack-001",
+                    ComponentHealthVerdictStatus::Ok,
+                    HealthIndicatorFreshness::Fresh,
+                ),
+                component_verdict(
+                    "motor-front-left",
+                    ComponentHealthVerdictStatus::Watch,
+                    HealthIndicatorFreshness::Fresh,
+                ),
+            ],
+        ))
+        .expect("readiness should evaluate");
+
+        assert_eq!(decision.status, FleetReadinessDecisionStatus::Permitted);
+        assert!(decision.blockers.is_empty());
+        assert_eq!(decision.component_count, 2);
+    }
+
+    #[test]
+    fn readiness_hard_blocks_overdue_service_interval() {
+        let decision = evaluate_fleet_readiness(readiness_request(
+            vec![component_for_readiness(
+                "battery-pack-001",
+                FleetComponentType::Battery,
+                121.0,
+                20,
+                10.0,
+            )],
+            vec![service_limit(
+                "battery-pack-001",
+                Some(100.0),
+                Some(200),
+                Some(100.0),
+            )],
+            vec![component_verdict(
+                "battery-pack-001",
+                ComponentHealthVerdictStatus::Ok,
+                HealthIndicatorFreshness::Fresh,
+            )],
+        ))
+        .expect("readiness should evaluate");
+
+        assert_eq!(decision.status, FleetReadinessDecisionStatus::Blocked);
+        assert_eq!(
+            decision.blockers[0].reason_code,
+            FleetReadinessBlockReason::OverdueServiceHours
+        );
+        assert_eq!(
+            decision.blockers[0].component_ref.as_deref(),
+            Some("battery-pack-001")
+        );
+        assert_eq!(decision.blockers[0].observed_value, Some(121.0));
+        assert_eq!(decision.blockers[0].threshold, Some(100.0));
+    }
+
+    #[test]
+    fn readiness_hard_blocks_active_critical_health_verdict() {
+        let decision = evaluate_fleet_readiness(readiness_request(
+            vec![component_for_readiness(
+                "motor-front-left",
+                FleetComponentType::Motor,
+                15.0,
+                20,
+                10.0,
+            )],
+            vec![service_limit(
+                "motor-front-left",
+                Some(100.0),
+                Some(200),
+                Some(100.0),
+            )],
+            vec![component_verdict(
+                "motor-front-left",
+                ComponentHealthVerdictStatus::Critical,
+                HealthIndicatorFreshness::Fresh,
+            )],
+        ))
+        .expect("readiness should evaluate");
+
+        assert_eq!(decision.status, FleetReadinessDecisionStatus::Blocked);
+        assert_eq!(
+            decision.blockers[0].reason_code,
+            FleetReadinessBlockReason::CriticalHealthVerdict
+        );
+        assert_eq!(
+            decision.blockers[0].component_ref.as_deref(),
+            Some("motor-front-left")
+        );
+    }
+
+    #[test]
+    fn readiness_hard_blocks_degraded_battery_health() {
+        let decision = evaluate_fleet_readiness(readiness_request(
+            vec![component_for_readiness(
+                "battery-pack-001",
+                FleetComponentType::Battery,
+                15.0,
+                20,
+                10.0,
+            )],
+            vec![service_limit(
+                "battery-pack-001",
+                Some(100.0),
+                Some(200),
+                Some(100.0),
+            )],
+            vec![component_verdict(
+                "battery-pack-001",
+                ComponentHealthVerdictStatus::Degraded,
+                HealthIndicatorFreshness::Fresh,
+            )],
+        ))
+        .expect("readiness should evaluate");
+
+        assert_eq!(decision.status, FleetReadinessDecisionStatus::Blocked);
+        assert_eq!(
+            decision.blockers[0].reason_code,
+            FleetReadinessBlockReason::BatteryHealthBelowThreshold
+        );
+        assert_eq!(
+            decision.blockers[0].component_ref.as_deref(),
+            Some("battery-pack-001")
+        );
+    }
+
+    #[test]
+    fn readiness_denies_missing_or_stale_health_data_by_default() {
+        let stale = evaluate_fleet_readiness(readiness_request(
+            vec![component_for_readiness(
+                "battery-pack-001",
+                FleetComponentType::Battery,
+                15.0,
+                20,
+                10.0,
+            )],
+            vec![service_limit(
+                "battery-pack-001",
+                Some(100.0),
+                Some(200),
+                Some(100.0),
+            )],
+            vec![component_verdict(
+                "battery-pack-001",
+                ComponentHealthVerdictStatus::Ok,
+                HealthIndicatorFreshness::Stale,
+            )],
+        ))
+        .expect("readiness should evaluate");
+
+        assert_eq!(stale.status, FleetReadinessDecisionStatus::Blocked);
+        assert_eq!(
+            stale.blockers[0].reason_code,
+            FleetReadinessBlockReason::StaleHealthData
+        );
+
+        let missing = evaluate_fleet_readiness(readiness_request(
+            vec![component_for_readiness(
+                "motor-front-left",
+                FleetComponentType::Motor,
+                15.0,
+                20,
+                10.0,
+            )],
+            vec![service_limit(
+                "motor-front-left",
+                Some(100.0),
+                Some(200),
+                Some(100.0),
+            )],
+            vec![],
+        ))
+        .expect("readiness should evaluate");
+
+        assert_eq!(missing.status, FleetReadinessDecisionStatus::Blocked);
+        assert_eq!(
+            missing.blockers[0].reason_code,
+            FleetReadinessBlockReason::MissingHealthData
+        );
+    }
+
     fn indicator_sample(
         component_id: &str,
         indicator: FleetHealthIndicator,
@@ -1313,6 +1790,102 @@ mod tests {
             watch_at,
             degraded_at,
             critical_at,
+        }
+    }
+
+    fn readiness_request(
+        installed_components: Vec<FleetComponentRecord>,
+        service_limits: Vec<ComponentServiceLimit>,
+        health_verdicts: Vec<ComponentHealthVerdict>,
+    ) -> FleetReadinessRequest {
+        FleetReadinessRequest {
+            airframe_id: "airframe-1".to_string(),
+            checked_at: "2026-06-12T12:45:00Z".to_string(),
+            installed_components,
+            service_limits,
+            health_verdicts,
+        }
+    }
+
+    fn component_for_readiness(
+        component_id: &str,
+        component_type: FleetComponentType,
+        flight_hours: f64,
+        cycles: u32,
+        duty_score: f64,
+    ) -> FleetComponentRecord {
+        FleetComponentRecord {
+            component_id: component_id.to_string(),
+            component_type,
+            serial: format!("{component_id}-serial"),
+            airframe_id: Some("airframe-1".to_string()),
+            installed_at: Some("2026-06-01T10:00:00Z".to_string()),
+            removed_at: None,
+            service_history: vec![],
+            flight_hours,
+            cycles,
+            duty_score,
+            created_at: "2026-06-01T10:05:00Z".to_string(),
+            updated_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn service_limit(
+        component_id: &str,
+        max_flight_hours: Option<f64>,
+        max_cycles: Option<u32>,
+        max_duty_score: Option<f64>,
+    ) -> ComponentServiceLimit {
+        ComponentServiceLimit {
+            component_id: component_id.to_string(),
+            max_flight_hours,
+            max_cycles,
+            max_duty_score,
+        }
+    }
+
+    fn component_verdict(
+        component_id: &str,
+        status: ComponentHealthVerdictStatus,
+        freshness: HealthIndicatorFreshness,
+    ) -> ComponentHealthVerdict {
+        let (reason_code, value, threshold) = match status {
+            ComponentHealthVerdictStatus::Ok => (
+                HealthVerdictReasonCode::AllIndicatorsWithinThreshold,
+                30.0,
+                60.0,
+            ),
+            ComponentHealthVerdictStatus::Watch => {
+                (HealthVerdictReasonCode::WatchThresholdExceeded, 0.7, 0.6)
+            }
+            ComponentHealthVerdictStatus::Degraded => {
+                (HealthVerdictReasonCode::DegradedThresholdExceeded, 1.2, 1.0)
+            }
+            ComponentHealthVerdictStatus::Critical => {
+                (HealthVerdictReasonCode::CriticalThresholdExceeded, 1.8, 1.5)
+            }
+        };
+
+        ComponentHealthVerdict {
+            component_id: component_id.to_string(),
+            evaluated_at: "2026-06-12T12:30:00Z".to_string(),
+            method_version: "fleet-health-thresholds-v1".to_string(),
+            status,
+            reason_code,
+            indicator: Some(FleetHealthIndicator::MotorVibration),
+            threshold: Some(threshold),
+            value: Some(value),
+            freshness,
+            evidence: vec![HealthVerdictEvidence {
+                indicator: FleetHealthIndicator::MotorVibration,
+                value,
+                threshold,
+                status,
+                reason_code,
+                sample_ts: "2026-06-12T12:00:00Z".to_string(),
+                source_ref: "telemetry:session-001".to_string(),
+                freshness,
+            }],
         }
     }
 }
