@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,6 +141,120 @@ pub struct ReadingRejectionRecord {
     pub rejected_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayReadingMetric {
+    BatteryVoltage,
+    ElectricalConductivity,
+    SoilMoisturePercent,
+    SoilTemperatureCelsius,
+}
+
+impl GatewayReadingMetric {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GatewayReadingMetric::BatteryVoltage => "battery_voltage",
+            GatewayReadingMetric::ElectricalConductivity => "electrical_conductivity",
+            GatewayReadingMetric::SoilMoisturePercent => "soil_moisture_percent",
+            GatewayReadingMetric::SoilTemperatureCelsius => "soil_temperature_celsius",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RawGatewayReading {
+    pub payload_id: String,
+    pub device_id: String,
+    pub metric: GatewayReadingMetric,
+    pub raw_value: f64,
+    pub gateway_ts: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GatewayReadingRecord {
+    pub payload_id: String,
+    pub device_id: String,
+    pub metric: GatewayReadingMetric,
+    pub raw_value: f64,
+    pub gateway_ts: String,
+    pub received_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayPayloadRejectionReason {
+    MalformedPayload,
+    RetiredDevice,
+    UnknownDevice,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GatewayPayloadRejection {
+    pub payload_id: Option<String>,
+    pub device_id: Option<String>,
+    pub reason: GatewayPayloadRejectionReason,
+    pub details: String,
+    pub rejected_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GatewayIngestSummary {
+    pub accepted_readings: Vec<GatewayReadingRecord>,
+    pub rejections: Vec<GatewayPayloadRejection>,
+    pub rejected_payload_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum GatewayIngestError {
+    #[error("payload_id cannot be empty")]
+    EmptyPayloadId,
+    #[error("gateway reading device_id cannot be empty")]
+    EmptyGatewayDeviceId,
+    #[error("gateway timestamp cannot be empty")]
+    EmptyGatewayTimestamp,
+    #[error("received_at cannot be empty")]
+    EmptyReceivedAt,
+    #[error("gateway raw_value must be finite")]
+    InvalidRawValue,
+    #[error("malformed gateway payload {payload_id}: {reason}")]
+    MalformedPayload { payload_id: String, reason: String },
+}
+
+pub trait GatewayAdapter {
+    fn subscribe(&mut self) -> Result<(), GatewayIngestError>;
+    fn next_reading(&mut self) -> Option<Result<RawGatewayReading, GatewayIngestError>>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimulatedGateway {
+    readings: VecDeque<Result<RawGatewayReading, GatewayIngestError>>,
+    subscribed: bool,
+}
+
+impl SimulatedGateway {
+    pub fn new(readings: Vec<Result<RawGatewayReading, GatewayIngestError>>) -> Self {
+        Self {
+            readings: VecDeque::from(readings),
+            subscribed: false,
+        }
+    }
+}
+
+impl GatewayAdapter for SimulatedGateway {
+    fn subscribe(&mut self) -> Result<(), GatewayIngestError> {
+        self.subscribed = true;
+        Ok(())
+    }
+
+    fn next_reading(&mut self) -> Option<Result<RawGatewayReading, GatewayIngestError>> {
+        if self.subscribed {
+            self.readings.pop_front()
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SoilIotError {
     #[error("device_id cannot be empty")]
@@ -244,6 +359,144 @@ pub fn reading_rejection_for_device(
         .transpose()
 }
 
+pub fn decode_gateway_payload(
+    payload_id: String,
+    payload_json: &str,
+) -> Result<RawGatewayReading, GatewayIngestError> {
+    let payload_id = normalize_gateway_text(payload_id, GatewayIngestError::EmptyPayloadId)?;
+    let payload = serde_json::from_str::<GatewayPayloadBody>(payload_json).map_err(|error| {
+        GatewayIngestError::MalformedPayload {
+            payload_id: payload_id.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+
+    validate_raw_gateway_reading(RawGatewayReading {
+        payload_id,
+        device_id: payload.device_id,
+        metric: payload.metric,
+        raw_value: payload.raw_value,
+        gateway_ts: payload.gateway_ts,
+    })
+}
+
+pub fn ingest_gateway_readings(
+    gateway: &mut impl GatewayAdapter,
+    registered_devices: &[SoilDeviceRecord],
+    received_at: String,
+) -> Result<GatewayIngestSummary, GatewayIngestError> {
+    let received_at = normalize_gateway_text(received_at, GatewayIngestError::EmptyReceivedAt)?;
+    gateway.subscribe()?;
+    let devices = registered_devices
+        .iter()
+        .map(|device| (device.device_id.clone(), device))
+        .collect::<BTreeMap<_, _>>();
+    let mut accepted_readings = Vec::new();
+    let mut rejections = Vec::new();
+
+    while let Some(next) = gateway.next_reading() {
+        match next {
+            Ok(reading) => {
+                let reading = match validate_raw_gateway_reading(reading) {
+                    Ok(reading) => reading,
+                    Err(error) => {
+                        rejections.push(rejection_from_gateway_error(error, &received_at));
+                        continue;
+                    }
+                };
+                match devices.get(&reading.device_id).copied() {
+                    None => rejections.push(GatewayPayloadRejection {
+                        payload_id: Some(reading.payload_id),
+                        device_id: Some(reading.device_id),
+                        reason: GatewayPayloadRejectionReason::UnknownDevice,
+                        details: "reading device is not registered".to_string(),
+                        rejected_at: received_at.clone(),
+                    }),
+                    Some(device) if device.status == SoilDeviceStatus::Retired => {
+                        rejections.push(GatewayPayloadRejection {
+                            payload_id: Some(reading.payload_id),
+                            device_id: Some(reading.device_id),
+                            reason: GatewayPayloadRejectionReason::RetiredDevice,
+                            details: "reading device is retired".to_string(),
+                            rejected_at: received_at.clone(),
+                        })
+                    }
+                    Some(_) => accepted_readings.push(GatewayReadingRecord {
+                        payload_id: reading.payload_id,
+                        device_id: reading.device_id,
+                        metric: reading.metric,
+                        raw_value: reading.raw_value,
+                        gateway_ts: reading.gateway_ts,
+                        received_at: received_at.clone(),
+                    }),
+                }
+            }
+            Err(error) => rejections.push(rejection_from_gateway_error(error, &received_at)),
+        }
+    }
+
+    let rejected_payload_count = rejections.len() as u32;
+    Ok(GatewayIngestSummary {
+        accepted_readings,
+        rejections,
+        rejected_payload_count,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct GatewayPayloadBody {
+    device_id: String,
+    metric: GatewayReadingMetric,
+    raw_value: f64,
+    gateway_ts: String,
+}
+
+fn validate_raw_gateway_reading(
+    reading: RawGatewayReading,
+) -> Result<RawGatewayReading, GatewayIngestError> {
+    let payload_id =
+        normalize_gateway_text(reading.payload_id, GatewayIngestError::EmptyPayloadId)?;
+    let device_id =
+        normalize_gateway_text(reading.device_id, GatewayIngestError::EmptyGatewayDeviceId)?;
+    let gateway_ts = normalize_gateway_text(
+        reading.gateway_ts,
+        GatewayIngestError::EmptyGatewayTimestamp,
+    )?;
+    if !reading.raw_value.is_finite() {
+        return Err(GatewayIngestError::InvalidRawValue);
+    }
+
+    Ok(RawGatewayReading {
+        payload_id,
+        device_id,
+        metric: reading.metric,
+        raw_value: reading.raw_value,
+        gateway_ts,
+    })
+}
+
+fn rejection_from_gateway_error(
+    error: GatewayIngestError,
+    rejected_at: &str,
+) -> GatewayPayloadRejection {
+    match error {
+        GatewayIngestError::MalformedPayload { payload_id, reason } => GatewayPayloadRejection {
+            payload_id: Some(payload_id),
+            device_id: None,
+            reason: GatewayPayloadRejectionReason::MalformedPayload,
+            details: reason,
+            rejected_at: rejected_at.to_string(),
+        },
+        other => GatewayPayloadRejection {
+            payload_id: None,
+            device_id: None,
+            reason: GatewayPayloadRejectionReason::MalformedPayload,
+            details: other.to_string(),
+            rejected_at: rejected_at.to_string(),
+        },
+    }
+}
+
 fn normalize_position(position: GeoPosition) -> Result<GeoPosition, SoilIotError> {
     let crs = normalize_required_text(position.crs, SoilIotError::EmptyCrs)?;
     if crs != "EPSG:4326" {
@@ -262,6 +515,18 @@ fn normalize_position(position: GeoPosition) -> Result<GeoPosition, SoilIotError
         longitude: position.longitude,
         crs,
     })
+}
+
+fn normalize_gateway_text(
+    value: String,
+    error: GatewayIngestError,
+) -> Result<String, GatewayIngestError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
 }
 
 fn normalize_required_text(value: String, error: SoilIotError) -> Result<String, SoilIotError> {
@@ -287,8 +552,10 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_soil_device_record, reading_rejection_for_device, transition_soil_device_status,
-        GeoPosition, ReadingRejectionReason, RegisterSoilDeviceRequest, SoilDeviceStatus,
+        build_soil_device_record, decode_gateway_payload, ingest_gateway_readings,
+        reading_rejection_for_device, transition_soil_device_status, GatewayIngestError,
+        GatewayPayloadRejectionReason, GatewayReadingMetric, GeoPosition, RawGatewayReading,
+        ReadingRejectionReason, RegisterSoilDeviceRequest, SimulatedGateway, SoilDeviceStatus,
         SoilIotError, SoilSensorType,
     };
 
@@ -404,6 +671,53 @@ mod tests {
         .expect_err("invalid position should be rejected");
 
         assert_eq!(error, SoilIotError::InvalidPosition);
+    }
+
+    #[test]
+    fn simulated_gateway_ingest_records_registered_device_readings() {
+        let mut gateway = SimulatedGateway::new(vec![Ok(RawGatewayReading {
+            payload_id: "payload-001".to_string(),
+            device_id: "soil-probe-001".to_string(),
+            metric: GatewayReadingMetric::SoilMoisturePercent,
+            raw_value: 34.5,
+            gateway_ts: "2026-06-12T10:00:00Z".to_string(),
+        })]);
+        let device = valid_device();
+        let result =
+            ingest_gateway_readings(&mut gateway, &[device], "2026-06-12T10:00:03Z".to_string())
+                .expect("ingest should succeed");
+
+        assert_eq!(result.accepted_readings.len(), 1);
+        assert_eq!(result.accepted_readings[0].device_id, "soil-probe-001");
+        assert_eq!(result.accepted_readings[0].raw_value, 34.5);
+        assert_eq!(
+            result.accepted_readings[0].received_at,
+            "2026-06-12T10:00:03Z"
+        );
+        assert_eq!(result.rejected_payload_count, 0);
+    }
+
+    #[test]
+    fn malformed_gateway_payload_is_rejected_and_counted() {
+        let error = decode_gateway_payload("payload-bad".to_string(), "{not-json")
+            .expect_err("malformed payload should fail decode");
+        assert!(matches!(error, GatewayIngestError::MalformedPayload { .. }));
+
+        let mut gateway = SimulatedGateway::new(vec![Err(error)]);
+        let result = ingest_gateway_readings(
+            &mut gateway,
+            &[valid_device()],
+            "2026-06-12T10:00:03Z".to_string(),
+        )
+        .expect("malformed payload should be counted, not fatal");
+
+        assert_eq!(result.accepted_readings.len(), 0);
+        assert_eq!(result.rejected_payload_count, 1);
+        assert_eq!(result.rejections.len(), 1);
+        assert_eq!(
+            result.rejections[0].reason,
+            GatewayPayloadRejectionReason::MalformedPayload
+        );
     }
 
     fn valid_device() -> super::SoilDeviceRecord {
