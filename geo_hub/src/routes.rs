@@ -14,6 +14,11 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     Json,
 };
+use compliance::{
+    append_compliance_record_version, build_initial_compliance_record, refuse_in_place_mutation,
+    AppendComplianceRecordVersionRequest, ComplianceRecord, ComplianceRecordError,
+    ComplianceRecordType, CreateComplianceRecordRequest,
+};
 use crop_intelligence::{
     build_model_version_record, validate_model_reference, CropModelRegistryError, CropModelTask,
     InferenceModelReference, ModelGateResponse, ModelVersionRecord,
@@ -311,6 +316,14 @@ pub struct UpdateReconstructionStatusRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CropModelListQuery {
     pub task: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceRecordListQuery {
+    pub record_id: Option<String>,
+    pub record_type: Option<String>,
+    pub org_id: Option<String>,
+    pub field_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1772,6 +1785,117 @@ pub async fn validate_crop_model_for_inference(
         }
         Err(error) => Err(crop_model_registry_error(error)),
     }
+}
+
+pub async fn create_compliance_record(
+    State(state): State<AppState>,
+    Json(request): Json<CreateComplianceRecordRequest>,
+) -> AppResult<Json<ComplianceRecord>> {
+    let record = build_initial_compliance_record(
+        request,
+        format!("compliance-record-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(compliance_record_error)?;
+
+    assert_field_owned_by_org(&state, &record.org_id, &record.field_id).await?;
+    insert_compliance_record(&state, &record).await?;
+    audit_compliance_record_event(
+        &state,
+        &record.record_id,
+        "record_created",
+        Some(&record.actor),
+        Some("initial compliance record version created"),
+    )
+    .await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_compliance_records(
+    Query(query): Query<ComplianceRecordListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ComplianceRecord>>> {
+    let record_id = normalize_optional_text(query.record_id);
+    let org_id = normalize_optional_text(query.org_id);
+    let field_id = normalize_optional_text(query.field_id);
+    let record_type = normalize_optional_text(query.record_type)
+        .map(parse_compliance_record_type)
+        .transpose()?
+        .map(|record_type| record_type.as_str().to_string());
+
+    let rows = sqlx::query(
+        r#"
+        SELECT record_id, version, record_type, org_id, field_id, flight_id, created_at,
+               actor, provenance_ref, prior_version, change_reason
+        FROM compliance_records
+        WHERE (?1 IS NULL OR record_id = ?1)
+          AND (?2 IS NULL OR record_type = ?2)
+          AND (?3 IS NULL OR org_id = ?3)
+          AND (?4 IS NULL OR field_id = ?4)
+        ORDER BY record_id ASC, version ASC
+        "#,
+    )
+    .bind(record_id)
+    .bind(record_type)
+    .bind(org_id)
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_compliance_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn append_compliance_record_version_route(
+    Path(record_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<AppendComplianceRecordVersionRequest>,
+) -> AppResult<Json<ComplianceRecord>> {
+    let record_id = normalize_optional_text(Some(record_id))
+        .ok_or_else(|| AppError::BadRequest("record_id is required".to_string()))?;
+    let latest = load_latest_compliance_record(&state, &record_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let record = append_compliance_record_version(&latest, request, current_record_timestamp())
+        .map_err(compliance_record_error)?;
+
+    assert_field_owned_by_org(&state, &record.org_id, &record.field_id).await?;
+    insert_compliance_record(&state, &record).await?;
+    audit_compliance_record_event(
+        &state,
+        &record.record_id,
+        "version_appended",
+        Some(&record.actor),
+        record.change_reason.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(record))
+}
+
+pub async fn refuse_delete_compliance_record(
+    Path(record_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<StatusCode> {
+    let record_id = normalize_optional_text(Some(record_id))
+        .ok_or_else(|| AppError::BadRequest("record_id is required".to_string()))?;
+    let latest = load_latest_compliance_record(&state, &record_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    audit_compliance_record_event(
+        &state,
+        &record_id,
+        "delete_refused",
+        Some(&latest.actor),
+        Some("delete refused because compliance records are append-only"),
+    )
+    .await?;
+
+    Err(compliance_record_error(refuse_in_place_mutation("delete")))
 }
 
 pub async fn list_farms(State(state): State<AppState>) -> AppResult<Json<Vec<FarmRecord>>> {
@@ -3914,6 +4038,16 @@ fn parse_crop_model_task(value: String) -> AppResult<CropModelTask> {
         .map_err(crop_model_registry_error)
 }
 
+fn compliance_record_error(error: ComplianceRecordError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn parse_compliance_record_type(value: String) -> AppResult<ComplianceRecordType> {
+    value
+        .parse::<ComplianceRecordType>()
+        .map_err(compliance_record_error)
+}
+
 fn normalize_farm_name(name: String) -> AppResult<String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -4646,6 +4780,25 @@ fn decode_crop_model_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ModelVer
     })
 }
 
+fn decode_compliance_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ComplianceRecord> {
+    let version: i64 = row.get("version");
+    let prior_version: Option<i64> = row.get("prior_version");
+
+    Ok(ComplianceRecord {
+        record_id: row.get("record_id"),
+        version: version as u32,
+        record_type: parse_compliance_record_type(row.get::<String, _>("record_type"))?,
+        org_id: row.get("org_id"),
+        field_id: row.get("field_id"),
+        flight_id: row.get("flight_id"),
+        created_at: row.get("created_at"),
+        actor: row.get("actor"),
+        provenance_ref: row.get("provenance_ref"),
+        prior_version: prior_version.map(|version| version as u32),
+        change_reason: row.get("change_reason"),
+    })
+}
+
 fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<AnnotationRecord> {
     let geometry_json: String = row.get("geometry_json");
     let geometry = serde_json::from_str::<AnnotationGeometry>(&geometry_json).map_err(|err| {
@@ -4911,6 +5064,103 @@ async fn audit_crop_model_event(
     .bind(model_id)
     .bind(version)
     .bind(event_type)
+    .bind(current_record_timestamp())
+    .bind(details)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn assert_field_owned_by_org(
+    state: &AppState,
+    org_id: &str,
+    field_id: &str,
+) -> AppResult<()> {
+    let owner: Option<String> = sqlx::query_scalar("SELECT owner FROM fields WHERE field_id = ?1")
+        .bind(field_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(Error::from)?;
+
+    match owner {
+        Some(owner) if owner == org_id => Ok(()),
+        Some(owner) => Err(AppError::BadRequest(format!(
+            "field {field_id} belongs to org {owner}, not {org_id}"
+        ))),
+        None => Err(AppError::BadRequest(format!(
+            "field {field_id} does not exist"
+        ))),
+    }
+}
+
+async fn insert_compliance_record(state: &AppState, record: &ComplianceRecord) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO compliance_records (
+            record_id, version, record_type, org_id, field_id, flight_id, created_at,
+            actor, provenance_ref, prior_version, change_reason
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&record.record_id)
+    .bind(i64::from(record.version))
+    .bind(record.record_type.as_str())
+    .bind(&record.org_id)
+    .bind(&record.field_id)
+    .bind(&record.flight_id)
+    .bind(&record.created_at)
+    .bind(&record.actor)
+    .bind(&record.provenance_ref)
+    .bind(record.prior_version.map(i64::from))
+    .bind(&record.change_reason)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_latest_compliance_record(
+    state: &AppState,
+    record_id: &str,
+) -> AppResult<Option<ComplianceRecord>> {
+    sqlx::query(
+        r#"
+        SELECT record_id, version, record_type, org_id, field_id, flight_id, created_at,
+               actor, provenance_ref, prior_version, change_reason
+        FROM compliance_records
+        WHERE record_id = ?1
+        ORDER BY version DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(record_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?
+    .map(|row| decode_compliance_record(&row))
+    .transpose()
+}
+
+async fn audit_compliance_record_event(
+    state: &AppState,
+    record_id: &str,
+    event_type: &str,
+    actor: Option<&str>,
+    details: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO compliance_record_events (record_id, event_type, actor, created_at, details)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(record_id)
+    .bind(event_type)
+    .bind(actor)
     .bind(current_record_timestamp())
     .bind(details)
     .execute(&state.pool)

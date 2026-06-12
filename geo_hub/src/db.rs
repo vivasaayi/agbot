@@ -448,6 +448,42 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS compliance_records (
+            record_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            record_type TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            flight_id TEXT,
+            created_at TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            provenance_ref TEXT NOT NULL,
+            prior_version INTEGER,
+            change_reason TEXT,
+            PRIMARY KEY (record_id, version)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS compliance_record_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor TEXT,
+            created_at TEXT NOT NULL,
+            details TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_scenes_field_id ON scenes(field_id);
         "#,
     )
@@ -568,6 +604,33 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_crop_model_events_model_version
         ON crop_model_events(model_id, version);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_compliance_records_org_field
+        ON compliance_records(org_id, field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_compliance_records_record_type
+        ON compliance_records(record_type);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_compliance_record_events_record_id
+        ON compliance_record_events(record_id);
         "#,
     )
     .execute(pool)

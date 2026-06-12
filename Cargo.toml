@@ -10,6 +10,7 @@ members = [
     "shared",
     "orthomosaic",
     "crop_intelligence",
+    "compliance",
     "lidar_mapper",
     "imagery_processor",
     "geo_hub",

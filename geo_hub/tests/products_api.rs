@@ -1941,6 +1941,163 @@ async fn crop_intelligence_unregistered_model_inference_is_rejected_and_audited(
 }
 
 #[tokio::test]
+async fn compliance_records_create_list_append_versions_and_refuse_delete() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_compliance_field(&ctx, "field-north", "org-alpha").await?;
+    seed_compliance_field(&ctx, "field-south", "org-alpha").await?;
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "record_id": "comp-rec-1",
+                        "record_type": "chemical_application",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "flight_id": "flight-77",
+                        "actor": "compliance-officer-1",
+                        "provenance_ref": "provenance:compliance/comp-rec-1/v1"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let body = to_bytes(create_response.into_body(), 64 * 1024).await?;
+    let created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created.get("record_id").and_then(|value| value.as_str()),
+        Some("comp-rec-1")
+    );
+    assert_eq!(
+        created.get("version").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        created
+            .get("provenance_ref")
+            .and_then(|value| value.as_str()),
+        Some("provenance:compliance/comp-rec-1/v1")
+    );
+
+    let append_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/records/comp-rec-1/versions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "field_id": "field-south",
+                        "flight_id": "flight-77",
+                        "actor": "compliance-officer-2",
+                        "provenance_ref": "provenance:compliance/comp-rec-1/v2",
+                        "change_reason": "corrected field linkage"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(append_response.status(), StatusCode::OK);
+    let body = to_bytes(append_response.into_body(), 64 * 1024).await?;
+    let appended: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        appended.get("version").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        appended.get("field_id").and_then(|value| value.as_str()),
+        Some("field-south")
+    );
+    assert_eq!(
+        appended
+            .get("prior_version")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/compliance/records?record_id=comp-rec-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let versions: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(versions.len(), 2);
+    assert_eq!(
+        versions[0].get("version").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        versions[0].get("field_id").and_then(|value| value.as_str()),
+        Some("field-north")
+    );
+    assert_eq!(
+        versions[1].get("version").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        versions[1].get("field_id").and_then(|value| value.as_str()),
+        Some("field-south")
+    );
+
+    let delete_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/compliance/records/comp-rec-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(delete_response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(delete_response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&body).contains("append-only"));
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM compliance_record_events WHERE record_id = ?1 AND event_type = ?2",
+    )
+    .bind("comp-rec-1")
+    .bind("delete_refused")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    let retained_versions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM compliance_records WHERE record_id = ?1")
+            .bind("comp-rec-1")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(retained_versions, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_field_rejects_orphan_farm_reference() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -4270,6 +4427,38 @@ struct TestContext {
 struct AcceptanceFixture {
     field_id: String,
     scene_id: String,
+}
+
+async fn seed_compliance_field(ctx: &TestContext, field_id: &str, owner: &str) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO fields (field_id, owner, name, crop, season, notes, boundary_json, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(field_id)
+    .bind(owner)
+    .bind(format!("Compliance {field_id}"))
+    .bind("corn")
+    .bind("2026")
+    .bind(None::<String>)
+    .bind(
+        json!({
+            "crs": "EPSG:4326",
+            "coordinates": [
+                { "longitude": -96.7, "latitude": 41.1 },
+                { "longitude": -96.2, "latitude": 41.1 },
+                { "longitude": -96.2, "latitude": 41.4 },
+                { "longitude": -96.7, "latitude": 41.1 }
+            ]
+        })
+        .to_string(),
+    )
+    .bind("2026-06-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
 }
 
 async fn seed_orthomosaic_scene(

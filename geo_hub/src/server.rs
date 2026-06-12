@@ -77,6 +77,18 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::validate_crop_model_for_inference),
         )
         .route(
+            "/api/compliance/records",
+            get(routes::list_compliance_records).post(routes::create_compliance_record),
+        )
+        .route(
+            "/api/compliance/records/:record_id",
+            delete(routes::refuse_delete_compliance_record),
+        )
+        .route(
+            "/api/compliance/records/:record_id/versions",
+            post(routes::append_compliance_record_version_route),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

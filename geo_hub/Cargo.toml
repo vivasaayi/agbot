@@ -23,6 +23,7 @@ shared = { path = "../shared" }
 imagery_processor = { path = "../imagery_processor" }
 orthomosaic = { path = "../orthomosaic" }
 crop_intelligence = { path = "../crop_intelligence" }
+compliance = { path = "../compliance" }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
 image = { workspace = true }
