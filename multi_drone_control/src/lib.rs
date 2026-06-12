@@ -154,6 +154,71 @@ pub enum CoordinatedAction {
     },
 }
 
+impl CoordinatedAction {
+    fn action_kind(&self) -> &'static str {
+        match self {
+            CoordinatedAction::SynchronizedSurvey { .. } => "synchronized_survey",
+            CoordinatedAction::PatternSearch { .. } => "pattern_search",
+            CoordinatedAction::CoverageOptimization { .. } => "coverage_optimization",
+            CoordinatedAction::DataCollection { .. } => "data_collection",
+        }
+    }
+
+    fn target_positions(&self) -> Vec<(f64, f64, f32)> {
+        match self {
+            CoordinatedAction::SynchronizedSurvey { area, .. }
+            | CoordinatedAction::PatternSearch { area, .. } => {
+                area.iter().map(|(x, y)| (*x, *y, 0.0)).collect()
+            }
+            CoordinatedAction::CoverageOptimization { .. } => Vec::new(),
+            CoordinatedAction::DataCollection { collection_points } => collection_points.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SwarmActionTarget {
+    pub drone_id: Uuid,
+    pub target_position: (f64, f64, f32),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SwarmActionConstraintReport {
+    pub action_ref: String,
+    pub target_count: usize,
+    pub checked_at: DateTime<Utc>,
+    pub violations: Vec<SafetyViolation>,
+}
+
+impl SwarmActionConstraintReport {
+    pub fn passed(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum SwarmActionSafetyError {
+    #[error("swarm {swarm_id} not found for action {action_ref}")]
+    SwarmNotFound { swarm_id: Uuid, action_ref: String },
+    #[error("swarm {swarm_id} has no drones for action {action_ref}")]
+    EmptySwarm { swarm_id: Uuid, action_ref: String },
+    #[error("swarm action {action_ref} rejected with {violation_count} safety violation(s)")]
+    Rejected {
+        action_ref: String,
+        violation_count: usize,
+        report: SwarmActionConstraintReport,
+    },
+}
+
+impl SwarmActionSafetyError {
+    pub fn report(&self) -> &SwarmActionConstraintReport {
+        match self {
+            SwarmActionSafetyError::Rejected { report, .. } => report,
+            _ => panic!("only rejected swarm action safety errors carry a report"),
+        }
+    }
+}
+
 /// Main control service
 pub struct MultiDroneControlService {
     controller: Arc<RwLock<MultiDroneController>>,
@@ -299,6 +364,169 @@ impl MultiDroneController {
 
     pub fn update_constraints(&mut self, constraints: GlobalConstraints) {
         self.global_constraints = constraints;
+    }
+
+    pub fn validate_swarm_action_targets(
+        &self,
+        action_ref: impl Into<String>,
+        targets: &[SwarmActionTarget],
+        checked_at: DateTime<Utc>,
+    ) -> std::result::Result<SwarmActionConstraintReport, SwarmActionSafetyError> {
+        let action_ref = action_ref.into().trim().to_string();
+        let mut violations = Vec::new();
+
+        for target in targets {
+            violations.extend(self.target_constraint_violations(&action_ref, target, checked_at));
+        }
+
+        let report = SwarmActionConstraintReport {
+            action_ref: action_ref.clone(),
+            target_count: targets.len(),
+            checked_at,
+            violations,
+        };
+
+        if report.passed() {
+            Ok(report)
+        } else {
+            Err(SwarmActionSafetyError::Rejected {
+                action_ref,
+                violation_count: report.violations.len(),
+                report,
+            })
+        }
+    }
+
+    pub fn validate_coordinated_action(
+        &self,
+        swarm_id: Uuid,
+        action: &CoordinatedAction,
+        checked_at: DateTime<Utc>,
+    ) -> std::result::Result<SwarmActionConstraintReport, SwarmActionSafetyError> {
+        let action_ref = format!("swarm:{swarm_id}:{}", action.action_kind());
+        let swarm =
+            self.swarms
+                .get(&swarm_id)
+                .ok_or_else(|| SwarmActionSafetyError::SwarmNotFound {
+                    swarm_id,
+                    action_ref: action_ref.clone(),
+                })?;
+        let target_positions = action.target_positions();
+
+        if target_positions.is_empty() {
+            return self.validate_swarm_action_targets(action_ref, &[], checked_at);
+        }
+
+        let drone_ids = swarm.drone_ids();
+        if drone_ids.is_empty() {
+            return Err(SwarmActionSafetyError::EmptySwarm {
+                swarm_id,
+                action_ref,
+            });
+        }
+
+        let targets = target_positions
+            .into_iter()
+            .enumerate()
+            .map(|(index, target_position)| SwarmActionTarget {
+                drone_id: drone_ids[index % drone_ids.len()],
+                target_position,
+            })
+            .collect::<Vec<_>>();
+
+        self.validate_swarm_action_targets(action_ref, &targets, checked_at)
+    }
+
+    fn target_constraint_violations(
+        &self,
+        action_ref: &str,
+        target: &SwarmActionTarget,
+        checked_at: DateTime<Utc>,
+    ) -> Vec<SafetyViolation> {
+        let mut violations = Vec::new();
+        let constraints = &self.global_constraints;
+
+        if target.target_position.2 > constraints.max_altitude_m {
+            violations.push(SafetyViolation {
+                drone_id: target.drone_id,
+                violation_type: ViolationType::AltitudeExceeded,
+                description: format!(
+                    "Target altitude {:.1}m exceeds maximum {:.1}m",
+                    target.target_position.2, constraints.max_altitude_m
+                ),
+                severity: Severity::High,
+                timestamp: checked_at,
+                position: Some(target.target_position),
+                action_ref: Some(action_ref.to_string()),
+            });
+        }
+
+        if !Self::target_within_geofence(&target.target_position, constraints) {
+            violations.push(SafetyViolation {
+                drone_id: target.drone_id,
+                violation_type: ViolationType::GeofenceViolation,
+                description: "Target outside geofence boundary".to_string(),
+                severity: Severity::Critical,
+                timestamp: checked_at,
+                position: Some(target.target_position),
+                action_ref: Some(action_ref.to_string()),
+            });
+        }
+
+        for zone in &constraints.no_fly_zones {
+            if zone.active && Self::target_in_no_fly_zone(&target.target_position, zone) {
+                violations.push(SafetyViolation {
+                    drone_id: target.drone_id,
+                    violation_type: ViolationType::NoFlyZoneViolation,
+                    description: format!("Target inside no-fly zone: {}", zone.name),
+                    severity: Severity::Critical,
+                    timestamp: checked_at,
+                    position: Some(target.target_position),
+                    action_ref: Some(action_ref.to_string()),
+                });
+            }
+        }
+
+        violations
+    }
+
+    fn target_within_geofence(position: &(f64, f64, f32), constraints: &GlobalConstraints) -> bool {
+        if constraints.geofence_boundaries.len() < 3 {
+            return true;
+        }
+
+        Self::point_in_polygon(position.0, position.1, &constraints.geofence_boundaries)
+    }
+
+    fn target_in_no_fly_zone(position: &(f64, f64, f32), zone: &NoFlyZone) -> bool {
+        if let Some((min_alt, max_alt)) = zone.altitude_restriction {
+            if position.2 < min_alt || position.2 > max_alt {
+                return false;
+            }
+        }
+
+        if zone.boundary.len() < 3 {
+            return false;
+        }
+
+        Self::point_in_polygon(position.0, position.1, &zone.boundary)
+    }
+
+    fn point_in_polygon(x: f64, y: f64, boundary: &[(f64, f64)]) -> bool {
+        let mut inside = false;
+        let mut j = boundary.len() - 1;
+
+        for i in 0..boundary.len() {
+            let (xi, yi) = boundary[i];
+            let (xj, yj) = boundary[j];
+
+            if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+                inside = !inside;
+            }
+            j = i;
+        }
+
+        inside
     }
 
     fn active_membership_conflict(
@@ -460,6 +688,12 @@ impl MultiDroneControlService {
             }
             ControlCommand::ExecuteCoordinatedAction { swarm_id, action } => {
                 let action_str = format!("{:?}", action);
+                {
+                    let controller = self.controller.read().await;
+                    controller
+                        .validate_coordinated_action(swarm_id, &action, Utc::now())
+                        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                }
                 self.coordination_engine
                     .write()
                     .await
@@ -504,6 +738,8 @@ impl MultiDroneControlService {
                     ),
                     severity: Severity::High,
                     timestamp: Utc::now(),
+                    position: Some(status.position),
+                    action_ref: None,
                 });
             }
 
@@ -515,6 +751,8 @@ impl MultiDroneControlService {
                     description: "Drone outside geofence boundary".to_string(),
                     severity: Severity::Critical,
                     timestamp: Utc::now(),
+                    position: Some(status.position),
+                    action_ref: None,
                 });
             }
 
@@ -527,6 +765,8 @@ impl MultiDroneControlService {
                         description: format!("Drone in no-fly zone: {}", zone.name),
                         severity: Severity::Critical,
                         timestamp: Utc::now(),
+                        position: Some(status.position),
+                        action_ref: None,
                     });
                 }
             }
@@ -597,16 +837,18 @@ impl MultiDroneControlService {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SafetyViolation {
     pub drone_id: Uuid,
     pub violation_type: ViolationType,
     pub description: String,
     pub severity: Severity,
     pub timestamp: DateTime<Utc>,
+    pub position: Option<(f64, f64, f32)>,
+    pub action_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ViolationType {
     AltitudeExceeded,
     GeofenceViolation,
@@ -616,7 +858,7 @@ pub enum ViolationType {
     BatteryLow,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Severity {
     Low,
     Medium,
@@ -756,6 +998,101 @@ mod tests {
         assert!(controller.list_swarm_registry().is_empty());
     }
 
+    #[test]
+    fn swarm_action_targets_inside_constraints_pass_pre_execution_check() {
+        let controller = constrained_controller();
+        let drone_a = Uuid::new_v4();
+        let drone_b = Uuid::new_v4();
+        let targets = vec![
+            SwarmActionTarget {
+                drone_id: drone_a,
+                target_position: (30.0, 30.0, 40.0),
+            },
+            SwarmActionTarget {
+                drone_id: drone_b,
+                target_position: (-20.0, 20.0, 45.0),
+            },
+        ];
+
+        let report = controller
+            .validate_swarm_action_targets("survey:north-block", &targets, fixed_time())
+            .expect("all targets are inside constraints");
+
+        assert!(report.passed());
+        assert_eq!(report.action_ref, "survey:north-block");
+        assert_eq!(report.target_count, 2);
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn no_fly_target_rejects_entire_swarm_action_without_partial_pass() {
+        let controller = constrained_controller();
+        let safe_drone = Uuid::new_v4();
+        let unsafe_drone = Uuid::new_v4();
+        let targets = vec![
+            SwarmActionTarget {
+                drone_id: safe_drone,
+                target_position: (-40.0, -40.0, 50.0),
+            },
+            SwarmActionTarget {
+                drone_id: unsafe_drone,
+                target_position: (5.0, 5.0, 50.0),
+            },
+        ];
+
+        let err = controller
+            .validate_swarm_action_targets("survey:north-block", &targets, fixed_time())
+            .expect_err("one no-fly target must reject the whole action");
+        let report = err.report();
+
+        assert!(!report.passed());
+        assert_eq!(report.action_ref, "survey:north-block");
+        assert_eq!(report.target_count, 2);
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(report.violations[0].drone_id, unsafe_drone);
+        assert_eq!(
+            report.violations[0].violation_type,
+            ViolationType::NoFlyZoneViolation
+        );
+        assert_eq!(report.violations[0].severity, Severity::Critical);
+        assert_eq!(
+            report.violations[0].action_ref.as_deref(),
+            Some("survey:north-block")
+        );
+        assert_eq!(report.violations[0].position, Some((5.0, 5.0, 50.0)));
+    }
+
+    #[test]
+    fn geofence_and_altitude_target_violations_are_reported_per_drone() {
+        let controller = constrained_controller();
+        let geofence_drone = Uuid::new_v4();
+        let altitude_drone = Uuid::new_v4();
+        let targets = vec![
+            SwarmActionTarget {
+                drone_id: geofence_drone,
+                target_position: (150.0, 10.0, 50.0),
+            },
+            SwarmActionTarget {
+                drone_id: altitude_drone,
+                target_position: (10.0, 10.0, 121.0),
+            },
+        ];
+
+        let err = controller
+            .validate_swarm_action_targets("survey:north-block", &targets, fixed_time())
+            .expect_err("geofence and altitude target violations must reject the action");
+        let report = err.report();
+        let violation_types = report
+            .violations
+            .iter()
+            .map(|violation| violation.violation_type.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(report.violations.len(), 2);
+        assert!(violation_types.contains(&ViolationType::GeofenceViolation));
+        assert!(violation_types.contains(&ViolationType::AltitudeExceeded));
+    }
+
     #[tokio::test]
     async fn test_service_creation() {
         let service = MultiDroneControlService::new("Test Service".to_string());
@@ -809,5 +1146,72 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert_eq!(registry[0].drone_ids, vec![drone_id]);
         assert_eq!(registry[0].status, swarm::SwarmStatus::Forming);
+    }
+
+    #[tokio::test]
+    async fn execute_coordinated_action_rechecks_constraints_before_execution() {
+        let service = MultiDroneControlService::new("Test Service".to_string());
+        let drone_id = Uuid::new_v4();
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: vec![drone_id],
+                formation: Formation::Line {
+                    spacing_m: 5.0,
+                    heading_deg: 0.0,
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        let swarm_id = {
+            let mut controller = service.controller.write().await;
+            controller.global_constraints = constrained_controller().global_constraints;
+            controller.list_swarm_registry()[0].swarm_id
+        };
+
+        service
+            .send_command(ControlCommand::ExecuteCoordinatedAction {
+                swarm_id,
+                action: CoordinatedAction::DataCollection {
+                    collection_points: vec![(5.0, 5.0, 50.0)],
+                },
+            })
+            .await
+            .unwrap();
+        let err = service.process_commands().await.unwrap_err();
+
+        assert!(err.to_string().contains("rejected with 1 safety violation"));
+    }
+
+    fn constrained_controller() -> MultiDroneController {
+        let mut controller = MultiDroneController::new("Safety Controller".to_string());
+        controller.global_constraints = GlobalConstraints {
+            max_altitude_m: 120.0,
+            geofence_boundaries: vec![
+                (-100.0, -100.0),
+                (100.0, -100.0),
+                (100.0, 100.0),
+                (-100.0, 100.0),
+            ],
+            no_fly_zones: vec![NoFlyZone {
+                id: Uuid::new_v4(),
+                name: "Farmhouse".to_string(),
+                boundary: vec![(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)],
+                altitude_restriction: Some((0.0, 120.0)),
+                reason: "people and structures".to_string(),
+                active: true,
+            }],
+            max_concurrent_drones: 4,
+            emergency_landing_sites: vec![(0.0, -80.0)],
+        };
+        controller
+    }
+
+    fn fixed_time() -> DateTime<Utc> {
+        "2026-06-12T12:00:00Z"
+            .parse()
+            .expect("fixed timestamp should parse")
     }
 }
