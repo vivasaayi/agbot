@@ -463,6 +463,64 @@ pub struct ReprojectionErrorReport {
     pub failing_point_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcpMarkedImagePoint {
+    pub frame_id: String,
+    pub image_x_px: f64,
+    pub image_y_px: f64,
+    pub estimated_x_m: f64,
+    pub estimated_y_m: f64,
+    pub estimated_z_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcpSurveyedCoordinate {
+    pub x_m: f64,
+    pub y_m: f64,
+    pub z_m: f64,
+    pub crs: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroundControlPoint {
+    pub gcp_id: String,
+    pub marked_image_points: Vec<GcpMarkedImagePoint>,
+    pub surveyed_coord: GcpSurveyedCoordinate,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcpRegistrationRequest {
+    pub frame_set_id: String,
+    pub project_crs: String,
+    pub generated_at: String,
+    pub gcps: Vec<GroundControlPoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcpResidualRecord {
+    pub gcp_id: String,
+    pub marked_point_count: usize,
+    pub estimated_x_m: f64,
+    pub estimated_y_m: f64,
+    pub estimated_z_m: f64,
+    pub surveyed_x_m: f64,
+    pub surveyed_y_m: f64,
+    pub surveyed_z_m: f64,
+    pub horizontal_residual_m: f64,
+    pub vertical_residual_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcpAccuracyReport {
+    pub frame_set_id: String,
+    pub project_crs: String,
+    pub generated_at: String,
+    pub residuals: Vec<GcpResidualRecord>,
+    pub horizontal_rmse_m: f64,
+    pub vertical_rmse_m: f64,
+    pub overall_rmse_m: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FeatureMatchingError {
     #[error("frame set must include at least one frame")]
@@ -554,6 +612,30 @@ pub enum ReprojectionReportError {
     EmptyPoints,
     #[error("sparse SfM report contains a non-finite reprojection error")]
     NonFiniteResidual,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum GcpRegistrationError {
+    #[error("frame_set_id cannot be empty")]
+    EmptyFrameSetId,
+    #[error("project_crs cannot be empty")]
+    EmptyProjectCrs,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("at least one GCP is required")]
+    EmptyGcps,
+    #[error("gcp_id cannot be empty")]
+    EmptyGcpId,
+    #[error("GCP {gcp_id} must include at least one marked image point")]
+    EmptyMarkedImagePoints { gcp_id: String },
+    #[error("GCP {gcp_id} surveyed CRS {actual_crs} does not match project CRS {expected_crs}")]
+    CrsMismatch {
+        gcp_id: String,
+        expected_crs: String,
+        actual_crs: String,
+    },
+    #[error("GCP {gcp_id} contains a non-finite coordinate")]
+    NonFiniteCoordinate { gcp_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1235,6 +1317,47 @@ pub fn build_reprojection_error_report(
     })
 }
 
+pub fn register_ground_control_points(
+    request: GcpRegistrationRequest,
+) -> Result<GcpAccuracyReport, GcpRegistrationError> {
+    let frame_set_id = normalize_optional_text(Some(request.frame_set_id))
+        .ok_or(GcpRegistrationError::EmptyFrameSetId)?;
+    let project_crs = normalize_optional_text(Some(request.project_crs))
+        .ok_or(GcpRegistrationError::EmptyProjectCrs)?;
+    let generated_at = normalize_optional_text(Some(request.generated_at))
+        .ok_or(GcpRegistrationError::EmptyGeneratedAt)?;
+    if request.gcps.is_empty() {
+        return Err(GcpRegistrationError::EmptyGcps);
+    }
+
+    let mut residuals = request
+        .gcps
+        .into_iter()
+        .map(|gcp| gcp_residual(gcp, &project_crs))
+        .collect::<Result<Vec<_>, _>>()?;
+    residuals.sort_by(|left, right| left.gcp_id.cmp(&right.gcp_id));
+
+    let residual_count = residuals.len() as f64;
+    let horizontal_squared_sum = residuals
+        .iter()
+        .map(|residual| residual.horizontal_residual_m.powi(2))
+        .sum::<f64>();
+    let vertical_squared_sum = residuals
+        .iter()
+        .map(|residual| residual.vertical_residual_m.powi(2))
+        .sum::<f64>();
+
+    Ok(GcpAccuracyReport {
+        frame_set_id,
+        project_crs,
+        generated_at,
+        residuals,
+        horizontal_rmse_m: (horizontal_squared_sum / residual_count).sqrt(),
+        vertical_rmse_m: (vertical_squared_sum / residual_count).sqrt(),
+        overall_rmse_m: ((horizontal_squared_sum + vertical_squared_sum) / residual_count).sqrt(),
+    })
+}
+
 impl FrameQaRecord {
     fn rect(&self) -> Rect {
         Rect {
@@ -1534,6 +1657,76 @@ fn validate_reprojection_report_config(
         }
     }
     Ok(())
+}
+
+fn gcp_residual(
+    gcp: GroundControlPoint,
+    project_crs: &str,
+) -> Result<GcpResidualRecord, GcpRegistrationError> {
+    let gcp_id =
+        normalize_optional_text(Some(gcp.gcp_id)).ok_or(GcpRegistrationError::EmptyGcpId)?;
+    let surveyed_crs = normalize_optional_text(Some(gcp.surveyed_coord.crs.clone()))
+        .ok_or(GcpRegistrationError::EmptyProjectCrs)?;
+    if surveyed_crs != project_crs {
+        return Err(GcpRegistrationError::CrsMismatch {
+            gcp_id,
+            expected_crs: project_crs.to_string(),
+            actual_crs: surveyed_crs,
+        });
+    }
+    if gcp.marked_image_points.is_empty() {
+        return Err(GcpRegistrationError::EmptyMarkedImagePoints { gcp_id });
+    }
+    if !gcp.surveyed_coord.x_m.is_finite()
+        || !gcp.surveyed_coord.y_m.is_finite()
+        || !gcp.surveyed_coord.z_m.is_finite()
+        || gcp.marked_image_points.iter().any(|point| {
+            !point.image_x_px.is_finite()
+                || !point.image_y_px.is_finite()
+                || !point.estimated_x_m.is_finite()
+                || !point.estimated_y_m.is_finite()
+                || !point.estimated_z_m.is_finite()
+        })
+    {
+        return Err(GcpRegistrationError::NonFiniteCoordinate { gcp_id });
+    }
+
+    let marked_point_count = gcp.marked_image_points.len();
+    let count = marked_point_count as f64;
+    let estimated_x_m = gcp
+        .marked_image_points
+        .iter()
+        .map(|point| point.estimated_x_m)
+        .sum::<f64>()
+        / count;
+    let estimated_y_m = gcp
+        .marked_image_points
+        .iter()
+        .map(|point| point.estimated_y_m)
+        .sum::<f64>()
+        / count;
+    let estimated_z_m = gcp
+        .marked_image_points
+        .iter()
+        .map(|point| point.estimated_z_m)
+        .sum::<f64>()
+        / count;
+    let dx_m = estimated_x_m - gcp.surveyed_coord.x_m;
+    let dy_m = estimated_y_m - gcp.surveyed_coord.y_m;
+    let dz_m = estimated_z_m - gcp.surveyed_coord.z_m;
+
+    Ok(GcpResidualRecord {
+        gcp_id,
+        marked_point_count,
+        estimated_x_m,
+        estimated_y_m,
+        estimated_z_m,
+        surveyed_x_m: gcp.surveyed_coord.x_m,
+        surveyed_y_m: gcp.surveyed_coord.y_m,
+        surveyed_z_m: gcp.surveyed_coord.z_m,
+        horizontal_residual_m: (dx_m.powi(2) + dy_m.powi(2)).sqrt(),
+        vertical_residual_m: dz_m.abs(),
+    })
 }
 
 fn dsm_cell_index(
@@ -1935,9 +2128,10 @@ mod tests {
         run_sparse_sfm, transition_reconstruction_status, CameraExif, CameraImuPose, DensePoint,
         DensePointCloud, DsmConfig, FeatureMatchingConfig, FieldCoverageExtent, FrameIngestRequest,
         FrameQaReasonCode, FrameSetIngestError, FrameSetIngestRequest, FrameSetQaConfig,
-        OrthomosaicConfig, OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest,
-        ReconstructionStatus, ReprojectionReportConfig, SparseSfmConfig, SparseSfmError,
-        SparseSfmFailureReason,
+        GcpMarkedImagePoint, GcpRegistrationError, GcpRegistrationRequest, GcpSurveyedCoordinate,
+        GroundControlPoint, OrthomosaicConfig, OrthomosaicError, ReconstructionJobError,
+        ReconstructionJobRequest, ReconstructionStatus, ReprojectionReportConfig, SparseSfmConfig,
+        SparseSfmError, SparseSfmFailureReason,
     };
     use shared::schemas::assert_raster_spatial_ref;
     use shared::schemas::GpsCoords;
@@ -2471,6 +2665,70 @@ mod tests {
         assert!(report.failing_point_ids.is_empty());
     }
 
+    #[test]
+    fn gcp_registration_reports_residuals_and_overall_accuracy() {
+        let report = super::register_ground_control_points(gcp_request(vec![
+            gcp(
+                " GCP-1 ",
+                "EPSG:32614",
+                100.0,
+                200.0,
+                10.0,
+                vec![
+                    marked("frame-001", 101.0, 202.0, 12.0),
+                    marked("frame-002", 99.0, 198.0, 8.0),
+                ],
+            ),
+            gcp(
+                "GCP-2",
+                "EPSG:32614",
+                50.0,
+                50.0,
+                5.0,
+                vec![marked("frame-001", 53.0, 54.0, 7.0)],
+            ),
+        ]))
+        .expect("GCP registration should report residuals");
+
+        assert_eq!(report.frame_set_id, "frame-set-qa");
+        assert_eq!(report.project_crs, "EPSG:32614");
+        assert_eq!(report.generated_at, "2026-06-01T12:07:00Z");
+        assert_eq!(report.residuals.len(), 2);
+        assert_eq!(report.residuals[0].gcp_id, "GCP-1");
+        assert_eq!(report.residuals[0].marked_point_count, 2);
+        assert_close(report.residuals[0].horizontal_residual_m, 0.0);
+        assert_close(report.residuals[0].vertical_residual_m, 0.0);
+        assert_eq!(report.residuals[1].gcp_id, "GCP-2");
+        assert_eq!(report.residuals[1].marked_point_count, 1);
+        assert_close(report.residuals[1].horizontal_residual_m, 5.0);
+        assert_close(report.residuals[1].vertical_residual_m, 2.0);
+        assert_close(report.horizontal_rmse_m, 3.5355339059327378);
+        assert_close(report.vertical_rmse_m, 1.4142135623730951);
+        assert_close(report.overall_rmse_m, 3.8078865529319543);
+    }
+
+    #[test]
+    fn gcp_registration_refuses_surveyed_crs_mismatch() {
+        let error = super::register_ground_control_points(gcp_request(vec![gcp(
+            "GCP-1",
+            "EPSG:4326",
+            100.0,
+            200.0,
+            10.0,
+            vec![marked("frame-001", 100.0, 200.0, 10.0)],
+        )]))
+        .expect_err("control points must match the project CRS exactly");
+
+        assert_eq!(
+            error,
+            GcpRegistrationError::CrsMismatch {
+                gcp_id: "GCP-1".to_string(),
+                expected_crs: "EPSG:32614".to_string(),
+                actual_crs: "EPSG:4326".to_string()
+            }
+        );
+    }
+
     fn qa_frame_set(frames: Vec<FrameIngestRequest>) -> super::FrameSetRecord {
         build_frame_set_record(
             FrameSetIngestRequest {
@@ -2632,6 +2890,51 @@ mod tests {
             max_overall_rms_error_px: 0.5,
             max_camera_error_px: 0.5,
             max_point_error_px: 0.5,
+        }
+    }
+
+    fn gcp_request(gcps: Vec<GroundControlPoint>) -> GcpRegistrationRequest {
+        GcpRegistrationRequest {
+            frame_set_id: " frame-set-qa ".to_string(),
+            project_crs: " EPSG:32614 ".to_string(),
+            generated_at: " 2026-06-01T12:07:00Z ".to_string(),
+            gcps,
+        }
+    }
+
+    fn gcp(
+        gcp_id: &str,
+        crs: &str,
+        surveyed_x_m: f64,
+        surveyed_y_m: f64,
+        surveyed_z_m: f64,
+        marked_image_points: Vec<GcpMarkedImagePoint>,
+    ) -> GroundControlPoint {
+        GroundControlPoint {
+            gcp_id: gcp_id.to_string(),
+            marked_image_points,
+            surveyed_coord: GcpSurveyedCoordinate {
+                x_m: surveyed_x_m,
+                y_m: surveyed_y_m,
+                z_m: surveyed_z_m,
+                crs: crs.to_string(),
+            },
+        }
+    }
+
+    fn marked(
+        frame_id: &str,
+        estimated_x_m: f64,
+        estimated_y_m: f64,
+        estimated_z_m: f64,
+    ) -> GcpMarkedImagePoint {
+        GcpMarkedImagePoint {
+            frame_id: frame_id.to_string(),
+            image_x_px: 120.0,
+            image_y_px: 240.0,
+            estimated_x_m,
+            estimated_y_m,
+            estimated_z_m,
         }
     }
 
