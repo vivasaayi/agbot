@@ -19,8 +19,10 @@ pub use link_client::{
     LinkStateSnapshot, ReconnectPolicy, SharedLinkState,
 };
 pub use message_dispatch::{
-    shared_message_dispatch_state, DispatchError, DispatchedMessage, MessageDispatchState,
-    MessageRoute, MissionStatusSnapshot, SharedMessageDispatchState, SystemStatusSnapshot,
+    shared_message_dispatch_state, CaptureEvent, CaptureEventKind, DispatchError,
+    DispatchedMessage, MessageDispatchState, MessageRoute, MissionStatusSnapshot,
+    SharedMessageDispatchState, SystemStatusSnapshot, TelemetryFreshnessSnapshot,
+    TelemetryFreshnessState, TelemetryTileSnapshot, TelemetryTileValues,
 };
 
 #[derive(Parser, Debug)]

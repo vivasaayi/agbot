@@ -1,8 +1,12 @@
 use serde::Serialize;
-use shared::schemas::WebSocketMessage;
+use shared::schemas::{Telemetry, WebSocketMessage};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+pub const DEFAULT_CAPTURE_EVENT_LIMIT: usize = 100;
+pub const DEFAULT_TELEMETRY_STALE_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +25,79 @@ pub struct DispatchedMessage {
     pub message: WebSocketMessage,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TelemetryTileValues {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude_m: f64,
+    pub battery_voltage: f32,
+    pub battery_percentage: u8,
+    pub armed: bool,
+    pub mode: String,
+    pub ground_speed: f32,
+    pub air_speed: f32,
+    pub heading: f32,
+    pub altitude_relative: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TelemetryTileSnapshot {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude_m: f64,
+    pub battery_voltage: f32,
+    pub battery_percentage: u8,
+    pub armed: bool,
+    pub mode: String,
+    pub ground_speed: f32,
+    pub air_speed: f32,
+    pub heading: f32,
+    pub altitude_relative: f32,
+    pub last_update_at: chrono::DateTime<chrono::Utc>,
+    pub last_update_age_seconds: u64,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryFreshnessState {
+    NoData,
+    Fresh,
+    Stale,
+}
+
+impl std::fmt::Display for TelemetryFreshnessState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            TelemetryFreshnessState::NoData => "No data",
+            TelemetryFreshnessState::Fresh => "Fresh",
+            TelemetryFreshnessState::Stale => "Stale",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TelemetryFreshnessSnapshot {
+    pub state: TelemetryFreshnessState,
+    pub last_update_age_seconds: Option<u64>,
+    pub stale_after_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureEventKind {
+    Lidar,
+    ImageCaptured,
+    NdviProcessed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CaptureEvent {
+    pub event_type: CaptureEventKind,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MissionStatusSnapshot {
     pub mission_id: Uuid,
@@ -33,16 +110,21 @@ pub struct SystemStatusSnapshot {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MessageDispatchState {
     pub latest_telemetry_mode: Option<String>,
     pub latest_telemetry_battery_percentage: Option<u8>,
+    pub latest_telemetry: Option<TelemetryTileValues>,
+    pub latest_telemetry_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub mission_statuses: Vec<MissionStatusSnapshot>,
     pub lidar_scan_point_counts: Vec<usize>,
     pub captured_image_ids: Vec<Uuid>,
     pub ndvi_means: Vec<f32>,
+    pub capture_events: Vec<CaptureEvent>,
     pub system_statuses: Vec<SystemStatusSnapshot>,
     pub malformed_frames: u64,
+    #[serde(skip)]
+    capture_event_limit: usize,
 }
 
 pub type SharedMessageDispatchState = Arc<RwLock<MessageDispatchState>>;
@@ -54,6 +136,23 @@ pub enum DispatchError {
 }
 
 impl MessageDispatchState {
+    pub fn with_capture_event_limit(capture_event_limit: usize) -> Self {
+        Self {
+            latest_telemetry_mode: None,
+            latest_telemetry_battery_percentage: None,
+            latest_telemetry: None,
+            latest_telemetry_updated_at: None,
+            mission_statuses: Vec::new(),
+            lidar_scan_point_counts: Vec::new(),
+            captured_image_ids: Vec::new(),
+            ndvi_means: Vec::new(),
+            capture_events: Vec::new(),
+            system_statuses: Vec::new(),
+            malformed_frames: 0,
+            capture_event_limit: capture_event_limit.max(1),
+        }
+    }
+
     pub fn dispatch_frame(&mut self, frame: &str) -> Result<DispatchedMessage, DispatchError> {
         let message = serde_json::from_str::<WebSocketMessage>(frame).map_err(|err| {
             self.malformed_frames = self.malformed_frames.saturating_add(1);
@@ -64,10 +163,20 @@ impl MessageDispatchState {
     }
 
     pub fn dispatch_message(&mut self, message: &WebSocketMessage) -> MessageRoute {
+        self.dispatch_message_at(message, chrono::Utc::now())
+    }
+
+    pub fn dispatch_message_at(
+        &mut self,
+        message: &WebSocketMessage,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> MessageRoute {
         match message {
             WebSocketMessage::Telemetry { data } => {
                 self.latest_telemetry_mode = Some(data.mode.clone());
                 self.latest_telemetry_battery_percentage = Some(data.battery_percentage);
+                self.latest_telemetry = Some(TelemetryTileValues::from(data));
+                self.latest_telemetry_updated_at = Some(received_at);
                 MessageRoute::Telemetry
             }
             WebSocketMessage::MissionStatus { mission_id, status } => {
@@ -79,14 +188,32 @@ impl MessageDispatchState {
             }
             WebSocketMessage::LidarUpdate { scan } => {
                 self.lidar_scan_point_counts.push(scan.points.len());
+                self.append_capture_event(CaptureEvent {
+                    event_type: CaptureEventKind::Lidar,
+                    timestamp: scan.timestamp,
+                    summary: format!("LiDAR scan: {} points", scan.points.len()),
+                });
                 MessageRoute::LidarUpdate
             }
             WebSocketMessage::ImageCaptured { image } => {
                 self.captured_image_ids.push(image.image_id);
+                self.append_capture_event(CaptureEvent {
+                    event_type: CaptureEventKind::ImageCaptured,
+                    timestamp: image.metadata.timestamp,
+                    summary: format!("Image captured: {}", image.image_id),
+                });
                 MessageRoute::ImageCaptured
             }
             WebSocketMessage::NdviProcessed { result } => {
                 self.ndvi_means.push(result.mean_ndvi);
+                self.append_capture_event(CaptureEvent {
+                    event_type: CaptureEventKind::NdviProcessed,
+                    timestamp: result.timestamp,
+                    summary: format!(
+                        "NDVI processed: mean {:.3}, vegetation {:.1}%",
+                        result.mean_ndvi, result.vegetation_percentage
+                    ),
+                });
                 MessageRoute::NdviProcessed
             }
             WebSocketMessage::SystemStatus { status, message } => {
@@ -98,6 +225,117 @@ impl MessageDispatchState {
             }
         }
     }
+
+    pub fn telemetry_tile_snapshot_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        stale_after: Duration,
+    ) -> Option<TelemetryTileSnapshot> {
+        let telemetry = self.latest_telemetry.as_ref()?;
+        let last_update_at = self.latest_telemetry_updated_at?;
+        let age = age_seconds(last_update_at, now);
+        Some(TelemetryTileSnapshot {
+            latitude: telemetry.latitude,
+            longitude: telemetry.longitude,
+            altitude_m: telemetry.altitude_m,
+            battery_voltage: telemetry.battery_voltage,
+            battery_percentage: telemetry.battery_percentage,
+            armed: telemetry.armed,
+            mode: telemetry.mode.clone(),
+            ground_speed: telemetry.ground_speed,
+            air_speed: telemetry.air_speed,
+            heading: telemetry.heading,
+            altitude_relative: telemetry.altitude_relative,
+            last_update_at,
+            last_update_age_seconds: age,
+            stale: age > stale_after.as_secs(),
+        })
+    }
+
+    pub fn telemetry_freshness_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        stale_after: Duration,
+    ) -> TelemetryFreshnessSnapshot {
+        match self.telemetry_tile_snapshot_at(now, stale_after) {
+            Some(snapshot) => TelemetryFreshnessSnapshot {
+                state: if snapshot.stale {
+                    TelemetryFreshnessState::Stale
+                } else {
+                    TelemetryFreshnessState::Fresh
+                },
+                last_update_age_seconds: Some(snapshot.last_update_age_seconds),
+                stale_after_seconds: stale_after.as_secs(),
+            },
+            None => TelemetryFreshnessSnapshot {
+                state: TelemetryFreshnessState::NoData,
+                last_update_age_seconds: None,
+                stale_after_seconds: stale_after.as_secs(),
+            },
+        }
+    }
+
+    pub fn telemetry_tile_snapshot(&self) -> Option<TelemetryTileSnapshot> {
+        self.telemetry_tile_snapshot_at(chrono::Utc::now(), DEFAULT_TELEMETRY_STALE_AFTER)
+    }
+
+    pub fn telemetry_freshness(&self) -> TelemetryFreshnessSnapshot {
+        self.telemetry_freshness_at(chrono::Utc::now(), DEFAULT_TELEMETRY_STALE_AFTER)
+    }
+
+    pub fn capture_events(&self, filter: Option<CaptureEventKind>) -> Vec<CaptureEvent> {
+        self.capture_events
+            .iter()
+            .filter(|event| filter.map_or(true, |kind| event.event_type == kind))
+            .cloned()
+            .collect()
+    }
+
+    fn append_capture_event(&mut self, event: CaptureEvent) {
+        self.capture_events.push(event);
+        self.capture_events.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then(left.event_type.cmp(&right.event_type))
+                .then(left.summary.cmp(&right.summary))
+        });
+        while self.capture_events.len() > self.capture_event_limit {
+            self.capture_events.remove(0);
+        }
+    }
+}
+
+impl Default for MessageDispatchState {
+    fn default() -> Self {
+        Self::with_capture_event_limit(DEFAULT_CAPTURE_EVENT_LIMIT)
+    }
+}
+
+impl From<&Telemetry> for TelemetryTileValues {
+    fn from(telemetry: &Telemetry) -> Self {
+        Self {
+            latitude: telemetry.position.latitude,
+            longitude: telemetry.position.longitude,
+            altitude_m: telemetry.position.altitude,
+            battery_voltage: telemetry.battery_voltage,
+            battery_percentage: telemetry.battery_percentage,
+            armed: telemetry.armed,
+            mode: telemetry.mode.clone(),
+            ground_speed: telemetry.ground_speed,
+            air_speed: telemetry.air_speed,
+            heading: telemetry.heading,
+            altitude_relative: telemetry.altitude_relative,
+        }
+    }
+}
+
+fn age_seconds(
+    last_update_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    now.signed_duration_since(last_update_at)
+        .num_seconds()
+        .max(0) as u64
 }
 
 pub fn shared_message_dispatch_state() -> SharedMessageDispatchState {
@@ -111,7 +349,7 @@ mod tests {
         GpsCoords, ImageMetadata, LidarPoint, LidarScan, MultispectralImage, NdviResult, Telemetry,
         WebSocketMessage,
     };
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
     use uuid::Uuid;
 
     #[test]
@@ -209,6 +447,91 @@ mod tests {
         assert_eq!(state.system_statuses, before.system_statuses);
     }
 
+    #[test]
+    fn telemetry_snapshot_tracks_all_bound_tiles_and_freshness() {
+        let mut state = MessageDispatchState::default();
+        state.dispatch_message_at(
+            &WebSocketMessage::Telemetry {
+                data: sample_telemetry("GUIDED", 72),
+            },
+            timestamp_at("2026-01-01T00:00:10Z"),
+        );
+
+        let snapshot = state
+            .telemetry_tile_snapshot_at(
+                timestamp_at("2026-01-01T00:00:12Z"),
+                Duration::from_secs(5),
+            )
+            .expect("telemetry tile snapshot should exist");
+
+        assert_eq!(snapshot.latitude, 42.0);
+        assert_eq!(snapshot.longitude, -71.0);
+        assert_eq!(snapshot.altitude_m, 120.0);
+        assert_eq!(snapshot.battery_percentage, 72);
+        assert_eq!(snapshot.battery_voltage, 15.4);
+        assert_eq!(snapshot.mode, "GUIDED");
+        assert!(snapshot.armed);
+        assert_eq!(snapshot.ground_speed, 6.5);
+        assert_eq!(snapshot.air_speed, 7.0);
+        assert_eq!(snapshot.heading, 180.0);
+        assert_eq!(snapshot.altitude_relative, 45.0);
+        assert_eq!(snapshot.last_update_age_seconds, 2);
+        assert!(!snapshot.stale);
+    }
+
+    #[test]
+    fn telemetry_health_marks_stale_when_gap_exceeds_threshold() {
+        let mut state = MessageDispatchState::default();
+        assert_eq!(
+            state
+                .telemetry_freshness_at(
+                    timestamp_at("2026-01-01T00:00:12Z"),
+                    Duration::from_secs(5)
+                )
+                .state,
+            TelemetryFreshnessState::NoData
+        );
+
+        state.dispatch_message_at(
+            &WebSocketMessage::Telemetry {
+                data: sample_telemetry("AUTO", 88),
+            },
+            timestamp_at("2026-01-01T00:00:00Z"),
+        );
+
+        let freshness = state
+            .telemetry_freshness_at(timestamp_at("2026-01-01T00:00:06Z"), Duration::from_secs(5));
+
+        assert_eq!(freshness.state, TelemetryFreshnessState::Stale);
+        assert_eq!(freshness.last_update_age_seconds, Some(6));
+    }
+
+    #[test]
+    fn capture_timeline_orders_filters_and_evicts_oldest_events() {
+        let image_id = Uuid::new_v4();
+        let mut state = MessageDispatchState::with_capture_event_limit(2);
+        let mut lidar = sample_lidar_scan();
+        lidar.timestamp = timestamp_at("2026-01-01T00:00:20Z");
+        let mut image = sample_image(image_id);
+        image.metadata.timestamp = timestamp_at("2026-01-01T00:00:30Z");
+        let mut ndvi = sample_ndvi(image_id);
+        ndvi.timestamp = timestamp_at("2026-01-01T00:00:10Z");
+
+        state.dispatch_message(&WebSocketMessage::ImageCaptured { image });
+        state.dispatch_message(&WebSocketMessage::NdviProcessed { result: ndvi });
+        state.dispatch_message(&WebSocketMessage::LidarUpdate { scan: lidar });
+
+        let timeline = state.capture_events(None);
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].event_type, CaptureEventKind::Lidar);
+        assert_eq!(timeline[0].timestamp, timestamp_at("2026-01-01T00:00:20Z"));
+        assert_eq!(timeline[1].event_type, CaptureEventKind::ImageCaptured);
+
+        let lidar_events = state.capture_events(Some(CaptureEventKind::Lidar));
+        assert_eq!(lidar_events.len(), 1);
+        assert!(lidar_events[0].summary.contains("2 points"));
+    }
+
     fn sample_telemetry(mode: &str, battery_percentage: u8) -> Telemetry {
         Telemetry {
             timestamp: timestamp(),
@@ -285,7 +608,11 @@ mod tests {
     }
 
     fn timestamp() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        timestamp_at("2026-01-01T00:00:00Z")
+    }
+
+    fn timestamp_at(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
             .unwrap()
             .with_timezone(&chrono::Utc)
     }
