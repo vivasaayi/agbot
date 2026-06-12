@@ -1,3 +1,4 @@
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +300,65 @@ pub struct PreflightAuthorizationDecision {
     pub cert_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ProductLabelInterval {
+    pub label_ref: String,
+    pub rei_hours: Option<i64>,
+    pub phi_days: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntervalWindowStatus {
+    Known,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReiPhiWindow {
+    pub application_id: String,
+    pub label_ref: String,
+    pub source_application_ref: String,
+    pub applied_at: String,
+    pub rei_status: IntervalWindowStatus,
+    pub phi_status: IntervalWindowStatus,
+    pub rei_clear_at: Option<String>,
+    pub phi_clear_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryHarvestAction {
+    ReEntry,
+    Harvest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryHarvestDecisionStatus {
+    Cleared,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryHarvestBlockReason {
+    ReiActive,
+    PhiActive,
+    UnknownRei,
+    UnknownPhi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryHarvestDecision {
+    pub application_id: String,
+    pub action: EntryHarvestAction,
+    pub checked_at: String,
+    pub status: EntryHarvestDecisionStatus,
+    pub reason_code: Option<EntryHarvestBlockReason>,
+    pub clear_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CreateComplianceRecordRequest {
     #[serde(default)]
@@ -505,6 +565,22 @@ pub enum PreflightAuthorizationError {
         #[source]
         source: AirspaceZoneError,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReiPhiError {
+    #[error("label_ref cannot be empty")]
+    EmptyLabelRef,
+    #[error("checked_at cannot be empty")]
+    EmptyCheckedAt,
+    #[error("applied_at is not a valid RFC3339 timestamp")]
+    InvalidAppliedAt,
+    #[error("checked_at is not a valid RFC3339 timestamp")]
+    InvalidCheckedAt,
+    #[error("REI hours must be zero or greater")]
+    InvalidReiHours,
+    #[error("PHI days must be zero or greater")]
+    InvalidPhiDays,
 }
 
 pub fn build_initial_compliance_record(
@@ -827,6 +903,95 @@ pub fn evaluate_preflight_authorization(
         zone_ref: None,
         cert_ref: cert_check.cert_id,
     })
+}
+
+pub fn compute_rei_phi_window(
+    application: &ChemicalApplicationRecord,
+    label: ProductLabelInterval,
+) -> Result<ReiPhiWindow, ReiPhiError> {
+    let label_ref = normalize_required_rei_text(label.label_ref, ReiPhiError::EmptyLabelRef)?;
+    if label.rei_hours.is_some_and(|hours| hours < 0) {
+        return Err(ReiPhiError::InvalidReiHours);
+    }
+    if label.phi_days.is_some_and(|days| days < 0) {
+        return Err(ReiPhiError::InvalidPhiDays);
+    }
+    let applied_at = parse_rfc3339_utc(&application.applied_at, ReiPhiError::InvalidAppliedAt)?;
+    let rei_clear_at = label
+        .rei_hours
+        .map(|hours| format_rfc3339(applied_at + Duration::hours(hours)));
+    let phi_clear_at = label
+        .phi_days
+        .map(|days| format_rfc3339(applied_at + Duration::days(days)));
+
+    Ok(ReiPhiWindow {
+        application_id: application.application_id.clone(),
+        label_ref,
+        source_application_ref: application.application_id.clone(),
+        applied_at: format_rfc3339(applied_at),
+        rei_status: if rei_clear_at.is_some() {
+            IntervalWindowStatus::Known
+        } else {
+            IntervalWindowStatus::Unknown
+        },
+        phi_status: if phi_clear_at.is_some() {
+            IntervalWindowStatus::Known
+        } else {
+            IntervalWindowStatus::Unknown
+        },
+        rei_clear_at,
+        phi_clear_at,
+    })
+}
+
+pub fn evaluate_entry_harvest_clearance(
+    window: &ReiPhiWindow,
+    action: EntryHarvestAction,
+    checked_at: String,
+) -> Result<EntryHarvestDecision, ReiPhiError> {
+    let checked_at_text = normalize_required_rei_text(checked_at, ReiPhiError::EmptyCheckedAt)?;
+    let checked_at = parse_rfc3339_utc(&checked_at_text, ReiPhiError::InvalidCheckedAt)?;
+    let (clear_at, unknown_reason, active_reason) = match action {
+        EntryHarvestAction::ReEntry => (
+            window.rei_clear_at.as_deref(),
+            EntryHarvestBlockReason::UnknownRei,
+            EntryHarvestBlockReason::ReiActive,
+        ),
+        EntryHarvestAction::Harvest => (
+            window.phi_clear_at.as_deref(),
+            EntryHarvestBlockReason::UnknownPhi,
+            EntryHarvestBlockReason::PhiActive,
+        ),
+    };
+
+    let Some(clear_at) = clear_at else {
+        return Ok(entry_harvest_blocked(
+            window,
+            action,
+            format_rfc3339(checked_at),
+            unknown_reason,
+            None,
+        ));
+    };
+    let clear_at_time = parse_rfc3339_utc(clear_at, ReiPhiError::InvalidAppliedAt)?;
+    if checked_at < clear_at_time {
+        Ok(entry_harvest_blocked(
+            window,
+            action,
+            format_rfc3339(checked_at),
+            active_reason,
+            Some(clear_at.to_string()),
+        ))
+    } else {
+        Ok(EntryHarvestDecision {
+            application_id: window.application_id.clone(),
+            action,
+            checked_at: format_rfc3339(checked_at),
+            status: EntryHarvestDecisionStatus::Cleared,
+            reason_code: None,
+            clear_at: Some(clear_at.to_string()),
+        })
+    }
 }
 
 pub fn airspace_zone_contains_point(zone: &AirspaceZoneRecord, point: AirspaceCoordinate) -> bool {
@@ -1245,6 +1410,42 @@ fn hard_blocking_zone(zone: &AirspaceZoneRecord) -> bool {
     )
 }
 
+fn normalize_required_rei_text(value: String, error: ReiPhiError) -> Result<String, ReiPhiError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn parse_rfc3339_utc(value: &str, error: ReiPhiError) -> Result<DateTime<Utc>, ReiPhiError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| error)
+}
+
+fn format_rfc3339(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn entry_harvest_blocked(
+    window: &ReiPhiWindow,
+    action: EntryHarvestAction,
+    checked_at: String,
+    reason_code: EntryHarvestBlockReason,
+    clear_at: Option<String>,
+) -> EntryHarvestDecision {
+    EntryHarvestDecision {
+        application_id: window.application_id.clone(),
+        action,
+        checked_at,
+        status: EntryHarvestDecisionStatus::Blocked,
+        reason_code: Some(reason_code),
+        clear_at,
+    }
+}
+
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -1392,15 +1593,17 @@ mod tests {
         airspace_zone_contains_point, airspace_zone_intersects_polygon,
         append_compliance_record_version, build_airspace_zone_record,
         build_initial_compliance_record, build_operator_certification_record,
-        check_operator_certification, evaluate_preflight_authorization, refuse_in_place_mutation,
-        AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
+        check_operator_certification, compute_rei_phi_window, evaluate_entry_harvest_clearance,
+        evaluate_preflight_authorization, refuse_in_place_mutation, AirspaceCoordinate,
+        AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
         AppendComplianceRecordVersionRequest, ApplicationGeometry, AuthorizationBlockReason,
         AuthorizationDecisionStatus, CertificationBlockReason, CertificationStatus,
         ChemicalApplicationRecord, ComplianceRecordError, ComplianceRecordPayload,
-        ComplianceRecordType, CreateComplianceRecordRequest,
+        ComplianceRecordType, CreateComplianceRecordRequest, EntryHarvestAction,
+        EntryHarvestBlockReason, EntryHarvestDecisionStatus, IntervalWindowStatus,
         OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
-        PreflightAuthorizationRequest, RemoteIdFlightLogRecord, RemoteIdTrackPoint,
-        TelemetryGapRecord,
+        PreflightAuthorizationRequest, ProductLabelInterval, RemoteIdFlightLogRecord,
+        RemoteIdTrackPoint, TelemetryGapRecord,
     };
 
     #[test]
@@ -1659,6 +1862,84 @@ mod tests {
         assert_eq!(
             decision.reason_code,
             Some(AuthorizationBlockReason::StaleAirspaceData)
+        );
+    }
+
+    #[test]
+    fn rei_phi_window_computes_clearance_times_from_label() {
+        let window = compute_rei_phi_window(
+            &application_record(),
+            ProductLabelInterval {
+                label_ref: "EPA-12345-LBL".to_string(),
+                rei_hours: Some(12),
+                phi_days: Some(7),
+            },
+        )
+        .expect("window should compute");
+
+        assert_eq!(window.application_id, "chem-app-1");
+        assert_eq!(window.label_ref, "EPA-12345-LBL");
+        assert_eq!(window.rei_status, IntervalWindowStatus::Known);
+        assert_eq!(window.phi_status, IntervalWindowStatus::Known);
+        assert_eq!(window.rei_clear_at.as_deref(), Some("2026-06-13T01:00:00Z"));
+        assert_eq!(window.phi_clear_at.as_deref(), Some("2026-06-19T13:00:00Z"));
+    }
+
+    #[test]
+    fn rei_gate_blocks_reentry_before_clearance() {
+        let window = compute_rei_phi_window(
+            &application_record(),
+            ProductLabelInterval {
+                label_ref: "EPA-12345-LBL".to_string(),
+                rei_hours: Some(12),
+                phi_days: Some(7),
+            },
+        )
+        .expect("window should compute");
+
+        let decision = evaluate_entry_harvest_clearance(
+            &window,
+            EntryHarvestAction::ReEntry,
+            "2026-06-12T18:00:00Z".to_string(),
+        )
+        .expect("clearance should evaluate");
+
+        assert_eq!(decision.status, EntryHarvestDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(EntryHarvestBlockReason::ReiActive)
+        );
+        assert_eq!(decision.clear_at.as_deref(), Some("2026-06-13T01:00:00Z"));
+    }
+
+    #[test]
+    fn missing_label_interval_marks_unknown_and_blocks_clearance() {
+        let window = compute_rei_phi_window(
+            &application_record(),
+            ProductLabelInterval {
+                label_ref: "EPA-12345-LBL".to_string(),
+                rei_hours: None,
+                phi_days: None,
+            },
+        )
+        .expect("window should compute with unknown intervals");
+
+        assert_eq!(window.rei_status, IntervalWindowStatus::Unknown);
+        assert_eq!(window.phi_status, IntervalWindowStatus::Unknown);
+        assert_eq!(window.rei_clear_at, None);
+        assert_eq!(window.phi_clear_at, None);
+
+        let decision = evaluate_entry_harvest_clearance(
+            &window,
+            EntryHarvestAction::Harvest,
+            "2026-06-20T12:00:00Z".to_string(),
+        )
+        .expect("clearance should evaluate");
+
+        assert_eq!(decision.status, EntryHarvestDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(EntryHarvestBlockReason::UnknownPhi)
         );
     }
 
@@ -1966,6 +2247,23 @@ mod tests {
             "2026-06-12T12:00:00Z".to_string(),
         )
         .expect("operator cert should be valid")
+    }
+
+    fn application_record() -> ChemicalApplicationRecord {
+        ChemicalApplicationRecord {
+            application_id: "chem-app-1".to_string(),
+            product: "Example Herbicide".to_string(),
+            epa_or_label_ref: "EPA-12345-LBL".to_string(),
+            field_id: "field-north".to_string(),
+            geometry: ApplicationGeometry {
+                crs: "EPSG:4326".to_string(),
+                coordinates: square_zone(),
+            },
+            applied_at: "2026-06-12T13:00:00Z".to_string(),
+            rate: 1.75,
+            units: "L/ha".to_string(),
+            operator_id: "operator-17".to_string(),
+        }
     }
 
     fn preflight_request(
