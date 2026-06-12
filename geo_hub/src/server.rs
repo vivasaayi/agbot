@@ -109,6 +109,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::install_fleet_component_route),
         )
         .route(
+            "/api/fleet-health/duty-accruals",
+            post(routes::accrue_fleet_component_duty),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

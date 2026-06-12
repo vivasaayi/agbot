@@ -1628,6 +1628,111 @@ async fn fleet_health_component_registry_links_airframe_and_rejects_double_insta
 }
 
 #[tokio::test]
+async fn fleet_health_duty_accrual_is_idempotent_per_session() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let airframe_id = enroll_test_fleet_node(&ctx, "hw-drone-duty-001").await?;
+    register_test_component(&ctx, "battery-pack-duty-001", &airframe_id).await?;
+
+    let accrual_payload = json!({
+        "session_id": "session-duty-001",
+        "airframe_id": airframe_id,
+        "flight_hours": 1.25,
+        "cycles": 1,
+        "duty_score": 0.80,
+        "ended_at": "2026-06-03T12:15:00Z"
+    });
+
+    let first_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet-health/duty-accruals")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(accrual_payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let body = to_bytes(first_response.into_body(), 64 * 1024).await?;
+    let first_accruals: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(first_accruals.len(), 1);
+    assert_eq!(
+        first_accruals[0]
+            .get("component_id")
+            .and_then(|value| value.as_str()),
+        Some("battery-pack-duty-001")
+    );
+
+    let replay_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet-health/duty-accruals")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(accrual_payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(replay_response.status(), StatusCode::OK);
+    let body = to_bytes(replay_response.into_body(), 64 * 1024).await?;
+    let replay_accruals: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(replay_accruals.len(), 1);
+
+    let component_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fleet-health/components?airframe_id={airframe_id}"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(component_response.status(), StatusCode::OK);
+    let body = to_bytes(component_response.into_body(), 64 * 1024).await?;
+    let components: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(components.len(), 1);
+    assert_eq!(
+        components[0]
+            .get("flight_hours")
+            .and_then(|value| value.as_f64()),
+        Some(1.25)
+    );
+    assert_eq!(
+        components[0].get("cycles").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        components[0]
+            .get("duty_score")
+            .and_then(|value| value.as_f64()),
+        Some(0.80)
+    );
+
+    let accrual_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fleet_component_duty_accruals WHERE session_id = ?1 AND component_id = ?2",
+    )
+    .bind("session-duty-001")
+    .bind("battery-pack-duty-001")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(accrual_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn orthomosaic_frame_set_ingest_lists_pose_metadata() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -4749,6 +4854,37 @@ async fn enroll_test_fleet_node(ctx: &TestContext, hardware_id: &str) -> Result<
         .and_then(|value| value.as_str())
         .expect("node_id should exist")
         .to_string())
+}
+
+async fn register_test_component(
+    ctx: &TestContext,
+    component_id: &str,
+    airframe_id: &str,
+) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet-health/components")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "component_id": component_id,
+                        "component_type": "battery",
+                        "serial": format!("SERIAL-{component_id}"),
+                        "airframe_id": airframe_id,
+                        "installed_at": "2026-06-01T10:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
 }
 
 async fn seed_compliance_field(ctx: &TestContext, field_id: &str, owner: &str) -> Result<()> {

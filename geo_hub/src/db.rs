@@ -391,6 +391,9 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             installed_at TEXT,
             removed_at TEXT,
             service_history_json TEXT NOT NULL,
+            flight_hours REAL NOT NULL DEFAULT 0,
+            cycles INTEGER NOT NULL DEFAULT 0,
+            duty_score REAL NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -409,6 +412,46 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             event_at TEXT NOT NULL,
             actor TEXT,
             details TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "fleet_components",
+        "flight_hours",
+        "ALTER TABLE fleet_components ADD COLUMN flight_hours REAL NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "fleet_components",
+        "cycles",
+        "ALTER TABLE fleet_components ADD COLUMN cycles INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "fleet_components",
+        "duty_score",
+        "ALTER TABLE fleet_components ADD COLUMN duty_score REAL NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fleet_component_duty_accruals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            component_id TEXT NOT NULL,
+            airframe_id TEXT NOT NULL,
+            flight_hours REAL NOT NULL,
+            cycles INTEGER NOT NULL,
+            duty_score REAL NOT NULL,
+            accrued_at TEXT NOT NULL,
+            UNIQUE(session_id, component_id)
         );
         "#,
     )
@@ -632,6 +675,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_fleet_component_events_component_id
         ON fleet_component_events(component_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_fleet_component_duty_accruals_airframe
+        ON fleet_component_duty_accruals(airframe_id, session_id);
         "#,
     )
     .execute(pool)

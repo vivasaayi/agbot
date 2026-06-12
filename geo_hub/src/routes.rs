@@ -27,7 +27,8 @@ use crop_intelligence::{
     ModelVersionRegistrationRequest,
 };
 use fleet_health::{
-    build_component_record, component_event, install_component, FleetComponentEventRecord,
+    accrue_component_duty, build_component_duty_accruals, build_component_record, component_event,
+    install_component, ComponentDutyAccrualRecord, DutyAccrualRequest, FleetComponentEventRecord,
     FleetComponentRecord, FleetComponentType, FleetHealthError, InstallComponentRequest,
     RegisterComponentRequest, ServiceHistoryEntry,
 };
@@ -1607,7 +1608,7 @@ pub async fn list_fleet_components(
     let rows = sqlx::query(
         r#"
         SELECT component_id, component_type, serial, airframe_id, installed_at, removed_at,
-               service_history_json, created_at, updated_at
+               service_history_json, flight_hours, cycles, duty_score, created_at, updated_at
         FROM fleet_components
         WHERE (?1 IS NULL OR airframe_id = ?1)
           AND (?2 IS NULL OR component_type = ?2)
@@ -1711,6 +1712,64 @@ pub async fn install_fleet_component_route(
     .await?;
 
     Ok(Json(updated))
+}
+
+pub async fn accrue_fleet_component_duty(
+    State(state): State<AppState>,
+    Json(request): Json<DutyAccrualRequest>,
+) -> AppResult<Json<Vec<ComponentDutyAccrualRecord>>> {
+    validate_enrolled_airframe(&state, request.airframe_id.trim()).await?;
+    let components =
+        load_active_fleet_components_for_airframe(&state, request.airframe_id.trim()).await?;
+    let component_ids = components
+        .iter()
+        .map(|component| component.component_id.clone())
+        .collect::<Vec<_>>();
+    let accruals =
+        build_component_duty_accruals(request, &component_ids).map_err(fleet_health_error)?;
+
+    for accrual in &accruals {
+        let inserted = insert_component_duty_accrual(&state, accrual).await?;
+        if inserted {
+            if let Some(component) = components
+                .iter()
+                .find(|component| component.component_id == accrual.component_id)
+            {
+                let updated = accrue_component_duty(component, accrual, current_record_timestamp())
+                    .map_err(fleet_health_error)?;
+                update_fleet_component_duty_totals(&state, &updated).await?;
+                append_fleet_component_event(
+                    &state,
+                    &component_event(
+                        &updated.component_id,
+                        "duty_accrued",
+                        updated.airframe_id.clone(),
+                        accrual.accrued_at.clone(),
+                        None,
+                        Some(format!("session {}", accrual.session_id)),
+                    )
+                    .map_err(fleet_health_error)?,
+                )
+                .await?;
+            }
+        }
+    }
+
+    let session_id = accruals
+        .first()
+        .map(|accrual| accrual.session_id.clone())
+        .unwrap_or_default();
+    let airframe_id = accruals
+        .first()
+        .map(|accrual| accrual.airframe_id.clone())
+        .unwrap_or_default();
+    let persisted = if session_id.is_empty() {
+        Vec::new()
+    } else {
+        load_component_duty_accruals_for_session(&state, &session_id, &airframe_id).await?
+    };
+
+    Ok(Json(persisted))
 }
 
 pub async fn ingest_orthomosaic_frame_set(
@@ -5050,8 +5109,25 @@ fn decode_fleet_component_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Fle
         installed_at: row.get("installed_at"),
         removed_at: row.get("removed_at"),
         service_history,
+        flight_hours: row.get("flight_hours"),
+        cycles: row.get::<i64, _>("cycles") as u32,
+        duty_score: row.get("duty_score"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_component_duty_accrual(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ComponentDutyAccrualRecord> {
+    Ok(ComponentDutyAccrualRecord {
+        session_id: row.get("session_id"),
+        component_id: row.get("component_id"),
+        airframe_id: row.get("airframe_id"),
+        flight_hours: row.get("flight_hours"),
+        cycles: row.get::<i64, _>("cycles") as u32,
+        duty_score: row.get("duty_score"),
+        accrued_at: row.get("accrued_at"),
     })
 }
 
@@ -5343,9 +5419,9 @@ async fn insert_fleet_component(state: &AppState, record: &FleetComponentRecord)
         r#"
         INSERT INTO fleet_components (
             component_id, component_type, serial, airframe_id, installed_at, removed_at,
-            service_history_json, created_at, updated_at
+            service_history_json, flight_hours, cycles, duty_score, created_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#,
     )
     .bind(&record.component_id)
@@ -5355,6 +5431,9 @@ async fn insert_fleet_component(state: &AppState, record: &FleetComponentRecord)
     .bind(&record.installed_at)
     .bind(&record.removed_at)
     .bind(service_history_json)
+    .bind(record.flight_hours)
+    .bind(i64::from(record.cycles))
+    .bind(record.duty_score)
     .bind(&record.created_at)
     .bind(&record.updated_at)
     .execute(&state.pool)
@@ -5385,6 +5464,55 @@ async fn update_fleet_component_install(
     .map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn update_fleet_component_duty_totals(
+    state: &AppState,
+    record: &FleetComponentRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE fleet_components
+        SET flight_hours = ?1, cycles = ?2, duty_score = ?3, updated_at = ?4
+        WHERE component_id = ?5
+        "#,
+    )
+    .bind(record.flight_hours)
+    .bind(i64::from(record.cycles))
+    .bind(record.duty_score)
+    .bind(&record.updated_at)
+    .bind(&record.component_id)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_component_duty_accrual(
+    state: &AppState,
+    accrual: &ComponentDutyAccrualRecord,
+) -> AppResult<bool> {
+    let result = sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO fleet_component_duty_accruals (
+            session_id, component_id, airframe_id, flight_hours, cycles, duty_score, accrued_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&accrual.session_id)
+    .bind(&accrual.component_id)
+    .bind(&accrual.airframe_id)
+    .bind(accrual.flight_hours)
+    .bind(i64::from(accrual.cycles))
+    .bind(accrual.duty_score)
+    .bind(&accrual.accrued_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 async fn append_fleet_component_event(
@@ -5418,7 +5546,7 @@ async fn load_fleet_component(
     sqlx::query(
         r#"
         SELECT component_id, component_type, serial, airframe_id, installed_at, removed_at,
-               service_history_json, created_at, updated_at
+               service_history_json, flight_hours, cycles, duty_score, created_at, updated_at
         FROM fleet_components
         WHERE component_id = ?1
         "#,
@@ -5429,6 +5557,57 @@ async fn load_fleet_component(
     .map_err(Error::from)?
     .map(|row| decode_fleet_component_record(&row))
     .transpose()
+}
+
+async fn load_active_fleet_components_for_airframe(
+    state: &AppState,
+    airframe_id: &str,
+) -> AppResult<Vec<FleetComponentRecord>> {
+    let airframe_id = normalize_optional_text(Some(airframe_id.to_string()))
+        .ok_or_else(|| AppError::BadRequest("airframe_id is required".to_string()))?;
+    let rows = sqlx::query(
+        r#"
+        SELECT component_id, component_type, serial, airframe_id, installed_at, removed_at,
+               service_history_json, flight_hours, cycles, duty_score, created_at, updated_at
+        FROM fleet_components
+        WHERE airframe_id = ?1
+          AND removed_at IS NULL
+        ORDER BY component_id ASC
+        "#,
+    )
+    .bind(airframe_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_fleet_component_record(&row))
+        .collect()
+}
+
+async fn load_component_duty_accruals_for_session(
+    state: &AppState,
+    session_id: &str,
+    airframe_id: &str,
+) -> AppResult<Vec<ComponentDutyAccrualRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT session_id, component_id, airframe_id, flight_hours, cycles, duty_score, accrued_at
+        FROM fleet_component_duty_accruals
+        WHERE session_id = ?1
+          AND airframe_id = ?2
+        ORDER BY component_id ASC
+        "#,
+    )
+    .bind(session_id)
+    .bind(airframe_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_component_duty_accrual(&row))
+        .collect()
 }
 
 async fn validate_orthomosaic_linkage(

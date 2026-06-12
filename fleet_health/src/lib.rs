@@ -86,6 +86,20 @@ pub struct InstallComponentRequest {
     pub actor: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DutyAccrualRequest {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub airframe_id: String,
+    pub flight_hours: f64,
+    #[serde(default)]
+    pub cycles: u32,
+    pub duty_score: f64,
+    #[serde(default)]
+    pub ended_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetComponentRecord {
     pub component_id: String,
@@ -95,6 +109,9 @@ pub struct FleetComponentRecord {
     pub installed_at: Option<String>,
     pub removed_at: Option<String>,
     pub service_history: Vec<ServiceHistoryEntry>,
+    pub flight_hours: f64,
+    pub cycles: u32,
+    pub duty_score: f64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -109,6 +126,17 @@ pub struct FleetComponentEventRecord {
     pub details: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentDutyAccrualRecord {
+    pub session_id: String,
+    pub component_id: String,
+    pub airframe_id: String,
+    pub flight_hours: f64,
+    pub cycles: u32,
+    pub duty_score: f64,
+    pub accrued_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FleetHealthError {
     #[error("component_id cannot be empty")]
@@ -121,6 +149,14 @@ pub enum FleetHealthError {
     EmptyInstalledAt,
     #[error("created_at cannot be empty")]
     EmptyCreatedAt,
+    #[error("session_id cannot be empty")]
+    EmptySessionId,
+    #[error("flight_hours must be finite and non-negative")]
+    InvalidFlightHours,
+    #[error("duty_score must be finite and non-negative")]
+    InvalidDutyScore,
+    #[error("ended_at cannot be empty")]
+    EmptyEndedAt,
     #[error("service_id cannot be empty")]
     EmptyServiceId,
     #[error("service performed_at cannot be empty")]
@@ -173,6 +209,9 @@ pub fn build_component_record(
         installed_at,
         removed_at: normalize_optional_text(request.removed_at),
         service_history,
+        flight_hours: 0.0,
+        cycles: 0,
+        duty_score: 0.0,
         created_at: created_at.clone(),
         updated_at: created_at,
     })
@@ -203,6 +242,49 @@ pub fn install_component(
     updated.airframe_id = Some(airframe_id);
     updated.installed_at = Some(installed_at);
     updated.removed_at = None;
+    updated.updated_at = normalize_required_text(updated_at, FleetHealthError::EmptyCreatedAt)?;
+    Ok(updated)
+}
+
+pub fn build_component_duty_accruals(
+    request: DutyAccrualRequest,
+    component_ids: &[String],
+) -> Result<Vec<ComponentDutyAccrualRecord>, FleetHealthError> {
+    let session_id = normalize_required_text(request.session_id, FleetHealthError::EmptySessionId)?;
+    let airframe_id =
+        normalize_required_text(request.airframe_id, FleetHealthError::EmptyAirframeId)?;
+    validate_nonnegative_finite(request.flight_hours, FleetHealthError::InvalidFlightHours)?;
+    validate_nonnegative_finite(request.duty_score, FleetHealthError::InvalidDutyScore)?;
+    let accrued_at = normalize_required_text(request.ended_at, FleetHealthError::EmptyEndedAt)?;
+
+    component_ids
+        .iter()
+        .map(|component_id| {
+            Ok(ComponentDutyAccrualRecord {
+                session_id: session_id.clone(),
+                component_id: normalize_required_text(
+                    component_id.clone(),
+                    FleetHealthError::EmptyComponentId,
+                )?,
+                airframe_id: airframe_id.clone(),
+                flight_hours: request.flight_hours,
+                cycles: request.cycles,
+                duty_score: request.duty_score,
+                accrued_at: accrued_at.clone(),
+            })
+        })
+        .collect()
+}
+
+pub fn accrue_component_duty(
+    component: &FleetComponentRecord,
+    accrual: &ComponentDutyAccrualRecord,
+    updated_at: String,
+) -> Result<FleetComponentRecord, FleetHealthError> {
+    let mut updated = component.clone();
+    updated.flight_hours += accrual.flight_hours;
+    updated.cycles += accrual.cycles;
+    updated.duty_score += accrual.duty_score;
     updated.updated_at = normalize_required_text(updated_at, FleetHealthError::EmptyCreatedAt)?;
     Ok(updated)
 }
@@ -272,10 +354,22 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
+fn validate_nonnegative_finite(
+    value: f64,
+    error: FleetHealthError,
+) -> Result<(), FleetHealthError> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_component_record, component_event, install_component, FleetComponentType,
+        accrue_component_duty, build_component_duty_accruals, build_component_record,
+        component_event, install_component, DutyAccrualRequest, FleetComponentType,
         FleetHealthError, InstallComponentRequest, RegisterComponentRequest, ServiceHistoryEntry,
     };
 
@@ -390,5 +484,65 @@ mod tests {
         assert_eq!(event.event_type, "installed");
         assert_eq!(event.airframe_id.as_deref(), Some("airframe-1"));
         assert_eq!(event.actor.as_deref(), Some("tech-1"));
+    }
+
+    #[test]
+    fn duty_accrual_builds_per_component_records_and_updates_totals() {
+        let component = build_component_record(
+            RegisterComponentRequest {
+                component_id: Some("battery-pack-001".to_string()),
+                component_type: FleetComponentType::Battery,
+                serial: "BAT-2026-001".to_string(),
+                airframe_id: Some("airframe-1".to_string()),
+                installed_at: Some("2026-06-01T10:00:00Z".to_string()),
+                removed_at: None,
+                service_history: vec![],
+            },
+            "generated-component".to_string(),
+            "2026-06-01T10:05:00Z".to_string(),
+        )
+        .expect("component should be valid");
+
+        let accruals = build_component_duty_accruals(
+            DutyAccrualRequest {
+                session_id: " session-001 ".to_string(),
+                airframe_id: " airframe-1 ".to_string(),
+                flight_hours: 1.25,
+                cycles: 1,
+                duty_score: 0.8,
+                ended_at: " 2026-06-03T12:15:00Z ".to_string(),
+            },
+            &[component.component_id.clone()],
+        )
+        .expect("accrual should be valid");
+
+        assert_eq!(accruals.len(), 1);
+        assert_eq!(accruals[0].session_id, "session-001");
+        assert_eq!(accruals[0].component_id, "battery-pack-001");
+
+        let updated =
+            accrue_component_duty(&component, &accruals[0], "2026-06-03T12:15:00Z".to_string())
+                .expect("totals should update");
+        assert_eq!(updated.flight_hours, 1.25);
+        assert_eq!(updated.cycles, 1);
+        assert_eq!(updated.duty_score, 0.8);
+    }
+
+    #[test]
+    fn duty_accrual_rejects_invalid_hours() {
+        let error = build_component_duty_accruals(
+            DutyAccrualRequest {
+                session_id: "session-001".to_string(),
+                airframe_id: "airframe-1".to_string(),
+                flight_hours: -1.0,
+                cycles: 1,
+                duty_score: 0.8,
+                ended_at: "2026-06-03T12:15:00Z".to_string(),
+            },
+            &["battery-pack-001".to_string()],
+        )
+        .expect_err("negative hours should be rejected");
+
+        assert_eq!(error, FleetHealthError::InvalidFlightHours);
     }
 }
