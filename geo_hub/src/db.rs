@@ -460,6 +460,40 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS soil_iot_devices (
+            device_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            zone_id TEXT,
+            sensor_type TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            crs TEXT NOT NULL,
+            calibration_profile_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS soil_iot_reading_rejections (
+            rejection_id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            rejected_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,
@@ -684,6 +718,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_fleet_component_duty_accruals_airframe
         ON fleet_component_duty_accruals(airframe_id, session_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_soil_iot_devices_field_id
+        ON soil_iot_devices(field_id, zone_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_soil_iot_devices_org_id
+        ON soil_iot_devices(org_id);
         "#,
     )
     .execute(pool)

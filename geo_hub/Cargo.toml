@@ -25,6 +25,7 @@ orthomosaic = { path = "../orthomosaic" }
 crop_intelligence = { path = "../crop_intelligence" }
 compliance = { path = "../compliance" }
 fleet_health = { path = "../fleet_health" }
+soil_iot = { path = "../soil_iot" }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
 image = { workspace = true }

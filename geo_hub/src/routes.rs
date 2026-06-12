@@ -52,6 +52,10 @@ use shared::schemas::{
     RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
     DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
+use soil_iot::{
+    build_soil_device_record, GeoPosition, RegisterSoilDeviceRequest, SoilDeviceRecord,
+    SoilDeviceStatus, SoilIotError, SoilSensorType,
+};
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -313,6 +317,14 @@ pub struct FleetNodeListQuery {
 pub struct FleetComponentListQuery {
     pub airframe_id: Option<String>,
     pub component_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoilDeviceListQuery {
+    pub org_id: Option<String>,
+    pub field_id: Option<String>,
+    pub zone_id: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1770,6 +1782,59 @@ pub async fn accrue_fleet_component_duty(
     };
 
     Ok(Json(persisted))
+}
+
+pub async fn register_soil_iot_device(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterSoilDeviceRequest>,
+) -> AppResult<Json<SoilDeviceRecord>> {
+    let record = build_soil_device_record(
+        request,
+        Uuid::new_v4().to_string(),
+        current_record_timestamp(),
+    )
+    .map_err(soil_iot_error)?;
+
+    insert_soil_iot_device(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_soil_iot_devices(
+    Query(query): Query<SoilDeviceListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SoilDeviceRecord>>> {
+    let org_id = normalize_optional_text(query.org_id);
+    let field_id = normalize_optional_text(query.field_id);
+    let zone_id = normalize_optional_text(query.zone_id);
+    let status = normalize_optional_text(query.status)
+        .map(parse_soil_device_status)
+        .transpose()?
+        .map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT device_id, org_id, field_id, zone_id, sensor_type, latitude, longitude, crs,
+               calibration_profile_ref, status, created_at, updated_at
+        FROM soil_iot_devices
+        WHERE (?1 IS NULL OR org_id = ?1)
+          AND (?2 IS NULL OR field_id = ?2)
+          AND (?3 IS NULL OR zone_id = ?3)
+          AND (?4 IS NULL OR status = ?4)
+        ORDER BY updated_at DESC, device_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(field_id)
+    .bind(zone_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_soil_iot_device(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
 }
 
 pub async fn ingest_orthomosaic_frame_set(
@@ -4373,6 +4438,18 @@ fn parse_fleet_component_type(value: String) -> AppResult<FleetComponentType> {
         .map_err(fleet_health_error)
 }
 
+fn soil_iot_error(error: SoilIotError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
+    value.parse::<SoilSensorType>().map_err(soil_iot_error)
+}
+
+fn parse_soil_device_status(value: String) -> AppResult<SoilDeviceStatus> {
+    value.parse::<SoilDeviceStatus>().map_err(soil_iot_error)
+}
+
 fn orthomosaic_ingest_error(error: FrameSetIngestError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -5131,6 +5208,25 @@ fn decode_component_duty_accrual(
     })
 }
 
+fn decode_soil_iot_device(row: &sqlx::sqlite::SqliteRow) -> AppResult<SoilDeviceRecord> {
+    Ok(SoilDeviceRecord {
+        device_id: row.get("device_id"),
+        org_id: row.get("org_id"),
+        field_id: row.get("field_id"),
+        zone_id: row.get("zone_id"),
+        sensor_type: parse_soil_sensor_type(row.get::<String, _>("sensor_type"))?,
+        position: GeoPosition {
+            latitude: row.get("latitude"),
+            longitude: row.get("longitude"),
+            crs: row.get("crs"),
+        },
+        calibration_profile_ref: row.get("calibration_profile_ref"),
+        status: parse_soil_device_status(row.get::<String, _>("status"))?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 fn decode_fleet_component_event(
     row: &sqlx::sqlite::SqliteRow,
 ) -> AppResult<FleetComponentEventRecord> {
@@ -5513,6 +5609,35 @@ async fn insert_component_duty_accrual(
     .map_err(Error::from)?;
 
     Ok(result.rows_affected() > 0)
+}
+
+async fn insert_soil_iot_device(state: &AppState, record: &SoilDeviceRecord) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO soil_iot_devices (
+            device_id, org_id, field_id, zone_id, sensor_type, latitude, longitude, crs,
+            calibration_profile_ref, status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&record.device_id)
+    .bind(&record.org_id)
+    .bind(&record.field_id)
+    .bind(&record.zone_id)
+    .bind(record.sensor_type.as_str())
+    .bind(record.position.latitude)
+    .bind(record.position.longitude)
+    .bind(&record.position.crs)
+    .bind(&record.calibration_profile_ref)
+    .bind(record.status.as_str())
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
 }
 
 async fn append_fleet_component_event(
