@@ -1,4 +1,4 @@
-use crate::{LinkStateSnapshot, SharedLinkState};
+use crate::{LinkStateSnapshot, MessageDispatchState, SharedLinkState, SharedMessageDispatchState};
 use axum::{extract::State, response::Html, Json};
 use shared::{config::AgroConfig, AgroResult};
 use std::sync::Arc;
@@ -8,11 +8,26 @@ pub struct WebServer {
     #[allow(dead_code)]
     config: Arc<AgroConfig>,
     link_state: SharedLinkState,
+    dispatch_state: SharedMessageDispatchState,
+}
+
+#[derive(Clone)]
+struct WebServerState {
+    link_state: SharedLinkState,
+    dispatch_state: SharedMessageDispatchState,
 }
 
 impl WebServer {
-    pub async fn new(config: Arc<AgroConfig>, link_state: SharedLinkState) -> AgroResult<Self> {
-        Ok(Self { config, link_state })
+    pub async fn new(
+        config: Arc<AgroConfig>,
+        link_state: SharedLinkState,
+        dispatch_state: SharedMessageDispatchState,
+    ) -> AgroResult<Self> {
+        Ok(Self {
+            config,
+            link_state,
+            dispatch_state,
+        })
     }
 
     pub async fn run(&self) -> AgroResult<()> {
@@ -22,10 +37,14 @@ impl WebServer {
         let app = Router::new()
             .route("/", get(dashboard_page))
             .route("/api/link-state", get(link_state))
+            .route("/api/dispatch-state", get(dispatch_state))
             .route("/telemetry", get(telemetry_page))
             .route("/maps", get(maps_page))
             .nest_service("/static", ServeDir::new("static"))
-            .with_state(self.link_state.clone());
+            .with_state(WebServerState {
+                link_state: self.link_state.clone(),
+                dispatch_state: self.dispatch_state.clone(),
+            });
 
         let bind_addr = "0.0.0.0:8081"; // Different port from mission control
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -37,8 +56,12 @@ impl WebServer {
     }
 }
 
-async fn link_state(State(link_state): State<SharedLinkState>) -> Json<LinkStateSnapshot> {
-    Json(link_state.read().await.snapshot())
+async fn link_state(State(state): State<WebServerState>) -> Json<LinkStateSnapshot> {
+    Json(state.link_state.read().await.snapshot())
+}
+
+async fn dispatch_state(State(state): State<WebServerState>) -> Json<MessageDispatchState> {
+    Json(state.dispatch_state.read().await.clone())
 }
 
 async fn dashboard_page() -> Html<&'static str> {
@@ -81,6 +104,7 @@ async fn dashboard_page() -> Html<&'static str> {
             <p><span id="mission-control-indicator" class="status-indicator status-connecting"></span>Mission Control: <span id="mission-control-state">Connecting</span></p>
             <p><span class="status-indicator status-disconnected"></span>Flight Controller: Simulation Mode</p>
             <p><span class="status-indicator status-connected"></span>Sensors: Active</p>
+            <p>Malformed frames: <span id="malformed-frames">0</span></p>
         </div>
 
         <div class="panel">
@@ -199,8 +223,20 @@ async fn dashboard_page() -> Html<&'static str> {
             }
         }
 
+        async function refreshDispatchState() {
+            try {
+                const response = await fetch('/api/dispatch-state');
+                const snapshot = await response.json();
+                document.getElementById('malformed-frames').textContent = snapshot.malformed_frames || 0;
+            } catch (error) {
+                document.getElementById('malformed-frames').textContent = 'unknown';
+            }
+        }
+
         refreshLinkState();
+        refreshDispatchState();
         setInterval(refreshLinkState, 1000);
+        setInterval(refreshDispatchState, 1000);
     </script>
 </body>
 </html>

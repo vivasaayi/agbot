@@ -1,3 +1,4 @@
+use crate::message_dispatch::{shared_message_dispatch_state, SharedMessageDispatchState};
 use futures_util::StreamExt;
 use serde::Serialize;
 use shared::{schemas::WebSocketMessage, AgroResult};
@@ -146,6 +147,26 @@ pub async fn run_websocket_client_until(
 pub async fn run_websocket_client_with_handler_until<F>(
     ws_url: String,
     link_state: SharedLinkState,
+    stop_rx: watch::Receiver<bool>,
+    handle_message: F,
+) -> AgroResult<()>
+where
+    F: FnMut(WebSocketMessage) + Send,
+{
+    run_websocket_client_with_dispatch_until(
+        ws_url,
+        link_state,
+        shared_message_dispatch_state(),
+        stop_rx,
+        handle_message,
+    )
+    .await
+}
+
+pub async fn run_websocket_client_with_dispatch_until<F>(
+    ws_url: String,
+    link_state: SharedLinkState,
+    dispatch_state: SharedMessageDispatchState,
     mut stop_rx: watch::Receiver<bool>,
     mut handle_message: F,
 ) -> AgroResult<()>
@@ -184,8 +205,12 @@ where
                         message = read.next() => {
                             match message {
                                 Some(Ok(Message::Text(text))) => {
-                                    match serde_json::from_str::<WebSocketMessage>(&text) {
-                                        Ok(ws_msg) => handle_message(ws_msg),
+                                    let dispatch_result = {
+                                        let mut dispatch = dispatch_state.write().await;
+                                        dispatch.dispatch_frame(&text)
+                                    };
+                                    match dispatch_result {
+                                        Ok(dispatched) => handle_message(dispatched.message),
                                         Err(err) => error!("Failed to parse WebSocket message: {}", err),
                                     }
                                 }

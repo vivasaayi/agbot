@@ -10,11 +10,17 @@ use tracing::{error, info};
 
 pub mod cli_interface;
 pub mod link_client;
+pub mod message_dispatch;
 pub mod web_server;
 
 pub use link_client::{
-    run_websocket_client_until, run_websocket_client_with_handler_until, shared_link_state,
-    ConnectionState, LinkStateMachine, LinkStateSnapshot, ReconnectPolicy, SharedLinkState,
+    run_websocket_client_until, run_websocket_client_with_dispatch_until,
+    run_websocket_client_with_handler_until, shared_link_state, ConnectionState, LinkStateMachine,
+    LinkStateSnapshot, ReconnectPolicy, SharedLinkState,
+};
+pub use message_dispatch::{
+    shared_message_dispatch_state, DispatchError, DispatchedMessage, MessageDispatchState,
+    MessageRoute, MissionStatusSnapshot, SharedMessageDispatchState, SystemStatusSnapshot,
 };
 
 #[derive(Parser, Debug)]
@@ -31,13 +37,19 @@ pub struct Args {
 pub struct GroundStationUI {
     config: Arc<AgroConfig>,
     link_state: SharedLinkState,
+    dispatch_state: SharedMessageDispatchState,
 }
 
 impl GroundStationUI {
     pub async fn new() -> AgroResult<Self> {
         let config = Arc::new(AgroConfig::load()?);
         let link_state = shared_link_state(ReconnectPolicy::default());
-        Ok(Self { config, link_state })
+        let dispatch_state = shared_message_dispatch_state();
+        Ok(Self {
+            config,
+            link_state,
+            dispatch_state,
+        })
     }
 
     pub async fn run(&self) -> AgroResult<()> {
@@ -53,15 +65,21 @@ impl GroundStationUI {
     async fn run_web_server(&self, args: &Args) -> AgroResult<()> {
         info!("Starting web-based ground station UI");
 
-        let server =
-            web_server::WebServer::new(self.config.clone(), self.link_state.clone()).await?;
+        let server = web_server::WebServer::new(
+            self.config.clone(),
+            self.link_state.clone(),
+            self.dispatch_state.clone(),
+        )
+        .await?;
         let (stop_tx, stop_rx) = watch::channel(false);
         let ws_url = self.mission_control_ws_url(args);
         let link_state = self.link_state.clone();
+        let dispatch_state = self.dispatch_state.clone();
         let ws_handle = tokio::spawn(async move {
-            if let Err(err) = run_websocket_client_with_handler_until(
+            if let Err(err) = run_websocket_client_with_dispatch_until(
                 ws_url,
                 link_state,
+                dispatch_state,
                 stop_rx,
                 GroundStationUI::handle_websocket_message,
             )
@@ -86,10 +104,12 @@ impl GroundStationUI {
 
         let (stop_tx, stop_rx) = watch::channel(false);
         let link_state = self.link_state.clone();
+        let dispatch_state = self.dispatch_state.clone();
         let ws_handle = tokio::spawn(async move {
-            if let Err(err) = run_websocket_client_with_handler_until(
+            if let Err(err) = run_websocket_client_with_dispatch_until(
                 ws_url,
                 link_state,
+                dispatch_state,
                 stop_rx,
                 GroundStationUI::handle_websocket_message,
             )
@@ -99,7 +119,8 @@ impl GroundStationUI {
             }
         });
 
-        cli_interface::run_cli_interface(self.link_state.clone()).await;
+        cli_interface::run_cli_interface(self.link_state.clone(), self.dispatch_state.clone())
+            .await;
         let _ = stop_tx.send(true);
         let _ = ws_handle.await;
 
@@ -108,6 +129,10 @@ impl GroundStationUI {
 
     pub fn link_state(&self) -> SharedLinkState {
         self.link_state.clone()
+    }
+
+    pub fn dispatch_state(&self) -> SharedMessageDispatchState {
+        self.dispatch_state.clone()
     }
 
     fn mission_control_ws_url(&self, args: &Args) -> String {

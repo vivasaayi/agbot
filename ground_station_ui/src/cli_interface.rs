@@ -1,8 +1,11 @@
-use crate::SharedLinkState;
+use crate::{SharedLinkState, SharedMessageDispatchState};
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tracing::info;
 
-pub async fn run_cli_interface(link_state: SharedLinkState) {
+pub async fn run_cli_interface(
+    link_state: SharedLinkState,
+    dispatch_state: SharedMessageDispatchState,
+) {
     info!("CLI Ground Station Interface");
     info!("Commands: help, status, quit");
 
@@ -25,10 +28,12 @@ pub async fn run_cli_interface(link_state: SharedLinkState) {
                 }
                 "status" => {
                     let snapshot = link_state.read().await.snapshot();
+                    let dispatch = dispatch_state.read().await.clone();
                     println!("System Status:");
                     println!("  WebSocket: {}", snapshot.state);
                     println!("  Reconnect attempts: {}", snapshot.reconnect_attempts);
                     println!("  Next retry: {} ms", snapshot.next_backoff.as_millis());
+                    println!("  Malformed frames: {}", dispatch.malformed_frames);
                     if let Some(error) = snapshot.last_error {
                         println!("  Last error: {}", error);
                     }
