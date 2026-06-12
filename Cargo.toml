@@ -8,6 +8,7 @@ members = [
     "data_collector",
     "post_processor",
     "shared",
+    "alerting",
     "orthomosaic",
     "crop_intelligence",
     "copilot",
