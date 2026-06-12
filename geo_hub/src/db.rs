@@ -383,6 +383,22 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
+            frame_set_id TEXT PRIMARY KEY,
+            scene_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            frames_json TEXT NOT NULL,
+            crs_hint TEXT,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_scenes_field_id ON scenes(field_id);
         "#,
     )
@@ -458,6 +474,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_fleet_nodes_owner_org_id
         ON fleet_nodes(owner_org_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_orthomosaic_frame_sets_scene_id
+        ON orthomosaic_frame_sets(scene_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_orthomosaic_frame_sets_field_id
+        ON orthomosaic_frame_sets(field_id);
         "#,
     )
     .execute(pool)

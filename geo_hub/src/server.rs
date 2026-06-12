@@ -53,6 +53,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/fleet/nodes/enroll", post(routes::enroll_fleet_node))
         .route("/api/fleet/nodes/:node_id", get(routes::get_fleet_node))
         .route(
+            "/api/orthomosaic/frame-sets",
+            get(routes::list_orthomosaic_frame_sets).post(routes::ingest_orthomosaic_frame_set),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

@@ -8,6 +8,7 @@ members = [
     "data_collector",
     "post_processor",
     "shared",
+    "orthomosaic",
     "lidar_mapper",
     "imagery_processor",
     "geo_hub",

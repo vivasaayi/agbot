@@ -1482,6 +1482,193 @@ async fn fleet_node_enrollment_rejects_missing_hardware_identity() -> Result<()>
 }
 
 #[tokio::test]
+async fn orthomosaic_frame_set_ingest_lists_pose_metadata() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_orthomosaic_scene(&ctx, "ortho-scene-1", "ortho-field-1", "season-2026").await?;
+
+    let ingest_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/orthomosaic/frame-sets")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "frame_set_id": "frame-set-001",
+                        "scene_id": "ortho-scene-1",
+                        "field_id": "ortho-field-1",
+                        "season_id": "season-2026",
+                        "crs_hint": "EPSG:4326",
+                        "frames": [
+                            {
+                                "frame_id": "frame-001",
+                                "capture_ts": "2026-06-01T12:00:00Z",
+                                "gps": {
+                                    "latitude": 41.10,
+                                    "longitude": -96.70,
+                                    "altitude": 120.0
+                                },
+                                "imu": {
+                                    "roll_deg": 1.2,
+                                    "pitch_deg": -0.4,
+                                    "yaw_deg": 87.0
+                                },
+                                "exif": {
+                                    "camera_model": "MicaSense RedEdge",
+                                    "focal_length_mm": 5.4,
+                                    "image_width_px": 1280,
+                                    "image_height_px": 960
+                                }
+                            },
+                            {
+                                "frame_id": "frame-002",
+                                "capture_ts": "2026-06-01T12:00:02Z",
+                                "gps": {
+                                    "latitude": 41.1005,
+                                    "longitude": -96.6995,
+                                    "altitude": 121.0
+                                },
+                                "imu": {
+                                    "roll_deg": 1.0,
+                                    "pitch_deg": -0.2,
+                                    "yaw_deg": 88.0
+                                },
+                                "exif": {
+                                    "camera_model": "MicaSense RedEdge",
+                                    "focal_length_mm": 5.4,
+                                    "image_width_px": 1280,
+                                    "image_height_px": 960
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+    let body = to_bytes(ingest_response.into_body(), 64 * 1024).await?;
+    let frame_set: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        frame_set
+            .get("frame_set_id")
+            .and_then(|value| value.as_str()),
+        Some("frame-set-001")
+    );
+    assert_eq!(
+        frame_set.get("scene_id").and_then(|value| value.as_str()),
+        Some("ortho-scene-1")
+    );
+    assert_eq!(
+        frame_set.get("crs_hint").and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    let frames = frame_set
+        .get("frames")
+        .and_then(|value| value.as_array())
+        .expect("frames should be returned");
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        frames[0]
+            .pointer("/gps/latitude")
+            .and_then(|value| value.as_f64()),
+        Some(41.10)
+    );
+    assert_eq!(
+        frames[0]
+            .pointer("/imu/yaw_deg")
+            .and_then(|value| value.as_f64()),
+        Some(87.0)
+    );
+    assert_eq!(
+        frames[0]
+            .pointer("/exif/camera_model")
+            .and_then(|value| value.as_str()),
+        Some("MicaSense RedEdge")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/orthomosaic/frame-sets?scene_id=ortho-scene-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0]
+            .get("frame_set_id")
+            .and_then(|value| value.as_str()),
+        Some("frame-set-001")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn orthomosaic_frame_set_ingest_rejects_no_pose_frames() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_orthomosaic_scene(&ctx, "ortho-scene-2", "ortho-field-2", "season-2026").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/orthomosaic/frame-sets")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "frame_set_id": "frame-set-no-pose",
+                        "scene_id": "ortho-scene-2",
+                        "field_id": "ortho-field-2",
+                        "season_id": "season-2026",
+                        "frames": [
+                            {
+                                "frame_id": "frame-001",
+                                "capture_ts": "2026-06-01T12:00:00Z",
+                                "exif": {
+                                    "camera_model": "MicaSense RedEdge"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("no camera pose"));
+
+    let frame_set_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orthomosaic_frame_sets")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(frame_set_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_field_rejects_orphan_farm_reference() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -3811,6 +3998,86 @@ struct TestContext {
 struct AcceptanceFixture {
     field_id: String,
     scene_id: String,
+}
+
+async fn seed_orthomosaic_scene(
+    ctx: &TestContext,
+    scene_id: &str,
+    field_id: &str,
+    season_id: &str,
+) -> Result<()> {
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    sqlx::query(
+        r#"
+        INSERT INTO fields (field_id, owner, name, crop, season, notes, boundary_json, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(field_id)
+    .bind("org-alpha")
+    .bind("Orthomosaic Field")
+    .bind("corn")
+    .bind(season_id)
+    .bind(None::<String>)
+    .bind(
+        json!({
+            "crs": "EPSG:4326",
+            "coordinates": [
+                { "longitude": -96.7, "latitude": 41.1 },
+                { "longitude": -96.2, "latitude": 41.1 },
+                { "longitude": -96.2, "latitude": 41.4 },
+                { "longitude": -96.7, "latitude": 41.1 }
+            ]
+        })
+        .to_string(),
+    )
+    .bind("2026-06-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (scene_id, owner, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at, field_id, season_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(scene_id)
+    .bind("org-alpha")
+    .bind("micasense-rededge")
+    .bind("2026-06-01T12:00:00Z")
+    .bind(scene_dir.to_string_lossy().to_string())
+    .bind(
+        json!({
+            "metadata": {
+                "timestamp": "2026-06-01T12:00:00Z",
+                "gps_position": {
+                    "latitude": 41.10,
+                    "longitude": -96.70,
+                    "altitude": 120.0
+                },
+                "bands": ["B4", "B5"],
+                "exposure_time": 1.0,
+                "gain": 1.0,
+                "width": 1280,
+                "height": 960
+            },
+            "file_paths": {
+                "B4": "B4.tif",
+                "B5": "B5.tif"
+            },
+            "image_id": Uuid::new_v4()
+        })
+        .to_string(),
+    )
+    .bind(None::<f64>)
+    .bind("2026-06-01T12:00:00Z")
+    .bind(field_id)
+    .bind(season_id)
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
 }
 
 async fn setup_golden_acceptance_fixture(

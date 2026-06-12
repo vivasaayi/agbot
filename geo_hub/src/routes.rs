@@ -18,6 +18,10 @@ use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
 };
 use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb};
+use orthomosaic::{
+    build_frame_set_record, FramePoseRecord, FrameSetIngestError, FrameSetIngestRequest,
+    FrameSetRecord,
+};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
@@ -283,6 +287,12 @@ pub struct ImportShapefileRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FleetNodeListQuery {
     pub owner_org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrthomosaicFrameSetListQuery {
+    pub scene_id: Option<String>,
+    pub field_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1463,6 +1473,109 @@ pub async fn get_fleet_node(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(node))
+}
+
+pub async fn ingest_orthomosaic_frame_set(
+    State(state): State<AppState>,
+    Json(request): Json<FrameSetIngestRequest>,
+) -> AppResult<Json<FrameSetRecord>> {
+    validate_orthomosaic_linkage(
+        &state,
+        &request.scene_id,
+        &request.field_id,
+        &request.season_id,
+    )
+    .await?;
+    let record = build_frame_set_record(
+        request,
+        Uuid::new_v4().to_string(),
+        current_record_timestamp(),
+    )
+    .map_err(orthomosaic_ingest_error)?;
+    let frames_json =
+        serde_json::to_string(&record.frames).map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO orthomosaic_frame_sets
+            (frame_set_id, scene_id, field_id, season_id, frames_json, crs_hint, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&record.frame_set_id)
+    .bind(&record.scene_id)
+    .bind(&record.field_id)
+    .bind(&record.season_id)
+    .bind(frames_json)
+    .bind(&record.crs_hint)
+    .bind(&record.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_orthomosaic_frame_sets(
+    Query(query): Query<OrthomosaicFrameSetListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<FrameSetRecord>>> {
+    let scene_id = normalize_optional_text(query.scene_id);
+    let field_id = normalize_optional_text(query.field_id);
+    let rows = match (scene_id, field_id) {
+        (Some(scene_id), Some(field_id)) => sqlx::query(
+            r#"
+            SELECT frame_set_id, scene_id, field_id, season_id, frames_json, crs_hint, created_at
+            FROM orthomosaic_frame_sets
+            WHERE scene_id = ?1 AND field_id = ?2
+            ORDER BY created_at DESC, frame_set_id ASC
+            "#,
+        )
+        .bind(scene_id)
+        .bind(field_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?,
+        (Some(scene_id), None) => sqlx::query(
+            r#"
+            SELECT frame_set_id, scene_id, field_id, season_id, frames_json, crs_hint, created_at
+            FROM orthomosaic_frame_sets
+            WHERE scene_id = ?1
+            ORDER BY created_at DESC, frame_set_id ASC
+            "#,
+        )
+        .bind(scene_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?,
+        (None, Some(field_id)) => sqlx::query(
+            r#"
+            SELECT frame_set_id, scene_id, field_id, season_id, frames_json, crs_hint, created_at
+            FROM orthomosaic_frame_sets
+            WHERE field_id = ?1
+            ORDER BY created_at DESC, frame_set_id ASC
+            "#,
+        )
+        .bind(field_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?,
+        (None, None) => sqlx::query(
+            r#"
+            SELECT frame_set_id, scene_id, field_id, season_id, frames_json, crs_hint, created_at
+            FROM orthomosaic_frame_sets
+            ORDER BY created_at DESC, frame_set_id ASC
+            "#,
+        )
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?,
+    };
+
+    rows.into_iter()
+        .map(|row| decode_orthomosaic_frame_set_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
 }
 
 pub async fn list_farms(State(state): State<AppState>) -> AppResult<Json<Vec<FarmRecord>>> {
@@ -3581,6 +3694,10 @@ fn parse_fleet_node_status(value: String) -> AppResult<FleetNodeStatus> {
     })
 }
 
+fn orthomosaic_ingest_error(error: FrameSetIngestError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn normalize_farm_name(name: String) -> AppResult<String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -4256,6 +4373,25 @@ fn decode_fleet_node_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FleetNod
     })
 }
 
+fn decode_orthomosaic_frame_set_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FrameSetRecord> {
+    let frames_json: String = row.get("frames_json");
+    let frames = serde_json::from_str::<Vec<FramePoseRecord>>(&frames_json).map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode orthomosaic frame set frames_json"),
+        )
+    })?;
+
+    Ok(FrameSetRecord {
+        frame_set_id: row.get("frame_set_id"),
+        scene_id: row.get("scene_id"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        frames,
+        crs_hint: row.get("crs_hint"),
+        created_at: row.get("created_at"),
+    })
+}
+
 fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<AnnotationRecord> {
     let geometry_json: String = row.get("geometry_json");
     let geometry = serde_json::from_str::<AnnotationGeometry>(&geometry_json).map_err(|err| {
@@ -4404,6 +4540,62 @@ async fn load_fleet_node_by_hardware_id(
     .map_err(Error::from)?;
 
     row.map(|row| decode_fleet_node_record(&row)).transpose()
+}
+
+async fn validate_orthomosaic_linkage(
+    state: &AppState,
+    scene_id: &str,
+    field_id: &str,
+    season_id: &str,
+) -> AppResult<()> {
+    let scene_id = normalize_optional_text(Some(scene_id.to_string()))
+        .ok_or_else(|| AppError::BadRequest("scene_id is required".to_string()))?;
+    let field_id = normalize_optional_text(Some(field_id.to_string()))
+        .ok_or_else(|| AppError::BadRequest("field_id is required".to_string()))?;
+    let season_id = normalize_optional_text(Some(season_id.to_string()))
+        .ok_or_else(|| AppError::BadRequest("season_id is required".to_string()))?;
+    let field = load_field(state, &field_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("field {field_id} does not exist")))?;
+    if field
+        .season
+        .as_deref()
+        .is_some_and(|field_season| field_season != season_id)
+    {
+        return Err(AppError::BadRequest(format!(
+            "field {field_id} is linked to season {}, not {season_id}",
+            field.season.unwrap_or_default()
+        )));
+    }
+
+    let scene_row = sqlx::query("SELECT field_id, season_id FROM scenes WHERE scene_id = ?1")
+        .bind(&scene_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(Error::from)?
+        .ok_or_else(|| AppError::BadRequest(format!("scene {scene_id} does not exist")))?;
+    let scene_field_id: Option<String> = scene_row.get("field_id");
+    if scene_field_id
+        .as_deref()
+        .is_some_and(|scene_field_id| scene_field_id != field_id)
+    {
+        return Err(AppError::BadRequest(format!(
+            "scene {scene_id} is linked to field {}, not {field_id}",
+            scene_field_id.unwrap_or_default()
+        )));
+    }
+    let scene_season_id: Option<String> = scene_row.get("season_id");
+    if scene_season_id
+        .as_deref()
+        .is_some_and(|scene_season_id| scene_season_id != season_id)
+    {
+        return Err(AppError::BadRequest(format!(
+            "scene {scene_id} is linked to season {}, not {season_id}",
+            scene_season_id.unwrap_or_default()
+        )));
+    }
+
+    Ok(())
 }
 
 async fn field_owner_for_farm(
