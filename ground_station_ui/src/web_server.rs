@@ -541,6 +541,56 @@ async fn maps_page() -> Html<&'static str> {
             ctx.stroke();
         }
 
+        function drawPolygon(vertices, strokeStyle, fillStyle, lineWidth) {
+            if (!vertices || vertices.length < 3) {
+                return;
+            }
+
+            ctx.beginPath();
+            vertices.forEach((vertex, index) => {
+                if (index === 0) {
+                    ctx.moveTo(vertex.x_px, vertex.y_px);
+                } else {
+                    ctx.lineTo(vertex.x_px, vertex.y_px);
+                }
+            });
+            ctx.closePath();
+            ctx.fillStyle = fillStyle;
+            ctx.fill();
+            ctx.strokeStyle = strokeStyle;
+            ctx.lineWidth = lineWidth;
+            ctx.stroke();
+        }
+
+        function drawMissionOverlay(overlay) {
+            if (!overlay) {
+                return;
+            }
+
+            if (overlay.geofence) {
+                drawPolygon(overlay.geofence.vertices, '#16803c', 'rgba(22, 128, 60, 0.10)', 3);
+            }
+
+            (overlay.no_fly_zones || []).forEach((zone) => {
+                drawPolygon(zone.vertices, '#b42318', 'rgba(180, 35, 24, 0.18)', 2);
+            });
+
+            ctx.font = '12px Arial, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            (overlay.waypoints || []).forEach((waypoint) => {
+                ctx.fillStyle = '#1d4ed8';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.arc(waypoint.x_px, waypoint.y_px, 6, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+                ctx.fillStyle = '#ffffff';
+                ctx.fillText(String(waypoint.sequence), waypoint.x_px, waypoint.y_px);
+            });
+        }
+
         function drawMarker(marker) {
             if (!marker) {
                 return;
@@ -566,10 +616,11 @@ async fn maps_page() -> Html<&'static str> {
         function updateReadout(state) {
             document.getElementById('map-crs').textContent = state.basemap.crs;
             document.getElementById('map-path-count').textContent = `Path: ${state.flight_path.length}`;
-            const assertion = (state.overlay_assertions || [])[0];
+            const assertions = state.overlay_assertions || [];
+            const allAccepted = assertions.length > 0 && assertions.every((assertion) => assertion.accepted);
             const overlayBadge = document.getElementById('map-overlay-state');
-            overlayBadge.textContent = assertion && assertion.accepted ? 'Overlay aligned' : 'Overlay refused';
-            overlayBadge.className = assertion && assertion.accepted ? 'badge ok' : 'badge error';
+            overlayBadge.textContent = allAccepted ? 'Overlays aligned' : 'Overlay refused';
+            overlayBadge.className = allAccepted ? 'badge ok' : 'badge error';
 
             const marker = state.current_position;
             if (!marker) {
@@ -581,8 +632,11 @@ async fn maps_page() -> Html<&'static str> {
                 return;
             }
 
-            document.getElementById('map-status').textContent = 'Live telemetry';
-            document.getElementById('map-status').className = 'badge ok';
+            const breach = state.geofence_breach;
+            document.getElementById('map-status').textContent =
+                breach && breach.outside ? 'Geofence breach' : 'Live telemetry';
+            document.getElementById('map-status').className =
+                breach && breach.outside ? 'badge error' : 'badge ok';
             document.getElementById('position-readout').textContent =
                 `${marker.latitude.toFixed(6)}, ${marker.longitude.toFixed(6)}`;
             document.getElementById('altitude-readout').textContent =
@@ -593,6 +647,7 @@ async fn maps_page() -> Html<&'static str> {
 
         function renderMap(state) {
             drawGrid(state);
+            drawMissionOverlay(state.mission_overlay);
             drawPath(state.flight_path || []);
             drawMarker(state.current_position);
             updateReadout(state);

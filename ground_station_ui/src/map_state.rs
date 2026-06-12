@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use shared::schemas::{GpsCoords, Telemetry};
+use shared::schemas::{GpsCoords, Mission, Telemetry};
+use uuid::Uuid;
 
 pub const WGS84_CRS: &str = "EPSG:4326";
 pub const WEB_MERCATOR_CRS: &str = "EPSG:3857";
@@ -147,10 +148,21 @@ pub struct BasemapLayer {
 
 impl BasemapLayer {
     pub fn from_path(samples: &[FlightPathSample]) -> Self {
-        let projected_points: Vec<ProjectedPoint> = samples
+        Self::from_path_and_mission(samples, None)
+    }
+
+    pub fn from_path_and_mission(
+        samples: &[FlightPathSample],
+        mission_overlay: Option<&MissionOverlayInput>,
+    ) -> Self {
+        let mut projected_points: Vec<ProjectedPoint> = samples
             .iter()
             .map(|sample| project_wgs84_to_web_mercator(&sample.gps_position()))
             .collect();
+
+        if let Some(mission_overlay) = mission_overlay {
+            projected_points.extend(mission_overlay.projected_source_points());
+        }
 
         Self {
             layer_id: "ground-station-basemap".to_string(),
@@ -173,6 +185,83 @@ impl Default for BasemapLayer {
             width_px: DEFAULT_MAP_WIDTH_PX,
             height_px: DEFAULT_MAP_HEIGHT_PX,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MissionOverlayInput {
+    pub mission_id: Uuid,
+    pub waypoints: Vec<MissionWaypointInput>,
+    pub geofence: Option<MissionPolygonInput>,
+    pub no_fly_zones: Vec<MissionPolygonInput>,
+}
+
+impl MissionOverlayInput {
+    pub fn from_mission_without_safety_geometry(mission: &Mission) -> Self {
+        Self {
+            mission_id: mission.id,
+            waypoints: mission
+                .waypoints
+                .iter()
+                .map(|waypoint| MissionWaypointInput {
+                    sequence: waypoint.sequence,
+                    position: waypoint.position.clone(),
+                })
+                .collect(),
+            geofence: None,
+            no_fly_zones: Vec::new(),
+        }
+    }
+
+    fn projected_source_points(&self) -> Vec<ProjectedPoint> {
+        let mut points: Vec<ProjectedPoint> = self
+            .waypoints
+            .iter()
+            .map(|waypoint| project_wgs84_to_web_mercator(&waypoint.position))
+            .collect();
+
+        if let Some(geofence) = &self.geofence {
+            points.extend(geofence.projected_source_points());
+        }
+        for zone in &self.no_fly_zones {
+            points.extend(zone.projected_source_points());
+        }
+
+        points
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MissionWaypointInput {
+    pub sequence: u16,
+    pub position: GpsCoords,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MissionPolygonInput {
+    pub polygon_id: String,
+    pub source_crs: String,
+    pub vertices: Vec<GpsCoords>,
+}
+
+impl MissionPolygonInput {
+    pub fn wgs84(polygon_id: impl Into<String>, vertices: Vec<GpsCoords>) -> Self {
+        Self {
+            polygon_id: polygon_id.into(),
+            source_crs: WGS84_CRS.to_string(),
+            vertices,
+        }
+    }
+
+    fn projected_source_points(&self) -> Vec<ProjectedPoint> {
+        if self.source_crs != WGS84_CRS {
+            return Vec::new();
+        }
+
+        self.vertices
+            .iter()
+            .map(project_wgs84_to_web_mercator)
+            .collect()
     }
 }
 
@@ -212,6 +301,54 @@ pub struct MapPathPoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MissionMapOverlay {
+    pub mission_id: Uuid,
+    pub waypoints: Vec<MissionWaypointOverlay>,
+    pub geofence: Option<MissionPolygonOverlay>,
+    pub no_fly_zones: Vec<MissionPolygonOverlay>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MissionWaypointOverlay {
+    pub sequence: u16,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude_m: f64,
+    pub source_crs: String,
+    pub map_crs: String,
+    pub x_m: f64,
+    pub y_m: f64,
+    pub x_px: f64,
+    pub y_px: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MissionPolygonOverlay {
+    pub polygon_id: String,
+    pub source_crs: String,
+    pub map_crs: String,
+    pub vertices: Vec<MissionPolygonVertex>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MissionPolygonVertex {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub x_m: f64,
+    pub y_m: f64,
+    pub x_px: f64,
+    pub y_px: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GeofenceBreach {
+    pub mission_id: Uuid,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub outside: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OverlayAssertion {
     pub overlay_id: String,
     pub crs: String,
@@ -223,12 +360,21 @@ pub struct MapRenderState {
     pub basemap: BasemapLayer,
     pub current_position: Option<MapPathPoint>,
     pub flight_path: Vec<MapPathPoint>,
+    pub mission_overlay: Option<MissionMapOverlay>,
+    pub geofence_breach: Option<GeofenceBreach>,
     pub overlay_assertions: Vec<OverlayAssertion>,
 }
 
 impl MapRenderState {
     pub fn from_flight_path(samples: &[FlightPathSample]) -> Self {
-        let basemap = BasemapLayer::from_path(samples);
+        Self::from_flight_path_and_mission(samples, None)
+    }
+
+    pub fn from_flight_path_and_mission(
+        samples: &[FlightPathSample],
+        mission_overlay: Option<&MissionOverlayInput>,
+    ) -> Self {
+        let basemap = BasemapLayer::from_path_and_mission(samples, mission_overlay);
         let telemetry_overlay = MapOverlayLayer::new(
             "telemetry-flight-path",
             WEB_MERCATOR_CRS,
@@ -242,16 +388,39 @@ impl MapRenderState {
             .map(|sample| MapPathPoint::from_sample(sample, &basemap))
             .collect();
         let current_position = flight_path.last().cloned();
+        let rendered_mission_overlay =
+            mission_overlay.map(|overlay| MissionMapOverlay::from_input(overlay, &basemap));
+        let geofence_breach = rendered_mission_overlay.as_ref().and_then(|overlay| {
+            let marker = current_position.as_ref()?;
+            let geofence = mission_overlay?.geofence.as_ref()?;
+            Some(GeofenceBreach {
+                mission_id: overlay.mission_id,
+                latitude: marker.latitude,
+                longitude: marker.longitude,
+                outside: !point_is_inside_or_on_boundary(
+                    marker.latitude,
+                    marker.longitude,
+                    &geofence.vertices,
+                ),
+            })
+        });
+
+        let mut overlay_assertions = vec![OverlayAssertion {
+            overlay_id: telemetry_overlay.overlay_id,
+            crs: telemetry_overlay.crs,
+            accepted: true,
+        }];
+        if let Some(overlay) = &rendered_mission_overlay {
+            overlay_assertions.extend(overlay.assertions(&basemap));
+        }
 
         Self {
             basemap,
             current_position,
             flight_path,
-            overlay_assertions: vec![OverlayAssertion {
-                overlay_id: telemetry_overlay.overlay_id,
-                crs: telemetry_overlay.crs,
-                accepted: true,
-            }],
+            mission_overlay: rendered_mission_overlay,
+            geofence_breach,
+            overlay_assertions,
         }
     }
 }
@@ -268,6 +437,97 @@ impl MapPathPoint {
             altitude_m: sample.altitude_m,
             source_crs: WGS84_CRS.to_string(),
             map_crs: basemap.crs.clone(),
+            x_m: projected.x_m,
+            y_m: projected.y_m,
+            x_px,
+            y_px,
+        }
+    }
+}
+
+impl MissionMapOverlay {
+    fn from_input(input: &MissionOverlayInput, basemap: &BasemapLayer) -> Self {
+        Self {
+            mission_id: input.mission_id,
+            waypoints: input
+                .waypoints
+                .iter()
+                .map(|waypoint| MissionWaypointOverlay::from_input(waypoint, basemap))
+                .collect(),
+            geofence: input
+                .geofence
+                .as_ref()
+                .and_then(|polygon| MissionPolygonOverlay::from_input(polygon, basemap)),
+            no_fly_zones: input
+                .no_fly_zones
+                .iter()
+                .filter_map(|polygon| MissionPolygonOverlay::from_input(polygon, basemap))
+                .collect(),
+        }
+    }
+
+    fn assertions(&self, basemap: &BasemapLayer) -> Vec<OverlayAssertion> {
+        let mut assertions = Vec::new();
+        if self.geofence.is_some() {
+            assertions.push(assert_projected_overlay("mission-geofence", basemap));
+        }
+        assertions.extend(
+            self.no_fly_zones
+                .iter()
+                .map(|zone| assert_projected_overlay(&zone.polygon_id, basemap)),
+        );
+        if !self.waypoints.is_empty() {
+            assertions.push(assert_projected_overlay("mission-waypoints", basemap));
+        }
+        assertions
+    }
+}
+
+impl MissionWaypointOverlay {
+    fn from_input(input: &MissionWaypointInput, basemap: &BasemapLayer) -> Self {
+        let projected = project_wgs84_to_web_mercator(&input.position);
+        let (x_px, y_px) = project_to_canvas(&projected, basemap);
+        Self {
+            sequence: input.sequence,
+            latitude: input.position.latitude,
+            longitude: input.position.longitude,
+            altitude_m: input.position.altitude,
+            source_crs: WGS84_CRS.to_string(),
+            map_crs: basemap.crs.clone(),
+            x_m: projected.x_m,
+            y_m: projected.y_m,
+            x_px,
+            y_px,
+        }
+    }
+}
+
+impl MissionPolygonOverlay {
+    fn from_input(input: &MissionPolygonInput, basemap: &BasemapLayer) -> Option<Self> {
+        if input.source_crs != WGS84_CRS || input.vertices.len() < 3 {
+            return None;
+        }
+
+        Some(Self {
+            polygon_id: input.polygon_id.clone(),
+            source_crs: input.source_crs.clone(),
+            map_crs: basemap.crs.clone(),
+            vertices: input
+                .vertices
+                .iter()
+                .map(|vertex| MissionPolygonVertex::from_gps(vertex, basemap))
+                .collect(),
+        })
+    }
+}
+
+impl MissionPolygonVertex {
+    fn from_gps(position: &GpsCoords, basemap: &BasemapLayer) -> Self {
+        let projected = project_wgs84_to_web_mercator(position);
+        let (x_px, y_px) = project_to_canvas(&projected, basemap);
+        Self {
+            latitude: position.latitude,
+            longitude: position.longitude,
             x_m: projected.x_m,
             y_m: projected.y_m,
             x_px,
@@ -359,6 +619,60 @@ fn project_to_canvas(projected: &ProjectedPoint, basemap: &BasemapLayer) -> (f64
         x_ratio * basemap.width_px as f64,
         (1.0 - y_ratio) * basemap.height_px as f64,
     )
+}
+
+fn assert_projected_overlay(overlay_id: &str, basemap: &BasemapLayer) -> OverlayAssertion {
+    let overlay = MapOverlayLayer::new(overlay_id, WEB_MERCATOR_CRS, basemap.extent.clone());
+    let accepted = assert_overlay_matches_basemap(basemap, &overlay).is_ok();
+    OverlayAssertion {
+        overlay_id: overlay_id.to_string(),
+        crs: WEB_MERCATOR_CRS.to_string(),
+        accepted,
+    }
+}
+
+fn point_is_inside_or_on_boundary(latitude: f64, longitude: f64, polygon: &[GpsCoords]) -> bool {
+    if polygon.len() < 3 {
+        return false;
+    }
+
+    let mut inside = false;
+    let mut previous = polygon.last().expect("polygon has at least 3 vertices");
+    for current in polygon {
+        if point_on_segment(latitude, longitude, previous, current) {
+            return true;
+        }
+
+        let yi = previous.latitude;
+        let yj = current.latitude;
+        let xi = previous.longitude;
+        let xj = current.longitude;
+        let crosses_latitude = (yi > latitude) != (yj > latitude);
+        if crosses_latitude {
+            let crossing_longitude = (xj - xi) * (latitude - yi) / (yj - yi) + xi;
+            if longitude < crossing_longitude {
+                inside = !inside;
+            }
+        }
+        previous = current;
+    }
+
+    inside
+}
+
+fn point_on_segment(latitude: f64, longitude: f64, start: &GpsCoords, end: &GpsCoords) -> bool {
+    const EPSILON: f64 = 1e-10;
+    let cross = (longitude - start.longitude) * (end.latitude - start.latitude)
+        - (latitude - start.latitude) * (end.longitude - start.longitude);
+    if cross.abs() > EPSILON {
+        return false;
+    }
+
+    let within_longitude = longitude >= start.longitude.min(end.longitude) - EPSILON
+        && longitude <= start.longitude.max(end.longitude) + EPSILON;
+    let within_latitude = latitude >= start.latitude.min(end.latitude) - EPSILON
+        && latitude <= start.latitude.max(end.latitude) + EPSILON;
+    within_longitude && within_latitude
 }
 
 fn assert_extent_edge(

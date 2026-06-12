@@ -1,4 +1,4 @@
-use crate::{FlightPathSample, MapRenderState, DEFAULT_FLIGHT_PATH_LIMIT};
+use crate::{FlightPathSample, MapRenderState, MissionOverlayInput, DEFAULT_FLIGHT_PATH_LIMIT};
 use serde::Serialize;
 use shared::schemas::{Telemetry, WebSocketMessage};
 use std::sync::Arc;
@@ -123,6 +123,7 @@ pub struct MessageDispatchState {
     pub ndvi_means: Vec<f32>,
     pub capture_events: Vec<CaptureEvent>,
     pub flight_path: Vec<FlightPathSample>,
+    pub mission_overlay: Option<MissionOverlayInput>,
     pub system_statuses: Vec<SystemStatusSnapshot>,
     pub malformed_frames: u64,
     #[serde(skip)]
@@ -152,6 +153,7 @@ impl MessageDispatchState {
             ndvi_means: Vec::new(),
             capture_events: Vec::new(),
             flight_path: Vec::new(),
+            mission_overlay: None,
             system_statuses: Vec::new(),
             malformed_frames: 0,
             capture_event_limit: capture_event_limit.max(1),
@@ -299,7 +301,14 @@ impl MessageDispatchState {
     }
 
     pub fn map_render_state(&self) -> MapRenderState {
-        MapRenderState::from_flight_path(&self.flight_path)
+        MapRenderState::from_flight_path_and_mission(
+            &self.flight_path,
+            self.mission_overlay.as_ref(),
+        )
+    }
+
+    pub fn set_mission_overlay(&mut self, mission_overlay: MissionOverlayInput) {
+        self.mission_overlay = Some(mission_overlay);
     }
 
     fn append_capture_event(&mut self, event: CaptureEvent) {
@@ -365,7 +374,8 @@ mod tests {
     use super::*;
     use crate::{
         assert_overlay_matches_basemap, BasemapLayer, FlightPathSample, MapOverlayLayer,
-        MapRenderError, MapRenderState, WEB_MERCATOR_CRS, WGS84_CRS,
+        MapRenderError, MapRenderState, MissionOverlayInput, MissionPolygonInput,
+        MissionWaypointInput, WEB_MERCATOR_CRS, WGS84_CRS,
     };
     use shared::schemas::{
         GpsCoords, ImageMetadata, LidarPoint, LidarScan, MultispectralImage, NdviResult, Telemetry,
@@ -591,6 +601,87 @@ mod tests {
     }
 
     #[test]
+    fn mission_overlay_projects_waypoints_geofence_and_no_fly_zones() {
+        let mut state = MessageDispatchState::default();
+        state.set_mission_overlay(sample_mission_overlay(
+            Some(sample_geofence()),
+            vec![sample_no_fly_zone()],
+        ));
+        let mut telemetry = sample_telemetry("AUTO", 88);
+        telemetry.position.latitude = 42.0002;
+        telemetry.position.longitude = -71.0002;
+        state.dispatch_message(&WebSocketMessage::Telemetry { data: telemetry });
+
+        let map_state = state.map_render_state();
+        let overlay = map_state
+            .mission_overlay
+            .expect("mission geometry should render as an overlay");
+
+        assert_eq!(overlay.waypoints.len(), 2);
+        assert!(overlay
+            .waypoints
+            .iter()
+            .all(|waypoint| waypoint.map_crs == WEB_MERCATOR_CRS));
+        assert_eq!(
+            overlay
+                .geofence
+                .as_ref()
+                .expect("geofence should be rendered")
+                .map_crs,
+            WEB_MERCATOR_CRS
+        );
+        assert_eq!(overlay.no_fly_zones.len(), 1);
+        assert!(overlay
+            .no_fly_zones
+            .iter()
+            .all(|zone| zone.map_crs == WEB_MERCATOR_CRS));
+        assert_eq!(
+            map_state
+                .geofence_breach
+                .as_ref()
+                .map(|breach| breach.outside),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn mission_overlay_flags_drone_outside_geofence() {
+        let mut state = MessageDispatchState::default();
+        state.set_mission_overlay(sample_mission_overlay(Some(sample_geofence()), vec![]));
+        let mut telemetry = sample_telemetry("AUTO", 88);
+        telemetry.position.latitude = 42.0040;
+        telemetry.position.longitude = -71.0040;
+        state.dispatch_message(&WebSocketMessage::Telemetry { data: telemetry });
+
+        let map_state = state.map_render_state();
+
+        assert_eq!(
+            map_state
+                .geofence_breach
+                .as_ref()
+                .map(|breach| breach.outside),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn mission_overlay_omits_missing_geofence_without_default_geometry() {
+        let mut state = MessageDispatchState::default();
+        state.set_mission_overlay(sample_mission_overlay(None, vec![]));
+        state.dispatch_message(&WebSocketMessage::Telemetry {
+            data: sample_telemetry("AUTO", 88),
+        });
+
+        let map_state = state.map_render_state();
+        let overlay = map_state
+            .mission_overlay
+            .expect("waypoints should render even without a geofence");
+
+        assert!(overlay.geofence.is_none());
+        assert!(map_state.geofence_breach.is_none());
+    }
+
+    #[test]
     fn capture_timeline_orders_filters_and_evicts_oldest_events() {
         let image_id = Uuid::new_v4();
         let mut state = MessageDispatchState::with_capture_event_limit(2);
@@ -632,6 +723,69 @@ mod tests {
             air_speed: 7.0,
             heading: 180.0,
             altitude_relative: 45.0,
+        }
+    }
+
+    fn sample_mission_overlay(
+        geofence: Option<MissionPolygonInput>,
+        no_fly_zones: Vec<MissionPolygonInput>,
+    ) -> MissionOverlayInput {
+        MissionOverlayInput {
+            mission_id: Uuid::new_v4(),
+            waypoints: vec![
+                MissionWaypointInput {
+                    sequence: 1,
+                    position: GpsCoords {
+                        latitude: 42.0001,
+                        longitude: -71.0001,
+                        altitude: 120.0,
+                    },
+                },
+                MissionWaypointInput {
+                    sequence: 2,
+                    position: GpsCoords {
+                        latitude: 42.0004,
+                        longitude: -71.0004,
+                        altitude: 122.0,
+                    },
+                },
+            ],
+            geofence,
+            no_fly_zones,
+        }
+    }
+
+    fn sample_geofence() -> MissionPolygonInput {
+        MissionPolygonInput::wgs84(
+            "field-geofence",
+            vec![
+                gps(41.9995, -71.0008),
+                gps(42.0008, -71.0008),
+                gps(42.0008, -70.9995),
+                gps(41.9995, -70.9995),
+                gps(41.9995, -71.0008),
+            ],
+        )
+    }
+
+    fn sample_no_fly_zone() -> MissionPolygonInput {
+        MissionPolygonInput::wgs84(
+            "pump-house",
+            vec![
+                gps(42.00025, -71.0003),
+                gps(42.00035, -71.0003),
+                gps(42.00035, -71.0002),
+                gps(42.00025, -71.0002),
+                gps(42.00025, -71.0003),
+            ],
+        )
+    }
+
+    fn gps(latitude: f64, longitude: f64) -> GpsCoords {
+        GpsCoords {
+            latitude,
+            longitude,
+            altitude: 0.0,
         }
     }
 
