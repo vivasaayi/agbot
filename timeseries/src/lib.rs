@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RasterSeriesValue {
@@ -87,6 +87,16 @@ impl TimeSeriesStore {
             .map(|(_, point)| point.clone())
             .collect()
     }
+
+    fn list_metrics(&self, entity_ref: &str) -> Vec<String> {
+        self.points
+            .keys()
+            .filter(|key| key.entity_ref == entity_ref)
+            .map(|key| key.metric.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -99,6 +109,54 @@ impl TimeRange {
     fn contains(&self, t: &str) -> bool {
         self.start.as_deref().map_or(true, |start| t >= start)
             && self.end.as_deref().map_or(true, |end| t <= end)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TimeSeriesEngine {
+    store: TimeSeriesStore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesQuery {
+    pub entity_ref: String,
+    pub metric: String,
+    pub range: TimeRange,
+    pub limit: Option<usize>,
+    pub cursor: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeriesQueryPage {
+    pub points: Vec<SeriesPoint>,
+    pub next_cursor: Option<usize>,
+    pub no_series: bool,
+}
+
+impl TimeSeriesEngine {
+    pub fn append(&mut self, point: SeriesPoint) -> Result<(), TimeSeriesError> {
+        self.store.append(point)
+    }
+
+    pub fn query(&self, query: SeriesQuery) -> SeriesQueryPage {
+        let points = self
+            .store
+            .query(&query.entity_ref, &query.metric, query.range);
+        let no_series = points.is_empty();
+        let start = query.cursor.unwrap_or(0).min(points.len());
+        let limit = query.limit.unwrap_or(points.len()).max(1);
+        let end = (start + limit).min(points.len());
+        let next_cursor = (end < points.len()).then_some(end);
+
+        SeriesQueryPage {
+            points: points[start..end].to_vec(),
+            next_cursor,
+            no_series,
+        }
+    }
+
+    pub fn list_metrics(&self, entity_ref: &str) -> Vec<String> {
+        self.store.list_metrics(entity_ref)
     }
 }
 
@@ -186,8 +244,8 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GeoExtent, RasterSeriesValue, SeriesPoint, SeriesValue, TimeRange, TimeSeriesError,
-        TimeSeriesStore,
+        GeoExtent, RasterSeriesValue, SeriesPoint, SeriesQuery, SeriesValue, TimeRange,
+        TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
     };
 
     #[test]
@@ -287,6 +345,77 @@ mod tests {
                 t: "2026-06-12T10:00:00Z".to_string()
             }
         );
+    }
+
+    #[test]
+    fn reusable_api_appends_queries_and_lists_metrics_with_pagination() {
+        let mut engine = TimeSeriesEngine::default();
+        engine
+            .append(scalar_point(
+                "field:alpha",
+                "ndvi_mean",
+                "2026-06-10T10:00:00Z",
+                0.68,
+            ))
+            .expect("first point should append");
+        engine
+            .append(scalar_point(
+                "field:alpha",
+                "ndvi_mean",
+                "2026-06-12T10:00:00Z",
+                0.72,
+            ))
+            .expect("second point should append");
+        engine
+            .append(scalar_point(
+                "field:alpha",
+                "soil_moisture",
+                "2026-06-12T11:00:00Z",
+                34.0,
+            ))
+            .expect("third point should append");
+
+        let first_page = engine.query(SeriesQuery {
+            entity_ref: "field:alpha".to_string(),
+            metric: "ndvi_mean".to_string(),
+            range: TimeRange::default(),
+            limit: Some(1),
+            cursor: None,
+        });
+        assert!(!first_page.no_series);
+        assert_eq!(first_page.points.len(), 1);
+        assert_eq!(first_page.next_cursor, Some(1));
+
+        let second_page = engine.query(SeriesQuery {
+            entity_ref: "field:alpha".to_string(),
+            metric: "ndvi_mean".to_string(),
+            range: TimeRange::default(),
+            limit: Some(1),
+            cursor: first_page.next_cursor,
+        });
+        assert_eq!(second_page.points.len(), 1);
+        assert_eq!(second_page.next_cursor, None);
+
+        assert_eq!(
+            engine.list_metrics("field:alpha"),
+            vec!["ndvi_mean".to_string(), "soil_moisture".to_string()]
+        );
+    }
+
+    #[test]
+    fn reusable_api_unknown_metric_returns_empty_marker() {
+        let engine = TimeSeriesEngine::default();
+        let page = engine.query(SeriesQuery {
+            entity_ref: "field:missing".to_string(),
+            metric: "ndvi_mean".to_string(),
+            range: TimeRange::default(),
+            limit: Some(25),
+            cursor: None,
+        });
+
+        assert!(page.no_series);
+        assert!(page.points.is_empty());
+        assert_eq!(page.next_cursor, None);
     }
 
     fn scalar_point(entity_ref: &str, metric: &str, t: &str, value: f64) -> SeriesPoint {
