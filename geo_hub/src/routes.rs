@@ -19,8 +19,10 @@ use geojson::{
 };
 use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb};
 use orthomosaic::{
-    build_frame_set_record, FramePoseRecord, FrameSetIngestError, FrameSetIngestRequest,
-    FrameSetRecord,
+    build_frame_set_record, build_reconstruction_job, transition_reconstruction_status,
+    FramePoseRecord, FrameSetIngestError, FrameSetIngestRequest, FrameSetRecord,
+    ReconstructionJobError, ReconstructionJobRecord, ReconstructionJobRequest,
+    ReconstructionStatus,
 };
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
@@ -293,6 +295,12 @@ pub struct FleetNodeListQuery {
 pub struct OrthomosaicFrameSetListQuery {
     pub scene_id: Option<String>,
     pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateReconstructionStatusRequest {
+    pub status: ReconstructionStatus,
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1576,6 +1584,90 @@ pub async fn list_orthomosaic_frame_sets(
         .map(|row| decode_orthomosaic_frame_set_record(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
+}
+
+pub async fn submit_orthomosaic_reconstruction(
+    State(state): State<AppState>,
+    Json(request): Json<ReconstructionJobRequest>,
+) -> AppResult<Json<ReconstructionJobRecord>> {
+    let record = build_reconstruction_job(
+        request,
+        Uuid::new_v4().to_string(),
+        current_record_timestamp(),
+    )
+    .map_err(reconstruction_job_error)?;
+    if !orthomosaic_frame_set_exists(&state, &record.frame_set_id).await? {
+        return Err(AppError::BadRequest(format!(
+            "frame_set_id {} does not exist",
+            record.frame_set_id
+        )));
+    }
+    let params_json =
+        serde_json::to_string(&record.params).map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO orthomosaic_reconstructions
+            (recon_id, frame_set_id, params_json, status, failure_reason, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&record.recon_id)
+    .bind(&record.frame_set_id)
+    .bind(params_json)
+    .bind(record.status.as_str())
+    .bind(&record.failure_reason)
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(record))
+}
+
+pub async fn get_orthomosaic_reconstruction(
+    Path(recon_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ReconstructionJobRecord>> {
+    let record = load_orthomosaic_reconstruction(&state, &recon_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(record))
+}
+
+pub async fn update_orthomosaic_reconstruction_status(
+    Path(recon_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateReconstructionStatusRequest>,
+) -> AppResult<Json<ReconstructionJobRecord>> {
+    let record = load_orthomosaic_reconstruction(&state, &recon_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let updated = transition_reconstruction_status(
+        record,
+        request.status,
+        request.failure_reason,
+        current_record_timestamp(),
+    )
+    .map_err(reconstruction_job_error)?;
+
+    sqlx::query(
+        r#"
+        UPDATE orthomosaic_reconstructions
+        SET status = ?2, failure_reason = ?3, updated_at = ?4
+        WHERE recon_id = ?1
+        "#,
+    )
+    .bind(&updated.recon_id)
+    .bind(updated.status.as_str())
+    .bind(&updated.failure_reason)
+    .bind(&updated.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(updated))
 }
 
 pub async fn list_farms(State(state): State<AppState>) -> AppResult<Json<Vec<FarmRecord>>> {
@@ -3698,6 +3790,16 @@ fn orthomosaic_ingest_error(error: FrameSetIngestError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn reconstruction_job_error(error: ReconstructionJobError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn parse_reconstruction_status(value: String) -> AppResult<ReconstructionStatus> {
+    value.parse::<ReconstructionStatus>().map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode reconstruction status"))
+    })
+}
+
 fn normalize_farm_name(name: String) -> AppResult<String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -4392,6 +4494,27 @@ fn decode_orthomosaic_frame_set_record(row: &sqlx::sqlite::SqliteRow) -> AppResu
     })
 }
 
+fn decode_orthomosaic_reconstruction_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ReconstructionJobRecord> {
+    let params_json: String = row.get("params_json");
+    let params = serde_json::from_str::<serde_json::Value>(&params_json).map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode orthomosaic reconstruction params_json"),
+        )
+    })?;
+
+    Ok(ReconstructionJobRecord {
+        recon_id: row.get("recon_id"),
+        frame_set_id: row.get("frame_set_id"),
+        params,
+        status: parse_reconstruction_status(row.get::<String, _>("status"))?,
+        failure_reason: row.get("failure_reason"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<AnnotationRecord> {
     let geometry_json: String = row.get("geometry_json");
     let geometry = serde_json::from_str::<AnnotationGeometry>(&geometry_json).map_err(|err| {
@@ -4596,6 +4719,37 @@ async fn validate_orthomosaic_linkage(
     }
 
     Ok(())
+}
+
+async fn orthomosaic_frame_set_exists(state: &AppState, frame_set_id: &str) -> AppResult<bool> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM orthomosaic_frame_sets WHERE frame_set_id = ?1")
+            .bind(frame_set_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(Error::from)?;
+
+    Ok(count > 0)
+}
+
+async fn load_orthomosaic_reconstruction(
+    state: &AppState,
+    recon_id: &str,
+) -> AppResult<Option<ReconstructionJobRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT recon_id, frame_set_id, params_json, status, failure_reason, created_at, updated_at
+        FROM orthomosaic_reconstructions
+        WHERE recon_id = ?1
+        "#,
+    )
+    .bind(recon_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_orthomosaic_reconstruction_record(&row))
+        .transpose()
 }
 
 async fn field_owner_for_farm(

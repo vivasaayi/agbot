@@ -57,6 +57,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_orthomosaic_frame_sets).post(routes::ingest_orthomosaic_frame_set),
         )
         .route(
+            "/api/orthomosaic/reconstructions",
+            post(routes::submit_orthomosaic_reconstruction),
+        )
+        .route(
+            "/api/orthomosaic/reconstructions/:recon_id",
+            get(routes::get_orthomosaic_reconstruction),
+        )
+        .route(
+            "/api/orthomosaic/reconstructions/:recon_id/status",
+            put(routes::update_orthomosaic_reconstruction_status),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

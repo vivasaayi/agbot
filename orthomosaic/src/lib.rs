@@ -79,6 +79,172 @@ pub struct FrameSetRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructionStatus {
+    Queued,
+    Reconstructing,
+    Orthorectifying,
+    Completed,
+    Failed,
+}
+
+impl ReconstructionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReconstructionStatus::Queued => "queued",
+            ReconstructionStatus::Reconstructing => "reconstructing",
+            ReconstructionStatus::Orthorectifying => "orthorectifying",
+            ReconstructionStatus::Completed => "completed",
+            ReconstructionStatus::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for ReconstructionStatus {
+    type Err = ReconstructionJobError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "queued" => Ok(ReconstructionStatus::Queued),
+            "reconstructing" => Ok(ReconstructionStatus::Reconstructing),
+            "orthorectifying" => Ok(ReconstructionStatus::Orthorectifying),
+            "completed" => Ok(ReconstructionStatus::Completed),
+            "failed" => Ok(ReconstructionStatus::Failed),
+            _ => Err(ReconstructionJobError::UnsupportedStatus {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ReconstructionJobRequest {
+    #[serde(default)]
+    pub recon_id: Option<String>,
+    #[serde(default)]
+    pub frame_set_id: String,
+    #[serde(default = "default_reconstruction_params")]
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReconstructionJobRecord {
+    pub recon_id: String,
+    pub frame_set_id: String,
+    pub params: serde_json::Value,
+    pub status: ReconstructionStatus,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReconstructionJobError {
+    #[error("recon_id cannot be empty")]
+    EmptyReconId,
+    #[error("frame_set_id cannot be empty")]
+    EmptyFrameSetId,
+    #[error("timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("failure reason cannot be empty")]
+    EmptyFailureReason,
+    #[error("unsupported reconstruction status {value}")]
+    UnsupportedStatus { value: String },
+    #[error("invalid reconstruction status transition {from:?} -> {to:?}")]
+    InvalidStatusTransition {
+        from: ReconstructionStatus,
+        to: ReconstructionStatus,
+    },
+}
+
+pub fn build_reconstruction_job(
+    request: ReconstructionJobRequest,
+    issued_recon_id: String,
+    created_at: String,
+) -> Result<ReconstructionJobRecord, ReconstructionJobError> {
+    let recon_id = normalize_optional_text(request.recon_id)
+        .or_else(|| normalize_optional_text(Some(issued_recon_id)))
+        .ok_or(ReconstructionJobError::EmptyReconId)?;
+    let frame_set_id = normalize_required_recon_text(
+        request.frame_set_id,
+        ReconstructionJobError::EmptyFrameSetId,
+    )?;
+    let created_at =
+        normalize_required_recon_text(created_at, ReconstructionJobError::EmptyTimestamp)?;
+
+    Ok(ReconstructionJobRecord {
+        recon_id,
+        frame_set_id,
+        params: request.params,
+        status: ReconstructionStatus::Queued,
+        failure_reason: None,
+        created_at: created_at.clone(),
+        updated_at: created_at,
+    })
+}
+
+pub fn transition_reconstruction_status(
+    mut record: ReconstructionJobRecord,
+    next_status: ReconstructionStatus,
+    failure_reason: Option<String>,
+    updated_at: String,
+) -> Result<ReconstructionJobRecord, ReconstructionJobError> {
+    validate_reconstruction_transition(record.status, next_status)?;
+    let updated_at =
+        normalize_required_recon_text(updated_at, ReconstructionJobError::EmptyTimestamp)?;
+    let failure_reason = if next_status == ReconstructionStatus::Failed {
+        Some(
+            normalize_optional_text(failure_reason)
+                .ok_or(ReconstructionJobError::EmptyFailureReason)?,
+        )
+    } else {
+        None
+    };
+
+    record.status = next_status;
+    record.failure_reason = failure_reason;
+    record.updated_at = updated_at;
+    Ok(record)
+}
+
+fn validate_reconstruction_transition(
+    current: ReconstructionStatus,
+    next: ReconstructionStatus,
+) -> Result<(), ReconstructionJobError> {
+    let valid = matches!(
+        (current, next),
+        (
+            ReconstructionStatus::Queued,
+            ReconstructionStatus::Reconstructing
+        ) | (
+            ReconstructionStatus::Reconstructing,
+            ReconstructionStatus::Orthorectifying
+        ) | (
+            ReconstructionStatus::Orthorectifying,
+            ReconstructionStatus::Completed
+        ) | (ReconstructionStatus::Queued, ReconstructionStatus::Failed)
+            | (
+                ReconstructionStatus::Reconstructing,
+                ReconstructionStatus::Failed
+            )
+            | (
+                ReconstructionStatus::Orthorectifying,
+                ReconstructionStatus::Failed
+            )
+    );
+
+    if valid {
+        Ok(())
+    } else {
+        Err(ReconstructionJobError::InvalidStatusTransition {
+            from: current,
+            to: next,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FrameSetIngestError {
     #[error("frame_set_id cannot be empty")]
@@ -181,11 +347,22 @@ fn normalize_required_text(
     normalize_optional_text(Some(value)).ok_or(error)
 }
 
+fn normalize_required_recon_text(
+    value: String,
+    error: ReconstructionJobError,
+) -> Result<String, ReconstructionJobError> {
+    normalize_optional_text(Some(value)).ok_or(error)
+}
+
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim().to_string();
         (!trimmed.is_empty()).then_some(trimmed)
     })
+}
+
+fn default_reconstruction_params() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 fn validate_gps(gps: &GpsCoords) -> Result<(), ()> {
@@ -212,8 +389,9 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_frame_set_record, CameraImuPose, FrameIngestRequest, FrameSetIngestError,
-        FrameSetIngestRequest,
+        build_frame_set_record, build_reconstruction_job, transition_reconstruction_status,
+        CameraImuPose, FrameIngestRequest, FrameSetIngestError, FrameSetIngestRequest,
+        ReconstructionJobError, ReconstructionJobRequest, ReconstructionStatus,
     };
     use shared::schemas::GpsCoords;
 
@@ -315,6 +493,93 @@ mod tests {
             error,
             FrameSetIngestError::NoCameraPose {
                 frame_id: "frame-001".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn reconstruction_job_creation_starts_queued_with_parameters() {
+        let job = build_reconstruction_job(
+            ReconstructionJobRequest {
+                recon_id: Some(" recon-001 ".to_string()),
+                frame_set_id: " frame-set-001 ".to_string(),
+                params: serde_json::json!({
+                    "feature_detector": "orb",
+                    "max_features": 4000
+                }),
+            },
+            "generated-recon".to_string(),
+            " 2026-06-01T12:10:00Z ".to_string(),
+        )
+        .expect("job should be created");
+
+        assert_eq!(job.recon_id, "recon-001");
+        assert_eq!(job.frame_set_id, "frame-set-001");
+        assert_eq!(job.status, ReconstructionStatus::Queued);
+        assert_eq!(job.failure_reason, None);
+        assert_eq!(
+            job.params
+                .get("feature_detector")
+                .and_then(|value| value.as_str()),
+            Some("orb")
+        );
+    }
+
+    #[test]
+    fn reconstruction_job_failure_records_reason() {
+        let job = build_reconstruction_job(
+            ReconstructionJobRequest {
+                recon_id: Some("recon-001".to_string()),
+                frame_set_id: "frame-set-001".to_string(),
+                params: serde_json::json!({}),
+            },
+            "generated-recon".to_string(),
+            "2026-06-01T12:10:00Z".to_string(),
+        )
+        .expect("job should be created");
+
+        let failed = transition_reconstruction_status(
+            job,
+            ReconstructionStatus::Failed,
+            Some(" feature-match-insufficient-overlap ".to_string()),
+            "2026-06-01T12:11:00Z".to_string(),
+        )
+        .expect("job should fail with reason");
+
+        assert_eq!(failed.status, ReconstructionStatus::Failed);
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("feature-match-insufficient-overlap")
+        );
+        assert_eq!(failed.updated_at, "2026-06-01T12:11:00Z");
+    }
+
+    #[test]
+    fn reconstruction_job_rejects_invalid_lifecycle_jump() {
+        let job = build_reconstruction_job(
+            ReconstructionJobRequest {
+                recon_id: Some("recon-001".to_string()),
+                frame_set_id: "frame-set-001".to_string(),
+                params: serde_json::json!({}),
+            },
+            "generated-recon".to_string(),
+            "2026-06-01T12:10:00Z".to_string(),
+        )
+        .expect("job should be created");
+
+        let error = transition_reconstruction_status(
+            job,
+            ReconstructionStatus::Completed,
+            None,
+            "2026-06-01T12:11:00Z".to_string(),
+        )
+        .expect_err("queued cannot jump straight to completed");
+
+        assert_eq!(
+            error,
+            ReconstructionJobError::InvalidStatusTransition {
+                from: ReconstructionStatus::Queued,
+                to: ReconstructionStatus::Completed
             }
         );
     }

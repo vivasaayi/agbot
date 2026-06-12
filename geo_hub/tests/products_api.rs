@@ -1669,6 +1669,157 @@ async fn orthomosaic_frame_set_ingest_rejects_no_pose_frames() -> Result<()> {
 }
 
 #[tokio::test]
+async fn orthomosaic_reconstruction_submit_status_and_failure_roundtrip() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_orthomosaic_frame_set(
+        &ctx,
+        "recon-scene-1",
+        "recon-field-1",
+        "season-2026",
+        "frame-set-recon-1",
+    )
+    .await?;
+
+    let submit_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/orthomosaic/reconstructions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recon_id": "recon-001",
+                        "frame_set_id": "frame-set-recon-1",
+                        "params": {
+                            "feature_detector": "orb",
+                            "max_features": 4000
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(submit_response.status(), StatusCode::OK);
+    let body = to_bytes(submit_response.into_body(), 64 * 1024).await?;
+    let submitted: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        submitted.get("recon_id").and_then(|value| value.as_str()),
+        Some("recon-001")
+    );
+    assert_eq!(
+        submitted.get("status").and_then(|value| value.as_str()),
+        Some("queued")
+    );
+    assert_eq!(
+        submitted
+            .pointer("/params/feature_detector")
+            .and_then(|value| value.as_str()),
+        Some("orb")
+    );
+
+    let status_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/orthomosaic/reconstructions/recon-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(status_response.status(), StatusCode::OK);
+    let body = to_bytes(status_response.into_body(), 64 * 1024).await?;
+    let status: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        status.get("status").and_then(|value| value.as_str()),
+        Some("queued")
+    );
+
+    let fail_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/orthomosaic/reconstructions/recon-001/status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "status": "failed",
+                        "failure_reason": "feature-match-insufficient-overlap"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(fail_response.status(), StatusCode::OK);
+    let body = to_bytes(fail_response.into_body(), 64 * 1024).await?;
+    let failed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        failed.get("status").and_then(|value| value.as_str()),
+        Some("failed")
+    );
+    assert_eq!(
+        failed
+            .get("failure_reason")
+            .and_then(|value| value.as_str()),
+        Some("feature-match-insufficient-overlap")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn orthomosaic_reconstruction_rejects_unknown_frame_set() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/orthomosaic/reconstructions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recon_id": "recon-missing-frame-set",
+                        "frame_set_id": "missing-frame-set",
+                        "params": {
+                            "feature_detector": "orb"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("frame_set_id missing-frame-set does not exist"));
+
+    let recon_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orthomosaic_reconstructions")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(recon_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_field_rejects_orphan_farm_reference() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -4074,6 +4225,55 @@ async fn seed_orthomosaic_scene(
     .bind("2026-06-01T12:00:00Z")
     .bind(field_id)
     .bind(season_id)
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn seed_orthomosaic_frame_set(
+    ctx: &TestContext,
+    scene_id: &str,
+    field_id: &str,
+    season_id: &str,
+    frame_set_id: &str,
+) -> Result<()> {
+    seed_orthomosaic_scene(ctx, scene_id, field_id, season_id).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO orthomosaic_frame_sets
+            (frame_set_id, scene_id, field_id, season_id, frames_json, crs_hint, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(frame_set_id)
+    .bind(scene_id)
+    .bind(field_id)
+    .bind(season_id)
+    .bind(
+        json!([
+            {
+                "frame_id": "frame-001",
+                "capture_ts": "2026-06-01T12:00:00Z",
+                "gps": {
+                    "latitude": 41.10,
+                    "longitude": -96.70,
+                    "altitude": 120.0
+                },
+                "imu": {
+                    "roll_deg": 1.2,
+                    "pitch_deg": -0.4,
+                    "yaw_deg": 87.0
+                },
+                "exif": {
+                    "camera_model": "MicaSense RedEdge"
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .bind("EPSG:4326")
+    .bind("2026-06-01T12:05:00Z")
     .execute(&ctx.pool)
     .await?;
 
