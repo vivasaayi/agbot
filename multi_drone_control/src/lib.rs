@@ -211,11 +211,16 @@ pub enum SwarmActionSafetyError {
 }
 
 impl SwarmActionSafetyError {
-    pub fn report(&self) -> &SwarmActionConstraintReport {
+    pub fn rejected_report(&self) -> Option<&SwarmActionConstraintReport> {
         match self {
-            SwarmActionSafetyError::Rejected { report, .. } => report,
-            _ => panic!("only rejected swarm action safety errors carry a report"),
+            SwarmActionSafetyError::Rejected { report, .. } => Some(report),
+            _ => None,
         }
+    }
+
+    pub fn report(&self) -> &SwarmActionConstraintReport {
+        self.rejected_report()
+            .expect("only rejected swarm action safety errors carry a report")
     }
 }
 
@@ -226,6 +231,7 @@ pub struct MultiDroneControlService {
     coordination_engine: Arc<RwLock<CoordinationEngine>>,
     mission_assigner: Arc<RwLock<MissionAssignmentEngine>>,
     collision_avoidance: Arc<RwLock<CollisionAvoidanceSystem>>,
+    safety_audit_log: Arc<RwLock<SafetyViolationAuditLog>>,
     command_sender: mpsc::UnboundedSender<ControlCommand>,
     command_receiver: Arc<RwLock<mpsc::UnboundedReceiver<ControlCommand>>>,
 }
@@ -615,6 +621,7 @@ impl MultiDroneControlService {
                 mission_assignment::AssignmentAlgorithm::FirstAvailable,
             ))),
             collision_avoidance: Arc::new(RwLock::new(CollisionAvoidanceSystem::new())),
+            safety_audit_log: Arc::new(RwLock::new(SafetyViolationAuditLog::default())),
             command_sender,
             command_receiver: Arc::new(RwLock::new(command_receiver)),
         }
@@ -688,11 +695,16 @@ impl MultiDroneControlService {
             }
             ControlCommand::ExecuteCoordinatedAction { swarm_id, action } => {
                 let action_str = format!("{:?}", action);
-                {
+                let validation_result = {
                     let controller = self.controller.read().await;
-                    controller
-                        .validate_coordinated_action(swarm_id, &action, Utc::now())
-                        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                    controller.validate_coordinated_action(swarm_id, &action, Utc::now())
+                };
+                if let Err(err) = validation_result {
+                    if let Some(report) = err.rejected_report() {
+                        self.audit_safety_violations(&report.violations, Utc::now())
+                            .await;
+                    }
+                    return Err(anyhow::anyhow!(err.to_string()));
                 }
                 self.coordination_engine
                     .write()
@@ -719,6 +731,31 @@ impl MultiDroneControlService {
         }
 
         Ok(())
+    }
+
+    async fn audit_safety_violations(
+        &self,
+        violations: &[SafetyViolation],
+        recorded_at: DateTime<Utc>,
+    ) {
+        let mut audit_log = self.safety_audit_log.write().await;
+        for violation in violations {
+            audit_log.append(violation.clone(), recorded_at);
+        }
+    }
+
+    pub async fn list_safety_violation_audit_records(&self) -> Vec<SafetyViolationAuditRecord> {
+        self.safety_audit_log.read().await.records()
+    }
+
+    pub async fn check_safety_audit_completeness(
+        &self,
+        expected: &[SafetyViolation],
+    ) -> SafetyAuditCompletenessReport {
+        self.safety_audit_log
+            .read()
+            .await
+            .check_completeness(expected)
     }
 
     pub async fn check_safety_violations(&self) -> Result<Vec<SafetyViolation>> {
@@ -771,6 +808,10 @@ impl MultiDroneControlService {
                 }
             }
         }
+
+        drop(controller);
+        drop(statuses);
+        self.audit_safety_violations(&violations, Utc::now()).await;
 
         Ok(violations)
     }
@@ -848,6 +889,99 @@ pub struct SafetyViolation {
     pub action_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SafetyViolationAuditRecord {
+    pub audit_id: String,
+    pub sequence: u64,
+    pub violation: SafetyViolation,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SafetyViolationAuditLog {
+    records: Vec<SafetyViolationAuditRecord>,
+}
+
+impl SafetyViolationAuditLog {
+    pub fn append(
+        &mut self,
+        violation: SafetyViolation,
+        recorded_at: DateTime<Utc>,
+    ) -> SafetyViolationAuditRecord {
+        let sequence = self.records.len() as u64 + 1;
+        let record = SafetyViolationAuditRecord {
+            audit_id: format!("safety-violation-{sequence:06}"),
+            sequence,
+            violation,
+            recorded_at,
+        };
+        self.records.push(record.clone());
+        record
+    }
+
+    pub fn records(&self) -> Vec<SafetyViolationAuditRecord> {
+        self.records.clone()
+    }
+
+    pub fn check_completeness(
+        &self,
+        expected: &[SafetyViolation],
+    ) -> SafetyAuditCompletenessReport {
+        let gaps = expected
+            .iter()
+            .filter(|expected_violation| {
+                !self
+                    .records
+                    .iter()
+                    .any(|record| record.violation == **expected_violation)
+            })
+            .map(SafetyViolationAuditGap::from)
+            .collect::<Vec<_>>();
+
+        SafetyAuditCompletenessReport {
+            expected_count: expected.len(),
+            audited_count: self.records.len(),
+            gaps,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SafetyAuditCompletenessReport {
+    pub expected_count: usize,
+    pub audited_count: usize,
+    pub gaps: Vec<SafetyViolationAuditGap>,
+}
+
+impl SafetyAuditCompletenessReport {
+    pub fn passed(&self) -> bool {
+        self.gaps.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SafetyViolationAuditGap {
+    pub drone_id: Uuid,
+    pub violation_type: ViolationType,
+    pub severity: Severity,
+    pub timestamp: DateTime<Utc>,
+    pub position: Option<(f64, f64, f32)>,
+    pub action_ref: Option<String>,
+}
+
+impl From<&SafetyViolation> for SafetyViolationAuditGap {
+    fn from(violation: &SafetyViolation) -> Self {
+        Self {
+            drone_id: violation.drone_id,
+            violation_type: violation.violation_type.clone(),
+            severity: violation.severity.clone(),
+            timestamp: violation.timestamp,
+            position: violation.position,
+            action_ref: violation.action_ref.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ViolationType {
     AltitudeExceeded,
@@ -858,12 +992,36 @@ pub enum ViolationType {
     BatteryLow,
 }
 
+impl ViolationType {
+    pub fn all() -> Vec<Self> {
+        vec![
+            ViolationType::AltitudeExceeded,
+            ViolationType::GeofenceViolation,
+            ViolationType::NoFlyZoneViolation,
+            ViolationType::CollisionRisk,
+            ViolationType::CommunicationLoss,
+            ViolationType::BatteryLow,
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Severity {
     Low,
     Medium,
     High,
     Critical,
+}
+
+impl Severity {
+    pub fn all() -> Vec<Self> {
+        vec![
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -1093,6 +1251,88 @@ mod tests {
         assert!(violation_types.contains(&ViolationType::AltitudeExceeded));
     }
 
+    #[test]
+    fn safety_violation_audit_log_appends_context_and_detects_dropped_gap() {
+        let mut log = SafetyViolationAuditLog::default();
+        let audited = sample_violation(
+            Uuid::new_v4(),
+            ViolationType::GeofenceViolation,
+            Severity::Critical,
+            (150.0, 10.0, 50.0),
+        );
+        let dropped = sample_violation(
+            Uuid::new_v4(),
+            ViolationType::AltitudeExceeded,
+            Severity::High,
+            (10.0, 10.0, 121.0),
+        );
+
+        let record = log.append(audited.clone(), fixed_time());
+
+        assert_eq!(record.audit_id, "safety-violation-000001");
+        assert_eq!(record.sequence, 1);
+        assert_eq!(record.violation, audited);
+        assert_eq!(log.records().len(), 1);
+
+        let report = log.check_completeness(&[audited, dropped.clone()]);
+
+        assert!(!report.passed());
+        assert_eq!(report.expected_count, 2);
+        assert_eq!(report.audited_count, 1);
+        assert_eq!(report.gaps.len(), 1);
+        assert_eq!(report.gaps[0].drone_id, dropped.drone_id);
+        assert_eq!(
+            report.gaps[0].violation_type,
+            ViolationType::AltitudeExceeded
+        );
+        assert_eq!(
+            report.gaps[0].action_ref.as_deref(),
+            Some("survey:north-block")
+        );
+    }
+
+    #[tokio::test]
+    async fn service_check_safety_violations_persists_geofence_breach_context() {
+        let service = MultiDroneControlService::new("Test Service".to_string());
+        let drone_id = Uuid::new_v4();
+        {
+            let mut controller = service.controller.write().await;
+            controller.global_constraints = constrained_controller().global_constraints;
+        }
+        service
+            .update_drone_status(DroneStatus {
+                id: drone_id,
+                position: (150.0, 10.0, 50.0),
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.9,
+                status: "in_mission".to_string(),
+                assigned_mission: None,
+                last_update: fixed_time(),
+            })
+            .await;
+
+        let violations = service.check_safety_violations().await.unwrap();
+        let records = service.list_safety_violation_audit_records().await;
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].audit_id, "safety-violation-000001");
+        assert_eq!(
+            records[0].violation.violation_type,
+            ViolationType::GeofenceViolation
+        );
+        assert_eq!(records[0].violation.drone_id, drone_id);
+        assert_eq!(records[0].violation.position, Some((150.0, 10.0, 50.0)));
+    }
+
+    #[test]
+    fn safety_violation_taxonomy_has_six_types_and_four_severities() {
+        assert_eq!(ViolationType::all().len(), 6);
+        assert_eq!(Severity::all().len(), 4);
+        assert!(ViolationType::all().contains(&ViolationType::NoFlyZoneViolation));
+        assert!(Severity::all().contains(&Severity::Critical));
+    }
+
     #[tokio::test]
     async fn test_service_creation() {
         let service = MultiDroneControlService::new("Test Service".to_string());
@@ -1213,5 +1453,22 @@ mod tests {
         "2026-06-12T12:00:00Z"
             .parse()
             .expect("fixed timestamp should parse")
+    }
+
+    fn sample_violation(
+        drone_id: Uuid,
+        violation_type: ViolationType,
+        severity: Severity,
+        position: (f64, f64, f32),
+    ) -> SafetyViolation {
+        SafetyViolation {
+            drone_id,
+            violation_type,
+            description: "sample violation".to_string(),
+            severity,
+            timestamp: fixed_time(),
+            position: Some(position),
+            action_ref: Some("survey:north-block".to_string()),
+        }
     }
 }
