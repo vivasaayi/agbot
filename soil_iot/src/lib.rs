@@ -220,6 +220,7 @@ pub struct CalibrationProfile {
 #[serde(rename_all = "snake_case")]
 pub enum ReadingQaReason {
     OutOfRange,
+    Stuck,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,6 +248,45 @@ pub struct ValidatedSoilReading {
     pub source_qa_flags: Vec<String>,
     pub qa_flags: Vec<ReadingQaFlag>,
     pub excluded_from_products: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StuckSensorWindowConfig {
+    pub min_samples: usize,
+    pub variance_threshold: f64,
+    pub range_threshold: f64,
+    pub valid_min: f64,
+    pub valid_max: f64,
+    pub rail_tolerance: f64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StuckSensorRail {
+    Lower,
+    Upper,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StuckSensorDetection {
+    pub device_id: String,
+    pub metric: GatewayReadingMetric,
+    pub reason_code: ReadingQaReason,
+    pub window: usize,
+    pub sample_count: usize,
+    pub window_start_ts: String,
+    pub window_end_ts: String,
+    pub observed_variance: f64,
+    pub observed_range: f64,
+    pub observed_min: f64,
+    pub observed_max: f64,
+    pub variance_threshold: f64,
+    pub range_threshold: f64,
+    pub pinned_at_rail: Option<StuckSensorRail>,
+    pub rail_tolerance: f64,
+    pub method_version: String,
+    pub evidence_payload_ids: Vec<String>,
 }
 
 impl GeolocatedSoilReading {
@@ -376,6 +416,14 @@ pub enum SoilIotError {
         reading_metric: GatewayReadingMetric,
         profile_metric: GatewayReadingMetric,
     },
+    #[error("stuck-sensor method_version cannot be empty")]
+    EmptyStuckWindowMethodVersion,
+    #[error(
+        "stuck-sensor window config must be finite with min_samples > 1 and valid_min <= valid_max"
+    )]
+    InvalidStuckWindowConfig,
+    #[error("stuck-sensor window must contain one device and metric")]
+    MixedStuckWindowSeries,
 }
 
 pub fn build_soil_device_record(
@@ -638,6 +686,78 @@ pub fn validate_and_calibrate_reading(
     })
 }
 
+pub fn detect_stuck_sensor_window(
+    readings: &[ValidatedSoilReading],
+    config: StuckSensorWindowConfig,
+) -> Result<Option<StuckSensorDetection>, SoilIotError> {
+    let config = normalize_stuck_window_config(config)?;
+    if readings.len() < config.min_samples {
+        return Ok(None);
+    }
+
+    let first = &readings[0];
+    let mut values = Vec::with_capacity(readings.len());
+    let mut evidence_payload_ids = Vec::with_capacity(readings.len());
+    for reading in readings {
+        if reading.device_id != first.device_id || reading.metric != first.metric {
+            return Err(SoilIotError::MixedStuckWindowSeries);
+        }
+        if !reading.calibrated_value.is_finite() {
+            return Err(SoilIotError::InvalidReadingValue);
+        }
+        if reading.excluded_from_products || !reading.qa_flags.is_empty() {
+            return Ok(None);
+        }
+        values.push(reading.calibrated_value);
+        evidence_payload_ids.push(reading.payload_id.clone());
+    }
+
+    let window = values.len();
+    let mean = values.iter().sum::<f64>() / window as f64;
+    let observed_variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / window as f64;
+    let (observed_min, observed_max) = values.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(observed_min, observed_max), value| (observed_min.min(*value), observed_max.max(*value)),
+    );
+    let observed_range = observed_max - observed_min;
+    let pinned_at_rail = pinned_rail(&values, &config);
+    let flatlined =
+        observed_variance <= config.variance_threshold && observed_range <= config.range_threshold;
+    let rail_pinned = pinned_at_rail.is_some() && observed_range <= config.range_threshold;
+    let stuck = flatlined || rail_pinned;
+
+    if stuck {
+        Ok(Some(StuckSensorDetection {
+            device_id: first.device_id.clone(),
+            metric: first.metric,
+            reason_code: ReadingQaReason::Stuck,
+            window,
+            sample_count: window,
+            window_start_ts: first.ts.clone(),
+            window_end_ts: readings[window - 1].ts.clone(),
+            observed_variance,
+            observed_range,
+            observed_min,
+            observed_max,
+            variance_threshold: config.variance_threshold,
+            range_threshold: config.range_threshold,
+            pinned_at_rail,
+            rail_tolerance: config.rail_tolerance,
+            method_version: config.method_version,
+            evidence_payload_ids,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct GatewayPayloadBody {
     device_id: String,
@@ -724,6 +844,55 @@ fn normalize_calibration_profile(
     }
 }
 
+fn normalize_stuck_window_config(
+    config: StuckSensorWindowConfig,
+) -> Result<StuckSensorWindowConfig, SoilIotError> {
+    let method_version = normalize_required_text(
+        config.method_version,
+        SoilIotError::EmptyStuckWindowMethodVersion,
+    )?;
+    let valid = config.min_samples > 1
+        && config.variance_threshold.is_finite()
+        && config.variance_threshold >= 0.0
+        && config.range_threshold.is_finite()
+        && config.range_threshold >= 0.0
+        && config.valid_min.is_finite()
+        && config.valid_max.is_finite()
+        && config.valid_min <= config.valid_max
+        && config.rail_tolerance.is_finite()
+        && config.rail_tolerance >= 0.0;
+
+    if valid {
+        Ok(StuckSensorWindowConfig {
+            min_samples: config.min_samples,
+            variance_threshold: config.variance_threshold,
+            range_threshold: config.range_threshold,
+            valid_min: config.valid_min,
+            valid_max: config.valid_max,
+            rail_tolerance: config.rail_tolerance,
+            method_version,
+        })
+    } else {
+        Err(SoilIotError::InvalidStuckWindowConfig)
+    }
+}
+
+fn pinned_rail(values: &[f64], config: &StuckSensorWindowConfig) -> Option<StuckSensorRail> {
+    if values
+        .iter()
+        .all(|value| (*value - config.valid_min).abs() <= config.rail_tolerance)
+    {
+        Some(StuckSensorRail::Lower)
+    } else if values
+        .iter()
+        .all(|value| (*value - config.valid_max).abs() <= config.rail_tolerance)
+    {
+        Some(StuckSensorRail::Upper)
+    } else {
+        None
+    }
+}
+
 fn normalize_position(position: GeoPosition) -> Result<GeoPosition, SoilIotError> {
     let crs = normalize_required_text(position.crs, SoilIotError::EmptyCrs)?;
     if crs != "EPSG:4326" {
@@ -780,12 +949,13 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::{
         build_geolocated_soil_reading, build_soil_device_record, decode_gateway_payload,
-        ingest_gateway_readings, reading_rejection_for_device, transition_soil_device_status,
-        validate_and_calibrate_reading, CalibrationProfile, GatewayIngestError,
-        GatewayPayloadRejectionReason, GatewayReadingMetric, GatewayReadingRecord, GeoPosition,
-        RawGatewayReading, ReadingGeolocationStatus, ReadingQaReason, ReadingRejectionReason,
-        RegisterSoilDeviceRequest, SimulatedGateway, SoilDeviceStatus, SoilIotError,
-        SoilSensorType,
+        detect_stuck_sensor_window, ingest_gateway_readings, reading_rejection_for_device,
+        transition_soil_device_status, validate_and_calibrate_reading, CalibrationProfile,
+        GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
+        GatewayReadingRecord, GeoPosition, RawGatewayReading, ReadingGeolocationStatus,
+        ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
+        SimulatedGateway, SoilDeviceStatus, SoilIotError, SoilSensorType, StuckSensorRail,
+        StuckSensorWindowConfig,
     };
     use timeseries::SeriesValue;
 
@@ -1076,6 +1246,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stuck_sensor_detection_ignores_normal_variation() {
+        let readings = validated_window([34.5, 35.1, 33.8, 34.9]);
+
+        let detection = detect_stuck_sensor_window(&readings, stuck_window_config())
+            .expect("normal window should be evaluable");
+
+        assert!(detection.is_none());
+    }
+
+    #[test]
+    fn stuck_sensor_detection_flags_flatline_with_variance_evidence() {
+        let readings = validated_window([34.5, 34.5, 34.5, 34.5]);
+
+        let detection = detect_stuck_sensor_window(&readings, stuck_window_config())
+            .expect("flatline window should be evaluable")
+            .expect("flatline window should be flagged");
+
+        assert_eq!(detection.reason_code, ReadingQaReason::Stuck);
+        assert_eq!(detection.window, 4);
+        assert_eq!(detection.sample_count, 4);
+        assert_eq!(detection.window_start_ts, "2026-06-12T10:00:00Z");
+        assert_eq!(detection.window_end_ts, "2026-06-12T10:00:03Z");
+        assert_eq!(detection.observed_variance, 0.0);
+        assert_eq!(detection.observed_range, 0.0);
+        assert_eq!(detection.observed_min, 34.5);
+        assert_eq!(detection.observed_max, 34.5);
+        assert_eq!(detection.evidence_payload_ids.len(), 4);
+        assert_eq!(detection.pinned_at_rail, None);
+    }
+
+    #[test]
+    fn stuck_sensor_detection_flags_values_pinned_at_upper_rail() {
+        let readings = validated_window([99.98, 100.0, 99.99, 100.0]);
+        let mut config = stuck_window_config();
+        config.variance_threshold = 0.0;
+
+        let detection = detect_stuck_sensor_window(&readings, config)
+            .expect("rail-pinned window should be evaluable")
+            .expect("rail-pinned window should be flagged");
+
+        assert_eq!(detection.reason_code, ReadingQaReason::Stuck);
+        assert_eq!(detection.pinned_at_rail, Some(StuckSensorRail::Upper));
+        assert!(detection.observed_variance > 0.0);
+    }
+
+    #[test]
+    fn stuck_sensor_detection_requires_complete_clean_window() {
+        let short_window = validated_window([34.5, 34.5, 34.5]);
+
+        let short_detection = detect_stuck_sensor_window(&short_window, stuck_window_config())
+            .expect("short clean window should be evaluable");
+        assert!(short_detection.is_none());
+
+        let mut excluded_window = validated_window([34.5, 34.5, 34.5, 34.5]);
+        excluded_window[0].excluded_from_products = true;
+        let excluded_detection =
+            detect_stuck_sensor_window(&excluded_window, stuck_window_config())
+                .expect("excluded window should be evaluable");
+        assert!(excluded_detection.is_none());
+
+        let mut flagged_window = validated_window([34.5, 34.5, 34.5, 34.5]);
+        flagged_window[0].qa_flags.push(ReadingQaFlag {
+            reason_code: ReadingQaReason::OutOfRange,
+            profile_ref: "calibration:soil-probe-001:v1".to_string(),
+            method_version: "linear-v1".to_string(),
+            raw_value: 250.0,
+            calibrated_value: 250.0,
+            valid_min: 0.0,
+            valid_max: 100.0,
+        });
+        let flagged_detection = detect_stuck_sensor_window(&flagged_window, stuck_window_config())
+            .expect("flagged window should be evaluable");
+        assert!(flagged_detection.is_none());
+    }
+
+    #[test]
+    fn stuck_sensor_detection_rejects_mixed_device_or_metric_window() {
+        let mut readings = validated_window([34.5, 34.5, 34.5, 34.5]);
+        readings[1].device_id = "soil-probe-002".to_string();
+
+        let error = detect_stuck_sensor_window(&readings, stuck_window_config())
+            .expect_err("mixed device windows should fail");
+
+        assert_eq!(error, SoilIotError::MixedStuckWindowSeries);
+
+        let mut readings = validated_window([34.5, 34.5, 34.5, 34.5]);
+        readings[1].metric = GatewayReadingMetric::SoilTemperatureCelsius;
+
+        let error = detect_stuck_sensor_window(&readings, stuck_window_config())
+            .expect_err("mixed metric windows should fail");
+
+        assert_eq!(error, SoilIotError::MixedStuckWindowSeries);
+    }
+
     fn valid_device() -> super::SoilDeviceRecord {
         build_soil_device_record(
             RegisterSoilDeviceRequest {
@@ -1123,6 +1388,44 @@ mod tests {
             valid_min,
             valid_max,
             method_version: "linear-v1".to_string(),
+        }
+    }
+
+    fn validated_window<const N: usize>(values: [f64; N]) -> Vec<super::ValidatedSoilReading> {
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, raw_value)| {
+                let mut raw = valid_gateway_record();
+                raw.payload_id = format!("payload-{index:03}");
+                raw.raw_value = raw_value;
+                raw.gateway_ts = format!("2026-06-12T10:00:0{index}Z");
+                let reading = build_geolocated_soil_reading(&valid_device(), raw)
+                    .expect("reading should geolocate");
+                validate_and_calibrate_reading(
+                    reading,
+                    calibration_profile(
+                        GatewayReadingMetric::SoilMoisturePercent,
+                        1.0,
+                        0.0,
+                        0.0,
+                        100.0,
+                    ),
+                )
+                .expect("reading should validate")
+            })
+            .collect()
+    }
+
+    fn stuck_window_config() -> StuckSensorWindowConfig {
+        StuckSensorWindowConfig {
+            min_samples: 4,
+            variance_threshold: 0.001,
+            range_threshold: 0.05,
+            valid_min: 0.0,
+            valid_max: 100.0,
+            rail_tolerance: 0.05,
+            method_version: "stuck-window-v1".to_string(),
         }
     }
 }
