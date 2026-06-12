@@ -13,6 +13,7 @@ pub mod report_generator;
 pub mod thermal_analysis;
 pub mod zonal_statistics;
 pub mod zone_delineation;
+pub mod zone_recommendations;
 
 pub use lidar_analysis::{LidarAnalysisConfig, LidarAnalysisProcessor};
 pub use ndvi_analysis::{NdviAnalysisConfig, NdviAnalysisProcessor};
@@ -27,6 +28,10 @@ pub use zonal_statistics::{
 };
 pub use zone_delineation::{
     delineate_anomaly_zones, AnomalyZone, AnomalyZonePolygon, ZoneDelineationError,
+};
+pub use zone_recommendations::{
+    create_recommendation_from_zone, priority_for_zone_area, ZoneRecommendationError,
+    ZoneRecommendationRequest,
 };
 
 /// Post-processing pipeline for agricultural drone data
