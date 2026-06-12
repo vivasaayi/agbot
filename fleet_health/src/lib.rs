@@ -162,6 +162,14 @@ impl FleetHealthIndicator {
             FleetHealthIndicator::EscTemperature => "esc_temperature_c",
         }
     }
+
+    pub fn unit(self) -> &'static str {
+        match self {
+            FleetHealthIndicator::BatteryInternalResistance => "milliohm",
+            FleetHealthIndicator::MotorVibration => "g",
+            FleetHealthIndicator::EscTemperature => "celsius",
+        }
+    }
 }
 
 impl std::str::FromStr for FleetHealthIndicator {
@@ -227,6 +235,7 @@ impl FleetHealthIndicatorSample {
         SeriesPoint {
             entity_ref: format!("component:{}", self.component_id),
             metric: self.indicator.as_str().to_string(),
+            unit: self.indicator.unit().to_string(),
             t: self.ts.clone(),
             value: SeriesValue::Scalar { value: self.value },
             source_ref: self.source_ref.clone(),
@@ -1416,6 +1425,7 @@ mod tests {
         let point = resistance.to_series_point();
         assert_eq!(point.entity_ref, "component:battery-pack-001");
         assert_eq!(point.metric, "battery_internal_resistance_milliohm");
+        assert_eq!(point.unit, "milliohm");
         assert_eq!(point.t, "2026-06-12T12:00:00Z");
         match point.value {
             SeriesValue::Scalar { value } => assert!((value - 30.0).abs() < 1e-9),

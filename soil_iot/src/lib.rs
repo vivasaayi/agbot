@@ -160,6 +160,15 @@ impl GatewayReadingMetric {
             GatewayReadingMetric::SoilTemperatureCelsius => "soil_temperature_celsius",
         }
     }
+
+    pub fn unit(self) -> &'static str {
+        match self {
+            GatewayReadingMetric::BatteryVoltage => "volt",
+            GatewayReadingMetric::ElectricalConductivity => "millisiemens_per_cm",
+            GatewayReadingMetric::SoilMoisturePercent => "percent",
+            GatewayReadingMetric::SoilTemperatureCelsius => "celsius",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -294,6 +303,7 @@ impl GeolocatedSoilReading {
         SeriesPoint {
             entity_ref: format!("device:{}", self.device_id),
             metric: self.metric.as_str().to_string(),
+            unit: self.metric.unit().to_string(),
             t: self.ts.clone(),
             value: SeriesValue::Scalar {
                 value: self.raw_value,
@@ -1144,6 +1154,7 @@ mod tests {
         let point = reading.to_series_point();
         assert_eq!(point.entity_ref, "device:soil-probe-001");
         assert_eq!(point.metric, "soil_moisture_percent");
+        assert_eq!(point.unit, "percent");
         assert_eq!(point.t, "2026-06-12T10:00:00Z");
         match point.value {
             SeriesValue::Scalar { value } => assert_eq!(value, 34.5),

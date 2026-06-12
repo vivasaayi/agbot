@@ -35,10 +35,26 @@ pub enum SeriesValue {
 pub struct SeriesPoint {
     pub entity_ref: String,
     pub metric: String,
+    pub unit: String,
     pub t: String,
     pub value: SeriesValue,
     pub source_ref: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKind {
+    Scalar,
+    Raster,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricDefinition {
+    pub metric: String,
+    pub unit: String,
+    pub kind: MetricKind,
+    pub expected_cadence: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -169,9 +185,86 @@ pub struct RasterChangeResult {
     pub changed_cell_count: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeriesProductIngest {
+    pub entity_ref: String,
+    pub metric: String,
+    pub unit: String,
+    pub source_ref: String,
+    pub product_ref: String,
+    pub product_date: String,
+    pub finalized_at: String,
+    pub value: SeriesValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeriesConflictResolution {
+    KeepExisting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeriesIngestConflict {
+    pub entity_ref: String,
+    pub metric: String,
+    pub t: String,
+    pub existing_source_ref: String,
+    pub incoming_source_ref: String,
+    pub resolution: SeriesConflictResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeriesIngestOutcome {
+    pub point: SeriesPoint,
+    pub conflict: Option<SeriesIngestConflict>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZonalTrendTarget {
+    pub entity_ref: String,
+    pub metric: String,
+    pub zone_ref: String,
+    pub zone_crs: String,
+    pub range: TimeRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ZonalTrendConfig {
+    pub min_points: usize,
+    pub flat_slope_epsilon: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrendDirection {
+    Increasing,
+    Decreasing,
+    Flat,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZonalTrendResult {
+    pub entity_ref: String,
+    pub metric: String,
+    pub unit: String,
+    pub zone_ref: String,
+    pub zone_crs: String,
+    pub slope_per_day: f64,
+    pub intercept: f64,
+    pub fit_r_squared: f64,
+    pub direction: TrendDirection,
+    pub points_used: Vec<SeriesPoint>,
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TimeSeriesStore {
     points: BTreeMap<SeriesKey, SeriesPoint>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MetricRegistry {
+    definitions: BTreeMap<String, MetricDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -180,12 +273,34 @@ pub enum TimeSeriesError {
     EmptyEntityRef,
     #[error("metric cannot be empty")]
     EmptyMetric,
+    #[error("unit cannot be empty")]
+    EmptyUnit,
+    #[error("expected cadence cannot be empty for {metric}")]
+    EmptyExpectedCadence { metric: String },
     #[error("timestamp cannot be empty")]
     EmptyTimestamp,
     #[error("source_ref cannot be empty")]
     EmptySourceRef,
+    #[error("product_ref cannot be empty")]
+    EmptyProductRef,
     #[error("created_at cannot be empty")]
     EmptyCreatedAt,
+    #[error("metric already registered: {metric}")]
+    DuplicateMetricDefinition { metric: String },
+    #[error("unknown metric: {metric}")]
+    UnknownMetric { metric: String },
+    #[error("metric {metric} unit mismatch: expected {expected_unit}, got {actual_unit}")]
+    MetricUnitMismatch {
+        metric: String,
+        expected_unit: String,
+        actual_unit: String,
+    },
+    #[error("metric {metric} kind mismatch")]
+    MetricKindMismatch {
+        metric: String,
+        expected_kind: MetricKind,
+        actual_kind: MetricKind,
+    },
     #[error("scalar value must be finite")]
     InvalidScalarValue,
     #[error("raster_ref cannot be empty")]
@@ -245,6 +360,23 @@ pub enum TimeSeriesError {
     InvalidRasterCellCount,
     #[error("aligned raster grid values must be finite when present")]
     InvalidRasterCellValue,
+    #[error("zone_ref cannot be empty")]
+    EmptyZoneRef,
+    #[error("zone_crs cannot be empty")]
+    EmptyZoneCrs,
+    #[error("trend config must require at least two points with finite non-negative flat epsilon")]
+    InvalidTrendConfig,
+    #[error("trend requires scalar points for {entity_ref}/{metric}")]
+    TrendRequiresScalarPoint { entity_ref: String, metric: String },
+    #[error("insufficient trend history for {entity_ref}/{metric}: observed {observed_points}, required {required_points}")]
+    InsufficientTrendHistory {
+        entity_ref: String,
+        metric: String,
+        observed_points: usize,
+        required_points: usize,
+    },
+    #[error("invalid trend timestamp for {timestamp}")]
+    InvalidTrendTimestamp { timestamp: String },
 }
 
 impl TimeSeriesStore {
@@ -271,6 +403,14 @@ impl TimeSeriesStore {
             .collect()
     }
 
+    fn get(&self, entity_ref: &str, metric: &str, t: &str) -> Option<&SeriesPoint> {
+        self.points.get(&SeriesKey {
+            entity_ref: entity_ref.to_string(),
+            metric: metric.to_string(),
+            t: t.to_string(),
+        })
+    }
+
     fn list_metrics(&self, entity_ref: &str) -> Vec<String> {
         self.points
             .keys()
@@ -282,7 +422,28 @@ impl TimeSeriesStore {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+impl MetricRegistry {
+    pub fn register(
+        &mut self,
+        definition: MetricDefinition,
+    ) -> Result<MetricDefinition, TimeSeriesError> {
+        let definition = normalize_metric_definition(definition)?;
+        if self.definitions.contains_key(&definition.metric) {
+            return Err(TimeSeriesError::DuplicateMetricDefinition {
+                metric: definition.metric,
+            });
+        }
+        self.definitions
+            .insert(definition.metric.clone(), definition.clone());
+        Ok(definition)
+    }
+
+    pub fn get(&self, metric: &str) -> Option<&MetricDefinition> {
+        self.definitions.get(metric)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeRange {
     pub start: Option<String>,
     pub end: Option<String>,
@@ -298,6 +459,8 @@ impl TimeRange {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TimeSeriesEngine {
     store: TimeSeriesStore,
+    metric_registry: MetricRegistry,
+    ingest_conflicts: Vec<SeriesIngestConflict>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,7 +480,16 @@ pub struct SeriesQueryPage {
 }
 
 impl TimeSeriesEngine {
+    pub fn register_metric(
+        &mut self,
+        definition: MetricDefinition,
+    ) -> Result<MetricDefinition, TimeSeriesError> {
+        self.metric_registry.register(definition)
+    }
+
     pub fn append(&mut self, point: SeriesPoint) -> Result<(), TimeSeriesError> {
+        let point = normalize_point(point)?;
+        self.validate_point_metric(&point)?;
         self.store.append(point)
     }
 
@@ -340,6 +512,150 @@ impl TimeSeriesEngine {
 
     pub fn list_metrics(&self, entity_ref: &str) -> Vec<String> {
         self.store.list_metrics(entity_ref)
+    }
+
+    pub fn ingest_product(
+        &mut self,
+        ingest: SeriesProductIngest,
+    ) -> Result<SeriesIngestOutcome, TimeSeriesError> {
+        let ingest = normalize_product_ingest(ingest)?;
+        let point = SeriesPoint {
+            entity_ref: ingest.entity_ref,
+            metric: ingest.metric,
+            unit: ingest.unit,
+            t: ingest.product_date,
+            value: ingest.value,
+            source_ref: ingest.source_ref,
+            created_at: ingest.finalized_at,
+        };
+        let point = normalize_point(point)?;
+        self.validate_point_metric(&point)?;
+
+        if let Some(existing) = self.store.get(&point.entity_ref, &point.metric, &point.t) {
+            let conflict = SeriesIngestConflict {
+                entity_ref: point.entity_ref.clone(),
+                metric: point.metric.clone(),
+                t: point.t.clone(),
+                existing_source_ref: existing.source_ref.clone(),
+                incoming_source_ref: point.source_ref.clone(),
+                resolution: SeriesConflictResolution::KeepExisting,
+            };
+            self.ingest_conflicts.push(conflict.clone());
+            return Ok(SeriesIngestOutcome {
+                point: existing.clone(),
+                conflict: Some(conflict),
+            });
+        }
+
+        self.store.append(point.clone())?;
+        Ok(SeriesIngestOutcome {
+            point,
+            conflict: None,
+        })
+    }
+
+    pub fn ingest_conflicts(&self) -> &[SeriesIngestConflict] {
+        &self.ingest_conflicts
+    }
+
+    pub fn compute_zonal_trend(
+        &self,
+        target: ZonalTrendTarget,
+        config: ZonalTrendConfig,
+    ) -> Result<ZonalTrendResult, TimeSeriesError> {
+        let target = normalize_zonal_trend_target(target)?;
+        let config = normalize_zonal_trend_config(config)?;
+        let definition = self.metric_registry.get(&target.metric).ok_or_else(|| {
+            TimeSeriesError::UnknownMetric {
+                metric: target.metric.clone(),
+            }
+        })?;
+        if definition.kind != MetricKind::Scalar {
+            return Err(TimeSeriesError::MetricKindMismatch {
+                metric: target.metric,
+                expected_kind: MetricKind::Scalar,
+                actual_kind: definition.kind,
+            });
+        }
+
+        let points = self
+            .store
+            .query(&target.entity_ref, &target.metric, target.range.clone());
+        if points.len() < config.min_points {
+            return Err(TimeSeriesError::InsufficientTrendHistory {
+                entity_ref: target.entity_ref,
+                metric: target.metric,
+                observed_points: points.len(),
+                required_points: config.min_points,
+            });
+        }
+
+        let mut samples = Vec::with_capacity(points.len());
+        for point in &points {
+            let SeriesValue::Scalar { value } = point.value else {
+                return Err(TimeSeriesError::TrendRequiresScalarPoint {
+                    entity_ref: target.entity_ref,
+                    metric: target.metric,
+                });
+            };
+            samples.push((timestamp_day_index(&point.t)?, value));
+        }
+
+        let first_day = samples[0].0;
+        let normalized_samples = samples
+            .iter()
+            .map(|(day, value)| ((*day - first_day) as f64, *value))
+            .collect::<Vec<_>>();
+        let (slope_per_day, intercept, fit_r_squared) = least_squares_trend(&normalized_samples)?;
+        let direction = if slope_per_day.abs() <= config.flat_slope_epsilon {
+            TrendDirection::Flat
+        } else if slope_per_day > 0.0 {
+            TrendDirection::Increasing
+        } else {
+            TrendDirection::Decreasing
+        };
+        let evidence_refs = points
+            .iter()
+            .map(|point| point.source_ref.clone())
+            .collect::<Vec<_>>();
+
+        Ok(ZonalTrendResult {
+            entity_ref: target.entity_ref,
+            metric: target.metric,
+            unit: definition.unit.clone(),
+            zone_ref: target.zone_ref,
+            zone_crs: target.zone_crs,
+            slope_per_day,
+            intercept,
+            fit_r_squared,
+            direction,
+            points_used: points,
+            evidence_refs,
+        })
+    }
+
+    fn validate_point_metric(&self, point: &SeriesPoint) -> Result<(), TimeSeriesError> {
+        let definition = self.metric_registry.get(&point.metric).ok_or_else(|| {
+            TimeSeriesError::UnknownMetric {
+                metric: point.metric.clone(),
+            }
+        })?;
+        if point.unit != definition.unit {
+            return Err(TimeSeriesError::MetricUnitMismatch {
+                metric: point.metric.clone(),
+                expected_unit: definition.unit.clone(),
+                actual_unit: point.unit.clone(),
+            });
+        }
+        let actual_kind = metric_kind_for_value(&point.value);
+        if actual_kind != definition.kind {
+            return Err(TimeSeriesError::MetricKindMismatch {
+                metric: point.metric.clone(),
+                expected_kind: definition.kind,
+                actual_kind,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -739,6 +1055,162 @@ fn normalize_change_config(
     })
 }
 
+fn normalize_metric_definition(
+    mut definition: MetricDefinition,
+) -> Result<MetricDefinition, TimeSeriesError> {
+    definition.metric = normalize_required_text(definition.metric, TimeSeriesError::EmptyMetric)?;
+    definition.unit = normalize_required_text(definition.unit, TimeSeriesError::EmptyUnit)?;
+    definition.expected_cadence = normalize_required_text(
+        definition.expected_cadence,
+        TimeSeriesError::EmptyExpectedCadence {
+            metric: definition.metric.clone(),
+        },
+    )?;
+    Ok(definition)
+}
+
+fn normalize_product_ingest(
+    mut ingest: SeriesProductIngest,
+) -> Result<SeriesProductIngest, TimeSeriesError> {
+    ingest.entity_ref =
+        normalize_required_text(ingest.entity_ref, TimeSeriesError::EmptyEntityRef)?;
+    ingest.metric = normalize_required_text(ingest.metric, TimeSeriesError::EmptyMetric)?;
+    ingest.unit = normalize_required_text(ingest.unit, TimeSeriesError::EmptyUnit)?;
+    ingest.source_ref =
+        normalize_required_text(ingest.source_ref, TimeSeriesError::EmptySourceRef)?;
+    ingest.product_ref =
+        normalize_required_text(ingest.product_ref, TimeSeriesError::EmptyProductRef)?;
+    ingest.product_date =
+        normalize_required_text(ingest.product_date, TimeSeriesError::EmptyTimestamp)?;
+    ingest.finalized_at =
+        normalize_required_text(ingest.finalized_at, TimeSeriesError::EmptyCreatedAt)?;
+    ingest.value = match ingest.value {
+        SeriesValue::Scalar { value } => {
+            if !value.is_finite() {
+                return Err(TimeSeriesError::InvalidScalarValue);
+            }
+            SeriesValue::Scalar { value }
+        }
+        SeriesValue::Raster(raster) => SeriesValue::Raster(normalize_raster_value(raster)?),
+    };
+    Ok(ingest)
+}
+
+fn normalize_zonal_trend_target(
+    mut target: ZonalTrendTarget,
+) -> Result<ZonalTrendTarget, TimeSeriesError> {
+    target.entity_ref =
+        normalize_required_text(target.entity_ref, TimeSeriesError::EmptyEntityRef)?;
+    target.metric = normalize_required_text(target.metric, TimeSeriesError::EmptyMetric)?;
+    target.zone_ref = normalize_required_text(target.zone_ref, TimeSeriesError::EmptyZoneRef)?;
+    target.zone_crs = normalize_required_text(target.zone_crs, TimeSeriesError::EmptyZoneCrs)?;
+    Ok(target)
+}
+
+fn normalize_zonal_trend_config(
+    config: ZonalTrendConfig,
+) -> Result<ZonalTrendConfig, TimeSeriesError> {
+    if config.min_points < 2
+        || !config.flat_slope_epsilon.is_finite()
+        || config.flat_slope_epsilon < 0.0
+    {
+        return Err(TimeSeriesError::InvalidTrendConfig);
+    }
+    Ok(config)
+}
+
+fn metric_kind_for_value(value: &SeriesValue) -> MetricKind {
+    match value {
+        SeriesValue::Scalar { .. } => MetricKind::Scalar,
+        SeriesValue::Raster(_) => MetricKind::Raster,
+    }
+}
+
+fn timestamp_day_index(timestamp: &str) -> Result<i64, TimeSeriesError> {
+    let invalid = || TimeSeriesError::InvalidTrendTimestamp {
+        timestamp: timestamp.to_string(),
+    };
+    let date = timestamp.get(0..10).ok_or_else(invalid)?;
+    let bytes = date.as_bytes();
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return Err(invalid());
+    }
+    let year = date[0..4].parse::<i32>().map_err(|_| invalid())?;
+    let month = date[5..7].parse::<u32>().map_err(|_| invalid())?;
+    let day = date[8..10].parse::<u32>().map_err(|_| invalid())?;
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return Err(invalid());
+    }
+
+    Ok(days_from_civil(year, month, day))
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    i64::from(era * 146_097 + day_of_era - 719_468)
+}
+
+fn least_squares_trend(samples: &[(f64, f64)]) -> Result<(f64, f64, f64), TimeSeriesError> {
+    if samples.len() < 2 {
+        return Err(TimeSeriesError::InvalidTrendConfig);
+    }
+    let n = samples.len() as f64;
+    let sum_x = samples.iter().map(|(x, _)| *x).sum::<f64>();
+    let sum_y = samples.iter().map(|(_, y)| *y).sum::<f64>();
+    let sum_xx = samples.iter().map(|(x, _)| x * x).sum::<f64>();
+    let sum_xy = samples.iter().map(|(x, y)| x * y).sum::<f64>();
+    let denominator = n * sum_xx - sum_x * sum_x;
+    if !denominator.is_finite() || denominator.abs() < f64::EPSILON {
+        return Err(TimeSeriesError::InvalidTrendTimestamp {
+            timestamp: "duplicate trend timestamps".to_string(),
+        });
+    }
+    let slope = (n * sum_xy - sum_x * sum_y) / denominator;
+    let intercept = (sum_y - slope * sum_x) / n;
+    let mean_y = sum_y / n;
+    let total_sum_squares = samples
+        .iter()
+        .map(|(_, y)| {
+            let diff = y - mean_y;
+            diff * diff
+        })
+        .sum::<f64>();
+    let residual_sum_squares = samples
+        .iter()
+        .map(|(x, y)| {
+            let predicted = slope * x + intercept;
+            let diff = y - predicted;
+            diff * diff
+        })
+        .sum::<f64>();
+    let fit_r_squared = if total_sum_squares.abs() < f64::EPSILON {
+        1.0
+    } else {
+        1.0 - residual_sum_squares / total_sum_squares
+    };
+    Ok((slope, intercept, fit_r_squared.clamp(0.0, 1.0)))
+}
+
 fn validate_change_alignment(
     guard_proof: &AlignmentGuardProof,
     evidence: &RasterAlignmentEvidence,
@@ -884,6 +1356,7 @@ fn normalize_point(point: SeriesPoint) -> Result<SeriesPoint, TimeSeriesError> {
     Ok(SeriesPoint {
         entity_ref: normalize_required_text(point.entity_ref, TimeSeriesError::EmptyEntityRef)?,
         metric: normalize_required_text(point.metric, TimeSeriesError::EmptyMetric)?,
+        unit: normalize_required_text(point.unit, TimeSeriesError::EmptyUnit)?,
         t: normalize_required_text(point.t, TimeSeriesError::EmptyTimestamp)?,
         value,
         source_ref: normalize_required_text(point.source_ref, TimeSeriesError::EmptySourceRef)?,
@@ -957,9 +1430,10 @@ mod tests {
     use super::{
         align_raster_pair, compute_aligned_raster_change, guard_coregisterable_pair,
         AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason,
-        GeoExtent, RasterAlignmentConfig, RasterAlignmentEvidence, RasterChangeConfig,
-        RasterResolution, RasterSeriesValue, SeriesPoint, SeriesQuery, SeriesValue, TimeRange,
-        TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
+        GeoExtent, MetricDefinition, MetricKind, RasterAlignmentConfig, RasterAlignmentEvidence,
+        RasterChangeConfig, RasterResolution, RasterSeriesValue, SeriesPoint, SeriesProductIngest,
+        SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
+        TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
     };
 
     #[test]
@@ -1004,6 +1478,7 @@ mod tests {
             .append(SeriesPoint {
                 entity_ref: "field:alpha".to_string(),
                 metric: "ndvi_raster".to_string(),
+                unit: "index".to_string(),
                 t: "2026-06-10T10:00:00Z".to_string(),
                 value: SeriesValue::Raster(RasterSeriesValue {
                     raster_ref: "product:scene-001:ndvi".to_string(),
@@ -1070,25 +1545,38 @@ mod tests {
     fn reusable_api_appends_queries_and_lists_metrics_with_pagination() {
         let mut engine = TimeSeriesEngine::default();
         engine
-            .append(scalar_point(
+            .register_metric(metric_definition("ndvi_mean", "index", MetricKind::Scalar))
+            .expect("ndvi metric should register");
+        engine
+            .register_metric(metric_definition(
+                "soil_moisture",
+                "percent",
+                MetricKind::Scalar,
+            ))
+            .expect("soil metric should register");
+        engine
+            .append(scalar_point_with_unit(
                 "field:alpha",
                 "ndvi_mean",
+                "index",
                 "2026-06-10T10:00:00Z",
                 0.68,
             ))
             .expect("first point should append");
         engine
-            .append(scalar_point(
+            .append(scalar_point_with_unit(
                 "field:alpha",
                 "ndvi_mean",
+                "index",
                 "2026-06-12T10:00:00Z",
                 0.72,
             ))
             .expect("second point should append");
         engine
-            .append(scalar_point(
+            .append(scalar_point_with_unit(
                 "field:alpha",
                 "soil_moisture",
+                "percent",
                 "2026-06-12T11:00:00Z",
                 34.0,
             ))
@@ -1135,6 +1623,202 @@ mod tests {
         assert!(page.no_series);
         assert!(page.points.is_empty());
         assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn metric_registry_accepts_matching_points_and_rejects_unknown_or_unit_mismatch() {
+        let mut engine = TimeSeriesEngine::default();
+        engine
+            .register_metric(metric_definition("ndvi_mean", "index", MetricKind::Scalar))
+            .expect("metric should register");
+
+        engine
+            .append(scalar_point_with_unit(
+                "field:alpha",
+                "ndvi_mean",
+                "index",
+                "2026-06-10T10:00:00Z",
+                0.68,
+            ))
+            .expect("registered unit should append");
+
+        let unknown_error = engine
+            .append(scalar_point_with_unit(
+                "field:alpha",
+                "soil_moisture",
+                "percent",
+                "2026-06-10T10:00:00Z",
+                34.0,
+            ))
+            .expect_err("unknown metric should be refused");
+        assert_eq!(
+            unknown_error,
+            TimeSeriesError::UnknownMetric {
+                metric: "soil_moisture".to_string()
+            }
+        );
+
+        let mismatch_error = engine
+            .append(scalar_point_with_unit(
+                "field:alpha",
+                "ndvi_mean",
+                "percent",
+                "2026-06-12T10:00:00Z",
+                72.0,
+            ))
+            .expect_err("unit mismatch should be refused");
+        assert_eq!(
+            mismatch_error,
+            TimeSeriesError::MetricUnitMismatch {
+                metric: "ndvi_mean".to_string(),
+                expected_unit: "index".to_string(),
+                actual_unit: "percent".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn product_ingest_records_fresh_raster_point_and_duplicate_conflict() {
+        let mut engine = TimeSeriesEngine::default();
+        engine
+            .register_metric(metric_definition(
+                "ndvi_raster",
+                "index",
+                MetricKind::Raster,
+            ))
+            .expect("raster metric should register");
+
+        let first = engine
+            .ingest_product(sample_product_ingest(
+                "scene:001",
+                "product:scene-001:ndvi",
+                "2026-06-10T10:00:00Z",
+            ))
+            .expect("first product should ingest");
+        assert!(first.conflict.is_none());
+        assert_eq!(first.point.t, "2026-06-10T10:00:00Z");
+        assert_eq!(first.point.source_ref, "scene:001");
+        match &first.point.value {
+            SeriesValue::Raster(raster) => {
+                assert_eq!(raster.crs.as_deref(), Some("EPSG:32610"));
+                assert_eq!(raster.extent, Some(default_extent()));
+            }
+            SeriesValue::Scalar { .. } => panic!("expected raster ingest"),
+        }
+
+        let duplicate = engine
+            .ingest_product(sample_product_ingest(
+                "scene:002",
+                "product:scene-002:ndvi",
+                "2026-06-10T10:00:00Z",
+            ))
+            .expect("duplicate should record a deterministic conflict");
+        let conflict = duplicate
+            .conflict
+            .expect("duplicate should report conflict");
+        assert_eq!(conflict.existing_source_ref, "scene:001");
+        assert_eq!(conflict.incoming_source_ref, "scene:002");
+        assert_eq!(engine.ingest_conflicts().len(), 1);
+
+        let stored = engine.query(SeriesQuery {
+            entity_ref: "field:alpha".to_string(),
+            metric: "ndvi_raster".to_string(),
+            range: TimeRange::default(),
+            limit: None,
+            cursor: None,
+        });
+        assert_eq!(stored.points.len(), 1);
+        assert_eq!(stored.points[0].source_ref, "scene:001");
+    }
+
+    #[test]
+    fn zonal_trend_returns_slope_direction_fit_and_contributing_points() {
+        let mut engine = TimeSeriesEngine::default();
+        engine
+            .register_metric(metric_definition("ndvi_mean", "index", MetricKind::Scalar))
+            .expect("metric should register");
+        for (date, value) in [
+            ("2026-06-10T10:00:00Z", 0.60),
+            ("2026-06-12T10:00:00Z", 0.70),
+            ("2026-06-14T10:00:00Z", 0.80),
+        ] {
+            engine
+                .append(scalar_point_with_unit(
+                    "field:alpha",
+                    "ndvi_mean",
+                    "index",
+                    date,
+                    value,
+                ))
+                .expect("trend point should append");
+        }
+
+        let trend = engine
+            .compute_zonal_trend(
+                ZonalTrendTarget {
+                    entity_ref: "field:alpha".to_string(),
+                    metric: "ndvi_mean".to_string(),
+                    zone_ref: "zone:NE".to_string(),
+                    zone_crs: "EPSG:32610".to_string(),
+                    range: TimeRange::default(),
+                },
+                ZonalTrendConfig {
+                    min_points: 3,
+                    flat_slope_epsilon: 0.001,
+                },
+            )
+            .expect("three points should produce a trend");
+
+        assert_eq!(trend.direction, TrendDirection::Increasing);
+        assert!((trend.slope_per_day - 0.05).abs() < 0.000001);
+        assert!(trend.fit_r_squared > 0.999);
+        assert_eq!(trend.zone_ref, "zone:NE");
+        assert_eq!(trend.zone_crs, "EPSG:32610");
+        assert_eq!(trend.points_used.len(), 3);
+        assert_eq!(trend.evidence_refs.len(), 3);
+    }
+
+    #[test]
+    fn zonal_trend_refuses_insufficient_history() {
+        let mut engine = TimeSeriesEngine::default();
+        engine
+            .register_metric(metric_definition("ndvi_mean", "index", MetricKind::Scalar))
+            .expect("metric should register");
+        engine
+            .append(scalar_point_with_unit(
+                "field:alpha",
+                "ndvi_mean",
+                "index",
+                "2026-06-10T10:00:00Z",
+                0.60,
+            ))
+            .expect("one point should append");
+
+        let error = engine
+            .compute_zonal_trend(
+                ZonalTrendTarget {
+                    entity_ref: "field:alpha".to_string(),
+                    metric: "ndvi_mean".to_string(),
+                    zone_ref: "zone:NE".to_string(),
+                    zone_crs: "EPSG:32610".to_string(),
+                    range: TimeRange::default(),
+                },
+                ZonalTrendConfig {
+                    min_points: 3,
+                    flat_slope_epsilon: 0.001,
+                },
+            )
+            .expect_err("one point should be insufficient");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::InsufficientTrendHistory {
+                entity_ref: "field:alpha".to_string(),
+                metric: "ndvi_mean".to_string(),
+                observed_points: 1,
+                required_points: 3
+            }
+        );
     }
 
     #[test]
@@ -1611,9 +2295,20 @@ mod tests {
     }
 
     fn scalar_point(entity_ref: &str, metric: &str, t: &str, value: f64) -> SeriesPoint {
+        scalar_point_with_unit(entity_ref, metric, "index", t, value)
+    }
+
+    fn scalar_point_with_unit(
+        entity_ref: &str,
+        metric: &str,
+        unit: &str,
+        t: &str,
+        value: f64,
+    ) -> SeriesPoint {
         SeriesPoint {
             entity_ref: entity_ref.to_string(),
             metric: metric.to_string(),
+            unit: unit.to_string(),
             t: t.to_string(),
             value: SeriesValue::Scalar { value },
             source_ref: format!("source:{entity_ref}:{metric}:{t}"),
@@ -1631,6 +2326,7 @@ mod tests {
         SeriesPoint {
             entity_ref: entity_ref.to_string(),
             metric: metric.to_string(),
+            unit: "index".to_string(),
             t: t.to_string(),
             value: SeriesValue::Raster(RasterSeriesValue {
                 raster_ref: raster_ref.to_string(),
@@ -1640,6 +2336,46 @@ mod tests {
             }),
             source_ref: format!("source:{entity_ref}:{metric}:{t}"),
             created_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn metric_definition(metric: &str, unit: &str, kind: MetricKind) -> MetricDefinition {
+        MetricDefinition {
+            metric: metric.to_string(),
+            unit: unit.to_string(),
+            kind,
+            expected_cadence: "per_flight".to_string(),
+        }
+    }
+
+    fn sample_product_ingest(
+        source_ref: &str,
+        raster_ref: &str,
+        product_date: &str,
+    ) -> SeriesProductIngest {
+        SeriesProductIngest {
+            entity_ref: "field:alpha".to_string(),
+            metric: "ndvi_raster".to_string(),
+            unit: "index".to_string(),
+            source_ref: source_ref.to_string(),
+            product_ref: raster_ref.to_string(),
+            product_date: product_date.to_string(),
+            finalized_at: "2026-06-12T12:00:00Z".to_string(),
+            value: SeriesValue::Raster(RasterSeriesValue {
+                raster_ref: raster_ref.to_string(),
+                crs: Some("EPSG:32610".to_string()),
+                extent: Some(default_extent()),
+                resolution: Some(RasterResolution { x: 1.0, y: 1.0 }),
+            }),
+        }
+    }
+
+    fn default_extent() -> GeoExtent {
+        GeoExtent {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 2.0,
+            max_y: 2.0,
         }
     }
 
