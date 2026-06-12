@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use shared::schemas::{
-    assert_raster_spatial_ref, GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+    assert_raster_spatial_ref, validate_field_boundary, FieldBoundary,
+    FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint, RasterResolution,
+    RasterSpatialRef, RasterSpatialRefError,
 };
 
 const WGS84: &str = "EPSG:4326";
@@ -117,19 +119,62 @@ struct RasterGeoTiffEnvelope {
     transform: [f64; 6],
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldBoundaryImportRequest {
+    pub payload: ImportPayload,
+    pub target_crs: String,
+    pub field_id: String,
+    pub farm_id: Option<String>,
+    pub org_id: String,
+    pub owner: String,
+    pub name: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldBoundaryImportReport {
+    pub field: FieldRecord,
+    pub source_filename: String,
+    pub source_crs: String,
+    pub target_crs: String,
+    pub feature_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldBoundaryRejectionReason {
+    MissingCrs,
+    TooFewCoordinates,
+    InvalidCoordinate,
+    RingNotClosed,
+    SelfIntersection,
+    EmptyArea,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InteropRejectionReason {
     ParseError,
     MissingCrs,
-    UnsupportedCrs { crs: String },
-    UnsupportedGeometry { geometry_type: String },
+    UnsupportedCrs {
+        crs: String,
+    },
+    UnsupportedGeometry {
+        geometry_type: String,
+    },
     InvalidGeometry,
     EmptyFeatureCollection,
-    LayerMissingCrs { layer_name: String },
+    LayerMissingCrs {
+        layer_name: String,
+    },
     MissingRasterTransform,
-    InvalidRasterSpatialRef { reason: String },
+    InvalidRasterSpatialRef {
+        reason: String,
+    },
     InvalidRasterCells,
+    InvalidFieldBoundary {
+        reason: FieldBoundaryRejectionReason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
@@ -317,6 +362,76 @@ pub fn reopen_raster_geotiff(bytes: &[u8]) -> Result<RasterProduct, InteropError
     Ok(product)
 }
 
+pub fn import_field_boundary(
+    request: FieldBoundaryImportRequest,
+) -> Result<FieldBoundaryImportReport, InteropError> {
+    let source_filename = normalized_filename(request.payload.filename.clone());
+    let imported = validate_and_reproject_import(
+        request.payload,
+        CrsTransform {
+            target_crs: request.target_crs,
+        },
+    )?;
+    let first_feature = imported
+        .features
+        .first()
+        .ok_or_else(|| rejected(&source_filename, InteropRejectionReason::InvalidGeometry))?;
+    let ReprojectedGeometry::Polygon { rings } = &first_feature.geometry else {
+        return Err(rejected(
+            &source_filename,
+            InteropRejectionReason::UnsupportedGeometry {
+                geometry_type: reprojected_geometry_type(&first_feature.geometry).to_string(),
+            },
+        ));
+    };
+    let exterior = rings
+        .first()
+        .ok_or_else(|| rejected(&source_filename, InteropRejectionReason::InvalidGeometry))?;
+    let boundary = FieldBoundary {
+        coordinates: exterior
+            .iter()
+            .map(|coordinate| GeoPoint {
+                longitude: coordinate.x,
+                latitude: coordinate.y,
+            })
+            .collect(),
+        crs: Some(imported.target_crs.clone()),
+    };
+    let validated = validate_field_boundary(&boundary).map_err(|reason| {
+        rejected(
+            &source_filename,
+            InteropRejectionReason::InvalidFieldBoundary {
+                reason: reason.into(),
+            },
+        )
+    })?;
+    let field = FieldRecord {
+        farm_id: request.farm_id,
+        field_id: request.field_id,
+        org_id: request.org_id,
+        owner: request.owner,
+        name: request.name,
+        area_ha: Some(validated.area_ha),
+        crop: None,
+        season: None,
+        notes: Some(format!(
+            "imported from {source_filename}; source_crs={}; target_crs={}",
+            imported.source_crs, imported.target_crs
+        )),
+        boundary: validated.boundary,
+        extent: validated.extent,
+        created_at: request.created_at,
+    };
+
+    Ok(FieldBoundaryImportReport {
+        field,
+        source_filename,
+        source_crs: imported.source_crs,
+        target_crs: imported.target_crs,
+        feature_count: imported.feature_count,
+    })
+}
+
 fn export_geojson(imported: &InteropImportResult) -> Result<Vec<u8>, InteropError> {
     let features = imported
         .features
@@ -437,6 +552,27 @@ fn raster_spatial_ref_rejection(filename: &str, error: RasterSpatialRefError) ->
                 reason: other.to_string(),
             },
         ),
+    }
+}
+
+fn reprojected_geometry_type(geometry: &ReprojectedGeometry) -> &'static str {
+    match geometry {
+        ReprojectedGeometry::Point { .. } => "Point",
+        ReprojectedGeometry::LineString { .. } => "LineString",
+        ReprojectedGeometry::Polygon { .. } => "Polygon",
+    }
+}
+
+impl From<FieldBoundaryValidationError> for FieldBoundaryRejectionReason {
+    fn from(value: FieldBoundaryValidationError) -> Self {
+        match value {
+            FieldBoundaryValidationError::MissingCrs => Self::MissingCrs,
+            FieldBoundaryValidationError::TooFewCoordinates => Self::TooFewCoordinates,
+            FieldBoundaryValidationError::InvalidCoordinate => Self::InvalidCoordinate,
+            FieldBoundaryValidationError::RingNotClosed => Self::RingNotClosed,
+            FieldBoundaryValidationError::SelfIntersection => Self::SelfIntersection,
+            FieldBoundaryValidationError::EmptyArea => Self::EmptyArea,
+        }
     }
 }
 
@@ -735,8 +871,9 @@ impl ExtentBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_raster_geotiff, reopen_raster_geotiff, round_trip_vector_layer,
-        validate_and_reproject_import, validate_geopackage_layers, CrsTransform, ImportFormat,
+        export_raster_geotiff, import_field_boundary, reopen_raster_geotiff,
+        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
+        CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason, ImportFormat,
         ImportPayload, InteropError, InteropRejectionReason, RasterProduct, ReprojectedGeometry,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
@@ -915,6 +1052,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn field_boundary_import_creates_field_record_with_area_and_source_crs() {
+        let report = import_field_boundary(FieldBoundaryImportRequest {
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: "field-alpha-boundary.geojson".to_string(),
+                bytes: valid_geojson("EPSG:4326").as_bytes().to_vec(),
+            },
+            target_crs: "EPSG:4326".to_string(),
+            field_id: "field-alpha".to_string(),
+            farm_id: Some("farm-alpha".to_string()),
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            name: "North Block".to_string(),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        })
+        .expect("valid boundary should import");
+
+        assert_eq!(report.source_filename, "field-alpha-boundary.geojson");
+        assert_eq!(report.source_crs, "EPSG:4326");
+        assert_eq!(report.target_crs, "EPSG:4326");
+        assert_eq!(report.feature_count, 1);
+        assert_eq!(report.field.field_id, "field-alpha");
+        assert_eq!(report.field.farm_id.as_deref(), Some("farm-alpha"));
+        assert_eq!(report.field.org_id, "org-alpha");
+        assert_eq!(report.field.owner, "owner-alpha");
+        assert_eq!(report.field.name, "North Block");
+        assert_eq!(report.field.boundary.crs.as_deref(), Some("EPSG:4326"));
+        assert_eq!(
+            report.field.boundary.coordinates.first(),
+            report.field.boundary.coordinates.last()
+        );
+        assert!(report.field.area_ha.expect("area should be set") > 0.0);
+        assert_eq!(report.field.extent.min_lon, -121.0);
+        assert_eq!(report.field.extent.max_lon, -120.99);
+    }
+
+    #[test]
+    fn field_boundary_import_rejects_self_intersecting_ring() {
+        let error = import_field_boundary(FieldBoundaryImportRequest {
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: "bowtie-boundary.geojson".to_string(),
+                bytes: bowtie_geojson("EPSG:4326").as_bytes().to_vec(),
+            },
+            target_crs: "EPSG:4326".to_string(),
+            field_id: "field-bowtie".to_string(),
+            farm_id: None,
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            name: "Invalid Bowtie".to_string(),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        })
+        .expect_err("self-intersecting boundary should be rejected");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "bowtie-boundary.geojson".to_string(),
+                reason: InteropRejectionReason::InvalidFieldBoundary {
+                    reason: FieldBoundaryRejectionReason::SelfIntersection
+                }
+            }
+        );
+    }
+
     fn valid_geojson(crs: &str) -> String {
         format!(
             r#"{{
@@ -932,6 +1135,32 @@ mod tests {
                             [-121.0000, 39.0000],
                             [-120.9900, 39.0000],
                             [-120.9900, 39.0100],
+                            [-121.0000, 39.0100],
+                            [-121.0000, 39.0000]
+                        ]]
+                    }}
+                }}]
+            }}"#
+        )
+    }
+
+    fn bowtie_geojson(crs: &str) -> String {
+        format!(
+            r#"{{
+                "type": "FeatureCollection",
+                "crs": {{
+                    "type": "name",
+                    "properties": {{ "name": "{crs}" }}
+                }},
+                "features": [{{
+                    "type": "Feature",
+                    "properties": {{ "zone": "invalid" }},
+                    "geometry": {{
+                        "type": "Polygon",
+                        "coordinates": [[
+                            [-121.0000, 39.0000],
+                            [-120.9900, 39.0100],
+                            [-120.9900, 39.0000],
                             [-121.0000, 39.0100],
                             [-121.0000, 39.0000]
                         ]]
