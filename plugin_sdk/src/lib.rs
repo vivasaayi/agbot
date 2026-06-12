@@ -134,6 +134,21 @@ pub struct SandboxExecutionOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostApiVersionRange {
+    pub supported_min: String,
+    pub supported_max: String,
+}
+
+impl Default for HostApiVersionRange {
+    fn default() -> Self {
+        Self {
+            supported_min: "2026.1".to_string(),
+            supported_max: "2026.1".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestViolation {
     pub field: ManifestField,
     pub reason: ManifestRejectionReason,
@@ -146,15 +161,55 @@ pub enum PluginRegistrationError {
     InvalidManifest { violations: Vec<ManifestViolation> },
     #[error("plugin already registered: {plugin_id}")]
     DuplicatePluginId { plugin_id: String },
+    #[error(
+        "plugin {plugin_id} host_api_version {host_api_version} is outside supported range {supported_min}..={supported_max}"
+    )]
+    UnsupportedHostApiVersion {
+        plugin_id: String,
+        host_api_version: String,
+        supported_min: String,
+        supported_max: String,
+    },
+    #[error("invalid host_api_version {host_api_version}")]
+    InvalidHostApiVersion { host_api_version: String },
+    #[error("invalid host api version range {supported_min}..={supported_max}")]
+    InvalidHostApiVersionRange {
+        supported_min: String,
+        supported_max: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PluginHost {
     registrations: BTreeMap<String, PluginRegistrationRecord>,
     capability_audit: Vec<CapabilityAuditEntry>,
+    host_api_versions: HostApiVersionRange,
 }
 
 impl PluginHost {
+    pub fn with_supported_host_api_range(
+        supported_min: &str,
+        supported_max: &str,
+    ) -> Result<Self, PluginRegistrationError> {
+        let host_api_versions = HostApiVersionRange {
+            supported_min: normalize_optional_text(supported_min.to_string()).ok_or_else(|| {
+                PluginRegistrationError::InvalidHostApiVersion {
+                    host_api_version: supported_min.to_string(),
+                }
+            })?,
+            supported_max: normalize_optional_text(supported_max.to_string()).ok_or_else(|| {
+                PluginRegistrationError::InvalidHostApiVersion {
+                    host_api_version: supported_max.to_string(),
+                }
+            })?,
+        };
+        validate_host_api_range(&host_api_versions)?;
+        Ok(Self {
+            host_api_versions,
+            ..Self::default()
+        })
+    }
+
     pub fn list_extension_points(&self) -> Vec<ExtensionPointContract> {
         extension_point_taxonomy()
     }
@@ -164,6 +219,7 @@ impl PluginHost {
         manifest: RawPluginManifest,
     ) -> Result<PluginRegistrationRecord, PluginRegistrationError> {
         let manifest = validate_manifest(manifest)?;
+        enforce_host_api_compatibility(&manifest, &self.host_api_versions)?;
         if self.registrations.contains_key(&manifest.plugin_id) {
             return Err(PluginRegistrationError::DuplicatePluginId {
                 plugin_id: manifest.plugin_id,
@@ -434,6 +490,69 @@ fn capability_violation_reason(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ParsedHostApiVersion {
+    major: u32,
+    minor: u32,
+}
+
+fn enforce_host_api_compatibility(
+    manifest: &PluginManifest,
+    range: &HostApiVersionRange,
+) -> Result<(), PluginRegistrationError> {
+    validate_host_api_range(range)?;
+    let plugin_version = parse_host_api_version(&manifest.host_api_version)?;
+    let min_version = parse_host_api_version(&range.supported_min)?;
+    let max_version = parse_host_api_version(&range.supported_max)?;
+    if plugin_version < min_version || plugin_version > max_version {
+        return Err(PluginRegistrationError::UnsupportedHostApiVersion {
+            plugin_id: manifest.plugin_id.clone(),
+            host_api_version: manifest.host_api_version.clone(),
+            supported_min: range.supported_min.clone(),
+            supported_max: range.supported_max.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_host_api_range(range: &HostApiVersionRange) -> Result<(), PluginRegistrationError> {
+    let min_version = parse_host_api_version(&range.supported_min)?;
+    let max_version = parse_host_api_version(&range.supported_max)?;
+    if min_version > max_version {
+        return Err(PluginRegistrationError::InvalidHostApiVersionRange {
+            supported_min: range.supported_min.clone(),
+            supported_max: range.supported_max.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn parse_host_api_version(value: &str) -> Result<ParsedHostApiVersion, PluginRegistrationError> {
+    let normalized = normalize_optional_text(value.to_string()).ok_or_else(|| {
+        PluginRegistrationError::InvalidHostApiVersion {
+            host_api_version: value.to_string(),
+        }
+    })?;
+    let Some((major, minor)) = normalized.split_once('.') else {
+        return Err(PluginRegistrationError::InvalidHostApiVersion {
+            host_api_version: normalized,
+        });
+    };
+    let Ok(major) = major.parse::<u32>() else {
+        return Err(PluginRegistrationError::InvalidHostApiVersion {
+            host_api_version: normalized,
+        });
+    };
+    let Ok(minor) = minor.parse::<u32>() else {
+        return Err(PluginRegistrationError::InvalidHostApiVersion {
+            host_api_version: normalized,
+        });
+    };
+    Ok(ParsedHostApiVersion { major, minor })
+}
+
 fn normalize_optional_text(value: String) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -673,6 +792,44 @@ mod tests {
             Some(CapabilityViolationReason::UndeclaredCapability)
         );
         assert_eq!(outcome.result, None);
+    }
+
+    #[test]
+    fn compatible_host_api_version_registers_within_supported_range() {
+        let mut host = PluginHost::with_supported_host_api_range("2026.1", "2026.3")
+            .expect("range should be valid");
+        let mut manifest = read_scene_manifest();
+        manifest.host_api_version = "2026.3".to_string();
+
+        let record = host
+            .register_plugin(manifest)
+            .expect("compatible plugin should register");
+
+        assert_eq!(record.host_api_version, "2026.3");
+        assert_eq!(host.list_plugins().len(), 1);
+    }
+
+    #[test]
+    fn unsupported_host_api_version_is_refused_before_registration() {
+        let mut host = PluginHost::with_supported_host_api_range("2026.1", "2026.3")
+            .expect("range should be valid");
+        let mut manifest = read_scene_manifest();
+        manifest.host_api_version = "2025.9".to_string();
+
+        let error = host
+            .register_plugin(manifest)
+            .expect_err("unsupported host api version should be refused");
+
+        assert_eq!(
+            error,
+            PluginRegistrationError::UnsupportedHostApiVersion {
+                plugin_id: "plugin.scene_reader".to_string(),
+                host_api_version: "2025.9".to_string(),
+                supported_min: "2026.1".to_string(),
+                supported_max: "2026.3".to_string(),
+            }
+        );
+        assert!(host.list_plugins().is_empty());
     }
 
     fn custom_index_manifest() -> RawPluginManifest {
