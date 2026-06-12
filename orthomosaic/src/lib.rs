@@ -426,6 +426,43 @@ pub struct DsmRaster {
     pub extent_round_trips: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ReprojectionReportConfig {
+    pub max_overall_rms_error_px: f64,
+    pub max_camera_error_px: f64,
+    pub max_point_error_px: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CameraReprojectionErrorRecord {
+    pub frame_id: String,
+    pub reprojection_error_px: f64,
+    pub threshold_px: f64,
+    pub passes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PointReprojectionErrorRecord {
+    pub point_id: String,
+    pub reprojection_error_px: f64,
+    pub threshold_px: f64,
+    pub observations: usize,
+    pub passes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReprojectionErrorReport {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub cameras: Vec<CameraReprojectionErrorRecord>,
+    pub points: Vec<PointReprojectionErrorRecord>,
+    pub overall_rms_error_px: f64,
+    pub max_overall_rms_error_px: f64,
+    pub passes: bool,
+    pub failing_camera_ids: Vec<String>,
+    pub failing_point_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FeatureMatchingError {
     #[error("frame set must include at least one frame")]
@@ -503,6 +540,20 @@ pub enum OrthomosaicError {
     MissingQaFrame { frame_id: String },
     #[error("georeferencing-error: {reason}")]
     GeoreferencingError { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ReprojectionReportError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("reprojection report config field {field} must be finite and non-negative")]
+    InvalidConfig { field: &'static str },
+    #[error("sparse SfM report has no camera estimates")]
+    EmptyCameras,
+    #[error("sparse SfM report has no sparse points")]
+    EmptyPoints,
+    #[error("sparse SfM report contains a non-finite reprojection error")]
+    NonFiniteResidual,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1095,6 +1146,95 @@ pub fn generate_dsm(
     })
 }
 
+pub fn build_reprojection_error_report(
+    sfm_report: &SparseSfmReport,
+    config: ReprojectionReportConfig,
+    generated_at: String,
+) -> Result<ReprojectionErrorReport, ReprojectionReportError> {
+    validate_reprojection_report_config(config)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(ReprojectionReportError::EmptyGeneratedAt)?;
+    if sfm_report.cameras.is_empty() {
+        return Err(ReprojectionReportError::EmptyCameras);
+    }
+    if sfm_report.sparse_points.is_empty() {
+        return Err(ReprojectionReportError::EmptyPoints);
+    }
+    if sfm_report
+        .cameras
+        .iter()
+        .any(|camera| !camera.reprojection_error_px.is_finite())
+        || sfm_report
+            .sparse_points
+            .iter()
+            .any(|point| !point.reprojection_error_px.is_finite())
+    {
+        return Err(ReprojectionReportError::NonFiniteResidual);
+    }
+
+    let mut cameras = sfm_report
+        .cameras
+        .iter()
+        .map(|camera| CameraReprojectionErrorRecord {
+            frame_id: camera.frame_id.clone(),
+            reprojection_error_px: camera.reprojection_error_px,
+            threshold_px: config.max_camera_error_px,
+            passes: camera.reprojection_error_px <= config.max_camera_error_px,
+        })
+        .collect::<Vec<_>>();
+    cameras.sort_by(|left, right| left.frame_id.cmp(&right.frame_id));
+
+    let mut points = sfm_report
+        .sparse_points
+        .iter()
+        .map(|point| PointReprojectionErrorRecord {
+            point_id: point.point_id.clone(),
+            reprojection_error_px: point.reprojection_error_px,
+            threshold_px: config.max_point_error_px,
+            observations: point.observations,
+            passes: point.reprojection_error_px <= config.max_point_error_px,
+        })
+        .collect::<Vec<_>>();
+    points.sort_by(|left, right| left.point_id.cmp(&right.point_id));
+
+    let residual_sum = cameras
+        .iter()
+        .map(|camera| camera.reprojection_error_px.powi(2))
+        .chain(
+            points
+                .iter()
+                .map(|point| point.reprojection_error_px.powi(2)),
+        )
+        .sum::<f64>();
+    let residual_count = cameras.len() + points.len();
+    let overall_rms_error_px = (residual_sum / residual_count as f64).sqrt();
+    let failing_camera_ids = cameras
+        .iter()
+        .filter(|camera| !camera.passes)
+        .map(|camera| camera.frame_id.clone())
+        .collect::<Vec<_>>();
+    let failing_point_ids = points
+        .iter()
+        .filter(|point| !point.passes)
+        .map(|point| point.point_id.clone())
+        .collect::<Vec<_>>();
+    let passes = overall_rms_error_px <= config.max_overall_rms_error_px
+        && failing_camera_ids.is_empty()
+        && failing_point_ids.is_empty();
+
+    Ok(ReprojectionErrorReport {
+        frame_set_id: sfm_report.frame_set_id.clone(),
+        generated_at,
+        cameras,
+        points,
+        overall_rms_error_px,
+        max_overall_rms_error_px: config.max_overall_rms_error_px,
+        passes,
+        failing_camera_ids,
+        failing_point_ids,
+    })
+}
+
 impl FrameQaRecord {
     fn rect(&self) -> Rect {
         Rect {
@@ -1377,6 +1517,21 @@ fn validate_dsm_config(config: &DsmConfig) -> Result<(), DsmError> {
     }
     if config.max_x_m <= config.min_x_m || config.max_y_m <= config.min_y_m {
         return Err(DsmError::InvalidExtent);
+    }
+    Ok(())
+}
+
+fn validate_reprojection_report_config(
+    config: ReprojectionReportConfig,
+) -> Result<(), ReprojectionReportError> {
+    for (field, value) in [
+        ("max_overall_rms_error_px", config.max_overall_rms_error_px),
+        ("max_camera_error_px", config.max_camera_error_px),
+        ("max_point_error_px", config.max_point_error_px),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(ReprojectionReportError::InvalidConfig { field });
+        }
     }
     Ok(())
 }
@@ -1775,13 +1930,14 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_frame_set_record, build_reconstruction_job, generate_dsm, run_feature_matching,
-        run_frame_set_qa, run_orthorectified_mosaic, run_sparse_sfm,
-        transition_reconstruction_status, CameraExif, CameraImuPose, DensePoint, DensePointCloud,
-        DsmConfig, FeatureMatchingConfig, FieldCoverageExtent, FrameIngestRequest,
+        build_frame_set_record, build_reconstruction_job, build_reprojection_error_report,
+        generate_dsm, run_feature_matching, run_frame_set_qa, run_orthorectified_mosaic,
+        run_sparse_sfm, transition_reconstruction_status, CameraExif, CameraImuPose, DensePoint,
+        DensePointCloud, DsmConfig, FeatureMatchingConfig, FieldCoverageExtent, FrameIngestRequest,
         FrameQaReasonCode, FrameSetIngestError, FrameSetIngestRequest, FrameSetQaConfig,
         OrthomosaicConfig, OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest,
-        ReconstructionStatus, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
+        ReconstructionStatus, ReprojectionReportConfig, SparseSfmConfig, SparseSfmError,
+        SparseSfmFailureReason,
     };
     use shared::schemas::assert_raster_spatial_ref;
     use shared::schemas::GpsCoords;
@@ -2274,6 +2430,47 @@ mod tests {
         assert_eq!(dsm.elevation_m[2], dsm_config().nodata_value);
     }
 
+    #[test]
+    fn reprojection_report_passes_known_residual_scene() {
+        let (_, _, sfm) = solved_sfm_fixture();
+
+        let report = build_reprojection_error_report(
+            &sfm,
+            reprojection_config(),
+            "2026-06-01T12:06:00Z".to_string(),
+        )
+        .expect("reprojection report should build");
+
+        assert_eq!(report.frame_set_id, "frame-set-qa");
+        assert_eq!(report.cameras.len(), 2);
+        assert_eq!(report.points.len(), sfm.sparse_points.len());
+        assert!(report.passes);
+        assert_close(report.overall_rms_error_px, 0.0);
+        assert!(report.cameras.iter().all(|camera| camera.passes));
+        assert!(report.points.iter().all(|point| point.passes));
+    }
+
+    #[test]
+    fn reprojection_report_flags_over_threshold_reconstruction() {
+        let (_, _, mut sfm) = solved_sfm_fixture();
+        sfm.cameras[0].reprojection_error_px = 3.0;
+
+        let report = build_reprojection_error_report(
+            &sfm,
+            reprojection_config(),
+            "2026-06-01T12:06:00Z".to_string(),
+        )
+        .expect("reprojection report should build");
+
+        assert!(!report.passes);
+        assert!(report.overall_rms_error_px > reprojection_config().max_overall_rms_error_px);
+        assert_eq!(
+            report.failing_camera_ids,
+            vec![sfm.cameras[0].frame_id.clone()]
+        );
+        assert!(report.failing_point_ids.is_empty());
+    }
+
     fn qa_frame_set(frames: Vec<FrameIngestRequest>) -> super::FrameSetRecord {
         build_frame_set_record(
             FrameSetIngestRequest {
@@ -2427,6 +2624,14 @@ mod tests {
             max_x_m: 20.0,
             max_y_m: 20.0,
             nodata_value: -9999.0,
+        }
+    }
+
+    fn reprojection_config() -> ReprojectionReportConfig {
+        ReprojectionReportConfig {
+            max_overall_rms_error_px: 0.5,
+            max_camera_error_px: 0.5,
+            max_point_error_px: 0.5,
         }
     }
 
