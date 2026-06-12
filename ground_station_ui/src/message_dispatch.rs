@@ -1,3 +1,4 @@
+use crate::{FlightPathSample, MapRenderState, DEFAULT_FLIGHT_PATH_LIMIT};
 use serde::Serialize;
 use shared::schemas::{Telemetry, WebSocketMessage};
 use std::sync::Arc;
@@ -121,10 +122,13 @@ pub struct MessageDispatchState {
     pub captured_image_ids: Vec<Uuid>,
     pub ndvi_means: Vec<f32>,
     pub capture_events: Vec<CaptureEvent>,
+    pub flight_path: Vec<FlightPathSample>,
     pub system_statuses: Vec<SystemStatusSnapshot>,
     pub malformed_frames: u64,
     #[serde(skip)]
     capture_event_limit: usize,
+    #[serde(skip)]
+    flight_path_limit: usize,
 }
 
 pub type SharedMessageDispatchState = Arc<RwLock<MessageDispatchState>>;
@@ -147,9 +151,11 @@ impl MessageDispatchState {
             captured_image_ids: Vec::new(),
             ndvi_means: Vec::new(),
             capture_events: Vec::new(),
+            flight_path: Vec::new(),
             system_statuses: Vec::new(),
             malformed_frames: 0,
             capture_event_limit: capture_event_limit.max(1),
+            flight_path_limit: DEFAULT_FLIGHT_PATH_LIMIT,
         }
     }
 
@@ -177,6 +183,7 @@ impl MessageDispatchState {
                 self.latest_telemetry_battery_percentage = Some(data.battery_percentage);
                 self.latest_telemetry = Some(TelemetryTileValues::from(data));
                 self.latest_telemetry_updated_at = Some(received_at);
+                self.append_flight_path_sample(FlightPathSample::from_telemetry(data));
                 MessageRoute::Telemetry
             }
             WebSocketMessage::MissionStatus { mission_id, status } => {
@@ -291,6 +298,10 @@ impl MessageDispatchState {
             .collect()
     }
 
+    pub fn map_render_state(&self) -> MapRenderState {
+        MapRenderState::from_flight_path(&self.flight_path)
+    }
+
     fn append_capture_event(&mut self, event: CaptureEvent) {
         self.capture_events.push(event);
         self.capture_events.sort_by(|left, right| {
@@ -301,6 +312,13 @@ impl MessageDispatchState {
         });
         while self.capture_events.len() > self.capture_event_limit {
             self.capture_events.remove(0);
+        }
+    }
+
+    fn append_flight_path_sample(&mut self, sample: FlightPathSample) {
+        self.flight_path.push(sample);
+        while self.flight_path.len() > self.flight_path_limit {
+            self.flight_path.remove(0);
         }
     }
 }
@@ -345,6 +363,10 @@ pub fn shared_message_dispatch_state() -> SharedMessageDispatchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        assert_overlay_matches_basemap, BasemapLayer, FlightPathSample, MapOverlayLayer,
+        MapRenderError, MapRenderState, WEB_MERCATOR_CRS, WGS84_CRS,
+    };
     use shared::schemas::{
         GpsCoords, ImageMetadata, LidarPoint, LidarScan, MultispectralImage, NdviResult, Telemetry,
         WebSocketMessage,
@@ -504,6 +526,68 @@ mod tests {
 
         assert_eq!(freshness.state, TelemetryFreshnessState::Stale);
         assert_eq!(freshness.last_update_age_seconds, Some(6));
+    }
+
+    #[test]
+    fn telemetry_updates_accumulate_map_path_and_project_latest_position() {
+        let mut state = MessageDispatchState::default();
+        let mut first = sample_telemetry("AUTO", 88);
+        first.position.latitude = 42.0000;
+        first.position.longitude = -71.0000;
+        let mut second = sample_telemetry("AUTO", 87);
+        second.timestamp = timestamp_at("2026-01-01T00:00:05Z");
+        second.position.latitude = 42.0005;
+        second.position.longitude = -71.0007;
+
+        state.dispatch_message(&WebSocketMessage::Telemetry { data: first });
+        state.dispatch_message(&WebSocketMessage::Telemetry { data: second });
+
+        let map_state = state.map_render_state();
+        assert_eq!(map_state.basemap.crs, WEB_MERCATOR_CRS);
+        assert_eq!(map_state.flight_path.len(), 2);
+        let marker = map_state
+            .current_position
+            .expect("latest telemetry should produce a drone marker");
+        assert_eq!(marker.latitude, 42.0005);
+        assert_eq!(marker.longitude, -71.0007);
+        assert!(marker.x_px >= 0.0 && marker.x_px <= map_state.basemap.width_px as f64);
+        assert!(marker.y_px >= 0.0 && marker.y_px <= map_state.basemap.height_px as f64);
+    }
+
+    #[test]
+    fn telemetry_coordinate_projects_to_map_canvas() {
+        let sample = FlightPathSample::from_telemetry(&sample_telemetry("GUIDED", 72));
+        let map_state = MapRenderState::from_flight_path(&[sample]);
+        let point = map_state
+            .flight_path
+            .first()
+            .expect("single telemetry sample should produce one path point");
+
+        assert_eq!(point.source_crs, WGS84_CRS);
+        assert_eq!(point.map_crs, WEB_MERCATOR_CRS);
+        assert!(point.x_m.is_finite());
+        assert!(point.y_m.is_finite());
+        assert!(point.x_px >= 0.0 && point.x_px <= map_state.basemap.width_px as f64);
+        assert!(point.y_px >= 0.0 && point.y_px <= map_state.basemap.height_px as f64);
+    }
+
+    #[test]
+    fn wrong_crs_overlay_is_refused_before_rendering() {
+        let basemap = BasemapLayer::default();
+        let overlay = MapOverlayLayer::new("ndvi-overlay", WGS84_CRS, basemap.extent.clone());
+
+        let error = assert_overlay_matches_basemap(&basemap, &overlay).unwrap_err();
+
+        assert!(matches!(
+            error,
+            MapRenderError::CrsMismatch {
+                overlay_id,
+                basemap_crs,
+                overlay_crs
+            } if overlay_id == "ndvi-overlay"
+                && basemap_crs == WEB_MERCATOR_CRS
+                && overlay_crs == WGS84_CRS
+        ));
     }
 
     #[test]

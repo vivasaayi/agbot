@@ -10,6 +10,7 @@ use tracing::{error, info};
 
 pub mod cli_interface;
 pub mod link_client;
+pub mod map_state;
 pub mod message_dispatch;
 pub mod web_server;
 
@@ -17,6 +18,11 @@ pub use link_client::{
     run_websocket_client_until, run_websocket_client_with_dispatch_until,
     run_websocket_client_with_handler_until, shared_link_state, ConnectionState, LinkStateMachine,
     LinkStateSnapshot, ReconnectPolicy, SharedLinkState,
+};
+pub use map_state::{
+    assert_overlay_matches_basemap, project_wgs84_to_web_mercator, BasemapLayer, FlightPathSample,
+    MapOverlayLayer, MapPathPoint, MapRenderError, MapRenderState, OverlayAssertion,
+    ProjectedExtent, ProjectedPoint, DEFAULT_FLIGHT_PATH_LIMIT, WEB_MERCATOR_CRS, WGS84_CRS,
 };
 pub use message_dispatch::{
     shared_message_dispatch_state, CaptureEvent, CaptureEventKind, DispatchError,

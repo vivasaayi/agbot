@@ -1,5 +1,5 @@
 use crate::{
-    CaptureEvent, LinkStateSnapshot, SharedLinkState, SharedMessageDispatchState,
+    CaptureEvent, LinkStateSnapshot, MapRenderState, SharedLinkState, SharedMessageDispatchState,
     TelemetryFreshnessSnapshot, TelemetryTileSnapshot,
 };
 use axum::{extract::State, response::Html, Json};
@@ -50,6 +50,7 @@ impl WebServer {
             .route("/", get(dashboard_page))
             .route("/api/link-state", get(link_state))
             .route("/api/dispatch-state", get(dispatch_state))
+            .route("/api/map-state", get(map_state))
             .route("/telemetry", get(telemetry_page))
             .route("/maps", get(maps_page))
             .nest_service("/static", ServeDir::new("static"))
@@ -80,6 +81,10 @@ async fn dispatch_state(State(state): State<WebServerState>) -> Json<DispatchSta
         telemetry_freshness: dispatch.telemetry_freshness(),
         capture_events: dispatch.capture_events(None),
     })
+}
+
+async fn map_state(State(state): State<WebServerState>) -> Json<MapRenderState> {
+    Json(state.dispatch_state.read().await.map_render_state())
 }
 
 async fn dashboard_page() -> Html<&'static str> {
@@ -427,19 +432,27 @@ async fn maps_page() -> Html<&'static str> {
 <head>
     <title>Maps - AgroDrone</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; color: #17202a; }
         .container { max-width: 1200px; margin: 0 auto; }
         .header { background: #2c3e50; color: white; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
         .panel { background: white; padding: 20px; border-radius: 5px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         .nav { margin-bottom: 20px; }
         .nav a { margin-right: 20px; text-decoration: none; color: #3498db; }
-        .map-placeholder { height: 400px; background: #ecf0f1; border: 2px dashed #bdc3c7; display: flex; align-items: center; justify-content: center; }
+        .map-toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+        .badge { background: #edf2f7; border: 1px solid #d5dde6; border-radius: 4px; padding: 6px 10px; font-size: 14px; }
+        .badge.ok { background: #e8f6ef; border-color: #a9dfbf; color: #145a32; }
+        .badge.error { background: #fdecea; border-color: #f5b7b1; color: #922b21; }
+        .map-frame { border: 1px solid #b8c2cc; background: #dfe7ef; overflow: hidden; }
+        #operation-map { width: 100%; height: auto; display: block; background: #eef3f7; }
+        .map-readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-top: 12px; }
+        .readout-item { background: #f8fafc; border: 1px solid #e1e7ef; border-radius: 4px; padding: 8px; }
+        .readout-item strong { display: block; font-size: 12px; color: #536271; margin-bottom: 4px; text-transform: uppercase; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🗺️ Maps & Visualization</h1>
+            <h1>Maps & Visualization</h1>
         </div>
         
         <div class="nav">
@@ -449,26 +462,162 @@ async fn maps_page() -> Html<&'static str> {
         </div>
 
         <div class="panel">
-            <h2>NDVI Map</h2>
-            <div class="map-placeholder">
-                <p>NDVI visualization will appear here when images are processed</p>
+            <div class="map-toolbar">
+                <span id="map-status" class="badge">Loading</span>
+                <span id="map-crs" class="badge">CRS</span>
+                <span id="map-path-count" class="badge">Path: 0</span>
+                <span id="map-overlay-state" class="badge">Overlay</span>
             </div>
-        </div>
-
-        <div class="panel">
-            <h2>LiDAR Point Cloud</h2>
-            <div class="map-placeholder">
-                <p>LiDAR scan visualization will appear here</p>
+            <div class="map-frame">
+                <canvas id="operation-map" width="900" height="520"></canvas>
             </div>
-        </div>
-
-        <div class="panel">
-            <h2>Flight Path</h2>
-            <div class="map-placeholder">
-                <p>Flight path and telemetry overlay will appear here</p>
+            <div class="map-readout">
+                <div class="readout-item">
+                    <strong>Position</strong>
+                    <span id="position-readout">No data</span>
+                </div>
+                <div class="readout-item">
+                    <strong>Altitude</strong>
+                    <span id="altitude-readout">No data</span>
+                </div>
+                <div class="readout-item">
+                    <strong>Updated</strong>
+                    <span id="timestamp-readout">No data</span>
+                </div>
             </div>
         </div>
     </div>
+    <script>
+        const canvas = document.getElementById('operation-map');
+        const ctx = canvas.getContext('2d');
+
+        function drawGrid(state) {
+            const width = state.basemap.width_px;
+            const height = state.basemap.height_px;
+            canvas.width = width;
+            canvas.height = height;
+
+            ctx.fillStyle = '#eef3f7';
+            ctx.fillRect(0, 0, width, height);
+
+            ctx.strokeStyle = '#c9d6e2';
+            ctx.lineWidth = 1;
+            const gridCount = 8;
+            for (let i = 0; i <= gridCount; i++) {
+                const x = (width / gridCount) * i;
+                const y = (height / gridCount) * i;
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, height);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            ctx.strokeStyle = '#6b7c8f';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(0, 0, width, height);
+        }
+
+        function drawPath(path) {
+            if (!path || path.length === 0) {
+                return;
+            }
+
+            ctx.strokeStyle = '#1f7a8c';
+            ctx.lineWidth = 3;
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            path.forEach((point, index) => {
+                if (index === 0) {
+                    ctx.moveTo(point.x_px, point.y_px);
+                } else {
+                    ctx.lineTo(point.x_px, point.y_px);
+                }
+            });
+            ctx.stroke();
+        }
+
+        function drawMarker(marker) {
+            if (!marker) {
+                return;
+            }
+
+            ctx.fillStyle = '#e74c3c';
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(marker.x_px, marker.y_px, 8, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.strokeStyle = '#2c3e50';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(marker.x_px, marker.y_px - 16);
+            ctx.lineTo(marker.x_px + 7, marker.y_px);
+            ctx.lineTo(marker.x_px, marker.y_px + 16);
+            ctx.stroke();
+        }
+
+        function updateReadout(state) {
+            document.getElementById('map-crs').textContent = state.basemap.crs;
+            document.getElementById('map-path-count').textContent = `Path: ${state.flight_path.length}`;
+            const assertion = (state.overlay_assertions || [])[0];
+            const overlayBadge = document.getElementById('map-overlay-state');
+            overlayBadge.textContent = assertion && assertion.accepted ? 'Overlay aligned' : 'Overlay refused';
+            overlayBadge.className = assertion && assertion.accepted ? 'badge ok' : 'badge error';
+
+            const marker = state.current_position;
+            if (!marker) {
+                document.getElementById('map-status').textContent = 'No telemetry';
+                document.getElementById('map-status').className = 'badge';
+                document.getElementById('position-readout').textContent = 'No data';
+                document.getElementById('altitude-readout').textContent = 'No data';
+                document.getElementById('timestamp-readout').textContent = 'No data';
+                return;
+            }
+
+            document.getElementById('map-status').textContent = 'Live telemetry';
+            document.getElementById('map-status').className = 'badge ok';
+            document.getElementById('position-readout').textContent =
+                `${marker.latitude.toFixed(6)}, ${marker.longitude.toFixed(6)}`;
+            document.getElementById('altitude-readout').textContent =
+                `${marker.altitude_m.toFixed(1)} m`;
+            document.getElementById('timestamp-readout').textContent =
+                new Date(marker.timestamp).toLocaleTimeString();
+        }
+
+        function renderMap(state) {
+            drawGrid(state);
+            drawPath(state.flight_path || []);
+            drawMarker(state.current_position);
+            updateReadout(state);
+        }
+
+        async function refreshMapState() {
+            try {
+                const response = await fetch('/api/map-state');
+                const state = await response.json();
+                renderMap(state);
+            } catch (error) {
+                drawGrid({
+                    basemap: { width_px: 900, height_px: 520, crs: 'EPSG:3857' },
+                    flight_path: [],
+                    current_position: null,
+                    overlay_assertions: []
+                });
+                document.getElementById('map-status').textContent = 'Map unavailable';
+                document.getElementById('map-status').className = 'badge error';
+            }
+        }
+
+        refreshMapState();
+        setInterval(refreshMapState, 1000);
+    </script>
 </body>
 </html>
     "#,
