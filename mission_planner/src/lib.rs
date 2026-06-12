@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 pub mod abort_recovery;
 pub mod api;
+pub mod automated_failsafe;
 pub mod database;
 pub mod dispatch_safety;
 pub mod flight_path;
@@ -26,6 +27,11 @@ pub use abort_recovery::{
     AbortRecoveryError, AbortRecoveryPlan, AbortTrigger,
 };
 pub use api::MissionApi;
+pub use automated_failsafe::{
+    assert_failsafe_ready_for_arming, evaluate_automated_failsafe, AutomatedFailsafeAuditEvent,
+    AutomatedFailsafeAuditEventKind, AutomatedFailsafeConfig, AutomatedFailsafeError,
+    AutomatedFailsafeEvaluation, AutomatedFailsafeState, AutomatedFailsafeTrigger,
+};
 pub use database::{DatabaseService, MissionStats};
 pub use dispatch_safety::{
     evaluate_dispatch_safety, DispatchSafetyConfig, DispatchSafetyError, DispatchSafetyReport,
