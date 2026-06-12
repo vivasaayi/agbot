@@ -104,6 +104,36 @@ pub struct FieldSeasonHistory {
     pub crop_plans: Vec<CropPlanRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneRecord {
+    pub scene_id: String,
+    pub field_id: String,
+    pub season_id: String,
+    pub org_id: String,
+    pub captured_at: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneLayerRecord {
+    pub layer_id: String,
+    pub scene_id: String,
+    pub product_type: String,
+    #[serde(default)]
+    pub crs: String,
+    #[serde(default)]
+    pub extent: Option<GeoBounds>,
+    #[serde(default)]
+    pub resolution: Option<RasterResolution>,
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldSceneCatalogEntry {
+    pub scene: SceneRecord,
+    pub layers: Vec<SceneLayerRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FarmFieldError {
     #[error("farm_id cannot be empty")]
@@ -120,6 +150,18 @@ pub enum FarmFieldError {
     EmptyCropPlanId,
     #[error("crop cannot be empty")]
     EmptyCrop,
+    #[error("scene_id cannot be empty")]
+    EmptySceneId,
+    #[error("layer_id cannot be empty")]
+    EmptyLayerId,
+    #[error("product_type cannot be empty")]
+    EmptyProductType,
+    #[error("captured_at cannot be empty")]
+    EmptyCapturedAt,
+    #[error("source cannot be empty")]
+    EmptySource,
+    #[error("uri cannot be empty")]
+    EmptyUri,
     #[error("field requires a farm_id: {field_id}")]
     MissingFarmId { field_id: String },
     #[error("farm not found: {farm_id}")]
@@ -128,6 +170,14 @@ pub enum FarmFieldError {
     FieldNotFound { field_id: String },
     #[error("season not found: {season_id}")]
     SeasonNotFound { season_id: String },
+    #[error("scene not found: {scene_id}")]
+    SceneNotFound { scene_id: String },
+    #[error("season {season_id} does not belong to field {field_id} in org {org_id}")]
+    SeasonFieldMismatch {
+        season_id: String,
+        field_id: String,
+        org_id: String,
+    },
     #[error("farm {farm_id} belongs to {farm_org_id}, not {field_org_id}")]
     TenantBoundary {
         farm_id: String,
@@ -148,6 +198,11 @@ pub enum FarmFieldError {
         season_id: String,
         overlapping_season_id: String,
     },
+    #[error("layer {layer_id} metadata is invalid: {reason}")]
+    LayerMetadataInvalid {
+        layer_id: String,
+        reason: SceneLayerMetadataError,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -166,6 +221,20 @@ pub enum FieldBoundaryValidationError {
     EmptyArea,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SceneLayerMetadataError {
+    #[error("missing CRS")]
+    MissingCrs,
+    #[error("missing extent")]
+    MissingExtent,
+    #[error("invalid extent")]
+    InvalidExtent,
+    #[error("missing resolution")]
+    MissingResolution,
+    #[error("resolution must be positive")]
+    NonPositiveResolution,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FarmFieldRegistry {
     farms: HashMap<String, FarmRecord>,
@@ -174,6 +243,10 @@ pub struct FarmFieldRegistry {
     seasons: HashMap<String, SeasonRecord>,
     #[serde(default)]
     crop_plans: HashMap<String, CropPlanRecord>,
+    #[serde(default)]
+    scenes: HashMap<String, SceneRecord>,
+    #[serde(default)]
+    scene_layers: HashMap<String, SceneLayerRecord>,
 }
 
 impl FarmFieldRegistry {
@@ -349,6 +422,89 @@ impl FarmFieldRegistry {
             })
             .collect()
     }
+
+    pub fn insert_scene(&mut self, scene: SceneRecord) -> Result<SceneRecord, FarmFieldError> {
+        let scene = normalize_scene_record(scene)?;
+        self.fields
+            .get(&scene.field_id)
+            .filter(|field| field.org_id == scene.org_id)
+            .ok_or_else(|| FarmFieldError::FieldNotFound {
+                field_id: scene.field_id.clone(),
+            })?;
+
+        let season =
+            self.seasons
+                .get(&scene.season_id)
+                .ok_or_else(|| FarmFieldError::SeasonNotFound {
+                    season_id: scene.season_id.clone(),
+                })?;
+        if season.field_id != scene.field_id || season.org_id != scene.org_id {
+            return Err(FarmFieldError::SeasonFieldMismatch {
+                season_id: scene.season_id,
+                field_id: scene.field_id,
+                org_id: scene.org_id,
+            });
+        }
+
+        self.scenes.insert(scene.scene_id.clone(), scene.clone());
+        Ok(scene)
+    }
+
+    pub fn insert_scene_layer(
+        &mut self,
+        layer: SceneLayerRecord,
+    ) -> Result<SceneLayerRecord, FarmFieldError> {
+        let layer = normalize_scene_layer_record(layer)?;
+        self.scenes
+            .get(&layer.scene_id)
+            .ok_or_else(|| FarmFieldError::SceneNotFound {
+                scene_id: layer.scene_id.clone(),
+            })?;
+        validate_scene_layer_metadata(&layer)?;
+
+        self.scene_layers
+            .insert(layer.layer_id.clone(), layer.clone());
+        Ok(layer)
+    }
+
+    pub fn scenes_for_field_season(
+        &self,
+        org_id: &str,
+        field_id: &str,
+        season_id: &str,
+    ) -> Vec<FieldSceneCatalogEntry> {
+        let mut scenes = self
+            .scenes
+            .values()
+            .filter(|scene| {
+                scene.org_id == org_id && scene.field_id == field_id && scene.season_id == season_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        scenes.sort_by(|left, right| {
+            left.captured_at
+                .cmp(&right.captured_at)
+                .then(left.scene_id.cmp(&right.scene_id))
+        });
+
+        scenes
+            .into_iter()
+            .map(|scene| {
+                let mut layers = self
+                    .scene_layers
+                    .values()
+                    .filter(|layer| layer.scene_id == scene.scene_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                layers.sort_by(|left, right| {
+                    left.product_type
+                        .cmp(&right.product_type)
+                        .then(left.layer_id.cmp(&right.layer_id))
+                });
+                FieldSceneCatalogEntry { scene, layers }
+            })
+            .collect()
+    }
 }
 
 fn normalize_farm_record(mut farm: FarmRecord) -> Result<FarmRecord, FarmFieldError> {
@@ -396,6 +552,82 @@ fn normalize_crop_plan_record(
     crop_plan.crop = normalize_farm_field_text(crop_plan.crop).ok_or(FarmFieldError::EmptyCrop)?;
     crop_plan.planting_date = crop_plan.planting_date.and_then(normalize_farm_field_text);
     Ok(crop_plan)
+}
+
+fn normalize_scene_record(mut scene: SceneRecord) -> Result<SceneRecord, FarmFieldError> {
+    scene.scene_id =
+        normalize_farm_field_text(scene.scene_id).ok_or(FarmFieldError::EmptySceneId)?;
+    scene.field_id =
+        normalize_farm_field_text(scene.field_id).ok_or(FarmFieldError::EmptyFieldId)?;
+    scene.season_id =
+        normalize_farm_field_text(scene.season_id).ok_or(FarmFieldError::EmptySeasonId)?;
+    scene.org_id = normalize_farm_field_text(scene.org_id).ok_or(FarmFieldError::EmptyOrgId)?;
+    scene.captured_at =
+        normalize_farm_field_text(scene.captured_at).ok_or(FarmFieldError::EmptyCapturedAt)?;
+    scene.source = normalize_farm_field_text(scene.source).ok_or(FarmFieldError::EmptySource)?;
+    Ok(scene)
+}
+
+fn normalize_scene_layer_record(
+    mut layer: SceneLayerRecord,
+) -> Result<SceneLayerRecord, FarmFieldError> {
+    layer.layer_id =
+        normalize_farm_field_text(layer.layer_id).ok_or(FarmFieldError::EmptyLayerId)?;
+    layer.scene_id =
+        normalize_farm_field_text(layer.scene_id).ok_or(FarmFieldError::EmptySceneId)?;
+    layer.product_type =
+        normalize_farm_field_text(layer.product_type).ok_or(FarmFieldError::EmptyProductType)?;
+    layer.crs = layer.crs.trim().to_string();
+    layer.uri = normalize_farm_field_text(layer.uri).ok_or(FarmFieldError::EmptyUri)?;
+    Ok(layer)
+}
+
+fn validate_scene_layer_metadata(layer: &SceneLayerRecord) -> Result<(), FarmFieldError> {
+    if layer.crs.is_empty() {
+        return Err(FarmFieldError::LayerMetadataInvalid {
+            layer_id: layer.layer_id.clone(),
+            reason: SceneLayerMetadataError::MissingCrs,
+        });
+    }
+
+    let extent = layer
+        .extent
+        .as_ref()
+        .ok_or_else(|| FarmFieldError::LayerMetadataInvalid {
+            layer_id: layer.layer_id.clone(),
+            reason: SceneLayerMetadataError::MissingExtent,
+        })?;
+    if !extent.min_lon.is_finite()
+        || !extent.min_lat.is_finite()
+        || !extent.max_lon.is_finite()
+        || !extent.max_lat.is_finite()
+        || extent.min_lon >= extent.max_lon
+        || extent.min_lat >= extent.max_lat
+    {
+        return Err(FarmFieldError::LayerMetadataInvalid {
+            layer_id: layer.layer_id.clone(),
+            reason: SceneLayerMetadataError::InvalidExtent,
+        });
+    }
+
+    let resolution = layer
+        .resolution
+        .ok_or_else(|| FarmFieldError::LayerMetadataInvalid {
+            layer_id: layer.layer_id.clone(),
+            reason: SceneLayerMetadataError::MissingResolution,
+        })?;
+    if !resolution.x.is_finite()
+        || !resolution.y.is_finite()
+        || resolution.x <= 0.0
+        || resolution.y <= 0.0
+    {
+        return Err(FarmFieldError::LayerMetadataInvalid {
+            layer_id: layer.layer_id.clone(),
+            reason: SceneLayerMetadataError::NonPositiveResolution,
+        });
+    }
+
+    Ok(())
 }
 
 fn normalize_farm_field_text(value: String) -> Option<String> {
@@ -1001,7 +1233,7 @@ mod tests {
         FieldBoundary, FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint,
         MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat,
-        ReportRecord, SeasonRecord,
+        ReportRecord, SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
     };
 
     #[test]
@@ -1469,6 +1701,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scene_and_layers_are_listable_by_field_and_season() {
+        let mut registry = registry_with_field_and_season();
+        registry
+            .insert_scene(SceneRecord {
+                scene_id: "scene-2026-04-15".to_string(),
+                field_id: "field-a".to_string(),
+                season_id: "season-2026".to_string(),
+                org_id: "org-a".to_string(),
+                captured_at: "2026-04-15T14:30:00Z".to_string(),
+                source: "landsat".to_string(),
+            })
+            .expect("scene persists");
+        registry
+            .insert_scene_layer(SceneLayerRecord {
+                layer_id: "layer-ndvi".to_string(),
+                scene_id: "scene-2026-04-15".to_string(),
+                product_type: "ndvi".to_string(),
+                crs: "EPSG:4326".to_string(),
+                extent: Some(test_extent()),
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+                uri: "s3://agbot/scenes/scene-2026-04-15/ndvi.tif".to_string(),
+            })
+            .expect("layer persists");
+
+        let scenes = registry.scenes_for_field_season("org-a", "field-a", "season-2026");
+
+        assert_eq!(scenes.len(), 1);
+        assert_eq!(scenes[0].scene.scene_id, "scene-2026-04-15");
+        assert_eq!(scenes[0].scene.source, "landsat");
+        assert_eq!(scenes[0].layers.len(), 1);
+        assert_eq!(scenes[0].layers[0].product_type, "ndvi");
+        assert_eq!(scenes[0].layers[0].crs, "EPSG:4326");
+        assert_eq!(scenes[0].layers[0].extent, Some(test_extent()));
+        assert_eq!(
+            scenes[0].layers[0].resolution,
+            Some(RasterResolution { x: 10.0, y: 10.0 })
+        );
+    }
+
+    #[test]
+    fn scene_layer_missing_metadata_is_rejected_without_writing() {
+        let mut registry = registry_with_field_and_season();
+        registry
+            .insert_scene(SceneRecord {
+                scene_id: "scene-2026-04-15".to_string(),
+                field_id: "field-a".to_string(),
+                season_id: "season-2026".to_string(),
+                org_id: "org-a".to_string(),
+                captured_at: "2026-04-15T14:30:00Z".to_string(),
+                source: "landsat".to_string(),
+            })
+            .expect("scene persists");
+
+        let error = registry
+            .insert_scene_layer(SceneLayerRecord {
+                layer_id: "layer-missing-crs".to_string(),
+                scene_id: "scene-2026-04-15".to_string(),
+                product_type: "ndvi".to_string(),
+                crs: " ".to_string(),
+                extent: Some(test_extent()),
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+                uri: "s3://agbot/scenes/scene-2026-04-15/ndvi.tif".to_string(),
+            })
+            .expect_err("missing CRS is rejected");
+
+        assert_eq!(
+            error,
+            FarmFieldError::LayerMetadataInvalid {
+                layer_id: "layer-missing-crs".to_string(),
+                reason: SceneLayerMetadataError::MissingCrs
+            }
+        );
+
+        let error = registry
+            .insert_scene_layer(SceneLayerRecord {
+                layer_id: "layer-missing-extent".to_string(),
+                scene_id: "scene-2026-04-15".to_string(),
+                product_type: "rgb".to_string(),
+                crs: "EPSG:4326".to_string(),
+                extent: None,
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+                uri: "s3://agbot/scenes/scene-2026-04-15/rgb.tif".to_string(),
+            })
+            .expect_err("missing extent is rejected");
+
+        assert_eq!(
+            error,
+            FarmFieldError::LayerMetadataInvalid {
+                layer_id: "layer-missing-extent".to_string(),
+                reason: SceneLayerMetadataError::MissingExtent
+            }
+        );
+        assert!(
+            registry.scenes_for_field_season("org-a", "field-a", "season-2026")[0]
+                .layers
+                .is_empty()
+        );
+    }
+
     fn test_boundary() -> FieldBoundary {
         FieldBoundary {
             crs: Some("EPSG:4326".to_string()),
@@ -1558,6 +1890,21 @@ mod tests {
                 created_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect("field persists");
+        registry
+    }
+
+    fn registry_with_field_and_season() -> FarmFieldRegistry {
+        let mut registry = registry_with_field();
+        registry
+            .insert_season(SeasonRecord {
+                season_id: "season-2026".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2026-03-01".to_string(),
+                end: "2026-10-31".to_string(),
+                label: "2026 Corn".to_string(),
+            })
+            .expect("season persists");
         registry
     }
 
