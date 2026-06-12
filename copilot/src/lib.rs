@@ -1,4 +1,8 @@
 use serde::{Deserialize, Serialize};
+use shared::schemas::{
+    RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +176,99 @@ pub struct CopilotUncertaintyMarker {
 pub struct UncertaintyAnnotatedAnswer {
     pub answer: GroundedCopilotAnswer,
     pub uncertainty: CopilotUncertaintyMarker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopilotRecommendationDraftStatus {
+    Draft,
+    Approved,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotRecommendationDraftRequest {
+    pub draft_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub scene_id: String,
+    pub author_user_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub action_category: String,
+    pub priority: RecommendationPriority,
+    pub zone_ref: String,
+    pub answer: GroundedCopilotAnswer,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotRecommendationDraft {
+    pub draft_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub scene_id: String,
+    pub author_user_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub action_category: String,
+    pub priority: RecommendationPriority,
+    pub zone_ref: String,
+    pub cited_evidence_ids: Vec<String>,
+    pub answer: GroundedCopilotAnswer,
+    pub status: CopilotRecommendationDraftStatus,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopilotRecommendationApproval {
+    pub recommendation_id: String,
+    pub reviewer_user_id: String,
+    pub reviewed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovedCopilotRecommendation {
+    pub draft: CopilotRecommendationDraft,
+    pub recommendation: RecommendationRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotRecommendationDraftError {
+    #[error("draft_id cannot be empty")]
+    EmptyDraftId,
+    #[error("org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("scene_id cannot be empty")]
+    EmptySceneId,
+    #[error("author_user_id cannot be empty")]
+    EmptyAuthorUserId,
+    #[error("title cannot be empty")]
+    EmptyTitle,
+    #[error("action_category cannot be empty")]
+    EmptyActionCategory,
+    #[error("zone_ref cannot be empty")]
+    EmptyZoneRef,
+    #[error("timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("reviewer_user_id cannot be empty")]
+    EmptyReviewerUserId,
+    #[error("recommendation_id cannot be empty")]
+    EmptyRecommendationId,
+    #[error("recommendation draft requires at least one cited evidence id")]
+    NoCitedEvidence,
+    #[error("recommendation draft has already been approved: {draft_id}")]
+    DraftAlreadyApproved { draft_id: String },
+    #[error(transparent)]
+    RecommendationPersistence(#[from] RecommendationPersistenceError),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -425,6 +522,116 @@ pub fn annotate_answer_uncertainty(
         },
         answer,
     }
+}
+
+pub fn draft_recommendation_from_answer(
+    request: CopilotRecommendationDraftRequest,
+) -> Result<CopilotRecommendationDraft, CopilotRecommendationDraftError> {
+    let draft_id = normalize_draft_text(
+        request.draft_id,
+        CopilotRecommendationDraftError::EmptyDraftId,
+    )?;
+    let org_id = normalize_draft_text(request.org_id, CopilotRecommendationDraftError::EmptyOrgId)?;
+    let field_id = normalize_draft_text(
+        request.field_id,
+        CopilotRecommendationDraftError::EmptyFieldId,
+    )?;
+    let scene_id = normalize_draft_text(
+        request.scene_id,
+        CopilotRecommendationDraftError::EmptySceneId,
+    )?;
+    let author_user_id = normalize_draft_text(
+        request.author_user_id,
+        CopilotRecommendationDraftError::EmptyAuthorUserId,
+    )?;
+    let title = normalize_draft_text(request.title, CopilotRecommendationDraftError::EmptyTitle)?;
+    let action_category = normalize_draft_text(
+        request.action_category,
+        CopilotRecommendationDraftError::EmptyActionCategory,
+    )?;
+    let zone_ref = normalize_draft_text(
+        request.zone_ref,
+        CopilotRecommendationDraftError::EmptyZoneRef,
+    )?;
+    let created_at = normalize_draft_text(
+        request.created_at,
+        CopilotRecommendationDraftError::EmptyTimestamp,
+    )?;
+    let cited_evidence_ids = normalize_draft_citations(request.answer.cited_evidence_ids.clone())?;
+
+    Ok(CopilotRecommendationDraft {
+        draft_id,
+        org_id,
+        field_id,
+        scene_id,
+        author_user_id,
+        title,
+        note: normalize_optional_text(request.note),
+        action_category,
+        priority: request.priority,
+        zone_ref,
+        cited_evidence_ids,
+        answer: request.answer,
+        status: CopilotRecommendationDraftStatus::Draft,
+        created_at: created_at.clone(),
+        updated_at: created_at,
+        reviewed_by: None,
+        reviewed_at: None,
+    })
+}
+
+pub fn approve_recommendation_draft(
+    registry: &mut RecommendationLifecycleRegistry,
+    draft: CopilotRecommendationDraft,
+    approval: CopilotRecommendationApproval,
+) -> Result<ApprovedCopilotRecommendation, CopilotRecommendationDraftError> {
+    if draft.status != CopilotRecommendationDraftStatus::Draft {
+        return Err(CopilotRecommendationDraftError::DraftAlreadyApproved {
+            draft_id: draft.draft_id,
+        });
+    }
+
+    let recommendation_id = normalize_draft_text(
+        approval.recommendation_id,
+        CopilotRecommendationDraftError::EmptyRecommendationId,
+    )?;
+    let reviewer_user_id = normalize_draft_text(
+        approval.reviewer_user_id,
+        CopilotRecommendationDraftError::EmptyReviewerUserId,
+    )?;
+    let reviewed_at = normalize_draft_text(
+        approval.reviewed_at,
+        CopilotRecommendationDraftError::EmptyTimestamp,
+    )?;
+
+    let recommendation = registry.create_recommendation(RecommendationRecord {
+        recommendation_id,
+        scene_id: draft.scene_id.clone(),
+        field_id: Some(draft.field_id.clone()),
+        org_id: draft.org_id.clone(),
+        author_user_id: reviewer_user_id.clone(),
+        title: draft.title.clone(),
+        note: draft.note.clone(),
+        category: Some(draft.action_category.clone()),
+        action_category: draft.action_category.clone(),
+        priority: draft.priority,
+        status: RecommendationStatus::Open,
+        evidence_refs: draft.cited_evidence_ids.clone(),
+        annotation_ids: Vec::new(),
+        created_at: reviewed_at.clone(),
+        updated_at: reviewed_at.clone(),
+    })?;
+
+    let mut approved_draft = draft;
+    approved_draft.status = CopilotRecommendationDraftStatus::Approved;
+    approved_draft.updated_at = reviewed_at.clone();
+    approved_draft.reviewed_by = Some(reviewer_user_id);
+    approved_draft.reviewed_at = Some(reviewed_at);
+
+    Ok(ApprovedCopilotRecommendation {
+        draft: approved_draft,
+        recommendation,
+    })
 }
 
 pub fn post_check_grounded_answer(
@@ -752,6 +959,29 @@ fn normalize_grounding_text(
     normalize_text(value).ok_or(error)
 }
 
+fn normalize_draft_text(
+    value: String,
+    error: CopilotRecommendationDraftError,
+) -> Result<String, CopilotRecommendationDraftError> {
+    normalize_text(value).ok_or(error)
+}
+
+fn normalize_draft_citations(
+    values: Vec<String>,
+) -> Result<Vec<String>, CopilotRecommendationDraftError> {
+    let cited_evidence_ids = values
+        .into_iter()
+        .filter_map(normalize_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if cited_evidence_ids.is_empty() {
+        Err(CopilotRecommendationDraftError::NoCitedEvidence)
+    } else {
+        Ok(cited_evidence_ids)
+    }
+}
+
 fn normalize_fixture(
     fixture: DeterministicAnswerFixture,
 ) -> Result<DeterministicAnswerFixture, CopilotModelError> {
@@ -798,15 +1028,18 @@ mod tests {
     use std::{cell::Cell, collections::BTreeSet};
 
     use super::{
-        annotate_answer_uncertainty, answer_grounded_question, build_evidence_retrieval_index,
+        annotate_answer_uncertainty, answer_grounded_question, approve_recommendation_draft,
+        build_evidence_retrieval_index, draft_recommendation_from_answer,
         post_check_grounded_answer, CopilotAnswer, CopilotAnswerClaim, CopilotAnswerRequest,
         CopilotConfidenceLevel, CopilotGroundingError, CopilotIndexError, CopilotModel,
-        CopilotModelError, CopilotRefusalReason, DeterministicAnswerFixture,
-        DeterministicCopilotModel, EvidenceCandidate, EvidenceFreshnessRecord,
-        EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind, EvidenceRejectionReason,
-        GroundedCopilotAnswer, GroundedCopilotQuestionRequest, LedgerEvidenceResolver,
-        UnavailableCopilotModel, UncertaintyReasonCode,
+        CopilotModelError, CopilotRecommendationApproval, CopilotRecommendationDraftError,
+        CopilotRecommendationDraftRequest, CopilotRecommendationDraftStatus, CopilotRefusalReason,
+        DeterministicAnswerFixture, DeterministicCopilotModel, EvidenceCandidate,
+        EvidenceFreshnessRecord, EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind,
+        EvidenceRejectionReason, GroundedCopilotAnswer, GroundedCopilotQuestionRequest,
+        LedgerEvidenceResolver, UnavailableCopilotModel, UncertaintyReasonCode,
     };
+    use shared::schemas::{RecommendationLifecycleRegistry, RecommendationPriority};
 
     struct FixtureLedger {
         refs: BTreeSet<String>,
@@ -1254,6 +1487,91 @@ mod tests {
             .uncertainty
             .reason_codes
             .contains(&UncertaintyReasonCode::PartialEvidenceCoverage));
+    }
+
+    #[test]
+    fn recommendation_draft_is_reviewable_and_inert_until_approval() {
+        let answer = grounded_answer_with_claims(vec![CopilotAnswerClaim {
+            text: "The northeast zone needs irrigation follow-up.".to_string(),
+            cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+        }]);
+        let mut registry = RecommendationLifecycleRegistry::default();
+
+        let draft = draft_recommendation_from_answer(CopilotRecommendationDraftRequest {
+            draft_id: " draft-copilot-001 ".to_string(),
+            org_id: "org-a".to_string(),
+            field_id: "field-001".to_string(),
+            scene_id: "scene-2026-06-12".to_string(),
+            author_user_id: "copilot".to_string(),
+            title: "Review irrigation in NE zone".to_string(),
+            note: Some("Grounded draft from a cited answer.".to_string()),
+            action_category: "irrigation".to_string(),
+            priority: RecommendationPriority::High,
+            zone_ref: "zone-ne".to_string(),
+            answer,
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        })
+        .expect("grounded answer should produce a draft");
+
+        assert_eq!(draft.status, CopilotRecommendationDraftStatus::Draft);
+        assert_eq!(draft.draft_id, "draft-copilot-001");
+        assert_eq!(draft.zone_ref, "zone-ne");
+        assert_eq!(draft.cited_evidence_ids, vec!["evidence-ndvi-001"]);
+        assert!(registry.recommendations_for_org("org-a").is_empty());
+
+        let approved = approve_recommendation_draft(
+            &mut registry,
+            draft,
+            CopilotRecommendationApproval {
+                recommendation_id: "rec-copilot-001".to_string(),
+                reviewer_user_id: "advisor-1".to_string(),
+                reviewed_at: "2026-06-12T14:05:00Z".to_string(),
+            },
+        )
+        .expect("advisor approval should activate the recommendation");
+
+        assert_eq!(
+            approved.draft.status,
+            CopilotRecommendationDraftStatus::Approved
+        );
+        let active = registry.recommendations_for_org("org-a");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].recommendation_id, "rec-copilot-001");
+        assert_eq!(active[0].author_user_id, "advisor-1");
+        assert_eq!(active[0].evidence_refs, vec!["evidence-ndvi-001"]);
+        assert_eq!(active[0].field_id.as_deref(), Some("field-001"));
+    }
+
+    #[test]
+    fn recommendation_draft_rejects_uncited_answer() {
+        let error = draft_recommendation_from_answer(CopilotRecommendationDraftRequest {
+            draft_id: "draft-copilot-001".to_string(),
+            org_id: "org-a".to_string(),
+            field_id: "field-001".to_string(),
+            scene_id: "scene-2026-06-12".to_string(),
+            author_user_id: "copilot".to_string(),
+            title: "Review irrigation in NE zone".to_string(),
+            note: None,
+            action_category: "irrigation".to_string(),
+            priority: RecommendationPriority::High,
+            zone_ref: "zone-ne".to_string(),
+            answer: GroundedCopilotAnswer {
+                text: "Uncited draft should not be allowed.".to_string(),
+                claims: vec![CopilotAnswerClaim {
+                    text: "The zone needs attention.".to_string(),
+                    cited_evidence_ids: vec![],
+                }],
+                cited_evidence_ids: vec![],
+                confidence: 0.6,
+                model_provider: "test-double".to_string(),
+                model_id: "fixture-rag".to_string(),
+                model_version: "2026-06-12".to_string(),
+            },
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        })
+        .expect_err("uncited answer should not produce a draft");
+
+        assert_eq!(error, CopilotRecommendationDraftError::NoCitedEvidence);
     }
 
     fn retrieved_evidence(evidence_id: &str) -> EvidenceIndexEntry {
