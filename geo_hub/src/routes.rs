@@ -15,9 +15,11 @@ use axum::{
     Json,
 };
 use compliance::{
-    append_compliance_record_version, build_initial_compliance_record, refuse_in_place_mutation,
-    AppendComplianceRecordVersionRequest, ComplianceRecord, ComplianceRecordError,
-    ComplianceRecordType, CreateComplianceRecordRequest,
+    airspace_zone_contains_point, airspace_zone_is_effective_at, append_compliance_record_version,
+    build_airspace_zone_record, build_initial_compliance_record, refuse_in_place_mutation,
+    AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
+    AirspaceZoneRecord, AppendComplianceRecordVersionRequest, ComplianceRecord,
+    ComplianceRecordError, ComplianceRecordType, CreateComplianceRecordRequest,
 };
 use crop_intelligence::{
     build_model_version_record, validate_model_reference, CropModelRegistryError, CropModelTask,
@@ -324,6 +326,19 @@ pub struct ComplianceRecordListQuery {
     pub record_type: Option<String>,
     pub org_id: Option<String>,
     pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AirspaceZoneListQuery {
+    pub zone_id: Option<String>,
+    pub zone_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AirspaceZonePointQuery {
+    pub longitude: f64,
+    pub latitude: f64,
+    pub at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1896,6 +1911,89 @@ pub async fn refuse_delete_compliance_record(
     .await?;
 
     Err(compliance_record_error(refuse_in_place_mutation("delete")))
+}
+
+pub async fn ingest_airspace_zone(
+    State(state): State<AppState>,
+    Json(request): Json<AirspaceZoneIngestRequest>,
+) -> AppResult<Json<AirspaceZoneRecord>> {
+    let record = build_airspace_zone_record(
+        request,
+        format!("airspace-zone-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(airspace_zone_error)?;
+    insert_airspace_zone(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_airspace_zones(
+    Query(query): Query<AirspaceZoneListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<AirspaceZoneRecord>>> {
+    let zone_id = normalize_optional_text(query.zone_id);
+    let zone_class = normalize_optional_text(query.zone_class)
+        .map(parse_airspace_zone_class)
+        .transpose()?
+        .map(|zone_class| zone_class.as_str().to_string());
+
+    let rows = sqlx::query(
+        r#"
+        SELECT zone_id, zone_class, crs, geometry_json, min_lon, min_lat, max_lon, max_lat,
+               effective_from, effective_to, source, created_at
+        FROM compliance_airspace_zones
+        WHERE (?1 IS NULL OR zone_id = ?1)
+          AND (?2 IS NULL OR zone_class = ?2)
+        ORDER BY zone_id ASC
+        "#,
+    )
+    .bind(zone_id)
+    .bind(zone_class)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_airspace_zone(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn query_airspace_zones_for_point(
+    Query(query): Query<AirspaceZonePointQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<AirspaceZoneRecord>>> {
+    let point = validate_airspace_query_point(query.longitude, query.latitude)?;
+    let at = normalize_optional_text(query.at);
+    let rows = sqlx::query(
+        r#"
+        SELECT zone_id, zone_class, crs, geometry_json, min_lon, min_lat, max_lon, max_lat,
+               effective_from, effective_to, source, created_at
+        FROM compliance_airspace_zones
+        WHERE min_lon <= ?1
+          AND max_lon >= ?1
+          AND min_lat <= ?2
+          AND max_lat >= ?2
+        ORDER BY zone_id ASC
+        "#,
+    )
+    .bind(point.longitude)
+    .bind(point.latitude)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let zones = rows
+        .into_iter()
+        .map(|row| decode_airspace_zone(&row))
+        .collect::<AppResult<Vec<_>>>()?
+        .into_iter()
+        .filter(|zone| airspace_zone_is_effective_at(zone, at.as_deref()))
+        .filter(|zone| airspace_zone_contains_point(zone, point))
+        .collect::<Vec<_>>();
+
+    Ok(Json(zones))
 }
 
 pub async fn list_farms(State(state): State<AppState>) -> AppResult<Json<Vec<FarmRecord>>> {
@@ -4048,6 +4146,16 @@ fn parse_compliance_record_type(value: String) -> AppResult<ComplianceRecordType
         .map_err(compliance_record_error)
 }
 
+fn airspace_zone_error(error: AirspaceZoneError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn parse_airspace_zone_class(value: String) -> AppResult<AirspaceZoneClass> {
+    value
+        .parse::<AirspaceZoneClass>()
+        .map_err(airspace_zone_error)
+}
+
 fn normalize_farm_name(name: String) -> AppResult<String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -4799,6 +4907,33 @@ fn decode_compliance_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Complian
     })
 }
 
+fn decode_airspace_zone(row: &sqlx::sqlite::SqliteRow) -> AppResult<AirspaceZoneRecord> {
+    let geometry_json: String = row.get("geometry_json");
+    let coordinates =
+        serde_json::from_str::<Vec<AirspaceCoordinate>>(&geometry_json).map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode airspace zone geometry_json"),
+            )
+        })?;
+
+    Ok(AirspaceZoneRecord {
+        zone_id: row.get("zone_id"),
+        zone_class: parse_airspace_zone_class(row.get::<String, _>("zone_class"))?,
+        crs: row.get("crs"),
+        coordinates,
+        extent: compliance::AirspaceZoneExtent {
+            min_lon: row.get("min_lon"),
+            min_lat: row.get("min_lat"),
+            max_lon: row.get("max_lon"),
+            max_lat: row.get("max_lat"),
+        },
+        effective_from: row.get("effective_from"),
+        effective_to: row.get("effective_to"),
+        source: row.get("source"),
+        created_at: row.get("created_at"),
+    })
+}
+
 fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<AnnotationRecord> {
     let geometry_json: String = row.get("geometry_json");
     let geometry = serde_json::from_str::<AnnotationGeometry>(&geometry_json).map_err(|err| {
@@ -5168,6 +5303,54 @@ async fn audit_compliance_record_event(
     .map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn insert_airspace_zone(state: &AppState, record: &AirspaceZoneRecord) -> AppResult<()> {
+    let geometry_json =
+        serde_json::to_string(&record.coordinates).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO compliance_airspace_zones (
+            zone_id, zone_class, crs, geometry_json, min_lon, min_lat, max_lon, max_lat,
+            effective_from, effective_to, source, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&record.zone_id)
+    .bind(record.zone_class.as_str())
+    .bind(&record.crs)
+    .bind(geometry_json)
+    .bind(record.extent.min_lon)
+    .bind(record.extent.min_lat)
+    .bind(record.extent.max_lon)
+    .bind(record.extent.max_lat)
+    .bind(&record.effective_from)
+    .bind(&record.effective_to)
+    .bind(&record.source)
+    .bind(&record.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+fn validate_airspace_query_point(longitude: f64, latitude: f64) -> AppResult<AirspaceCoordinate> {
+    if !longitude.is_finite()
+        || !latitude.is_finite()
+        || !(-180.0..=180.0).contains(&longitude)
+        || !(-90.0..=90.0).contains(&latitude)
+    {
+        return Err(AppError::BadRequest(
+            "airspace point query requires valid longitude/latitude".to_string(),
+        ));
+    }
+
+    Ok(AirspaceCoordinate {
+        longitude,
+        latitude,
+    })
 }
 
 async fn field_owner_for_farm(

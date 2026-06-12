@@ -89,6 +89,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::append_compliance_record_version_route),
         )
         .route(
+            "/api/compliance/airspace-zones",
+            get(routes::list_airspace_zones).post(routes::ingest_airspace_zone),
+        )
+        .route(
+            "/api/compliance/airspace-zones/query",
+            get(routes::query_airspace_zones_for_point),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

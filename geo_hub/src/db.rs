@@ -484,6 +484,27 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS compliance_airspace_zones (
+            zone_id TEXT PRIMARY KEY,
+            zone_class TEXT NOT NULL,
+            crs TEXT NOT NULL,
+            geometry_json TEXT NOT NULL,
+            min_lon REAL NOT NULL,
+            min_lat REAL NOT NULL,
+            max_lon REAL NOT NULL,
+            max_lat REAL NOT NULL,
+            effective_from TEXT NOT NULL,
+            effective_to TEXT,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_scenes_field_id ON scenes(field_id);
         "#,
     )
@@ -631,6 +652,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_compliance_record_events_record_id
         ON compliance_record_events(record_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_compliance_airspace_zones_extent
+        ON compliance_airspace_zones(min_lon, min_lat, max_lon, max_lat);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_compliance_airspace_zones_class
+        ON compliance_airspace_zones(zone_class);
         "#,
     )
     .execute(pool)

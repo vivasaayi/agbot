@@ -45,6 +45,89 @@ impl std::str::FromStr for ComplianceRecordType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AirspaceZoneClass {
+    Advisory,
+    Controlled,
+    NoFly,
+    Restricted,
+    TemporaryFlightRestriction,
+}
+
+impl AirspaceZoneClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AirspaceZoneClass::Advisory => "advisory",
+            AirspaceZoneClass::Controlled => "controlled",
+            AirspaceZoneClass::NoFly => "no_fly",
+            AirspaceZoneClass::Restricted => "restricted",
+            AirspaceZoneClass::TemporaryFlightRestriction => "temporary_flight_restriction",
+        }
+    }
+}
+
+impl std::str::FromStr for AirspaceZoneClass {
+    type Err = AirspaceZoneError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "advisory" => Ok(Self::Advisory),
+            "controlled" => Ok(Self::Controlled),
+            "no_fly" => Ok(Self::NoFly),
+            "restricted" => Ok(Self::Restricted),
+            "temporary_flight_restriction" | "tfr" => Ok(Self::TemporaryFlightRestriction),
+            _ => Err(AirspaceZoneError::UnsupportedZoneClass {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AirspaceCoordinate {
+    pub longitude: f64,
+    pub latitude: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AirspaceZoneExtent {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AirspaceZoneIngestRequest {
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    pub zone_class: AirspaceZoneClass,
+    #[serde(default)]
+    pub crs: String,
+    #[serde(default)]
+    pub coordinates: Vec<AirspaceCoordinate>,
+    #[serde(default)]
+    pub effective_from: String,
+    #[serde(default)]
+    pub effective_to: Option<String>,
+    #[serde(default)]
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AirspaceZoneRecord {
+    pub zone_id: String,
+    pub zone_class: AirspaceZoneClass,
+    pub crs: String,
+    pub coordinates: Vec<AirspaceCoordinate>,
+    pub extent: AirspaceZoneExtent,
+    pub effective_from: String,
+    pub effective_to: Option<String>,
+    pub source: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CreateComplianceRecordRequest {
     #[serde(default)]
@@ -111,6 +194,30 @@ pub enum ComplianceRecordError {
     AppendOnlyMutationRefused { action: String },
 }
 
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum AirspaceZoneError {
+    #[error("zone_id cannot be empty")]
+    EmptyZoneId,
+    #[error("airspace zone CRS cannot be empty")]
+    EmptyCrs,
+    #[error("unsupported airspace zone CRS {value}; expected EPSG:4326")]
+    UnsupportedCrs { value: String },
+    #[error("airspace zone polygon must contain at least four coordinates including closure")]
+    TooFewCoordinates,
+    #[error("airspace zone polygon must be closed")]
+    UnclosedPolygon,
+    #[error("airspace coordinate is outside longitude/latitude bounds")]
+    InvalidCoordinate,
+    #[error("effective_from cannot be empty")]
+    EmptyEffectiveFrom,
+    #[error("source cannot be empty")]
+    EmptySource,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("unsupported airspace zone class {value}")]
+    UnsupportedZoneClass { value: String },
+}
+
 pub fn build_initial_compliance_record(
     request: CreateComplianceRecordRequest,
     generated_record_id: String,
@@ -169,6 +276,90 @@ pub fn append_compliance_record_version(
     })
 }
 
+pub fn build_airspace_zone_record(
+    request: AirspaceZoneIngestRequest,
+    generated_zone_id: String,
+    created_at: String,
+) -> Result<AirspaceZoneRecord, AirspaceZoneError> {
+    let zone_id = match normalize_optional_text(request.zone_id) {
+        Some(zone_id) => zone_id,
+        None => {
+            normalize_required_airspace_text(generated_zone_id, AirspaceZoneError::EmptyZoneId)?
+        }
+    };
+    let coordinates = validate_airspace_polygon(request.coordinates)?;
+    let extent = compute_airspace_extent(&coordinates)?;
+
+    Ok(AirspaceZoneRecord {
+        zone_id,
+        zone_class: request.zone_class,
+        crs: normalize_airspace_crs(request.crs)?,
+        coordinates,
+        extent,
+        effective_from: normalize_required_airspace_text(
+            request.effective_from,
+            AirspaceZoneError::EmptyEffectiveFrom,
+        )?,
+        effective_to: normalize_optional_text(request.effective_to),
+        source: normalize_required_airspace_text(request.source, AirspaceZoneError::EmptySource)?,
+        created_at: normalize_required_airspace_text(
+            created_at,
+            AirspaceZoneError::EmptyCreatedAt,
+        )?,
+    })
+}
+
+pub fn airspace_zone_contains_point(zone: &AirspaceZoneRecord, point: AirspaceCoordinate) -> bool {
+    point_in_polygon(point, &zone.coordinates)
+}
+
+pub fn airspace_zone_intersects_polygon(
+    zone: &AirspaceZoneRecord,
+    polygon: &[AirspaceCoordinate],
+) -> Result<bool, AirspaceZoneError> {
+    let polygon = validate_airspace_polygon(polygon.to_vec())?;
+
+    if polygon
+        .iter()
+        .copied()
+        .any(|point| point_in_polygon(point, &zone.coordinates))
+    {
+        return Ok(true);
+    }
+    if zone
+        .coordinates
+        .iter()
+        .copied()
+        .any(|point| point_in_polygon(point, &polygon))
+    {
+        return Ok(true);
+    }
+
+    for zone_edge in zone.coordinates.windows(2) {
+        for area_edge in polygon.windows(2) {
+            if segments_intersect(zone_edge[0], zone_edge[1], area_edge[0], area_edge[1]) {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn airspace_zone_is_effective_at(zone: &AirspaceZoneRecord, at: Option<&str>) -> bool {
+    let Some(at) = at.and_then(|value| normalize_optional_text(Some(value.to_string()))) else {
+        return true;
+    };
+
+    if at.as_str() < zone.effective_from.as_str() {
+        return false;
+    }
+    match &zone.effective_to {
+        Some(effective_to) => at.as_str() <= effective_to.as_str(),
+        None => true,
+    }
+}
+
 pub fn refuse_in_place_mutation(action: &str) -> ComplianceRecordError {
     ComplianceRecordError::AppendOnlyMutationRefused {
         action: action.trim().to_string(),
@@ -179,6 +370,18 @@ fn normalize_required_text(
     value: String,
     error: ComplianceRecordError,
 ) -> Result<String, ComplianceRecordError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_required_airspace_text(
+    value: String,
+    error: AirspaceZoneError,
+) -> Result<String, AirspaceZoneError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         Err(error)
@@ -198,12 +401,145 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_airspace_crs(value: String) -> Result<String, AirspaceZoneError> {
+    let crs = normalize_required_airspace_text(value, AirspaceZoneError::EmptyCrs)?;
+    if crs.eq_ignore_ascii_case("EPSG:4326") {
+        Ok("EPSG:4326".to_string())
+    } else {
+        Err(AirspaceZoneError::UnsupportedCrs { value: crs })
+    }
+}
+
+fn validate_airspace_polygon(
+    coordinates: Vec<AirspaceCoordinate>,
+) -> Result<Vec<AirspaceCoordinate>, AirspaceZoneError> {
+    if coordinates.len() < 4 {
+        return Err(AirspaceZoneError::TooFewCoordinates);
+    }
+    for coordinate in &coordinates {
+        if !coordinate.longitude.is_finite()
+            || !coordinate.latitude.is_finite()
+            || coordinate.longitude < -180.0
+            || coordinate.longitude > 180.0
+            || coordinate.latitude < -90.0
+            || coordinate.latitude > 90.0
+        {
+            return Err(AirspaceZoneError::InvalidCoordinate);
+        }
+    }
+    let first = coordinates[0];
+    let last = coordinates[coordinates.len() - 1];
+    if !same_coordinate(first, last) {
+        return Err(AirspaceZoneError::UnclosedPolygon);
+    }
+
+    Ok(coordinates)
+}
+
+fn compute_airspace_extent(
+    coordinates: &[AirspaceCoordinate],
+) -> Result<AirspaceZoneExtent, AirspaceZoneError> {
+    let coordinates = validate_airspace_polygon(coordinates.to_vec())?;
+    let mut extent = AirspaceZoneExtent {
+        min_lon: f64::INFINITY,
+        min_lat: f64::INFINITY,
+        max_lon: f64::NEG_INFINITY,
+        max_lat: f64::NEG_INFINITY,
+    };
+
+    for coordinate in coordinates {
+        extent.min_lon = extent.min_lon.min(coordinate.longitude);
+        extent.min_lat = extent.min_lat.min(coordinate.latitude);
+        extent.max_lon = extent.max_lon.max(coordinate.longitude);
+        extent.max_lat = extent.max_lat.max(coordinate.latitude);
+    }
+
+    Ok(extent)
+}
+
+fn point_in_polygon(point: AirspaceCoordinate, polygon: &[AirspaceCoordinate]) -> bool {
+    let mut inside = false;
+    for edge in polygon.windows(2) {
+        let a = edge[0];
+        let b = edge[1];
+        if point_on_segment(point, a, b) {
+            return true;
+        }
+
+        let crosses_latitude = (a.latitude > point.latitude) != (b.latitude > point.latitude);
+        if crosses_latitude {
+            let intersect_lon = (b.longitude - a.longitude) * (point.latitude - a.latitude)
+                / (b.latitude - a.latitude)
+                + a.longitude;
+            if point.longitude < intersect_lon {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn segments_intersect(
+    a: AirspaceCoordinate,
+    b: AirspaceCoordinate,
+    c: AirspaceCoordinate,
+    d: AirspaceCoordinate,
+) -> bool {
+    let o1 = orientation(a, b, c);
+    let o2 = orientation(a, b, d);
+    let o3 = orientation(c, d, a);
+    let o4 = orientation(c, d, b);
+
+    if nearly_zero(o1) && point_on_segment(c, a, b) {
+        return true;
+    }
+    if nearly_zero(o2) && point_on_segment(d, a, b) {
+        return true;
+    }
+    if nearly_zero(o3) && point_on_segment(a, c, d) {
+        return true;
+    }
+    if nearly_zero(o4) && point_on_segment(b, c, d) {
+        return true;
+    }
+
+    (o1 > 0.0) != (o2 > 0.0) && (o3 > 0.0) != (o4 > 0.0)
+}
+
+fn orientation(a: AirspaceCoordinate, b: AirspaceCoordinate, c: AirspaceCoordinate) -> f64 {
+    (b.longitude - a.longitude) * (c.latitude - a.latitude)
+        - (b.latitude - a.latitude) * (c.longitude - a.longitude)
+}
+
+fn point_on_segment(
+    point: AirspaceCoordinate,
+    a: AirspaceCoordinate,
+    b: AirspaceCoordinate,
+) -> bool {
+    nearly_zero(orientation(a, b, point))
+        && point.longitude >= a.longitude.min(b.longitude) - 1e-9
+        && point.longitude <= a.longitude.max(b.longitude) + 1e-9
+        && point.latitude >= a.latitude.min(b.latitude) - 1e-9
+        && point.latitude <= a.latitude.max(b.latitude) + 1e-9
+}
+
+fn same_coordinate(a: AirspaceCoordinate, b: AirspaceCoordinate) -> bool {
+    (a.longitude - b.longitude).abs() <= 1e-9 && (a.latitude - b.latitude).abs() <= 1e-9
+}
+
+fn nearly_zero(value: f64) -> bool {
+    value.abs() <= 1e-12
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        append_compliance_record_version, build_initial_compliance_record,
-        refuse_in_place_mutation, AppendComplianceRecordVersionRequest, ComplianceRecordError,
-        ComplianceRecordType, CreateComplianceRecordRequest,
+        airspace_zone_contains_point, airspace_zone_intersects_polygon,
+        append_compliance_record_version, build_airspace_zone_record,
+        build_initial_compliance_record, refuse_in_place_mutation, AirspaceCoordinate,
+        AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
+        AppendComplianceRecordVersionRequest, ComplianceRecordError, ComplianceRecordType,
+        CreateComplianceRecordRequest,
     };
 
     #[test]
@@ -305,5 +641,135 @@ mod tests {
                 action: "delete".to_string()
             }
         );
+    }
+
+    #[test]
+    fn airspace_zone_record_asserts_crs_and_extent() {
+        let zone = build_airspace_zone_record(
+            AirspaceZoneIngestRequest {
+                zone_id: Some(" nfz-1 ".to_string()),
+                zone_class: AirspaceZoneClass::NoFly,
+                crs: " epsg:4326 ".to_string(),
+                coordinates: square_zone(),
+                effective_from: " 2026-06-01T00:00:00Z ".to_string(),
+                effective_to: Some(" 2026-07-01T00:00:00Z ".to_string()),
+                source: " faa-uasfm-2026-06 ".to_string(),
+            },
+            "generated-zone".to_string(),
+            " 2026-06-12T12:00:00Z ".to_string(),
+        )
+        .expect("zone should be valid");
+
+        assert_eq!(zone.zone_id, "nfz-1");
+        assert_eq!(zone.zone_class, AirspaceZoneClass::NoFly);
+        assert_eq!(zone.crs, "EPSG:4326");
+        assert_eq!(zone.extent.min_lon, -96.70);
+        assert_eq!(zone.extent.max_lat, 41.40);
+        assert_eq!(zone.source, "faa-uasfm-2026-06");
+    }
+
+    #[test]
+    fn airspace_zone_point_and_area_membership_are_deterministic() {
+        let zone = build_airspace_zone_record(
+            AirspaceZoneIngestRequest {
+                zone_id: Some("nfz-1".to_string()),
+                zone_class: AirspaceZoneClass::NoFly,
+                crs: "EPSG:4326".to_string(),
+                coordinates: square_zone(),
+                effective_from: "2026-06-01T00:00:00Z".to_string(),
+                effective_to: None,
+                source: "faa-uasfm-2026-06".to_string(),
+            },
+            "generated-zone".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+        )
+        .expect("zone should be valid");
+
+        assert!(airspace_zone_contains_point(
+            &zone,
+            AirspaceCoordinate {
+                longitude: -96.45,
+                latitude: 41.20
+            }
+        ));
+        assert!(!airspace_zone_contains_point(
+            &zone,
+            AirspaceCoordinate {
+                longitude: -97.00,
+                latitude: 41.20
+            }
+        ));
+        assert!(airspace_zone_intersects_polygon(
+            &zone,
+            &[
+                AirspaceCoordinate {
+                    longitude: -96.50,
+                    latitude: 41.20,
+                },
+                AirspaceCoordinate {
+                    longitude: -96.10,
+                    latitude: 41.20,
+                },
+                AirspaceCoordinate {
+                    longitude: -96.10,
+                    latitude: 41.50,
+                },
+                AirspaceCoordinate {
+                    longitude: -96.50,
+                    latitude: 41.20,
+                },
+            ],
+        )
+        .expect("area query should be valid"));
+    }
+
+    #[test]
+    fn airspace_zone_rejects_unsupported_crs() {
+        let error = build_airspace_zone_record(
+            AirspaceZoneIngestRequest {
+                zone_id: Some("nfz-1".to_string()),
+                zone_class: AirspaceZoneClass::NoFly,
+                crs: "EPSG:3857".to_string(),
+                coordinates: square_zone(),
+                effective_from: "2026-06-01T00:00:00Z".to_string(),
+                effective_to: None,
+                source: "bad-crs".to_string(),
+            },
+            "generated-zone".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+        )
+        .expect_err("unsupported CRS should be rejected");
+
+        assert_eq!(
+            error,
+            AirspaceZoneError::UnsupportedCrs {
+                value: "EPSG:3857".to_string()
+            }
+        );
+    }
+
+    fn square_zone() -> Vec<AirspaceCoordinate> {
+        vec![
+            AirspaceCoordinate {
+                longitude: -96.70,
+                latitude: 41.10,
+            },
+            AirspaceCoordinate {
+                longitude: -96.20,
+                latitude: 41.10,
+            },
+            AirspaceCoordinate {
+                longitude: -96.20,
+                latitude: 41.40,
+            },
+            AirspaceCoordinate {
+                longitude: -96.70,
+                latitude: 41.40,
+            },
+            AirspaceCoordinate {
+                longitude: -96.70,
+                latitude: 41.10,
+            },
+        ]
     }
 }

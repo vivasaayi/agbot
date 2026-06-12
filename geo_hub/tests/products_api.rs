@@ -2098,6 +2098,149 @@ async fn compliance_records_create_list_append_versions_and_refuse_delete() -> R
 }
 
 #[tokio::test]
+async fn compliance_airspace_zones_ingest_query_and_reject_invalid_crs() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let zone_payload = json!({
+        "zone_id": "nfz-1",
+        "zone_class": "no_fly",
+        "crs": "EPSG:4326",
+        "coordinates": [
+            { "longitude": -96.70, "latitude": 41.10 },
+            { "longitude": -96.20, "latitude": 41.10 },
+            { "longitude": -96.20, "latitude": 41.40 },
+            { "longitude": -96.70, "latitude": 41.40 },
+            { "longitude": -96.70, "latitude": 41.10 }
+        ],
+        "effective_from": "2026-06-01T00:00:00Z",
+        "effective_to": "2026-07-01T00:00:00Z",
+        "source": "faa-uasfm-2026-06"
+    });
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/airspace-zones")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(zone_payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let body = to_bytes(create_response.into_body(), 64 * 1024).await?;
+    let created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created.get("zone_id").and_then(|value| value.as_str()),
+        Some("nfz-1")
+    );
+    assert_eq!(
+        created.get("crs").and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        created
+            .pointer("/extent/min_lon")
+            .and_then(|value| value.as_f64()),
+        Some(-96.70)
+    );
+    assert_eq!(
+        created
+            .pointer("/extent/max_lat")
+            .and_then(|value| value.as_f64()),
+        Some(41.40)
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/compliance/airspace-zones?zone_id=nfz-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].get("source").and_then(|value| value.as_str()),
+        Some("faa-uasfm-2026-06")
+    );
+
+    let query_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/compliance/airspace-zones/query?longitude=-96.45&latitude=41.20")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(query_response.status(), StatusCode::OK);
+    let body = to_bytes(query_response.into_body(), 64 * 1024).await?;
+    let containing_zones: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(containing_zones.len(), 1);
+    assert_eq!(
+        containing_zones[0]
+            .get("zone_id")
+            .and_then(|value| value.as_str()),
+        Some("nfz-1")
+    );
+
+    let invalid_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/airspace-zones")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "zone_id": "nfz-invalid",
+                        "zone_class": "no_fly",
+                        "crs": "EPSG:3857",
+                        "coordinates": [
+                            { "longitude": -96.70, "latitude": 41.10 },
+                            { "longitude": -96.20, "latitude": 41.10 },
+                            { "longitude": -96.20, "latitude": 41.40 },
+                            { "longitude": -96.70, "latitude": 41.40 },
+                            { "longitude": -96.70, "latitude": 41.10 }
+                        ],
+                        "effective_from": "2026-06-01T00:00:00Z",
+                        "source": "bad-crs-fixture"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(invalid_response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&body).contains("CRS"));
+
+    let zone_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM compliance_airspace_zones")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(zone_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_field_rejects_orphan_farm_reference() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
