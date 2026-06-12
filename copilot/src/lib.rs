@@ -84,6 +84,23 @@ pub struct CopilotAnswer {
     pub model_version: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopilotAnswerClaim {
+    pub text: String,
+    pub cited_evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroundedCopilotAnswer {
+    pub text: String,
+    pub claims: Vec<CopilotAnswerClaim>,
+    pub cited_evidence_ids: Vec<String>,
+    pub confidence: f64,
+    pub model_provider: String,
+    pub model_id: String,
+    pub model_version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeterministicAnswerFixture {
     pub question: String,
@@ -128,6 +145,32 @@ pub enum CopilotModelError {
     CitationNotRetrieved { evidence_id: String },
     #[error("copilot model adapter unavailable: {reason}")]
     AdapterUnavailable { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotGroundingError {
+    #[error("answer text cannot be empty")]
+    EmptyAnswerText,
+    #[error("grounded answer must contain at least one claim")]
+    NoClaims,
+    #[error("claim text cannot be empty")]
+    EmptyClaimText,
+    #[error("claim citation cannot be empty")]
+    EmptyCitation { claim: String },
+    #[error("claim has no cited evidence: {claim}")]
+    UncitedClaim { claim: String },
+    #[error("answer-level citation {evidence_id} was not in retrieved evidence")]
+    AnswerCitationNotRetrieved { evidence_id: String },
+    #[error("claim citation {evidence_id} was not in retrieved evidence for claim {claim}")]
+    CitationNotRetrieved { claim: String, evidence_id: String },
+    #[error("confidence must be finite and between 0 and 1")]
+    InvalidConfidence,
+    #[error("model_provider cannot be empty")]
+    EmptyModelProvider,
+    #[error("model_id cannot be empty")]
+    EmptyModelId,
+    #[error("model_version cannot be empty")]
+    EmptyModelVersion,
 }
 
 pub trait CopilotModel {
@@ -211,6 +254,93 @@ impl CopilotModel for UnavailableCopilotModel {
             reason: format!("{}: {}", self.adapter_name, self.reason),
         })
     }
+}
+
+pub fn post_check_grounded_answer(
+    answer: CopilotAnswer,
+    claims: Vec<CopilotAnswerClaim>,
+    retrieved_evidence: &[EvidenceIndexEntry],
+) -> Result<GroundedCopilotAnswer, CopilotGroundingError> {
+    let text = normalize_grounding_text(answer.text, CopilotGroundingError::EmptyAnswerText)?;
+    if !answer.confidence.is_finite() || !(0.0..=1.0).contains(&answer.confidence) {
+        return Err(CopilotGroundingError::InvalidConfidence);
+    }
+    let model_provider = normalize_grounding_text(
+        answer.model_provider,
+        CopilotGroundingError::EmptyModelProvider,
+    )?;
+    let model_id = normalize_grounding_text(answer.model_id, CopilotGroundingError::EmptyModelId)?;
+    let model_version = normalize_grounding_text(
+        answer.model_version,
+        CopilotGroundingError::EmptyModelVersion,
+    )?;
+    if claims.is_empty() {
+        return Err(CopilotGroundingError::NoClaims);
+    }
+
+    let retrieved_ids = retrieved_evidence
+        .iter()
+        .filter_map(|entry| {
+            let evidence_id = normalize_text(entry.evidence_id.clone())?;
+            normalize_text(entry.ledger_ref.clone())?;
+            Some(evidence_id)
+        })
+        .collect::<BTreeSet<_>>();
+
+    for evidence_id in answer.cited_evidence_ids {
+        let evidence_id = normalize_grounding_text(
+            evidence_id,
+            CopilotGroundingError::EmptyCitation {
+                claim: "answer".to_string(),
+            },
+        )?;
+        if !retrieved_ids.contains(&evidence_id) {
+            return Err(CopilotGroundingError::AnswerCitationNotRetrieved { evidence_id });
+        }
+    }
+
+    let mut normalized_claims = Vec::new();
+    let mut cited_evidence_ids = BTreeSet::new();
+    for claim in claims {
+        let claim_text =
+            normalize_grounding_text(claim.text, CopilotGroundingError::EmptyClaimText)?;
+        if claim.cited_evidence_ids.is_empty() {
+            return Err(CopilotGroundingError::UncitedClaim { claim: claim_text });
+        }
+
+        let mut normalized_citations = Vec::new();
+        for evidence_id in claim.cited_evidence_ids {
+            let evidence_id = normalize_grounding_text(
+                evidence_id,
+                CopilotGroundingError::EmptyCitation {
+                    claim: claim_text.clone(),
+                },
+            )?;
+            if !retrieved_ids.contains(&evidence_id) {
+                return Err(CopilotGroundingError::CitationNotRetrieved {
+                    claim: claim_text,
+                    evidence_id,
+                });
+            }
+            cited_evidence_ids.insert(evidence_id.clone());
+            normalized_citations.push(evidence_id);
+        }
+
+        normalized_claims.push(CopilotAnswerClaim {
+            text: claim_text,
+            cited_evidence_ids: normalized_citations,
+        });
+    }
+
+    Ok(GroundedCopilotAnswer {
+        text,
+        claims: normalized_claims,
+        cited_evidence_ids: cited_evidence_ids.into_iter().collect(),
+        confidence: answer.confidence,
+        model_provider,
+        model_id,
+        model_version,
+    })
 }
 
 pub fn build_evidence_retrieval_index(
@@ -339,6 +469,13 @@ fn normalize_model_text(
     normalize_text(value).ok_or(error)
 }
 
+fn normalize_grounding_text(
+    value: String,
+    error: CopilotGroundingError,
+) -> Result<String, CopilotGroundingError> {
+    normalize_text(value).ok_or(error)
+}
+
 fn normalize_fixture(
     fixture: DeterministicAnswerFixture,
 ) -> Result<DeterministicAnswerFixture, CopilotModelError> {
@@ -385,7 +522,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        build_evidence_retrieval_index, CopilotAnswerRequest, CopilotIndexError, CopilotModel,
+        build_evidence_retrieval_index, post_check_grounded_answer, CopilotAnswerClaim,
+        CopilotAnswerRequest, CopilotGroundingError, CopilotIndexError, CopilotModel,
         CopilotModelError, DeterministicAnswerFixture, DeterministicCopilotModel,
         EvidenceCandidate, EvidenceIndexEntry, EvidenceKind, EvidenceRejectionReason,
         LedgerEvidenceResolver, UnavailableCopilotModel,
@@ -602,6 +740,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grounded_answer_post_check_accepts_claims_with_resolvable_citations() {
+        let model = DeterministicCopilotModel::new(
+            "test-double".to_string(),
+            "fixture-rag".to_string(),
+            "2026-06-12".to_string(),
+            vec![DeterministicAnswerFixture {
+                question: "why is the northeast zone stressed?".to_string(),
+                text: "NDVI dropped below threshold in the northeast zone.".to_string(),
+                cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+                confidence: 0.82,
+            }],
+        )
+        .expect("fixture model should be valid");
+        let ledger = FixtureLedger {
+            refs: BTreeSet::from(["ledger:30:ndvi:001".to_string()]),
+        };
+        let index = build_evidence_retrieval_index(
+            "field-001".to_string(),
+            vec![EvidenceCandidate {
+                evidence_id: "evidence-ndvi-001".to_string(),
+                kind: EvidenceKind::ImageryProduct,
+                field_id: "field-001".to_string(),
+                scene_ref: Some("scene-2026-06-01".to_string()),
+                zone_ref: Some("zone-ne".to_string()),
+                ledger_ref: "ledger:30:ndvi:001".to_string(),
+                summary: "NDVI in the northeast zone dropped below threshold.".to_string(),
+            }],
+            &ledger,
+        )
+        .expect("index should build");
+        let retrieved = index.entries.clone();
+        let answer = model
+            .answer(CopilotAnswerRequest {
+                question: "why is the northeast zone stressed?".to_string(),
+                retrieved_evidence: retrieved.clone(),
+            })
+            .expect("fixture answer should be returned");
+
+        let grounded = post_check_grounded_answer(
+            answer,
+            vec![CopilotAnswerClaim {
+                text: "NDVI dropped below threshold in the northeast zone.".to_string(),
+                cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+            }],
+            &retrieved,
+        )
+        .expect("answer should be grounded");
+
+        assert_eq!(grounded.claims.len(), 1);
+        assert_eq!(grounded.cited_evidence_ids, vec!["evidence-ndvi-001"]);
+        assert_eq!(grounded.model_provider, "test-double");
+    }
+
+    #[test]
+    fn grounded_answer_post_check_rejects_uncited_claim() {
+        let error = post_check_grounded_answer(
+            fixture_answer(),
+            vec![CopilotAnswerClaim {
+                text: "The northeast zone is stressed.".to_string(),
+                cited_evidence_ids: vec![],
+            }],
+            &[retrieved_evidence("evidence-ndvi-001")],
+        )
+        .expect_err("uncited claim should be rejected");
+
+        assert_eq!(
+            error,
+            CopilotGroundingError::UncitedClaim {
+                claim: "The northeast zone is stressed.".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn grounded_answer_post_check_rejects_unresolved_claim_citation() {
+        let error = post_check_grounded_answer(
+            fixture_answer(),
+            vec![CopilotAnswerClaim {
+                text: "The northeast zone is stressed.".to_string(),
+                cited_evidence_ids: vec!["evidence-missing".to_string()],
+            }],
+            &[retrieved_evidence("evidence-ndvi-001")],
+        )
+        .expect_err("unresolved citation should be rejected");
+
+        assert_eq!(
+            error,
+            CopilotGroundingError::CitationNotRetrieved {
+                claim: "The northeast zone is stressed.".to_string(),
+                evidence_id: "evidence-missing".to_string()
+            }
+        );
+    }
+
     fn retrieved_evidence(evidence_id: &str) -> EvidenceIndexEntry {
         EvidenceIndexEntry {
             evidence_id: evidence_id.to_string(),
@@ -611,6 +844,17 @@ mod tests {
             zone_ref: Some("zone-ne".to_string()),
             ledger_ref: format!("ledger:30:{evidence_id}"),
             summary: "NDVI in the northeast zone dropped below threshold.".to_string(),
+        }
+    }
+
+    fn fixture_answer() -> super::CopilotAnswer {
+        super::CopilotAnswer {
+            text: "The northeast zone is stressed.".to_string(),
+            cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+            confidence: 0.82,
+            model_provider: "test-double".to_string(),
+            model_id: "fixture-rag".to_string(),
+            model_version: "2026-06-12".to_string(),
         }
     }
 }
