@@ -199,6 +199,60 @@ pub struct ApplicationGeometry {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OperatorCertificationRegistrationRequest {
+    #[serde(default)]
+    pub cert_id: Option<String>,
+    #[serde(default)]
+    pub operator_id: String,
+    #[serde(default)]
+    pub cert_type: String,
+    #[serde(default)]
+    pub issued_at: String,
+    #[serde(default)]
+    pub expires_at: String,
+    #[serde(default)]
+    pub authority: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorCertificationRecord {
+    pub cert_id: String,
+    pub operator_id: String,
+    pub cert_type: String,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub authority: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificationStatus {
+    Valid,
+    Expired,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificationBlockReason {
+    ExpiredCertification,
+    MissingCertification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificationCheckResult {
+    pub operator_id: String,
+    pub required_cert_type: String,
+    pub checked_at: String,
+    pub status: CertificationStatus,
+    pub cert_id: Option<String>,
+    pub expires_at: Option<String>,
+    pub block_flight: bool,
+    pub reason_code: Option<CertificationBlockReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CreateComplianceRecordRequest {
     #[serde(default)]
     pub record_id: Option<String>,
@@ -354,6 +408,31 @@ pub enum AirspaceZoneError {
     UnsupportedZoneClass { value: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OperatorCertificationError {
+    #[error("cert_id cannot be empty")]
+    EmptyCertId,
+    #[error("operator_id cannot be empty")]
+    EmptyOperatorId,
+    #[error("cert_type cannot be empty")]
+    EmptyCertType,
+    #[error("issued_at cannot be empty")]
+    EmptyIssuedAt,
+    #[error("expires_at cannot be empty")]
+    EmptyExpiresAt,
+    #[error("authority cannot be empty")]
+    EmptyAuthority,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("checked_at cannot be empty")]
+    EmptyCheckedAt,
+    #[error("{start_field} must be at or before {end_field}")]
+    InvalidTimeRange {
+        start_field: &'static str,
+        end_field: &'static str,
+    },
+}
+
 pub fn build_initial_compliance_record(
     request: CreateComplianceRecordRequest,
     generated_record_id: String,
@@ -462,6 +541,115 @@ pub fn build_airspace_zone_record(
             AirspaceZoneError::EmptyCreatedAt,
         )?,
     })
+}
+
+pub fn build_operator_certification_record(
+    request: OperatorCertificationRegistrationRequest,
+    generated_cert_id: String,
+    created_at: String,
+) -> Result<OperatorCertificationRecord, OperatorCertificationError> {
+    let cert_id = match normalize_optional_text(request.cert_id) {
+        Some(cert_id) => cert_id,
+        None => normalize_required_operator_text(
+            generated_cert_id,
+            OperatorCertificationError::EmptyCertId,
+        )?,
+    };
+    let operator_id = normalize_required_operator_text(
+        request.operator_id,
+        OperatorCertificationError::EmptyOperatorId,
+    )?;
+    let cert_type = normalize_required_operator_text(
+        request.cert_type,
+        OperatorCertificationError::EmptyCertType,
+    )?;
+    let issued_at = normalize_required_operator_text(
+        request.issued_at,
+        OperatorCertificationError::EmptyIssuedAt,
+    )?;
+    let expires_at = normalize_required_operator_text(
+        request.expires_at,
+        OperatorCertificationError::EmptyExpiresAt,
+    )?;
+    ensure_operator_time_range(&issued_at, &expires_at, "issued_at", "expires_at")?;
+
+    Ok(OperatorCertificationRecord {
+        cert_id,
+        operator_id,
+        cert_type,
+        issued_at,
+        expires_at,
+        authority: normalize_required_operator_text(
+            request.authority,
+            OperatorCertificationError::EmptyAuthority,
+        )?,
+        created_at: normalize_required_operator_text(
+            created_at,
+            OperatorCertificationError::EmptyCreatedAt,
+        )?,
+    })
+}
+
+pub fn check_operator_certification(
+    operator_id: String,
+    required_cert_type: String,
+    checked_at: String,
+    certifications: &[OperatorCertificationRecord],
+) -> Result<CertificationCheckResult, OperatorCertificationError> {
+    let operator_id =
+        normalize_required_operator_text(operator_id, OperatorCertificationError::EmptyOperatorId)?;
+    let required_cert_type = normalize_required_operator_text(
+        required_cert_type,
+        OperatorCertificationError::EmptyCertType,
+    )?;
+    let checked_at =
+        normalize_required_operator_text(checked_at, OperatorCertificationError::EmptyCheckedAt)?;
+
+    let best_match = certifications
+        .iter()
+        .filter(|certification| {
+            certification.operator_id == operator_id
+                && certification.cert_type == required_cert_type
+                && certification.issued_at <= checked_at
+        })
+        .max_by(|left, right| left.expires_at.cmp(&right.expires_at));
+
+    let Some(certification) = best_match else {
+        return Ok(CertificationCheckResult {
+            operator_id,
+            required_cert_type,
+            checked_at,
+            status: CertificationStatus::Missing,
+            cert_id: None,
+            expires_at: None,
+            block_flight: true,
+            reason_code: Some(CertificationBlockReason::MissingCertification),
+        });
+    };
+
+    if certification.expires_at < checked_at {
+        Ok(CertificationCheckResult {
+            operator_id,
+            required_cert_type,
+            checked_at,
+            status: CertificationStatus::Expired,
+            cert_id: Some(certification.cert_id.clone()),
+            expires_at: Some(certification.expires_at.clone()),
+            block_flight: true,
+            reason_code: Some(CertificationBlockReason::ExpiredCertification),
+        })
+    } else {
+        Ok(CertificationCheckResult {
+            operator_id,
+            required_cert_type,
+            checked_at,
+            status: CertificationStatus::Valid,
+            cert_id: Some(certification.cert_id.clone()),
+            expires_at: Some(certification.expires_at.clone()),
+            block_flight: false,
+            reason_code: None,
+        })
+    }
 }
 
 pub fn airspace_zone_contains_point(zone: &AirspaceZoneRecord, point: AirspaceCoordinate) -> bool {
@@ -812,6 +1000,34 @@ fn normalize_required_airspace_text(
     }
 }
 
+fn normalize_required_operator_text(
+    value: String,
+    error: OperatorCertificationError,
+) -> Result<String, OperatorCertificationError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn ensure_operator_time_range(
+    started_at: &str,
+    ended_at: &str,
+    start_field: &'static str,
+    end_field: &'static str,
+) -> Result<(), OperatorCertificationError> {
+    if started_at > ended_at {
+        Err(OperatorCertificationError::InvalidTimeRange {
+            start_field,
+            end_field,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -958,11 +1174,13 @@ mod tests {
     use super::{
         airspace_zone_contains_point, airspace_zone_intersects_polygon,
         append_compliance_record_version, build_airspace_zone_record,
-        build_initial_compliance_record, refuse_in_place_mutation, AirspaceCoordinate,
+        build_initial_compliance_record, build_operator_certification_record,
+        check_operator_certification, refuse_in_place_mutation, AirspaceCoordinate,
         AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
-        AppendComplianceRecordVersionRequest, ApplicationGeometry, ChemicalApplicationRecord,
-        ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
-        CreateComplianceRecordRequest, RemoteIdFlightLogRecord, RemoteIdTrackPoint,
+        AppendComplianceRecordVersionRequest, ApplicationGeometry, CertificationBlockReason,
+        CertificationStatus, ChemicalApplicationRecord, ComplianceRecordError,
+        ComplianceRecordPayload, ComplianceRecordType, CreateComplianceRecordRequest,
+        OperatorCertificationRegistrationRequest, RemoteIdFlightLogRecord, RemoteIdTrackPoint,
         TelemetryGapRecord,
     };
 
@@ -1054,6 +1272,74 @@ mod tests {
         .expect_err("missing provenance should be rejected");
 
         assert_eq!(error, ComplianceRecordError::EmptyProvenanceRef);
+    }
+
+    #[test]
+    fn operator_certification_valid_at_flight_time_allows_flight_input() {
+        let cert = operator_cert(
+            "cert-107-valid",
+            "operator-17",
+            "part-107",
+            "2026-01-01T00:00:00Z",
+            "2026-12-31T23:59:59Z",
+        );
+
+        let result = check_operator_certification(
+            " operator-17 ".to_string(),
+            " part-107 ".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+            &[cert],
+        )
+        .expect("certification check should run");
+
+        assert_eq!(result.status, CertificationStatus::Valid);
+        assert_eq!(result.cert_id.as_deref(), Some("cert-107-valid"));
+        assert!(!result.block_flight);
+        assert_eq!(result.reason_code, None);
+    }
+
+    #[test]
+    fn operator_certification_expired_blocks_flight_input() {
+        let cert = operator_cert(
+            "cert-107-expired",
+            "operator-17",
+            "part-107",
+            "2025-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+
+        let result = check_operator_certification(
+            "operator-17".to_string(),
+            "part-107".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+            &[cert],
+        )
+        .expect("certification check should run");
+
+        assert_eq!(result.status, CertificationStatus::Expired);
+        assert!(result.block_flight);
+        assert_eq!(
+            result.reason_code,
+            Some(CertificationBlockReason::ExpiredCertification)
+        );
+    }
+
+    #[test]
+    fn operator_certification_missing_blocks_flight_input() {
+        let result = check_operator_certification(
+            "operator-17".to_string(),
+            "part-107".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+            &[],
+        )
+        .expect("certification check should run");
+
+        assert_eq!(result.status, CertificationStatus::Missing);
+        assert!(result.block_flight);
+        assert_eq!(
+            result.reason_code,
+            Some(CertificationBlockReason::MissingCertification)
+        );
     }
 
     #[test]
@@ -1338,6 +1624,28 @@ mod tests {
                 value: "EPSG:3857".to_string()
             }
         );
+    }
+
+    fn operator_cert(
+        cert_id: &str,
+        operator_id: &str,
+        cert_type: &str,
+        issued_at: &str,
+        expires_at: &str,
+    ) -> super::OperatorCertificationRecord {
+        build_operator_certification_record(
+            OperatorCertificationRegistrationRequest {
+                cert_id: Some(cert_id.to_string()),
+                operator_id: operator_id.to_string(),
+                cert_type: cert_type.to_string(),
+                issued_at: issued_at.to_string(),
+                expires_at: expires_at.to_string(),
+                authority: "FAA".to_string(),
+            },
+            "generated-cert".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+        )
+        .expect("operator cert should be valid")
     }
 
     fn square_zone() -> Vec<AirspaceCoordinate> {
