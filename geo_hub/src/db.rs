@@ -306,9 +306,50 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             title TEXT NOT NULL,
             format TEXT NOT NULL,
             path TEXT NOT NULL,
+            visibility TEXT NOT NULL DEFAULT 'org',
             annotation_count INTEGER NOT NULL,
             recommendation_count INTEGER NOT NULL,
             created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "reports",
+        "visibility",
+        "ALTER TABLE reports ADD COLUMN visibility TEXT NOT NULL DEFAULT 'org'",
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS report_shares (
+            share_token TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            scene_id TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(report_id) REFERENCES reports(report_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS report_share_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_token TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            scene_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            details TEXT
         );
         "#,
     )
@@ -383,6 +424,14 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     sqlx::query(
         r#"
         CREATE INDEX IF NOT EXISTS idx_reports_scene_id ON reports(scene_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_report_shares_report_id ON report_shares(report_id);
         "#,
     )
     .execute(pool)

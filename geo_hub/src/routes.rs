@@ -230,6 +230,40 @@ pub struct UpdateRecommendationRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateReportRequest {
     pub title: Option<String>,
+    #[serde(default)]
+    pub visibility: ReportVisibility,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateReportShareRequest {
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportShareResponse {
+    pub share_token: String,
+    pub report_id: String,
+    pub scene_id: String,
+    pub url_path: String,
+    pub expires_at: String,
+    pub revoked_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReportShareRecord {
+    share_token: String,
+    report_id: String,
+    scene_id: String,
+    expires_at: String,
+    revoked_at: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct SharedReportRecord {
+    share: ReportShareRecord,
+    report: ReportRecord,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1825,7 +1859,7 @@ pub async fn list_scene_reports(
 
     let rows = sqlx::query(
         r#"
-        SELECT report_id, scene_id, field_id, title, format, path, annotation_count, recommendation_count, created_at
+        SELECT report_id, scene_id, field_id, title, format, path, visibility, annotation_count, recommendation_count, created_at
         FROM reports
         WHERE scene_id = ?1
         ORDER BY created_at DESC
@@ -1853,13 +1887,13 @@ pub async fn generate_scene_report(
         return Err(AppError::NotFound);
     }
 
-    let report = build_scene_report(&state, &scene_id, request.title).await?;
+    let report = build_scene_report(&state, &scene_id, request.title, request.visibility).await?;
     sqlx::query(
         r#"
         INSERT INTO reports (
-            report_id, scene_id, field_id, title, format, path, annotation_count, recommendation_count, created_at
+            report_id, scene_id, field_id, title, format, path, visibility, annotation_count, recommendation_count, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         "#,
     )
     .bind(&report.report_id)
@@ -1868,6 +1902,7 @@ pub async fn generate_scene_report(
     .bind(&report.title)
     .bind(report_format_str(report.format))
     .bind(&report.artifact_path)
+    .bind(report_visibility_str(report.visibility))
     .bind(report.annotation_count as i64)
     .bind(report.recommendation_count as i64)
     .bind(&report.created_at)
@@ -1889,30 +1924,115 @@ pub async fn download_scene_report(
     let report = load_report(&state, &scene_id, &report_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let report_path = PathBuf::from(&report.artifact_path);
+    report_file_response(&report).await
+}
 
-    let file = File::open(&report_path)
-        .await
-        .map_err(|error| match error.kind() {
-            ErrorKind::NotFound => AppError::NotFound,
-            _ => AppError::Anyhow(error.into()),
-        })?;
-
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    if let Some(filename) = report_path.file_name().and_then(|name| name.to_str()) {
-        if let Ok(value) = HeaderValue::from_str(&format!("inline; filename=\"{}\"", filename)) {
-            headers.insert(header::CONTENT_DISPOSITION, value);
-        }
+pub async fn create_report_share(
+    Path((scene_id, report_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<CreateReportShareRequest>,
+) -> AppResult<Json<ReportShareResponse>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
     }
 
-    Ok((headers, body).into_response())
+    let report = load_report(&state, &scene_id, &report_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if report.visibility != ReportVisibility::Shared {
+        return Err(AppError::BadRequest(
+            "org-only report cannot be shared".to_string(),
+        ));
+    }
+
+    let now = current_record_timestamp();
+    let share = ReportShareRecord {
+        share_token: Uuid::new_v4().to_string(),
+        report_id,
+        scene_id,
+        expires_at: normalize_share_expires_at(request.expires_at)?,
+        revoked_at: None,
+        created_at: now,
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO report_shares (share_token, report_id, scene_id, expires_at, revoked_at, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&share.share_token)
+    .bind(&share.report_id)
+    .bind(&share.scene_id)
+    .bind(&share.expires_at)
+    .bind(&share.revoked_at)
+    .bind(&share.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    audit_report_share_event(&state, &share, "share_created", None).await?;
+
+    Ok(Json(report_share_response(&share)))
+}
+
+pub async fn revoke_report_share(
+    Path((scene_id, report_id, share_token)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<StatusCode> {
+    let revoked_at = current_record_timestamp();
+    let result = sqlx::query(
+        r#"
+        UPDATE report_shares
+        SET revoked_at = COALESCE(revoked_at, ?1)
+        WHERE scene_id = ?2 AND report_id = ?3 AND share_token = ?4
+        "#,
+    )
+    .bind(&revoked_at)
+    .bind(&scene_id)
+    .bind(&report_id)
+    .bind(&share_token)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    let share = load_report_share(&state, &share_token)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    audit_report_share_event(&state, &share, "share_revoked", None).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn download_shared_report(
+    Path(share_token): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let share = load_report_share_with_report(&state, &share_token)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if share.share.revoked_at.is_some() {
+        return Err(AppError::Forbidden(
+            "report share link has been revoked".to_string(),
+        ));
+    }
+    if share_expired(&share.share.expires_at)? {
+        return Err(AppError::Forbidden(
+            "report share link has expired".to_string(),
+        ));
+    }
+    if share.report.visibility != ReportVisibility::Shared {
+        return Err(AppError::Forbidden(
+            "report is not publicly shareable".to_string(),
+        ));
+    }
+
+    audit_report_share_event(&state, &share.share, "share_accessed", None).await?;
+    report_file_response(&share.report).await
 }
 
 pub async fn export_scene_annotations_csv(
@@ -3251,6 +3371,7 @@ async fn build_scene_report(
     state: &AppState,
     scene_id: &str,
     title: Option<String>,
+    visibility: ReportVisibility,
 ) -> AppResult<ReportRecord> {
     let scene_row = sqlx::query(
         "SELECT scene_id, sensor, acquired_at, data_path, metadata_json, field_id FROM scenes WHERE scene_id = ?1",
@@ -3320,7 +3441,7 @@ async fn build_scene_report(
         artifact_path: artifact_uri.clone(),
         artifact_uri,
         download_url: format!("/api/scenes/{scene_id}/reports/{report_id}"),
-        visibility: ReportVisibility::Org,
+        visibility,
         annotation_count: annotations.len(),
         recommendation_count: recommendations.len(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -4058,10 +4179,28 @@ fn decode_report_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ReportRecord
         artifact_path: artifact_path.clone(),
         artifact_uri: artifact_path,
         download_url: format!("/api/scenes/{scene_id}/reports/{report_id}"),
-        visibility: ReportVisibility::Org,
+        visibility: parse_report_visibility(row.get("visibility"))?,
         annotation_count: row.get::<i64, _>("annotation_count") as usize,
         recommendation_count: row.get::<i64, _>("recommendation_count") as usize,
         created_at: row.get("created_at"),
+    })
+}
+
+fn decode_report_share_record(row: &sqlx::sqlite::SqliteRow) -> ReportShareRecord {
+    ReportShareRecord {
+        share_token: row.get("share_token"),
+        report_id: row.get("share_report_id"),
+        scene_id: row.get("share_scene_id"),
+        expires_at: row.get("share_expires_at"),
+        revoked_at: row.get("share_revoked_at"),
+        created_at: row.get("share_created_at"),
+    }
+}
+
+fn decode_shared_report_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<SharedReportRecord> {
+    Ok(SharedReportRecord {
+        share: decode_report_share_record(row),
+        report: decode_report_record(row)?,
     })
 }
 
@@ -4170,7 +4309,7 @@ async fn load_report(
 ) -> AppResult<Option<ReportRecord>> {
     let row = sqlx::query(
         r#"
-        SELECT report_id, scene_id, field_id, title, format, path, annotation_count, recommendation_count, created_at
+        SELECT report_id, scene_id, field_id, title, format, path, visibility, annotation_count, recommendation_count, created_at
         FROM reports
         WHERE scene_id = ?1 AND report_id = ?2
         "#,
@@ -4182,6 +4321,90 @@ async fn load_report(
     .map_err(Error::from)?;
 
     row.map(|row| decode_report_record(&row)).transpose()
+}
+
+async fn load_report_share(
+    state: &AppState,
+    share_token: &str,
+) -> AppResult<Option<ReportShareRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT share_token,
+               report_id AS share_report_id,
+               scene_id AS share_scene_id,
+               expires_at AS share_expires_at,
+               revoked_at AS share_revoked_at,
+               created_at AS share_created_at
+        FROM report_shares
+        WHERE share_token = ?1
+        "#,
+    )
+    .bind(share_token)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(row.map(|row| decode_report_share_record(&row)))
+}
+
+async fn load_report_share_with_report(
+    state: &AppState,
+    share_token: &str,
+) -> AppResult<Option<SharedReportRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT s.share_token,
+               s.report_id AS share_report_id,
+               s.scene_id AS share_scene_id,
+               s.expires_at AS share_expires_at,
+               s.revoked_at AS share_revoked_at,
+               s.created_at AS share_created_at,
+               r.report_id,
+               r.scene_id,
+               r.field_id,
+               r.title,
+               r.format,
+               r.path,
+               r.visibility,
+               r.annotation_count,
+               r.recommendation_count,
+               r.created_at
+        FROM report_shares s
+        JOIN reports r ON r.report_id = s.report_id AND r.scene_id = s.scene_id
+        WHERE s.share_token = ?1
+        "#,
+    )
+    .bind(share_token)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_shared_report_record(&row)).transpose()
+}
+
+async fn audit_report_share_event(
+    state: &AppState,
+    share: &ReportShareRecord,
+    event_type: &str,
+    details: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO report_share_events (share_token, report_id, scene_id, event_type, created_at, details)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&share.share_token)
+    .bind(&share.report_id)
+    .bind(&share.scene_id)
+    .bind(event_type)
+    .bind(current_record_timestamp())
+    .bind(details)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
 }
 
 async fn load_recommendation_annotation_ids(
@@ -4388,6 +4611,85 @@ fn parse_report_format(value: String) -> AppResult<ReportFormat> {
             value
         ))),
     }
+}
+
+fn report_visibility_str(visibility: ReportVisibility) -> &'static str {
+    match visibility {
+        ReportVisibility::Org => "org",
+        ReportVisibility::Shared => "shared",
+    }
+}
+
+fn parse_report_visibility(value: String) -> AppResult<ReportVisibility> {
+    match value.as_str() {
+        "org" => Ok(ReportVisibility::Org),
+        "shared" => Ok(ReportVisibility::Shared),
+        _ => Err(AppError::BadRequest(format!(
+            "invalid report visibility {}",
+            value
+        ))),
+    }
+}
+
+fn normalize_share_expires_at(value: Option<String>) -> AppResult<String> {
+    match normalize_optional_text(value) {
+        Some(value) => parse_share_timestamp(&value).map(format_share_timestamp),
+        None => Ok(format_share_timestamp(
+            chrono::Utc::now() + chrono::Duration::days(7),
+        )),
+    }
+}
+
+fn share_expired(expires_at: &str) -> AppResult<bool> {
+    Ok(parse_share_timestamp(expires_at)? <= chrono::Utc::now())
+}
+
+fn parse_share_timestamp(value: &str) -> AppResult<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|_| AppError::BadRequest(format!("invalid report share expiry {}", value)))
+}
+
+fn format_share_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> String {
+    timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn report_share_response(share: &ReportShareRecord) -> ReportShareResponse {
+    ReportShareResponse {
+        share_token: share.share_token.clone(),
+        report_id: share.report_id.clone(),
+        scene_id: share.scene_id.clone(),
+        url_path: format!("/api/report-shares/{}", share.share_token),
+        expires_at: share.expires_at.clone(),
+        revoked_at: share.revoked_at.clone(),
+        created_at: share.created_at.clone(),
+    }
+}
+
+async fn report_file_response(report: &ReportRecord) -> AppResult<Response> {
+    let report_path = PathBuf::from(&report.artifact_path);
+    let file = File::open(&report_path)
+        .await
+        .map_err(|error| match error.kind() {
+            ErrorKind::NotFound => AppError::NotFound,
+            _ => AppError::Anyhow(error.into()),
+        })?;
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    if let Some(filename) = report_path.file_name().and_then(|name| name.to_str()) {
+        if let Ok(value) = HeaderValue::from_str(&format!("inline; filename=\"{}\"", filename)) {
+            headers.insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+
+    Ok((headers, body).into_response())
 }
 
 fn render_scene_report_html(

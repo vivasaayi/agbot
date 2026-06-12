@@ -2635,6 +2635,187 @@ async fn report_generation_and_download_roundtrip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn shared_report_link_allows_public_access_until_revoked() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "shared-report-scene";
+    std::fs::create_dir_all(ctx.data_root.join("scenes").join(scene_id))?;
+    let report_id =
+        generate_report(&ctx, scene_id, "Shared agronomy report", Some("shared")).await?;
+
+    let share_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/reports/{report_id}/shares"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "expires_at": "2099-01-01T00:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(share_response.status(), StatusCode::OK);
+    let body = to_bytes(share_response.into_body(), 64 * 1024).await?;
+    let share_json: serde_json::Value = serde_json::from_slice(&body)?;
+    let share_token = share_json
+        .get("share_token")
+        .and_then(|value| value.as_str())
+        .expect("share token should exist")
+        .to_string();
+    let url_path = share_json
+        .get("url_path")
+        .and_then(|value| value.as_str())
+        .expect("url path should exist")
+        .to_string();
+
+    let public_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&url_path)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(public_response.status(), StatusCode::OK);
+    let body = to_bytes(public_response.into_body(), 256 * 1024).await?;
+    assert!(String::from_utf8_lossy(&body).contains("Shared agronomy report"));
+
+    let revoke_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/reports/{report_id}/shares/{share_token}"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(revoke_response.status(), StatusCode::NO_CONTENT);
+
+    let denied_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&url_path)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied_response.status(), StatusCode::FORBIDDEN);
+
+    let event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM report_share_events WHERE share_token = ?1")
+            .bind(&share_token)
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(event_count, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_report_share_link_is_denied() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "expired-report-scene";
+    std::fs::create_dir_all(ctx.data_root.join("scenes").join(scene_id))?;
+    let report_id = generate_report(&ctx, scene_id, "Expired report", Some("shared")).await?;
+
+    let share_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/reports/{report_id}/shares"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "expires_at": "2000-01-01T00:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(share_response.status(), StatusCode::OK);
+    let body = to_bytes(share_response.into_body(), 64 * 1024).await?;
+    let share_json: serde_json::Value = serde_json::from_slice(&body)?;
+    let url_path = share_json
+        .get("url_path")
+        .and_then(|value| value.as_str())
+        .expect("url path should exist");
+
+    let denied_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(url_path)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied_response.status(), StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn org_only_report_does_not_produce_public_share_link() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "org-only-report-scene";
+    std::fs::create_dir_all(ctx.data_root.join("scenes").join(scene_id))?;
+    let report_id = generate_report(&ctx, scene_id, "Org only report", None).await?;
+
+    let share_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/reports/{report_id}/shares"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "expires_at": "2099-01-01T00:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(share_response.status(), StatusCode::BAD_REQUEST);
+
+    let share_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM report_shares")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(share_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn scene_manifest_lists_available_products_from_disk() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -3655,6 +3836,42 @@ async fn insert_scene_with_spatial_ref(
     .await?;
 
     upsert_scene_spatial_ref(ctx, scene_id, spatial_ref).await
+}
+
+async fn generate_report(
+    ctx: &TestContext,
+    scene_id: &str,
+    title: &str,
+    visibility: Option<&str>,
+) -> Result<String> {
+    let mut payload = json!({
+        "title": title
+    });
+    if let Some(visibility) = visibility {
+        payload["visibility"] = serde_json::Value::String(visibility.to_string());
+    }
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/reports"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 256 * 1024).await?;
+    let report_json: serde_json::Value = serde_json::from_slice(&body)?;
+    Ok(report_json
+        .get("report_id")
+        .and_then(|value| value.as_str())
+        .expect("report_id should exist")
+        .to_string())
 }
 
 async fn link_scene_context(

@@ -1,7 +1,7 @@
 use crate::{config::HubConfig, routes, state::AppState};
 use anyhow::Result;
 use axum::{
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -99,6 +99,18 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/scenes/:scene_id/reports/:report_id",
             get(routes::download_scene_report),
+        )
+        .route(
+            "/api/scenes/:scene_id/reports/:report_id/shares",
+            post(routes::create_report_share),
+        )
+        .route(
+            "/api/scenes/:scene_id/reports/:report_id/shares/:share_token",
+            delete(routes::revoke_report_share),
+        )
+        .route(
+            "/api/report-shares/:share_token",
+            get(routes::download_shared_report),
         )
         .route(
             "/api/scenes/:scene_id/exports/annotations.csv",

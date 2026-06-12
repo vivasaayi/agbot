@@ -12,6 +12,8 @@ pub enum AppError {
     NotFound,
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Forbidden(String),
 }
 
 impl IntoResponse for AppError {
@@ -23,6 +25,7 @@ impl IntoResponse for AppError {
             }
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
         }
     }
 }
