@@ -8,6 +8,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 pub mod config;
 pub mod control_plane;
 pub mod error;
+pub mod plugin_extensions;
 pub mod schemas;
 pub mod types;
 

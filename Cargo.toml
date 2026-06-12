@@ -17,6 +17,7 @@ members = [
     "soil_iot",
     "timeseries",
     "provenance",
+    "plugin_sdk",
     "lidar_mapper",
     "imagery_processor",
     "geo_hub",
