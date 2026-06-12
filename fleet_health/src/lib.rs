@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use timeseries::{SeriesPoint, SeriesValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,6 +101,146 @@ pub struct DutyAccrualRequest {
     pub ended_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TelemetryHealthIndicatorRequest {
+    #[serde(default)]
+    pub source_ref: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub samples: Vec<HealthTelemetrySample>,
+    #[serde(default)]
+    pub telemetry_gaps: Vec<HealthTelemetryGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthTelemetrySample {
+    #[serde(default)]
+    pub component_id: String,
+    pub component_type: FleetComponentType,
+    #[serde(default)]
+    pub ts: String,
+    #[serde(default)]
+    pub battery_open_circuit_voltage_v: Option<f64>,
+    #[serde(default)]
+    pub battery_voltage_v: Option<f64>,
+    #[serde(default)]
+    pub battery_current_a: Option<f64>,
+    #[serde(default)]
+    pub motor_vibration_g: Option<f64>,
+    #[serde(default)]
+    pub esc_temperature_c: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthTelemetryGap {
+    #[serde(default)]
+    pub component_id: String,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub ended_at: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetHealthIndicator {
+    BatteryInternalResistance,
+    MotorVibration,
+    EscTemperature,
+}
+
+impl FleetHealthIndicator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetHealthIndicator::BatteryInternalResistance => {
+                "battery_internal_resistance_milliohm"
+            }
+            FleetHealthIndicator::MotorVibration => "motor_vibration_g",
+            FleetHealthIndicator::EscTemperature => "esc_temperature_c",
+        }
+    }
+}
+
+impl std::str::FromStr for FleetHealthIndicator {
+    type Err = FleetHealthError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "battery_internal_resistance_milliohm" | "battery_internal_resistance" => {
+                Ok(Self::BatteryInternalResistance)
+            }
+            "motor_vibration_g" | "motor_vibration" => Ok(Self::MotorVibration),
+            "esc_temperature_c" | "esc_temperature" => Ok(Self::EscTemperature),
+            _ => Err(FleetHealthError::UnsupportedHealthIndicator {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthIndicatorFreshness {
+    Fresh,
+    Stale,
+}
+
+impl HealthIndicatorFreshness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HealthIndicatorFreshness::Fresh => "fresh",
+            HealthIndicatorFreshness::Stale => "stale",
+        }
+    }
+}
+
+impl std::str::FromStr for HealthIndicatorFreshness {
+    type Err = FleetHealthError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fresh" => Ok(Self::Fresh),
+            "stale" => Ok(Self::Stale),
+            _ => Err(FleetHealthError::UnsupportedHealthFreshness {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetHealthIndicatorSample {
+    pub component_id: String,
+    pub indicator: FleetHealthIndicator,
+    pub value: f64,
+    pub ts: String,
+    pub source_ref: String,
+    pub created_at: String,
+    pub freshness: HealthIndicatorFreshness,
+}
+
+impl FleetHealthIndicatorSample {
+    pub fn to_series_point(&self) -> SeriesPoint {
+        SeriesPoint {
+            entity_ref: format!("component:{}", self.component_id),
+            metric: self.indicator.as_str().to_string(),
+            t: self.ts.clone(),
+            value: SeriesValue::Scalar { value: self.value },
+            source_ref: self.source_ref.clone(),
+            created_at: self.created_at.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetHealthIndicatorDerivation {
+    pub samples: Vec<FleetHealthIndicatorSample>,
+    pub gaps: Vec<HealthTelemetryGap>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetComponentRecord {
     pub component_id: String,
@@ -157,6 +298,22 @@ pub enum FleetHealthError {
     InvalidDutyScore,
     #[error("ended_at cannot be empty")]
     EmptyEndedAt,
+    #[error("source_ref cannot be empty")]
+    EmptySourceRef,
+    #[error("telemetry sample timestamp cannot be empty")]
+    EmptyTelemetryTimestamp,
+    #[error("telemetry sample set cannot be empty")]
+    EmptyTelemetrySamples,
+    #[error("telemetry value must be finite")]
+    InvalidTelemetryValue,
+    #[error("battery current must be finite and non-zero")]
+    InvalidBatteryCurrent,
+    #[error("telemetry gap timestamp cannot be empty")]
+    EmptyTelemetryGapTimestamp,
+    #[error("telemetry gap reason cannot be empty")]
+    EmptyTelemetryGapReason,
+    #[error("telemetry gap started_at must be at or before ended_at")]
+    InvalidTelemetryGapRange,
     #[error("service_id cannot be empty")]
     EmptyServiceId,
     #[error("service performed_at cannot be empty")]
@@ -167,6 +324,10 @@ pub enum FleetHealthError {
     EmptyServiceAction,
     #[error("unsupported fleet component type {value}")]
     UnsupportedComponentType { value: String },
+    #[error("unsupported fleet health indicator {value}")]
+    UnsupportedHealthIndicator { value: String },
+    #[error("unsupported health indicator freshness {value}")]
+    UnsupportedHealthFreshness { value: String },
     #[error("component {component_id} is already installed on airframe {airframe_id}")]
     AlreadyInstalled {
         component_id: String,
@@ -289,6 +450,88 @@ pub fn accrue_component_duty(
     Ok(updated)
 }
 
+pub fn derive_health_indicators(
+    request: TelemetryHealthIndicatorRequest,
+) -> Result<FleetHealthIndicatorDerivation, FleetHealthError> {
+    let source_ref = normalize_required_text(request.source_ref, FleetHealthError::EmptySourceRef)?;
+    let created_at = normalize_required_text(request.created_at, FleetHealthError::EmptyCreatedAt)?;
+    if request.samples.is_empty() {
+        return Err(FleetHealthError::EmptyTelemetrySamples);
+    }
+    let gaps = request
+        .telemetry_gaps
+        .into_iter()
+        .map(normalize_health_telemetry_gap)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut samples = Vec::new();
+
+    for sample in request.samples {
+        let sample = normalize_health_telemetry_sample(sample)?;
+        let freshness = if has_later_gap(&gaps, &sample.component_id, &sample.ts) {
+            HealthIndicatorFreshness::Stale
+        } else {
+            HealthIndicatorFreshness::Fresh
+        };
+
+        match sample.component_type {
+            FleetComponentType::Battery => {
+                if let (Some(open_circuit), Some(loaded), Some(current)) = (
+                    sample.battery_open_circuit_voltage_v,
+                    sample.battery_voltage_v,
+                    sample.battery_current_a,
+                ) {
+                    validate_finite(open_circuit)?;
+                    validate_finite(loaded)?;
+                    validate_finite(current)?;
+                    if current.abs() <= f64::EPSILON {
+                        return Err(FleetHealthError::InvalidBatteryCurrent);
+                    }
+                    samples.push(FleetHealthIndicatorSample {
+                        component_id: sample.component_id,
+                        indicator: FleetHealthIndicator::BatteryInternalResistance,
+                        value: ((open_circuit - loaded).abs() / current.abs()) * 1000.0,
+                        ts: sample.ts,
+                        source_ref: source_ref.clone(),
+                        created_at: created_at.clone(),
+                        freshness,
+                    });
+                }
+            }
+            FleetComponentType::Motor => {
+                if let Some(value) = sample.motor_vibration_g {
+                    validate_finite(value)?;
+                    samples.push(FleetHealthIndicatorSample {
+                        component_id: sample.component_id,
+                        indicator: FleetHealthIndicator::MotorVibration,
+                        value,
+                        ts: sample.ts,
+                        source_ref: source_ref.clone(),
+                        created_at: created_at.clone(),
+                        freshness,
+                    });
+                }
+            }
+            FleetComponentType::Esc => {
+                if let Some(value) = sample.esc_temperature_c {
+                    validate_finite(value)?;
+                    samples.push(FleetHealthIndicatorSample {
+                        component_id: sample.component_id,
+                        indicator: FleetHealthIndicator::EscTemperature,
+                        value,
+                        ts: sample.ts,
+                        source_ref: source_ref.clone(),
+                        created_at: created_at.clone(),
+                        freshness,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(FleetHealthIndicatorDerivation { samples, gaps })
+}
+
 pub fn component_event(
     component_id: &str,
     event_type: &str,
@@ -311,6 +554,57 @@ pub fn component_event(
         actor: normalize_optional_text(actor),
         details: normalize_optional_text(details),
     })
+}
+
+fn normalize_health_telemetry_sample(
+    sample: HealthTelemetrySample,
+) -> Result<HealthTelemetrySample, FleetHealthError> {
+    Ok(HealthTelemetrySample {
+        component_id: normalize_required_text(
+            sample.component_id,
+            FleetHealthError::EmptyComponentId,
+        )?,
+        component_type: sample.component_type,
+        ts: normalize_required_text(sample.ts, FleetHealthError::EmptyTelemetryTimestamp)?,
+        battery_open_circuit_voltage_v: sample.battery_open_circuit_voltage_v,
+        battery_voltage_v: sample.battery_voltage_v,
+        battery_current_a: sample.battery_current_a,
+        motor_vibration_g: sample.motor_vibration_g,
+        esc_temperature_c: sample.esc_temperature_c,
+    })
+}
+
+fn normalize_health_telemetry_gap(
+    gap: HealthTelemetryGap,
+) -> Result<HealthTelemetryGap, FleetHealthError> {
+    let component_id =
+        normalize_required_text(gap.component_id, FleetHealthError::EmptyComponentId)?;
+    let started_at =
+        normalize_required_text(gap.started_at, FleetHealthError::EmptyTelemetryGapTimestamp)?;
+    let ended_at =
+        normalize_required_text(gap.ended_at, FleetHealthError::EmptyTelemetryGapTimestamp)?;
+    if started_at > ended_at {
+        return Err(FleetHealthError::InvalidTelemetryGapRange);
+    }
+    Ok(HealthTelemetryGap {
+        component_id,
+        started_at,
+        ended_at,
+        reason: normalize_required_text(gap.reason, FleetHealthError::EmptyTelemetryGapReason)?,
+    })
+}
+
+fn has_later_gap(gaps: &[HealthTelemetryGap], component_id: &str, sample_ts: &str) -> bool {
+    gaps.iter()
+        .any(|gap| gap.component_id == component_id && gap.started_at.as_str() > sample_ts)
+}
+
+fn validate_finite(value: f64) -> Result<(), FleetHealthError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(FleetHealthError::InvalidTelemetryValue)
+    }
 }
 
 fn normalize_service_history_entry(
@@ -369,9 +663,12 @@ fn validate_nonnegative_finite(
 mod tests {
     use super::{
         accrue_component_duty, build_component_duty_accruals, build_component_record,
-        component_event, install_component, DutyAccrualRequest, FleetComponentType,
-        FleetHealthError, InstallComponentRequest, RegisterComponentRequest, ServiceHistoryEntry,
+        component_event, derive_health_indicators, install_component, DutyAccrualRequest,
+        FleetComponentType, FleetHealthError, FleetHealthIndicator, HealthIndicatorFreshness,
+        HealthTelemetryGap, HealthTelemetrySample, InstallComponentRequest,
+        RegisterComponentRequest, ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
     };
+    use timeseries::SeriesValue;
 
     #[test]
     fn component_record_normalizes_install_and_service_history() {
@@ -544,5 +841,100 @@ mod tests {
         .expect_err("negative hours should be rejected");
 
         assert_eq!(error, FleetHealthError::InvalidFlightHours);
+    }
+
+    #[test]
+    fn telemetry_health_indicators_derive_scalar_series_points() {
+        let derived = derive_health_indicators(TelemetryHealthIndicatorRequest {
+            source_ref: "telemetry:session-001".to_string(),
+            created_at: "2026-06-12T12:20:00Z".to_string(),
+            samples: vec![
+                HealthTelemetrySample {
+                    component_id: "battery-pack-001".to_string(),
+                    component_type: FleetComponentType::Battery,
+                    ts: "2026-06-12T12:00:00Z".to_string(),
+                    battery_open_circuit_voltage_v: Some(16.8),
+                    battery_voltage_v: Some(15.96),
+                    battery_current_a: Some(28.0),
+                    motor_vibration_g: None,
+                    esc_temperature_c: None,
+                },
+                HealthTelemetrySample {
+                    component_id: "motor-front-left".to_string(),
+                    component_type: FleetComponentType::Motor,
+                    ts: "2026-06-12T12:00:00Z".to_string(),
+                    battery_open_circuit_voltage_v: None,
+                    battery_voltage_v: None,
+                    battery_current_a: None,
+                    motor_vibration_g: Some(0.42),
+                    esc_temperature_c: None,
+                },
+                HealthTelemetrySample {
+                    component_id: "esc-front-left".to_string(),
+                    component_type: FleetComponentType::Esc,
+                    ts: "2026-06-12T12:00:00Z".to_string(),
+                    battery_open_circuit_voltage_v: None,
+                    battery_voltage_v: None,
+                    battery_current_a: None,
+                    motor_vibration_g: None,
+                    esc_temperature_c: Some(54.5),
+                },
+            ],
+            telemetry_gaps: vec![],
+        })
+        .expect("health indicators should derive");
+
+        assert_eq!(derived.samples.len(), 3);
+        let resistance = derived
+            .samples
+            .iter()
+            .find(|sample| sample.indicator == FleetHealthIndicator::BatteryInternalResistance)
+            .expect("resistance sample should exist");
+        assert_eq!(resistance.component_id, "battery-pack-001");
+        assert!((resistance.value - 30.0).abs() < 1e-9);
+        assert_eq!(resistance.freshness, HealthIndicatorFreshness::Fresh);
+
+        let point = resistance.to_series_point();
+        assert_eq!(point.entity_ref, "component:battery-pack-001");
+        assert_eq!(point.metric, "battery_internal_resistance_milliohm");
+        assert_eq!(point.t, "2026-06-12T12:00:00Z");
+        match point.value {
+            SeriesValue::Scalar { value } => assert!((value - 30.0).abs() < 1e-9),
+            SeriesValue::Raster(_) => panic!("health indicator should be scalar"),
+        }
+    }
+
+    #[test]
+    fn telemetry_dropout_records_gap_and_marks_last_indicator_stale_without_backfill() {
+        let derived = derive_health_indicators(TelemetryHealthIndicatorRequest {
+            source_ref: "telemetry:session-002".to_string(),
+            created_at: "2026-06-12T12:20:00Z".to_string(),
+            samples: vec![HealthTelemetrySample {
+                component_id: "battery-pack-001".to_string(),
+                component_type: FleetComponentType::Battery,
+                ts: "2026-06-12T12:00:00Z".to_string(),
+                battery_open_circuit_voltage_v: Some(16.8),
+                battery_voltage_v: Some(16.24),
+                battery_current_a: Some(28.0),
+                motor_vibration_g: None,
+                esc_temperature_c: None,
+            }],
+            telemetry_gaps: vec![HealthTelemetryGap {
+                component_id: "battery-pack-001".to_string(),
+                started_at: "2026-06-12T12:01:00Z".to_string(),
+                ended_at: "2026-06-12T12:05:00Z".to_string(),
+                reason: "mavlink-radio-dropout".to_string(),
+            }],
+        })
+        .expect("health indicators should derive with gap");
+
+        assert_eq!(derived.gaps.len(), 1);
+        assert_eq!(derived.gaps[0].reason, "mavlink-radio-dropout");
+        assert_eq!(derived.samples.len(), 1);
+        assert_eq!(
+            derived.samples[0].freshness,
+            HealthIndicatorFreshness::Stale
+        );
+        assert_ne!(derived.samples[0].ts, "2026-06-12T12:01:00Z");
     }
 }

@@ -460,6 +460,60 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS time_series_points (
+            entity_ref TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            t TEXT NOT NULL,
+            value_kind TEXT NOT NULL,
+            scalar_value REAL,
+            source_ref TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (entity_ref, metric, t, source_ref)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fleet_health_indicator_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            component_id TEXT NOT NULL,
+            airframe_id TEXT,
+            indicator TEXT NOT NULL,
+            value REAL NOT NULL,
+            ts TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            freshness TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(component_id, indicator, ts, source_ref)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fleet_health_telemetry_gaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            component_id TEXT NOT NULL,
+            airframe_id TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(component_id, started_at, ended_at, source_ref)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS soil_iot_devices (
             device_id TEXT PRIMARY KEY,
             org_id TEXT NOT NULL,
@@ -727,6 +781,33 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_fleet_component_duty_accruals_airframe
         ON fleet_component_duty_accruals(airframe_id, session_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_time_series_points_entity_metric
+        ON time_series_points(entity_ref, metric, t);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_fleet_health_indicator_samples_component
+        ON fleet_health_indicator_samples(component_id, indicator, ts);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_fleet_health_telemetry_gaps_component
+        ON fleet_health_telemetry_gaps(component_id, started_at, ended_at);
         "#,
     )
     .execute(pool)

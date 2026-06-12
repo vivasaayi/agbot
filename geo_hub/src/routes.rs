@@ -29,9 +29,11 @@ use crop_intelligence::{
 };
 use fleet_health::{
     accrue_component_duty, build_component_duty_accruals, build_component_record, component_event,
-    install_component, ComponentDutyAccrualRecord, DutyAccrualRequest, FleetComponentEventRecord,
-    FleetComponentRecord, FleetComponentType, FleetHealthError, InstallComponentRequest,
-    RegisterComponentRequest, ServiceHistoryEntry,
+    derive_health_indicators, install_component, ComponentDutyAccrualRecord, DutyAccrualRequest,
+    FleetComponentEventRecord, FleetComponentRecord, FleetComponentType, FleetHealthError,
+    FleetHealthIndicator, FleetHealthIndicatorDerivation, FleetHealthIndicatorSample,
+    HealthIndicatorFreshness, HealthTelemetryGap, InstallComponentRequest,
+    RegisterComponentRequest, ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
 };
 use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
@@ -59,10 +61,12 @@ use soil_iot::{
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::io::ErrorKind;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::SystemTime;
+use timeseries::SeriesValue;
 use tokio::fs::File;
 use tokio::fs::{self, DirEntry};
 use tokio_util::io::ReaderStream;
@@ -318,6 +322,13 @@ pub struct FleetNodeListQuery {
 pub struct FleetComponentListQuery {
     pub airframe_id: Option<String>,
     pub component_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FleetHealthIndicatorListQuery {
+    pub component_id: Option<String>,
+    pub indicator: Option<String>,
+    pub freshness: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1783,6 +1794,101 @@ pub async fn accrue_fleet_component_duty(
     };
 
     Ok(Json(persisted))
+}
+
+pub async fn derive_fleet_health_indicators_route(
+    State(state): State<AppState>,
+    Json(mut request): Json<TelemetryHealthIndicatorRequest>,
+) -> AppResult<Json<FleetHealthIndicatorDerivation>> {
+    let component_ids = request
+        .samples
+        .iter()
+        .filter_map(|sample| normalize_optional_text(Some(sample.component_id.clone())))
+        .chain(
+            request
+                .telemetry_gaps
+                .iter()
+                .filter_map(|gap| normalize_optional_text(Some(gap.component_id.clone()))),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut components = BTreeMap::new();
+    for component_id in component_ids {
+        let component = load_fleet_component(&state, &component_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::BadRequest(format!("component {component_id} does not exist"))
+            })?;
+        components.insert(component.component_id.clone(), component);
+    }
+    for sample in &mut request.samples {
+        if let Some(component_id) = normalize_optional_text(Some(sample.component_id.clone())) {
+            if let Some(component) = components.get(&component_id) {
+                sample.component_id = component.component_id.clone();
+                sample.component_type = component.component_type;
+            }
+        }
+    }
+    for gap in &mut request.telemetry_gaps {
+        if let Some(component_id) = normalize_optional_text(Some(gap.component_id.clone())) {
+            if let Some(component) = components.get(&component_id) {
+                gap.component_id = component.component_id.clone();
+            }
+        }
+    }
+
+    let derived = derive_health_indicators(request).map_err(fleet_health_error)?;
+    for sample in &derived.samples {
+        let airframe_id = components
+            .get(&sample.component_id)
+            .and_then(|component| component.airframe_id.as_deref());
+        insert_fleet_health_indicator_sample(&state, sample, airframe_id).await?;
+        insert_time_series_point(&state, sample).await?;
+    }
+    for gap in &derived.gaps {
+        let airframe_id = components
+            .get(&gap.component_id)
+            .and_then(|component| component.airframe_id.as_deref());
+        insert_fleet_health_telemetry_gap(&state, gap, airframe_id, &derived).await?;
+    }
+
+    Ok(Json(derived))
+}
+
+pub async fn list_fleet_health_indicators(
+    Query(query): Query<FleetHealthIndicatorListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<FleetHealthIndicatorSample>>> {
+    let component_id = normalize_optional_text(query.component_id);
+    let indicator = normalize_optional_text(query.indicator)
+        .map(parse_fleet_health_indicator)
+        .transpose()?
+        .map(|indicator| indicator.as_str().to_string());
+    let freshness = normalize_optional_text(query.freshness)
+        .map(parse_health_indicator_freshness)
+        .transpose()?
+        .map(|freshness| freshness.as_str().to_string());
+
+    let rows = sqlx::query(
+        r#"
+        SELECT component_id, indicator, value, ts, source_ref, freshness, created_at
+        FROM fleet_health_indicator_samples
+        WHERE (?1 IS NULL OR component_id = ?1)
+          AND (?2 IS NULL OR indicator = ?2)
+          AND (?3 IS NULL OR freshness = ?3)
+        ORDER BY ts ASC, component_id ASC, indicator ASC
+        "#,
+    )
+    .bind(component_id)
+    .bind(indicator)
+    .bind(freshness)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_fleet_health_indicator_sample(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
 }
 
 pub async fn register_soil_iot_device(
@@ -4439,6 +4545,18 @@ fn parse_fleet_component_type(value: String) -> AppResult<FleetComponentType> {
         .map_err(fleet_health_error)
 }
 
+fn parse_fleet_health_indicator(value: String) -> AppResult<FleetHealthIndicator> {
+    value
+        .parse::<FleetHealthIndicator>()
+        .map_err(fleet_health_error)
+}
+
+fn parse_health_indicator_freshness(value: String) -> AppResult<HealthIndicatorFreshness> {
+    value
+        .parse::<HealthIndicatorFreshness>()
+        .map_err(fleet_health_error)
+}
+
 fn soil_iot_error(error: SoilIotError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -5209,6 +5327,20 @@ fn decode_component_duty_accrual(
     })
 }
 
+fn decode_fleet_health_indicator_sample(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<FleetHealthIndicatorSample> {
+    Ok(FleetHealthIndicatorSample {
+        component_id: row.get("component_id"),
+        indicator: parse_fleet_health_indicator(row.get::<String, _>("indicator"))?,
+        value: row.get("value"),
+        ts: row.get("ts"),
+        source_ref: row.get("source_ref"),
+        created_at: row.get("created_at"),
+        freshness: parse_health_indicator_freshness(row.get::<String, _>("freshness"))?,
+    })
+}
+
 fn decode_soil_iot_device(row: &sqlx::sqlite::SqliteRow) -> AppResult<SoilDeviceRecord> {
     Ok(SoilDeviceRecord {
         device_id: row.get("device_id"),
@@ -5635,6 +5767,101 @@ async fn insert_component_duty_accrual(
     .map_err(Error::from)?;
 
     Ok(result.rows_affected() > 0)
+}
+
+async fn insert_fleet_health_indicator_sample(
+    state: &AppState,
+    sample: &FleetHealthIndicatorSample,
+    airframe_id: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO fleet_health_indicator_samples (
+            component_id, airframe_id, indicator, value, ts, source_ref, freshness, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&sample.component_id)
+    .bind(airframe_id)
+    .bind(sample.indicator.as_str())
+    .bind(sample.value)
+    .bind(&sample.ts)
+    .bind(&sample.source_ref)
+    .bind(sample.freshness.as_str())
+    .bind(&sample.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_time_series_point(
+    state: &AppState,
+    sample: &FleetHealthIndicatorSample,
+) -> AppResult<()> {
+    let point = sample.to_series_point();
+    let scalar_value = match point.value {
+        SeriesValue::Scalar { value } => value,
+        SeriesValue::Raster(_) => {
+            return Err(AppError::BadRequest(
+                "fleet health indicators must write scalar time-series points".to_string(),
+            ));
+        }
+    };
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO time_series_points (
+            entity_ref, metric, t, value_kind, scalar_value, source_ref, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&point.entity_ref)
+    .bind(&point.metric)
+    .bind(&point.t)
+    .bind("scalar")
+    .bind(scalar_value)
+    .bind(&point.source_ref)
+    .bind(&point.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_fleet_health_telemetry_gap(
+    state: &AppState,
+    gap: &HealthTelemetryGap,
+    airframe_id: Option<&str>,
+    derived: &FleetHealthIndicatorDerivation,
+) -> AppResult<()> {
+    let sample = derived.samples.first().ok_or_else(|| {
+        AppError::BadRequest("health indicator sample required before gap persistence".to_string())
+    })?;
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO fleet_health_telemetry_gaps (
+            component_id, airframe_id, started_at, ended_at, reason, source_ref, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&gap.component_id)
+    .bind(airframe_id)
+    .bind(&gap.started_at)
+    .bind(&gap.ended_at)
+    .bind(&gap.reason)
+    .bind(&sample.source_ref)
+    .bind(&sample.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
 }
 
 async fn insert_soil_iot_device(state: &AppState, record: &SoilDeviceRecord) -> AppResult<()> {

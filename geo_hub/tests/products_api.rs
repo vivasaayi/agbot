@@ -1733,6 +1733,152 @@ async fn fleet_health_duty_accrual_is_idempotent_per_session() -> Result<()> {
 }
 
 #[tokio::test]
+async fn fleet_health_indicators_persist_timeseries_and_explicit_gaps() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let airframe_id = enroll_test_fleet_node(&ctx, "hw-drone-health-indicators-001").await?;
+    register_test_component_type(&ctx, "battery-pack-health-001", "battery", &airframe_id).await?;
+    register_test_component_type(&ctx, "motor-front-left", "motor", &airframe_id).await?;
+    register_test_component_type(&ctx, "esc-front-left", "esc", &airframe_id).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet-health/health-indicators")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "source_ref": "telemetry:session-health-001",
+                        "created_at": "2026-06-12T12:20:00Z",
+                        "samples": [
+                            {
+                                "component_id": "battery-pack-health-001",
+                                "component_type": "battery",
+                                "ts": "2026-06-12T12:00:00Z",
+                                "battery_open_circuit_voltage_v": 16.8,
+                                "battery_voltage_v": 15.96,
+                                "battery_current_a": 28.0
+                            },
+                            {
+                                "component_id": "motor-front-left",
+                                "component_type": "motor",
+                                "ts": "2026-06-12T12:00:00Z",
+                                "motor_vibration_g": 0.42
+                            },
+                            {
+                                "component_id": "esc-front-left",
+                                "component_type": "esc",
+                                "ts": "2026-06-12T12:00:00Z",
+                                "esc_temperature_c": 54.5
+                            }
+                        ],
+                        "telemetry_gaps": [
+                            {
+                                "component_id": "battery-pack-health-001",
+                                "started_at": "2026-06-12T12:01:00Z",
+                                "ended_at": "2026-06-12T12:05:00Z",
+                                "reason": "mavlink-radio-dropout"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let derived: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        derived
+            .get("samples")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(3)
+    );
+    assert_eq!(
+        derived
+            .pointer("/gaps/0/reason")
+            .and_then(|value| value.as_str()),
+        Some("mavlink-radio-dropout")
+    );
+    let battery_sample = derived
+        .get("samples")
+        .and_then(|value| value.as_array())
+        .and_then(|samples| {
+            samples.iter().find(|sample| {
+                sample.get("indicator").and_then(|value| value.as_str())
+                    == Some("battery_internal_resistance")
+            })
+        })
+        .expect("battery indicator should exist");
+    assert_eq!(
+        battery_sample
+            .get("freshness")
+            .and_then(|value| value.as_str()),
+        Some("stale")
+    );
+    assert!(
+        (battery_sample
+            .get("value")
+            .and_then(|value| value.as_f64())
+            .expect("value should be numeric")
+            - 30.0)
+            .abs()
+            < 1e-9
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fleet-health/health-indicators?component_id=battery-pack-health-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].get("freshness").and_then(|value| value.as_str()),
+        Some("stale")
+    );
+
+    let time_series_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM time_series_points WHERE entity_ref LIKE 'component:%'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(time_series_count, 3);
+
+    let gap_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fleet_health_telemetry_gaps WHERE component_id = ?1",
+    )
+    .bind("battery-pack-health-001")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(gap_count, 1);
+
+    let backfilled_points: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM time_series_points WHERE t = ?1")
+            .bind("2026-06-12T12:01:00Z")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(backfilled_points, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn soil_iot_device_registry_registers_and_lists_geolocated_devices() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -5160,6 +5306,15 @@ async fn register_test_component(
     component_id: &str,
     airframe_id: &str,
 ) -> Result<()> {
+    register_test_component_type(ctx, component_id, "battery", airframe_id).await
+}
+
+async fn register_test_component_type(
+    ctx: &TestContext,
+    component_id: &str,
+    component_type: &str,
+    airframe_id: &str,
+) -> Result<()> {
     let response = ctx
         .app
         .clone()
@@ -5171,7 +5326,7 @@ async fn register_test_component(
                 .body(Body::from(
                     json!({
                         "component_id": component_id,
-                        "component_type": "battery",
+                        "component_type": component_type,
                         "serial": format!("SERIAL-{component_id}"),
                         "airframe_id": airframe_id,
                         "installed_at": "2026-06-01T10:00:00Z"

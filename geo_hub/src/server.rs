@@ -113,6 +113,11 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::accrue_fleet_component_duty),
         )
         .route(
+            "/api/fleet-health/health-indicators",
+            get(routes::list_fleet_health_indicators)
+                .post(routes::derive_fleet_health_indicators_route),
+        )
+        .route(
             "/api/soil-iot/devices",
             get(routes::list_soil_iot_devices).post(routes::register_soil_iot_device),
         )
