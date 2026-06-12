@@ -209,6 +209,470 @@ pub fn transition_reconstruction_status(
     Ok(record)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FrameSetQaConfig {
+    pub sensor_width_mm: f64,
+    pub sensor_height_mm: f64,
+    pub min_forward_overlap_fraction: f64,
+    pub min_coverage_fraction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldCoverageExtent {
+    pub field_id: String,
+    pub origin_latitude: f64,
+    pub origin_longitude: f64,
+    pub min_x_m: f64,
+    pub min_y_m: f64,
+    pub max_x_m: f64,
+    pub max_y_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameQaRecord {
+    pub frame_id: String,
+    pub gsd_m_per_px: f64,
+    pub ground_width_m: f64,
+    pub ground_height_m: f64,
+    pub min_x_m: f64,
+    pub min_y_m: f64,
+    pub max_x_m: f64,
+    pub max_y_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameOverlapQaRecord {
+    pub frame_a_id: String,
+    pub frame_b_id: String,
+    pub overlap_fraction: f64,
+    pub passes_threshold: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameQaReasonCode {
+    InsufficientOverlap,
+    InsufficientCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameSetQaGapRegion {
+    pub min_x_m: f64,
+    pub min_y_m: f64,
+    pub max_x_m: f64,
+    pub max_y_m: f64,
+    pub reason_code: FrameQaReasonCode,
+    #[serde(default)]
+    pub frame_a_id: Option<String>,
+    #[serde(default)]
+    pub frame_b_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameSetQaReport {
+    pub frame_set_id: String,
+    pub field_id: String,
+    pub generated_at: String,
+    pub frames: Vec<FrameQaRecord>,
+    pub overlaps: Vec<FrameOverlapQaRecord>,
+    pub mean_gsd_m_per_px: f64,
+    pub coverage_fraction: f64,
+    pub gap_regions: Vec<FrameSetQaGapRegion>,
+    pub passes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum FrameSetQaError {
+    #[error("frame set must include at least one frame")]
+    EmptyFrameSet,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("QA config field {field} must be finite and positive")]
+    InvalidConfig { field: &'static str },
+    #[error("QA config fraction {field} must be within 0..=1")]
+    InvalidConfigFraction { field: &'static str },
+    #[error("field extent is invalid")]
+    InvalidFieldExtent,
+    #[error("frame {frame_id} requires GPS for QA")]
+    MissingGps { frame_id: String },
+    #[error("frame {frame_id} requires EXIF for QA")]
+    MissingExif { frame_id: String },
+    #[error("frame {frame_id} requires focal_length_mm for QA")]
+    MissingFocalLength { frame_id: String },
+    #[error("frame {frame_id} requires image dimensions for QA")]
+    MissingImageDimensions { frame_id: String },
+    #[error("frame {frame_id} has invalid camera intrinsics")]
+    InvalidCameraIntrinsics { frame_id: String },
+}
+
+pub fn run_frame_set_qa(
+    frame_set: &FrameSetRecord,
+    field_extent: FieldCoverageExtent,
+    config: FrameSetQaConfig,
+    generated_at: String,
+) -> Result<FrameSetQaReport, FrameSetQaError> {
+    validate_qa_config(config)?;
+    validate_field_extent(&field_extent)?;
+    let generated_at =
+        normalize_optional_text(Some(generated_at)).ok_or(FrameSetQaError::EmptyGeneratedAt)?;
+    if frame_set.frames.is_empty() {
+        return Err(FrameSetQaError::EmptyFrameSet);
+    }
+
+    let mut frames = frame_set
+        .frames
+        .iter()
+        .map(|frame| build_frame_qa(frame, &field_extent, config))
+        .collect::<Result<Vec<_>, _>>()?;
+    frames.sort_by(|left, right| left.frame_id.cmp(&right.frame_id));
+
+    let mut ordered_frames = frame_set.frames.iter().collect::<Vec<_>>();
+    ordered_frames.sort_by(|left, right| {
+        left.capture_ts
+            .cmp(&right.capture_ts)
+            .then_with(|| left.frame_id.cmp(&right.frame_id))
+    });
+    let mut overlaps = Vec::new();
+    let mut gap_regions = Vec::new();
+    for pair in ordered_frames.windows(2) {
+        let frame_a = frames
+            .iter()
+            .find(|frame| frame.frame_id == pair[0].frame_id)
+            .expect("QA frame exists");
+        let frame_b = frames
+            .iter()
+            .find(|frame| frame.frame_id == pair[1].frame_id)
+            .expect("QA frame exists");
+        let overlap_fraction = overlap_fraction(frame_a, frame_b);
+        let passes_threshold = overlap_fraction >= config.min_forward_overlap_fraction;
+        overlaps.push(FrameOverlapQaRecord {
+            frame_a_id: frame_a.frame_id.clone(),
+            frame_b_id: frame_b.frame_id.clone(),
+            overlap_fraction,
+            passes_threshold,
+        });
+        if !passes_threshold {
+            gap_regions.push(gap_between_frames(
+                frame_a,
+                frame_b,
+                FrameQaReasonCode::InsufficientOverlap,
+            ));
+        }
+    }
+
+    let field_rect = Rect {
+        min_x: field_extent.min_x_m,
+        min_y: field_extent.min_y_m,
+        max_x: field_extent.max_x_m,
+        max_y: field_extent.max_y_m,
+    };
+    let clipped_footprints = frames
+        .iter()
+        .filter_map(|frame| frame.rect().intersection(&field_rect))
+        .collect::<Vec<_>>();
+    let coverage_area_m2 = union_area(&clipped_footprints);
+    let coverage_fraction = (coverage_area_m2 / field_rect.area()).clamp(0.0, 1.0);
+    if coverage_fraction < config.min_coverage_fraction && gap_regions.is_empty() {
+        gap_regions.push(FrameSetQaGapRegion {
+            min_x_m: field_extent.min_x_m,
+            min_y_m: field_extent.min_y_m,
+            max_x_m: field_extent.max_x_m,
+            max_y_m: field_extent.max_y_m,
+            reason_code: FrameQaReasonCode::InsufficientCoverage,
+            frame_a_id: None,
+            frame_b_id: None,
+        });
+    }
+
+    let mean_gsd_m_per_px =
+        frames.iter().map(|frame| frame.gsd_m_per_px).sum::<f64>() / frames.len() as f64;
+    let passes = overlaps.iter().all(|overlap| overlap.passes_threshold)
+        && coverage_fraction >= config.min_coverage_fraction;
+
+    Ok(FrameSetQaReport {
+        frame_set_id: frame_set.frame_set_id.clone(),
+        field_id: field_extent.field_id,
+        generated_at,
+        frames,
+        overlaps,
+        mean_gsd_m_per_px,
+        coverage_fraction,
+        gap_regions,
+        passes,
+    })
+}
+
+impl FrameQaRecord {
+    fn rect(&self) -> Rect {
+        Rect {
+            min_x: self.min_x_m,
+            min_y: self.min_y_m,
+            max_x: self.max_x_m,
+            max_y: self.max_y_m,
+        }
+    }
+}
+
+fn build_frame_qa(
+    frame: &FramePoseRecord,
+    field_extent: &FieldCoverageExtent,
+    config: FrameSetQaConfig,
+) -> Result<FrameQaRecord, FrameSetQaError> {
+    let gps = frame
+        .gps
+        .as_ref()
+        .ok_or_else(|| FrameSetQaError::MissingGps {
+            frame_id: frame.frame_id.clone(),
+        })?;
+    let exif = frame
+        .exif
+        .as_ref()
+        .ok_or_else(|| FrameSetQaError::MissingExif {
+            frame_id: frame.frame_id.clone(),
+        })?;
+    let focal_length_mm = finite_positive(
+        exif.focal_length_mm,
+        FrameSetQaError::MissingFocalLength {
+            frame_id: frame.frame_id.clone(),
+        },
+    )?;
+    let image_width_px = nonzero_dimension(exif.image_width_px, &frame.frame_id)?;
+    let image_height_px = nonzero_dimension(exif.image_height_px, &frame.frame_id)?;
+    if gps.altitude <= 0.0 || !gps.altitude.is_finite() {
+        return Err(FrameSetQaError::InvalidCameraIntrinsics {
+            frame_id: frame.frame_id.clone(),
+        });
+    }
+
+    let ground_width_m = gps.altitude * config.sensor_width_mm / focal_length_mm;
+    let ground_height_m = gps.altitude * config.sensor_height_mm / focal_length_mm;
+    if !ground_width_m.is_finite() || !ground_height_m.is_finite() {
+        return Err(FrameSetQaError::InvalidCameraIntrinsics {
+            frame_id: frame.frame_id.clone(),
+        });
+    }
+
+    let center_x_m = (gps.longitude - field_extent.origin_longitude)
+        * meters_per_degree_lon(field_extent.origin_latitude);
+    let center_y_m = (gps.latitude - field_extent.origin_latitude) * METERS_PER_DEGREE_LAT;
+    let gsd_x_m_per_px = ground_width_m / image_width_px as f64;
+    let gsd_y_m_per_px = ground_height_m / image_height_px as f64;
+
+    Ok(FrameQaRecord {
+        frame_id: frame.frame_id.clone(),
+        gsd_m_per_px: (gsd_x_m_per_px + gsd_y_m_per_px) / 2.0,
+        ground_width_m,
+        ground_height_m,
+        min_x_m: center_x_m - ground_width_m / 2.0,
+        min_y_m: center_y_m - ground_height_m / 2.0,
+        max_x_m: center_x_m + ground_width_m / 2.0,
+        max_y_m: center_y_m + ground_height_m / 2.0,
+    })
+}
+
+fn validate_qa_config(config: FrameSetQaConfig) -> Result<(), FrameSetQaError> {
+    require_positive("sensor_width_mm", config.sensor_width_mm)?;
+    require_positive("sensor_height_mm", config.sensor_height_mm)?;
+    require_fraction(
+        "min_forward_overlap_fraction",
+        config.min_forward_overlap_fraction,
+    )?;
+    require_fraction("min_coverage_fraction", config.min_coverage_fraction)?;
+    Ok(())
+}
+
+fn validate_field_extent(field_extent: &FieldCoverageExtent) -> Result<(), FrameSetQaError> {
+    let valid = field_extent.origin_latitude.is_finite()
+        && field_extent.origin_longitude.is_finite()
+        && field_extent.min_x_m.is_finite()
+        && field_extent.min_y_m.is_finite()
+        && field_extent.max_x_m.is_finite()
+        && field_extent.max_y_m.is_finite()
+        && field_extent.max_x_m > field_extent.min_x_m
+        && field_extent.max_y_m > field_extent.min_y_m
+        && !field_extent.field_id.trim().is_empty();
+    if valid {
+        Ok(())
+    } else {
+        Err(FrameSetQaError::InvalidFieldExtent)
+    }
+}
+
+fn require_positive(field: &'static str, value: f64) -> Result<(), FrameSetQaError> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(FrameSetQaError::InvalidConfig { field })
+    }
+}
+
+fn require_fraction(field: &'static str, value: f64) -> Result<(), FrameSetQaError> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(FrameSetQaError::InvalidConfigFraction { field })
+    }
+}
+
+fn finite_positive(value: Option<f64>, error: FrameSetQaError) -> Result<f64, FrameSetQaError> {
+    let value = value.ok_or_else(|| error.clone())?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(error)
+    }
+}
+
+fn nonzero_dimension(value: Option<u32>, frame_id: &str) -> Result<u32, FrameSetQaError> {
+    match value {
+        Some(value) if value > 0 => Ok(value),
+        _ => Err(FrameSetQaError::MissingImageDimensions {
+            frame_id: frame_id.to_string(),
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rect {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl Rect {
+    fn area(self) -> f64 {
+        ((self.max_x - self.min_x).max(0.0)) * ((self.max_y - self.min_y).max(0.0))
+    }
+
+    fn intersection(self, other: &Rect) -> Option<Rect> {
+        let rect = Rect {
+            min_x: self.min_x.max(other.min_x),
+            min_y: self.min_y.max(other.min_y),
+            max_x: self.max_x.min(other.max_x),
+            max_y: self.max_y.min(other.max_y),
+        };
+        (rect.area() > 0.0).then_some(rect)
+    }
+}
+
+fn overlap_fraction(frame_a: &FrameQaRecord, frame_b: &FrameQaRecord) -> f64 {
+    let rect_a = frame_a.rect();
+    let rect_b = frame_b.rect();
+    let Some(intersection) = rect_a.intersection(&rect_b) else {
+        return 0.0;
+    };
+    let denominator = rect_a.area().min(rect_b.area());
+    if denominator <= 0.0 {
+        0.0
+    } else {
+        intersection.area() / denominator
+    }
+}
+
+fn gap_between_frames(
+    frame_a: &FrameQaRecord,
+    frame_b: &FrameQaRecord,
+    reason_code: FrameQaReasonCode,
+) -> FrameSetQaGapRegion {
+    let rect_a = frame_a.rect();
+    let rect_b = frame_b.rect();
+    let (min_x, max_x) = if rect_a.max_x <= rect_b.min_x {
+        (rect_a.max_x, rect_b.min_x)
+    } else if rect_b.max_x <= rect_a.min_x {
+        (rect_b.max_x, rect_a.min_x)
+    } else {
+        (
+            rect_a.min_x.max(rect_b.min_x),
+            rect_a.max_x.min(rect_b.max_x),
+        )
+    };
+    let (min_y, max_y) = if rect_a.max_y <= rect_b.min_y {
+        (rect_a.max_y, rect_b.min_y)
+    } else if rect_b.max_y <= rect_a.min_y {
+        (rect_b.max_y, rect_a.min_y)
+    } else {
+        (
+            rect_a.min_y.max(rect_b.min_y),
+            rect_a.max_y.min(rect_b.max_y),
+        )
+    };
+
+    FrameSetQaGapRegion {
+        min_x_m: min_x.min(max_x),
+        min_y_m: min_y.min(max_y),
+        max_x_m: max_x.max(min_x),
+        max_y_m: max_y.max(min_y),
+        reason_code,
+        frame_a_id: Some(frame_a.frame_id.clone()),
+        frame_b_id: Some(frame_b.frame_id.clone()),
+    }
+}
+
+fn union_area(rects: &[Rect]) -> f64 {
+    if rects.is_empty() {
+        return 0.0;
+    }
+
+    let mut xs = rects
+        .iter()
+        .flat_map(|rect| [rect.min_x, rect.max_x])
+        .collect::<Vec<_>>();
+    xs.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    xs.dedup_by(|left, right| (*left - *right).abs() <= f64::EPSILON);
+
+    let mut area = 0.0;
+    for slab in xs.windows(2) {
+        let x0 = slab[0];
+        let x1 = slab[1];
+        if x1 <= x0 {
+            continue;
+        }
+        let mut intervals = rects
+            .iter()
+            .filter(|rect| rect.min_x < x1 && rect.max_x > x0)
+            .map(|rect| (rect.min_y, rect.max_y))
+            .collect::<Vec<_>>();
+        intervals.sort_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        area += (x1 - x0) * merged_interval_length(&intervals);
+    }
+    area
+}
+
+fn merged_interval_length(intervals: &[(f64, f64)]) -> f64 {
+    let mut total = 0.0;
+    let mut current: Option<(f64, f64)> = None;
+    for &(start, end) in intervals {
+        if end <= start {
+            continue;
+        }
+        match current {
+            Some((current_start, current_end)) if start <= current_end => {
+                current = Some((current_start, current_end.max(end)));
+            }
+            Some((current_start, current_end)) => {
+                total += current_end - current_start;
+                current = Some((start, end));
+            }
+            None => current = Some((start, end)),
+        }
+    }
+    if let Some((start, end)) = current {
+        total += end - start;
+    }
+    total
+}
+
+const METERS_PER_DEGREE_LAT: f64 = 111_320.0;
+
+fn meters_per_degree_lon(latitude: f64) -> f64 {
+    METERS_PER_DEGREE_LAT * latitude.to_radians().cos()
+}
+
 fn validate_reconstruction_transition(
     current: ReconstructionStatus,
     next: ReconstructionStatus,
@@ -389,9 +853,10 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_frame_set_record, build_reconstruction_job, transition_reconstruction_status,
-        CameraImuPose, FrameIngestRequest, FrameSetIngestError, FrameSetIngestRequest,
-        ReconstructionJobError, ReconstructionJobRequest, ReconstructionStatus,
+        build_frame_set_record, build_reconstruction_job, run_frame_set_qa,
+        transition_reconstruction_status, CameraExif, CameraImuPose, FieldCoverageExtent,
+        FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError, FrameSetIngestRequest,
+        FrameSetQaConfig, ReconstructionJobError, ReconstructionJobRequest, ReconstructionStatus,
     };
     use shared::schemas::GpsCoords;
 
@@ -581,6 +1046,139 @@ mod tests {
                 from: ReconstructionStatus::Queued,
                 to: ReconstructionStatus::Completed
             }
+        );
+    }
+
+    #[test]
+    fn frame_set_qa_reports_gsd_overlap_and_full_field_coverage() {
+        let frame_set = qa_frame_set(vec![
+            qa_frame("frame-001", 0.0, "2026-06-01T12:00:00Z"),
+            qa_frame("frame-002", 60.0, "2026-06-01T12:00:05Z"),
+        ]);
+        let qa = run_frame_set_qa(
+            &frame_set,
+            field_extent(-75.0, -50.0, 135.0, 50.0),
+            qa_config(),
+            "2026-06-01T12:01:00Z".to_string(),
+        )
+        .expect("QA should run");
+
+        assert_eq!(qa.frame_set_id, "frame-set-qa");
+        assert_eq!(qa.field_id, "field-1");
+        assert_eq!(qa.frames.len(), 2);
+        assert_close(qa.frames[0].gsd_m_per_px, 0.1);
+        assert_close(qa.mean_gsd_m_per_px, 0.1);
+        assert_eq!(qa.overlaps.len(), 1);
+        assert_close(qa.overlaps[0].overlap_fraction, 0.6);
+        assert!(qa.overlaps[0].passes_threshold);
+        assert_close(qa.coverage_fraction, 1.0);
+        assert!(qa.gap_regions.is_empty());
+        assert!(qa.passes);
+    }
+
+    #[test]
+    fn frame_set_qa_flags_gap_with_reason_code_when_overlap_is_insufficient() {
+        let frame_set = qa_frame_set(vec![
+            qa_frame("frame-001", 0.0, "2026-06-01T12:00:00Z"),
+            qa_frame("frame-002", 170.0, "2026-06-01T12:00:05Z"),
+        ]);
+
+        let qa = run_frame_set_qa(
+            &frame_set,
+            field_extent(-75.0, -50.0, 245.0, 50.0),
+            FrameSetQaConfig {
+                min_forward_overlap_fraction: 0.3,
+                min_coverage_fraction: 0.95,
+                ..qa_config()
+            },
+            "2026-06-01T12:01:00Z".to_string(),
+        )
+        .expect("QA should run with explicit gap");
+
+        assert!(!qa.passes);
+        assert_eq!(qa.overlaps.len(), 1);
+        assert_close(qa.overlaps[0].overlap_fraction, 0.0);
+        assert!(!qa.overlaps[0].passes_threshold);
+        assert_eq!(qa.gap_regions.len(), 1);
+        assert_eq!(
+            qa.gap_regions[0].reason_code,
+            FrameQaReasonCode::InsufficientOverlap
+        );
+        assert!(qa.gap_regions[0].max_x_m > qa.gap_regions[0].min_x_m);
+        assert!(qa.coverage_fraction < 0.95);
+    }
+
+    fn qa_frame_set(frames: Vec<FrameIngestRequest>) -> super::FrameSetRecord {
+        build_frame_set_record(
+            FrameSetIngestRequest {
+                frame_set_id: Some("frame-set-qa".to_string()),
+                scene_id: "scene-1".to_string(),
+                field_id: "field-1".to_string(),
+                season_id: "season-2026".to_string(),
+                frames,
+                crs_hint: Some("EPSG:32614".to_string()),
+            },
+            "generated".to_string(),
+            "2026-06-01T12:00:30Z".to_string(),
+        )
+        .expect("frame set should build")
+    }
+
+    fn qa_frame(frame_id: &str, x_m: f64, capture_ts: &str) -> FrameIngestRequest {
+        const ORIGIN_LAT: f64 = 41.0;
+        const ORIGIN_LON: f64 = -96.0;
+        let lon = ORIGIN_LON + x_m / meters_per_degree_lon(ORIGIN_LAT);
+        FrameIngestRequest {
+            frame_id: frame_id.to_string(),
+            gps: Some(GpsCoords {
+                latitude: ORIGIN_LAT,
+                longitude: lon,
+                altitude: 100.0,
+            }),
+            imu: Some(CameraImuPose {
+                roll_deg: 0.0,
+                pitch_deg: 0.0,
+                yaw_deg: 90.0,
+            }),
+            exif: Some(CameraExif {
+                camera_model: "QA Cam".to_string(),
+                focal_length_mm: Some(8.8),
+                image_width_px: Some(1500),
+                image_height_px: Some(1000),
+            }),
+            capture_ts: capture_ts.to_string(),
+        }
+    }
+
+    fn field_extent(min_x_m: f64, min_y_m: f64, max_x_m: f64, max_y_m: f64) -> FieldCoverageExtent {
+        FieldCoverageExtent {
+            field_id: "field-1".to_string(),
+            origin_latitude: 41.0,
+            origin_longitude: -96.0,
+            min_x_m,
+            min_y_m,
+            max_x_m,
+            max_y_m,
+        }
+    }
+
+    fn qa_config() -> FrameSetQaConfig {
+        FrameSetQaConfig {
+            sensor_width_mm: 13.2,
+            sensor_height_mm: 8.8,
+            min_forward_overlap_fraction: 0.3,
+            min_coverage_fraction: 0.9,
+        }
+    }
+
+    fn meters_per_degree_lon(latitude: f64) -> f64 {
+        111_320.0 * latitude.to_radians().cos()
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1e-6,
+            "expected {expected}, got {actual}"
         );
     }
 }
