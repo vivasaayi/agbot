@@ -33,11 +33,12 @@ use crop_intelligence::{
 };
 use fleet_health::{
     accrue_component_duty, build_component_duty_accruals, build_component_record, component_event,
-    derive_health_indicators, install_component, ComponentDutyAccrualRecord, DutyAccrualRequest,
-    FleetComponentEventRecord, FleetComponentRecord, FleetComponentType, FleetHealthError,
-    FleetHealthIndicator, FleetHealthIndicatorDerivation, FleetHealthIndicatorSample,
-    HealthIndicatorFreshness, HealthTelemetryGap, InstallComponentRequest,
-    RegisterComponentRequest, ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
+    derive_health_indicators, evaluate_ota_rollout, install_component, ComponentDutyAccrualRecord,
+    DutyAccrualRequest, FleetComponentEventRecord, FleetComponentRecord, FleetComponentType,
+    FleetHealthError, FleetHealthIndicator, FleetHealthIndicatorDerivation,
+    FleetHealthIndicatorSample, HealthIndicatorFreshness, HealthTelemetryGap,
+    InstallComponentRequest, OtaRolloutDecision, OtaRolloutRequest, RegisterComponentRequest,
+    ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
 };
 use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
@@ -1926,6 +1927,14 @@ pub async fn list_fleet_health_indicators(
         .map(|row| decode_fleet_health_indicator_sample(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
+}
+
+pub async fn evaluate_ota_rollout_route(
+    Json(request): Json<OtaRolloutRequest>,
+) -> AppResult<Json<OtaRolloutDecision>> {
+    evaluate_ota_rollout(request)
+        .map(Json)
+        .map_err(fleet_health_error)
 }
 
 pub async fn register_soil_iot_device(

@@ -1880,6 +1880,97 @@ async fn fleet_health_indicators_persist_timeseries_and_explicit_gaps() -> Resul
 }
 
 #[tokio::test]
+async fn fleet_health_ota_rollout_evaluates_stage_and_rollback() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet-health/ota-rollouts/evaluate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "rollout_id": "rollout-2026-06-12",
+                        "evaluated_at": "2026-06-12T13:00:00Z",
+                        "current_stage": "staged",
+                        "target_version": {
+                            "artifact": "agbot-edge",
+                            "version": "2.0.0",
+                            "signed": true
+                        },
+                        "rollback_version": {
+                            "artifact": "agbot-edge",
+                            "version": "1.9.0",
+                            "signed": true
+                        },
+                        "nodes": [
+                            {
+                                "node_id": "node-staged-1",
+                                "stage": "staged",
+                                "current_version": "2.0.0",
+                                "previous_version": "1.9.0"
+                            },
+                            {
+                                "node_id": "node-staged-2",
+                                "stage": "staged",
+                                "current_version": "2.0.0",
+                                "previous_version": "1.9.0"
+                            }
+                        ],
+                        "health_reports": [
+                            {
+                                "node_id": "node-staged-1",
+                                "status": "ok",
+                                "blocking_alerts": ["alert:disk-full"],
+                                "checked_at": "2026-06-12T13:02:00Z"
+                            },
+                            {
+                                "node_id": "node-staged-2",
+                                "status": "ok",
+                                "blocking_alerts": [],
+                                "checked_at": "2026-06-12T13:02:00Z"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let decision: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        decision.get("status").and_then(|value| value.as_str()),
+        Some("halted_rolled_back")
+    );
+    assert_eq!(
+        decision.get("reason_code").and_then(|value| value.as_str()),
+        Some("health_regression")
+    );
+    assert_eq!(
+        decision
+            .pointer("/rollback_actions/0/node_id")
+            .and_then(|value| value.as_str()),
+        Some("node-staged-1")
+    );
+    assert_eq!(
+        decision
+            .pointer("/rollback_actions/0/to_version")
+            .and_then(|value| value.as_str()),
+        Some("1.9.0")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fired_alert_history_is_filterable_paginable_and_not_fabricated() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

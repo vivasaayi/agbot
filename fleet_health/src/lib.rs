@@ -393,6 +393,99 @@ pub struct FleetReadinessDecision {
     pub verdict_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtaRolloutStage {
+    Canary,
+    Staged,
+    Fleet,
+}
+
+impl OtaRolloutStage {
+    pub fn next(self) -> Option<Self> {
+        match self {
+            Self::Canary => Some(Self::Staged),
+            Self::Staged => Some(Self::Fleet),
+            Self::Fleet => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtaRolloutDecisionStatus {
+    Advance,
+    HaltedRolledBack,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtaRolloutDecisionReason {
+    StageHealthy,
+    HealthRegression,
+    MissingSignedRollbackTarget,
+    UnsignedTargetVersion,
+    MissingStageNode,
+    MissingHealthReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtaArtifactVersion {
+    pub artifact: String,
+    pub version: String,
+    pub signed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtaRolloutNode {
+    pub node_id: String,
+    pub stage: OtaRolloutStage,
+    pub current_version: String,
+    pub previous_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtaNodeHealthReport {
+    pub node_id: String,
+    pub status: ComponentHealthVerdictStatus,
+    #[serde(default)]
+    pub blocking_alerts: Vec<String>,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtaRollbackAction {
+    pub node_id: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub health_status: ComponentHealthVerdictStatus,
+    pub blocking_alerts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtaRolloutRequest {
+    pub rollout_id: String,
+    pub evaluated_at: String,
+    pub current_stage: OtaRolloutStage,
+    pub target_version: OtaArtifactVersion,
+    pub rollback_version: Option<OtaArtifactVersion>,
+    pub nodes: Vec<OtaRolloutNode>,
+    pub health_reports: Vec<OtaNodeHealthReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtaRolloutDecision {
+    pub rollout_id: String,
+    pub evaluated_at: String,
+    pub current_stage: OtaRolloutStage,
+    pub next_stage: Option<OtaRolloutStage>,
+    pub status: OtaRolloutDecisionStatus,
+    pub reason_code: OtaRolloutDecisionReason,
+    pub rollback_actions: Vec<OtaRollbackAction>,
+    pub evaluated_node_count: usize,
+}
+
 impl FleetReadinessDecision {
     pub fn is_clear(&self) -> bool {
         self.status == FleetReadinessDecisionStatus::Permitted && self.blockers.is_empty()
@@ -510,6 +603,18 @@ pub enum FleetHealthError {
         component_id: String,
         airframe_id: String,
     },
+    #[error("rollout_id cannot be empty")]
+    EmptyRolloutId,
+    #[error("fleet node_id cannot be empty")]
+    EmptyFleetNodeId,
+    #[error("artifact name cannot be empty")]
+    EmptyArtifactName,
+    #[error("artifact version cannot be empty")]
+    EmptyArtifactVersion,
+    #[error("OTA stage has no target nodes")]
+    MissingOtaStageNode,
+    #[error("OTA health report is missing for node {node_id}")]
+    MissingOtaHealthReport { node_id: String },
 }
 
 pub fn build_component_record(
@@ -905,6 +1010,131 @@ pub fn evaluate_fleet_readiness(
     })
 }
 
+pub fn evaluate_ota_rollout(
+    request: OtaRolloutRequest,
+) -> Result<OtaRolloutDecision, FleetHealthError> {
+    let rollout_id = normalize_required_text(request.rollout_id, FleetHealthError::EmptyRolloutId)?;
+    let evaluated_at =
+        normalize_required_text(request.evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    let current_stage = request.current_stage;
+    let target_version = normalize_ota_artifact_version(request.target_version)?;
+    let rollback_version = request
+        .rollback_version
+        .map(normalize_ota_artifact_version)
+        .transpose()?;
+    let nodes = request
+        .nodes
+        .into_iter()
+        .map(normalize_ota_rollout_node)
+        .collect::<Result<Vec<_>, _>>()?;
+    let health_reports = request
+        .health_reports
+        .into_iter()
+        .map(normalize_ota_health_report)
+        .collect::<Result<Vec<_>, _>>()?;
+    let stage_nodes = nodes
+        .iter()
+        .filter(|node| node.stage == current_stage)
+        .collect::<Vec<_>>();
+
+    if stage_nodes.is_empty() {
+        return Ok(ota_decision(
+            rollout_id,
+            evaluated_at,
+            current_stage,
+            OtaRolloutDecisionStatus::Refused,
+            OtaRolloutDecisionReason::MissingStageNode,
+            None,
+            Vec::new(),
+            0,
+        ));
+    }
+
+    if !target_version.signed {
+        return Ok(ota_decision(
+            rollout_id,
+            evaluated_at,
+            current_stage,
+            OtaRolloutDecisionStatus::Refused,
+            OtaRolloutDecisionReason::UnsignedTargetVersion,
+            None,
+            Vec::new(),
+            stage_nodes.len(),
+        ));
+    }
+
+    let mut regressions = Vec::new();
+    for node in &stage_nodes {
+        let Some(report) = health_reports
+            .iter()
+            .find(|report| report.node_id == node.node_id)
+        else {
+            return Ok(ota_decision(
+                rollout_id,
+                evaluated_at,
+                current_stage,
+                OtaRolloutDecisionStatus::Refused,
+                OtaRolloutDecisionReason::MissingHealthReport,
+                None,
+                Vec::new(),
+                stage_nodes.len(),
+            ));
+        };
+
+        if ota_health_regressed(report) {
+            regressions.push((*node, report));
+        }
+    }
+
+    if regressions.is_empty() {
+        return Ok(ota_decision(
+            rollout_id,
+            evaluated_at,
+            current_stage,
+            OtaRolloutDecisionStatus::Advance,
+            OtaRolloutDecisionReason::StageHealthy,
+            current_stage.next(),
+            Vec::new(),
+            stage_nodes.len(),
+        ));
+    }
+
+    let Some(rollback_version) = rollback_version.filter(|version| version.signed) else {
+        return Ok(ota_decision(
+            rollout_id,
+            evaluated_at,
+            current_stage,
+            OtaRolloutDecisionStatus::Refused,
+            OtaRolloutDecisionReason::MissingSignedRollbackTarget,
+            None,
+            Vec::new(),
+            stage_nodes.len(),
+        ));
+    };
+
+    let rollback_actions = regressions
+        .into_iter()
+        .map(|(node, report)| OtaRollbackAction {
+            node_id: node.node_id.clone(),
+            from_version: node.current_version.clone(),
+            to_version: rollback_version.version.clone(),
+            health_status: report.status,
+            blocking_alerts: report.blocking_alerts.clone(),
+        })
+        .collect();
+
+    Ok(ota_decision(
+        rollout_id,
+        evaluated_at,
+        current_stage,
+        OtaRolloutDecisionStatus::HaltedRolledBack,
+        OtaRolloutDecisionReason::HealthRegression,
+        None,
+        rollback_actions,
+        stage_nodes.len(),
+    ))
+}
+
 pub fn component_event(
     component_id: &str,
     event_type: &str,
@@ -927,6 +1157,76 @@ pub fn component_event(
         actor: normalize_optional_text(actor),
         details: normalize_optional_text(details),
     })
+}
+
+fn normalize_ota_artifact_version(
+    version: OtaArtifactVersion,
+) -> Result<OtaArtifactVersion, FleetHealthError> {
+    Ok(OtaArtifactVersion {
+        artifact: normalize_required_text(version.artifact, FleetHealthError::EmptyArtifactName)?,
+        version: normalize_required_text(version.version, FleetHealthError::EmptyArtifactVersion)?,
+        signed: version.signed,
+    })
+}
+
+fn normalize_ota_rollout_node(node: OtaRolloutNode) -> Result<OtaRolloutNode, FleetHealthError> {
+    Ok(OtaRolloutNode {
+        node_id: normalize_required_text(node.node_id, FleetHealthError::EmptyFleetNodeId)?,
+        stage: node.stage,
+        current_version: normalize_required_text(
+            node.current_version,
+            FleetHealthError::EmptyArtifactVersion,
+        )?,
+        previous_version: normalize_required_text(
+            node.previous_version,
+            FleetHealthError::EmptyArtifactVersion,
+        )?,
+    })
+}
+
+fn normalize_ota_health_report(
+    report: OtaNodeHealthReport,
+) -> Result<OtaNodeHealthReport, FleetHealthError> {
+    Ok(OtaNodeHealthReport {
+        node_id: normalize_required_text(report.node_id, FleetHealthError::EmptyFleetNodeId)?,
+        status: report.status,
+        blocking_alerts: report
+            .blocking_alerts
+            .into_iter()
+            .filter_map(|alert| normalize_optional_text(Some(alert)))
+            .collect(),
+        checked_at: normalize_required_text(
+            report.checked_at,
+            FleetHealthError::EmptyTelemetryTimestamp,
+        )?,
+    })
+}
+
+fn ota_health_regressed(report: &OtaNodeHealthReport) -> bool {
+    report.status.severity_rank() >= ComponentHealthVerdictStatus::Degraded.severity_rank()
+        || !report.blocking_alerts.is_empty()
+}
+
+fn ota_decision(
+    rollout_id: String,
+    evaluated_at: String,
+    current_stage: OtaRolloutStage,
+    status: OtaRolloutDecisionStatus,
+    reason_code: OtaRolloutDecisionReason,
+    next_stage: Option<OtaRolloutStage>,
+    rollback_actions: Vec<OtaRollbackAction>,
+    evaluated_node_count: usize,
+) -> OtaRolloutDecision {
+    OtaRolloutDecision {
+        rollout_id,
+        evaluated_at,
+        current_stage,
+        next_stage,
+        status,
+        reason_code,
+        rollback_actions,
+        evaluated_node_count,
+    }
 }
 
 fn normalize_health_telemetry_sample(
@@ -1187,14 +1487,15 @@ mod tests {
     use super::{
         accrue_component_duty, build_component_duty_accruals, build_component_record,
         component_event, derive_health_indicators, evaluate_component_health_verdict,
-        evaluate_fleet_readiness, install_component, ComponentHealthVerdict,
+        evaluate_fleet_readiness, evaluate_ota_rollout, install_component, ComponentHealthVerdict,
         ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
         DutyAccrualRequest, FleetComponentRecord, FleetComponentType, FleetHealthError,
         FleetHealthIndicator, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
         FleetReadinessRequest, HealthIndicatorFreshness, HealthIndicatorThreshold,
         HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
-        InstallComponentRequest, RegisterComponentRequest, ServiceHistoryEntry,
-        TelemetryHealthIndicatorRequest,
+        InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
+        OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
+        RegisterComponentRequest, ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
     };
     use timeseries::SeriesValue;
 
@@ -1773,6 +2074,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ota_rollout_advances_canary_when_health_and_alerts_are_clear() {
+        let decision = evaluate_ota_rollout(ota_rollout_request(
+            OtaRolloutStage::Canary,
+            Some(signed_version("agbot-edge", "1.9.0")),
+            vec![ota_node("node-canary-1", OtaRolloutStage::Canary)],
+            vec![ota_health(
+                "node-canary-1",
+                ComponentHealthVerdictStatus::Ok,
+                vec![],
+            )],
+        ))
+        .expect("rollout should evaluate");
+
+        assert_eq!(decision.status, OtaRolloutDecisionStatus::Advance);
+        assert_eq!(decision.current_stage, OtaRolloutStage::Canary);
+        assert_eq!(decision.next_stage, Some(OtaRolloutStage::Staged));
+        assert_eq!(decision.reason_code, OtaRolloutDecisionReason::StageHealthy);
+        assert!(decision.rollback_actions.is_empty());
+    }
+
+    #[test]
+    fn ota_rollout_rolls_back_regressed_stage_nodes() {
+        let decision = evaluate_ota_rollout(ota_rollout_request(
+            OtaRolloutStage::Staged,
+            Some(signed_version("agbot-edge", "1.9.0")),
+            vec![
+                ota_node("node-staged-1", OtaRolloutStage::Staged),
+                ota_node("node-staged-2", OtaRolloutStage::Staged),
+            ],
+            vec![
+                ota_health(
+                    "node-staged-1",
+                    ComponentHealthVerdictStatus::Ok,
+                    vec!["alert:disk-full"],
+                ),
+                ota_health("node-staged-2", ComponentHealthVerdictStatus::Ok, vec![]),
+            ],
+        ))
+        .expect("rollout should evaluate");
+
+        assert_eq!(decision.status, OtaRolloutDecisionStatus::HaltedRolledBack);
+        assert_eq!(
+            decision.reason_code,
+            OtaRolloutDecisionReason::HealthRegression
+        );
+        assert_eq!(decision.next_stage, None);
+        assert_eq!(decision.rollback_actions.len(), 1);
+        assert_eq!(decision.rollback_actions[0].node_id, "node-staged-1");
+        assert_eq!(decision.rollback_actions[0].from_version, "2.0.0");
+        assert_eq!(decision.rollback_actions[0].to_version, "1.9.0");
+        assert_eq!(
+            decision.rollback_actions[0].blocking_alerts,
+            vec!["alert:disk-full".to_string()]
+        );
+    }
+
+    #[test]
+    fn ota_rollout_refuses_regression_without_signed_rollback_target() {
+        let decision = evaluate_ota_rollout(ota_rollout_request(
+            OtaRolloutStage::Canary,
+            Some(OtaArtifactVersion {
+                artifact: "agbot-edge".to_string(),
+                version: "1.9.0".to_string(),
+                signed: false,
+            }),
+            vec![ota_node("node-canary-1", OtaRolloutStage::Canary)],
+            vec![ota_health(
+                "node-canary-1",
+                ComponentHealthVerdictStatus::Critical,
+                vec![],
+            )],
+        ))
+        .expect("rollout should evaluate");
+
+        assert_eq!(decision.status, OtaRolloutDecisionStatus::Refused);
+        assert_eq!(
+            decision.reason_code,
+            OtaRolloutDecisionReason::MissingSignedRollbackTarget
+        );
+        assert_eq!(decision.current_stage, OtaRolloutStage::Canary);
+        assert_eq!(decision.next_stage, None);
+        assert!(decision.rollback_actions.is_empty());
+    }
+
     fn indicator_sample(
         component_id: &str,
         indicator: FleetHealthIndicator,
@@ -1786,6 +2172,53 @@ mod tests {
             source_ref: "telemetry:session-001".to_string(),
             created_at: "2026-06-12T12:20:00Z".to_string(),
             freshness: HealthIndicatorFreshness::Fresh,
+        }
+    }
+
+    fn ota_rollout_request(
+        current_stage: OtaRolloutStage,
+        rollback_version: Option<OtaArtifactVersion>,
+        nodes: Vec<OtaRolloutNode>,
+        health_reports: Vec<OtaNodeHealthReport>,
+    ) -> OtaRolloutRequest {
+        OtaRolloutRequest {
+            rollout_id: "rollout-2026-06-12".to_string(),
+            evaluated_at: "2026-06-12T13:00:00Z".to_string(),
+            current_stage,
+            target_version: signed_version("agbot-edge", "2.0.0"),
+            rollback_version,
+            nodes,
+            health_reports,
+        }
+    }
+
+    fn signed_version(artifact: &str, version: &str) -> OtaArtifactVersion {
+        OtaArtifactVersion {
+            artifact: artifact.to_string(),
+            version: version.to_string(),
+            signed: true,
+        }
+    }
+
+    fn ota_node(node_id: &str, stage: OtaRolloutStage) -> OtaRolloutNode {
+        OtaRolloutNode {
+            node_id: node_id.to_string(),
+            stage,
+            current_version: "2.0.0".to_string(),
+            previous_version: "1.9.0".to_string(),
+        }
+    }
+
+    fn ota_health(
+        node_id: &str,
+        status: ComponentHealthVerdictStatus,
+        blocking_alerts: Vec<&str>,
+    ) -> OtaNodeHealthReport {
+        OtaNodeHealthReport {
+            node_id: node_id.to_string(),
+            status,
+            blocking_alerts: blocking_alerts.into_iter().map(ToOwned::to_owned).collect(),
+            checked_at: "2026-06-12T13:02:00Z".to_string(),
         }
     }
 

@@ -118,6 +118,10 @@ pub fn build_router(state: AppState) -> Router {
                 .post(routes::derive_fleet_health_indicators_route),
         )
         .route(
+            "/api/fleet-health/ota-rollouts/evaluate",
+            post(routes::evaluate_ota_rollout_route),
+        )
+        .route(
             "/api/soil-iot/devices",
             get(routes::list_soil_iot_devices).post(routes::register_soil_iot_device),
         )
