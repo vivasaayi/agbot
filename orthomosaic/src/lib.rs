@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use shared::schemas::GpsCoords;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CameraImuPose {
@@ -281,6 +282,67 @@ pub struct FrameSetQaReport {
     pub passes: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FeatureMatchingConfig {
+    pub keypoint_spacing_m: f64,
+    pub min_pair_overlap_fraction: f64,
+    pub min_inlier_matches: usize,
+    pub max_keypoints_per_frame: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetectedKeypoint {
+    pub keypoint_id: String,
+    pub ground_cell_id: String,
+    pub ground_x_m: f64,
+    pub ground_y_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameFeatureSet {
+    pub frame_id: String,
+    pub keypoints: Vec<DetectedKeypoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FramePairMatchReport {
+    pub frame_a_id: String,
+    pub frame_b_id: String,
+    pub overlap_fraction: f64,
+    pub candidate_matches: usize,
+    pub inlier_matches: usize,
+    pub inlier_ratio: f64,
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeatureMatchReport {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub features: Vec<FrameFeatureSet>,
+    pub pairs: Vec<FramePairMatchReport>,
+    pub graph_connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum FeatureMatchingError {
+    #[error("frame set must include at least one frame")]
+    EmptyFrameSet,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("feature matching config field {field} must be finite and positive")]
+    InvalidConfig { field: &'static str },
+    #[error("feature matching config fraction {field} must be within 0..=1")]
+    InvalidConfigFraction { field: &'static str },
+    #[error("QA report frame_set_id {qa_frame_set_id} does not match frame set {frame_set_id}")]
+    FrameSetMismatch {
+        frame_set_id: String,
+        qa_frame_set_id: String,
+    },
+    #[error("QA report is missing frame {frame_id}")]
+    MissingQaFrame { frame_id: String },
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FrameSetQaError {
     #[error("frame set must include at least one frame")]
@@ -402,6 +464,109 @@ pub fn run_frame_set_qa(
     })
 }
 
+pub fn run_feature_matching(
+    frame_set: &FrameSetRecord,
+    qa_report: &FrameSetQaReport,
+    config: FeatureMatchingConfig,
+    generated_at: String,
+) -> Result<FeatureMatchReport, FeatureMatchingError> {
+    validate_feature_matching_config(config)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(FeatureMatchingError::EmptyGeneratedAt)?;
+    if frame_set.frames.is_empty() {
+        return Err(FeatureMatchingError::EmptyFrameSet);
+    }
+    if qa_report.frame_set_id != frame_set.frame_set_id {
+        return Err(FeatureMatchingError::FrameSetMismatch {
+            frame_set_id: frame_set.frame_set_id.clone(),
+            qa_frame_set_id: qa_report.frame_set_id.clone(),
+        });
+    }
+
+    let qa_frames = qa_report
+        .frames
+        .iter()
+        .map(|frame| (frame.frame_id.as_str(), frame))
+        .collect::<BTreeMap<_, _>>();
+    let mut features = Vec::new();
+    for frame in &frame_set.frames {
+        let qa_frame = qa_frames.get(frame.frame_id.as_str()).ok_or_else(|| {
+            FeatureMatchingError::MissingQaFrame {
+                frame_id: frame.frame_id.clone(),
+            }
+        })?;
+        features.push(detect_keypoints_from_footprint(qa_frame, config));
+    }
+    features.sort_by(|left, right| left.frame_id.cmp(&right.frame_id));
+
+    let feature_cells = features
+        .iter()
+        .map(|feature_set| {
+            (
+                feature_set.frame_id.as_str(),
+                feature_set
+                    .keypoints
+                    .iter()
+                    .map(|keypoint| keypoint.ground_cell_id.as_str())
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut pairs = Vec::new();
+    for overlap in &qa_report.overlaps {
+        let left = feature_cells
+            .get(overlap.frame_a_id.as_str())
+            .ok_or_else(|| FeatureMatchingError::MissingQaFrame {
+                frame_id: overlap.frame_a_id.clone(),
+            })?;
+        let right = feature_cells
+            .get(overlap.frame_b_id.as_str())
+            .ok_or_else(|| FeatureMatchingError::MissingQaFrame {
+                frame_id: overlap.frame_b_id.clone(),
+            })?;
+        let candidate_matches = left.intersection(right).count();
+        let overlap_passes = overlap.overlap_fraction >= config.min_pair_overlap_fraction;
+        let inlier_matches = if overlap_passes { candidate_matches } else { 0 };
+        let inlier_ratio = if candidate_matches == 0 {
+            0.0
+        } else {
+            inlier_matches as f64 / candidate_matches as f64
+        };
+        let connected = overlap_passes && inlier_matches >= config.min_inlier_matches;
+
+        pairs.push(FramePairMatchReport {
+            frame_a_id: overlap.frame_a_id.clone(),
+            frame_b_id: overlap.frame_b_id.clone(),
+            overlap_fraction: overlap.overlap_fraction,
+            candidate_matches,
+            inlier_matches,
+            inlier_ratio,
+            connected,
+        });
+    }
+    pairs.sort_by(|left, right| {
+        left.frame_a_id
+            .cmp(&right.frame_a_id)
+            .then_with(|| left.frame_b_id.cmp(&right.frame_b_id))
+    });
+
+    let frame_ids = frame_set
+        .frames
+        .iter()
+        .map(|frame| frame.frame_id.as_str())
+        .collect::<Vec<_>>();
+    let graph_connected = feature_match_graph_connected(&frame_ids, &pairs);
+
+    Ok(FeatureMatchReport {
+        frame_set_id: frame_set.frame_set_id.clone(),
+        generated_at,
+        features,
+        pairs,
+        graph_connected,
+    })
+}
+
 impl FrameQaRecord {
     fn rect(&self) -> Rect {
         Rect {
@@ -411,6 +576,75 @@ impl FrameQaRecord {
             max_y: self.max_y_m,
         }
     }
+}
+
+fn detect_keypoints_from_footprint(
+    frame: &FrameQaRecord,
+    config: FeatureMatchingConfig,
+) -> FrameFeatureSet {
+    let rect = frame.rect();
+    let spacing = config.keypoint_spacing_m;
+    let start_x = (rect.min_x / spacing).ceil() as i64;
+    let end_x = (rect.max_x / spacing).floor() as i64;
+    let start_y = (rect.min_y / spacing).ceil() as i64;
+    let end_y = (rect.max_y / spacing).floor() as i64;
+
+    let mut keypoints = Vec::new();
+    if start_x <= end_x && start_y <= end_y {
+        for iy in start_y..=end_y {
+            for ix in start_x..=end_x {
+                let ground_x_m = ix as f64 * spacing;
+                let ground_y_m = iy as f64 * spacing;
+                let ground_cell_id = format!("{ix}:{iy}");
+                keypoints.push(DetectedKeypoint {
+                    keypoint_id: format!("{}:{ground_cell_id}", frame.frame_id),
+                    ground_cell_id,
+                    ground_x_m,
+                    ground_y_m,
+                });
+            }
+        }
+    }
+    keypoints.truncate(config.max_keypoints_per_frame);
+
+    FrameFeatureSet {
+        frame_id: frame.frame_id.clone(),
+        keypoints,
+    }
+}
+
+fn feature_match_graph_connected(frame_ids: &[&str], pairs: &[FramePairMatchReport]) -> bool {
+    if frame_ids.len() <= 1 {
+        return true;
+    }
+
+    let mut adjacency = frame_ids
+        .iter()
+        .map(|frame_id| (*frame_id, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for pair in pairs.iter().filter(|pair| pair.connected) {
+        if let Some(neighbors) = adjacency.get_mut(pair.frame_a_id.as_str()) {
+            neighbors.insert(pair.frame_b_id.as_str());
+        }
+        if let Some(neighbors) = adjacency.get_mut(pair.frame_b_id.as_str()) {
+            neighbors.insert(pair.frame_a_id.as_str());
+        }
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![frame_ids[0]];
+    while let Some(frame_id) = stack.pop() {
+        if !visited.insert(frame_id) {
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(frame_id) {
+            for neighbor in neighbors {
+                stack.push(*neighbor);
+            }
+        }
+    }
+
+    visited.len() == frame_ids.len()
 }
 
 fn build_frame_qa(
@@ -478,6 +712,35 @@ fn validate_qa_config(config: FrameSetQaConfig) -> Result<(), FrameSetQaError> {
         config.min_forward_overlap_fraction,
     )?;
     require_fraction("min_coverage_fraction", config.min_coverage_fraction)?;
+    Ok(())
+}
+
+fn validate_feature_matching_config(
+    config: FeatureMatchingConfig,
+) -> Result<(), FeatureMatchingError> {
+    if !config.keypoint_spacing_m.is_finite() || config.keypoint_spacing_m <= 0.0 {
+        return Err(FeatureMatchingError::InvalidConfig {
+            field: "keypoint_spacing_m",
+        });
+    }
+    if !config.min_pair_overlap_fraction.is_finite()
+        || !(0.0..=1.0).contains(&config.min_pair_overlap_fraction)
+    {
+        return Err(FeatureMatchingError::InvalidConfigFraction {
+            field: "min_pair_overlap_fraction",
+        });
+    }
+    if config.min_inlier_matches == 0 {
+        return Err(FeatureMatchingError::InvalidConfig {
+            field: "min_inlier_matches",
+        });
+    }
+    if config.max_keypoints_per_frame == 0 {
+        return Err(FeatureMatchingError::InvalidConfig {
+            field: "max_keypoints_per_frame",
+        });
+    }
+
     Ok(())
 }
 
@@ -853,10 +1116,11 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_frame_set_record, build_reconstruction_job, run_frame_set_qa,
-        transition_reconstruction_status, CameraExif, CameraImuPose, FieldCoverageExtent,
-        FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError, FrameSetIngestRequest,
-        FrameSetQaConfig, ReconstructionJobError, ReconstructionJobRequest, ReconstructionStatus,
+        build_frame_set_record, build_reconstruction_job, run_feature_matching, run_frame_set_qa,
+        transition_reconstruction_status, CameraExif, CameraImuPose, FeatureMatchingConfig,
+        FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
+        FrameSetIngestRequest, FrameSetQaConfig, ReconstructionJobError, ReconstructionJobRequest,
+        ReconstructionStatus,
     };
     use shared::schemas::GpsCoords;
 
@@ -1108,6 +1372,78 @@ mod tests {
         assert!(qa.coverage_fraction < 0.95);
     }
 
+    #[test]
+    fn feature_matching_connects_overlapping_frame_set_with_inlier_evidence() {
+        let frame_set = qa_frame_set(vec![
+            qa_frame("frame-001", 0.0, "2026-06-01T12:00:00Z"),
+            qa_frame("frame-002", 60.0, "2026-06-01T12:00:05Z"),
+        ]);
+        let qa = run_frame_set_qa(
+            &frame_set,
+            field_extent(-75.0, -50.0, 135.0, 50.0),
+            qa_config(),
+            "2026-06-01T12:01:00Z".to_string(),
+        )
+        .expect("QA should run");
+
+        let report = run_feature_matching(
+            &frame_set,
+            &qa,
+            feature_config(),
+            "2026-06-01T12:02:00Z".to_string(),
+        )
+        .expect("feature matching should run");
+        let repeated = run_feature_matching(
+            &frame_set,
+            &qa,
+            feature_config(),
+            "2026-06-01T12:02:00Z".to_string(),
+        )
+        .expect("feature matching should be deterministic");
+
+        assert_eq!(report, repeated);
+        assert_eq!(report.frame_set_id, "frame-set-qa");
+        assert!(report.graph_connected);
+        assert_eq!(report.pairs.len(), 1);
+        assert!(report
+            .features
+            .iter()
+            .all(|features| !features.keypoints.is_empty()));
+        assert!(report.pairs[0].connected);
+        assert!(report.pairs[0].inlier_matches >= 4);
+        assert!(report.pairs[0].inlier_ratio >= 0.9);
+    }
+
+    #[test]
+    fn feature_matching_does_not_fabricate_links_for_non_overlapping_frames() {
+        let frame_set = qa_frame_set(vec![
+            qa_frame("frame-001", 0.0, "2026-06-01T12:00:00Z"),
+            qa_frame("frame-002", 300.0, "2026-06-01T12:00:05Z"),
+        ]);
+        let qa = run_frame_set_qa(
+            &frame_set,
+            field_extent(-75.0, -50.0, 375.0, 50.0),
+            qa_config(),
+            "2026-06-01T12:01:00Z".to_string(),
+        )
+        .expect("QA should run");
+
+        let report = run_feature_matching(
+            &frame_set,
+            &qa,
+            feature_config(),
+            "2026-06-01T12:02:00Z".to_string(),
+        )
+        .expect("feature matching should run");
+
+        assert_eq!(report.pairs.len(), 1);
+        assert_eq!(report.pairs[0].candidate_matches, 0);
+        assert_eq!(report.pairs[0].inlier_matches, 0);
+        assert_eq!(report.pairs[0].inlier_ratio, 0.0);
+        assert!(!report.pairs[0].connected);
+        assert!(!report.graph_connected);
+    }
+
     fn qa_frame_set(frames: Vec<FrameIngestRequest>) -> super::FrameSetRecord {
         build_frame_set_record(
             FrameSetIngestRequest {
@@ -1168,6 +1504,15 @@ mod tests {
             sensor_height_mm: 8.8,
             min_forward_overlap_fraction: 0.3,
             min_coverage_fraction: 0.9,
+        }
+    }
+
+    fn feature_config() -> FeatureMatchingConfig {
+        FeatureMatchingConfig {
+            keypoint_spacing_m: 20.0,
+            min_pair_overlap_fraction: 0.3,
+            min_inlier_matches: 4,
+            max_keypoints_per_frame: 128,
         }
     }
 
