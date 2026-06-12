@@ -191,6 +191,39 @@ pub struct AlertRecipient {
     pub role: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertRoutingRule {
+    pub rule_id: String,
+    pub source_domain: Option<String>,
+    pub field_id: Option<String>,
+    pub severity: Option<AlertSeverityHint>,
+    pub role: String,
+    pub recipients: Vec<AlertRecipient>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertRoutingDecision {
+    pub alert_id: String,
+    pub rule_id: Option<String>,
+    pub recipient_id: String,
+    pub role: String,
+    pub source_domain: String,
+    pub field_id: Option<String>,
+    pub severity: AlertSeverityHint,
+    pub channels: Vec<String>,
+    pub default_operator: bool,
+    pub audit_detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertRoutingOutcome {
+    pub alert_id: String,
+    pub recipients: Vec<AlertRecipient>,
+    pub decisions: Vec<AlertRoutingDecision>,
+    pub unrouted: bool,
+    pub default_operator_used: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
@@ -335,6 +368,24 @@ pub enum AlertingError {
     EmptyRecipientId,
     #[error("recipient role cannot be empty")]
     EmptyRecipientRole,
+    #[error("routing rule_id cannot be empty")]
+    EmptyRoutingRuleId,
+    #[error("routing rule requires at least one recipient")]
+    EmptyRoutingRecipientList,
+    #[error("routing rule {rule_id} expected recipient role {expected_role}, got {actual_role}")]
+    RoutingRecipientRoleMismatch {
+        rule_id: String,
+        expected_role: String,
+        actual_role: String,
+    },
+    #[error(
+        "routing recipient {recipient_id} matched conflicting roles {first_role} and {second_role}"
+    )]
+    RoutingRecipientRoleConflict {
+        recipient_id: String,
+        first_role: String,
+        second_role: String,
+    },
     #[error("severity evidence must be finite with warning <= critical <= emergency thresholds")]
     InvalidSeverityEvidence,
     #[error("dedup window requires non-empty window_start <= window_end")]
@@ -742,6 +793,67 @@ pub fn deduplicate_alert_stream(
     Ok(result)
 }
 
+pub fn route_alert_to_recipients(
+    alert: &FiredAlertRecord,
+    rules: &[AlertRoutingRule],
+    default_operator: AlertRecipient,
+) -> Result<AlertRoutingOutcome, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    let default_operator = normalize_alert_recipient(default_operator)?;
+    let normalized_rules = rules
+        .iter()
+        .cloned()
+        .map(normalize_routing_rule)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut recipients_by_id: BTreeMap<String, AlertRecipient> = BTreeMap::new();
+    let mut decisions = Vec::new();
+    for rule in &normalized_rules {
+        if !routing_rule_matches_alert(rule, &alert) {
+            continue;
+        }
+        for recipient in &rule.recipients {
+            if let Some(existing) = recipients_by_id.get(&recipient.recipient_id) {
+                if existing.role != recipient.role {
+                    return Err(AlertingError::RoutingRecipientRoleConflict {
+                        recipient_id: recipient.recipient_id.clone(),
+                        first_role: existing.role.clone(),
+                        second_role: recipient.role.clone(),
+                    });
+                }
+            } else {
+                recipients_by_id.insert(recipient.recipient_id.clone(), recipient.clone());
+            }
+            decisions.push(routing_decision(&alert, Some(rule), recipient, false));
+        }
+    }
+
+    if recipients_by_id.is_empty() {
+        let decision = routing_decision(&alert, None, &default_operator, true);
+        return Ok(AlertRoutingOutcome {
+            alert_id: alert.alert_id,
+            recipients: vec![default_operator],
+            decisions: vec![decision],
+            unrouted: true,
+            default_operator_used: true,
+        });
+    }
+
+    decisions.sort_by(|left, right| {
+        left.rule_id
+            .cmp(&right.rule_id)
+            .then_with(|| left.recipient_id.cmp(&right.recipient_id))
+    });
+
+    Ok(AlertRoutingOutcome {
+        alert_id: alert.alert_id,
+        recipients: recipients_by_id.into_values().collect(),
+        decisions,
+        unrouted: false,
+        default_operator_used: false,
+    })
+}
+
 pub fn deliver_alert<A: ChannelAdapter>(
     adapter: &mut A,
     alert: &FiredAlertRecord,
@@ -912,6 +1024,45 @@ fn normalize_alert_recipient(recipient: AlertRecipient) -> Result<AlertRecipient
     })
 }
 
+fn normalize_routing_rule(rule: AlertRoutingRule) -> Result<AlertRoutingRule, AlertingError> {
+    let rule_id = normalize_required_text(rule.rule_id, AlertingError::EmptyRoutingRuleId)?;
+    let source_domain = rule
+        .source_domain
+        .map(|value| normalize_required_text(value, AlertingError::EmptySourceDomain))
+        .transpose()?;
+    let field_id = rule
+        .field_id
+        .map(|value| normalize_required_text(value, AlertingError::EmptySubjectRef))
+        .transpose()?;
+    let role = normalize_required_text(rule.role, AlertingError::EmptyRecipientRole)?;
+    if rule.recipients.is_empty() {
+        return Err(AlertingError::EmptyRoutingRecipientList);
+    }
+    let recipients = rule
+        .recipients
+        .into_iter()
+        .map(normalize_alert_recipient)
+        .collect::<Result<Vec<_>, _>>()?;
+    for recipient in &recipients {
+        if recipient.role != role {
+            return Err(AlertingError::RoutingRecipientRoleMismatch {
+                rule_id,
+                expected_role: role,
+                actual_role: recipient.role.clone(),
+            });
+        }
+    }
+
+    Ok(AlertRoutingRule {
+        rule_id,
+        source_domain,
+        field_id,
+        severity: rule.severity,
+        role,
+        recipients,
+    })
+}
+
 fn normalize_retry_policy(
     policy: DeliveryRetryPolicy,
 ) -> Result<DeliveryRetryPolicy, AlertingError> {
@@ -962,6 +1113,65 @@ fn alert_bypasses_dedup_suppression(alert: &FiredAlertRecord) -> bool {
         alert.severity,
         AlertSeverityHint::Critical | AlertSeverityHint::Emergency
     )
+}
+
+fn routing_rule_matches_alert(rule: &AlertRoutingRule, alert: &FiredAlertRecord) -> bool {
+    rule.source_domain
+        .as_deref()
+        .map_or(true, |source_domain| source_domain == alert.source_domain)
+        && rule
+            .field_id
+            .as_deref()
+            .map_or(true, |field_id| alert.field_id.as_deref() == Some(field_id))
+        && rule
+            .severity
+            .map_or(true, |severity| severity == alert.severity)
+}
+
+fn routing_decision(
+    alert: &FiredAlertRecord,
+    rule: Option<&AlertRoutingRule>,
+    recipient: &AlertRecipient,
+    default_operator: bool,
+) -> AlertRoutingDecision {
+    let rule_id = rule.map(|rule| rule.rule_id.clone());
+    let audit_detail = if let Some(rule) = rule {
+        format!(
+            "routing rule {} matched alert {} for source_domain {} field {} severity {}; recipient {} role {}; channels {}",
+            rule.rule_id,
+            alert.alert_id,
+            alert.source_domain,
+            alert.field_id.as_deref().unwrap_or("none"),
+            alert.severity.as_str(),
+            recipient.recipient_id,
+            recipient.role,
+            alert.channels.join(",")
+        )
+    } else {
+        format!(
+            "alert {} unrouted: no routing rule matched source_domain {} field {} severity {}; surfaced to default operator {} role {}; channels {}",
+            alert.alert_id,
+            alert.source_domain,
+            alert.field_id.as_deref().unwrap_or("none"),
+            alert.severity.as_str(),
+            recipient.recipient_id,
+            recipient.role,
+            alert.channels.join(",")
+        )
+    };
+
+    AlertRoutingDecision {
+        alert_id: alert.alert_id.clone(),
+        rule_id,
+        recipient_id: recipient.recipient_id.clone(),
+        role: recipient.role.clone(),
+        source_domain: alert.source_domain.clone(),
+        field_id: alert.field_id.clone(),
+        severity: alert.severity,
+        channels: alert.channels.clone(),
+        default_operator,
+        audit_detail,
+    }
 }
 
 fn retry_backoff_seconds(policy: &DeliveryRetryPolicy, failed_attempt_number: usize) -> u64 {
@@ -1102,10 +1312,11 @@ fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
 mod tests {
     use super::{
         classify_alert_severity, compute_alert_dedup_key, deduplicate_alert_stream, deliver_alert,
-        evaluate_alert_rules, filter_alert_history, run_tracked_delivery, AlertChannel,
-        AlertDedupWindow, AlertEvent, AlertEventBackbone, AlertHistoryQuery, AlertRecipient,
-        AlertRule, AlertSeverityEvidence, AlertSeverityHint, AlertingError, DeliveryRetryPolicy,
-        DeliveryState, DeliveryStatus, InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
+        evaluate_alert_rules, filter_alert_history, route_alert_to_recipients,
+        run_tracked_delivery, AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone,
+        AlertHistoryQuery, AlertRecipient, AlertRoutingRule, AlertRule, AlertSeverityEvidence,
+        AlertSeverityHint, AlertingError, DeliveryRetryPolicy, DeliveryState, DeliveryStatus,
+        InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
     };
 
     #[test]
@@ -1575,6 +1786,166 @@ mod tests {
         assert_eq!(tracked.transitions.last().unwrap().backoff_seconds, None);
     }
 
+    #[test]
+    fn routing_matches_critical_field_alert_to_agronomist_and_audits_decision() {
+        let alert = fired_alert(
+            "alert-critical-field",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let outcome = route_alert_to_recipients(
+            &alert,
+            &[routing_rule(
+                "route-field-alpha-critical-agronomist",
+                Some("27-soil-iot-sensor-network"),
+                Some("field-alpha"),
+                Some(AlertSeverityHint::Critical),
+                "agronomist",
+                vec![role_recipient("ag-001", "agronomist")],
+            )],
+            role_recipient("ops-default", "operator"),
+        )
+        .expect("critical field alert should route");
+
+        assert!(!outcome.unrouted);
+        assert!(!outcome.default_operator_used);
+        assert_eq!(
+            outcome.recipients,
+            vec![role_recipient("ag-001", "agronomist")]
+        );
+        assert_eq!(outcome.decisions.len(), 1);
+        assert_eq!(
+            outcome.decisions[0].rule_id.as_deref(),
+            Some("route-field-alpha-critical-agronomist")
+        );
+        assert_eq!(outcome.decisions[0].recipient_id, "ag-001");
+        assert_eq!(outcome.decisions[0].role, "agronomist");
+        assert_eq!(
+            outcome.decisions[0].field_id.as_deref(),
+            Some("field-alpha")
+        );
+        assert_eq!(outcome.decisions[0].severity, AlertSeverityHint::Critical);
+        assert!(outcome.decisions[0]
+            .audit_detail
+            .contains("route-field-alpha-critical-agronomist"));
+    }
+
+    #[test]
+    fn routing_flags_unrouted_alert_and_surfaces_default_operator() {
+        let alert = fired_alert(
+            "alert-unmatched",
+            "25-predictive-maintenance-fleet-health",
+            None,
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+        let outcome = route_alert_to_recipients(
+            &alert,
+            &[routing_rule(
+                "route-field-alpha-critical-agronomist",
+                Some("27-soil-iot-sensor-network"),
+                Some("field-alpha"),
+                Some(AlertSeverityHint::Critical),
+                "agronomist",
+                vec![role_recipient("ag-001", "agronomist")],
+            )],
+            role_recipient("ops-default", "operator"),
+        )
+        .expect("unmatched alert should route to default operator");
+
+        assert!(outcome.unrouted);
+        assert!(outcome.default_operator_used);
+        assert_eq!(
+            outcome.recipients,
+            vec![role_recipient("ops-default", "operator")]
+        );
+        assert_eq!(outcome.decisions.len(), 1);
+        assert_eq!(outcome.decisions[0].rule_id, None);
+        assert_eq!(outcome.decisions[0].recipient_id, "ops-default");
+        assert!(outcome.decisions[0].default_operator);
+        assert!(outcome.decisions[0].audit_detail.contains("unrouted"));
+    }
+
+    #[test]
+    fn routing_rule_rejects_recipient_role_mismatch() {
+        let alert = fired_alert(
+            "alert-role-mismatch",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+
+        let error = route_alert_to_recipients(
+            &alert,
+            &[routing_rule(
+                "route-field-alpha-critical-agronomist",
+                Some("27-soil-iot-sensor-network"),
+                Some("field-alpha"),
+                Some(AlertSeverityHint::Critical),
+                "agronomist",
+                vec![role_recipient("ops-001", "operator")],
+            )],
+            role_recipient("ops-default", "operator"),
+        )
+        .expect_err("routing rule should reject recipients outside its role");
+
+        assert_eq!(
+            error,
+            AlertingError::RoutingRecipientRoleMismatch {
+                rule_id: "route-field-alpha-critical-agronomist".to_string(),
+                expected_role: "agronomist".to_string(),
+                actual_role: "operator".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn routing_rejects_cross_rule_recipient_role_conflict() {
+        let alert = fired_alert(
+            "alert-cross-rule-role-conflict",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+
+        let error = route_alert_to_recipients(
+            &alert,
+            &[
+                routing_rule(
+                    "route-agronomist",
+                    Some("27-soil-iot-sensor-network"),
+                    Some("field-alpha"),
+                    Some(AlertSeverityHint::Critical),
+                    "agronomist",
+                    vec![role_recipient("shared-user-001", "agronomist")],
+                ),
+                routing_rule(
+                    "route-operator",
+                    Some("27-soil-iot-sensor-network"),
+                    Some("field-alpha"),
+                    Some(AlertSeverityHint::Critical),
+                    "operator",
+                    vec![role_recipient("shared-user-001", "operator")],
+                ),
+            ],
+            role_recipient("ops-default", "operator"),
+        )
+        .expect_err("same recipient cannot be routed under conflicting roles");
+
+        assert_eq!(
+            error,
+            AlertingError::RoutingRecipientRoleConflict {
+                recipient_id: "shared-user-001".to_string(),
+                first_role: "agronomist".to_string(),
+                second_role: "operator".to_string(),
+            }
+        );
+    }
+
     fn sensor_health_event() -> AlertEvent {
         AlertEvent {
             source_domain: "27-soil-iot-sensor-network".to_string(),
@@ -1639,6 +2010,31 @@ mod tests {
         AlertRecipient {
             recipient_id: recipient_id.to_string(),
             role: "operator".to_string(),
+        }
+    }
+
+    fn role_recipient(recipient_id: &str, role: &str) -> AlertRecipient {
+        AlertRecipient {
+            recipient_id: recipient_id.to_string(),
+            role: role.to_string(),
+        }
+    }
+
+    fn routing_rule(
+        rule_id: &str,
+        source_domain: Option<&str>,
+        field_id: Option<&str>,
+        severity: Option<AlertSeverityHint>,
+        role: &str,
+        recipients: Vec<AlertRecipient>,
+    ) -> AlertRoutingRule {
+        AlertRoutingRule {
+            rule_id: rule_id.to_string(),
+            source_domain: source_domain.map(ToString::to_string),
+            field_id: field_id.map(ToString::to_string),
+            severity,
+            role: role.to_string(),
+            recipients,
         }
     }
 
