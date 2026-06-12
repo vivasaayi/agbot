@@ -433,6 +433,61 @@ struct SensorHealthConditionKey {
     reason_code: SensorHealthReasonCode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrrigationTriggerSuppressionReason {
+    InsufficientEvidence,
+    QaFlagged,
+    StaleData,
+    UnsupportedMetric,
+    WithinThreshold,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoneSoilMoistureProduct {
+    pub product_id: String,
+    pub field_id: String,
+    pub zone_id: String,
+    pub metric: GatewayReadingMetric,
+    pub value: f64,
+    pub freshness_age_seconds: u64,
+    #[serde(default)]
+    pub qa_flags: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationTriggerConfig {
+    pub low_moisture_threshold: f64,
+    pub max_freshness_age_seconds: u64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationTriggerInput {
+    pub contract_version: String,
+    pub trigger_id: String,
+    pub field_id: String,
+    pub zone_id: String,
+    pub metric: String,
+    pub value: f64,
+    pub threshold: f64,
+    pub trigger_ts: String,
+    pub evidence_refs: Vec<String>,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationTriggerEvaluation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<IrrigationTriggerInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_reason: Option<IrrigationTriggerSuppressionReason>,
+    pub evidence_refs: Vec<String>,
+}
+
 impl GeolocatedSoilReading {
     pub fn to_series_point(&self) -> SeriesPoint {
         SeriesPoint {
@@ -569,12 +624,24 @@ pub enum SoilIotError {
     EmptySensorHealthEvaluatedAt,
     #[error("sensor-health evidence_ref cannot be empty")]
     EmptySensorHealthEvidenceRef,
+    #[error("zone soil product_id cannot be empty")]
+    EmptyZoneSoilProductId,
+    #[error("zone_id cannot be empty")]
+    EmptyZoneId,
+    #[error("zone soil product generated_at cannot be empty")]
+    EmptyZoneSoilGeneratedAt,
+    #[error("irrigation trigger method_version cannot be empty")]
+    EmptyIrrigationTriggerMethodVersion,
+    #[error("irrigation trigger evidence_refs cannot contain empty values")]
+    EmptyIrrigationEvidenceRef,
     #[error(
         "stuck-sensor window config must be finite with min_samples > 1 and valid_min <= valid_max"
     )]
     InvalidStuckWindowConfig,
     #[error("sensor-health thresholds must be finite with low_battery_voltage >= 0")]
     InvalidSensorHealthThresholds,
+    #[error("irrigation trigger config must be finite with low_moisture_threshold >= 0")]
+    InvalidIrrigationTriggerConfig,
     #[error("stuck-sensor window must contain one device and metric")]
     MixedStuckWindowSeries,
 }
@@ -967,6 +1034,57 @@ pub fn emit_sensor_health_alert_events(
         .collect()
 }
 
+pub fn evaluate_irrigation_trigger(
+    product: ZoneSoilMoistureProduct,
+    config: IrrigationTriggerConfig,
+) -> Result<IrrigationTriggerEvaluation, SoilIotError> {
+    let product = normalize_zone_soil_moisture_product(product)?;
+    let config = normalize_irrigation_trigger_config(config)?;
+    let evidence_refs = product.evidence_refs.clone();
+
+    let suppressed_reason = if product.metric != GatewayReadingMetric::SoilMoisturePercent {
+        Some(IrrigationTriggerSuppressionReason::UnsupportedMetric)
+    } else if evidence_refs.is_empty() {
+        Some(IrrigationTriggerSuppressionReason::InsufficientEvidence)
+    } else if !product.qa_flags.is_empty() {
+        Some(IrrigationTriggerSuppressionReason::QaFlagged)
+    } else if product.freshness_age_seconds > config.max_freshness_age_seconds {
+        Some(IrrigationTriggerSuppressionReason::StaleData)
+    } else if product.value >= config.low_moisture_threshold {
+        Some(IrrigationTriggerSuppressionReason::WithinThreshold)
+    } else {
+        None
+    };
+
+    if let Some(reason) = suppressed_reason {
+        return Ok(IrrigationTriggerEvaluation {
+            trigger: None,
+            suppressed_reason: Some(reason),
+            evidence_refs,
+        });
+    }
+
+    Ok(IrrigationTriggerEvaluation {
+        trigger: Some(IrrigationTriggerInput {
+            contract_version: "water_management.irrigation_trigger.v1".to_string(),
+            trigger_id: format!(
+                "irrigation-trigger:{}:{}:{}:{}",
+                product.field_id, product.zone_id, product.product_id, config.method_version
+            ),
+            field_id: product.field_id,
+            zone_id: product.zone_id,
+            metric: product.metric.as_str().to_string(),
+            value: product.value,
+            threshold: config.low_moisture_threshold,
+            trigger_ts: product.generated_at,
+            evidence_refs: evidence_refs.clone(),
+            method_version: config.method_version,
+        }),
+        suppressed_reason: None,
+        evidence_refs,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct GatewayPayloadBody {
     device_id: String,
@@ -1235,6 +1353,67 @@ fn normalize_sensor_health_thresholds(
     })
 }
 
+fn normalize_zone_soil_moisture_product(
+    product: ZoneSoilMoistureProduct,
+) -> Result<ZoneSoilMoistureProduct, SoilIotError> {
+    if !product.value.is_finite() {
+        return Err(SoilIotError::InvalidReadingValue);
+    }
+
+    Ok(ZoneSoilMoistureProduct {
+        product_id: normalize_required_text(
+            product.product_id,
+            SoilIotError::EmptyZoneSoilProductId,
+        )?,
+        field_id: normalize_required_text(product.field_id, SoilIotError::EmptyFieldId)?,
+        zone_id: normalize_required_text(product.zone_id, SoilIotError::EmptyZoneId)?,
+        metric: product.metric,
+        value: product.value,
+        freshness_age_seconds: product.freshness_age_seconds,
+        qa_flags: normalize_text_values(
+            product.qa_flags,
+            SoilIotError::EmptyIrrigationEvidenceRef,
+        )?,
+        evidence_refs: normalize_text_values(
+            product.evidence_refs,
+            SoilIotError::EmptyIrrigationEvidenceRef,
+        )?,
+        generated_at: normalize_required_text(
+            product.generated_at,
+            SoilIotError::EmptyZoneSoilGeneratedAt,
+        )?,
+    })
+}
+
+fn normalize_irrigation_trigger_config(
+    config: IrrigationTriggerConfig,
+) -> Result<IrrigationTriggerConfig, SoilIotError> {
+    let method_version = normalize_required_text(
+        config.method_version,
+        SoilIotError::EmptyIrrigationTriggerMethodVersion,
+    )?;
+    if !config.low_moisture_threshold.is_finite() || config.low_moisture_threshold < 0.0 {
+        return Err(SoilIotError::InvalidIrrigationTriggerConfig);
+    }
+
+    Ok(IrrigationTriggerConfig {
+        low_moisture_threshold: config.low_moisture_threshold,
+        max_freshness_age_seconds: config.max_freshness_age_seconds,
+        method_version,
+    })
+}
+
+fn normalize_text_values(
+    values: Vec<String>,
+    error: SoilIotError,
+) -> Result<Vec<String>, SoilIotError> {
+    values
+        .into_iter()
+        .map(|value| normalize_required_text(value, error.clone()))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(|values| values.into_iter().collect())
+}
+
 fn pinned_rail(values: &[f64], config: &StuckSensorWindowConfig) -> Option<StuckSensorRail> {
     if values
         .iter()
@@ -1307,15 +1486,17 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::{
         build_geolocated_soil_reading, build_soil_device_record, decode_gateway_payload,
-        detect_stuck_sensor_window, emit_sensor_health_alert_events,
+        detect_stuck_sensor_window, emit_sensor_health_alert_events, evaluate_irrigation_trigger,
         evaluate_sensor_health_snapshot, ingest_gateway_readings, reading_rejection_for_device,
         transition_soil_device_status, validate_and_calibrate_reading, CalibrationProfile,
         GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
-        GatewayReadingRecord, GeoPosition, RawGatewayReading, ReadingGeolocationStatus,
+        GatewayReadingRecord, GeoPosition, IrrigationTriggerConfig,
+        IrrigationTriggerSuppressionReason, RawGatewayReading, ReadingGeolocationStatus,
         ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
         SensorHealthEventKind, SensorHealthLinkStatus, SensorHealthMonitorState,
         SensorHealthReasonCode, SensorHealthSnapshot, SensorHealthThresholds, SimulatedGateway,
         SoilDeviceStatus, SoilIotError, SoilSensorType, StuckSensorRail, StuckSensorWindowConfig,
+        ZoneSoilMoistureProduct,
     };
     use alerting::{AlertEventBackbone, AlertSeverityHint};
     use timeseries::SeriesValue;
@@ -1805,6 +1986,64 @@ mod tests {
         assert_eq!(monitor.active_condition_count(), 2);
     }
 
+    #[test]
+    fn irrigation_trigger_emits_domain16_payload_for_fresh_low_moisture() {
+        let evaluation = evaluate_irrigation_trigger(
+            zone_moisture_product(21.4, 120, vec![], vec!["soil-iot:reading-001"]),
+            irrigation_trigger_config(),
+        )
+        .expect("fresh clean low-moisture product should evaluate");
+
+        assert!(evaluation.suppressed_reason.is_none());
+        let trigger = evaluation.trigger.expect("low moisture should trigger");
+        assert_eq!(
+            trigger.contract_version,
+            "water_management.irrigation_trigger.v1"
+        );
+        assert_eq!(trigger.field_id, "field-001");
+        assert_eq!(trigger.zone_id, "zone-ne");
+        assert_eq!(trigger.metric, "soil_moisture_percent");
+        assert_eq!(trigger.value, 21.4);
+        assert_eq!(trigger.threshold, 25.0);
+        assert_eq!(trigger.trigger_ts, "2026-06-12T12:00:00Z");
+        assert_eq!(trigger.evidence_refs, vec!["soil-iot:reading-001"]);
+        assert!(trigger
+            .trigger_id
+            .contains("irrigation-trigger:field-001:zone-ne"));
+    }
+
+    #[test]
+    fn irrigation_trigger_suppresses_stale_or_flagged_products_with_reason() {
+        let stale = evaluate_irrigation_trigger(
+            zone_moisture_product(18.0, 900, vec![], vec!["soil-iot:reading-stale"]),
+            irrigation_trigger_config(),
+        )
+        .expect("stale product should evaluate");
+        assert!(stale.trigger.is_none());
+        assert_eq!(
+            stale.suppressed_reason,
+            Some(IrrigationTriggerSuppressionReason::StaleData)
+        );
+        assert_eq!(stale.evidence_refs, vec!["soil-iot:reading-stale"]);
+
+        let flagged = evaluate_irrigation_trigger(
+            zone_moisture_product(
+                18.0,
+                120,
+                vec!["stuck_sensor".to_string()],
+                vec!["soil-iot:reading-flagged"],
+            ),
+            irrigation_trigger_config(),
+        )
+        .expect("flagged product should evaluate");
+        assert!(flagged.trigger.is_none());
+        assert_eq!(
+            flagged.suppressed_reason,
+            Some(IrrigationTriggerSuppressionReason::QaFlagged)
+        );
+        assert_eq!(flagged.evidence_refs, vec!["soil-iot:reading-flagged"]);
+    }
+
     fn valid_device() -> super::SoilDeviceRecord {
         build_soil_device_record(
             RegisterSoilDeviceRequest {
@@ -1914,6 +2153,33 @@ mod tests {
             low_battery_voltage: 3.3,
             stale_after_seconds: 300,
             method_version: "soil-sensor-health-thresholds-v1".to_string(),
+        }
+    }
+
+    fn zone_moisture_product(
+        value: f64,
+        freshness_age_seconds: u64,
+        qa_flags: Vec<String>,
+        evidence_refs: Vec<&str>,
+    ) -> ZoneSoilMoistureProduct {
+        ZoneSoilMoistureProduct {
+            product_id: "zone-moisture-001".to_string(),
+            field_id: "field-001".to_string(),
+            zone_id: "zone-ne".to_string(),
+            metric: GatewayReadingMetric::SoilMoisturePercent,
+            value,
+            freshness_age_seconds,
+            qa_flags,
+            evidence_refs: evidence_refs.into_iter().map(ToOwned::to_owned).collect(),
+            generated_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn irrigation_trigger_config() -> IrrigationTriggerConfig {
+        IrrigationTriggerConfig {
+            low_moisture_threshold: 25.0,
+            max_freshness_age_seconds: 300,
+            method_version: "soil-irrigation-trigger-v1".to_string(),
         }
     }
 }
