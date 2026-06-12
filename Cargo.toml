@@ -11,6 +11,7 @@ members = [
     "orthomosaic",
     "crop_intelligence",
     "compliance",
+    "fleet_health",
     "lidar_mapper",
     "imagery_processor",
     "geo_hub",

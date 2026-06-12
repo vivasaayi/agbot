@@ -97,6 +97,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::query_airspace_zones_for_point),
         )
         .route(
+            "/api/fleet-health/components",
+            get(routes::list_fleet_components).post(routes::register_fleet_component),
+        )
+        .route(
+            "/api/fleet-health/components/:component_id/history",
+            get(routes::get_fleet_component_history),
+        )
+        .route(
+            "/api/fleet-health/components/:component_id/install",
+            post(routes::install_fleet_component_route),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

@@ -383,6 +383,40 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS fleet_components (
+            component_id TEXT PRIMARY KEY,
+            component_type TEXT NOT NULL,
+            serial TEXT NOT NULL UNIQUE,
+            airframe_id TEXT,
+            installed_at TEXT,
+            removed_at TEXT,
+            service_history_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fleet_component_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            component_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            airframe_id TEXT,
+            event_at TEXT NOT NULL,
+            actor TEXT,
+            details TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,
@@ -580,6 +614,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_fleet_nodes_owner_org_id
         ON fleet_nodes(owner_org_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_fleet_components_airframe_id
+        ON fleet_components(airframe_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_fleet_component_events_component_id
+        ON fleet_component_events(component_id);
         "#,
     )
     .execute(pool)

@@ -1482,6 +1482,152 @@ async fn fleet_node_enrollment_rejects_missing_hardware_identity() -> Result<()>
 }
 
 #[tokio::test]
+async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let airframe_a = enroll_test_fleet_node(&ctx, "hw-drone-health-001").await?;
+    let airframe_b = enroll_test_fleet_node(&ctx, "hw-drone-health-002").await?;
+
+    let register_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet-health/components")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "component_id": "battery-pack-001",
+                        "component_type": "battery",
+                        "serial": "BAT-2026-001",
+                        "airframe_id": airframe_a,
+                        "installed_at": "2026-06-01T10:00:00Z",
+                        "service_history": [{
+                            "service_id": "svc-001",
+                            "performed_at": "2026-06-01T09:30:00Z",
+                            "technician": "tech-1",
+                            "action": "incoming_inspection",
+                            "notes": "capacity check passed"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(register_response.status(), StatusCode::OK);
+    let body = to_bytes(register_response.into_body(), 64 * 1024).await?;
+    let registered: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        registered
+            .get("component_id")
+            .and_then(|value| value.as_str()),
+        Some("battery-pack-001")
+    );
+    assert_eq!(
+        registered.get("serial").and_then(|value| value.as_str()),
+        Some("BAT-2026-001")
+    );
+    assert_eq!(
+        registered
+            .get("airframe_id")
+            .and_then(|value| value.as_str()),
+        Some(airframe_a.as_str())
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fleet-health/components?airframe_id={airframe_a}"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0]
+            .get("component_id")
+            .and_then(|value| value.as_str()),
+        Some("battery-pack-001")
+    );
+
+    let history_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fleet-health/components/battery-pack-001/history")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(history_response.status(), StatusCode::OK);
+    let body = to_bytes(history_response.into_body(), 64 * 1024).await?;
+    let history: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert!(history.iter().any(|event| {
+        event.get("event_type").and_then(|value| value.as_str()) == Some("installed")
+    }));
+    assert!(history.iter().any(|event| {
+        event.get("event_type").and_then(|value| value.as_str()) == Some("service_recorded")
+    }));
+
+    let double_install_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet-health/components/battery-pack-001/install")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "airframe_id": airframe_b,
+                        "installed_at": "2026-06-02T10:00:00Z",
+                        "actor": "tech-2"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(double_install_response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(double_install_response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&body).contains("already installed"));
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fleet_component_events WHERE component_id = ?1 AND event_type = ?2",
+    )
+    .bind("battery-pack-001")
+    .bind("double_install_rejected")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    let active_airframe: String =
+        sqlx::query_scalar("SELECT airframe_id FROM fleet_components WHERE component_id = ?1")
+            .bind("battery-pack-001")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(active_airframe, airframe_a);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn orthomosaic_frame_set_ingest_lists_pose_metadata() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -4570,6 +4716,39 @@ struct TestContext {
 struct AcceptanceFixture {
     field_id: String,
     scene_id: String,
+}
+
+async fn enroll_test_fleet_node(ctx: &TestContext, hardware_id: &str) -> Result<String> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet/nodes/enroll")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "hardware_id": hardware_id,
+                        "kind": "drone",
+                        "capabilities": ["multispectral"],
+                        "owner_org_id": "org-alpha",
+                        "runtime_mode": "simulation"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let enrolled: serde_json::Value = serde_json::from_slice(&body)?;
+    Ok(enrolled
+        .get("node_id")
+        .and_then(|value| value.as_str())
+        .expect("node_id should exist")
+        .to_string())
 }
 
 async fn seed_compliance_field(ctx: &TestContext, field_id: &str, owner: &str) -> Result<()> {

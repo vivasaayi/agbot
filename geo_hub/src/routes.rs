@@ -26,6 +26,11 @@ use crop_intelligence::{
     InferenceModelReference, ModelGateResponse, ModelVersionRecord,
     ModelVersionRegistrationRequest,
 };
+use fleet_health::{
+    build_component_record, component_event, install_component, FleetComponentEventRecord,
+    FleetComponentRecord, FleetComponentType, FleetHealthError, InstallComponentRequest,
+    RegisterComponentRequest, ServiceHistoryEntry,
+};
 use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
 };
@@ -301,6 +306,12 @@ pub struct ImportShapefileRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FleetNodeListQuery {
     pub owner_org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FleetComponentListQuery {
+    pub airframe_id: Option<String>,
+    pub component_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1519,6 +1530,187 @@ pub async fn get_fleet_node(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(node))
+}
+
+pub async fn register_fleet_component(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterComponentRequest>,
+) -> AppResult<Json<FleetComponentRecord>> {
+    let record = build_component_record(
+        request,
+        format!("fleet-component-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(fleet_health_error)?;
+
+    if let Some(airframe_id) = &record.airframe_id {
+        validate_enrolled_airframe(&state, airframe_id).await?;
+    }
+
+    insert_fleet_component(&state, &record).await?;
+    append_fleet_component_event(
+        &state,
+        &component_event(
+            &record.component_id,
+            "registered",
+            record.airframe_id.clone(),
+            record.created_at.clone(),
+            None,
+            Some(format!("serial {}", record.serial)),
+        )
+        .map_err(fleet_health_error)?,
+    )
+    .await?;
+    if let (Some(airframe_id), Some(installed_at)) = (&record.airframe_id, &record.installed_at) {
+        append_fleet_component_event(
+            &state,
+            &component_event(
+                &record.component_id,
+                "installed",
+                Some(airframe_id.clone()),
+                installed_at.clone(),
+                None,
+                Some("initial install".to_string()),
+            )
+            .map_err(fleet_health_error)?,
+        )
+        .await?;
+    }
+    for service in &record.service_history {
+        append_fleet_component_event(
+            &state,
+            &component_event(
+                &record.component_id,
+                "service_recorded",
+                record.airframe_id.clone(),
+                service.performed_at.clone(),
+                Some(service.technician.clone()),
+                Some(service.action.clone()),
+            )
+            .map_err(fleet_health_error)?,
+        )
+        .await?;
+    }
+
+    Ok(Json(record))
+}
+
+pub async fn list_fleet_components(
+    Query(query): Query<FleetComponentListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<FleetComponentRecord>>> {
+    let airframe_id = normalize_optional_text(query.airframe_id);
+    let component_type = normalize_optional_text(query.component_type)
+        .map(parse_fleet_component_type)
+        .transpose()?
+        .map(|component_type| component_type.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT component_id, component_type, serial, airframe_id, installed_at, removed_at,
+               service_history_json, created_at, updated_at
+        FROM fleet_components
+        WHERE (?1 IS NULL OR airframe_id = ?1)
+          AND (?2 IS NULL OR component_type = ?2)
+        ORDER BY updated_at DESC, component_id ASC
+        "#,
+    )
+    .bind(airframe_id)
+    .bind(component_type)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_fleet_component_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_fleet_component_history(
+    Path(component_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<FleetComponentEventRecord>>> {
+    load_fleet_component(&state, &component_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let rows = sqlx::query(
+        r#"
+        SELECT component_id, event_type, airframe_id, event_at, actor, details
+        FROM fleet_component_events
+        WHERE component_id = ?1
+        ORDER BY event_at ASC, id ASC
+        "#,
+    )
+    .bind(component_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_fleet_component_event(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn install_fleet_component_route(
+    Path(component_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<InstallComponentRequest>,
+) -> AppResult<Json<FleetComponentRecord>> {
+    let component_id = normalize_optional_text(Some(component_id))
+        .ok_or_else(|| AppError::BadRequest("component_id is required".to_string()))?;
+    let existing = load_fleet_component(&state, &component_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    validate_enrolled_airframe(&state, request.airframe_id.trim()).await?;
+    let attempted_airframe = request.airframe_id.trim().to_string();
+    let attempted_at = normalize_optional_text(Some(request.installed_at.clone()))
+        .unwrap_or_else(current_record_timestamp);
+    let actor = request.actor.clone();
+
+    let updated = match install_component(&existing, request, current_record_timestamp()) {
+        Ok(updated) => updated,
+        Err(FleetHealthError::AlreadyInstalled { .. }) => {
+            append_fleet_component_event(
+                &state,
+                &component_event(
+                    &component_id,
+                    "double_install_rejected",
+                    Some(attempted_airframe),
+                    attempted_at,
+                    actor,
+                    Some("component already installed on another airframe".to_string()),
+                )
+                .map_err(fleet_health_error)?,
+            )
+            .await?;
+            return Err(fleet_health_error(FleetHealthError::AlreadyInstalled {
+                component_id: existing.component_id,
+                airframe_id: existing.airframe_id.unwrap_or_default(),
+            }));
+        }
+        Err(error) => return Err(fleet_health_error(error)),
+    };
+
+    update_fleet_component_install(&state, &updated).await?;
+    append_fleet_component_event(
+        &state,
+        &component_event(
+            &updated.component_id,
+            "installed",
+            updated.airframe_id.clone(),
+            updated
+                .installed_at
+                .clone()
+                .unwrap_or_else(current_record_timestamp),
+            actor,
+            Some("component installed".to_string()),
+        )
+        .map_err(fleet_health_error)?,
+    )
+    .await?;
+
+    Ok(Json(updated))
 }
 
 pub async fn ingest_orthomosaic_frame_set(
@@ -4112,6 +4304,16 @@ fn parse_fleet_node_status(value: String) -> AppResult<FleetNodeStatus> {
     })
 }
 
+fn fleet_health_error(error: FleetHealthError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn parse_fleet_component_type(value: String) -> AppResult<FleetComponentType> {
+    value
+        .parse::<FleetComponentType>()
+        .map_err(fleet_health_error)
+}
+
 fn orthomosaic_ingest_error(error: FrameSetIngestError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -4831,6 +5033,41 @@ fn decode_fleet_node_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FleetNod
     })
 }
 
+fn decode_fleet_component_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FleetComponentRecord> {
+    let service_history_json: String = row.get("service_history_json");
+    let service_history = serde_json::from_str::<Vec<ServiceHistoryEntry>>(&service_history_json)
+        .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode fleet component service_history_json"),
+        )
+    })?;
+
+    Ok(FleetComponentRecord {
+        component_id: row.get("component_id"),
+        component_type: parse_fleet_component_type(row.get::<String, _>("component_type"))?,
+        serial: row.get("serial"),
+        airframe_id: row.get("airframe_id"),
+        installed_at: row.get("installed_at"),
+        removed_at: row.get("removed_at"),
+        service_history,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_fleet_component_event(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<FleetComponentEventRecord> {
+    Ok(FleetComponentEventRecord {
+        component_id: row.get("component_id"),
+        event_type: row.get("event_type"),
+        airframe_id: row.get("airframe_id"),
+        event_at: row.get("event_at"),
+        actor: row.get("actor"),
+        details: row.get("details"),
+    })
+}
+
 fn decode_orthomosaic_frame_set_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FrameSetRecord> {
     let frames_json: String = row.get("frames_json");
     let frames = serde_json::from_str::<Vec<FramePoseRecord>>(&frames_json).map_err(|err| {
@@ -5082,6 +5319,116 @@ async fn load_fleet_node_by_hardware_id(
     .map_err(Error::from)?;
 
     row.map(|row| decode_fleet_node_record(&row)).transpose()
+}
+
+async fn validate_enrolled_airframe(state: &AppState, airframe_id: &str) -> AppResult<()> {
+    let airframe_id = normalize_optional_text(Some(airframe_id.to_string()))
+        .ok_or_else(|| AppError::BadRequest("airframe_id is required".to_string()))?;
+    let node = load_fleet_node(state, &airframe_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("airframe {airframe_id} is not enrolled")))?;
+    if node.kind != FleetNodeKind::Drone {
+        return Err(AppError::BadRequest(format!(
+            "fleet node {airframe_id} is not an aircraft"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn insert_fleet_component(state: &AppState, record: &FleetComponentRecord) -> AppResult<()> {
+    let service_history_json = serde_json::to_string(&record.service_history)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO fleet_components (
+            component_id, component_type, serial, airframe_id, installed_at, removed_at,
+            service_history_json, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&record.component_id)
+    .bind(record.component_type.as_str())
+    .bind(&record.serial)
+    .bind(&record.airframe_id)
+    .bind(&record.installed_at)
+    .bind(&record.removed_at)
+    .bind(service_history_json)
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn update_fleet_component_install(
+    state: &AppState,
+    record: &FleetComponentRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE fleet_components
+        SET airframe_id = ?1, installed_at = ?2, removed_at = ?3, updated_at = ?4
+        WHERE component_id = ?5
+        "#,
+    )
+    .bind(&record.airframe_id)
+    .bind(&record.installed_at)
+    .bind(&record.removed_at)
+    .bind(&record.updated_at)
+    .bind(&record.component_id)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn append_fleet_component_event(
+    state: &AppState,
+    event: &FleetComponentEventRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO fleet_component_events
+            (component_id, event_type, airframe_id, event_at, actor, details)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&event.component_id)
+    .bind(&event.event_type)
+    .bind(&event.airframe_id)
+    .bind(&event.event_at)
+    .bind(&event.actor)
+    .bind(&event.details)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_fleet_component(
+    state: &AppState,
+    component_id: &str,
+) -> AppResult<Option<FleetComponentRecord>> {
+    sqlx::query(
+        r#"
+        SELECT component_id, component_type, serial, airframe_id, installed_at, removed_at,
+               service_history_json, created_at, updated_at
+        FROM fleet_components
+        WHERE component_id = ?1
+        "#,
+    )
+    .bind(component_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?
+    .map(|row| decode_fleet_component_record(&row))
+    .transpose()
 }
 
 async fn validate_orthomosaic_linkage(
