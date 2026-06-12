@@ -1647,18 +1647,154 @@ pub enum ReportFormat {
     Html,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportVisibility {
+    Org,
+    Shared,
+}
+
+impl Default for ReportVisibility {
+    fn default() -> Self {
+        Self::Org
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportRecord {
     pub report_id: String,
     pub scene_id: String,
     pub field_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season_id: Option<String>,
+    #[serde(default = "default_record_owner")]
+    pub org_id: String,
+    #[serde(default = "default_record_owner")]
+    pub generated_by: String,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
     pub title: String,
     pub format: ReportFormat,
     pub artifact_path: String,
+    #[serde(default)]
+    pub artifact_uri: String,
     pub download_url: String,
+    #[serde(default)]
+    pub visibility: ReportVisibility,
     pub annotation_count: usize,
     pub recommendation_count: usize,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReportPersistenceError {
+    #[error("report_id cannot be empty")]
+    EmptyReportId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("season_id cannot be empty")]
+    EmptySeasonId,
+    #[error("org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("generated_by cannot be empty")]
+    EmptyGeneratedBy,
+    #[error("artifact_uri cannot be empty")]
+    EmptyArtifactUri,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("report must cite at least one source ref: {report_id}")]
+    MissingSourceRefs { report_id: String },
+    #[error("report already exists: {report_id}")]
+    ReportAlreadyExists { report_id: String },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReportDeliverableRegistry {
+    reports: HashMap<String, ReportRecord>,
+}
+
+impl ReportDeliverableRegistry {
+    pub fn create_report(
+        &mut self,
+        report: ReportRecord,
+    ) -> Result<ReportRecord, ReportPersistenceError> {
+        let report = normalize_report_record(report)?;
+        if self.reports.contains_key(&report.report_id) {
+            return Err(ReportPersistenceError::ReportAlreadyExists {
+                report_id: report.report_id,
+            });
+        }
+        self.reports
+            .insert(report.report_id.clone(), report.clone());
+        Ok(report)
+    }
+
+    pub fn reports_for_field_season(
+        &self,
+        org_id: &str,
+        field_id: &str,
+        season_id: &str,
+    ) -> Vec<ReportRecord> {
+        let Some(org_id) = normalize_farm_field_text(org_id.to_string()) else {
+            return Vec::new();
+        };
+        let Some(field_id) = normalize_farm_field_text(field_id.to_string()) else {
+            return Vec::new();
+        };
+        let Some(season_id) = normalize_farm_field_text(season_id.to_string()) else {
+            return Vec::new();
+        };
+        let mut reports = self
+            .reports
+            .values()
+            .filter(|report| {
+                report.org_id == org_id
+                    && report.field_id.as_deref() == Some(field_id.as_str())
+                    && report.season_id.as_deref() == Some(season_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        reports.sort_by(|left, right| left.report_id.cmp(&right.report_id));
+        reports
+    }
+}
+
+fn normalize_report_record(
+    mut report: ReportRecord,
+) -> Result<ReportRecord, ReportPersistenceError> {
+    report.report_id =
+        normalize_farm_field_text(report.report_id).ok_or(ReportPersistenceError::EmptyReportId)?;
+    report.field_id = Some(
+        report
+            .field_id
+            .and_then(normalize_farm_field_text)
+            .ok_or(ReportPersistenceError::EmptyFieldId)?,
+    );
+    report.season_id = Some(
+        report
+            .season_id
+            .and_then(normalize_farm_field_text)
+            .ok_or(ReportPersistenceError::EmptySeasonId)?,
+    );
+    report.org_id =
+        normalize_farm_field_text(report.org_id).ok_or(ReportPersistenceError::EmptyOrgId)?;
+    report.generated_by = normalize_farm_field_text(report.generated_by)
+        .ok_or(ReportPersistenceError::EmptyGeneratedBy)?;
+    report.artifact_uri = normalize_farm_field_text(report.artifact_uri)
+        .ok_or(ReportPersistenceError::EmptyArtifactUri)?;
+    report.created_at = normalize_farm_field_text(report.created_at)
+        .ok_or(ReportPersistenceError::EmptyCreatedAt)?;
+    report.source_refs = report
+        .source_refs
+        .into_iter()
+        .filter_map(normalize_farm_field_text)
+        .collect::<Vec<_>>();
+    if report.source_refs.is_empty() {
+        return Err(ReportPersistenceError::MissingSourceRefs {
+            report_id: report.report_id,
+        });
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -2021,7 +2157,8 @@ mod tests {
         FieldRecord, GeoBounds, GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef,
         RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, ReportFormat, ReportRecord, SceneLayerMetadataError,
+        RecommendationStatusChangeType, ReportDeliverableRegistry, ReportFormat,
+        ReportPersistenceError, ReportRecord, ReportVisibility, SceneLayerMetadataError,
         SceneLayerRecord, SceneRecord, SeasonRecord, WorkOrderChangeType, WorkOrderCreateRequest,
         WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
     };
@@ -3178,15 +3315,94 @@ mod tests {
     }
 
     #[test]
+    fn report_deliverable_links_sources_and_lists_by_field_season() {
+        let mut registry = ReportDeliverableRegistry::default();
+        let report = registry
+            .create_report(report_record(vec![
+                "scene:scene-1".to_string(),
+                "finding:finding-1".to_string(),
+                "recommendation:rec-1".to_string(),
+            ]))
+            .expect("report persists");
+
+        assert_eq!(report.report_id, "report-1");
+        assert_eq!(report.field_id.as_deref(), Some("field-1"));
+        assert_eq!(report.season_id.as_deref(), Some("season-2026"));
+        assert_eq!(report.org_id, "org-a");
+        assert_eq!(report.generated_by, "advisor-1");
+        assert_eq!(report.artifact_uri, "s3://reports/report-1.pdf");
+        assert_eq!(report.visibility, ReportVisibility::Org);
+        assert_eq!(
+            report.source_refs,
+            vec![
+                "scene:scene-1".to_string(),
+                "finding:finding-1".to_string(),
+                "recommendation:rec-1".to_string()
+            ]
+        );
+
+        let reports = registry.reports_for_field_season("org-a", "field-1", "season-2026");
+        assert_eq!(reports, vec![report]);
+        assert!(registry
+            .reports_for_field_season("org-b", "field-1", "season-2026")
+            .is_empty());
+    }
+
+    #[test]
+    fn report_deliverable_without_source_refs_is_rejected() {
+        let mut registry = ReportDeliverableRegistry::default();
+        let error = registry
+            .create_report(report_record(Vec::new()))
+            .expect_err("orphan report is rejected");
+
+        assert_eq!(
+            error,
+            ReportPersistenceError::MissingSourceRefs {
+                report_id: "report-1".to_string()
+            }
+        );
+        assert!(registry
+            .reports_for_field_season("org-a", "field-1", "season-2026")
+            .is_empty());
+    }
+
+    fn report_record(source_refs: Vec<String>) -> ReportRecord {
+        ReportRecord {
+            report_id: "report-1".to_string(),
+            scene_id: "scene-1".to_string(),
+            field_id: Some("field-1".to_string()),
+            season_id: Some("season-2026".to_string()),
+            org_id: "org-a".to_string(),
+            generated_by: "advisor-1".to_string(),
+            source_refs,
+            title: "North Field report".to_string(),
+            format: ReportFormat::Html,
+            artifact_path: "/tmp/report-1.html".to_string(),
+            artifact_uri: "s3://reports/report-1.pdf".to_string(),
+            download_url: "/api/scenes/scene-1/reports/report-1".to_string(),
+            visibility: ReportVisibility::Org,
+            annotation_count: 3,
+            recommendation_count: 2,
+            created_at: "2026-04-19T02:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
     fn report_record_round_trips_through_json() {
         let report = ReportRecord {
             report_id: "report-1".to_string(),
             scene_id: "scene-1".to_string(),
             field_id: Some("field-1".to_string()),
+            season_id: Some("season-2026".to_string()),
+            org_id: "org-a".to_string(),
+            generated_by: "advisor-1".to_string(),
+            source_refs: vec!["scene:scene-1".to_string()],
             title: "Scene 1 agronomy report".to_string(),
             format: ReportFormat::Html,
             artifact_path: "/tmp/report-1.html".to_string(),
+            artifact_uri: "s3://reports/report-1.pdf".to_string(),
             download_url: "/api/scenes/scene-1/reports/report-1".to_string(),
+            visibility: ReportVisibility::Org,
             annotation_count: 3,
             recommendation_count: 2,
             created_at: "2026-04-19T02:00:00Z".to_string(),

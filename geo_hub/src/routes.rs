@@ -21,8 +21,8 @@ use shared::schemas::{
     assert_raster_spatial_ref, bounds_from_points, validate_field_boundary, AnnotationGeometry,
     AnnotationRecord, FarmRecord, FieldBoundary, FieldRecord, GeoBounds, GeoPoint, GpsCoords,
     ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
-    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, DEFAULT_RECORD_OWNER,
-    GEO_EXTENT_ASSERTION_TOLERANCE,
+    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
+    DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -3188,15 +3188,36 @@ async fn build_scene_report(
     fs::write(&artifact_path, html)
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?;
+    let artifact_uri = artifact_path.to_string_lossy().to_string();
+    let mut source_refs = vec![format!("scene:{scene_id}")];
+    source_refs.extend(
+        annotations
+            .iter()
+            .map(|annotation| format!("annotation:{}", annotation.annotation_id)),
+    );
+    source_refs.extend(
+        recommendations
+            .iter()
+            .map(|recommendation| format!("recommendation:{}", recommendation.recommendation_id)),
+    );
 
     Ok(ReportRecord {
         report_id: report_id.clone(),
         scene_id: scene_id.to_string(),
         field_id: field.as_ref().map(|field| field.field_id.clone()),
+        season_id: None,
+        org_id: field
+            .as_ref()
+            .map(|field| field.org_id.clone())
+            .unwrap_or_else(|| DEFAULT_RECORD_OWNER.to_string()),
+        generated_by: DEFAULT_RECORD_OWNER.to_string(),
+        source_refs,
         title: report_title,
         format: ReportFormat::Html,
-        artifact_path: artifact_path.to_string_lossy().to_string(),
+        artifact_path: artifact_uri.clone(),
+        artifact_uri,
         download_url: format!("/api/scenes/{scene_id}/reports/{report_id}"),
+        visibility: ReportVisibility::Org,
         annotation_count: annotations.len(),
         recommendation_count: recommendations.len(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -3920,14 +3941,21 @@ async fn decode_recommendation_record(
 fn decode_report_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ReportRecord> {
     let scene_id: String = row.get("scene_id");
     let report_id: String = row.get("report_id");
+    let artifact_path: String = row.get("path");
     Ok(ReportRecord {
         report_id: report_id.clone(),
         scene_id: scene_id.clone(),
         field_id: row.get("field_id"),
+        season_id: None,
+        org_id: DEFAULT_RECORD_OWNER.to_string(),
+        generated_by: DEFAULT_RECORD_OWNER.to_string(),
+        source_refs: vec![format!("scene:{scene_id}")],
         title: row.get("title"),
         format: parse_report_format(row.get("format"))?,
-        artifact_path: row.get("path"),
+        artifact_path: artifact_path.clone(),
+        artifact_uri: artifact_path,
         download_url: format!("/api/scenes/{scene_id}/reports/{report_id}"),
+        visibility: ReportVisibility::Org,
         annotation_count: row.get::<i64, _>("annotation_count") as usize,
         recommendation_count: row.get::<i64, _>("recommendation_count") as usize,
         created_at: row.get("created_at"),
