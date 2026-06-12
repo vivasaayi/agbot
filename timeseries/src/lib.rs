@@ -257,6 +257,98 @@ pub struct ZonalTrendResult {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RollingBaselineConfig {
+    pub window_points: usize,
+    pub anomaly_band: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RollingBaselineResult {
+    pub entity_ref: String,
+    pub metric: String,
+    pub unit: String,
+    pub zone_ref: String,
+    pub zone_crs: String,
+    pub baseline_mean: f64,
+    pub latest_value: f64,
+    pub delta_from_baseline: f64,
+    pub anomaly: bool,
+    pub baseline_window: Vec<SeriesPoint>,
+    pub latest_point: SeriesPoint,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeasonalComparisonTarget {
+    pub entity_ref: String,
+    pub metric: String,
+    pub zone_ref: String,
+    pub zone_crs: String,
+    pub current_t: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeasonalComparisonConfig {
+    pub min_seasonal_points: usize,
+    pub day_of_year_tolerance: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeasonalComparisonResult {
+    pub entity_ref: String,
+    pub metric: String,
+    pub unit: String,
+    pub zone_ref: String,
+    pub zone_crs: String,
+    pub current_point: SeriesPoint,
+    pub seasonal_points: Vec<SeriesPoint>,
+    pub seasonal_mean: f64,
+    pub delta_from_seasonal_baseline: f64,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeEventDirection {
+    Dropped,
+    Increased,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeEventReasonCode {
+    BaselineDrop,
+    BaselineSpike,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ChangeEventConfig {
+    pub magnitude_threshold: f64,
+    pub min_changed_cells: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeEvent {
+    pub zone_ref: String,
+    pub metric: String,
+    pub magnitude: f64,
+    pub direction: ChangeEventDirection,
+    pub since_date: String,
+    pub reason_code: ChangeEventReasonCode,
+    pub changed_cell_count: u32,
+    pub severity_score: f64,
+    pub evidence_refs: Vec<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeEventDerivationInput {
+    pub change: RasterChangeResult,
+    pub trend: ZonalTrendResult,
+    pub baseline: RollingBaselineResult,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TimeSeriesStore {
     points: BTreeMap<SeriesKey, SeriesPoint>,
@@ -377,6 +469,25 @@ pub enum TimeSeriesError {
     },
     #[error("invalid trend timestamp for {timestamp}")]
     InvalidTrendTimestamp { timestamp: String },
+    #[error("baseline config must require at least one window point with finite non-negative anomaly band")]
+    InvalidBaselineConfig,
+    #[error("insufficient baseline history for {entity_ref}/{metric}: observed {observed_points}, required {required_points}")]
+    InsufficientBaselineHistory {
+        entity_ref: String,
+        metric: String,
+        observed_points: usize,
+        required_points: usize,
+    },
+    #[error("no seasonal baseline for {entity_ref}/{metric} at {current_t}: observed {observed_points}, required {required_points}")]
+    NoSeasonalBaseline {
+        entity_ref: String,
+        metric: String,
+        current_t: String,
+        observed_points: usize,
+        required_points: usize,
+    },
+    #[error("change event config must have finite non-negative threshold")]
+    InvalidChangeEventConfig,
 }
 
 impl TimeSeriesStore {
@@ -634,6 +745,148 @@ impl TimeSeriesEngine {
         })
     }
 
+    pub fn compute_rolling_baseline(
+        &self,
+        target: ZonalTrendTarget,
+        config: RollingBaselineConfig,
+    ) -> Result<RollingBaselineResult, TimeSeriesError> {
+        let target = normalize_zonal_trend_target(target)?;
+        let config = normalize_rolling_baseline_config(config)?;
+        let unit = self.scalar_metric_unit(&target.metric)?;
+        let points = self
+            .store
+            .query(&target.entity_ref, &target.metric, target.range.clone());
+        let required_points = config.window_points + 1;
+        if points.len() < required_points {
+            return Err(TimeSeriesError::InsufficientBaselineHistory {
+                entity_ref: target.entity_ref,
+                metric: target.metric,
+                observed_points: points.len(),
+                required_points,
+            });
+        }
+
+        let latest_point = points.last().cloned().expect("length checked");
+        let latest_value = scalar_value_from_point(&latest_point)?;
+        let baseline_start = points.len() - 1 - config.window_points;
+        let baseline_window = points[baseline_start..points.len() - 1].to_vec();
+        let baseline_values = baseline_window
+            .iter()
+            .map(scalar_value_from_point)
+            .collect::<Result<Vec<_>, _>>()?;
+        let baseline_mean = mean(&baseline_values);
+        let delta_from_baseline = latest_value - baseline_mean;
+        let anomaly = delta_from_baseline.abs() >= config.anomaly_band;
+        let mut evidence_refs = baseline_window
+            .iter()
+            .map(|point| point.source_ref.clone())
+            .collect::<Vec<_>>();
+        evidence_refs.push(latest_point.source_ref.clone());
+
+        Ok(RollingBaselineResult {
+            entity_ref: target.entity_ref,
+            metric: target.metric,
+            unit,
+            zone_ref: target.zone_ref,
+            zone_crs: target.zone_crs,
+            baseline_mean,
+            latest_value,
+            delta_from_baseline,
+            anomaly,
+            baseline_window,
+            latest_point,
+            evidence_refs,
+        })
+    }
+
+    pub fn compute_seasonal_comparison(
+        &self,
+        target: SeasonalComparisonTarget,
+        config: SeasonalComparisonConfig,
+    ) -> Result<SeasonalComparisonResult, TimeSeriesError> {
+        let target = normalize_seasonal_comparison_target(target)?;
+        let config = normalize_seasonal_comparison_config(config)?;
+        let unit = self.scalar_metric_unit(&target.metric)?;
+        let current_point = self
+            .store
+            .get(&target.entity_ref, &target.metric, &target.current_t)
+            .cloned()
+            .ok_or_else(|| TimeSeriesError::NoSeasonalBaseline {
+                entity_ref: target.entity_ref.clone(),
+                metric: target.metric.clone(),
+                current_t: target.current_t.clone(),
+                observed_points: 0,
+                required_points: config.min_seasonal_points,
+            })?;
+        let current_value = scalar_value_from_point(&current_point)?;
+        let (current_year, current_day_of_year) = timestamp_year_and_day(&target.current_t)?;
+        let mut seasonal_points = Vec::new();
+        for point in self
+            .store
+            .query(&target.entity_ref, &target.metric, TimeRange::default())
+        {
+            if point.t == target.current_t {
+                continue;
+            }
+            let (year, day_of_year) = timestamp_year_and_day(&point.t)?;
+            let same_season = year < current_year
+                && current_day_of_year.abs_diff(day_of_year) <= config.day_of_year_tolerance;
+            if same_season {
+                seasonal_points.push(point);
+            }
+        }
+        if seasonal_points.len() < config.min_seasonal_points {
+            return Err(TimeSeriesError::NoSeasonalBaseline {
+                entity_ref: target.entity_ref,
+                metric: target.metric,
+                current_t: target.current_t,
+                observed_points: seasonal_points.len(),
+                required_points: config.min_seasonal_points,
+            });
+        }
+        let seasonal_values = seasonal_points
+            .iter()
+            .map(scalar_value_from_point)
+            .collect::<Result<Vec<_>, _>>()?;
+        let seasonal_mean = mean(&seasonal_values);
+        let delta_from_seasonal_baseline = current_value - seasonal_mean;
+        let mut evidence_refs = seasonal_points
+            .iter()
+            .map(|point| point.source_ref.clone())
+            .collect::<Vec<_>>();
+        evidence_refs.push(current_point.source_ref.clone());
+
+        Ok(SeasonalComparisonResult {
+            entity_ref: target.entity_ref,
+            metric: target.metric,
+            unit,
+            zone_ref: target.zone_ref,
+            zone_crs: target.zone_crs,
+            current_point,
+            seasonal_points,
+            seasonal_mean,
+            delta_from_seasonal_baseline,
+            evidence_refs,
+        })
+    }
+
+    fn scalar_metric_unit(&self, metric: &str) -> Result<String, TimeSeriesError> {
+        let definition =
+            self.metric_registry
+                .get(metric)
+                .ok_or_else(|| TimeSeriesError::UnknownMetric {
+                    metric: metric.to_string(),
+                })?;
+        if definition.kind != MetricKind::Scalar {
+            return Err(TimeSeriesError::MetricKindMismatch {
+                metric: metric.to_string(),
+                expected_kind: MetricKind::Scalar,
+                actual_kind: definition.kind,
+            });
+        }
+        Ok(definition.unit.clone())
+    }
+
     fn validate_point_metric(&self, point: &SeriesPoint) -> Result<(), TimeSeriesError> {
         let definition = self.metric_registry.get(&point.metric).ok_or_else(|| {
             TimeSeriesError::UnknownMetric {
@@ -657,6 +910,82 @@ impl TimeSeriesEngine {
         }
         Ok(())
     }
+}
+
+pub fn derive_ranked_change_events(
+    inputs: Vec<ChangeEventDerivationInput>,
+    config: ChangeEventConfig,
+) -> Result<Vec<ChangeEvent>, TimeSeriesError> {
+    let config = normalize_change_event_config(config)?;
+    let mut events = Vec::new();
+    for input in inputs {
+        if input.change.changed_cell_count < config.min_changed_cells {
+            continue;
+        }
+        let magnitude = input.baseline.delta_from_baseline.abs();
+        if magnitude < config.magnitude_threshold {
+            continue;
+        }
+
+        let direction = if input.baseline.delta_from_baseline < 0.0 {
+            ChangeEventDirection::Dropped
+        } else {
+            ChangeEventDirection::Increased
+        };
+        let reason_code = match direction {
+            ChangeEventDirection::Dropped => ChangeEventReasonCode::BaselineDrop,
+            ChangeEventDirection::Increased => ChangeEventReasonCode::BaselineSpike,
+        };
+        let since_date = input
+            .trend
+            .points_used
+            .first()
+            .map(|point| point.t.clone())
+            .unwrap_or_else(|| input.baseline.latest_point.t.clone());
+        let severity_score = magnitude * f64::from(input.change.changed_cell_count);
+        let mut evidence_refs = Vec::new();
+        push_unique(&mut evidence_refs, input.change.alignment_ref.clone());
+        push_unique(&mut evidence_refs, input.change.alignment_proof_ref.clone());
+        push_unique(&mut evidence_refs, input.change.delta_raster_ref.clone());
+        push_unique(&mut evidence_refs, input.change.mask_raster_ref.clone());
+        push_unique(&mut evidence_refs, input.baseline.zone_ref.clone());
+        for reference in input.trend.evidence_refs {
+            push_unique(&mut evidence_refs, reference);
+        }
+        for reference in input.baseline.evidence_refs {
+            push_unique(&mut evidence_refs, reference);
+        }
+
+        let verb = match direction {
+            ChangeEventDirection::Dropped => "dropped",
+            ChangeEventDirection::Increased => "increased",
+        };
+        let summary = format!(
+            "{} {verb} {:.2} in {} since {}",
+            input.baseline.metric, magnitude, input.baseline.zone_ref, since_date
+        );
+        events.push(ChangeEvent {
+            zone_ref: input.baseline.zone_ref,
+            metric: input.baseline.metric,
+            magnitude,
+            direction,
+            since_date,
+            reason_code,
+            changed_cell_count: input.change.changed_cell_count,
+            severity_score,
+            evidence_refs,
+            summary,
+        });
+    }
+
+    events.sort_by(|left, right| {
+        right
+            .severity_score
+            .total_cmp(&left.severity_score)
+            .then_with(|| right.magnitude.total_cmp(&left.magnitude))
+            .then_with(|| left.zone_ref.cmp(&right.zone_ref))
+    });
+    Ok(events)
 }
 
 pub fn align_raster_pair(
@@ -1119,6 +1448,45 @@ fn normalize_zonal_trend_config(
     Ok(config)
 }
 
+fn normalize_rolling_baseline_config(
+    config: RollingBaselineConfig,
+) -> Result<RollingBaselineConfig, TimeSeriesError> {
+    if config.window_points == 0 || !config.anomaly_band.is_finite() || config.anomaly_band < 0.0 {
+        return Err(TimeSeriesError::InvalidBaselineConfig);
+    }
+    Ok(config)
+}
+
+fn normalize_seasonal_comparison_target(
+    mut target: SeasonalComparisonTarget,
+) -> Result<SeasonalComparisonTarget, TimeSeriesError> {
+    target.entity_ref =
+        normalize_required_text(target.entity_ref, TimeSeriesError::EmptyEntityRef)?;
+    target.metric = normalize_required_text(target.metric, TimeSeriesError::EmptyMetric)?;
+    target.zone_ref = normalize_required_text(target.zone_ref, TimeSeriesError::EmptyZoneRef)?;
+    target.zone_crs = normalize_required_text(target.zone_crs, TimeSeriesError::EmptyZoneCrs)?;
+    target.current_t = normalize_required_text(target.current_t, TimeSeriesError::EmptyTimestamp)?;
+    Ok(target)
+}
+
+fn normalize_seasonal_comparison_config(
+    config: SeasonalComparisonConfig,
+) -> Result<SeasonalComparisonConfig, TimeSeriesError> {
+    if config.min_seasonal_points == 0 {
+        return Err(TimeSeriesError::InvalidBaselineConfig);
+    }
+    Ok(config)
+}
+
+fn normalize_change_event_config(
+    config: ChangeEventConfig,
+) -> Result<ChangeEventConfig, TimeSeriesError> {
+    if !config.magnitude_threshold.is_finite() || config.magnitude_threshold < 0.0 {
+        return Err(TimeSeriesError::InvalidChangeEventConfig);
+    }
+    Ok(config)
+}
+
 fn metric_kind_for_value(value: &SeriesValue) -> MetricKind {
     match value {
         SeriesValue::Scalar { .. } => MetricKind::Scalar,
@@ -1127,6 +1495,16 @@ fn metric_kind_for_value(value: &SeriesValue) -> MetricKind {
 }
 
 fn timestamp_day_index(timestamp: &str) -> Result<i64, TimeSeriesError> {
+    let (year, month, day) = date_parts(timestamp)?;
+    Ok(days_from_civil(year, month, day))
+}
+
+fn timestamp_year_and_day(timestamp: &str) -> Result<(i32, u32), TimeSeriesError> {
+    let (year, month, day) = date_parts(timestamp)?;
+    Ok((year, day_of_year(year, month, day)))
+}
+
+fn date_parts(timestamp: &str) -> Result<(i32, u32, u32), TimeSeriesError> {
     let invalid = || TimeSeriesError::InvalidTrendTimestamp {
         timestamp: timestamp.to_string(),
     };
@@ -1142,7 +1520,7 @@ fn timestamp_day_index(timestamp: &str) -> Result<i64, TimeSeriesError> {
         return Err(invalid());
     }
 
-    Ok(days_from_civil(year, month, day))
+    Ok((year, month, day))
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
@@ -1157,6 +1535,13 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 
 fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn day_of_year(year: i32, month: u32, day: u32) -> u32 {
+    let days_before_month = (1..month)
+        .map(|previous_month| days_in_month(year, previous_month))
+        .sum::<u32>();
+    days_before_month + day
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
@@ -1209,6 +1594,26 @@ fn least_squares_trend(samples: &[(f64, f64)]) -> Result<(f64, f64, f64), TimeSe
         1.0 - residual_sum_squares / total_sum_squares
     };
     Ok((slope, intercept, fit_r_squared.clamp(0.0, 1.0)))
+}
+
+fn scalar_value_from_point(point: &SeriesPoint) -> Result<f64, TimeSeriesError> {
+    match point.value {
+        SeriesValue::Scalar { value } => Ok(value),
+        SeriesValue::Raster(_) => Err(TimeSeriesError::TrendRequiresScalarPoint {
+            entity_ref: point.entity_ref.clone(),
+            metric: point.metric.clone(),
+        }),
+    }
+}
+
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 fn validate_change_alignment(
@@ -1428,12 +1833,15 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        align_raster_pair, compute_aligned_raster_change, guard_coregisterable_pair,
-        AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason,
-        GeoExtent, MetricDefinition, MetricKind, RasterAlignmentConfig, RasterAlignmentEvidence,
-        RasterChangeConfig, RasterResolution, RasterSeriesValue, SeriesPoint, SeriesProductIngest,
-        SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
-        TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
+        align_raster_pair, compute_aligned_raster_change, derive_ranked_change_events,
+        guard_coregisterable_pair, AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof,
+        AlignmentRefusalReason, ChangeEventConfig, ChangeEventDerivationInput,
+        ChangeEventDirection, ChangeEventReasonCode, GeoExtent, MetricDefinition, MetricKind,
+        RasterAlignmentConfig, RasterAlignmentEvidence, RasterChangeConfig, RasterChangeResult,
+        RasterResolution, RasterSeriesValue, RollingBaselineConfig, SeasonalComparisonConfig,
+        SeasonalComparisonTarget, SeriesPoint, SeriesProductIngest, SeriesQuery, SeriesValue,
+        TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore, TrendDirection,
+        ZonalTrendConfig, ZonalTrendTarget,
     };
 
     #[test]
@@ -1819,6 +2227,208 @@ mod tests {
                 required_points: 3
             }
         );
+    }
+
+    #[test]
+    fn rolling_and_seasonal_baselines_record_windows_and_deltas() {
+        let engine = seeded_baseline_engine();
+
+        let rolling = engine
+            .compute_rolling_baseline(
+                ZonalTrendTarget {
+                    entity_ref: "field:alpha".to_string(),
+                    metric: "ndvi_mean".to_string(),
+                    zone_ref: "zone:NE".to_string(),
+                    zone_crs: "EPSG:32610".to_string(),
+                    range: TimeRange {
+                        start: Some("2026-01-01T00:00:00Z".to_string()),
+                        end: None,
+                    },
+                },
+                RollingBaselineConfig {
+                    window_points: 2,
+                    anomaly_band: 0.10,
+                },
+            )
+            .expect("rolling baseline should compute");
+
+        assert_eq!(rolling.baseline_window.len(), 2);
+        assert!((rolling.baseline_mean - 0.71).abs() < 0.000001);
+        assert!((rolling.latest_value - 0.50).abs() < 0.000001);
+        assert!((rolling.delta_from_baseline + 0.21).abs() < 0.000001);
+        assert!(rolling.anomaly);
+
+        let seasonal = engine
+            .compute_seasonal_comparison(
+                SeasonalComparisonTarget {
+                    entity_ref: "field:alpha".to_string(),
+                    metric: "ndvi_mean".to_string(),
+                    zone_ref: "zone:NE".to_string(),
+                    zone_crs: "EPSG:32610".to_string(),
+                    current_t: "2026-06-14T10:00:00Z".to_string(),
+                },
+                SeasonalComparisonConfig {
+                    min_seasonal_points: 2,
+                    day_of_year_tolerance: 1,
+                },
+            )
+            .expect("seasonal comparison should find prior seasons");
+
+        assert_eq!(seasonal.seasonal_points.len(), 2);
+        assert!((seasonal.seasonal_mean - 0.65).abs() < 0.000001);
+        assert!((seasonal.delta_from_seasonal_baseline + 0.15).abs() < 0.000001);
+    }
+
+    #[test]
+    fn seasonal_comparison_refuses_without_matching_history() {
+        let mut engine = TimeSeriesEngine::default();
+        engine
+            .register_metric(metric_definition("ndvi_mean", "index", MetricKind::Scalar))
+            .expect("metric should register");
+        engine
+            .append(scalar_point_with_unit(
+                "field:alpha",
+                "ndvi_mean",
+                "index",
+                "2026-06-14T10:00:00Z",
+                0.50,
+            ))
+            .expect("current point should append");
+
+        let error = engine
+            .compute_seasonal_comparison(
+                SeasonalComparisonTarget {
+                    entity_ref: "field:alpha".to_string(),
+                    metric: "ndvi_mean".to_string(),
+                    zone_ref: "zone:NE".to_string(),
+                    zone_crs: "EPSG:32610".to_string(),
+                    current_t: "2026-06-14T10:00:00Z".to_string(),
+                },
+                SeasonalComparisonConfig {
+                    min_seasonal_points: 1,
+                    day_of_year_tolerance: 0,
+                },
+            )
+            .expect_err("missing prior season should be refused");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::NoSeasonalBaseline {
+                entity_ref: "field:alpha".to_string(),
+                metric: "ndvi_mean".to_string(),
+                current_t: "2026-06-14T10:00:00Z".to_string(),
+                observed_points: 0,
+                required_points: 1
+            }
+        );
+    }
+
+    #[test]
+    fn ranked_change_events_cite_mask_trend_zone_and_baseline_evidence() {
+        let engine = seeded_baseline_engine();
+        let trend = engine
+            .compute_zonal_trend(
+                ZonalTrendTarget {
+                    entity_ref: "field:alpha".to_string(),
+                    metric: "ndvi_mean".to_string(),
+                    zone_ref: "zone:NE".to_string(),
+                    zone_crs: "EPSG:32610".to_string(),
+                    range: TimeRange {
+                        start: Some("2026-01-01T00:00:00Z".to_string()),
+                        end: None,
+                    },
+                },
+                ZonalTrendConfig {
+                    min_points: 3,
+                    flat_slope_epsilon: 0.001,
+                },
+            )
+            .expect("trend should compute");
+        let baseline = engine
+            .compute_rolling_baseline(
+                ZonalTrendTarget {
+                    entity_ref: "field:alpha".to_string(),
+                    metric: "ndvi_mean".to_string(),
+                    zone_ref: "zone:NE".to_string(),
+                    zone_crs: "EPSG:32610".to_string(),
+                    range: TimeRange {
+                        start: Some("2026-01-01T00:00:00Z".to_string()),
+                        end: None,
+                    },
+                },
+                RollingBaselineConfig {
+                    window_points: 2,
+                    anomaly_band: 0.10,
+                },
+            )
+            .expect("baseline should compute");
+        let change = sample_drop_change_result();
+
+        let events = derive_ranked_change_events(
+            vec![ChangeEventDerivationInput {
+                change,
+                trend,
+                baseline,
+            }],
+            ChangeEventConfig {
+                magnitude_threshold: 0.10,
+                min_changed_cells: 1,
+            },
+        )
+        .expect("change event derivation should run");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].zone_ref, "zone:NE");
+        assert_eq!(events[0].direction, ChangeEventDirection::Dropped);
+        assert_eq!(events[0].reason_code, ChangeEventReasonCode::BaselineDrop);
+        assert!((events[0].magnitude - 0.21).abs() < 0.000001);
+        assert!(events[0].summary.contains("dropped"));
+        assert!(events[0]
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == "alignment:field-alpha:ndvi"));
+        assert!(events[0]
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == "zone:NE"));
+    }
+
+    #[test]
+    fn change_event_derivation_returns_zero_for_subthreshold_change() {
+        let engine = seeded_baseline_engine();
+        let trend = engine
+            .compute_zonal_trend(
+                trend_target_2026(),
+                ZonalTrendConfig {
+                    min_points: 3,
+                    flat_slope_epsilon: 0.001,
+                },
+            )
+            .expect("trend should compute");
+        let baseline = engine
+            .compute_rolling_baseline(
+                trend_target_2026(),
+                RollingBaselineConfig {
+                    window_points: 2,
+                    anomaly_band: 0.10,
+                },
+            )
+            .expect("baseline should compute");
+
+        let events = derive_ranked_change_events(
+            vec![ChangeEventDerivationInput {
+                change: sample_drop_change_result(),
+                trend,
+                baseline,
+            }],
+            ChangeEventConfig {
+                magnitude_threshold: 0.50,
+                min_changed_cells: 1,
+            },
+        )
+        .expect("change event derivation should run");
+
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -2346,6 +2956,64 @@ mod tests {
             kind,
             expected_cadence: "per_flight".to_string(),
         }
+    }
+
+    fn seeded_baseline_engine() -> TimeSeriesEngine {
+        let mut engine = TimeSeriesEngine::default();
+        engine
+            .register_metric(metric_definition("ndvi_mean", "index", MetricKind::Scalar))
+            .expect("metric should register");
+        for (date, value) in [
+            ("2024-06-14T10:00:00Z", 0.64),
+            ("2025-06-14T10:00:00Z", 0.66),
+            ("2026-06-10T10:00:00Z", 0.70),
+            ("2026-06-12T10:00:00Z", 0.72),
+            ("2026-06-14T10:00:00Z", 0.50),
+        ] {
+            engine
+                .append(scalar_point_with_unit(
+                    "field:alpha",
+                    "ndvi_mean",
+                    "index",
+                    date,
+                    value,
+                ))
+                .expect("baseline point should append");
+        }
+        engine
+    }
+
+    fn trend_target_2026() -> ZonalTrendTarget {
+        ZonalTrendTarget {
+            entity_ref: "field:alpha".to_string(),
+            metric: "ndvi_mean".to_string(),
+            zone_ref: "zone:NE".to_string(),
+            zone_crs: "EPSG:32610".to_string(),
+            range: TimeRange {
+                start: Some("2026-01-01T00:00:00Z".to_string()),
+                end: None,
+            },
+        }
+    }
+
+    fn sample_drop_change_result() -> RasterChangeResult {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier = aligned_grid(&evidence, &evidence.aligned_earlier_ref, [0.70; 4]);
+        let later = aligned_grid(
+            &evidence,
+            &evidence.aligned_later_ref,
+            [0.45, 0.48, 0.70, 0.70],
+        );
+        compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier,
+            &later,
+            change_config(0.10),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("sample drop should produce change result")
     }
 
     fn sample_product_ingest(
