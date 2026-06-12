@@ -1,5 +1,6 @@
+# syntax=docker/dockerfile:1.7
 # Multi-stage Docker build for AgroDrone
-FROM rust:1.75-slim as builder
+FROM rust:1.93.1-slim-bookworm AS builder
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -22,7 +23,13 @@ RUN cargo build --release \
     --bin ground_station_ui
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM debian:12-slim AS runtime
+
+ARG AGRODRONE_COMMIT=unknown
+ARG AGRODRONE_IMAGE_DIGEST=unbuilt
+
+LABEL org.opencontainers.image.title="AGBot AgroDrone runtime" \
+      org.opencontainers.image.revision="${AGRODRONE_COMMIT}"
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
@@ -43,8 +50,17 @@ COPY --from=builder /app/target/release/imagery_processor /opt/agrodrone/bin/
 COPY --from=builder /app/target/release/lidar_mapper /opt/agrodrone/bin/
 COPY --from=builder /app/target/release/ground_station_ui /opt/agrodrone/bin/
 
-# Copy environment file
-COPY .env /opt/agrodrone/
+RUN printf '%s\n' \
+    '{' \
+    '  "schema_version": 1,' \
+    '  "toolchain": "rust 1.93.1",' \
+    '  "builder_base": "rust:1.93.1-slim-bookworm",' \
+    '  "runtime_base": "debian:12-slim",' \
+    "  \"source_commit\": \"${AGRODRONE_COMMIT}\"," \
+    "  \"image_digest\": \"${AGRODRONE_IMAGE_DIGEST}\"," \
+    '  "binaries": ["mission_control", "sensor_collector", "imagery_processor", "lidar_mapper", "ground_station_ui"]' \
+    '}' \
+    > /opt/agrodrone/build-manifest.json
 
 # Set environment
 ENV PATH="/opt/agrodrone/bin:$PATH"

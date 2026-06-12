@@ -68,12 +68,17 @@ jobs:
     
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
+
+    - name: Validate Dockerfile pins and manifest
+      run: bash scripts/verify-container-build.sh
       
     - name: Build Docker image
       uses: docker/build-push-action@v5
       with:
         context: .
         push: false
-        tags: agrodrone:latest
+        tags: agrodrone:${{ github.sha }}
+        build-args: |
+          AGRODRONE_COMMIT=${{ github.sha }}
         cache-from: type=gha
         cache-to: type=gha,mode=max

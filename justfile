@@ -150,7 +150,8 @@ lidar:
 # Build Docker image
 docker:
     @echo "🐳 Building Docker image..."
-    docker build -t agrodrone:latest .
+    bash scripts/verify-container-build.sh
+    docker build --build-arg AGRODRONE_COMMIT=$(git rev-parse HEAD) -t agrodrone:$(git rev-parse --short HEAD) .
 
 # Cross-compile for ARM64 (Jetson)
 arm64:

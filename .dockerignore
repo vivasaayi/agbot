@@ -1,8 +1,12 @@
 .git
+.claude
+.codex
 target
 data
 processed
 out
+.env
+geo_hub.db
 node_modules
 **/node_modules
 .DS_Store

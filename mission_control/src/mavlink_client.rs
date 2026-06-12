@@ -1,12 +1,12 @@
 use shared::{
     config::AgroConfig,
-    schemas::{Telemetry, GpsCoords, WebSocketMessage},
+    schemas::{GpsCoords, Telemetry, WebSocketMessage},
     AgroResult,
 };
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_serial::SerialPortBuilderExt;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 pub struct MavlinkClient {
     config: Arc<AgroConfig>,
@@ -22,15 +22,23 @@ impl MavlinkClient {
     }
 
     pub async fn run(&self) -> AgroResult<()> {
-        info!("Connecting to flight controller on {}", self.config.mavlink.serial_port);
-
-        let mut port = tokio_serial::new(&self.config.mavlink.serial_port, self.config.mavlink.baud_rate)
-            .open_native_async()
-            .map_err(|e| shared::error::AgroError::Mavlink(format!("Failed to open serial port: {}", e)))?;
-
-        let mut heartbeat_interval = tokio::time::interval(
-            std::time::Duration::from_millis(self.config.mavlink.heartbeat_interval_ms)
+        info!(
+            "Connecting to flight controller on {}",
+            self.config.mavlink.serial_port
         );
+
+        let mut port = tokio_serial::new(
+            &self.config.mavlink.serial_port,
+            self.config.mavlink.baud_rate,
+        )
+        .open_native_async()
+        .map_err(|e| {
+            shared::error::AgroError::Mavlink(format!("Failed to open serial port: {}", e))
+        })?;
+
+        let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_millis(
+            self.config.mavlink.heartbeat_interval_ms,
+        ));
 
         let mut telemetry_buffer = Vec::new();
 
@@ -43,7 +51,7 @@ impl MavlinkClient {
                     match result {
                         Ok(telemetry) => {
                             telemetry_buffer.push(telemetry.clone());
-                            
+
                             // Send telemetry update
                             let msg = WebSocketMessage::Telemetry { data: telemetry };
                             if let Err(e) = self.event_tx.send(msg) {
@@ -61,7 +69,7 @@ impl MavlinkClient {
 
     async fn send_heartbeat(&self, port: &mut tokio_serial::SerialStream) -> AgroResult<()> {
         use mavlink::common::*;
-        
+
         let heartbeat = MavMessage::HEARTBEAT(HEARTBEAT_DATA {
             custom_mode: 0,
             mavtype: MavType::MAV_TYPE_GCS,
@@ -79,24 +87,30 @@ impl MavlinkClient {
 
         let mut buf = Vec::new();
         mavlink::write_versioned_msg(&mut buf, mavlink::MavlinkVersion::V2, header, &heartbeat)
-            .map_err(|e| shared::error::AgroError::Mavlink(format!("Failed to serialize heartbeat: {}", e)))?;
+            .map_err(|e| {
+                shared::error::AgroError::Mavlink(format!("Failed to serialize heartbeat: {}", e))
+            })?;
 
-        tokio::io::AsyncWriteExt::write_all(port, &buf).await
-            .map_err(|e| shared::error::AgroError::Mavlink(format!("Failed to send heartbeat: {}", e)))?;
+        tokio::io::AsyncWriteExt::write_all(port, &buf)
+            .await
+            .map_err(|e| {
+                shared::error::AgroError::Mavlink(format!("Failed to send heartbeat: {}", e))
+            })?;
 
         Ok(())
     }
 
     async fn read_telemetry(&self, port: &mut tokio_serial::SerialStream) -> AgroResult<Telemetry> {
         use tokio::io::AsyncReadExt;
-        
+
         let mut buf = [0u8; 1024];
-        let _n = port.read(&mut buf).await
-            .map_err(|e| shared::error::AgroError::Mavlink(format!("Failed to read from port: {}", e)))?;
+        let _n = port.read(&mut buf).await.map_err(|e| {
+            shared::error::AgroError::Mavlink(format!("Failed to read from port: {}", e))
+        })?;
 
         // Parse MAVLink messages (simplified)
         // In a real implementation, you'd use proper MAVLink parsing
-        
+
         // For now, return mock telemetry
         Ok(Telemetry {
             timestamp: chrono::Utc::now(),
@@ -123,19 +137,14 @@ pub struct SimulatedMavlinkClient {
 }
 
 impl SimulatedMavlinkClient {
-    pub fn new(
-        config: Arc<AgroConfig>,
-        event_tx: broadcast::Sender<WebSocketMessage>,
-    ) -> Self {
+    pub fn new(config: Arc<AgroConfig>, event_tx: broadcast::Sender<WebSocketMessage>) -> Self {
         Self { config, event_tx }
     }
 
     pub async fn run(&self) -> AgroResult<()> {
         info!("Starting simulated MAVLink client");
 
-        let mut telemetry_interval = tokio::time::interval(
-            std::time::Duration::from_millis(1000)
-        );
+        let mut telemetry_interval = tokio::time::interval(std::time::Duration::from_millis(1000));
 
         let mut battery_percentage = 100u8;
         let mut altitude = 0.0f32;
@@ -156,7 +165,8 @@ impl SimulatedMavlinkClient {
                 timestamp: chrono::Utc::now(),
                 position: GpsCoords {
                     latitude: self.config.gps.home_latitude + (rand::random::<f64>() - 0.5) * 0.001,
-                    longitude: self.config.gps.home_longitude + (rand::random::<f64>() - 0.5) * 0.001,
+                    longitude: self.config.gps.home_longitude
+                        + (rand::random::<f64>() - 0.5) * 0.001,
                     altitude: self.config.gps.home_altitude + altitude as f64,
                 },
                 battery_voltage: 12.6 - (100 - battery_percentage) as f32 * 0.01,
