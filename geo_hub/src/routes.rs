@@ -20,8 +20,10 @@ use geojson::{
 use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    assert_raster_spatial_ref, bounds_from_points, validate_field_boundary, AnnotationGeometry,
-    AnnotationRecord, FarmRecord, FieldBoundary, FieldRecord, GeoBounds, GeoPoint, GpsCoords,
+    assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
+    validate_field_boundary, AnnotationGeometry, AnnotationRecord, FarmRecord, FieldBoundary,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
     ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
     RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
     DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
@@ -276,6 +278,11 @@ pub struct ImportShapefileRequest {
     pub crop: Option<String>,
     pub season: Option<String>,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FleetNodeListQuery {
+    pub owner_org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1362,6 +1369,100 @@ async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<Ve
     }
 
     Ok(persisted)
+}
+
+pub async fn enroll_fleet_node(
+    State(state): State<AppState>,
+    Json(request): Json<FleetNodeEnrollmentRequest>,
+) -> AppResult<Json<FleetNodeRecord>> {
+    let binding = bind_fleet_node_identity(
+        request.clone(),
+        None,
+        Uuid::new_v4().to_string(),
+        current_record_timestamp(),
+    )
+    .map_err(fleet_enrollment_error)?;
+    let record = binding.record;
+    let capabilities_json =
+        serde_json::to_string(&record.capabilities).map_err(|err| AppError::Anyhow(err.into()))?;
+
+    let result = sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO fleet_nodes
+            (node_id, hardware_id, kind, capabilities_json, owner_org_id, runtime_mode, enrolled_at, status)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&record.node_id)
+    .bind(&record.hardware_id)
+    .bind(record.kind.as_str())
+    .bind(capabilities_json)
+    .bind(&record.owner_org_id)
+    .bind(record.runtime_mode.as_str())
+    .bind(&record.enrolled_at)
+    .bind(record.status.as_str())
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    if result.rows_affected() == 0 {
+        let existing = load_fleet_node_by_hardware_id(&state, &record.hardware_id)
+            .await?
+            .ok_or_else(|| AppError::Anyhow(anyhow::anyhow!("fleet node conflict not found")))?;
+        let binding =
+            bind_fleet_node_identity(request, Some(existing), record.node_id, record.enrolled_at)
+                .map_err(fleet_enrollment_error)?;
+        return Ok(Json(binding.record));
+    }
+
+    Ok(Json(record))
+}
+
+pub async fn list_fleet_nodes(
+    Query(query): Query<FleetNodeListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<FleetNodeRecord>>> {
+    let owner_org_id = normalize_optional_text(query.owner_org_id);
+    let rows = if let Some(owner_org_id) = owner_org_id {
+        sqlx::query(
+            r#"
+            SELECT node_id, hardware_id, kind, capabilities_json, owner_org_id, runtime_mode, enrolled_at, status
+            FROM fleet_nodes
+            WHERE owner_org_id = ?1
+            ORDER BY enrolled_at DESC, node_id ASC
+            "#,
+        )
+        .bind(owner_org_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT node_id, hardware_id, kind, capabilities_json, owner_org_id, runtime_mode, enrolled_at, status
+            FROM fleet_nodes
+            ORDER BY enrolled_at DESC, node_id ASC
+            "#,
+        )
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?
+    };
+
+    rows.into_iter()
+        .map(|row| decode_fleet_node_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_fleet_node(
+    Path(node_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<FleetNodeRecord>> {
+    let node = load_fleet_node(&state, &node_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(node))
 }
 
 pub async fn list_farms(State(state): State<AppState>) -> AppResult<Json<Vec<FarmRecord>>> {
@@ -3458,6 +3559,28 @@ fn normalize_annotation_label(label: String) -> AppResult<String> {
     Ok(label)
 }
 
+fn fleet_enrollment_error(error: FleetNodeEnrollmentError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn parse_fleet_node_kind(value: String) -> AppResult<FleetNodeKind> {
+    value.parse::<FleetNodeKind>().map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode fleet node kind"))
+    })
+}
+
+fn parse_fleet_node_runtime_mode(value: String) -> AppResult<FleetNodeRuntimeMode> {
+    value.parse::<FleetNodeRuntimeMode>().map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode fleet node runtime_mode"))
+    })
+}
+
+fn parse_fleet_node_status(value: String) -> AppResult<FleetNodeStatus> {
+    value.parse::<FleetNodeStatus>().map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode fleet node status"))
+    })
+}
+
 fn normalize_farm_name(name: String) -> AppResult<String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -4112,6 +4235,27 @@ fn decode_farm_record(row: &sqlx::sqlite::SqliteRow) -> FarmRecord {
     }
 }
 
+fn decode_fleet_node_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FleetNodeRecord> {
+    let capabilities_json: String = row.get("capabilities_json");
+    let capabilities = serde_json::from_str::<Vec<String>>(&capabilities_json).map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode fleet node capabilities_json"))
+    })?;
+    let kind = parse_fleet_node_kind(row.get::<String, _>("kind"))?;
+    let runtime_mode = parse_fleet_node_runtime_mode(row.get::<String, _>("runtime_mode"))?;
+    let status = parse_fleet_node_status(row.get::<String, _>("status"))?;
+
+    Ok(FleetNodeRecord {
+        node_id: row.get("node_id"),
+        hardware_id: row.get("hardware_id"),
+        kind,
+        capabilities,
+        owner_org_id: row.get("owner_org_id"),
+        runtime_mode,
+        enrolled_at: row.get("enrolled_at"),
+        status,
+    })
+}
+
 fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<AnnotationRecord> {
     let geometry_json: String = row.get("geometry_json");
     let geometry = serde_json::from_str::<AnnotationGeometry>(&geometry_json).map_err(|err| {
@@ -4225,6 +4369,41 @@ async fn load_farm(state: &AppState, farm_id: &str) -> AppResult<Option<FarmReco
             .map_err(Error::from)?;
 
     Ok(row.map(|row| decode_farm_record(&row)))
+}
+
+async fn load_fleet_node(state: &AppState, node_id: &str) -> AppResult<Option<FleetNodeRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT node_id, hardware_id, kind, capabilities_json, owner_org_id, runtime_mode, enrolled_at, status
+        FROM fleet_nodes
+        WHERE node_id = ?1
+        "#,
+    )
+    .bind(node_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_fleet_node_record(&row)).transpose()
+}
+
+async fn load_fleet_node_by_hardware_id(
+    state: &AppState,
+    hardware_id: &str,
+) -> AppResult<Option<FleetNodeRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT node_id, hardware_id, kind, capabilities_json, owner_org_id, runtime_mode, enrolled_at, status
+        FROM fleet_nodes
+        WHERE hardware_id = ?1
+        "#,
+    )
+    .bind(hardware_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_fleet_node_record(&row)).transpose()
 }
 
 async fn field_owner_for_farm(

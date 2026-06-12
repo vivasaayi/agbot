@@ -1,6 +1,6 @@
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// GPS coordinates
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +132,225 @@ pub struct SceneLayerRecord {
 pub struct FieldSceneCatalogEntry {
     pub scene: SceneRecord,
     pub layers: Vec<SceneLayerRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetNodeKind {
+    Drone,
+    Edge,
+}
+
+impl FleetNodeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetNodeKind::Drone => "drone",
+            FleetNodeKind::Edge => "edge",
+        }
+    }
+}
+
+impl std::str::FromStr for FleetNodeKind {
+    type Err = FleetNodeEnrollmentError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "drone" => Ok(FleetNodeKind::Drone),
+            "edge" => Ok(FleetNodeKind::Edge),
+            _ => Err(FleetNodeEnrollmentError::UnsupportedKind {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetNodeRuntimeMode {
+    Simulation,
+    Flight,
+}
+
+impl FleetNodeRuntimeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetNodeRuntimeMode::Simulation => "simulation",
+            FleetNodeRuntimeMode::Flight => "flight",
+        }
+    }
+}
+
+impl std::str::FromStr for FleetNodeRuntimeMode {
+    type Err = FleetNodeEnrollmentError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "simulation" => Ok(FleetNodeRuntimeMode::Simulation),
+            "flight" => Ok(FleetNodeRuntimeMode::Flight),
+            _ => Err(FleetNodeEnrollmentError::UnsupportedRuntimeMode {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetNodeStatus {
+    Enrolled,
+}
+
+impl FleetNodeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetNodeStatus::Enrolled => "enrolled",
+        }
+    }
+}
+
+impl std::str::FromStr for FleetNodeStatus {
+    type Err = FleetNodeEnrollmentError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "enrolled" => Ok(FleetNodeStatus::Enrolled),
+            _ => Err(FleetNodeEnrollmentError::UnsupportedStatus {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FleetNodeEnrollmentRequest {
+    #[serde(default)]
+    pub hardware_id: String,
+    pub kind: FleetNodeKind,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub owner_org_id: String,
+    pub runtime_mode: FleetNodeRuntimeMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetNodeRecord {
+    pub node_id: String,
+    pub hardware_id: String,
+    pub kind: FleetNodeKind,
+    pub capabilities: Vec<String>,
+    pub owner_org_id: String,
+    pub runtime_mode: FleetNodeRuntimeMode,
+    pub enrolled_at: String,
+    pub status: FleetNodeStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetNodeIdentityBinding {
+    pub record: FleetNodeRecord,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FleetNodeEnrollmentError {
+    #[error("fleet node hardware_id cannot be empty")]
+    EmptyHardwareId,
+    #[error("fleet node node_id cannot be empty")]
+    EmptyNodeId,
+    #[error("fleet node owner_org_id cannot be empty")]
+    EmptyOwnerOrgId,
+    #[error("fleet node capabilities cannot be empty")]
+    EmptyCapabilities,
+    #[error("fleet node enrolled_at cannot be empty")]
+    EmptyEnrolledAt,
+    #[error("unsupported fleet node kind {value}")]
+    UnsupportedKind { value: String },
+    #[error("unsupported fleet node runtime_mode {value}")]
+    UnsupportedRuntimeMode { value: String },
+    #[error("unsupported fleet node status {value}")]
+    UnsupportedStatus { value: String },
+    #[error("existing fleet node hardware_id {existing} does not match enrollment {requested}")]
+    HardwareIdMismatch { existing: String, requested: String },
+}
+
+pub fn bind_fleet_node_identity(
+    request: FleetNodeEnrollmentRequest,
+    existing: Option<FleetNodeRecord>,
+    issued_node_id: String,
+    enrolled_at: String,
+) -> Result<FleetNodeIdentityBinding, FleetNodeEnrollmentError> {
+    let requested_hardware_id = normalize_fleet_node_arg(
+        request.hardware_id,
+        FleetNodeEnrollmentError::EmptyHardwareId,
+    )?;
+
+    if let Some(existing) = existing {
+        if existing.hardware_id != requested_hardware_id {
+            return Err(FleetNodeEnrollmentError::HardwareIdMismatch {
+                existing: existing.hardware_id,
+                requested: requested_hardware_id,
+            });
+        }
+        return Ok(FleetNodeIdentityBinding {
+            record: existing,
+            created: false,
+        });
+    }
+
+    let node_id = normalize_fleet_node_arg(issued_node_id, FleetNodeEnrollmentError::EmptyNodeId)?;
+    let owner_org_id = normalize_fleet_node_arg(
+        request.owner_org_id,
+        FleetNodeEnrollmentError::EmptyOwnerOrgId,
+    )?;
+    let enrolled_at =
+        normalize_fleet_node_arg(enrolled_at, FleetNodeEnrollmentError::EmptyEnrolledAt)?;
+    let capabilities = normalize_fleet_node_capabilities(request.capabilities)?;
+
+    Ok(FleetNodeIdentityBinding {
+        record: FleetNodeRecord {
+            node_id,
+            hardware_id: requested_hardware_id,
+            kind: request.kind,
+            capabilities,
+            owner_org_id,
+            runtime_mode: request.runtime_mode,
+            enrolled_at,
+            status: FleetNodeStatus::Enrolled,
+        },
+        created: true,
+    })
+}
+
+fn normalize_fleet_node_arg(
+    value: String,
+    error: FleetNodeEnrollmentError,
+) -> Result<String, FleetNodeEnrollmentError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_fleet_node_capabilities(
+    capabilities: Vec<String>,
+) -> Result<Vec<String>, FleetNodeEnrollmentError> {
+    let capabilities = capabilities
+        .into_iter()
+        .filter_map(|capability| {
+            let capability = capability.trim();
+            (!capability.is_empty()).then(|| capability.to_ascii_lowercase())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if capabilities.is_empty() {
+        Err(FleetNodeEnrollmentError::EmptyCapabilities)
+    } else {
+        Ok(capabilities)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -2150,18 +2369,105 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_raster_spatial_ref, bounds_from_points, validate_field_boundary,
-        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
+        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
+        validate_field_boundary, AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
         AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord, CropPlanRecord,
         FarmFieldError, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError,
-        FieldRecord, GeoBounds, GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, ReportDeliverableRegistry, ReportFormat,
-        ReportPersistenceError, ReportRecord, ReportVisibility, SceneLayerMetadataError,
-        SceneLayerRecord, SceneRecord, SeasonRecord, WorkOrderChangeType, WorkOrderCreateRequest,
-        WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
+        FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
+        ReportDeliverableRegistry, ReportFormat, ReportPersistenceError, ReportRecord,
+        ReportVisibility, SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
+        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry,
+        WorkOrderStatus,
     };
+
+    #[test]
+    fn fleet_node_identity_binding_normalizes_new_enrollment() {
+        let binding = bind_fleet_node_identity(
+            FleetNodeEnrollmentRequest {
+                hardware_id: " hw-drone-001 ".to_string(),
+                kind: FleetNodeKind::Drone,
+                capabilities: vec![
+                    "multispectral".to_string(),
+                    " LiDAR ".to_string(),
+                    "lidar".to_string(),
+                ],
+                owner_org_id: " org-alpha ".to_string(),
+                runtime_mode: FleetNodeRuntimeMode::Simulation,
+            },
+            None,
+            " node-001 ".to_string(),
+            " 2026-06-12T12:00:00Z ".to_string(),
+        )
+        .expect("new enrollment should bind");
+
+        assert!(binding.created);
+        assert_eq!(binding.record.node_id, "node-001");
+        assert_eq!(binding.record.hardware_id, "hw-drone-001");
+        assert_eq!(
+            binding.record.capabilities,
+            vec!["lidar".to_string(), "multispectral".to_string()]
+        );
+        assert_eq!(binding.record.owner_org_id, "org-alpha");
+        assert_eq!(
+            binding.record.runtime_mode,
+            FleetNodeRuntimeMode::Simulation
+        );
+        assert_eq!(binding.record.status, FleetNodeStatus::Enrolled);
+    }
+
+    #[test]
+    fn fleet_node_identity_binding_rebinds_duplicate_hardware_to_existing_node() {
+        let existing = FleetNodeRecord {
+            node_id: "node-001".to_string(),
+            hardware_id: "hw-drone-001".to_string(),
+            kind: FleetNodeKind::Drone,
+            capabilities: vec!["lidar".to_string()],
+            owner_org_id: "org-alpha".to_string(),
+            runtime_mode: FleetNodeRuntimeMode::Simulation,
+            enrolled_at: "2026-06-12T12:00:00Z".to_string(),
+            status: FleetNodeStatus::Enrolled,
+        };
+
+        let binding = bind_fleet_node_identity(
+            FleetNodeEnrollmentRequest {
+                hardware_id: "hw-drone-001".to_string(),
+                kind: FleetNodeKind::Drone,
+                capabilities: vec!["thermal".to_string()],
+                owner_org_id: "org-beta".to_string(),
+                runtime_mode: FleetNodeRuntimeMode::Flight,
+            },
+            Some(existing.clone()),
+            "node-002".to_string(),
+            "2026-06-12T13:00:00Z".to_string(),
+        )
+        .expect("duplicate enrollment should rebind");
+
+        assert!(!binding.created);
+        assert_eq!(binding.record, existing);
+    }
+
+    #[test]
+    fn fleet_node_identity_binding_rejects_missing_hardware_id() {
+        let error = bind_fleet_node_identity(
+            FleetNodeEnrollmentRequest {
+                hardware_id: "  ".to_string(),
+                kind: FleetNodeKind::Edge,
+                capabilities: vec!["compute".to_string()],
+                owner_org_id: "org-alpha".to_string(),
+                runtime_mode: FleetNodeRuntimeMode::Simulation,
+            },
+            None,
+            "node-001".to_string(),
+            "2026-06-12T12:00:00Z".to_string(),
+        )
+        .expect_err("blank hardware identity should be rejected");
+
+        assert_eq!(error, FleetNodeEnrollmentError::EmptyHardwareId);
+    }
 
     #[test]
     fn multispectral_image_deserializes_without_spatial_ref() {

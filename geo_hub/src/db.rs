@@ -366,6 +366,23 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS fleet_nodes (
+            node_id TEXT PRIMARY KEY,
+            hardware_id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL,
+            owner_org_id TEXT NOT NULL,
+            runtime_mode TEXT NOT NULL,
+            enrolled_at TEXT NOT NULL,
+            status TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_scenes_field_id ON scenes(field_id);
         "#,
     )
@@ -432,6 +449,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     sqlx::query(
         r#"
         CREATE INDEX IF NOT EXISTS idx_report_shares_report_id ON report_shares(report_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_fleet_nodes_owner_org_id
+        ON fleet_nodes(owner_org_id);
         "#,
     )
     .execute(pool)

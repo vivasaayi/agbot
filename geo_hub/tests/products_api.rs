@@ -1291,6 +1291,197 @@ async fn farm_field_scene_identity_persists_after_restart() -> Result<()> {
 }
 
 #[tokio::test]
+async fn fleet_node_enrollment_lists_gets_and_rebinds_duplicate_hardware() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let enroll_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet/nodes/enroll")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "hardware_id": "hw-drone-001",
+                        "kind": "drone",
+                        "capabilities": ["multispectral", " lidar ", "lidar"],
+                        "owner_org_id": "org-alpha",
+                        "runtime_mode": "simulation"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(enroll_response.status(), StatusCode::OK);
+    let body = to_bytes(enroll_response.into_body(), 64 * 1024).await?;
+    let enrolled: serde_json::Value = serde_json::from_slice(&body)?;
+    let node_id = enrolled
+        .get("node_id")
+        .and_then(|value| value.as_str())
+        .expect("node_id should be returned")
+        .to_string();
+    assert!(!node_id.trim().is_empty());
+    assert_eq!(
+        enrolled.get("hardware_id").and_then(|value| value.as_str()),
+        Some("hw-drone-001")
+    );
+    assert_eq!(
+        enrolled.get("kind").and_then(|value| value.as_str()),
+        Some("drone")
+    );
+    assert_eq!(
+        enrolled
+            .get("owner_org_id")
+            .and_then(|value| value.as_str()),
+        Some("org-alpha")
+    );
+    assert_eq!(
+        enrolled
+            .get("runtime_mode")
+            .and_then(|value| value.as_str()),
+        Some("simulation")
+    );
+    assert_eq!(
+        enrolled
+            .get("capabilities")
+            .and_then(|value| value.as_array()),
+        Some(&vec![json!("lidar"), json!("multispectral")])
+    );
+    assert_eq!(
+        enrolled.get("status").and_then(|value| value.as_str()),
+        Some("enrolled")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fleet/nodes?owner_org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].get("node_id").and_then(|value| value.as_str()),
+        Some(node_id.as_str())
+    );
+
+    let get_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/fleet/nodes/{node_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let body = to_bytes(get_response.into_body(), 64 * 1024).await?;
+    let fetched: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        fetched.get("node_id").and_then(|value| value.as_str()),
+        Some(node_id.as_str())
+    );
+
+    let duplicate_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet/nodes/enroll")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "hardware_id": "hw-drone-001",
+                        "kind": "drone",
+                        "capabilities": ["thermal"],
+                        "owner_org_id": "org-beta",
+                        "runtime_mode": "flight"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(duplicate_response.status(), StatusCode::OK);
+    let body = to_bytes(duplicate_response.into_body(), 64 * 1024).await?;
+    let duplicate: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        duplicate.get("node_id").and_then(|value| value.as_str()),
+        Some(node_id.as_str())
+    );
+    assert_eq!(
+        duplicate
+            .get("owner_org_id")
+            .and_then(|value| value.as_str()),
+        Some("org-alpha")
+    );
+
+    let node_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fleet_nodes WHERE hardware_id = ?1")
+            .bind("hw-drone-001")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(node_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fleet_node_enrollment_rejects_missing_hardware_identity() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fleet/nodes/enroll")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "hardware_id": "  ",
+                        "kind": "edge",
+                        "capabilities": ["compute"],
+                        "owner_org_id": "org-alpha",
+                        "runtime_mode": "simulation"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let node_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_nodes")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(node_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_field_rejects_orphan_farm_reference() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

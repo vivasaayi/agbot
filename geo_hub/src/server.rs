@@ -47,6 +47,12 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_fields).post(routes::create_field),
         )
         .route(
+            "/api/fleet/nodes",
+            get(routes::list_fleet_nodes).post(routes::enroll_fleet_node),
+        )
+        .route("/api/fleet/nodes/enroll", post(routes::enroll_fleet_node))
+        .route("/api/fleet/nodes/:node_id", get(routes::get_fleet_node))
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )
