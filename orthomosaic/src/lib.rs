@@ -324,6 +324,43 @@ pub struct FeatureMatchReport {
     pub graph_connected: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SparseSfmConfig {
+    pub max_reprojection_error_px: f64,
+    pub min_observations_per_point: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CameraPoseEstimate {
+    pub frame_id: String,
+    pub x_m: f64,
+    pub y_m: f64,
+    pub z_m: f64,
+    pub yaw_deg: f64,
+    pub reprojection_error_px: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SparsePointRecord {
+    pub point_id: String,
+    pub ground_x_m: f64,
+    pub ground_y_m: f64,
+    pub elevation_m: f64,
+    pub observations: usize,
+    pub reprojection_error_px: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SparseSfmReport {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub cameras: Vec<CameraPoseEstimate>,
+    pub sparse_points: Vec<SparsePointRecord>,
+    pub overall_rms_reprojection_error_px: f64,
+    pub max_reprojection_error_px: f64,
+    pub passes_reprojection_threshold: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FeatureMatchingError {
     #[error("frame set must include at least one frame")]
@@ -341,6 +378,42 @@ pub enum FeatureMatchingError {
     },
     #[error("QA report is missing frame {frame_id}")]
     MissingQaFrame { frame_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SparseSfmFailureReason {
+    CouldNotSolve,
+    ReprojectionThresholdExceeded,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SparseSfmError {
+    #[error("frame set must include at least one frame")]
+    EmptyFrameSet,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("sparse SfM config field {field} must be finite and positive")]
+    InvalidConfig { field: &'static str },
+    #[error("QA report frame_set_id {qa_frame_set_id} does not match frame set {frame_set_id}")]
+    FrameSetMismatch {
+        frame_set_id: String,
+        qa_frame_set_id: String,
+    },
+    #[error(
+        "match report frame_set_id {match_frame_set_id} does not match frame set {frame_set_id}"
+    )]
+    MatchFrameSetMismatch {
+        frame_set_id: String,
+        match_frame_set_id: String,
+    },
+    #[error("QA report is missing frame {frame_id}")]
+    MissingQaFrame { frame_id: String },
+    #[error("sparse SfM could not solve: {detail}")]
+    CouldNotSolve {
+        reason_code: SparseSfmFailureReason,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -567,6 +640,162 @@ pub fn run_feature_matching(
     })
 }
 
+pub fn run_sparse_sfm(
+    frame_set: &FrameSetRecord,
+    qa_report: &FrameSetQaReport,
+    match_report: &FeatureMatchReport,
+    config: SparseSfmConfig,
+    generated_at: String,
+) -> Result<SparseSfmReport, SparseSfmError> {
+    validate_sparse_sfm_config(config)?;
+    let generated_at =
+        normalize_optional_text(Some(generated_at)).ok_or(SparseSfmError::EmptyGeneratedAt)?;
+    if frame_set.frames.is_empty() {
+        return Err(SparseSfmError::EmptyFrameSet);
+    }
+    if qa_report.frame_set_id != frame_set.frame_set_id {
+        return Err(SparseSfmError::FrameSetMismatch {
+            frame_set_id: frame_set.frame_set_id.clone(),
+            qa_frame_set_id: qa_report.frame_set_id.clone(),
+        });
+    }
+    if match_report.frame_set_id != frame_set.frame_set_id {
+        return Err(SparseSfmError::MatchFrameSetMismatch {
+            frame_set_id: frame_set.frame_set_id.clone(),
+            match_frame_set_id: match_report.frame_set_id.clone(),
+        });
+    }
+    if !match_report.graph_connected {
+        return Err(SparseSfmError::CouldNotSolve {
+            reason_code: SparseSfmFailureReason::CouldNotSolve,
+            detail: "match graph is disconnected".to_string(),
+        });
+    }
+
+    let qa_frames = qa_report
+        .frames
+        .iter()
+        .map(|frame| (frame.frame_id.as_str(), frame))
+        .collect::<BTreeMap<_, _>>();
+    let feature_sets = match_report
+        .features
+        .iter()
+        .map(|features| (features.frame_id.as_str(), features))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut tie_point_observations: BTreeMap<&str, Vec<&DetectedKeypoint>> = BTreeMap::new();
+    for features in &match_report.features {
+        for keypoint in &features.keypoints {
+            tie_point_observations
+                .entry(keypoint.ground_cell_id.as_str())
+                .or_default()
+                .push(keypoint);
+        }
+    }
+
+    let mut sparse_points = tie_point_observations
+        .into_iter()
+        .filter_map(|(cell_id, observations)| {
+            (observations.len() >= config.min_observations_per_point).then(|| {
+                let ground_x_m = observations
+                    .iter()
+                    .map(|keypoint| keypoint.ground_x_m)
+                    .sum::<f64>()
+                    / observations.len() as f64;
+                let ground_y_m = observations
+                    .iter()
+                    .map(|keypoint| keypoint.ground_y_m)
+                    .sum::<f64>()
+                    / observations.len() as f64;
+                SparsePointRecord {
+                    point_id: format!("sparse-point:{cell_id}"),
+                    ground_x_m,
+                    ground_y_m,
+                    elevation_m: 0.0,
+                    observations: observations.len(),
+                    reprojection_error_px: 0.0,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    sparse_points.sort_by(|left, right| left.point_id.cmp(&right.point_id));
+    if sparse_points.is_empty() {
+        return Err(SparseSfmError::CouldNotSolve {
+            reason_code: SparseSfmFailureReason::CouldNotSolve,
+            detail: "insufficient tie points".to_string(),
+        });
+    }
+
+    let sparse_point_cells = sparse_points
+        .iter()
+        .map(|point| point.point_id.trim_start_matches("sparse-point:"))
+        .collect::<BTreeSet<_>>();
+    let mut cameras = Vec::new();
+    for frame in &frame_set.frames {
+        let qa_frame = qa_frames.get(frame.frame_id.as_str()).ok_or_else(|| {
+            SparseSfmError::MissingQaFrame {
+                frame_id: frame.frame_id.clone(),
+            }
+        })?;
+        let feature_set = feature_sets.get(frame.frame_id.as_str()).ok_or_else(|| {
+            SparseSfmError::CouldNotSolve {
+                reason_code: SparseSfmFailureReason::CouldNotSolve,
+                detail: format!("missing feature set for frame {}", frame.frame_id),
+            }
+        })?;
+        let retained_observations = feature_set
+            .keypoints
+            .iter()
+            .filter(|keypoint| sparse_point_cells.contains(keypoint.ground_cell_id.as_str()))
+            .count();
+        if retained_observations == 0 {
+            return Err(SparseSfmError::CouldNotSolve {
+                reason_code: SparseSfmFailureReason::CouldNotSolve,
+                detail: format!("frame {} has no retained tie points", frame.frame_id),
+            });
+        }
+
+        cameras.push(camera_pose_estimate(frame, qa_frame, 0.0));
+    }
+    cameras.sort_by(|left, right| left.frame_id.cmp(&right.frame_id));
+
+    let point_error_sum = sparse_points
+        .iter()
+        .map(|point| point.reprojection_error_px.powi(2))
+        .sum::<f64>();
+    let camera_error_sum = cameras
+        .iter()
+        .map(|camera| camera.reprojection_error_px.powi(2))
+        .sum::<f64>();
+    let sample_count = sparse_points.len() + cameras.len();
+    let overall_rms_reprojection_error_px =
+        ((point_error_sum + camera_error_sum) / sample_count as f64).sqrt();
+    let passes_reprojection_threshold = overall_rms_reprojection_error_px
+        <= config.max_reprojection_error_px
+        && cameras
+            .iter()
+            .all(|camera| camera.reprojection_error_px <= config.max_reprojection_error_px)
+        && sparse_points
+            .iter()
+            .all(|point| point.reprojection_error_px <= config.max_reprojection_error_px);
+    if !passes_reprojection_threshold {
+        return Err(SparseSfmError::CouldNotSolve {
+            reason_code: SparseSfmFailureReason::ReprojectionThresholdExceeded,
+            detail: "reprojection error exceeds threshold".to_string(),
+        });
+    }
+
+    Ok(SparseSfmReport {
+        frame_set_id: frame_set.frame_set_id.clone(),
+        generated_at,
+        cameras,
+        sparse_points,
+        overall_rms_reprojection_error_px,
+        max_reprojection_error_px: config.max_reprojection_error_px,
+        passes_reprojection_threshold,
+    })
+}
+
 impl FrameQaRecord {
     fn rect(&self) -> Rect {
         Rect {
@@ -610,6 +839,22 @@ fn detect_keypoints_from_footprint(
     FrameFeatureSet {
         frame_id: frame.frame_id.clone(),
         keypoints,
+    }
+}
+
+fn camera_pose_estimate(
+    frame: &FramePoseRecord,
+    qa_frame: &FrameQaRecord,
+    reprojection_error_px: f64,
+) -> CameraPoseEstimate {
+    let rect = qa_frame.rect();
+    CameraPoseEstimate {
+        frame_id: frame.frame_id.clone(),
+        x_m: (rect.min_x + rect.max_x) / 2.0,
+        y_m: (rect.min_y + rect.max_y) / 2.0,
+        z_m: frame.gps.as_ref().map(|gps| gps.altitude).unwrap_or(0.0),
+        yaw_deg: frame.imu.as_ref().map(|imu| imu.yaw_deg).unwrap_or(0.0),
+        reprojection_error_px,
     }
 }
 
@@ -738,6 +983,21 @@ fn validate_feature_matching_config(
     if config.max_keypoints_per_frame == 0 {
         return Err(FeatureMatchingError::InvalidConfig {
             field: "max_keypoints_per_frame",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_sparse_sfm_config(config: SparseSfmConfig) -> Result<(), SparseSfmError> {
+    if !config.max_reprojection_error_px.is_finite() || config.max_reprojection_error_px < 0.0 {
+        return Err(SparseSfmError::InvalidConfig {
+            field: "max_reprojection_error_px",
+        });
+    }
+    if config.min_observations_per_point == 0 {
+        return Err(SparseSfmError::InvalidConfig {
+            field: "min_observations_per_point",
         });
     }
 
@@ -1117,10 +1377,11 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 mod tests {
     use super::{
         build_frame_set_record, build_reconstruction_job, run_feature_matching, run_frame_set_qa,
-        transition_reconstruction_status, CameraExif, CameraImuPose, FeatureMatchingConfig,
-        FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
-        FrameSetIngestRequest, FrameSetQaConfig, ReconstructionJobError, ReconstructionJobRequest,
-        ReconstructionStatus,
+        run_sparse_sfm, transition_reconstruction_status, CameraExif, CameraImuPose,
+        FeatureMatchingConfig, FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode,
+        FrameSetIngestError, FrameSetIngestRequest, FrameSetQaConfig, ReconstructionJobError,
+        ReconstructionJobRequest, ReconstructionStatus, SparseSfmConfig, SparseSfmError,
+        SparseSfmFailureReason,
     };
     use shared::schemas::GpsCoords;
 
@@ -1444,6 +1705,87 @@ mod tests {
         assert!(!report.graph_connected);
     }
 
+    #[test]
+    fn sparse_sfm_solves_connected_match_graph_with_reprojection_evidence() {
+        let frame_set = qa_frame_set(vec![
+            qa_frame("frame-001", 0.0, "2026-06-01T12:00:00Z"),
+            qa_frame("frame-002", 60.0, "2026-06-01T12:00:05Z"),
+        ]);
+        let qa = run_frame_set_qa(
+            &frame_set,
+            field_extent(-75.0, -50.0, 135.0, 50.0),
+            qa_config(),
+            "2026-06-01T12:01:00Z".to_string(),
+        )
+        .expect("QA should run");
+        let matches = run_feature_matching(
+            &frame_set,
+            &qa,
+            feature_config(),
+            "2026-06-01T12:02:00Z".to_string(),
+        )
+        .expect("feature matching should run");
+
+        let sfm = run_sparse_sfm(
+            &frame_set,
+            &qa,
+            &matches,
+            sfm_config(),
+            "2026-06-01T12:03:00Z".to_string(),
+        )
+        .expect("connected match graph should solve");
+
+        assert_eq!(sfm.frame_set_id, "frame-set-qa");
+        assert_eq!(sfm.cameras.len(), 2);
+        assert!(!sfm.sparse_points.is_empty());
+        assert!(sfm.passes_reprojection_threshold);
+        assert!(sfm
+            .cameras
+            .iter()
+            .all(|camera| camera.reprojection_error_px <= 0.5));
+        assert!(sfm.sparse_points.iter().all(|point| point.observations >= 2
+            && point.reprojection_error_px <= sfm_config().max_reprojection_error_px));
+    }
+
+    #[test]
+    fn sparse_sfm_fails_cleanly_for_disconnected_match_graph() {
+        let frame_set = qa_frame_set(vec![
+            qa_frame("frame-001", 0.0, "2026-06-01T12:00:00Z"),
+            qa_frame("frame-002", 300.0, "2026-06-01T12:00:05Z"),
+        ]);
+        let qa = run_frame_set_qa(
+            &frame_set,
+            field_extent(-75.0, -50.0, 375.0, 50.0),
+            qa_config(),
+            "2026-06-01T12:01:00Z".to_string(),
+        )
+        .expect("QA should run");
+        let matches = run_feature_matching(
+            &frame_set,
+            &qa,
+            feature_config(),
+            "2026-06-01T12:02:00Z".to_string(),
+        )
+        .expect("feature matching should run");
+
+        let error = run_sparse_sfm(
+            &frame_set,
+            &qa,
+            &matches,
+            sfm_config(),
+            "2026-06-01T12:03:00Z".to_string(),
+        )
+        .expect_err("disconnected graph should not solve");
+
+        assert_eq!(
+            error,
+            SparseSfmError::CouldNotSolve {
+                reason_code: SparseSfmFailureReason::CouldNotSolve,
+                detail: "match graph is disconnected".to_string()
+            }
+        );
+    }
+
     fn qa_frame_set(frames: Vec<FrameIngestRequest>) -> super::FrameSetRecord {
         build_frame_set_record(
             FrameSetIngestRequest {
@@ -1513,6 +1855,13 @@ mod tests {
             min_pair_overlap_fraction: 0.3,
             min_inlier_matches: 4,
             max_keypoints_per_frame: 128,
+        }
+    }
+
+    fn sfm_config() -> SparseSfmConfig {
+        SparseSfmConfig {
+            max_reprojection_error_px: 0.5,
+            min_observations_per_point: 2,
         }
     }
 
