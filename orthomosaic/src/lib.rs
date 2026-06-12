@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use shared::schemas::GpsCoords;
+use shared::schemas::{
+    assert_raster_spatial_ref, GeoBounds, GpsCoords, RasterResolution, RasterSpatialRef,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -361,6 +363,32 @@ pub struct SparseSfmReport {
     pub passes_reprojection_threshold: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrthomosaicConfig {
+    pub output_crs: String,
+    pub resolution_m_per_px: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrthorectifiedFrameRecord {
+    pub frame_id: String,
+    pub min_x_m: f64,
+    pub min_y_m: f64,
+    pub max_x_m: f64,
+    pub max_y_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrthomosaicRaster {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub contributing_frames: Vec<OrthorectifiedFrameRecord>,
+    pub extent_round_trips: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FeatureMatchingError {
     #[error("frame set must include at least one frame")]
@@ -414,6 +442,30 @@ pub enum SparseSfmError {
         reason_code: SparseSfmFailureReason,
         detail: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum OrthomosaicError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("orthomosaic config output_crs cannot be empty")]
+    EmptyOutputCrs,
+    #[error("orthomosaic config resolution_m_per_px must be finite and positive")]
+    InvalidResolution,
+    #[error("QA report frame_set_id {qa_frame_set_id} does not match frame set {frame_set_id}")]
+    FrameSetMismatch {
+        frame_set_id: String,
+        qa_frame_set_id: String,
+    },
+    #[error("sparse SfM frame_set_id {sfm_frame_set_id} does not match frame set {frame_set_id}")]
+    SparseSfmFrameSetMismatch {
+        frame_set_id: String,
+        sfm_frame_set_id: String,
+    },
+    #[error("QA report is missing frame {frame_id}")]
+    MissingQaFrame { frame_id: String },
+    #[error("georeferencing-error: {reason}")]
+    GeoreferencingError { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -796,6 +848,109 @@ pub fn run_sparse_sfm(
     })
 }
 
+pub fn run_orthorectified_mosaic(
+    frame_set: &FrameSetRecord,
+    qa_report: &FrameSetQaReport,
+    sfm_report: &SparseSfmReport,
+    config: OrthomosaicConfig,
+    generated_at: String,
+) -> Result<OrthomosaicRaster, OrthomosaicError> {
+    let output_crs =
+        normalize_optional_text(Some(config.output_crs)).ok_or(OrthomosaicError::EmptyOutputCrs)?;
+    validate_mosaic_resolution(config.resolution_m_per_px)?;
+    let generated_at =
+        normalize_optional_text(Some(generated_at)).ok_or(OrthomosaicError::EmptyGeneratedAt)?;
+    if qa_report.frame_set_id != frame_set.frame_set_id {
+        return Err(OrthomosaicError::FrameSetMismatch {
+            frame_set_id: frame_set.frame_set_id.clone(),
+            qa_frame_set_id: qa_report.frame_set_id.clone(),
+        });
+    }
+    if sfm_report.frame_set_id != frame_set.frame_set_id {
+        return Err(OrthomosaicError::SparseSfmFrameSetMismatch {
+            frame_set_id: frame_set.frame_set_id.clone(),
+            sfm_frame_set_id: sfm_report.frame_set_id.clone(),
+        });
+    }
+    assert_solved_pose_set(frame_set, sfm_report)?;
+
+    let qa_frames = qa_report
+        .frames
+        .iter()
+        .map(|frame| (frame.frame_id.as_str(), frame))
+        .collect::<BTreeMap<_, _>>();
+    let mut contributing_frames = Vec::new();
+    for frame in &frame_set.frames {
+        let qa_frame = qa_frames.get(frame.frame_id.as_str()).ok_or_else(|| {
+            OrthomosaicError::MissingQaFrame {
+                frame_id: frame.frame_id.clone(),
+            }
+        })?;
+        contributing_frames.push(OrthorectifiedFrameRecord {
+            frame_id: frame.frame_id.clone(),
+            min_x_m: qa_frame.min_x_m,
+            min_y_m: qa_frame.min_y_m,
+            max_x_m: qa_frame.max_x_m,
+            max_y_m: qa_frame.max_y_m,
+        });
+    }
+    contributing_frames.sort_by(|left, right| left.frame_id.cmp(&right.frame_id));
+
+    let extent = mosaic_extent(&contributing_frames).ok_or_else(|| {
+        OrthomosaicError::GeoreferencingError {
+            reason: "empty_mosaic_extent".to_string(),
+        }
+    })?;
+    let width_px = ((extent.max_x - extent.min_x) / config.resolution_m_per_px).ceil() as u32;
+    let height_px = ((extent.max_y - extent.min_y) / config.resolution_m_per_px).ceil() as u32;
+    if width_px == 0 || height_px == 0 {
+        return Err(OrthomosaicError::GeoreferencingError {
+            reason: "non_positive_mosaic_dimensions".to_string(),
+        });
+    }
+
+    let adjusted_min_y = extent.max_y - height_px as f64 * config.resolution_m_per_px;
+    let adjusted_max_x = extent.min_x + width_px as f64 * config.resolution_m_per_px;
+    let spatial_ref = RasterSpatialRef {
+        georeferenced: true,
+        crs: Some(output_crs),
+        bbox: Some(GeoBounds {
+            min_lat: adjusted_min_y,
+            min_lon: extent.min_x,
+            max_lat: extent.max_y,
+            max_lon: adjusted_max_x,
+        }),
+        geo_transform: Some([
+            extent.min_x,
+            config.resolution_m_per_px,
+            0.0,
+            extent.max_y,
+            0.0,
+            -config.resolution_m_per_px,
+        ]),
+        resolution: Some(RasterResolution {
+            x: config.resolution_m_per_px,
+            y: config.resolution_m_per_px,
+        }),
+    };
+    let spatial_ref =
+        assert_raster_spatial_ref(Some(&spatial_ref), width_px, height_px).map_err(|error| {
+            OrthomosaicError::GeoreferencingError {
+                reason: error.to_string(),
+            }
+        })?;
+
+    Ok(OrthomosaicRaster {
+        frame_set_id: frame_set.frame_set_id.clone(),
+        generated_at,
+        width_px,
+        height_px,
+        spatial_ref,
+        contributing_frames,
+        extent_round_trips: true,
+    })
+}
+
 impl FrameQaRecord {
     fn rect(&self) -> Rect {
         Rect {
@@ -1002,6 +1157,63 @@ fn validate_sparse_sfm_config(config: SparseSfmConfig) -> Result<(), SparseSfmEr
     }
 
     Ok(())
+}
+
+fn validate_mosaic_resolution(resolution_m_per_px: f64) -> Result<(), OrthomosaicError> {
+    if resolution_m_per_px.is_finite() && resolution_m_per_px > 0.0 {
+        Ok(())
+    } else {
+        Err(OrthomosaicError::InvalidResolution)
+    }
+}
+
+fn assert_solved_pose_set(
+    frame_set: &FrameSetRecord,
+    sfm_report: &SparseSfmReport,
+) -> Result<(), OrthomosaicError> {
+    if !sfm_report.passes_reprojection_threshold
+        || sfm_report.cameras.len() != frame_set.frames.len()
+        || sfm_report.sparse_points.is_empty()
+    {
+        return Err(OrthomosaicError::GeoreferencingError {
+            reason: "unsolved_pose_set".to_string(),
+        });
+    }
+
+    let solved_frames = sfm_report
+        .cameras
+        .iter()
+        .map(|camera| camera.frame_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let all_frames_solved = frame_set
+        .frames
+        .iter()
+        .all(|frame| solved_frames.contains(frame.frame_id.as_str()));
+    if all_frames_solved {
+        Ok(())
+    } else {
+        Err(OrthomosaicError::GeoreferencingError {
+            reason: "unsolved_pose_set".to_string(),
+        })
+    }
+}
+
+fn mosaic_extent(frames: &[OrthorectifiedFrameRecord]) -> Option<Rect> {
+    let mut iter = frames.iter();
+    let first = iter.next()?;
+    let mut extent = Rect {
+        min_x: first.min_x_m,
+        min_y: first.min_y_m,
+        max_x: first.max_x_m,
+        max_y: first.max_y_m,
+    };
+    for frame in iter {
+        extent.min_x = extent.min_x.min(frame.min_x_m);
+        extent.min_y = extent.min_y.min(frame.min_y_m);
+        extent.max_x = extent.max_x.max(frame.max_x_m);
+        extent.max_y = extent.max_y.max(frame.max_y_m);
+    }
+    (extent.area() > 0.0).then_some(extent)
 }
 
 fn validate_field_extent(field_extent: &FieldCoverageExtent) -> Result<(), FrameSetQaError> {
@@ -1377,12 +1589,13 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 mod tests {
     use super::{
         build_frame_set_record, build_reconstruction_job, run_feature_matching, run_frame_set_qa,
-        run_sparse_sfm, transition_reconstruction_status, CameraExif, CameraImuPose,
-        FeatureMatchingConfig, FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode,
-        FrameSetIngestError, FrameSetIngestRequest, FrameSetQaConfig, ReconstructionJobError,
-        ReconstructionJobRequest, ReconstructionStatus, SparseSfmConfig, SparseSfmError,
-        SparseSfmFailureReason,
+        run_orthorectified_mosaic, run_sparse_sfm, transition_reconstruction_status, CameraExif,
+        CameraImuPose, FeatureMatchingConfig, FieldCoverageExtent, FrameIngestRequest,
+        FrameQaReasonCode, FrameSetIngestError, FrameSetIngestRequest, FrameSetQaConfig,
+        OrthomosaicConfig, OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest,
+        ReconstructionStatus, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
     };
+    use shared::schemas::assert_raster_spatial_ref;
     use shared::schemas::GpsCoords;
 
     #[test]
@@ -1786,6 +1999,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn orthorectified_mosaic_round_trips_georeferenced_extent() {
+        let (frame_set, qa, sfm) = solved_sfm_fixture();
+
+        let mosaic = run_orthorectified_mosaic(
+            &frame_set,
+            &qa,
+            &sfm,
+            mosaic_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect("solved poses should produce a mosaic");
+
+        assert_eq!(mosaic.frame_set_id, "frame-set-qa");
+        assert_eq!(mosaic.contributing_frames.len(), 2);
+        assert!(mosaic.width_px > 0);
+        assert!(mosaic.height_px > 0);
+        assert!(mosaic.extent_round_trips);
+        let asserted =
+            assert_raster_spatial_ref(Some(&mosaic.spatial_ref), mosaic.width_px, mosaic.height_px)
+                .expect("mosaic spatial ref should round-trip");
+        assert_eq!(asserted.crs.as_deref(), Some("EPSG:32614"));
+        assert_close(asserted.resolution.unwrap().x, 5.0);
+        assert_close(asserted.resolution.unwrap().y, 5.0);
+    }
+
+    #[test]
+    fn orthorectified_mosaic_refuses_unsolved_pose_set() {
+        let (frame_set, qa, mut sfm) = solved_sfm_fixture();
+        sfm.passes_reprojection_threshold = false;
+
+        let error = run_orthorectified_mosaic(
+            &frame_set,
+            &qa,
+            &sfm,
+            mosaic_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect_err("unsolved poses must not publish a mosaic");
+
+        assert_eq!(
+            error,
+            OrthomosaicError::GeoreferencingError {
+                reason: "unsolved_pose_set".to_string()
+            }
+        );
+    }
+
     fn qa_frame_set(frames: Vec<FrameIngestRequest>) -> super::FrameSetRecord {
         build_frame_set_record(
             FrameSetIngestRequest {
@@ -1863,6 +2124,48 @@ mod tests {
             max_reprojection_error_px: 0.5,
             min_observations_per_point: 2,
         }
+    }
+
+    fn mosaic_config() -> OrthomosaicConfig {
+        OrthomosaicConfig {
+            output_crs: "EPSG:32614".to_string(),
+            resolution_m_per_px: 5.0,
+        }
+    }
+
+    fn solved_sfm_fixture() -> (
+        super::FrameSetRecord,
+        super::FrameSetQaReport,
+        super::SparseSfmReport,
+    ) {
+        let frame_set = qa_frame_set(vec![
+            qa_frame("frame-001", 0.0, "2026-06-01T12:00:00Z"),
+            qa_frame("frame-002", 60.0, "2026-06-01T12:00:05Z"),
+        ]);
+        let qa = run_frame_set_qa(
+            &frame_set,
+            field_extent(-75.0, -50.0, 135.0, 50.0),
+            qa_config(),
+            "2026-06-01T12:01:00Z".to_string(),
+        )
+        .expect("QA should run");
+        let matches = run_feature_matching(
+            &frame_set,
+            &qa,
+            feature_config(),
+            "2026-06-01T12:02:00Z".to_string(),
+        )
+        .expect("feature matching should run");
+        let sfm = run_sparse_sfm(
+            &frame_set,
+            &qa,
+            &matches,
+            sfm_config(),
+            "2026-06-01T12:03:00Z".to_string(),
+        )
+        .expect("sparse SfM should solve");
+
+        (frame_set, qa, sfm)
     }
 
     fn meters_per_degree_lon(latitude: f64) -> f64 {
