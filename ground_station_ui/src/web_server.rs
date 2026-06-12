@@ -1,4 +1,5 @@
-use axum::response::Html;
+use crate::{LinkStateSnapshot, SharedLinkState};
+use axum::{extract::State, response::Html, Json};
 use shared::{config::AgroConfig, AgroResult};
 use std::sync::Arc;
 use tracing::info;
@@ -6,25 +7,25 @@ use tracing::info;
 pub struct WebServer {
     #[allow(dead_code)]
     config: Arc<AgroConfig>,
+    link_state: SharedLinkState,
 }
 
 impl WebServer {
-    pub async fn new(config: Arc<AgroConfig>) -> AgroResult<Self> {
-        Ok(Self { config })
+    pub async fn new(config: Arc<AgroConfig>, link_state: SharedLinkState) -> AgroResult<Self> {
+        Ok(Self { config, link_state })
     }
 
     pub async fn run(&self) -> AgroResult<()> {
-        use axum::{
-            routing::get,
-            Router,
-        };
+        use axum::{routing::get, Router};
         use tower_http::services::ServeDir;
 
         let app = Router::new()
             .route("/", get(dashboard_page))
+            .route("/api/link-state", get(link_state))
             .route("/telemetry", get(telemetry_page))
             .route("/maps", get(maps_page))
-            .nest_service("/static", ServeDir::new("static"));
+            .nest_service("/static", ServeDir::new("static"))
+            .with_state(self.link_state.clone());
 
         let bind_addr = "0.0.0.0:8081"; // Different port from mission control
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -36,8 +37,13 @@ impl WebServer {
     }
 }
 
+async fn link_state(State(link_state): State<SharedLinkState>) -> Json<LinkStateSnapshot> {
+    Json(link_state.read().await.snapshot())
+}
+
 async fn dashboard_page() -> Html<&'static str> {
-    Html(r#"
+    Html(
+        r#"
 <!DOCTYPE html>
 <html>
 <head>
@@ -52,6 +58,7 @@ async fn dashboard_page() -> Html<&'static str> {
         .status-indicator { width: 20px; height: 20px; border-radius: 50%; display: inline-block; margin-right: 10px; }
         .status-connected { background: #27ae60; }
         .status-disconnected { background: #e74c3c; }
+        .status-connecting { background: #f39c12; }
         .nav { margin-bottom: 20px; }
         .nav a { margin-right: 20px; text-decoration: none; color: #3498db; }
     </style>
@@ -71,7 +78,7 @@ async fn dashboard_page() -> Html<&'static str> {
 
         <div class="panel">
             <h2>System Status</h2>
-            <p><span class="status-indicator status-connected"></span>Mission Control: Connected</p>
+            <p><span id="mission-control-indicator" class="status-indicator status-connecting"></span>Mission Control: <span id="mission-control-state">Connecting</span></p>
             <p><span class="status-indicator status-disconnected"></span>Flight Controller: Simulation Mode</p>
             <p><span class="status-indicator status-connected"></span>Sensors: Active</p>
         </div>
@@ -169,14 +176,41 @@ async fn dashboard_page() -> Html<&'static str> {
                 activity.removeChild(messages[messages.length - 1]);
             }
         }
+
+        async function refreshLinkState() {
+            try {
+                const response = await fetch('/api/link-state');
+                const snapshot = await response.json();
+                const state = snapshot.state || 'lost';
+                const stateLabel = state.charAt(0).toUpperCase() + state.slice(1);
+                const detail = snapshot.last_error ? ` (${snapshot.last_error})` : '';
+                document.getElementById('mission-control-state').textContent = stateLabel + detail;
+                const indicator = document.getElementById('mission-control-indicator');
+                indicator.className = 'status-indicator ' + (
+                    state === 'connected'
+                        ? 'status-connected'
+                        : (state === 'connecting' || state === 'reconnecting')
+                            ? 'status-connecting'
+                            : 'status-disconnected'
+                );
+            } catch (error) {
+                document.getElementById('mission-control-state').textContent = 'Lost';
+                document.getElementById('mission-control-indicator').className = 'status-indicator status-disconnected';
+            }
+        }
+
+        refreshLinkState();
+        setInterval(refreshLinkState, 1000);
     </script>
 </body>
 </html>
-    "#)
+    "#,
+    )
 }
 
 async fn telemetry_page() -> Html<&'static str> {
-    Html(r#"
+    Html(
+        r#"
 <!DOCTYPE html>
 <html>
 <head>
@@ -254,11 +288,13 @@ async fn telemetry_page() -> Html<&'static str> {
     </script>
 </body>
 </html>
-    "#)
+    "#,
+    )
 }
 
 async fn maps_page() -> Html<&'static str> {
-    Html(r#"
+    Html(
+        r#"
 <!DOCTYPE html>
 <html>
 <head>
@@ -308,5 +344,6 @@ async fn maps_page() -> Html<&'static str> {
     </div>
 </body>
 </html>
-    "#)
+    "#,
+    )
 }

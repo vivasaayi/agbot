@@ -10,6 +10,7 @@ members = [
     "imagery_processor",
     "geo_hub",
     "geo_viewer",
+    "ground_station_ui",
 ]
 resolver = "2"
 
