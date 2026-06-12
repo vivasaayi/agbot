@@ -16,6 +16,7 @@ members = [
     "fleet_health",
     "soil_iot",
     "timeseries",
+    "provenance",
     "lidar_mapper",
     "imagery_processor",
     "geo_hub",
