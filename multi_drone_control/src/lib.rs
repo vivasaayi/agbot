@@ -10,11 +10,17 @@ pub mod collision_avoidance;
 pub mod coordination;
 pub mod mission_assignment;
 pub mod swarm;
+pub mod synchronized_survey;
 
 pub use collision_avoidance::{AvoidanceManeuver, CollisionAvoidanceSystem};
 pub use coordination::{CoordinationEngine, CoordinationStatus};
 pub use mission_assignment::{DroneAssignment, MissionAssignmentEngine};
 pub use swarm::{DroneSwarm, SwarmController, SwarmStatus};
+pub use synchronized_survey::{
+    evaluate_synchronized_survey_progress, plan_synchronized_survey, SurveyExecutionStatus,
+    SurveyLane, SurveyProgressReport, SurveySeparationSample, SynchronizedSurveyConfig,
+    SynchronizedSurveyError, SynchronizedSurveyPlan,
+};
 
 /// Multi-drone control system
 #[derive(Debug, Clone, Serialize, Deserialize)]
