@@ -205,6 +205,50 @@ pub struct GeolocatedSoilReading {
     pub qa_flags: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationProfile {
+    pub profile_ref: String,
+    pub metric: GatewayReadingMetric,
+    pub scale: f64,
+    pub offset: f64,
+    pub valid_min: f64,
+    pub valid_max: f64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadingQaReason {
+    OutOfRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadingQaFlag {
+    pub reason_code: ReadingQaReason,
+    pub profile_ref: String,
+    pub method_version: String,
+    pub raw_value: f64,
+    pub calibrated_value: f64,
+    pub valid_min: f64,
+    pub valid_max: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidatedSoilReading {
+    pub payload_id: String,
+    pub device_id: String,
+    pub metric: GatewayReadingMetric,
+    pub raw_value: f64,
+    pub calibrated_value: f64,
+    pub ts: String,
+    pub received_at: String,
+    pub field_id: String,
+    pub zone_id: Option<String>,
+    pub source_qa_flags: Vec<String>,
+    pub qa_flags: Vec<ReadingQaFlag>,
+    pub excluded_from_products: bool,
+}
+
 impl GeolocatedSoilReading {
     pub fn to_series_point(&self) -> SeriesPoint {
         SeriesPoint {
@@ -321,6 +365,17 @@ pub enum SoilIotError {
     UnsupportedStatus { value: String },
     #[error("retired device {device_id} cannot leave retired status")]
     RetiredDeviceCannotTransition { device_id: String },
+    #[error("calibration method_version cannot be empty")]
+    EmptyCalibrationMethodVersion,
+    #[error("soil reading raw value must be finite")]
+    InvalidReadingValue,
+    #[error("calibration profile {profile_ref} must be finite with valid_min <= valid_max")]
+    InvalidCalibrationProfile { profile_ref: String },
+    #[error("calibration profile metric {profile_metric:?} does not match reading metric {reading_metric:?}")]
+    CalibrationMetricMismatch {
+        reading_metric: GatewayReadingMetric,
+        profile_metric: GatewayReadingMetric,
+    },
 }
 
 pub fn build_soil_device_record(
@@ -531,6 +586,58 @@ pub fn build_geolocated_soil_reading(
     })
 }
 
+pub fn validate_and_calibrate_reading(
+    reading: GeolocatedSoilReading,
+    profile: CalibrationProfile,
+) -> Result<ValidatedSoilReading, SoilIotError> {
+    let profile = normalize_calibration_profile(profile)?;
+    if profile.metric != reading.metric {
+        return Err(SoilIotError::CalibrationMetricMismatch {
+            reading_metric: reading.metric,
+            profile_metric: profile.metric,
+        });
+    }
+    if !reading.raw_value.is_finite() {
+        return Err(SoilIotError::InvalidReadingValue);
+    }
+
+    let calibrated_value = profile.scale.mul_add(reading.raw_value, profile.offset);
+    if !calibrated_value.is_finite() {
+        return Err(SoilIotError::InvalidCalibrationProfile {
+            profile_ref: profile.profile_ref,
+        });
+    }
+
+    let mut qa_flags = Vec::new();
+    if calibrated_value < profile.valid_min || calibrated_value > profile.valid_max {
+        qa_flags.push(ReadingQaFlag {
+            reason_code: ReadingQaReason::OutOfRange,
+            profile_ref: profile.profile_ref.clone(),
+            method_version: profile.method_version.clone(),
+            raw_value: reading.raw_value,
+            calibrated_value,
+            valid_min: profile.valid_min,
+            valid_max: profile.valid_max,
+        });
+    }
+    let excluded_from_products = reading.excluded_from_geospatial_products || !qa_flags.is_empty();
+
+    Ok(ValidatedSoilReading {
+        payload_id: reading.payload_id,
+        device_id: reading.device_id,
+        metric: reading.metric,
+        raw_value: reading.raw_value,
+        calibrated_value,
+        ts: reading.ts,
+        received_at: reading.received_at,
+        field_id: reading.field_id,
+        zone_id: reading.zone_id,
+        source_qa_flags: reading.qa_flags,
+        qa_flags,
+        excluded_from_products,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct GatewayPayloadBody {
     device_id: String,
@@ -582,6 +689,38 @@ fn rejection_from_gateway_error(
             details: other.to_string(),
             rejected_at: rejected_at.to_string(),
         },
+    }
+}
+
+fn normalize_calibration_profile(
+    profile: CalibrationProfile,
+) -> Result<CalibrationProfile, SoilIotError> {
+    let profile_ref = normalize_required_text(
+        profile.profile_ref,
+        SoilIotError::EmptyCalibrationProfileRef,
+    )?;
+    let method_version = normalize_required_text(
+        profile.method_version,
+        SoilIotError::EmptyCalibrationMethodVersion,
+    )?;
+    let valid = profile.scale.is_finite()
+        && profile.offset.is_finite()
+        && profile.valid_min.is_finite()
+        && profile.valid_max.is_finite()
+        && profile.valid_min <= profile.valid_max;
+
+    if valid {
+        Ok(CalibrationProfile {
+            profile_ref,
+            metric: profile.metric,
+            scale: profile.scale,
+            offset: profile.offset,
+            valid_min: profile.valid_min,
+            valid_max: profile.valid_max,
+            method_version,
+        })
+    } else {
+        Err(SoilIotError::InvalidCalibrationProfile { profile_ref })
     }
 }
 
@@ -642,10 +781,11 @@ mod tests {
     use super::{
         build_geolocated_soil_reading, build_soil_device_record, decode_gateway_payload,
         ingest_gateway_readings, reading_rejection_for_device, transition_soil_device_status,
-        GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
-        GatewayReadingRecord, GeoPosition, RawGatewayReading, ReadingGeolocationStatus,
-        ReadingRejectionReason, RegisterSoilDeviceRequest, SimulatedGateway, SoilDeviceStatus,
-        SoilIotError, SoilSensorType,
+        validate_and_calibrate_reading, CalibrationProfile, GatewayIngestError,
+        GatewayPayloadRejectionReason, GatewayReadingMetric, GatewayReadingRecord, GeoPosition,
+        RawGatewayReading, ReadingGeolocationStatus, ReadingQaReason, ReadingRejectionReason,
+        RegisterSoilDeviceRequest, SimulatedGateway, SoilDeviceStatus, SoilIotError,
+        SoilSensorType,
     };
     use timeseries::SeriesValue;
 
@@ -857,6 +997,85 @@ mod tests {
         assert!(reading.excluded_from_geospatial_products);
     }
 
+    #[test]
+    fn validation_applies_linear_calibration_and_retains_raw_value() {
+        let reading = build_geolocated_soil_reading(&valid_device(), valid_gateway_record())
+            .expect("reading should geolocate");
+
+        let validated = validate_and_calibrate_reading(
+            reading,
+            calibration_profile(
+                GatewayReadingMetric::SoilMoisturePercent,
+                0.5,
+                1.0,
+                0.0,
+                100.0,
+            ),
+        )
+        .expect("reading should validate");
+
+        assert_eq!(validated.raw_value, 34.5);
+        assert_eq!(validated.calibrated_value, 18.25);
+        assert!(validated.qa_flags.is_empty());
+        assert!(!validated.excluded_from_products);
+    }
+
+    #[test]
+    fn validation_flags_out_of_range_reading_and_retains_it() {
+        let mut raw = valid_gateway_record();
+        raw.raw_value = 250.0;
+        let reading =
+            build_geolocated_soil_reading(&valid_device(), raw).expect("reading should geolocate");
+
+        let validated = validate_and_calibrate_reading(
+            reading,
+            calibration_profile(
+                GatewayReadingMetric::SoilMoisturePercent,
+                1.0,
+                0.0,
+                0.0,
+                100.0,
+            ),
+        )
+        .expect("out-of-range readings are retained with QA flags");
+
+        assert_eq!(validated.raw_value, 250.0);
+        assert_eq!(validated.calibrated_value, 250.0);
+        assert!(validated.excluded_from_products);
+        assert_eq!(validated.qa_flags.len(), 1);
+        assert_eq!(
+            validated.qa_flags[0].reason_code,
+            ReadingQaReason::OutOfRange
+        );
+        assert_eq!(validated.qa_flags[0].raw_value, 250.0);
+    }
+
+    #[test]
+    fn validation_rejects_profile_for_wrong_metric() {
+        let reading = build_geolocated_soil_reading(&valid_device(), valid_gateway_record())
+            .expect("reading should geolocate");
+
+        let error = validate_and_calibrate_reading(
+            reading,
+            calibration_profile(
+                GatewayReadingMetric::SoilTemperatureCelsius,
+                1.0,
+                0.0,
+                -40.0,
+                80.0,
+            ),
+        )
+        .expect_err("wrong metric profile should fail");
+
+        assert_eq!(
+            error,
+            SoilIotError::CalibrationMetricMismatch {
+                reading_metric: GatewayReadingMetric::SoilMoisturePercent,
+                profile_metric: GatewayReadingMetric::SoilTemperatureCelsius
+            }
+        );
+    }
+
     fn valid_device() -> super::SoilDeviceRecord {
         build_soil_device_record(
             RegisterSoilDeviceRequest {
@@ -886,6 +1105,24 @@ mod tests {
             raw_value: 34.5,
             gateway_ts: "2026-06-12T10:00:00Z".to_string(),
             received_at: "2026-06-12T10:00:03Z".to_string(),
+        }
+    }
+
+    fn calibration_profile(
+        metric: GatewayReadingMetric,
+        scale: f64,
+        offset: f64,
+        valid_min: f64,
+        valid_max: f64,
+    ) -> CalibrationProfile {
+        CalibrationProfile {
+            profile_ref: "calibration:soil-probe-001:v1".to_string(),
+            metric,
+            scale,
+            offset,
+            valid_min,
+            valid_max,
+            method_version: "linear-v1".to_string(),
         }
     }
 }
