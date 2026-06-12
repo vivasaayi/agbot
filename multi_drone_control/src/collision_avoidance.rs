@@ -83,6 +83,24 @@ pub struct SeparationVerification {
     pub verified: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictedConflictPair {
+    pub drone1_id: Uuid,
+    pub drone2_id: Uuid,
+    pub risk_level: RiskLevel,
+    pub time_to_conflict: std::time::Duration,
+    pub predicted_distance_m: f64,
+    pub threshold_m: f64,
+    pub predicted_position_1: Position3D,
+    pub predicted_position_2: Position3D,
+}
+
+impl PredictedConflictPair {
+    pub fn involves(&self, drone_id: Uuid) -> bool {
+        self.drone1_id == drone_id || self.drone2_id == drone_id
+    }
+}
+
 impl CollisionAvoidanceSystem {
     pub fn new() -> Self {
         Self {
@@ -205,8 +223,8 @@ impl CollisionAvoidanceSystem {
             // 1 degree of latitude ≈ 111,111 meters
             // 1 degree of longitude ≈ 111,111 * cos(latitude) meters
             let lat_change = (tracking_info.velocity.vy as f64 * dt) / 111_111.0;
-            let lon_change =
-                (tracking_info.velocity.vx as f64 * dt) / (111_111.0 * current_pos.latitude.cos());
+            let lon_change = (tracking_info.velocity.vx as f64 * dt)
+                / (111_111.0 * current_pos.latitude.to_radians().cos().abs().max(0.0001));
             let alt_change = tracking_info.velocity.vz * dt as f32;
 
             current_pos.latitude += lat_change;
@@ -217,6 +235,28 @@ impl CollisionAvoidanceSystem {
         }
 
         trajectory
+    }
+
+    pub async fn assess_predicted_conflicts(&self) -> Vec<PredictedConflictPair> {
+        let mut drones: Vec<DroneTrackingInfo> = self.tracked_drones.values().cloned().collect();
+        drones.sort_by(|left, right| left.id.as_bytes().cmp(right.id.as_bytes()));
+
+        let mut conflicts = Vec::new();
+        for i in 0..drones.len() {
+            for j in (i + 1)..drones.len() {
+                if let Some(conflict) = self.predict_pair_conflict(&drones[i], &drones[j]).await {
+                    conflicts.push(conflict);
+                }
+            }
+        }
+
+        conflicts.sort_by(|left, right| {
+            left.time_to_conflict
+                .cmp(&right.time_to_conflict)
+                .then_with(|| left.drone1_id.as_bytes().cmp(right.drone1_id.as_bytes()))
+                .then_with(|| left.drone2_id.as_bytes().cmp(right.drone2_id.as_bytes()))
+        });
+        conflicts
     }
 
     async fn assess_collision_risk(&mut self, drone_id: Uuid) -> Result<()> {
@@ -261,17 +301,16 @@ impl CollisionAvoidanceSystem {
         // Calculate current distance
         let current_distance = self.calculate_3d_distance(&drone1.position, &drone2.position);
 
-        // Check if trajectories intersect
-        let trajectory_risk = self.check_trajectory_intersection(drone1, drone2).await;
+        let predicted_conflict = self.predict_pair_conflict(drone1, drone2).await;
 
         // Determine risk level based on distance and trajectory
         let risk = if current_distance < 15.0 {
             RiskLevel::Critical
-        } else if current_distance < 25.0 || trajectory_risk {
+        } else if current_distance < self.min_separation_distance {
             RiskLevel::High
-        } else if current_distance < 50.0 {
-            RiskLevel::Medium
-        } else if current_distance < 100.0 {
+        } else if let Some(conflict) = predicted_conflict {
+            conflict.risk_level
+        } else if current_distance < self.min_separation_distance * 2.0 {
             RiskLevel::Low
         } else {
             RiskLevel::None
@@ -288,20 +327,76 @@ impl CollisionAvoidanceSystem {
         (horizontal_distance * horizontal_distance + altitude_diff * altitude_diff).sqrt()
     }
 
-    async fn check_trajectory_intersection(
+    async fn predict_pair_conflict(
         &self,
         drone1: &DroneTrackingInfo,
         drone2: &DroneTrackingInfo,
-    ) -> bool {
-        for (i, pos1) in drone1.predicted_trajectory.iter().enumerate() {
-            if let Some(pos2) = drone2.predicted_trajectory.get(i) {
-                let distance = self.calculate_3d_distance(pos1, pos2);
-                if distance < self.min_separation_distance {
-                    return true;
-                }
+    ) -> Option<PredictedConflictPair> {
+        let current_distance = self.calculate_3d_distance(&drone1.position, &drone2.position);
+        if current_distance < self.min_separation_distance {
+            return Some(self.build_predicted_conflict(
+                drone1.id,
+                drone2.id,
+                std::time::Duration::ZERO,
+                &drone1.position,
+                &drone2.position,
+                current_distance,
+            ));
+        }
+
+        let trajectory1 = self.predict_trajectory(drone1).await;
+        let trajectory2 = self.predict_trajectory(drone2).await;
+
+        for (step_index, (pos1, pos2)) in trajectory1.iter().zip(trajectory2.iter()).enumerate() {
+            let distance = self.calculate_3d_distance(pos1, pos2);
+            if distance < self.min_separation_distance {
+                return Some(self.build_predicted_conflict(
+                    drone1.id,
+                    drone2.id,
+                    std::time::Duration::from_secs((step_index + 1) as u64),
+                    pos1,
+                    pos2,
+                    distance,
+                ));
             }
         }
-        false
+
+        None
+    }
+
+    fn build_predicted_conflict(
+        &self,
+        drone1_id: Uuid,
+        drone2_id: Uuid,
+        time_to_conflict: std::time::Duration,
+        predicted_position_1: &Position3D,
+        predicted_position_2: &Position3D,
+        predicted_distance_m: f64,
+    ) -> PredictedConflictPair {
+        PredictedConflictPair {
+            drone1_id,
+            drone2_id,
+            risk_level: self.risk_level_for_predicted_distance(predicted_distance_m),
+            time_to_conflict,
+            predicted_distance_m,
+            threshold_m: self.min_separation_distance,
+            predicted_position_1: predicted_position_1.clone(),
+            predicted_position_2: predicted_position_2.clone(),
+        }
+    }
+
+    fn risk_level_for_predicted_distance(&self, distance_m: f64) -> RiskLevel {
+        if distance_m < 15.0 {
+            RiskLevel::Critical
+        } else if distance_m < self.min_separation_distance {
+            RiskLevel::High
+        } else if distance_m < self.min_separation_distance * 2.0 {
+            RiskLevel::Medium
+        } else if distance_m < self.min_separation_distance * 4.0 {
+            RiskLevel::Low
+        } else {
+            RiskLevel::None
+        }
     }
 
     async fn plan_avoidance_maneuver(
@@ -872,5 +967,132 @@ mod tests {
         assert!(maneuver.target_position.is_none());
         assert!(!verification.verified);
         assert!(verification.post_maneuver_distance_m < verification.minimum_required_m);
+    }
+
+    #[tokio::test]
+    async fn converging_trajectory_assessment_reports_time_to_conflict() {
+        let mut system = CollisionAvoidanceSystem::new();
+        let drone1_id = Uuid::new_v4();
+        let drone2_id = Uuid::new_v4();
+        let sixty_meters_lat_deg = (60.0_f64 / 6_371_000.0).to_degrees();
+        let pos1 = Position3D {
+            latitude: 0.0,
+            longitude: 0.0,
+            altitude_m: 100.0,
+        };
+        let pos2 = Position3D {
+            latitude: sixty_meters_lat_deg,
+            longitude: 0.0,
+            altitude_m: 100.0,
+        };
+
+        system
+            .register_drone(drone1_id, pos1.clone())
+            .await
+            .unwrap();
+        system
+            .register_drone(drone2_id, pos2.clone())
+            .await
+            .unwrap();
+        system
+            .update_drone_state(
+                drone1_id,
+                pos1,
+                Velocity3D {
+                    vx: 0.0,
+                    vy: 10.0,
+                    vz: 0.0,
+                    speed: 10.0,
+                },
+                0.0,
+            )
+            .await
+            .unwrap();
+        system
+            .update_drone_state(
+                drone2_id,
+                pos2,
+                Velocity3D {
+                    vx: 0.0,
+                    vy: -10.0,
+                    vz: 0.0,
+                    speed: 10.0,
+                },
+                180.0,
+            )
+            .await
+            .unwrap();
+
+        let conflicts = system.assess_predicted_conflicts().await;
+        assert_eq!(conflicts.len(), 1);
+
+        let conflict = &conflicts[0];
+        assert!(conflict.involves(drone1_id));
+        assert!(conflict.involves(drone2_id));
+        assert_eq!(conflict.time_to_conflict, std::time::Duration::from_secs(2));
+        assert!(conflict.predicted_distance_m < conflict.threshold_m);
+        assert!(conflict.risk_level >= RiskLevel::High);
+    }
+
+    #[tokio::test]
+    async fn diverging_trajectory_assessment_reports_no_false_conflict() {
+        let mut system = CollisionAvoidanceSystem::new();
+        let drone1_id = Uuid::new_v4();
+        let drone2_id = Uuid::new_v4();
+        let forty_meters_lat_deg = (40.0_f64 / 6_371_000.0).to_degrees();
+        let pos1 = Position3D {
+            latitude: 0.0,
+            longitude: 0.0,
+            altitude_m: 100.0,
+        };
+        let pos2 = Position3D {
+            latitude: forty_meters_lat_deg,
+            longitude: 0.0,
+            altitude_m: 100.0,
+        };
+
+        system
+            .register_drone(drone1_id, pos1.clone())
+            .await
+            .unwrap();
+        system
+            .register_drone(drone2_id, pos2.clone())
+            .await
+            .unwrap();
+        system
+            .update_drone_state(
+                drone1_id,
+                pos1,
+                Velocity3D {
+                    vx: 0.0,
+                    vy: -5.0,
+                    vz: 0.0,
+                    speed: 5.0,
+                },
+                180.0,
+            )
+            .await
+            .unwrap();
+        system
+            .update_drone_state(
+                drone2_id,
+                pos2,
+                Velocity3D {
+                    vx: 0.0,
+                    vy: 5.0,
+                    vz: 0.0,
+                    speed: 5.0,
+                },
+                0.0,
+            )
+            .await
+            .unwrap();
+
+        let conflicts = system.assess_predicted_conflicts().await;
+        assert!(conflicts.is_empty());
+        assert!(system
+            .tracked_drones
+            .values()
+            .all(|drone| drone.collision_risk_level < RiskLevel::Medium));
     }
 }
