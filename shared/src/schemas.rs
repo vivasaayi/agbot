@@ -1346,6 +1346,303 @@ fn is_valid_recommendation_status_transition(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum WorkOrderStatus {
+    Created,
+    Assigned,
+    InProgress,
+    Done,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkOrderRecord {
+    pub work_order_id: String,
+    pub field_id: String,
+    pub org_id: String,
+    pub source_rec_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_user_id: Option<String>,
+    pub status: WorkOrderStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkOrderCreateRequest {
+    pub work_order_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_recommendation: Option<RecommendationRecord>,
+    pub actor_user_id: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkOrderChangeType {
+    Created,
+    StatusChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkOrderChangeRecord {
+    pub work_order_id: String,
+    pub actor_user_id: String,
+    pub before: Option<WorkOrderStatus>,
+    pub after: WorkOrderStatus,
+    pub at: String,
+    pub change_type: WorkOrderChangeType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WorkOrderPersistenceError {
+    #[error("work_order_id cannot be empty")]
+    EmptyWorkOrderId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("source_rec_id cannot be empty")]
+    EmptySourceRecommendationId,
+    #[error("actor_user_id cannot be empty")]
+    EmptyActorUserId,
+    #[error("assignee_user_id cannot be empty")]
+    EmptyAssigneeUserId,
+    #[error("timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("work order requires a source recommendation: {work_order_id}")]
+    MissingSourceRecommendation { work_order_id: String },
+    #[error("source recommendation must be open: {recommendation_id}")]
+    SourceRecommendationNotOpen { recommendation_id: String },
+    #[error("work order already exists: {work_order_id}")]
+    WorkOrderAlreadyExists { work_order_id: String },
+    #[error("work order not found: {work_order_id}")]
+    WorkOrderNotFound { work_order_id: String },
+    #[error("invalid work order status transition: {from:?} -> {to:?}")]
+    InvalidStatusTransition {
+        from: WorkOrderStatus,
+        to: WorkOrderStatus,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkOrderRegistry {
+    work_orders: HashMap<String, WorkOrderRecord>,
+    history: Vec<WorkOrderChangeRecord>,
+}
+
+impl WorkOrderRegistry {
+    pub fn create_work_order_from_recommendation(
+        &mut self,
+        request: WorkOrderCreateRequest,
+    ) -> Result<WorkOrderRecord, WorkOrderPersistenceError> {
+        let work_order_id = normalize_work_order_arg(
+            &request.work_order_id,
+            WorkOrderPersistenceError::EmptyWorkOrderId,
+        )?;
+        let actor_user_id = normalize_work_order_arg(
+            &request.actor_user_id,
+            WorkOrderPersistenceError::EmptyActorUserId,
+        )?;
+        let created_at = normalize_work_order_arg(
+            &request.created_at,
+            WorkOrderPersistenceError::EmptyTimestamp,
+        )?;
+        let recommendation = request.source_recommendation.ok_or_else(|| {
+            WorkOrderPersistenceError::MissingSourceRecommendation {
+                work_order_id: work_order_id.clone(),
+            }
+        })?;
+        if recommendation.status != RecommendationStatus::Open {
+            return Err(WorkOrderPersistenceError::SourceRecommendationNotOpen {
+                recommendation_id: recommendation.recommendation_id,
+            });
+        }
+        if self.work_orders.contains_key(&work_order_id) {
+            return Err(WorkOrderPersistenceError::WorkOrderAlreadyExists { work_order_id });
+        }
+
+        let field_id = recommendation
+            .field_id
+            .and_then(normalize_farm_field_text)
+            .ok_or(WorkOrderPersistenceError::EmptyFieldId)?;
+        let org_id = normalize_farm_field_text(recommendation.org_id)
+            .ok_or(WorkOrderPersistenceError::EmptyOrgId)?;
+        let source_rec_id = normalize_farm_field_text(recommendation.recommendation_id)
+            .ok_or(WorkOrderPersistenceError::EmptySourceRecommendationId)?;
+        let assignee_user_id = request
+            .assignee_user_id
+            .map(|assignee| {
+                normalize_farm_field_text(assignee)
+                    .ok_or(WorkOrderPersistenceError::EmptyAssigneeUserId)
+            })
+            .transpose()?;
+        let due = request.due.and_then(normalize_farm_field_text);
+        let work_order = WorkOrderRecord {
+            work_order_id: work_order_id.clone(),
+            field_id,
+            org_id,
+            source_rec_id,
+            assignee_user_id,
+            status: WorkOrderStatus::Created,
+            due,
+            created_at: created_at.clone(),
+            updated_at: created_at.clone(),
+        };
+
+        self.history.push(WorkOrderChangeRecord {
+            work_order_id: work_order_id.clone(),
+            actor_user_id,
+            before: None,
+            after: WorkOrderStatus::Created,
+            at: created_at,
+            change_type: WorkOrderChangeType::Created,
+        });
+        self.work_orders.insert(work_order_id, work_order.clone());
+        Ok(work_order)
+    }
+
+    pub fn assign_work_order(
+        &mut self,
+        org_id: &str,
+        work_order_id: &str,
+        actor_user_id: &str,
+        assignee_user_id: &str,
+        at: &str,
+    ) -> Result<WorkOrderRecord, WorkOrderPersistenceError> {
+        let assignee_user_id = normalize_work_order_arg(
+            assignee_user_id,
+            WorkOrderPersistenceError::EmptyAssigneeUserId,
+        )?;
+        let mut work_order = self.transition_work_order_status(
+            org_id,
+            work_order_id,
+            actor_user_id,
+            at,
+            WorkOrderStatus::Assigned,
+        )?;
+        work_order.assignee_user_id = Some(assignee_user_id);
+        let key = work_order.work_order_id.clone();
+        self.work_orders.insert(key, work_order.clone());
+        Ok(work_order)
+    }
+
+    pub fn transition_work_order_status(
+        &mut self,
+        org_id: &str,
+        work_order_id: &str,
+        actor_user_id: &str,
+        at: &str,
+        status: WorkOrderStatus,
+    ) -> Result<WorkOrderRecord, WorkOrderPersistenceError> {
+        let org_id = normalize_work_order_arg(org_id, WorkOrderPersistenceError::EmptyOrgId)?;
+        let work_order_id =
+            normalize_work_order_arg(work_order_id, WorkOrderPersistenceError::EmptyWorkOrderId)?;
+        let actor_user_id =
+            normalize_work_order_arg(actor_user_id, WorkOrderPersistenceError::EmptyActorUserId)?;
+        let at = normalize_work_order_arg(at, WorkOrderPersistenceError::EmptyTimestamp)?;
+        let before = self.work_order_for_org(&org_id, &work_order_id)?;
+        if !is_valid_work_order_status_transition(before.status, status) {
+            return Err(WorkOrderPersistenceError::InvalidStatusTransition {
+                from: before.status,
+                to: status,
+            });
+        }
+
+        let mut after = before.clone();
+        after.status = status;
+        after.updated_at = at.clone();
+        self.work_orders
+            .insert(work_order_id.clone(), after.clone());
+        self.history.push(WorkOrderChangeRecord {
+            work_order_id,
+            actor_user_id,
+            before: Some(before.status),
+            after: status,
+            at,
+            change_type: WorkOrderChangeType::StatusChanged,
+        });
+        Ok(after)
+    }
+
+    pub fn work_orders_for_org(&self, org_id: &str) -> Vec<WorkOrderRecord> {
+        let Some(org_id) = normalize_farm_field_text(org_id.to_string()) else {
+            return Vec::new();
+        };
+        let mut work_orders = self
+            .work_orders
+            .values()
+            .filter(|work_order| work_order.org_id == org_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        work_orders.sort_by(|left, right| left.work_order_id.cmp(&right.work_order_id));
+        work_orders
+    }
+
+    pub fn work_order_history(
+        &self,
+        org_id: &str,
+        work_order_id: &str,
+    ) -> Vec<WorkOrderChangeRecord> {
+        let Some(org_id) = normalize_farm_field_text(org_id.to_string()) else {
+            return Vec::new();
+        };
+        let Some(work_order_id) = normalize_farm_field_text(work_order_id.to_string()) else {
+            return Vec::new();
+        };
+        self.history
+            .iter()
+            .filter(|change| change.work_order_id == work_order_id)
+            .filter(|change| {
+                self.work_orders
+                    .get(&change.work_order_id)
+                    .is_some_and(|work_order| work_order.org_id == org_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+
+    fn work_order_for_org(
+        &self,
+        org_id: &str,
+        work_order_id: &str,
+    ) -> Result<WorkOrderRecord, WorkOrderPersistenceError> {
+        self.work_orders
+            .get(work_order_id)
+            .filter(|work_order| work_order.org_id == org_id)
+            .cloned()
+            .ok_or_else(|| WorkOrderPersistenceError::WorkOrderNotFound {
+                work_order_id: work_order_id.to_string(),
+            })
+    }
+}
+
+fn normalize_work_order_arg(
+    value: &str,
+    error: WorkOrderPersistenceError,
+) -> Result<String, WorkOrderPersistenceError> {
+    normalize_farm_field_text(value.to_string()).ok_or(error)
+}
+
+fn is_valid_work_order_status_transition(from: WorkOrderStatus, to: WorkOrderStatus) -> bool {
+    matches!(
+        (from, to),
+        (WorkOrderStatus::Created, WorkOrderStatus::Assigned)
+            | (WorkOrderStatus::Assigned, WorkOrderStatus::InProgress)
+            | (
+                WorkOrderStatus::InProgress,
+                WorkOrderStatus::Done | WorkOrderStatus::Cancelled
+            )
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReportFormat {
     Html,
 }
@@ -1725,7 +2022,8 @@ mod tests {
         RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus,
         RecommendationStatusChangeType, ReportFormat, ReportRecord, SceneLayerMetadataError,
-        SceneLayerRecord, SceneRecord, SeasonRecord,
+        SceneLayerRecord, SceneRecord, SeasonRecord, WorkOrderChangeType, WorkOrderCreateRequest,
+        WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -2738,6 +3036,145 @@ mod tests {
                 to: RecommendationStatus::Open
             }
         );
+    }
+
+    #[test]
+    fn work_order_from_open_recommendation_appends_lifecycle_history() {
+        let mut registry = WorkOrderRegistry::default();
+        let work_order = registry
+            .create_work_order_from_recommendation(WorkOrderCreateRequest {
+                work_order_id: "wo-1".to_string(),
+                source_recommendation: Some(open_recommendation()),
+                actor_user_id: "grower-1".to_string(),
+                created_at: "2026-05-04T00:00:00Z".to_string(),
+                assignee_user_id: None,
+                due: Some("2026-05-10".to_string()),
+            })
+            .expect("work order persists");
+
+        assert_eq!(work_order.work_order_id, "wo-1");
+        assert_eq!(work_order.source_rec_id, "rec-1");
+        assert_eq!(work_order.field_id, "field-1");
+        assert_eq!(work_order.org_id, "org-a");
+        assert_eq!(work_order.status, WorkOrderStatus::Created);
+        assert_eq!(work_order.assignee_user_id, None);
+
+        registry
+            .assign_work_order(
+                "org-a",
+                "wo-1",
+                "manager-1",
+                "operator-1",
+                "2026-05-05T00:00:00Z",
+            )
+            .expect("assignment persists");
+        registry
+            .transition_work_order_status(
+                "org-a",
+                "wo-1",
+                "operator-1",
+                "2026-05-06T00:00:00Z",
+                WorkOrderStatus::InProgress,
+            )
+            .expect("start persists");
+        let done = registry
+            .transition_work_order_status(
+                "org-a",
+                "wo-1",
+                "operator-1",
+                "2026-05-07T00:00:00Z",
+                WorkOrderStatus::Done,
+            )
+            .expect("completion persists");
+
+        assert_eq!(done.status, WorkOrderStatus::Done);
+        assert_eq!(done.assignee_user_id.as_deref(), Some("operator-1"));
+        let history = registry.work_order_history("org-a", "wo-1");
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].change_type, WorkOrderChangeType::Created);
+        assert_eq!(history[0].before, None);
+        assert_eq!(history[0].after, WorkOrderStatus::Created);
+        assert_eq!(history[1].after, WorkOrderStatus::Assigned);
+        assert_eq!(history[2].after, WorkOrderStatus::InProgress);
+        assert_eq!(history[3].after, WorkOrderStatus::Done);
+        assert_eq!(registry.work_orders_for_org("org-a").len(), 1);
+        assert!(registry.work_orders_for_org("org-b").is_empty());
+    }
+
+    #[test]
+    fn work_order_without_source_recommendation_is_rejected() {
+        let mut registry = WorkOrderRegistry::default();
+        let error = registry
+            .create_work_order_from_recommendation(WorkOrderCreateRequest {
+                work_order_id: "wo-1".to_string(),
+                source_recommendation: None,
+                actor_user_id: "grower-1".to_string(),
+                created_at: "2026-05-04T00:00:00Z".to_string(),
+                assignee_user_id: None,
+                due: None,
+            })
+            .expect_err("work order requires recommendation");
+
+        assert_eq!(
+            error,
+            WorkOrderPersistenceError::MissingSourceRecommendation {
+                work_order_id: "wo-1".to_string()
+            }
+        );
+        assert!(registry.work_orders_for_org("org-a").is_empty());
+    }
+
+    #[test]
+    fn work_order_invalid_transition_is_rejected() {
+        let mut registry = WorkOrderRegistry::default();
+        registry
+            .create_work_order_from_recommendation(WorkOrderCreateRequest {
+                work_order_id: "wo-1".to_string(),
+                source_recommendation: Some(open_recommendation()),
+                actor_user_id: "grower-1".to_string(),
+                created_at: "2026-05-04T00:00:00Z".to_string(),
+                assignee_user_id: None,
+                due: None,
+            })
+            .expect("work order persists");
+
+        let error = registry
+            .transition_work_order_status(
+                "org-a",
+                "wo-1",
+                "operator-1",
+                "2026-05-06T00:00:00Z",
+                WorkOrderStatus::Done,
+            )
+            .expect_err("created cannot move directly to done");
+
+        assert_eq!(
+            error,
+            WorkOrderPersistenceError::InvalidStatusTransition {
+                from: WorkOrderStatus::Created,
+                to: WorkOrderStatus::Done
+            }
+        );
+    }
+
+    fn open_recommendation() -> RecommendationRecord {
+        RecommendationRecord {
+            recommendation_id: "rec-1".to_string(),
+            scene_id: "scene-1".to_string(),
+            field_id: Some("field-1".to_string()),
+            org_id: "org-a".to_string(),
+            author_user_id: "advisor-1".to_string(),
+            title: "Scout anomaly zone zone-1".to_string(),
+            note: Some("Check irrigation and re-scout in 48h".to_string()),
+            category: Some("scout".to_string()),
+            action_category: "scout".to_string(),
+            priority: RecommendationPriority::High,
+            status: RecommendationStatus::Open,
+            evidence_refs: vec!["zone:zone-1".to_string()],
+            annotation_ids: Vec::new(),
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            updated_at: "2026-05-01T00:00:00Z".to_string(),
+        }
     }
 
     #[test]
