@@ -241,6 +241,83 @@ pub struct FleetHealthIndicatorDerivation {
     pub gaps: Vec<HealthTelemetryGap>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentHealthVerdictStatus {
+    Ok,
+    Watch,
+    Degraded,
+    Critical,
+}
+
+impl ComponentHealthVerdictStatus {
+    fn severity_rank(self) -> u8 {
+        match self {
+            ComponentHealthVerdictStatus::Ok => 0,
+            ComponentHealthVerdictStatus::Watch => 1,
+            ComponentHealthVerdictStatus::Degraded => 2,
+            ComponentHealthVerdictStatus::Critical => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthVerdictReasonCode {
+    AllIndicatorsWithinThreshold,
+    WatchThresholdExceeded,
+    DegradedThresholdExceeded,
+    CriticalThresholdExceeded,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthIndicatorThreshold {
+    pub indicator: FleetHealthIndicator,
+    pub watch_at: f64,
+    pub degraded_at: f64,
+    pub critical_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ComponentHealthVerdictRequest {
+    #[serde(default)]
+    pub component_id: String,
+    #[serde(default)]
+    pub evaluated_at: String,
+    #[serde(default)]
+    pub method_version: String,
+    #[serde(default)]
+    pub samples: Vec<FleetHealthIndicatorSample>,
+    #[serde(default)]
+    pub thresholds: Vec<HealthIndicatorThreshold>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthVerdictEvidence {
+    pub indicator: FleetHealthIndicator,
+    pub value: f64,
+    pub threshold: f64,
+    pub status: ComponentHealthVerdictStatus,
+    pub reason_code: HealthVerdictReasonCode,
+    pub sample_ts: String,
+    pub source_ref: String,
+    pub freshness: HealthIndicatorFreshness,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentHealthVerdict {
+    pub component_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub status: ComponentHealthVerdictStatus,
+    pub reason_code: HealthVerdictReasonCode,
+    pub indicator: Option<FleetHealthIndicator>,
+    pub threshold: Option<f64>,
+    pub value: Option<f64>,
+    pub freshness: HealthIndicatorFreshness,
+    pub evidence: Vec<HealthVerdictEvidence>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetComponentRecord {
     pub component_id: String,
@@ -304,8 +381,25 @@ pub enum FleetHealthError {
     EmptyTelemetryTimestamp,
     #[error("telemetry sample set cannot be empty")]
     EmptyTelemetrySamples,
+    #[error("health indicator sample set cannot be empty")]
+    EmptyHealthIndicatorSamples,
+    #[error("health threshold set cannot be empty")]
+    EmptyHealthThresholds,
+    #[error("health threshold method_version cannot be empty")]
+    EmptyHealthMethodVersion,
     #[error("telemetry value must be finite")]
     InvalidTelemetryValue,
+    #[error(
+        "health threshold must be finite, non-negative, and ordered watch <= degraded <= critical"
+    )]
+    InvalidHealthThreshold { indicator: FleetHealthIndicator },
+    #[error("missing health threshold for {indicator:?}")]
+    MissingHealthThreshold { indicator: FleetHealthIndicator },
+    #[error("indicator sample belongs to component {sample_component_id}, not requested component {component_id}")]
+    IndicatorComponentMismatch {
+        component_id: String,
+        sample_component_id: String,
+    },
     #[error("battery current must be finite and non-zero")]
     InvalidBatteryCurrent,
     #[error("telemetry gap timestamp cannot be empty")]
@@ -532,6 +626,93 @@ pub fn derive_health_indicators(
     Ok(FleetHealthIndicatorDerivation { samples, gaps })
 }
 
+pub fn evaluate_component_health_verdict(
+    request: ComponentHealthVerdictRequest,
+) -> Result<ComponentHealthVerdict, FleetHealthError> {
+    let component_id =
+        normalize_required_text(request.component_id, FleetHealthError::EmptyComponentId)?;
+    let evaluated_at =
+        normalize_required_text(request.evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    let method_version = normalize_required_text(
+        request.method_version,
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    if request.samples.is_empty() {
+        return Err(FleetHealthError::EmptyHealthIndicatorSamples);
+    }
+    if request.thresholds.is_empty() {
+        return Err(FleetHealthError::EmptyHealthThresholds);
+    }
+
+    let thresholds = request
+        .thresholds
+        .into_iter()
+        .map(normalize_health_threshold)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut evidence = Vec::new();
+
+    for sample in request.samples {
+        let sample_component_id =
+            normalize_required_text(sample.component_id, FleetHealthError::EmptyComponentId)?;
+        if sample_component_id != component_id {
+            return Err(FleetHealthError::IndicatorComponentMismatch {
+                component_id,
+                sample_component_id,
+            });
+        }
+        validate_finite(sample.value)?;
+        let sample_ts =
+            normalize_required_text(sample.ts, FleetHealthError::EmptyTelemetryTimestamp)?;
+        let source_ref =
+            normalize_required_text(sample.source_ref, FleetHealthError::EmptySourceRef)?;
+        let threshold = thresholds
+            .iter()
+            .find(|threshold| threshold.indicator == sample.indicator)
+            .ok_or(FleetHealthError::MissingHealthThreshold {
+                indicator: sample.indicator,
+            })?;
+        let (status, reason_code, threshold_value) =
+            classify_health_indicator(sample.value, threshold);
+
+        evidence.push(HealthVerdictEvidence {
+            indicator: sample.indicator,
+            value: sample.value,
+            threshold: threshold_value,
+            status,
+            reason_code,
+            sample_ts,
+            source_ref,
+            freshness: sample.freshness,
+        });
+    }
+
+    let selected = evidence
+        .iter()
+        .max_by(|left, right| compare_verdict_evidence(left, right))
+        .expect("non-empty evidence checked above");
+    let freshness = if evidence
+        .iter()
+        .any(|item| item.freshness == HealthIndicatorFreshness::Stale)
+    {
+        HealthIndicatorFreshness::Stale
+    } else {
+        HealthIndicatorFreshness::Fresh
+    };
+
+    Ok(ComponentHealthVerdict {
+        component_id,
+        evaluated_at,
+        method_version,
+        status: selected.status,
+        reason_code: selected.reason_code,
+        indicator: Some(selected.indicator),
+        threshold: Some(selected.threshold),
+        value: Some(selected.value),
+        freshness,
+        evidence,
+    })
+}
+
 pub fn component_event(
     component_id: &str,
     event_type: &str,
@@ -607,6 +788,70 @@ fn validate_finite(value: f64) -> Result<(), FleetHealthError> {
     }
 }
 
+fn normalize_health_threshold(
+    threshold: HealthIndicatorThreshold,
+) -> Result<HealthIndicatorThreshold, FleetHealthError> {
+    let valid = threshold.watch_at.is_finite()
+        && threshold.degraded_at.is_finite()
+        && threshold.critical_at.is_finite()
+        && threshold.watch_at >= 0.0
+        && threshold.degraded_at >= threshold.watch_at
+        && threshold.critical_at >= threshold.degraded_at;
+
+    if valid {
+        Ok(threshold)
+    } else {
+        Err(FleetHealthError::InvalidHealthThreshold {
+            indicator: threshold.indicator,
+        })
+    }
+}
+
+fn classify_health_indicator(
+    value: f64,
+    threshold: &HealthIndicatorThreshold,
+) -> (ComponentHealthVerdictStatus, HealthVerdictReasonCode, f64) {
+    if value >= threshold.critical_at {
+        (
+            ComponentHealthVerdictStatus::Critical,
+            HealthVerdictReasonCode::CriticalThresholdExceeded,
+            threshold.critical_at,
+        )
+    } else if value >= threshold.degraded_at {
+        (
+            ComponentHealthVerdictStatus::Degraded,
+            HealthVerdictReasonCode::DegradedThresholdExceeded,
+            threshold.degraded_at,
+        )
+    } else if value >= threshold.watch_at {
+        (
+            ComponentHealthVerdictStatus::Watch,
+            HealthVerdictReasonCode::WatchThresholdExceeded,
+            threshold.watch_at,
+        )
+    } else {
+        (
+            ComponentHealthVerdictStatus::Ok,
+            HealthVerdictReasonCode::AllIndicatorsWithinThreshold,
+            threshold.watch_at,
+        )
+    }
+}
+
+fn compare_verdict_evidence(
+    left: &HealthVerdictEvidence,
+    right: &HealthVerdictEvidence,
+) -> std::cmp::Ordering {
+    left.status
+        .severity_rank()
+        .cmp(&right.status.severity_rank())
+        .then_with(|| {
+            left.value
+                .partial_cmp(&right.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
 fn normalize_service_history_entry(
     entry: ServiceHistoryEntry,
 ) -> Result<ServiceHistoryEntry, FleetHealthError> {
@@ -663,9 +908,11 @@ fn validate_nonnegative_finite(
 mod tests {
     use super::{
         accrue_component_duty, build_component_duty_accruals, build_component_record,
-        component_event, derive_health_indicators, install_component, DutyAccrualRequest,
-        FleetComponentType, FleetHealthError, FleetHealthIndicator, HealthIndicatorFreshness,
-        HealthTelemetryGap, HealthTelemetrySample, InstallComponentRequest,
+        component_event, derive_health_indicators, evaluate_component_health_verdict,
+        install_component, ComponentHealthVerdictRequest, ComponentHealthVerdictStatus,
+        DutyAccrualRequest, FleetComponentType, FleetHealthError, FleetHealthIndicator,
+        HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
+        HealthTelemetrySample, HealthVerdictReasonCode, InstallComponentRequest,
         RegisterComponentRequest, ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
     };
     use timeseries::SeriesValue;
@@ -936,5 +1183,136 @@ mod tests {
             HealthIndicatorFreshness::Stale
         );
         assert_ne!(derived.samples[0].ts, "2026-06-12T12:01:00Z");
+    }
+
+    #[test]
+    fn component_verdict_is_ok_when_indicators_are_within_thresholds() {
+        let verdict = evaluate_component_health_verdict(ComponentHealthVerdictRequest {
+            component_id: "battery-pack-001".to_string(),
+            evaluated_at: "2026-06-12T12:30:00Z".to_string(),
+            method_version: "fleet-health-thresholds-v1".to_string(),
+            samples: vec![indicator_sample(
+                "battery-pack-001",
+                FleetHealthIndicator::BatteryInternalResistance,
+                31.0,
+            )],
+            thresholds: vec![threshold(
+                FleetHealthIndicator::BatteryInternalResistance,
+                60.0,
+                85.0,
+                110.0,
+            )],
+        })
+        .expect("verdict should evaluate");
+
+        assert_eq!(verdict.status, ComponentHealthVerdictStatus::Ok);
+        assert_eq!(
+            verdict.reason_code,
+            HealthVerdictReasonCode::AllIndicatorsWithinThreshold
+        );
+        assert_eq!(
+            verdict.indicator,
+            Some(FleetHealthIndicator::BatteryInternalResistance)
+        );
+        assert_eq!(verdict.threshold, Some(60.0));
+        assert_eq!(verdict.value, Some(31.0));
+        assert_eq!(verdict.evidence.len(), 1);
+    }
+
+    #[test]
+    fn critical_indicator_sets_component_verdict_with_threshold_evidence() {
+        let verdict = evaluate_component_health_verdict(ComponentHealthVerdictRequest {
+            component_id: "motor-front-left".to_string(),
+            evaluated_at: "2026-06-12T12:30:00Z".to_string(),
+            method_version: "fleet-health-thresholds-v1".to_string(),
+            samples: vec![
+                indicator_sample(
+                    "motor-front-left",
+                    FleetHealthIndicator::MotorVibration,
+                    1.8,
+                ),
+                indicator_sample(
+                    "motor-front-left",
+                    FleetHealthIndicator::EscTemperature,
+                    72.0,
+                ),
+            ],
+            thresholds: vec![
+                threshold(FleetHealthIndicator::MotorVibration, 0.6, 1.0, 1.5),
+                threshold(FleetHealthIndicator::EscTemperature, 70.0, 85.0, 100.0),
+            ],
+        })
+        .expect("verdict should evaluate");
+
+        assert_eq!(verdict.status, ComponentHealthVerdictStatus::Critical);
+        assert_eq!(
+            verdict.reason_code,
+            HealthVerdictReasonCode::CriticalThresholdExceeded
+        );
+        assert_eq!(
+            verdict.indicator,
+            Some(FleetHealthIndicator::MotorVibration)
+        );
+        assert_eq!(verdict.threshold, Some(1.5));
+        assert_eq!(verdict.value, Some(1.8));
+        assert_eq!(verdict.evidence[0].source_ref, "telemetry:session-001");
+    }
+
+    #[test]
+    fn verdict_refuses_indicator_without_configured_threshold() {
+        let error = evaluate_component_health_verdict(ComponentHealthVerdictRequest {
+            component_id: "motor-front-left".to_string(),
+            evaluated_at: "2026-06-12T12:30:00Z".to_string(),
+            method_version: "fleet-health-thresholds-v1".to_string(),
+            samples: vec![indicator_sample(
+                "motor-front-left",
+                FleetHealthIndicator::MotorVibration,
+                0.7,
+            )],
+            thresholds: vec![threshold(
+                FleetHealthIndicator::BatteryInternalResistance,
+                60.0,
+                85.0,
+                110.0,
+            )],
+        })
+        .expect_err("missing threshold should be rejected");
+
+        assert_eq!(
+            error,
+            FleetHealthError::MissingHealthThreshold {
+                indicator: FleetHealthIndicator::MotorVibration
+            }
+        );
+    }
+
+    fn indicator_sample(
+        component_id: &str,
+        indicator: FleetHealthIndicator,
+        value: f64,
+    ) -> super::FleetHealthIndicatorSample {
+        super::FleetHealthIndicatorSample {
+            component_id: component_id.to_string(),
+            indicator,
+            value,
+            ts: "2026-06-12T12:00:00Z".to_string(),
+            source_ref: "telemetry:session-001".to_string(),
+            created_at: "2026-06-12T12:20:00Z".to_string(),
+            freshness: HealthIndicatorFreshness::Fresh,
+        }
+    }
+
+    fn threshold(
+        indicator: FleetHealthIndicator,
+        watch_at: f64,
+        degraded_at: f64,
+        critical_at: f64,
+    ) -> HealthIndicatorThreshold {
+        HealthIndicatorThreshold {
+            indicator,
+            watch_at,
+            degraded_at,
+            critical_at,
+        }
     }
 }
