@@ -52,7 +52,16 @@ pub struct RasterAlignmentConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentRefusalReason {
+    EntityMismatch,
+    MetricMismatch,
+    NotRasterPoint,
+    MissingCrs,
+    MissingExtent,
+    MissingResolution,
+    CrsMismatch,
     InsufficientOverlap,
+    ResolutionMismatch,
+    InvalidGuardConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,6 +100,37 @@ pub struct RasterAlignmentEvidence {
     pub transform: RasterGridTransform,
     pub resampling_method: String,
     pub overlap_ratio_basis_points: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlignmentGuardConfig {
+    pub minimum_overlap_ratio: f64,
+    pub resolution_tolerance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlignmentGuardProof {
+    pub alignment_proof_ref: String,
+    pub entity_ref: String,
+    pub metric: String,
+    pub earlier_t: String,
+    pub later_t: String,
+    pub earlier_raster_ref: String,
+    pub later_raster_ref: String,
+    pub target_crs: String,
+    pub overlap_ratio_basis_points: u32,
+    pub earlier_resolution: RasterResolution,
+    pub later_resolution: RasterResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlignmentGuardRefusal {
+    pub reason_code: AlignmentRefusalReason,
+    pub mismatch_detail: String,
+    pub earlier_raster_ref: Option<String>,
+    pub later_raster_ref: Option<String>,
+    pub alignment_proof_ref: Option<String>,
+    pub change_job_blocked: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -341,6 +381,148 @@ pub fn align_raster_pair(
     })
 }
 
+pub fn guard_coregisterable_pair(
+    earlier: &SeriesPoint,
+    later: &SeriesPoint,
+    config: AlignmentGuardConfig,
+    generated_alignment_proof_ref: String,
+) -> Result<AlignmentGuardProof, AlignmentGuardRefusal> {
+    let alignment_proof_ref = normalize_required_text(
+        generated_alignment_proof_ref,
+        TimeSeriesError::EmptyAlignmentRef,
+    )
+    .map_err(|error| {
+        guard_refusal(
+            AlignmentRefusalReason::InvalidGuardConfig,
+            error.to_string(),
+            raster_ref_from_point(earlier),
+            raster_ref_from_point(later),
+        )
+    })?;
+    let config = normalize_guard_config(config).map_err(|error| {
+        guard_refusal(
+            AlignmentRefusalReason::InvalidGuardConfig,
+            error.to_string(),
+            raster_ref_from_point(earlier),
+            raster_ref_from_point(later),
+        )
+    })?;
+    let earlier = normalize_point(earlier.clone()).map_err(|error| {
+        guard_refusal(
+            guard_reason_from_error(&error),
+            error.to_string(),
+            raster_ref_from_point(earlier),
+            raster_ref_from_point(later),
+        )
+    })?;
+    let later = normalize_point(later.clone()).map_err(|error| {
+        guard_refusal(
+            guard_reason_from_error(&error),
+            error.to_string(),
+            raster_ref_from_point(&earlier),
+            raster_ref_from_point(later),
+        )
+    })?;
+    let earlier_ref = raster_ref_from_point(&earlier);
+    let later_ref = raster_ref_from_point(&later);
+
+    if earlier.entity_ref != later.entity_ref {
+        return Err(guard_refusal(
+            AlignmentRefusalReason::EntityMismatch,
+            format!(
+                "entity mismatch: {} vs {}",
+                earlier.entity_ref, later.entity_ref
+            ),
+            earlier_ref,
+            later_ref,
+        ));
+    }
+    if earlier.metric != later.metric {
+        return Err(guard_refusal(
+            AlignmentRefusalReason::MetricMismatch,
+            format!("metric mismatch: {} vs {}", earlier.metric, later.metric),
+            earlier_ref,
+            later_ref,
+        ));
+    }
+
+    let earlier_raster = raster_alignment_input(&earlier).map_err(|error| {
+        guard_refusal(
+            guard_reason_from_error(&error),
+            error.to_string(),
+            earlier_ref.clone(),
+            later_ref.clone(),
+        )
+    })?;
+    let later_raster = raster_alignment_input(&later).map_err(|error| {
+        guard_refusal(
+            guard_reason_from_error(&error),
+            error.to_string(),
+            earlier_ref.clone(),
+            later_ref.clone(),
+        )
+    })?;
+    if earlier_raster.crs != later_raster.crs {
+        return Err(guard_refusal(
+            AlignmentRefusalReason::CrsMismatch,
+            format!(
+                "CRS mismatch: {} vs {}",
+                earlier_raster.crs, later_raster.crs
+            ),
+            Some(earlier_raster.raster_ref),
+            Some(later_raster.raster_ref),
+        ));
+    }
+
+    let observed_overlap_basis_points =
+        overlap_ratio_basis_points(earlier_raster.extent, later_raster.extent);
+    let minimum_overlap_basis_points = ratio_to_basis_points(config.minimum_overlap_ratio);
+    if observed_overlap_basis_points < minimum_overlap_basis_points {
+        return Err(guard_refusal(
+            AlignmentRefusalReason::InsufficientOverlap,
+            format!(
+                "observed {observed_overlap_basis_points}bp below required {minimum_overlap_basis_points}bp"
+            ),
+            Some(earlier_raster.raster_ref),
+            Some(later_raster.raster_ref),
+        ));
+    }
+
+    if !resolution_compatible(
+        earlier_raster.resolution,
+        later_raster.resolution,
+        config.resolution_tolerance,
+    ) {
+        return Err(guard_refusal(
+            AlignmentRefusalReason::ResolutionMismatch,
+            format!(
+                "resolution mismatch: {}x{} vs {}x{} with tolerance {}",
+                earlier_raster.resolution.x,
+                earlier_raster.resolution.y,
+                later_raster.resolution.x,
+                later_raster.resolution.y,
+                config.resolution_tolerance
+            ),
+            Some(earlier_raster.raster_ref),
+            Some(later_raster.raster_ref),
+        ));
+    }
+
+    Ok(AlignmentGuardProof {
+        alignment_proof_ref,
+        entity_ref: earlier.entity_ref,
+        metric: earlier.metric,
+        earlier_t: earlier.t,
+        later_t: later.t,
+        earlier_raster_ref: earlier_raster.raster_ref,
+        later_raster_ref: later_raster.raster_ref,
+        target_crs: earlier_raster.crs,
+        overlap_ratio_basis_points: observed_overlap_basis_points,
+        earlier_resolution: earlier_raster.resolution,
+        later_resolution: later_raster.resolution,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SeriesKey {
     entity_ref: String,
@@ -409,6 +591,20 @@ fn normalize_alignment_config(
     })
 }
 
+fn normalize_guard_config(
+    config: AlignmentGuardConfig,
+) -> Result<AlignmentGuardConfig, TimeSeriesError> {
+    if !config.minimum_overlap_ratio.is_finite()
+        || !(0.0..=1.0).contains(&config.minimum_overlap_ratio)
+        || !config.resolution_tolerance.is_finite()
+        || config.resolution_tolerance < 0.0
+    {
+        return Err(TimeSeriesError::InvalidAlignmentConfig);
+    }
+
+    Ok(config)
+}
+
 fn extent_intersection(a: GeoExtent, b: GeoExtent) -> Option<GeoExtent> {
     let intersection = GeoExtent {
         min_x: a.min_x.max(b.min_x),
@@ -428,12 +624,64 @@ fn ratio_to_basis_points(ratio: f64) -> u32 {
     (ratio.clamp(0.0, 1.0) * 10_000.0).round() as u32
 }
 
+fn overlap_ratio_basis_points(a: GeoExtent, b: GeoExtent) -> u32 {
+    let overlap_area = extent_intersection(a, b).map_or(0.0, extent_area);
+    let denominator = extent_area(a).min(extent_area(b));
+    let ratio = if denominator > 0.0 {
+        overlap_area / denominator
+    } else {
+        0.0
+    };
+    ratio_to_basis_points(ratio)
+}
+
+fn resolution_compatible(
+    earlier: RasterResolution,
+    later: RasterResolution,
+    tolerance: f64,
+) -> bool {
+    (earlier.x - later.x).abs() <= tolerance && (earlier.y - later.y).abs() <= tolerance
+}
+
 fn grid_cell_count(distance: f64, resolution: f64) -> Result<u32, TimeSeriesError> {
     let cells = (distance / resolution).floor();
     if cells < 1.0 {
         Err(TimeSeriesError::InvalidAlignedGrid)
     } else {
         Ok(cells as u32)
+    }
+}
+
+fn raster_ref_from_point(point: &SeriesPoint) -> Option<String> {
+    match &point.value {
+        SeriesValue::Raster(raster) => Some(raster.raster_ref.clone()),
+        SeriesValue::Scalar { .. } => None,
+    }
+}
+
+fn guard_refusal(
+    reason_code: AlignmentRefusalReason,
+    mismatch_detail: String,
+    earlier_raster_ref: Option<String>,
+    later_raster_ref: Option<String>,
+) -> AlignmentGuardRefusal {
+    AlignmentGuardRefusal {
+        reason_code,
+        mismatch_detail,
+        earlier_raster_ref,
+        later_raster_ref,
+        alignment_proof_ref: None,
+        change_job_blocked: true,
+    }
+}
+
+fn guard_reason_from_error(error: &TimeSeriesError) -> AlignmentRefusalReason {
+    match error {
+        TimeSeriesError::AlignmentRequiresRasterPoint => AlignmentRefusalReason::NotRasterPoint,
+        TimeSeriesError::MissingRasterCrs => AlignmentRefusalReason::MissingCrs,
+        TimeSeriesError::MissingRasterExtent => AlignmentRefusalReason::MissingExtent,
+        TimeSeriesError::MissingRasterResolution => AlignmentRefusalReason::MissingResolution,
+        _ => AlignmentRefusalReason::InvalidGuardConfig,
     }
 }
 
@@ -522,9 +770,9 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        align_raster_pair, AlignmentRefusalReason, GeoExtent, RasterAlignmentConfig,
-        RasterResolution, RasterSeriesValue, SeriesPoint, SeriesQuery, SeriesValue, TimeRange,
-        TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
+        align_raster_pair, guard_coregisterable_pair, AlignmentGuardConfig, AlignmentRefusalReason,
+        GeoExtent, RasterAlignmentConfig, RasterResolution, RasterSeriesValue, SeriesPoint,
+        SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
     };
 
     #[test]
@@ -873,6 +1121,190 @@ mod tests {
         assert_eq!(error, TimeSeriesError::MissingRasterResolution);
     }
 
+    #[test]
+    fn alignment_guard_passes_coregisterable_pair_with_proof_ref() {
+        let earlier = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-10T10:00:00Z",
+            "product:scene-001:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+        );
+        let later = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-12T10:00:00Z",
+            "product:scene-002:ndvi",
+            GeoExtent {
+                min_x: 2.0,
+                min_y: 2.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+        );
+
+        let proof = guard_coregisterable_pair(
+            &earlier,
+            &later,
+            guard_config(0.75, 0.0),
+            "alignment-proof:field-alpha:ndvi".to_string(),
+        )
+        .expect("compatible pair should pass guard");
+
+        assert_eq!(
+            proof.alignment_proof_ref,
+            "alignment-proof:field-alpha:ndvi"
+        );
+        assert_eq!(proof.target_crs, "EPSG:32610");
+        assert_eq!(proof.overlap_ratio_basis_points, 10_000);
+        assert_eq!(
+            proof.earlier_resolution,
+            RasterResolution { x: 1.0, y: 1.0 }
+        );
+        assert_eq!(proof.later_resolution, RasterResolution { x: 1.0, y: 1.0 });
+    }
+
+    #[test]
+    fn alignment_guard_refuses_crs_mismatch_with_api_shape() {
+        let earlier = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-10T10:00:00Z",
+            "product:scene-001:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+        );
+        let mut later = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-12T10:00:00Z",
+            "product:scene-002:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+        );
+        if let SeriesValue::Raster(value) = &mut later.value {
+            value.crs = Some("EPSG:4326".to_string());
+        }
+
+        let refusal = guard_coregisterable_pair(
+            &earlier,
+            &later,
+            guard_config(0.75, 0.0),
+            "alignment-proof:field-alpha:ndvi".to_string(),
+        )
+        .expect_err("CRS mismatch should refuse guard");
+
+        assert_eq!(refusal.reason_code, AlignmentRefusalReason::CrsMismatch);
+        assert!(refusal.mismatch_detail.contains("EPSG:32610"));
+        assert!(refusal.mismatch_detail.contains("EPSG:4326"));
+        assert!(refusal.change_job_blocked);
+        assert!(refusal.alignment_proof_ref.is_none());
+    }
+
+    #[test]
+    fn alignment_guard_refuses_insufficient_overlap_with_detail() {
+        let earlier = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-10T10:00:00Z",
+            "product:scene-001:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+        );
+        let later = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-12T10:00:00Z",
+            "product:scene-002:ndvi",
+            GeoExtent {
+                min_x: 9.5,
+                min_y: 9.5,
+                max_x: 12.0,
+                max_y: 12.0,
+            },
+        );
+
+        let refusal = guard_coregisterable_pair(
+            &earlier,
+            &later,
+            guard_config(0.50, 0.0),
+            "alignment-proof:field-alpha:ndvi".to_string(),
+        )
+        .expect_err("insufficient overlap should refuse guard");
+
+        assert_eq!(
+            refusal.reason_code,
+            AlignmentRefusalReason::InsufficientOverlap
+        );
+        assert!(refusal.mismatch_detail.contains("400bp"));
+        assert!(refusal.mismatch_detail.contains("5000bp"));
+        assert!(refusal.change_job_blocked);
+    }
+
+    #[test]
+    fn alignment_guard_refuses_resolution_mismatch() {
+        let earlier = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-10T10:00:00Z",
+            "product:scene-001:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+        );
+        let mut later = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-12T10:00:00Z",
+            "product:scene-002:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+        );
+        if let SeriesValue::Raster(value) = &mut later.value {
+            value.resolution = Some(RasterResolution { x: 2.0, y: 2.0 });
+        }
+
+        let refusal = guard_coregisterable_pair(
+            &earlier,
+            &later,
+            guard_config(0.75, 0.01),
+            "alignment-proof:field-alpha:ndvi".to_string(),
+        )
+        .expect_err("resolution mismatch should refuse guard");
+
+        assert_eq!(
+            refusal.reason_code,
+            AlignmentRefusalReason::ResolutionMismatch
+        );
+        assert!(refusal.mismatch_detail.contains("1"));
+        assert!(refusal.mismatch_detail.contains("2"));
+        assert!(refusal.change_job_blocked);
+    }
+
     fn scalar_point(entity_ref: &str, metric: &str, t: &str, value: f64) -> SeriesPoint {
         SeriesPoint {
             entity_ref: entity_ref.to_string(),
@@ -916,6 +1348,13 @@ mod tests {
             target_resolution_y,
             minimum_overlap_ratio,
             resampling_method: " nearest ".to_string(),
+        }
+    }
+
+    fn guard_config(minimum_overlap_ratio: f64, resolution_tolerance: f64) -> AlignmentGuardConfig {
+        AlignmentGuardConfig {
+            minimum_overlap_ratio,
+            resolution_tolerance,
         }
     }
 }
