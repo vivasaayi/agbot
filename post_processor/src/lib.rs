@@ -8,12 +8,17 @@ use uuid::Uuid;
 
 pub mod lidar_analysis;
 pub mod ndvi_analysis;
+pub mod product_anomalies;
 pub mod report_generator;
 pub mod thermal_analysis;
 pub mod zonal_statistics;
 
 pub use lidar_analysis::{LidarAnalysisConfig, LidarAnalysisProcessor};
 pub use ndvi_analysis::{NdviAnalysisConfig, NdviAnalysisProcessor};
+pub use product_anomalies::{
+    flag_product_anomalies, AnomalyDetectionConfig, AnomalyDetectionError, ProductAnomaly,
+    ProductAnomalyReasonCode,
+};
 pub use report_generator::ReportGenerator;
 pub use thermal_analysis::{ThermalAnalysisConfig, ThermalAnalysisProcessor};
 pub use zonal_statistics::{
