@@ -133,6 +133,42 @@ pub struct AlignmentGuardRefusal {
     pub change_job_blocked: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlignedRasterGrid {
+    pub raster_ref: String,
+    pub alignment_ref: String,
+    pub crs: String,
+    pub extent: GeoExtent,
+    pub resolution: RasterResolution,
+    pub grid_columns: u32,
+    pub grid_rows: u32,
+    pub values: Vec<Option<f64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RasterChangeConfig {
+    pub absolute_threshold: f64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RasterChangeResult {
+    pub delta_raster_ref: String,
+    pub mask_raster_ref: String,
+    pub alignment_ref: String,
+    pub alignment_proof_ref: String,
+    pub crs: String,
+    pub extent: GeoExtent,
+    pub resolution: RasterResolution,
+    pub grid_columns: u32,
+    pub grid_rows: u32,
+    pub absolute_threshold: f64,
+    pub method_version: String,
+    pub delta_values: Vec<Option<f64>>,
+    pub change_mask: Vec<bool>,
+    pub changed_cell_count: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TimeSeriesStore {
     points: BTreeMap<SeriesKey, SeriesPoint>,
@@ -195,6 +231,20 @@ pub enum TimeSeriesError {
     },
     #[error("aligned grid must contain at least one cell")]
     InvalidAlignedGrid,
+    #[error("delta_raster_ref cannot be empty")]
+    EmptyDeltaRasterRef,
+    #[error("mask_raster_ref cannot be empty")]
+    EmptyMaskRasterRef,
+    #[error("change method_version cannot be empty")]
+    EmptyChangeMethodVersion,
+    #[error("raster change config must be finite with a non-negative threshold")]
+    InvalidChangeConfig,
+    #[error("raster change inputs must match alignment evidence and proof")]
+    ChangeAlignmentMismatch,
+    #[error("aligned raster grid cell count does not match dimensions")]
+    InvalidRasterCellCount,
+    #[error("aligned raster grid values must be finite when present")]
+    InvalidRasterCellValue,
 }
 
 impl TimeSeriesStore {
@@ -523,6 +573,73 @@ pub fn guard_coregisterable_pair(
     })
 }
 
+pub fn compute_aligned_raster_change(
+    guard_proof: &AlignmentGuardProof,
+    evidence: &RasterAlignmentEvidence,
+    earlier: &AlignedRasterGrid,
+    later: &AlignedRasterGrid,
+    config: RasterChangeConfig,
+    generated_delta_raster_ref: String,
+    generated_mask_raster_ref: String,
+) -> Result<RasterChangeResult, TimeSeriesError> {
+    let delta_raster_ref = normalize_required_text(
+        generated_delta_raster_ref,
+        TimeSeriesError::EmptyDeltaRasterRef,
+    )?;
+    let mask_raster_ref = normalize_required_text(
+        generated_mask_raster_ref,
+        TimeSeriesError::EmptyMaskRasterRef,
+    )?;
+    let config = normalize_change_config(config)?;
+    validate_change_alignment(guard_proof, evidence, earlier, later)?;
+    validate_aligned_grid(earlier)?;
+    validate_aligned_grid(later)?;
+
+    let mut delta_values = Vec::with_capacity(earlier.values.len());
+    let mut change_mask = Vec::with_capacity(earlier.values.len());
+    let mut changed_cell_count = 0_u32;
+    for (earlier_value, later_value) in earlier.values.iter().zip(&later.values) {
+        match (earlier_value, later_value) {
+            (Some(earlier_value), Some(later_value)) => {
+                let delta = later_value - earlier_value;
+                if !delta.is_finite() {
+                    return Err(TimeSeriesError::InvalidRasterCellValue);
+                }
+                let changed = delta.abs() >= config.absolute_threshold;
+                if changed {
+                    changed_cell_count += 1;
+                }
+                delta_values.push(Some(delta));
+                change_mask.push(changed);
+            }
+            _ => {
+                delta_values.push(None);
+                change_mask.push(false);
+            }
+        }
+    }
+
+    Ok(RasterChangeResult {
+        delta_raster_ref,
+        mask_raster_ref,
+        alignment_ref: evidence.alignment_ref.clone(),
+        alignment_proof_ref: guard_proof.alignment_proof_ref.clone(),
+        crs: evidence.target_crs.clone(),
+        extent: evidence.aligned_extent,
+        resolution: RasterResolution {
+            x: evidence.target_resolution_x,
+            y: evidence.target_resolution_y,
+        },
+        grid_columns: evidence.grid_columns,
+        grid_rows: evidence.grid_rows,
+        absolute_threshold: config.absolute_threshold,
+        method_version: config.method_version,
+        delta_values,
+        change_mask,
+        changed_cell_count,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SeriesKey {
     entity_ref: String,
@@ -603,6 +720,74 @@ fn normalize_guard_config(
     }
 
     Ok(config)
+}
+
+fn normalize_change_config(
+    config: RasterChangeConfig,
+) -> Result<RasterChangeConfig, TimeSeriesError> {
+    let method_version = normalize_required_text(
+        config.method_version,
+        TimeSeriesError::EmptyChangeMethodVersion,
+    )?;
+    if !config.absolute_threshold.is_finite() || config.absolute_threshold < 0.0 {
+        return Err(TimeSeriesError::InvalidChangeConfig);
+    }
+
+    Ok(RasterChangeConfig {
+        absolute_threshold: config.absolute_threshold,
+        method_version,
+    })
+}
+
+fn validate_change_alignment(
+    guard_proof: &AlignmentGuardProof,
+    evidence: &RasterAlignmentEvidence,
+    earlier: &AlignedRasterGrid,
+    later: &AlignedRasterGrid,
+) -> Result<(), TimeSeriesError> {
+    let expected_resolution = RasterResolution {
+        x: evidence.target_resolution_x,
+        y: evidence.target_resolution_y,
+    };
+    let matches = guard_proof.target_crs == evidence.target_crs
+        && earlier.raster_ref == evidence.aligned_earlier_ref
+        && later.raster_ref == evidence.aligned_later_ref
+        && earlier.alignment_ref == evidence.alignment_ref
+        && later.alignment_ref == evidence.alignment_ref
+        && earlier.crs == evidence.target_crs
+        && later.crs == evidence.target_crs
+        && earlier.extent == evidence.aligned_extent
+        && later.extent == evidence.aligned_extent
+        && earlier.resolution == expected_resolution
+        && later.resolution == expected_resolution
+        && earlier.grid_columns == evidence.grid_columns
+        && later.grid_columns == evidence.grid_columns
+        && earlier.grid_rows == evidence.grid_rows
+        && later.grid_rows == evidence.grid_rows;
+
+    if matches {
+        Ok(())
+    } else {
+        Err(TimeSeriesError::ChangeAlignmentMismatch)
+    }
+}
+
+fn validate_aligned_grid(grid: &AlignedRasterGrid) -> Result<(), TimeSeriesError> {
+    let expected_len = usize::try_from(grid.grid_columns)
+        .ok()
+        .and_then(|columns| {
+            usize::try_from(grid.grid_rows)
+                .ok()
+                .and_then(|rows| columns.checked_mul(rows))
+        })
+        .ok_or(TimeSeriesError::InvalidRasterCellCount)?;
+    if grid.values.len() != expected_len {
+        return Err(TimeSeriesError::InvalidRasterCellCount);
+    }
+    if grid.values.iter().flatten().any(|value| !value.is_finite()) {
+        return Err(TimeSeriesError::InvalidRasterCellValue);
+    }
+    Ok(())
 }
 
 fn extent_intersection(a: GeoExtent, b: GeoExtent) -> Option<GeoExtent> {
@@ -770,9 +955,11 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        align_raster_pair, guard_coregisterable_pair, AlignmentGuardConfig, AlignmentRefusalReason,
-        GeoExtent, RasterAlignmentConfig, RasterResolution, RasterSeriesValue, SeriesPoint,
-        SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
+        align_raster_pair, compute_aligned_raster_change, guard_coregisterable_pair,
+        AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason,
+        GeoExtent, RasterAlignmentConfig, RasterAlignmentEvidence, RasterChangeConfig,
+        RasterResolution, RasterSeriesValue, SeriesPoint, SeriesQuery, SeriesValue, TimeRange,
+        TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
     };
 
     #[test]
@@ -1305,6 +1492,124 @@ mod tests {
         assert!(refusal.change_job_blocked);
     }
 
+    #[test]
+    fn raster_change_computes_delta_and_threshold_mask_on_aligned_grid() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier_grid = aligned_grid(
+            &evidence,
+            &evidence.aligned_earlier_ref,
+            [0.25, 0.50, 0.75, 1.00],
+        );
+        let later_grid = aligned_grid(
+            &evidence,
+            &evidence.aligned_later_ref,
+            [0.00, 1.00, 0.875, 0.50],
+        );
+
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier_grid,
+            &later_grid,
+            change_config(0.25),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("aligned rasters should produce change outputs");
+
+        assert_eq!(change.delta_raster_ref, "change:field-alpha:delta");
+        assert_eq!(change.mask_raster_ref, "change:field-alpha:mask");
+        assert_eq!(change.alignment_ref, evidence.alignment_ref);
+        assert_eq!(change.crs, evidence.target_crs);
+        assert_eq!(change.extent, evidence.aligned_extent);
+        assert_eq!(change.resolution, RasterResolution { x: 1.0, y: 1.0 });
+        assert_eq!(change.grid_columns, 2);
+        assert_eq!(change.grid_rows, 2);
+        assert_eq!(change.absolute_threshold, 0.25);
+        assert_eq!(
+            change.delta_values,
+            vec![Some(-0.25), Some(0.50), Some(0.125), Some(-0.50)]
+        );
+        assert_eq!(change.change_mask, vec![true, true, false, true]);
+        assert_eq!(change.changed_cell_count, 3);
+    }
+
+    #[test]
+    fn raster_change_identical_scenes_emit_empty_mask() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier_grid = aligned_grid(
+            &evidence,
+            &evidence.aligned_earlier_ref,
+            [0.25, 0.50, 0.75, 1.00],
+        );
+        let later_grid = aligned_grid(
+            &evidence,
+            &evidence.aligned_later_ref,
+            [0.25, 0.50, 0.75, 1.00],
+        );
+
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier_grid,
+            &later_grid,
+            change_config(0.01),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("identical aligned rasters should still produce outputs");
+
+        assert_eq!(
+            change.delta_values,
+            vec![Some(0.0), Some(0.0), Some(0.0), Some(0.0)]
+        );
+        assert_eq!(change.change_mask, vec![false, false, false, false]);
+        assert_eq!(change.changed_cell_count, 0);
+    }
+
+    #[test]
+    fn raster_change_is_refused_before_delta_when_guard_refuses_pair() {
+        let earlier = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-10T10:00:00Z",
+            "product:scene-001:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 2.0,
+                max_y: 2.0,
+            },
+        );
+        let mut later = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-12T10:00:00Z",
+            "product:scene-002:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 2.0,
+                max_y: 2.0,
+            },
+        );
+        if let SeriesValue::Raster(value) = &mut later.value {
+            value.crs = Some("EPSG:4326".to_string());
+        }
+
+        let refusal = guard_coregisterable_pair(
+            &earlier,
+            &later,
+            guard_config(0.75, 0.0),
+            "alignment-proof:field-alpha:ndvi".to_string(),
+        )
+        .expect_err("guard should refuse before change computation");
+
+        assert_eq!(refusal.reason_code, AlignmentRefusalReason::CrsMismatch);
+        assert!(refusal.change_job_blocked);
+        assert!(refusal.alignment_proof_ref.is_none());
+    }
+
     fn scalar_point(entity_ref: &str, metric: &str, t: &str, value: f64) -> SeriesPoint {
         SeriesPoint {
             entity_ref: entity_ref.to_string(),
@@ -1355,6 +1660,72 @@ mod tests {
         AlignmentGuardConfig {
             minimum_overlap_ratio,
             resolution_tolerance,
+        }
+    }
+
+    fn aligned_pair_evidence_and_proof() -> (RasterAlignmentEvidence, AlignmentGuardProof) {
+        let earlier = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-10T10:00:00Z",
+            "product:scene-001:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 2.0,
+                max_y: 2.0,
+            },
+        );
+        let later = raster_point(
+            "field:alpha",
+            "ndvi_raster",
+            "2026-06-12T10:00:00Z",
+            "product:scene-002:ndvi",
+            GeoExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 2.0,
+                max_y: 2.0,
+            },
+        );
+        let evidence = align_raster_pair(
+            &earlier,
+            &later,
+            alignment_config(1.0, 1.0, 1.0),
+            "alignment:field-alpha:ndvi".to_string(),
+        )
+        .expect("aligned pair should produce evidence");
+        let proof = guard_coregisterable_pair(
+            &earlier,
+            &later,
+            guard_config(1.0, 0.0),
+            "alignment-proof:field-alpha:ndvi".to_string(),
+        )
+        .expect("aligned pair should pass guard");
+        (evidence, proof)
+    }
+
+    fn aligned_grid(
+        evidence: &RasterAlignmentEvidence,
+        raster_ref: &str,
+        values: [f64; 4],
+    ) -> AlignedRasterGrid {
+        AlignedRasterGrid {
+            raster_ref: raster_ref.to_string(),
+            alignment_ref: evidence.alignment_ref.clone(),
+            crs: evidence.target_crs.clone(),
+            extent: evidence.aligned_extent,
+            resolution: RasterResolution { x: 1.0, y: 1.0 },
+            grid_columns: evidence.grid_columns,
+            grid_rows: evidence.grid_rows,
+            values: values.into_iter().map(Some).collect(),
+        }
+    }
+
+    fn change_config(absolute_threshold: f64) -> RasterChangeConfig {
+        RasterChangeConfig {
+            absolute_threshold,
+            method_version: "delta-mask-v1".to_string(),
         }
     }
 }
