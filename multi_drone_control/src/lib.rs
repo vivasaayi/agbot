@@ -7,12 +7,18 @@ use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 pub mod collision_avoidance;
+pub mod coordinated_approval;
 pub mod coordination;
 pub mod mission_assignment;
 pub mod swarm;
 pub mod synchronized_survey;
 
 pub use collision_avoidance::{AvoidanceManeuver, CollisionAvoidanceSystem};
+pub use coordinated_approval::{
+    authorize_coordinated_execution, dry_run_coordinated_execution, ApprovalAuditEvent,
+    ApprovalGateConfig, ApprovalGateError, CoordinatedExecutionDecision,
+    CoordinatedExecutionDryRun, CoordinatedExecutionStatus, OperatorApproval,
+};
 pub use coordination::{CoordinationEngine, CoordinationStatus};
 pub use mission_assignment::{DroneAssignment, MissionAssignmentEngine};
 pub use swarm::{DroneSwarm, SwarmController, SwarmStatus};
