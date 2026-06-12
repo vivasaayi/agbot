@@ -212,6 +212,42 @@ pub struct DeliveryOutcome {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    Queued,
+    Sending,
+    Delivered,
+    Failed,
+    Retrying,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryRetryPolicy {
+    pub max_attempts: usize,
+    pub base_backoff_seconds: u64,
+    pub max_backoff_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryStateTransition {
+    pub attempt_number: usize,
+    pub from: DeliveryState,
+    pub to: DeliveryState,
+    pub backoff_seconds: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedDelivery {
+    pub delivery_id: String,
+    pub final_state: DeliveryState,
+    pub attempts: Vec<DeliveryOutcome>,
+    pub transitions: Vec<DeliveryStateTransition>,
+    pub last_error: Option<String>,
+    pub max_attempts: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InAppFeedItem {
     pub recipient_id: String,
@@ -229,6 +265,8 @@ pub struct InAppChannelAdapter {
 pub struct MockChannelAdapter {
     channel: AlertChannel,
     failure: Option<String>,
+    failures_remaining: usize,
+    always_fail: bool,
     outcomes: Vec<DeliveryOutcome>,
 }
 
@@ -301,6 +339,8 @@ pub enum AlertingError {
     InvalidSeverityEvidence,
     #[error("dedup window requires non-empty window_start <= window_end")]
     InvalidDedupWindow,
+    #[error("retry policy requires max_attempts > 0 and bounded positive backoff")]
+    InvalidRetryPolicy,
     #[error("invalid alert severity {0}")]
     InvalidSeverity(String),
 }
@@ -379,6 +419,8 @@ impl MockChannelAdapter {
         Self {
             channel,
             failure: None,
+            failures_remaining: 0,
+            always_fail: false,
             outcomes: Vec::new(),
         }
     }
@@ -387,6 +429,18 @@ impl MockChannelAdapter {
         Self {
             channel,
             failure: Some(error),
+            failures_remaining: usize::MAX,
+            always_fail: true,
+            outcomes: Vec::new(),
+        }
+    }
+
+    pub fn flaky(channel: AlertChannel, failures_before_success: usize, error: String) -> Self {
+        Self {
+            channel,
+            failure: Some(error),
+            failures_remaining: failures_before_success,
+            always_fail: false,
             outcomes: Vec::new(),
         }
     }
@@ -402,8 +456,17 @@ impl ChannelAdapter for MockChannelAdapter {
     }
 
     fn send(&mut self, alert: &FiredAlertRecord, recipient: &AlertRecipient) -> DeliveryOutcome {
-        let outcome = if let Some(error) = &self.failure {
-            failed_outcome(self.channel, alert, recipient, error)
+        let should_fail = self.always_fail || self.failures_remaining > 0;
+        let outcome = if should_fail {
+            if self.failures_remaining > 0 {
+                self.failures_remaining -= 1;
+            }
+            failed_outcome(
+                self.channel,
+                alert,
+                recipient,
+                self.failure.as_deref().unwrap_or("channel delivery failed"),
+            )
         } else {
             delivered_outcome(self.channel, alert, recipient)
         };
@@ -689,6 +752,92 @@ pub fn deliver_alert<A: ChannelAdapter>(
     Ok(adapter.send(&alert, &recipient))
 }
 
+pub fn run_tracked_delivery<A: ChannelAdapter>(
+    adapter: &mut A,
+    alert: &FiredAlertRecord,
+    recipient: AlertRecipient,
+    policy: DeliveryRetryPolicy,
+) -> Result<TrackedDelivery, AlertingError> {
+    let policy = normalize_retry_policy(policy)?;
+    let mut state = DeliveryState::Queued;
+    let mut attempts = Vec::new();
+    let mut transitions = Vec::new();
+
+    for attempt_number in 1..=policy.max_attempts {
+        transitions.push(delivery_transition(
+            attempt_number,
+            state,
+            DeliveryState::Sending,
+            None,
+            None,
+        ));
+
+        let outcome = deliver_alert(adapter, alert, recipient.clone())?;
+        let delivery_id = outcome.delivery_id.clone();
+
+        match outcome.status {
+            DeliveryStatus::Delivered => {
+                attempts.push(outcome);
+                transitions.push(delivery_transition(
+                    attempt_number,
+                    DeliveryState::Sending,
+                    DeliveryState::Delivered,
+                    None,
+                    None,
+                ));
+                return Ok(TrackedDelivery {
+                    delivery_id,
+                    final_state: DeliveryState::Delivered,
+                    attempts,
+                    transitions,
+                    last_error: None,
+                    max_attempts: policy.max_attempts,
+                });
+            }
+            DeliveryStatus::Failed => {
+                let failure_error = outcome.error.clone();
+                attempts.push(outcome);
+                if attempt_number < policy.max_attempts {
+                    let backoff_seconds = retry_backoff_seconds(&policy, attempt_number);
+                    transitions.push(delivery_transition(
+                        attempt_number,
+                        DeliveryState::Sending,
+                        DeliveryState::Failed,
+                        None,
+                        failure_error.clone(),
+                    ));
+                    transitions.push(delivery_transition(
+                        attempt_number,
+                        DeliveryState::Failed,
+                        DeliveryState::Retrying,
+                        Some(backoff_seconds),
+                        failure_error.clone(),
+                    ));
+                    state = DeliveryState::Retrying;
+                } else {
+                    transitions.push(delivery_transition(
+                        attempt_number,
+                        DeliveryState::Sending,
+                        DeliveryState::Failed,
+                        None,
+                        failure_error.clone(),
+                    ));
+                    return Ok(TrackedDelivery {
+                        delivery_id,
+                        final_state: DeliveryState::Failed,
+                        attempts,
+                        transitions,
+                        last_error: failure_error,
+                        max_attempts: policy.max_attempts,
+                    });
+                }
+            }
+        }
+    }
+
+    Err(AlertingError::InvalidRetryPolicy)
+}
+
 fn normalize_event(event: AlertEvent) -> Result<AlertEvent, AlertingError> {
     Ok(AlertEvent {
         source_domain: normalize_required_text(
@@ -763,6 +912,20 @@ fn normalize_alert_recipient(recipient: AlertRecipient) -> Result<AlertRecipient
     })
 }
 
+fn normalize_retry_policy(
+    policy: DeliveryRetryPolicy,
+) -> Result<DeliveryRetryPolicy, AlertingError> {
+    if policy.max_attempts == 0
+        || policy.base_backoff_seconds == 0
+        || policy.max_backoff_seconds == 0
+        || policy.base_backoff_seconds > policy.max_backoff_seconds
+    {
+        return Err(AlertingError::InvalidRetryPolicy);
+    }
+
+    Ok(policy)
+}
+
 fn severity_from_evidence_or_rule(
     rule_severity: AlertSeverityHint,
     evidence: &AlertSeverityEvidence,
@@ -799,6 +962,30 @@ fn alert_bypasses_dedup_suppression(alert: &FiredAlertRecord) -> bool {
         alert.severity,
         AlertSeverityHint::Critical | AlertSeverityHint::Emergency
     )
+}
+
+fn retry_backoff_seconds(policy: &DeliveryRetryPolicy, failed_attempt_number: usize) -> u64 {
+    let mut backoff = policy.base_backoff_seconds;
+    for _ in 1..failed_attempt_number {
+        backoff = backoff.saturating_mul(2).min(policy.max_backoff_seconds);
+    }
+    backoff.min(policy.max_backoff_seconds)
+}
+
+fn delivery_transition(
+    attempt_number: usize,
+    from: DeliveryState,
+    to: DeliveryState,
+    backoff_seconds: Option<u64>,
+    error: Option<String>,
+) -> DeliveryStateTransition {
+    DeliveryStateTransition {
+        attempt_number,
+        from,
+        to,
+        backoff_seconds,
+        error,
+    }
 }
 
 fn delivered_outcome(
@@ -915,10 +1102,10 @@ fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
 mod tests {
     use super::{
         classify_alert_severity, compute_alert_dedup_key, deduplicate_alert_stream, deliver_alert,
-        evaluate_alert_rules, filter_alert_history, AlertChannel, AlertDedupWindow, AlertEvent,
-        AlertEventBackbone, AlertHistoryQuery, AlertRecipient, AlertRule, AlertSeverityEvidence,
-        AlertSeverityHint, AlertingError, DeliveryStatus, InAppChannelAdapter, MockChannelAdapter,
-        SourceAdapter,
+        evaluate_alert_rules, filter_alert_history, run_tracked_delivery, AlertChannel,
+        AlertDedupWindow, AlertEvent, AlertEventBackbone, AlertHistoryQuery, AlertRecipient,
+        AlertRule, AlertSeverityEvidence, AlertSeverityHint, AlertingError, DeliveryRetryPolicy,
+        DeliveryState, DeliveryStatus, InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
     };
 
     #[test]
@@ -1316,6 +1503,78 @@ mod tests {
         assert_eq!(adapter.recorded_outcomes()[0], outcome);
     }
 
+    #[test]
+    fn delivery_tracking_retries_transient_failure_to_delivered() {
+        let alert = fired_alert(
+            "alert-flaky",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut adapter =
+            MockChannelAdapter::flaky(AlertChannel::Email, 2, "temporary timeout".to_string());
+
+        let tracked = run_tracked_delivery(
+            &mut adapter,
+            &alert,
+            alert_recipient("ops-001"),
+            retry_policy(),
+        )
+        .expect("transient channel should eventually deliver");
+
+        assert_eq!(tracked.final_state, DeliveryState::Delivered);
+        assert_eq!(tracked.attempts.len(), 3);
+        assert_eq!(tracked.last_error, None);
+        assert_eq!(tracked.transitions[0].from, DeliveryState::Queued);
+        assert_eq!(tracked.transitions[0].to, DeliveryState::Sending);
+        assert_eq!(tracked.transitions[1].from, DeliveryState::Sending);
+        assert_eq!(tracked.transitions[1].to, DeliveryState::Failed);
+        assert_eq!(tracked.transitions[2].from, DeliveryState::Failed);
+        assert_eq!(tracked.transitions[2].to, DeliveryState::Retrying);
+        assert_eq!(tracked.transitions[2].backoff_seconds, Some(5));
+        assert_eq!(tracked.transitions[5].backoff_seconds, Some(10));
+        assert_eq!(tracked.transitions[7].to, DeliveryState::Delivered);
+    }
+
+    #[test]
+    fn delivery_tracking_exhausts_attempt_cap_to_terminal_failed() {
+        let alert = fired_alert(
+            "alert-down",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut adapter =
+            MockChannelAdapter::failing(AlertChannel::Webhook, "provider down".to_string());
+
+        let tracked = run_tracked_delivery(
+            &mut adapter,
+            &alert,
+            alert_recipient("ops-001"),
+            DeliveryRetryPolicy {
+                max_attempts: 2,
+                base_backoff_seconds: 5,
+                max_backoff_seconds: 20,
+            },
+        )
+        .expect("terminal channel failure should be recorded");
+
+        assert_eq!(tracked.final_state, DeliveryState::Failed);
+        assert_eq!(tracked.attempts.len(), 2);
+        assert_eq!(tracked.last_error, Some("provider down".to_string()));
+        assert_eq!(
+            tracked.transitions.last().unwrap().from,
+            DeliveryState::Sending
+        );
+        assert_eq!(
+            tracked.transitions.last().unwrap().to,
+            DeliveryState::Failed
+        );
+        assert_eq!(tracked.transitions.last().unwrap().backoff_seconds, None);
+    }
+
     fn sensor_health_event() -> AlertEvent {
         AlertEvent {
             source_domain: "27-soil-iot-sensor-network".to_string(),
@@ -1380,6 +1639,14 @@ mod tests {
         AlertRecipient {
             recipient_id: recipient_id.to_string(),
             role: "operator".to_string(),
+        }
+    }
+
+    fn retry_policy() -> DeliveryRetryPolicy {
+        DeliveryRetryPolicy {
+            max_attempts: 3,
+            base_backoff_seconds: 5,
+            max_backoff_seconds: 20,
         }
     }
 }
