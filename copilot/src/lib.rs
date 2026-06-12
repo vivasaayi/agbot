@@ -102,6 +102,33 @@ pub struct GroundedCopilotAnswer {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroundedCopilotQuestionRequest {
+    pub question: String,
+    pub retrieved_evidence: Vec<EvidenceIndexEntry>,
+    pub claims: Vec<CopilotAnswerClaim>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopilotRefusalReason {
+    NoEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopilotRefusal {
+    pub refused: bool,
+    pub reason: CopilotRefusalReason,
+    pub needed_evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroundedCopilotTurn {
+    pub refused: bool,
+    pub refusal: Option<CopilotRefusal>,
+    pub answer: Option<GroundedCopilotAnswer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeterministicAnswerFixture {
     pub question: String,
     pub text: String,
@@ -171,6 +198,16 @@ pub enum CopilotGroundingError {
     EmptyModelId,
     #[error("model_version cannot be empty")]
     EmptyModelVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum CopilotTurnError {
+    #[error("question cannot be empty")]
+    EmptyQuestion,
+    #[error(transparent)]
+    Model(#[from] CopilotModelError),
+    #[error(transparent)]
+    Grounding(#[from] CopilotGroundingError),
 }
 
 pub trait CopilotModel {
@@ -254,6 +291,29 @@ impl CopilotModel for UnavailableCopilotModel {
             reason: format!("{}: {}", self.adapter_name, self.reason),
         })
     }
+}
+
+pub fn answer_grounded_question(
+    model: &impl CopilotModel,
+    request: GroundedCopilotQuestionRequest,
+) -> Result<GroundedCopilotTurn, CopilotTurnError> {
+    let question = normalize_text(request.question).ok_or(CopilotTurnError::EmptyQuestion)?;
+    let retrieved_evidence = relevant_evidence_for_question(&question, request.retrieved_evidence);
+    if retrieved_evidence.is_empty() {
+        return Ok(no_evidence_refusal());
+    }
+
+    let answer = model.answer(CopilotAnswerRequest {
+        question,
+        retrieved_evidence: retrieved_evidence.clone(),
+    })?;
+    let grounded = post_check_grounded_answer(answer, request.claims, &retrieved_evidence)?;
+
+    Ok(GroundedCopilotTurn {
+        refused: false,
+        refusal: None,
+        answer: Some(grounded),
+    })
 }
 
 pub fn post_check_grounded_answer(
@@ -341,6 +401,111 @@ pub fn post_check_grounded_answer(
         model_id,
         model_version,
     })
+}
+
+fn no_evidence_refusal() -> GroundedCopilotTurn {
+    GroundedCopilotTurn {
+        refused: true,
+        refusal: Some(CopilotRefusal {
+            refused: true,
+            reason: CopilotRefusalReason::NoEvidence,
+            needed_evidence: vec![
+                "resolvable indexed evidence relevant to the question".to_string()
+            ],
+        }),
+        answer: None,
+    }
+}
+
+fn relevant_evidence_for_question(
+    question: &str,
+    retrieved_evidence: Vec<EvidenceIndexEntry>,
+) -> Vec<EvidenceIndexEntry> {
+    let question_tokens = meaningful_tokens(question);
+    if question_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    retrieved_evidence
+        .into_iter()
+        .filter(|entry| {
+            normalize_text(entry.evidence_id.clone()).is_some()
+                && normalize_text(entry.ledger_ref.clone()).is_some()
+                && evidence_tokens(entry)
+                    .iter()
+                    .any(|token| question_tokens.contains(token))
+        })
+        .collect()
+}
+
+fn evidence_tokens(entry: &EvidenceIndexEntry) -> BTreeSet<String> {
+    let mut text = format!(
+        "{} {} {}",
+        entry.summary,
+        entry.evidence_id,
+        evidence_kind_label(entry.kind)
+    );
+    if let Some(scene_ref) = &entry.scene_ref {
+        text.push(' ');
+        text.push_str(scene_ref);
+    }
+    if let Some(zone_ref) = &entry.zone_ref {
+        text.push(' ');
+        text.push_str(zone_ref);
+    }
+    meaningful_tokens(&text)
+}
+
+fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Finding => "finding",
+        EvidenceKind::ImageryProduct => "imagery product",
+        EvidenceKind::LidarProduct => "lidar product",
+        EvidenceKind::Report => "report",
+        EvidenceKind::Trend => "trend change",
+    }
+}
+
+fn meaningful_tokens(value: &str) -> BTreeSet<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            if token.len() >= 3 && !is_copilot_stopword(&token) {
+                Some(token)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_copilot_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "why"
+            | "what"
+            | "when"
+            | "where"
+            | "how"
+            | "this"
+            | "that"
+            | "are"
+            | "was"
+            | "were"
+            | "does"
+            | "did"
+            | "field"
+            | "zone"
+            | "crop"
+            | "flight"
+            | "last"
+            | "since"
+    )
 }
 
 pub fn build_evidence_retrieval_index(
@@ -519,13 +684,14 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{cell::Cell, collections::BTreeSet};
 
     use super::{
-        build_evidence_retrieval_index, post_check_grounded_answer, CopilotAnswerClaim,
-        CopilotAnswerRequest, CopilotGroundingError, CopilotIndexError, CopilotModel,
-        CopilotModelError, DeterministicAnswerFixture, DeterministicCopilotModel,
-        EvidenceCandidate, EvidenceIndexEntry, EvidenceKind, EvidenceRejectionReason,
+        answer_grounded_question, build_evidence_retrieval_index, post_check_grounded_answer,
+        CopilotAnswer, CopilotAnswerClaim, CopilotAnswerRequest, CopilotGroundingError,
+        CopilotIndexError, CopilotModel, CopilotModelError, CopilotRefusalReason,
+        DeterministicAnswerFixture, DeterministicCopilotModel, EvidenceCandidate,
+        EvidenceIndexEntry, EvidenceKind, EvidenceRejectionReason, GroundedCopilotQuestionRequest,
         LedgerEvidenceResolver, UnavailableCopilotModel,
     };
 
@@ -835,6 +1001,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grounding_guard_refuses_empty_retrieval_without_calling_model() {
+        let model = RecordingCopilotModel::new(fixture_answer());
+
+        let turn = answer_grounded_question(
+            &model,
+            grounded_question_request("why is the northeast zone stressed?", vec![]),
+        )
+        .expect("guardrail should return a refusal");
+
+        assert!(turn.refused);
+        assert_eq!(
+            turn.refusal.as_ref().map(|refusal| refusal.reason),
+            Some(CopilotRefusalReason::NoEvidence)
+        );
+        assert!(turn.answer.is_none());
+        assert!(!model.was_called());
+    }
+
+    #[test]
+    fn grounding_guard_refuses_unresolved_index_evidence_before_model_call() {
+        let ledger = FixtureLedger {
+            refs: BTreeSet::new(),
+        };
+        let index = build_evidence_retrieval_index(
+            "field-001".to_string(),
+            vec![EvidenceCandidate {
+                evidence_id: "evidence-ndvi-001".to_string(),
+                kind: EvidenceKind::ImageryProduct,
+                field_id: "field-001".to_string(),
+                scene_ref: Some("scene-2026-06-01".to_string()),
+                zone_ref: Some("zone-ne".to_string()),
+                ledger_ref: "ledger:30:missing".to_string(),
+                summary: "NDVI in the northeast zone dropped below threshold.".to_string(),
+            }],
+            &ledger,
+        )
+        .expect("index should build with rejected evidence");
+        let model = RecordingCopilotModel::new(fixture_answer());
+
+        let turn = answer_grounded_question(
+            &model,
+            grounded_question_request("why is the northeast zone stressed?", index.entries.clone()),
+        )
+        .expect("guardrail should return a refusal");
+
+        assert!(index.entries.is_empty());
+        assert!(turn.refused);
+        assert_eq!(
+            turn.refusal.as_ref().map(|refusal| refusal.reason),
+            Some(CopilotRefusalReason::NoEvidence)
+        );
+        assert!(!model.was_called());
+    }
+
+    #[test]
+    fn grounding_guard_answers_when_relevant_evidence_exists() {
+        let model = RecordingCopilotModel::new(fixture_answer());
+
+        let turn = answer_grounded_question(
+            &model,
+            grounded_question_request(
+                "why is the northeast zone stressed?",
+                vec![retrieved_evidence("evidence-ndvi-001")],
+            ),
+        )
+        .expect("grounded answer should return");
+
+        assert!(!turn.refused);
+        assert!(turn.refusal.is_none());
+        assert!(turn.answer.is_some());
+        assert!(model.was_called());
+    }
+
     fn retrieved_evidence(evidence_id: &str) -> EvidenceIndexEntry {
         EvidenceIndexEntry {
             evidence_id: evidence_id.to_string(),
@@ -847,6 +1087,20 @@ mod tests {
         }
     }
 
+    fn grounded_question_request(
+        question: &str,
+        retrieved_evidence: Vec<EvidenceIndexEntry>,
+    ) -> GroundedCopilotQuestionRequest {
+        GroundedCopilotQuestionRequest {
+            question: question.to_string(),
+            retrieved_evidence,
+            claims: vec![CopilotAnswerClaim {
+                text: "The northeast zone is stressed.".to_string(),
+                cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+            }],
+        }
+    }
+
     fn fixture_answer() -> super::CopilotAnswer {
         super::CopilotAnswer {
             text: "The northeast zone is stressed.".to_string(),
@@ -855,6 +1109,34 @@ mod tests {
             model_provider: "test-double".to_string(),
             model_id: "fixture-rag".to_string(),
             model_version: "2026-06-12".to_string(),
+        }
+    }
+
+    struct RecordingCopilotModel {
+        answer: CopilotAnswer,
+        called: Cell<bool>,
+    }
+
+    impl RecordingCopilotModel {
+        fn new(answer: CopilotAnswer) -> Self {
+            Self {
+                answer,
+                called: Cell::new(false),
+            }
+        }
+
+        fn was_called(&self) -> bool {
+            self.called.get()
+        }
+    }
+
+    impl CopilotModel for RecordingCopilotModel {
+        fn answer(
+            &self,
+            _request: CopilotAnswerRequest,
+        ) -> Result<CopilotAnswer, CopilotModelError> {
+            self.called.set(true);
+            Ok(self.answer.clone())
         }
     }
 }
