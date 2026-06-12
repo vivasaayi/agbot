@@ -1,4 +1,10 @@
 use crate::{
+    operator_actions::{
+        shared_operator_action_state, ActionAckStatus, MissionControlActionAck,
+        MissionControlActionRequest, OperatorActionError, OperatorActionKind, OperatorActionState,
+        RejectingMissionControlActionClient, SharedMissionControlActionClient,
+        SharedOperatorActionState,
+    },
     operator_session::{
         shared_operator_session_registry, OperatorLoginRequest, OperatorSession,
         OperatorSessionError, OperatorSessionRegistry, SharedOperatorSessionRegistry,
@@ -7,13 +13,13 @@ use crate::{
     TelemetryFreshnessSnapshot, TelemetryTileSnapshot,
 };
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
     response::Html,
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use shared::control_plane::MembershipRole;
 use shared::{config::AgroConfig, AgroResult};
 use std::sync::Arc;
@@ -25,6 +31,8 @@ pub struct WebServer {
     link_state: SharedLinkState,
     dispatch_state: SharedMessageDispatchState,
     operator_sessions: SharedOperatorSessionRegistry,
+    operator_action_state: SharedOperatorActionState,
+    mission_control_actions: SharedMissionControlActionClient,
 }
 
 #[derive(Clone)]
@@ -32,6 +40,8 @@ struct WebServerState {
     link_state: SharedLinkState,
     dispatch_state: SharedMessageDispatchState,
     operator_sessions: SharedOperatorSessionRegistry,
+    operator_action_state: SharedOperatorActionState,
+    mission_control_actions: SharedMissionControlActionClient,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +59,19 @@ struct OperatorActionGateResponse {
     org_id: uuid::Uuid,
     role: MembershipRole,
     expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OperatorActionRequestBody {
+    mission_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OperatorActionResponse {
+    success: bool,
+    status: &'static str,
+    message: String,
+    ack: Option<MissionControlActionAck>,
 }
 
 impl WebServer {
@@ -72,11 +95,32 @@ impl WebServer {
         dispatch_state: SharedMessageDispatchState,
         operator_sessions: SharedOperatorSessionRegistry,
     ) -> AgroResult<Self> {
+        Self::new_with_operator_controls(
+            config,
+            link_state,
+            dispatch_state,
+            operator_sessions,
+            shared_operator_action_state(OperatorActionState::default()),
+            Arc::new(RejectingMissionControlActionClient),
+        )
+        .await
+    }
+
+    pub async fn new_with_operator_controls(
+        config: Arc<AgroConfig>,
+        link_state: SharedLinkState,
+        dispatch_state: SharedMessageDispatchState,
+        operator_sessions: SharedOperatorSessionRegistry,
+        operator_action_state: SharedOperatorActionState,
+        mission_control_actions: SharedMissionControlActionClient,
+    ) -> AgroResult<Self> {
         Ok(Self {
             config,
             link_state,
             dispatch_state,
             operator_sessions,
+            operator_action_state,
+            mission_control_actions,
         })
     }
 
@@ -85,6 +129,8 @@ impl WebServer {
             link_state: self.link_state.clone(),
             dispatch_state: self.dispatch_state.clone(),
             operator_sessions: self.operator_sessions.clone(),
+            operator_action_state: self.operator_action_state.clone(),
+            mission_control_actions: self.mission_control_actions.clone(),
         });
 
         let bind_addr = "0.0.0.0:8081"; // Different port from mission control
@@ -109,6 +155,10 @@ fn build_router_with_state(state: WebServerState) -> Router {
         .route(
             "/api/operator/actions/session-check",
             post(operator_action_session_check),
+        )
+        .route(
+            "/api/operator/actions/:action",
+            post(submit_operator_action),
         )
         .route("/telemetry", get(telemetry_page))
         .route("/maps", get(maps_page))
@@ -166,6 +216,50 @@ async fn operator_action_session_check(
     }))
 }
 
+async fn submit_operator_action(
+    State(state): State<WebServerState>,
+    Path(action): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<OperatorActionRequestBody>,
+) -> Result<(StatusCode, Json<OperatorActionResponse>), (StatusCode, String)> {
+    let token = bearer_token(&headers)
+        .ok_or(OperatorSessionError::MissingSession)
+        .map_err(operator_session_error_response)?;
+    let authorized = {
+        let sessions = state.operator_sessions.read().await;
+        sessions
+            .authorize_action_at(token, chrono::Utc::now())
+            .map_err(operator_session_error_response)?
+    };
+    let action = action
+        .parse::<OperatorActionKind>()
+        .map_err(operator_action_error_response)?;
+
+    if let Err(error) = state
+        .operator_action_state
+        .read()
+        .await
+        .ensure_simulation_validated()
+    {
+        return Ok(operator_action_status_response(error, None));
+    }
+
+    let request = MissionControlActionRequest::new(
+        authorized.principal,
+        action,
+        body.mission_id,
+        chrono::Utc::now(),
+    );
+    let result = state
+        .mission_control_actions
+        .submit_operator_action(request);
+
+    Ok(match result {
+        Ok(ack) => operator_action_ack_response(ack),
+        Err(error) => operator_action_status_response(error, None),
+    })
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -186,6 +280,70 @@ fn operator_session_error_response(error: OperatorSessionError) -> (StatusCode, 
         | OperatorSessionError::SessionExpired => StatusCode::UNAUTHORIZED,
     };
     (status, error.to_string())
+}
+
+fn operator_action_error_response(error: OperatorActionError) -> (StatusCode, String) {
+    let status = match &error {
+        OperatorActionError::UnsupportedAction { .. } => StatusCode::BAD_REQUEST,
+        OperatorActionError::SimulationLoopNotValidated => StatusCode::CONFLICT,
+        OperatorActionError::MissionControlRejected { .. } => StatusCode::CONFLICT,
+        OperatorActionError::MissionControlNoAck { .. } => StatusCode::GATEWAY_TIMEOUT,
+        OperatorActionError::MissionControlUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, error.to_string())
+}
+
+fn operator_action_ack_response(
+    ack: MissionControlActionAck,
+) -> (StatusCode, Json<OperatorActionResponse>) {
+    let status = match ack.status {
+        ActionAckStatus::Accepted => StatusCode::OK,
+        ActionAckStatus::Rejected => StatusCode::CONFLICT,
+        ActionAckStatus::TimedOut => StatusCode::GATEWAY_TIMEOUT,
+    };
+    let response_status = match ack.status {
+        ActionAckStatus::Accepted => "accepted",
+        ActionAckStatus::Rejected => "rejected",
+        ActionAckStatus::TimedOut => "timed_out",
+    };
+    let success = ack.status == ActionAckStatus::Accepted;
+    let message = ack.message.clone();
+
+    (
+        status,
+        Json(OperatorActionResponse {
+            success,
+            status: response_status,
+            message,
+            ack: Some(ack),
+        }),
+    )
+}
+
+fn operator_action_status_response(
+    error: OperatorActionError,
+    ack: Option<MissionControlActionAck>,
+) -> (StatusCode, Json<OperatorActionResponse>) {
+    let (status, response_status) = match &error {
+        OperatorActionError::UnsupportedAction { .. } => (StatusCode::BAD_REQUEST, "unsupported"),
+        OperatorActionError::SimulationLoopNotValidated => (StatusCode::CONFLICT, "disabled"),
+        OperatorActionError::MissionControlRejected { .. } => (StatusCode::CONFLICT, "rejected"),
+        OperatorActionError::MissionControlNoAck { .. } => {
+            (StatusCode::GATEWAY_TIMEOUT, "timed_out")
+        }
+        OperatorActionError::MissionControlUnavailable { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+        }
+    };
+    (
+        status,
+        Json(OperatorActionResponse {
+            success: false,
+            status: response_status,
+            message: error.to_string(),
+            ack,
+        }),
+    )
 }
 
 async fn dashboard_page() -> Html<&'static str> {
@@ -784,6 +942,7 @@ async fn maps_page() -> Html<&'static str> {
 mod tests {
     use super::*;
     use crate::{
+        operator_actions::MissionControlActionClient,
         operator_session::{
             shared_operator_session_registry, OperatorCredential, OperatorSessionConfig,
             OperatorSessionRegistry,
@@ -796,6 +955,7 @@ mod tests {
     };
     use serde_json::json;
     use shared::control_plane::{MembershipRole, TenantPrincipal};
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -937,10 +1097,175 @@ mod tests {
         assert_eq!(action_response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    async fn rth_action_forwards_to_mission_control_and_returns_ack() {
+        let mission_id = Uuid::new_v4();
+        let client = Arc::new(RecordingMissionControlActionClient::new(vec![Ok(
+            MissionControlActionAck::accepted(
+                OperatorActionKind::ReturnToHome,
+                mission_id,
+                "rth guardrails accepted",
+                chrono::Utc::now(),
+            ),
+        )]));
+        let (state, principal) = test_state_with_operator_actions(
+            MembershipRole::Operator,
+            "secret",
+            15,
+            validated_operator_action_state(),
+            client.clone(),
+        );
+        let app = build_router_with_state(state);
+        let token = login_token(app.clone(), "secret").await;
+
+        let (status, body) = submit_action(app, &token, "return-to-home", mission_id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.get("success").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/ack/status").and_then(|value| value.as_str()),
+            Some("accepted")
+        );
+        assert_eq!(
+            body.pointer("/ack/action").and_then(|value| value.as_str()),
+            Some("return-to-home")
+        );
+
+        let requests = client.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].operator_id, principal.user_id);
+        assert_eq!(requests[0].org_id, principal.org_id);
+        assert_eq!(requests[0].operator_role, MembershipRole::Operator);
+        assert_eq!(requests[0].action, OperatorActionKind::ReturnToHome);
+        assert_eq!(requests[0].target_mission_id, mission_id);
+    }
+
+    #[tokio::test]
+    async fn operator_action_is_disabled_until_simulation_loop_validates() {
+        let mission_id = Uuid::new_v4();
+        let client = Arc::new(RecordingMissionControlActionClient::new(vec![Ok(
+            MissionControlActionAck::accepted(
+                OperatorActionKind::Abort,
+                mission_id,
+                "abort accepted",
+                chrono::Utc::now(),
+            ),
+        )]));
+        let (state, _) = test_state_with_operator_actions(
+            MembershipRole::Operator,
+            "secret",
+            15,
+            shared_operator_action_state(OperatorActionState::default()),
+            client.clone(),
+        );
+        let app = build_router_with_state(state);
+        let token = login_token(app.clone(), "secret").await;
+
+        let (status, body) = submit_action(app, &token, "abort", mission_id).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.get("success").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            body.get("status").and_then(|value| value.as_str()),
+            Some("disabled")
+        );
+        assert!(client.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn guardrail_rejection_is_returned_without_reporting_success() {
+        let mission_id = Uuid::new_v4();
+        let client = Arc::new(RecordingMissionControlActionClient::new(vec![Ok(
+            MissionControlActionAck::rejected(
+                OperatorActionKind::Abort,
+                mission_id,
+                "battery guardrail rejected abort mode",
+                chrono::Utc::now(),
+            ),
+        )]));
+        let (state, _) = test_state_with_operator_actions(
+            MembershipRole::Operator,
+            "secret",
+            15,
+            validated_operator_action_state(),
+            client.clone(),
+        );
+        let app = build_router_with_state(state);
+        let token = login_token(app.clone(), "secret").await;
+
+        let (status, body) = submit_action(app, &token, "abort", mission_id).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.get("success").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            body.pointer("/ack/status").and_then(|value| value.as_str()),
+            Some("rejected")
+        );
+        assert_eq!(client.recorded_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_mission_control_ack_is_returned_as_timeout() {
+        let mission_id = Uuid::new_v4();
+        let client = Arc::new(RecordingMissionControlActionClient::new(vec![Err(
+            OperatorActionError::MissionControlNoAck {
+                reason: "ack deadline elapsed".to_string(),
+            },
+        )]));
+        let (state, _) = test_state_with_operator_actions(
+            MembershipRole::Operator,
+            "secret",
+            15,
+            validated_operator_action_state(),
+            client.clone(),
+        );
+        let app = build_router_with_state(state);
+        let token = login_token(app.clone(), "secret").await;
+
+        let (status, body) = submit_action(app, &token, "pause", mission_id).await;
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            body.get("success").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            body.get("status").and_then(|value| value.as_str()),
+            Some("timed_out")
+        );
+        assert!(body.get("ack").is_some_and(|value| value.is_null()));
+        assert_eq!(client.recorded_requests().len(), 1);
+    }
+
     fn test_state(
         role: MembershipRole,
         credential: &str,
         session_minutes: i64,
+    ) -> (WebServerState, TenantPrincipal) {
+        test_state_with_operator_actions(
+            role,
+            credential,
+            session_minutes,
+            shared_operator_action_state(OperatorActionState::default()),
+            Arc::new(RejectingMissionControlActionClient),
+        )
+    }
+
+    fn test_state_with_operator_actions(
+        role: MembershipRole,
+        credential: &str,
+        session_minutes: i64,
+        operator_action_state: SharedOperatorActionState,
+        mission_control_actions: SharedMissionControlActionClient,
     ) -> (WebServerState, TenantPrincipal) {
         let principal = TenantPrincipal {
             user_id: Uuid::new_v4(),
@@ -960,8 +1285,117 @@ mod tests {
                 link_state: shared_link_state(ReconnectPolicy::default()),
                 dispatch_state: shared_message_dispatch_state(),
                 operator_sessions: shared_operator_session_registry(sessions),
+                operator_action_state,
+                mission_control_actions,
             },
             principal,
         )
+    }
+
+    fn validated_operator_action_state() -> SharedOperatorActionState {
+        let mut state = OperatorActionState::default();
+        state.mark_simulation_validated("flight_sim_cpp:headless-regression");
+        shared_operator_action_state(state)
+    }
+
+    async fn login_token(app: Router, credential: &str) -> String {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/operator/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "email": "ops@example.com",
+                            "credential": credential
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle login");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body should read");
+        let login_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("login response should decode");
+
+        login_json
+            .get("session_token")
+            .and_then(|value| value.as_str())
+            .expect("login should return session token")
+            .to_string()
+    }
+
+    async fn submit_action(
+        app: Router,
+        token: &str,
+        action: &str,
+        mission_id: Uuid,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/operator/actions/{action}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "mission_id": mission_id
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle operator action");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body should read");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("action response should decode");
+        (status, json)
+    }
+
+    struct RecordingMissionControlActionClient {
+        requests: Mutex<Vec<MissionControlActionRequest>>,
+        responses: Mutex<Vec<Result<MissionControlActionAck, OperatorActionError>>>,
+    }
+
+    impl RecordingMissionControlActionClient {
+        fn new(responses: Vec<Result<MissionControlActionAck, OperatorActionError>>) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                responses: Mutex::new(responses),
+            }
+        }
+
+        fn recorded_requests(&self) -> Vec<MissionControlActionRequest> {
+            self.requests
+                .lock()
+                .expect("request lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl MissionControlActionClient for RecordingMissionControlActionClient {
+        fn submit_operator_action(
+            &self,
+            request: MissionControlActionRequest,
+        ) -> Result<MissionControlActionAck, OperatorActionError> {
+            self.requests
+                .lock()
+                .expect("request lock should not be poisoned")
+                .push(request);
+            self.responses
+                .lock()
+                .expect("response lock should not be poisoned")
+                .remove(0)
+        }
     }
 }

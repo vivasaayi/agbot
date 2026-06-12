@@ -12,6 +12,7 @@ pub mod cli_interface;
 pub mod link_client;
 pub mod map_state;
 pub mod message_dispatch;
+pub mod operator_actions;
 pub mod operator_session;
 pub mod web_server;
 
@@ -32,6 +33,13 @@ pub use message_dispatch::{
     DispatchedMessage, MessageDispatchState, MessageRoute, MissionStatusSnapshot,
     SharedMessageDispatchState, SystemStatusSnapshot, TelemetryFreshnessSnapshot,
     TelemetryFreshnessState, TelemetryTileSnapshot, TelemetryTileValues,
+};
+pub use operator_actions::{
+    shared_operator_action_state, ActionAckStatus, MissionControlActionAck,
+    MissionControlActionClient, MissionControlActionRequest, OperatorActionError,
+    OperatorActionKind, OperatorActionState, OperatorActionSubmission,
+    RejectingMissionControlActionClient, SharedMissionControlActionClient,
+    SharedOperatorActionState,
 };
 pub use operator_session::{
     shared_operator_session_registry, AuthorizedOperatorAction, OperatorCredential,
