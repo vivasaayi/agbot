@@ -34,6 +34,33 @@ pub struct AlertCandidateRecord {
     pub accepted_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertRule {
+    pub rule_id: String,
+    pub event_type: String,
+    pub subject_ref: Option<String>,
+    pub severity: AlertSeverityHint,
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FiredAlertRecord {
+    pub alert_id: String,
+    pub matched_rule_id: String,
+    pub source_event_ref: String,
+    pub evidence_refs: Vec<String>,
+    pub severity: AlertSeverityHint,
+    pub channels: Vec<String>,
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RuleEvaluationOutcome {
+    pub fired_alerts: Vec<FiredAlertRecord>,
+    pub non_match_count: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AlertEventBackbone {
     candidates: Vec<AlertCandidateRecord>,
@@ -99,6 +126,49 @@ impl AlertEventBackbone {
     }
 }
 
+pub fn evaluate_alert_rules(
+    candidate: &AlertCandidateRecord,
+    rules: &[AlertRule],
+) -> RuleEvaluationOutcome {
+    let mut fired_alerts = Vec::new();
+    let mut non_match_count = 0;
+
+    for rule in rules {
+        if rule_matches_candidate(rule, candidate) {
+            fired_alerts.push(FiredAlertRecord {
+                alert_id: format!("alert:{}:{}", candidate.alert_candidate_id, rule.rule_id),
+                matched_rule_id: rule.rule_id.clone(),
+                source_event_ref: candidate.alert_candidate_id.clone(),
+                evidence_refs: candidate.evidence_refs.clone(),
+                severity: rule.severity,
+                channels: rule.channels.clone(),
+                explanation: format!(
+                    "rule {} matched event_type {} for subject {}; evidence refs: {}",
+                    rule.rule_id,
+                    candidate.event_type,
+                    candidate.subject_ref,
+                    candidate.evidence_refs.join(",")
+                ),
+            });
+        } else {
+            non_match_count += 1;
+        }
+    }
+
+    RuleEvaluationOutcome {
+        fired_alerts,
+        non_match_count,
+    }
+}
+
+fn rule_matches_candidate(rule: &AlertRule, candidate: &AlertCandidateRecord) -> bool {
+    rule.event_type == candidate.event_type
+        && rule
+            .subject_ref
+            .as_deref()
+            .map_or(true, |subject_ref| subject_ref == candidate.subject_ref)
+}
+
 fn normalize_event(event: AlertEvent) -> Result<AlertEvent, AlertingError> {
     Ok(AlertEvent {
         source_domain: normalize_required_text(
@@ -132,7 +202,10 @@ fn normalize_required_text(value: String, error: AlertingError) -> Result<String
 
 #[cfg(test)]
 mod tests {
-    use super::{AlertEvent, AlertEventBackbone, AlertSeverityHint, AlertingError, SourceAdapter};
+    use super::{
+        evaluate_alert_rules, AlertEvent, AlertEventBackbone, AlertRule, AlertSeverityHint,
+        AlertingError, SourceAdapter,
+    };
 
     #[test]
     fn source_adapter_accepts_and_persists_well_formed_event() {
@@ -165,6 +238,63 @@ mod tests {
         assert_eq!(error, AlertingError::EmptySourceDomain);
         assert_eq!(backbone.list_candidates().len(), 0);
         assert_eq!(backbone.rejected_event_count(), 1);
+    }
+
+    #[test]
+    fn rule_engine_fires_matching_alert_with_explanation() {
+        let mut backbone = AlertEventBackbone::default();
+        let candidate = backbone
+            .emit(sensor_health_event())
+            .expect("event should be accepted");
+        let outcome = evaluate_alert_rules(
+            &candidate,
+            &[AlertRule {
+                rule_id: "rule-sensor-stale-warning".to_string(),
+                event_type: "sensor_stale".to_string(),
+                subject_ref: None,
+                severity: AlertSeverityHint::Critical,
+                channels: vec!["in_app".to_string()],
+            }],
+        );
+
+        assert_eq!(outcome.fired_alerts.len(), 1);
+        assert_eq!(
+            outcome.fired_alerts[0].matched_rule_id,
+            "rule-sensor-stale-warning"
+        );
+        assert_eq!(
+            outcome.fired_alerts[0].source_event_ref,
+            candidate.alert_candidate_id
+        );
+        assert_eq!(
+            outcome.fired_alerts[0].evidence_refs,
+            vec!["reading:soil-probe-001:latest"]
+        );
+        assert!(outcome.fired_alerts[0]
+            .explanation
+            .contains("rule-sensor-stale-warning"));
+        assert_eq!(outcome.non_match_count, 0);
+    }
+
+    #[test]
+    fn rule_engine_records_observable_no_match() {
+        let mut backbone = AlertEventBackbone::default();
+        let candidate = backbone
+            .emit(sensor_health_event())
+            .expect("event should be accepted");
+        let outcome = evaluate_alert_rules(
+            &candidate,
+            &[AlertRule {
+                rule_id: "rule-weather".to_string(),
+                event_type: "weather_warning".to_string(),
+                subject_ref: None,
+                severity: AlertSeverityHint::Warning,
+                channels: vec!["in_app".to_string()],
+            }],
+        );
+
+        assert!(outcome.fired_alerts.is_empty());
+        assert_eq!(outcome.non_match_count, 1);
     }
 
     fn sensor_health_event() -> AlertEvent {
