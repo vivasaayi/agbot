@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const EVIDENCE_DIGEST_ALGORITHM: &str = "sha256";
 
@@ -66,6 +66,19 @@ pub struct EvidenceIntegrityProof {
     pub digest: String,
     pub algorithm: String,
     pub byte_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackwardProvenanceTrace {
+    pub target_artifact_id: String,
+    pub records: Vec<LineageRecord>,
+    pub gaps: Vec<LineageGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageGap {
+    pub missing_artifact_id: String,
+    pub referenced_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -145,6 +158,52 @@ impl LineageLedger {
 
     pub fn artifact_count(&self) -> usize {
         self.records.len()
+    }
+
+    pub fn trace_backward(
+        &self,
+        artifact_id: &str,
+    ) -> Result<BackwardProvenanceTrace, ProvenanceError> {
+        let target_artifact_id =
+            normalize_required_text(artifact_id.to_string(), ProvenanceError::EmptyArtifactId)?;
+        let mut trace = BackwardProvenanceTrace {
+            target_artifact_id: target_artifact_id.clone(),
+            records: Vec::new(),
+            gaps: Vec::new(),
+        };
+        let mut visited = BTreeSet::new();
+        self.collect_backward_lineage(&target_artifact_id, None, &mut visited, &mut trace);
+        Ok(trace)
+    }
+
+    fn collect_backward_lineage(
+        &self,
+        artifact_id: &str,
+        referenced_by: Option<String>,
+        visited: &mut BTreeSet<String>,
+        trace: &mut BackwardProvenanceTrace,
+    ) {
+        if !visited.insert(artifact_id.to_string()) {
+            return;
+        }
+
+        let Some(record) = self.records.get(artifact_id) else {
+            trace.gaps.push(LineageGap {
+                missing_artifact_id: artifact_id.to_string(),
+                referenced_by,
+            });
+            return;
+        };
+
+        trace.records.push(record.clone());
+        for input_artifact_id in &record.inputs {
+            self.collect_backward_lineage(
+                input_artifact_id,
+                Some(record.artifact_id.clone()),
+                visited,
+                trace,
+            );
+        }
     }
 }
 
@@ -436,6 +495,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn backward_provenance_trace_includes_product_scene_and_capture() {
+        let mut ledger = LineageLedger::default();
+        seed_capture_graph(&mut ledger);
+
+        let trace = ledger
+            .trace_backward("finding:09:stress-ne-zone")
+            .expect("backward trace should run");
+
+        let artifact_ids = trace
+            .records
+            .iter()
+            .map(|record| record.artifact_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            artifact_ids,
+            vec![
+                "finding:09:stress-ne-zone",
+                "product:ndvi:alpha-2026-06-12",
+                "scene:alpha-2026-06-12",
+                "capture:alpha-2026-06-12"
+            ]
+        );
+        assert!(trace.gaps.is_empty());
+        assert_eq!(trace.records[1].method, "05.ndvi_product");
+        assert_eq!(trace.records[2].method, "04.capture_session_scene");
+        assert_eq!(trace.records[3].method, "04.capture_session");
+    }
+
+    #[test]
+    fn backward_provenance_trace_reports_missing_input_gap() {
+        let mut ledger = LineageLedger::default();
+        let finding = finding_lineage();
+        ledger.records.insert(finding.artifact_id.clone(), finding);
+
+        let trace = ledger
+            .trace_backward("finding:09:stress-ne-zone")
+            .expect("incomplete trace should still return evidence");
+
+        assert_eq!(trace.records.len(), 1);
+        assert_eq!(trace.gaps.len(), 1);
+        assert_eq!(
+            trace.gaps[0].missing_artifact_id,
+            "product:ndvi:alpha-2026-06-12"
+        );
+        assert_eq!(
+            trace.gaps[0].referenced_by,
+            Some("finding:09:stress-ne-zone".to_string())
+        );
+    }
+
     fn seed_product(ledger: &mut LineageLedger) {
         ledger
             .record_lineage(scene_lineage())
@@ -443,6 +553,36 @@ mod tests {
         ledger
             .record_lineage(product_lineage())
             .expect("product lineage should be recorded");
+    }
+
+    fn seed_capture_graph(ledger: &mut LineageLedger) {
+        ledger
+            .record_lineage(capture_lineage())
+            .expect("capture lineage should be recorded");
+        ledger
+            .record_lineage(scene_lineage_with_capture())
+            .expect("scene lineage should be recorded");
+        ledger
+            .record_lineage(product_lineage())
+            .expect("product lineage should be recorded");
+        ledger
+            .record_lineage(finding_lineage())
+            .expect("finding lineage should be recorded");
+    }
+
+    fn capture_lineage() -> LineageRecord {
+        LineageRecord {
+            artifact_id: "capture:alpha-2026-06-12".to_string(),
+            kind: ArtifactKind::Capture,
+            inputs: Vec::new(),
+            method: "04.capture_session".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "flight_id": "flight:alpha-17",
+                "platform": "agrodrone-7"
+            })),
+            operator: "operator:dsp-7".to_string(),
+            created_at: "2026-06-12T11:45:00Z".to_string(),
+        }
     }
 
     fn scene_lineage() -> LineageRecord {
@@ -457,6 +597,13 @@ mod tests {
             })),
             operator: "operator:dsp-7".to_string(),
             created_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn scene_lineage_with_capture() -> LineageRecord {
+        LineageRecord {
+            inputs: vec!["capture:alpha-2026-06-12".to_string()],
+            ..scene_lineage()
         }
     }
 
