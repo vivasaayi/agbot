@@ -11,6 +11,7 @@ pub mod coordinated_approval;
 pub mod coordination;
 pub mod mission_assignment;
 pub mod swarm;
+pub mod swarm_command;
 pub mod synchronized_survey;
 
 pub use collision_avoidance::{AvoidanceManeuver, CollisionAvoidanceSystem};
@@ -22,6 +23,11 @@ pub use coordinated_approval::{
 pub use coordination::{CoordinationEngine, CoordinationStatus};
 pub use mission_assignment::{DroneAssignment, MissionAssignmentEngine};
 pub use swarm::{DroneSwarm, SwarmController, SwarmStatus};
+pub use swarm_command::{
+    dry_run_swarm_command, execute_audited_swarm_command, SwarmCommandAuditEvent,
+    SwarmCommandConfig, SwarmCommandError, SwarmCommandOutcome, SwarmCommandRoute,
+    SwarmCommandStatus,
+};
 pub use synchronized_survey::{
     evaluate_synchronized_survey_progress, plan_synchronized_survey, SurveyExecutionStatus,
     SurveyLane, SurveyProgressReport, SurveySeparationSample, SynchronizedSurveyConfig,
