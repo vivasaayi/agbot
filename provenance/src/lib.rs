@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const EVIDENCE_DIGEST_ALGORITHM: &str = "sha256";
+const SYSTEM_AUDIT_ACTOR_ID: &str = "system:provenance-ledger";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,6 +14,65 @@ pub enum ArtifactKind {
     Finding,
     Report,
     Action,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    Operator,
+    Agronomist,
+    DroneServiceProvider,
+    PlatformAdmin,
+    SystemService,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorIdentity {
+    pub actor_id: String,
+    pub actor_kind: ActorKind,
+}
+
+impl ActorIdentity {
+    pub fn system(actor_id: &str) -> Self {
+        Self {
+            actor_id: actor_id.to_string(),
+            actor_kind: ActorKind::SystemService,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionContext {
+    pub actor_id: Option<String>,
+    pub actor_kind: Option<ActorKind>,
+}
+
+impl ActionContext {
+    pub fn new(actor_id: Option<String>, actor_kind: Option<ActorKind>) -> Self {
+        Self {
+            actor_id,
+            actor_kind,
+        }
+    }
+
+    pub fn resolve_actor(&self, action_ref: &str) -> Result<ActorIdentity, ProvenanceError> {
+        let action_ref =
+            normalize_required_text(action_ref.to_string(), ProvenanceError::EmptyActionRef)?;
+        let Some(actor_id) = self
+            .actor_id
+            .clone()
+            .and_then(normalize_optional_text_owned)
+        else {
+            return Err(ProvenanceError::UnattributedAction { action_ref });
+        };
+        let Some(actor_kind) = self.actor_kind else {
+            return Err(ProvenanceError::UnattributedAction { action_ref });
+        };
+        normalize_actor_identity(ActorIdentity {
+            actor_id,
+            actor_kind,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +104,7 @@ pub struct LineageRecord {
     pub method: String,
     pub parameters: ProvenanceParameters,
     pub operator: String,
+    pub actor: ActorIdentity,
     pub created_at: String,
 }
 
@@ -81,6 +142,58 @@ pub struct LineageGap {
     pub referenced_by: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditAction {
+    pub action_ref: String,
+    pub action_kind: String,
+    pub artifact_ref: Option<String>,
+    pub payload: ProvenanceParameters,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    Accepted,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditRefusalReason {
+    UnattributedAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditChainBreachReason {
+    SequenceMismatch,
+    PreviousHashMismatch,
+    PayloadHashMismatch,
+    EntryHashMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub seq: u64,
+    pub prev_hash: Option<String>,
+    pub payload_hash: String,
+    pub entry_hash: String,
+    pub actor: ActorIdentity,
+    pub ts: String,
+    pub action: AuditAction,
+    pub outcome: AuditOutcome,
+    pub refusal_reason: Option<AuditRefusalReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditChainVerification {
+    pub verified: bool,
+    pub verified_len: usize,
+    pub breach_index: Option<usize>,
+    pub reason: Option<AuditChainBreachReason>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LineageLedger {
     records: BTreeMap<String, LineageRecord>,
@@ -91,10 +204,17 @@ pub struct EvidenceStore {
     objects: BTreeMap<String, StoredEvidence>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AuditLedger {
+    entries: Vec<AuditEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProvenanceError {
     #[error("artifact_id cannot be empty")]
     EmptyArtifactId,
+    #[error("actor_id cannot be empty")]
+    EmptyActorId,
     #[error("input artifact id cannot be empty for {artifact_id}")]
     EmptyInputArtifactId { artifact_id: String },
     #[error("method cannot be empty for {artifact_id}")]
@@ -103,6 +223,12 @@ pub enum ProvenanceError {
     EmptyOperator { artifact_id: String },
     #[error("created_at cannot be empty for {artifact_id}")]
     EmptyCreatedAt { artifact_id: String },
+    #[error("action_ref cannot be empty")]
+    EmptyActionRef,
+    #[error("action_kind cannot be empty for {action_ref}")]
+    EmptyActionKind { action_ref: String },
+    #[error("action timestamp cannot be empty for {action_ref}")]
+    EmptyActionTimestamp { action_ref: String },
     #[error("evidence_kind cannot be empty")]
     EmptyEvidenceKind,
     #[error("evidence digest cannot be empty")]
@@ -121,8 +247,17 @@ pub enum ProvenanceError {
         expected_digest: String,
         actual_digest: String,
     },
+    #[error("mutating action {action_ref} has no resolvable actor")]
+    UnattributedAction { action_ref: String },
+    #[error("audit log is append-only: refused {attempted_operation} for {action_ref}")]
+    AppendOnlyAuditLog {
+        action_ref: String,
+        attempted_operation: String,
+    },
     #[error("evidence serialization failed: {details}")]
     EvidenceSerializationFailed { details: String },
+    #[error("audit serialization failed: {details}")]
+    AuditSerializationFailed { details: String },
 }
 
 impl LineageLedger {
@@ -268,6 +403,171 @@ impl EvidenceStore {
     }
 }
 
+impl AuditLedger {
+    pub fn append_action(
+        &mut self,
+        actor: ActorIdentity,
+        action: AuditAction,
+    ) -> Result<AuditEntry, ProvenanceError> {
+        let ts = action.occurred_at.clone();
+        self.append_entry(actor, action, &ts, AuditOutcome::Accepted, None)
+    }
+
+    pub fn append_action_from_context(
+        &mut self,
+        context: ActionContext,
+        action: AuditAction,
+        ts: &str,
+    ) -> Result<AuditEntry, ProvenanceError> {
+        let action = normalize_audit_action(action)?;
+        match context.resolve_actor(&action.action_ref) {
+            Ok(actor) => self.append_entry(actor, action, ts, AuditOutcome::Accepted, None),
+            Err(ProvenanceError::UnattributedAction { action_ref }) => {
+                self.append_entry(
+                    ActorIdentity::system(SYSTEM_AUDIT_ACTOR_ID),
+                    action,
+                    ts,
+                    AuditOutcome::Refused,
+                    Some(AuditRefusalReason::UnattributedAction),
+                )?;
+                Err(ProvenanceError::UnattributedAction { action_ref })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn entries(&self) -> &[AuditEntry] {
+        &self.entries
+    }
+
+    pub fn verify_chain(&self) -> AuditChainVerification {
+        verify_audit_chain(&self.entries)
+    }
+
+    pub fn replace_entry(
+        &mut self,
+        _seq: u64,
+        replacement: AuditEntry,
+    ) -> Result<(), ProvenanceError> {
+        Err(ProvenanceError::AppendOnlyAuditLog {
+            action_ref: replacement.action.action_ref,
+            attempted_operation: "update".to_string(),
+        })
+    }
+
+    pub fn delete_entry(&mut self, seq: u64) -> Result<(), ProvenanceError> {
+        let action_ref = self
+            .entries
+            .iter()
+            .find(|entry| entry.seq == seq)
+            .map(|entry| entry.action.action_ref.clone())
+            .unwrap_or_else(|| format!("seq:{seq}"));
+        Err(ProvenanceError::AppendOnlyAuditLog {
+            action_ref,
+            attempted_operation: "delete".to_string(),
+        })
+    }
+
+    fn append_entry(
+        &mut self,
+        actor: ActorIdentity,
+        action: AuditAction,
+        ts: &str,
+        outcome: AuditOutcome,
+        refusal_reason: Option<AuditRefusalReason>,
+    ) -> Result<AuditEntry, ProvenanceError> {
+        let actor = normalize_actor_identity(actor)?;
+        let action = normalize_audit_action(action)?;
+        let ts = normalize_required_text(
+            ts.to_string(),
+            ProvenanceError::EmptyActionTimestamp {
+                action_ref: action.action_ref.clone(),
+            },
+        )?;
+        let seq = self.entries.len() as u64 + 1;
+        let prev_hash = self.entries.last().map(|entry| entry.entry_hash.clone());
+        let payload_hash = audit_payload_hash(&action)?;
+        let entry_hash = audit_entry_hash(
+            seq,
+            &prev_hash,
+            &payload_hash,
+            &actor,
+            &ts,
+            outcome,
+            refusal_reason,
+        )?;
+        let entry = AuditEntry {
+            seq,
+            prev_hash,
+            payload_hash,
+            entry_hash,
+            actor,
+            ts,
+            action,
+            outcome,
+            refusal_reason,
+        };
+        self.entries.push(entry.clone());
+        Ok(entry)
+    }
+}
+
+pub fn verify_audit_chain(entries: &[AuditEntry]) -> AuditChainVerification {
+    for (index, entry) in entries.iter().enumerate() {
+        let expected_seq = index as u64 + 1;
+        if entry.seq != expected_seq {
+            return audit_chain_breach(index, AuditChainBreachReason::SequenceMismatch);
+        }
+
+        let expected_prev_hash = if index == 0 {
+            None
+        } else {
+            Some(entries[index - 1].entry_hash.clone())
+        };
+        if entry.prev_hash != expected_prev_hash {
+            return audit_chain_breach(index, AuditChainBreachReason::PreviousHashMismatch);
+        }
+
+        let Ok(expected_payload_hash) = audit_payload_hash(&entry.action) else {
+            return audit_chain_breach(index, AuditChainBreachReason::PayloadHashMismatch);
+        };
+        if entry.payload_hash != expected_payload_hash {
+            return audit_chain_breach(index, AuditChainBreachReason::PayloadHashMismatch);
+        }
+
+        let Ok(expected_entry_hash) = audit_entry_hash(
+            entry.seq,
+            &entry.prev_hash,
+            &entry.payload_hash,
+            &entry.actor,
+            &entry.ts,
+            entry.outcome,
+            entry.refusal_reason,
+        ) else {
+            return audit_chain_breach(index, AuditChainBreachReason::EntryHashMismatch);
+        };
+        if entry.entry_hash != expected_entry_hash {
+            return audit_chain_breach(index, AuditChainBreachReason::EntryHashMismatch);
+        }
+    }
+
+    AuditChainVerification {
+        verified: true,
+        verified_len: entries.len(),
+        breach_index: None,
+        reason: None,
+    }
+}
+
+fn audit_chain_breach(index: usize, reason: AuditChainBreachReason) -> AuditChainVerification {
+    AuditChainVerification {
+        verified: false,
+        verified_len: index,
+        breach_index: Some(index),
+        reason: Some(reason),
+    }
+}
+
 fn normalize_lineage_record(mut record: LineageRecord) -> Result<LineageRecord, ProvenanceError> {
     record.artifact_id =
         normalize_required_text(record.artifact_id, ProvenanceError::EmptyArtifactId)?;
@@ -295,6 +595,7 @@ fn normalize_lineage_record(mut record: LineageRecord) -> Result<LineageRecord, 
             artifact_id: record.artifact_id.clone(),
         },
     )?;
+    record.actor = normalize_actor_identity(record.actor)?;
     record.created_at = normalize_required_text(
         record.created_at,
         ProvenanceError::EmptyCreatedAt {
@@ -302,6 +603,30 @@ fn normalize_lineage_record(mut record: LineageRecord) -> Result<LineageRecord, 
         },
     )?;
     Ok(record)
+}
+
+fn normalize_actor_identity(mut actor: ActorIdentity) -> Result<ActorIdentity, ProvenanceError> {
+    actor.actor_id = normalize_required_text(actor.actor_id, ProvenanceError::EmptyActorId)?;
+    Ok(actor)
+}
+
+fn normalize_audit_action(mut action: AuditAction) -> Result<AuditAction, ProvenanceError> {
+    action.action_ref =
+        normalize_required_text(action.action_ref, ProvenanceError::EmptyActionRef)?;
+    action.action_kind = normalize_required_text(
+        action.action_kind,
+        ProvenanceError::EmptyActionKind {
+            action_ref: action.action_ref.clone(),
+        },
+    )?;
+    action.artifact_ref = action.artifact_ref.and_then(normalize_optional_text_owned);
+    action.occurred_at = normalize_required_text(
+        action.occurred_at,
+        ProvenanceError::EmptyActionTimestamp {
+            action_ref: action.action_ref.clone(),
+        },
+    )?;
+    Ok(action)
 }
 
 fn normalize_evidence_object(
@@ -319,14 +644,59 @@ fn canonical_evidence_bytes(object: &EvidenceObject) -> Result<Vec<u8>, Provenan
 }
 
 fn evidence_digest_for_bytes(bytes: &[u8]) -> String {
+    digest_for_bytes(EVIDENCE_DIGEST_ALGORITHM, bytes)
+}
+
+fn audit_payload_hash(action: &AuditAction) -> Result<String, ProvenanceError> {
+    let bytes =
+        serde_json::to_vec(action).map_err(|error| ProvenanceError::AuditSerializationFailed {
+            details: error.to_string(),
+        })?;
+    Ok(digest_for_bytes(EVIDENCE_DIGEST_ALGORITHM, &bytes))
+}
+
+#[derive(Serialize)]
+struct AuditEntryHashMaterial<'a> {
+    seq: u64,
+    prev_hash: &'a Option<String>,
+    payload_hash: &'a str,
+    actor: &'a ActorIdentity,
+    ts: &'a str,
+    outcome: AuditOutcome,
+    refusal_reason: Option<AuditRefusalReason>,
+}
+
+fn audit_entry_hash(
+    seq: u64,
+    prev_hash: &Option<String>,
+    payload_hash: &str,
+    actor: &ActorIdentity,
+    ts: &str,
+    outcome: AuditOutcome,
+    refusal_reason: Option<AuditRefusalReason>,
+) -> Result<String, ProvenanceError> {
+    let material = AuditEntryHashMaterial {
+        seq,
+        prev_hash,
+        payload_hash,
+        actor,
+        ts,
+        outcome,
+        refusal_reason,
+    };
+    let bytes = serde_json::to_vec(&material).map_err(|error| {
+        ProvenanceError::AuditSerializationFailed {
+            details: error.to_string(),
+        }
+    })?;
+    Ok(digest_for_bytes(EVIDENCE_DIGEST_ALGORITHM, &bytes))
+}
+
+fn digest_for_bytes(algorithm: &str, bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
-    format!(
-        "{}:{}",
-        EVIDENCE_DIGEST_ALGORITHM,
-        lowercase_hex(digest.as_slice())
-    )
+    format!("{}:{}", algorithm, lowercase_hex(digest.as_slice()))
 }
 
 fn lowercase_hex(bytes: &[u8]) -> String {
@@ -356,11 +726,16 @@ fn normalize_optional_text(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn normalize_optional_text_owned(value: String) -> Option<String> {
+    normalize_optional_text(&value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactKind, EvidenceObject, EvidenceStore, LineageLedger, LineageRecord, ProvenanceError,
-        ProvenanceParameters,
+        verify_audit_chain, ActionContext, ActorIdentity, ActorKind, ArtifactKind, AuditAction,
+        AuditChainBreachReason, AuditLedger, AuditOutcome, AuditRefusalReason, EvidenceObject,
+        EvidenceStore, LineageLedger, LineageRecord, ProvenanceError, ProvenanceParameters,
     };
 
     #[test]
@@ -377,6 +752,7 @@ mod tests {
         assert_eq!(finding.inputs, vec!["product:ndvi:alpha-2026-06-12"]);
         assert_eq!(finding.method, "09.crop_stress_finding");
         assert_eq!(finding.operator, "operator:dsp-7");
+        assert_eq!(finding.actor, sample_actor());
         assert_eq!(finding.created_at, "2026-06-12T13:00:00Z");
     }
 
@@ -434,6 +810,136 @@ mod tests {
                 "zone": "NE"
             })
         );
+    }
+
+    #[test]
+    fn lineage_requires_formal_actor_identity() {
+        let mut ledger = LineageLedger::default();
+        seed_product(&mut ledger);
+        let mut finding = finding_lineage();
+        finding.actor.actor_id = " ".to_string();
+
+        let error = ledger
+            .record_lineage(finding)
+            .expect_err("lineage without actor identity should be rejected");
+
+        assert_eq!(error, ProvenanceError::EmptyActorId);
+        assert!(ledger.fetch_lineage("finding:09:stress-ne-zone").is_none());
+    }
+
+    #[test]
+    fn actor_context_appends_action_and_audits_missing_actor_refusal() {
+        let mut audit = AuditLedger::default();
+
+        let accepted = audit
+            .append_action_from_context(
+                ActionContext::new(
+                    Some("operator:dsp-7".to_string()),
+                    Some(ActorKind::Operator),
+                ),
+                sample_audit_action("action:field-boundary:update"),
+                "2026-06-12T13:05:00Z",
+            )
+            .expect("authenticated actor should append audit entry");
+
+        assert_eq!(accepted.actor, sample_actor());
+        assert_eq!(accepted.outcome, AuditOutcome::Accepted);
+
+        let error = audit
+            .append_action_from_context(
+                ActionContext::new(None, None),
+                sample_audit_action("action:unattributed:update"),
+                "2026-06-12T13:06:00Z",
+            )
+            .expect_err("missing actor should refuse action");
+
+        assert_eq!(
+            error,
+            ProvenanceError::UnattributedAction {
+                action_ref: "action:unattributed:update".to_string()
+            }
+        );
+        let entries = audit.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].outcome, AuditOutcome::Refused);
+        assert_eq!(
+            entries[1].refusal_reason,
+            Some(AuditRefusalReason::UnattributedAction)
+        );
+        assert_eq!(
+            entries[1].actor,
+            ActorIdentity::system("system:provenance-ledger")
+        );
+    }
+
+    #[test]
+    fn audit_log_is_append_only_and_hash_chained() {
+        let mut audit = AuditLedger::default();
+        let first = audit
+            .append_action(sample_actor(), sample_audit_action("action:mission:create"))
+            .expect("first action should append");
+        let second = audit
+            .append_action(
+                sample_actor(),
+                sample_audit_action("action:mission:approve"),
+            )
+            .expect("second action should append");
+
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.prev_hash, None);
+        assert_eq!(second.seq, 2);
+        assert_eq!(second.prev_hash, Some(first.entry_hash.clone()));
+        assert!(first.payload_hash.starts_with("sha256:"));
+        assert!(second.entry_hash.starts_with("sha256:"));
+
+        let verification = audit.verify_chain();
+        assert!(verification.verified);
+        assert_eq!(verification.verified_len, 2);
+        assert_eq!(verification.breach_index, None);
+
+        let error = audit
+            .replace_entry(first.seq, first)
+            .expect_err("audit entries should not be updateable");
+        assert_eq!(
+            error,
+            ProvenanceError::AppendOnlyAuditLog {
+                action_ref: "action:mission:create".to_string(),
+                attempted_operation: "update".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn audit_chain_verification_detects_edited_or_reordered_entries() {
+        let mut audit = AuditLedger::default();
+        audit
+            .append_action(sample_actor(), sample_audit_action("action:mission:create"))
+            .expect("first action should append");
+        audit
+            .append_action(
+                sample_actor(),
+                sample_audit_action("action:mission:approve"),
+            )
+            .expect("second action should append");
+
+        let mut edited = audit.entries().to_vec();
+        edited[1].action.payload = ProvenanceParameters::from_json(serde_json::json!({
+            "field_id": "field:alpha",
+            "approved": false
+        }));
+        let edited_verification = verify_audit_chain(&edited);
+        assert!(!edited_verification.verified);
+        assert_eq!(edited_verification.breach_index, Some(1));
+        assert_eq!(
+            edited_verification.reason,
+            Some(AuditChainBreachReason::PayloadHashMismatch)
+        );
+
+        let mut reordered = audit.entries().to_vec();
+        reordered.swap(0, 1);
+        let reordered_verification = verify_audit_chain(&reordered);
+        assert!(!reordered_verification.verified);
+        assert_eq!(reordered_verification.breach_index, Some(0));
     }
 
     #[test]
@@ -581,6 +1087,7 @@ mod tests {
                 "platform": "agrodrone-7"
             })),
             operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
             created_at: "2026-06-12T11:45:00Z".to_string(),
         }
     }
@@ -596,6 +1103,7 @@ mod tests {
                 "sensor_set": "multispectral-rig-2"
             })),
             operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
             created_at: "2026-06-12T12:00:00Z".to_string(),
         }
     }
@@ -618,6 +1126,7 @@ mod tests {
                 "nir_band": "B08"
             })),
             operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
             created_at: "2026-06-12T12:30:00Z".to_string(),
         }
     }
@@ -634,7 +1143,28 @@ mod tests {
                 "zone": "NE"
             })),
             operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
             created_at: "2026-06-12T13:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_actor() -> ActorIdentity {
+        ActorIdentity {
+            actor_id: "operator:dsp-7".to_string(),
+            actor_kind: ActorKind::Operator,
+        }
+    }
+
+    fn sample_audit_action(action_ref: &str) -> AuditAction {
+        AuditAction {
+            action_ref: action_ref.to_string(),
+            action_kind: "mission_mutation".to_string(),
+            artifact_ref: Some("mission:alpha-17".to_string()),
+            payload: ProvenanceParameters::from_json(serde_json::json!({
+                "field_id": "field:alpha",
+                "approved": true
+            })),
+            occurred_at: "2026-06-12T13:05:00Z".to_string(),
         }
     }
 
