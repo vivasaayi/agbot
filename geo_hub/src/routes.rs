@@ -14,6 +14,11 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     Json,
 };
+use crop_intelligence::{
+    build_model_version_record, validate_model_reference, CropModelRegistryError, CropModelTask,
+    InferenceModelReference, ModelGateResponse, ModelVersionRecord,
+    ModelVersionRegistrationRequest,
+};
 use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
 };
@@ -301,6 +306,11 @@ pub struct OrthomosaicFrameSetListQuery {
 pub struct UpdateReconstructionStatusRequest {
     pub status: ReconstructionStatus,
     pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CropModelListQuery {
+    pub task: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1668,6 +1678,100 @@ pub async fn update_orthomosaic_reconstruction_status(
     .map_err(Error::from)?;
 
     Ok(Json(updated))
+}
+
+pub async fn register_crop_model(
+    State(state): State<AppState>,
+    Json(request): Json<ModelVersionRegistrationRequest>,
+) -> AppResult<Json<ModelVersionRecord>> {
+    let record = build_model_version_record(request, current_record_timestamp())
+        .map_err(crop_model_registry_error)?;
+    let metrics_json =
+        serde_json::to_string(&record.metrics).map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO crop_models
+            (model_id, version, task, training_set_ref, metrics_json, provenance_ref, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&record.model_id)
+    .bind(&record.version)
+    .bind(record.task.as_str())
+    .bind(&record.training_set_ref)
+    .bind(metrics_json)
+    .bind(&record.provenance_ref)
+    .bind(&record.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_crop_models(
+    Query(query): Query<CropModelListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ModelVersionRecord>>> {
+    let task = normalize_optional_text(query.task);
+    let rows = if let Some(task) = task {
+        let task = parse_crop_model_task(task)?;
+        sqlx::query(
+            r#"
+            SELECT model_id, version, task, training_set_ref, metrics_json, provenance_ref, created_at
+            FROM crop_models
+            WHERE task = ?1
+            ORDER BY created_at DESC, model_id ASC, version ASC
+            "#,
+        )
+        .bind(task.as_str())
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT model_id, version, task, training_set_ref, metrics_json, provenance_ref, created_at
+            FROM crop_models
+            ORDER BY created_at DESC, model_id ASC, version ASC
+            "#,
+        )
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?
+    };
+
+    rows.into_iter()
+        .map(|row| decode_crop_model_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn validate_crop_model_for_inference(
+    State(state): State<AppState>,
+    Json(reference): Json<InferenceModelReference>,
+) -> AppResult<Json<ModelGateResponse>> {
+    let model_id = reference.model_id.trim().to_string();
+    let version = reference.version.trim().to_string();
+    let registered = crop_model_exists(&state, &model_id, &version).await?;
+    match validate_model_reference(reference, registered) {
+        Ok(response) => Ok(Json(response)),
+        Err(CropModelRegistryError::UnregisteredModel { model_id, version }) => {
+            audit_crop_model_event(
+                &state,
+                &model_id,
+                &version,
+                "unregistered_model_rejected",
+                Some("inference request rejected because model version is not registered"),
+            )
+            .await?;
+            Err(AppError::BadRequest(format!(
+                "unregistered model {model_id}@{version}"
+            )))
+        }
+        Err(error) => Err(crop_model_registry_error(error)),
+    }
 }
 
 pub async fn list_farms(State(state): State<AppState>) -> AppResult<Json<Vec<FarmRecord>>> {
@@ -3800,6 +3904,16 @@ fn parse_reconstruction_status(value: String) -> AppResult<ReconstructionStatus>
     })
 }
 
+fn crop_model_registry_error(error: CropModelRegistryError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn parse_crop_model_task(value: String) -> AppResult<CropModelTask> {
+    value
+        .parse::<CropModelTask>()
+        .map_err(crop_model_registry_error)
+}
+
 fn normalize_farm_name(name: String) -> AppResult<String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -4515,6 +4629,23 @@ fn decode_orthomosaic_reconstruction_record(
     })
 }
 
+fn decode_crop_model_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ModelVersionRecord> {
+    let metrics_json: String = row.get("metrics_json");
+    let metrics = serde_json::from_str::<serde_json::Value>(&metrics_json).map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode crop model metrics_json"))
+    })?;
+
+    Ok(ModelVersionRecord {
+        model_id: row.get("model_id"),
+        version: row.get("version"),
+        task: parse_crop_model_task(row.get::<String, _>("task"))?,
+        training_set_ref: row.get("training_set_ref"),
+        metrics,
+        provenance_ref: row.get("provenance_ref"),
+        created_at: row.get("created_at"),
+    })
+}
+
 fn decode_annotation_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<AnnotationRecord> {
     let geometry_json: String = row.get("geometry_json");
     let geometry = serde_json::from_str::<AnnotationGeometry>(&geometry_json).map_err(|err| {
@@ -4750,6 +4881,43 @@ async fn load_orthomosaic_reconstruction(
 
     row.map(|row| decode_orthomosaic_reconstruction_record(&row))
         .transpose()
+}
+
+async fn crop_model_exists(state: &AppState, model_id: &str, version: &str) -> AppResult<bool> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM crop_models WHERE model_id = ?1 AND version = ?2")
+            .bind(model_id)
+            .bind(version)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(Error::from)?;
+
+    Ok(count > 0)
+}
+
+async fn audit_crop_model_event(
+    state: &AppState,
+    model_id: &str,
+    version: &str,
+    event_type: &str,
+    details: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO crop_model_events (model_id, version, event_type, created_at, details)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(model_id)
+    .bind(version)
+    .bind(event_type)
+    .bind(current_record_timestamp())
+    .bind(details)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
 }
 
 async fn field_owner_for_farm(

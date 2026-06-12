@@ -69,6 +69,14 @@ pub fn build_router(state: AppState) -> Router {
             put(routes::update_orthomosaic_reconstruction_status),
         )
         .route(
+            "/api/crop-intelligence/models",
+            get(routes::list_crop_models).post(routes::register_crop_model),
+        )
+        .route(
+            "/api/crop-intelligence/inference-requests/validate",
+            post(routes::validate_crop_model_for_inference),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

@@ -1820,6 +1820,127 @@ async fn orthomosaic_reconstruction_rejects_unknown_frame_set() -> Result<()> {
 }
 
 #[tokio::test]
+async fn crop_intelligence_model_registry_registers_and_lists_versions() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let register_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/models")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model_id": "lesion-detector",
+                        "version": "2026.06.1",
+                        "task": "disease_detection",
+                        "training_set_ref": "dataset:lesion-v3",
+                        "metrics": {
+                            "precision": 0.91,
+                            "recall": 0.87,
+                            "iou": 0.73
+                        },
+                        "provenance_ref": "provenance:model/lesion-detector/2026.06.1"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(register_response.status(), StatusCode::OK);
+    let body = to_bytes(register_response.into_body(), 64 * 1024).await?;
+    let registered: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        registered.get("model_id").and_then(|value| value.as_str()),
+        Some("lesion-detector")
+    );
+    assert_eq!(
+        registered.get("version").and_then(|value| value.as_str()),
+        Some("2026.06.1")
+    );
+    assert_eq!(
+        registered.get("task").and_then(|value| value.as_str()),
+        Some("disease_detection")
+    );
+    assert_eq!(
+        registered
+            .pointer("/metrics/precision")
+            .and_then(|value| value.as_f64()),
+        Some(0.91)
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/crop-intelligence/models?task=disease_detection")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].get("version").and_then(|value| value.as_str()),
+        Some("2026.06.1")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn crop_intelligence_unregistered_model_inference_is_rejected_and_audited() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/inference-requests/validate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model_id": "unknown-model",
+                        "version": "v0"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("unregistered model unknown-model@v0"));
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crop_model_events WHERE model_id = ?1 AND version = ?2 AND event_type = ?3",
+    )
+    .bind("unknown-model")
+    .bind("v0")
+    .bind("unregistered_model_rejected")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_field_rejects_orphan_farm_reference() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

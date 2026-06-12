@@ -416,6 +416,38 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS crop_models (
+            model_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            task TEXT NOT NULL,
+            training_set_ref TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            provenance_ref TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (model_id, version)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS crop_model_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            details TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_scenes_field_id ON scenes(field_id);
         "#,
     )
@@ -518,6 +550,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_orthomosaic_reconstructions_frame_set_id
         ON orthomosaic_reconstructions(frame_set_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_crop_models_task
+        ON crop_models(task);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_crop_model_events_model_version
+        ON crop_model_events(model_id, version);
         "#,
     )
     .execute(pool)

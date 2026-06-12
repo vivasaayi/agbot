@@ -9,6 +9,7 @@ members = [
     "post_processor",
     "shared",
     "orthomosaic",
+    "crop_intelligence",
     "lidar_mapper",
     "imagery_processor",
     "geo_hub",
