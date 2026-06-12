@@ -685,6 +685,45 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS crop_detection_verifications (
+            detection_id TEXT PRIMARY KEY,
+            task TEXT NOT NULL,
+            label TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            evidence_tile_refs_json TEXT NOT NULL,
+            zone_geometry_json TEXT NOT NULL,
+            verification_state TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            verified_at TEXT NOT NULL,
+            corrected_label TEXT,
+            corrected_geometry_json TEXT,
+            correction_label_json TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS crop_detection_correction_labels (
+            label_id TEXT PRIMARY KEY,
+            source_detection_id TEXT NOT NULL,
+            task TEXT NOT NULL,
+            label TEXT NOT NULL,
+            geometry_json TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            evidence_tile_refs_json TEXT NOT NULL,
+            FOREIGN KEY(source_detection_id) REFERENCES crop_detection_verifications(detection_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS alert_fired_alerts (
             alert_id TEXT PRIMARY KEY,
             matched_rule_id TEXT NOT NULL,
@@ -965,6 +1004,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_crop_model_events_model_version
         ON crop_model_events(model_id, version);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_crop_detection_verifications_state
+        ON crop_detection_verifications(verification_state);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_crop_detection_correction_labels_source
+        ON crop_detection_correction_labels(source_detection_id);
         "#,
     )
     .execute(pool)

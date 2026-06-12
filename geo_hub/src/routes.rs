@@ -27,9 +27,13 @@ use compliance::{
     CreateComplianceRecordRequest,
 };
 use crop_intelligence::{
-    build_model_version_record, validate_model_reference, CropModelRegistryError, CropModelTask,
-    InferenceModelReference, ModelGateResponse, ModelVersionRecord,
-    ModelVersionRegistrationRequest,
+    apply_detection_verification, build_model_version_record, validate_detection_finding_promotion,
+    validate_model_reference, CropDetectionCorrectionLabel, CropDetectionVerificationAction,
+    CropDetectionVerificationError, CropDetectionVerificationRecord,
+    CropDetectionVerificationRequest, CropModelRegistryError, CropModelTask,
+    DetectionVerificationState, DetectionZoneGeometry, FindingPromotionDecision,
+    FindingPromotionError, FindingPromotionRequest, InferenceModelReference, ModelGateResponse,
+    ModelVersionRecord, ModelVersionRegistrationRequest,
 };
 use fleet_health::{
     accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
@@ -409,6 +413,29 @@ pub struct UpdateReconstructionStatusRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CropModelListQuery {
     pub task: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifyCropDetectionRequest {
+    pub task: CropModelTask,
+    pub label: String,
+    pub confidence: f64,
+    #[serde(default)]
+    pub evidence_tile_refs: Vec<String>,
+    pub zone_geometry: DetectionZoneGeometry,
+    pub action: CropDetectionVerificationAction,
+    pub actor: String,
+    pub verified_at: String,
+    #[serde(default)]
+    pub corrected_label: Option<String>,
+    #[serde(default)]
+    pub corrected_geometry: Option<DetectionZoneGeometry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CropFindingPromotionValidationRequest {
+    #[serde(default)]
+    pub allow_unverified: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2591,6 +2618,49 @@ pub async fn validate_crop_model_for_inference(
         }
         Err(error) => Err(crop_model_registry_error(error)),
     }
+}
+
+pub async fn verify_crop_detection(
+    Path(detection_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<VerifyCropDetectionRequest>,
+) -> AppResult<Json<CropDetectionVerificationRecord>> {
+    let record = apply_detection_verification(CropDetectionVerificationRequest {
+        detection_id,
+        task: request.task,
+        label: request.label,
+        confidence: request.confidence,
+        evidence_tile_refs: request.evidence_tile_refs,
+        zone_geometry: request.zone_geometry,
+        action: request.action,
+        actor: request.actor,
+        verified_at: request.verified_at,
+        corrected_label: request.corrected_label,
+        corrected_geometry: request.corrected_geometry,
+    })
+    .map_err(crop_detection_verification_error)?;
+
+    persist_crop_detection_verification(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn validate_crop_detection_finding_promotion(
+    Path(detection_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CropFindingPromotionValidationRequest>,
+) -> AppResult<Json<FindingPromotionDecision>> {
+    let verification_state = load_crop_detection_verification_state(&state, &detection_id)
+        .await?
+        .unwrap_or_default();
+    let decision = validate_detection_finding_promotion(FindingPromotionRequest {
+        detection_id,
+        verification_state,
+        allow_unverified: request.allow_unverified,
+    })
+    .map_err(finding_promotion_error)?;
+
+    Ok(Json(decision))
 }
 
 pub async fn create_compliance_record(
@@ -5116,10 +5186,24 @@ fn crop_model_registry_error(error: CropModelRegistryError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn crop_detection_verification_error(error: CropDetectionVerificationError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn finding_promotion_error(error: FindingPromotionError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_crop_model_task(value: String) -> AppResult<CropModelTask> {
     value
         .parse::<CropModelTask>()
         .map_err(crop_model_registry_error)
+}
+
+fn parse_detection_verification_state(value: String) -> AppResult<DetectionVerificationState> {
+    value
+        .parse::<DetectionVerificationState>()
+        .map_err(crop_detection_verification_error)
 }
 
 fn compliance_record_error(error: ComplianceRecordError) -> AppError {
@@ -7003,6 +7087,129 @@ async fn audit_crop_model_event(
     .map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn persist_crop_detection_verification(
+    state: &AppState,
+    record: &CropDetectionVerificationRecord,
+) -> AppResult<()> {
+    let evidence_tile_refs_json = serde_json::to_string(&record.evidence_tile_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let zone_geometry_json =
+        serde_json::to_string(&record.zone_geometry).map_err(|err| AppError::Anyhow(err.into()))?;
+    let corrected_geometry_json = record
+        .corrected_geometry
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let correction_label_json = record
+        .correction_label
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        INSERT INTO crop_detection_verifications (
+            detection_id, task, label, confidence, evidence_tile_refs_json,
+            zone_geometry_json, verification_state, actor, verified_at,
+            corrected_label, corrected_geometry_json, correction_label_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(detection_id) DO UPDATE SET
+            task = excluded.task,
+            label = excluded.label,
+            confidence = excluded.confidence,
+            evidence_tile_refs_json = excluded.evidence_tile_refs_json,
+            zone_geometry_json = excluded.zone_geometry_json,
+            verification_state = excluded.verification_state,
+            actor = excluded.actor,
+            verified_at = excluded.verified_at,
+            corrected_label = excluded.corrected_label,
+            corrected_geometry_json = excluded.corrected_geometry_json,
+            correction_label_json = excluded.correction_label_json
+        "#,
+    )
+    .bind(&record.detection_id)
+    .bind(record.task.as_str())
+    .bind(&record.label)
+    .bind(record.confidence)
+    .bind(&evidence_tile_refs_json)
+    .bind(&zone_geometry_json)
+    .bind(record.verification_state.as_str())
+    .bind(&record.actor)
+    .bind(&record.verified_at)
+    .bind(&record.corrected_label)
+    .bind(&corrected_geometry_json)
+    .bind(&correction_label_json)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query("DELETE FROM crop_detection_correction_labels WHERE source_detection_id = ?1")
+        .bind(&record.detection_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    if let Some(label) = record.correction_label.as_ref() {
+        persist_crop_detection_correction_label(&mut tx, label).await?;
+    }
+
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn persist_crop_detection_correction_label(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    label: &CropDetectionCorrectionLabel,
+) -> AppResult<()> {
+    let geometry_json =
+        serde_json::to_string(&label.geometry).map_err(|err| AppError::Anyhow(err.into()))?;
+    let evidence_tile_refs_json = serde_json::to_string(&label.evidence_tile_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO crop_detection_correction_labels (
+            label_id, source_detection_id, task, label, geometry_json,
+            actor, created_at, evidence_tile_refs_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&label.label_id)
+    .bind(&label.source_detection_id)
+    .bind(label.task.as_str())
+    .bind(&label.label)
+    .bind(geometry_json)
+    .bind(&label.actor)
+    .bind(&label.created_at)
+    .bind(evidence_tile_refs_json)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_crop_detection_verification_state(
+    state: &AppState,
+    detection_id: &str,
+) -> AppResult<Option<DetectionVerificationState>> {
+    let state_value = sqlx::query_scalar::<_, String>(
+        "SELECT verification_state FROM crop_detection_verifications WHERE detection_id = ?1",
+    )
+    .bind(detection_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    state_value
+        .map(parse_detection_verification_state)
+        .transpose()
 }
 
 async fn assert_field_owned_by_org(

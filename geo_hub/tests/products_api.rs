@@ -3314,6 +3314,173 @@ async fn crop_intelligence_unregistered_model_inference_is_rejected_and_audited(
 }
 
 #[tokio::test]
+async fn crop_intelligence_verifies_and_corrects_detections_with_label_feedback() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/detections/disease:tile-1:1/verification")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "task": "disease_detection",
+                        "label": "northern_leaf_blight",
+                        "confidence": 0.82,
+                        "evidence_tile_refs": ["tile-1"],
+                        "zone_geometry": {
+                            "crs": "EPSG:32614",
+                            "bbox": {
+                                "min_lon": 5.0,
+                                "min_lat": 5.0,
+                                "max_lon": 15.0,
+                                "max_lat": 15.0
+                            }
+                        },
+                        "action": "corrected",
+                        "actor": "agronomist-7",
+                        "verified_at": "2026-06-12T14:00:00Z",
+                        "corrected_label": "nitrogen_stress",
+                        "corrected_geometry": {
+                            "crs": "EPSG:32614",
+                            "bbox": {
+                                "min_lon": 6.0,
+                                "min_lat": 6.0,
+                                "max_lon": 16.0,
+                                "max_lat": 16.0
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let verification: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        verification
+            .get("verification_state")
+            .and_then(|value| value.as_str()),
+        Some("corrected")
+    );
+    assert_eq!(
+        verification.get("actor").and_then(|value| value.as_str()),
+        Some("agronomist-7")
+    );
+    assert_eq!(
+        verification
+            .get("corrected_label")
+            .and_then(|value| value.as_str()),
+        Some("nitrogen_stress")
+    );
+    assert_eq!(
+        verification
+            .pointer("/correction_label/label")
+            .and_then(|value| value.as_str()),
+        Some("nitrogen_stress")
+    );
+
+    let state: String = sqlx::query_scalar(
+        "SELECT verification_state FROM crop_detection_verifications WHERE detection_id = ?1",
+    )
+    .bind("disease:tile-1:1")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(state, "corrected");
+
+    let label_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crop_detection_correction_labels WHERE source_detection_id = ?1 AND label = ?2",
+    )
+    .bind("disease:tile-1:1")
+    .bind("nitrogen_stress")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(label_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn crop_intelligence_blocks_unverified_detection_finding_promotion_by_default() -> Result<()>
+{
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let blocked = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/detections/weed:tile-1:1/finding-promotion/validate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "allow_unverified": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(blocked.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("unverified detection weed:tile-1:1 cannot be promoted"));
+
+    let allowed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/detections/weed:tile-1:1/finding-promotion/validate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "allow_unverified": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let body = to_bytes(allowed.into_body(), 64 * 1024).await?;
+    let decision: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        decision
+            .get("verification_state")
+            .and_then(|value| value.as_str()),
+        Some("unverified")
+    );
+    assert_eq!(
+        decision
+            .get("promotion_allowed")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        decision.get("reason").and_then(|value| value.as_str()),
+        Some("unverified_override")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn compliance_records_create_list_append_versions_and_refuse_delete() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

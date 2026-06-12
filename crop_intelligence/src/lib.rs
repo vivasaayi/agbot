@@ -297,6 +297,132 @@ pub struct WeedMapReport {
     pub zones: Vec<WeedMapZone>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionVerificationState {
+    Unverified,
+    Confirmed,
+    Rejected,
+    Corrected,
+}
+
+impl DetectionVerificationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DetectionVerificationState::Unverified => "unverified",
+            DetectionVerificationState::Confirmed => "confirmed",
+            DetectionVerificationState::Rejected => "rejected",
+            DetectionVerificationState::Corrected => "corrected",
+        }
+    }
+}
+
+impl Default for DetectionVerificationState {
+    fn default() -> Self {
+        Self::Unverified
+    }
+}
+
+impl std::str::FromStr for DetectionVerificationState {
+    type Err = CropDetectionVerificationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "unverified" => Ok(DetectionVerificationState::Unverified),
+            "confirmed" => Ok(DetectionVerificationState::Confirmed),
+            "rejected" => Ok(DetectionVerificationState::Rejected),
+            "corrected" => Ok(DetectionVerificationState::Corrected),
+            _ => Err(CropDetectionVerificationError::InvalidVerificationState {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CropDetectionVerificationAction {
+    Confirmed,
+    Rejected,
+    Corrected,
+}
+
+impl CropDetectionVerificationAction {
+    fn verification_state(self) -> DetectionVerificationState {
+        match self {
+            CropDetectionVerificationAction::Confirmed => DetectionVerificationState::Confirmed,
+            CropDetectionVerificationAction::Rejected => DetectionVerificationState::Rejected,
+            CropDetectionVerificationAction::Corrected => DetectionVerificationState::Corrected,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropDetectionVerificationRequest {
+    pub detection_id: String,
+    pub task: CropModelTask,
+    pub label: String,
+    pub confidence: f64,
+    #[serde(default)]
+    pub evidence_tile_refs: Vec<String>,
+    pub zone_geometry: DetectionZoneGeometry,
+    pub action: CropDetectionVerificationAction,
+    pub actor: String,
+    pub verified_at: String,
+    #[serde(default)]
+    pub corrected_label: Option<String>,
+    #[serde(default)]
+    pub corrected_geometry: Option<DetectionZoneGeometry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropDetectionCorrectionLabel {
+    pub label_id: String,
+    pub source_detection_id: String,
+    pub task: CropModelTask,
+    pub label: String,
+    pub geometry: DetectionZoneGeometry,
+    pub actor: String,
+    pub created_at: String,
+    pub evidence_tile_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropDetectionVerificationRecord {
+    pub detection_id: String,
+    pub task: CropModelTask,
+    pub label: String,
+    pub confidence: f64,
+    pub evidence_tile_refs: Vec<String>,
+    pub zone_geometry: DetectionZoneGeometry,
+    pub verification_state: DetectionVerificationState,
+    pub actor: String,
+    pub verified_at: String,
+    #[serde(default)]
+    pub corrected_label: Option<String>,
+    #[serde(default)]
+    pub corrected_geometry: Option<DetectionZoneGeometry>,
+    #[serde(default)]
+    pub correction_label: Option<CropDetectionCorrectionLabel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingPromotionRequest {
+    pub detection_id: String,
+    pub verification_state: DetectionVerificationState,
+    #[serde(default)]
+    pub allow_unverified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingPromotionDecision {
+    pub detection_id: String,
+    pub verification_state: DetectionVerificationState,
+    pub promotion_allowed: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CropModelRegistryError {
     #[error("model_id cannot be empty")]
@@ -421,6 +547,50 @@ pub enum WeedMappingError {
     CoverFieldMismatch { expected: String, actual: String },
     #[error("candidate on tile {tile_id} falls outside the deterministic cover tile extent")]
     ZoneOutsideTileExtent { tile_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CropDetectionVerificationError {
+    #[error("detection_id cannot be empty")]
+    EmptyDetectionId,
+    #[error("detection label cannot be empty")]
+    EmptyLabel,
+    #[error("detection confidence must be finite and between 0 and 1")]
+    InvalidConfidence,
+    #[error("detection evidence_tile_refs cannot be empty")]
+    EmptyEvidence,
+    #[error("detection evidence_tile_refs cannot contain empty values")]
+    EmptyEvidenceRef,
+    #[error("detection geometry CRS cannot be empty")]
+    EmptyGeometryCrs,
+    #[error("detection geometry bbox is invalid")]
+    InvalidGeometry,
+    #[error("verification actor cannot be empty")]
+    EmptyActor,
+    #[error("verification timestamp cannot be empty")]
+    EmptyVerifiedAt,
+    #[error("corrected label cannot be empty")]
+    EmptyCorrectedLabel,
+    #[error("corrected geometry CRS cannot be empty")]
+    EmptyCorrectedGeometryCrs,
+    #[error("corrected geometry bbox is invalid")]
+    InvalidCorrectedGeometry,
+    #[error("corrected verification requires a corrected label or geometry")]
+    MissingCorrection,
+    #[error("verification state {value} is invalid")]
+    InvalidVerificationState { value: String },
+    #[error("task {task:?} is not a pest, disease, or weed detection task")]
+    UnsupportedDetectionTask { task: CropModelTask },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FindingPromotionError {
+    #[error("detection_id cannot be empty")]
+    EmptyDetectionId,
+    #[error("unverified detection {detection_id} cannot be promoted without explicit override")]
+    UnverifiedDetectionBlocked { detection_id: String },
+    #[error("rejected detection {detection_id} cannot be promoted to a finding")]
+    RejectedDetectionBlocked { detection_id: String },
 }
 
 pub fn build_model_version_record(
@@ -783,6 +953,122 @@ pub fn run_weed_mapping(
     })
 }
 
+pub fn apply_detection_verification(
+    request: CropDetectionVerificationRequest,
+) -> Result<CropDetectionVerificationRecord, CropDetectionVerificationError> {
+    validate_detection_task(request.task)?;
+    let detection_id = normalize_detection_text(
+        request.detection_id,
+        CropDetectionVerificationError::EmptyDetectionId,
+    )?;
+    let label =
+        normalize_detection_text(request.label, CropDetectionVerificationError::EmptyLabel)?;
+    if !is_unit_fraction(request.confidence) {
+        return Err(CropDetectionVerificationError::InvalidConfidence);
+    }
+    let evidence_tile_refs = normalize_evidence_refs(request.evidence_tile_refs)?;
+    validate_detection_geometry(
+        &request.zone_geometry,
+        CropDetectionVerificationError::EmptyGeometryCrs,
+        CropDetectionVerificationError::InvalidGeometry,
+    )?;
+    let actor =
+        normalize_detection_text(request.actor, CropDetectionVerificationError::EmptyActor)?;
+    let verified_at = normalize_detection_text(
+        request.verified_at,
+        CropDetectionVerificationError::EmptyVerifiedAt,
+    )?;
+    let corrected_label = match request.corrected_label {
+        Some(value) => Some(normalize_detection_text(
+            value,
+            CropDetectionVerificationError::EmptyCorrectedLabel,
+        )?),
+        None => None,
+    };
+    let corrected_geometry = match request.corrected_geometry {
+        Some(geometry) => {
+            validate_detection_geometry(
+                &geometry,
+                CropDetectionVerificationError::EmptyCorrectedGeometryCrs,
+                CropDetectionVerificationError::InvalidCorrectedGeometry,
+            )?;
+            Some(geometry)
+        }
+        None => None,
+    };
+
+    let verification_state = request.action.verification_state();
+    let correction_label = if verification_state == DetectionVerificationState::Corrected {
+        if corrected_label.is_none() && corrected_geometry.is_none() {
+            return Err(CropDetectionVerificationError::MissingCorrection);
+        }
+        let feedback_label = corrected_label.clone().unwrap_or_else(|| label.clone());
+        let feedback_geometry = corrected_geometry
+            .clone()
+            .unwrap_or_else(|| request.zone_geometry.clone());
+        Some(CropDetectionCorrectionLabel {
+            label_id: format!("label:correction:{detection_id}"),
+            source_detection_id: detection_id.clone(),
+            task: request.task,
+            label: feedback_label,
+            geometry: feedback_geometry,
+            actor: actor.clone(),
+            created_at: verified_at.clone(),
+            evidence_tile_refs: evidence_tile_refs.clone(),
+        })
+    } else {
+        None
+    };
+
+    Ok(CropDetectionVerificationRecord {
+        detection_id,
+        task: request.task,
+        label,
+        confidence: request.confidence,
+        evidence_tile_refs,
+        zone_geometry: request.zone_geometry,
+        verification_state,
+        actor,
+        verified_at,
+        corrected_label,
+        corrected_geometry,
+        correction_label,
+    })
+}
+
+pub fn validate_detection_finding_promotion(
+    request: FindingPromotionRequest,
+) -> Result<FindingPromotionDecision, FindingPromotionError> {
+    let detection_id = normalize_promotion_text(
+        request.detection_id,
+        FindingPromotionError::EmptyDetectionId,
+    )?;
+    match request.verification_state {
+        DetectionVerificationState::Confirmed | DetectionVerificationState::Corrected => {
+            Ok(FindingPromotionDecision {
+                detection_id,
+                verification_state: request.verification_state,
+                promotion_allowed: true,
+                reason: None,
+            })
+        }
+        DetectionVerificationState::Rejected => {
+            Err(FindingPromotionError::RejectedDetectionBlocked { detection_id })
+        }
+        DetectionVerificationState::Unverified if request.allow_unverified => {
+            Ok(FindingPromotionDecision {
+                detection_id,
+                verification_state: DetectionVerificationState::Unverified,
+                promotion_allowed: true,
+                reason: Some("unverified_override".to_string()),
+            })
+        }
+        DetectionVerificationState::Unverified => {
+            Err(FindingPromotionError::UnverifiedDetectionBlocked { detection_id })
+        }
+    }
+}
+
 fn normalize_required_text(
     value: String,
     error: CropModelRegistryError,
@@ -1114,6 +1400,73 @@ fn normalize_weed_text(value: String, error: WeedMappingError) -> Result<String,
     }
 }
 
+fn validate_detection_task(task: CropModelTask) -> Result<(), CropDetectionVerificationError> {
+    match task {
+        CropModelTask::DiseaseDetection
+        | CropModelTask::PestDetection
+        | CropModelTask::WeedMapping => Ok(()),
+        _ => Err(CropDetectionVerificationError::UnsupportedDetectionTask { task }),
+    }
+}
+
+fn normalize_detection_text(
+    value: String,
+    error: CropDetectionVerificationError,
+) -> Result<String, CropDetectionVerificationError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_evidence_refs(
+    values: Vec<String>,
+) -> Result<Vec<String>, CropDetectionVerificationError> {
+    let mut refs = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(CropDetectionVerificationError::EmptyEvidenceRef);
+        }
+        refs.push(trimmed.to_string());
+    }
+    refs.sort();
+    refs.dedup();
+    if refs.is_empty() {
+        Err(CropDetectionVerificationError::EmptyEvidence)
+    } else {
+        Ok(refs)
+    }
+}
+
+fn validate_detection_geometry(
+    geometry: &DetectionZoneGeometry,
+    empty_crs: CropDetectionVerificationError,
+    invalid_geometry: CropDetectionVerificationError,
+) -> Result<(), CropDetectionVerificationError> {
+    if geometry.crs.trim().is_empty() {
+        return Err(empty_crs);
+    }
+    if !valid_bbox(&geometry.bbox) {
+        return Err(invalid_geometry);
+    }
+    Ok(())
+}
+
+fn normalize_promotion_text(
+    value: String,
+    error: FindingPromotionError,
+) -> Result<String, FindingPromotionError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn bbox_area_m2(bbox: &GeoBounds) -> f64 {
     (bbox.max_lon - bbox.min_lon) * (bbox.max_lat - bbox.min_lat)
 }
@@ -1129,12 +1482,16 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_model_version_record, run_canopy_cover, run_disease_lesion_detection,
-        run_stand_count, run_weed_mapping, validate_model_reference, CanopyCoverConfig,
-        CanopyCoverError, CanopyCoverTile, CropModelRegistryError, CropModelTask,
-        DiseaseDetectionConfig, DiseaseDetectionError, DiseaseLesionCandidate,
-        InferenceModelReference, ModelVersionRegistrationRequest, PlantCountConfig, PlantCountTile,
-        PlantCountZeroReason, WeedMappingConfig, WeedMappingError, WeedZoneCandidate,
+        apply_detection_verification, build_model_version_record, run_canopy_cover,
+        run_disease_lesion_detection, run_stand_count, run_weed_mapping,
+        validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
+        CanopyCoverError, CanopyCoverTile, CropDetectionVerificationAction,
+        CropDetectionVerificationRequest, CropModelRegistryError, CropModelTask,
+        DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
+        DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
+        FindingPromotionRequest, InferenceModelReference, ModelVersionRegistrationRequest,
+        PlantCountConfig, PlantCountTile, PlantCountZeroReason, WeedMappingConfig,
+        WeedMappingError, WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -1590,6 +1947,85 @@ mod tests {
         assert_eq!(error, WeedMappingError::DeterministicCoverRequired);
     }
 
+    #[test]
+    fn human_verification_records_actor_timestamp_and_correction_label() {
+        let record = apply_detection_verification(CropDetectionVerificationRequest {
+            detection_id: "disease:tile-1:1".to_string(),
+            task: CropModelTask::DiseaseDetection,
+            label: "northern_leaf_blight".to_string(),
+            confidence: 0.82,
+            evidence_tile_refs: vec!["tile-1".to_string()],
+            zone_geometry: detection_geometry(5.0, 5.0, 15.0, 15.0),
+            action: CropDetectionVerificationAction::Corrected,
+            actor: "agronomist-7".to_string(),
+            verified_at: "2026-06-12T14:00:00Z".to_string(),
+            corrected_label: Some("nitrogen_stress".to_string()),
+            corrected_geometry: Some(detection_geometry(6.0, 6.0, 16.0, 16.0)),
+        })
+        .expect("correction should produce an audited verification record");
+
+        assert_eq!(record.detection_id, "disease:tile-1:1");
+        assert_eq!(
+            record.verification_state,
+            DetectionVerificationState::Corrected
+        );
+        assert_eq!(record.actor, "agronomist-7");
+        assert_eq!(record.verified_at, "2026-06-12T14:00:00Z");
+        assert_eq!(record.evidence_tile_refs, vec!["tile-1".to_string()]);
+        assert_eq!(record.corrected_label.as_deref(), Some("nitrogen_stress"));
+        assert_eq!(
+            record
+                .corrected_geometry
+                .as_ref()
+                .expect("geometry should be corrected")
+                .bbox,
+            GeoBounds {
+                min_lon: 6.0,
+                min_lat: 6.0,
+                max_lon: 16.0,
+                max_lat: 16.0,
+            }
+        );
+        let feedback = record
+            .correction_label
+            .expect("correction should feed back as a label");
+        assert_eq!(feedback.label_id, "label:correction:disease:tile-1:1");
+        assert_eq!(feedback.label, "nitrogen_stress");
+        assert_eq!(feedback.actor, "agronomist-7");
+        assert_eq!(feedback.source_detection_id, "disease:tile-1:1");
+    }
+
+    #[test]
+    fn finding_promotion_blocks_unverified_detection_by_default() {
+        let error = validate_detection_finding_promotion(FindingPromotionRequest {
+            detection_id: "weed:tile-1:1".to_string(),
+            verification_state: DetectionVerificationState::Unverified,
+            allow_unverified: false,
+        })
+        .expect_err("unverified detections should not become findings by default");
+
+        assert_eq!(
+            error,
+            FindingPromotionError::UnverifiedDetectionBlocked {
+                detection_id: "weed:tile-1:1".to_string()
+            }
+        );
+
+        let decision = validate_detection_finding_promotion(FindingPromotionRequest {
+            detection_id: "weed:tile-1:1".to_string(),
+            verification_state: DetectionVerificationState::Unverified,
+            allow_unverified: true,
+        })
+        .expect("explicit override should be audited and allowed");
+
+        assert!(decision.promotion_allowed);
+        assert_eq!(
+            decision.verification_state,
+            DetectionVerificationState::Unverified
+        );
+        assert_eq!(decision.reason.as_deref(), Some("unverified_override"));
+    }
+
     fn plant_tile(
         tile_id: &str,
         zone_id: Option<&str>,
@@ -1675,6 +2111,23 @@ mod tests {
             tile_id: tile_id.to_string(),
             confidence,
             bbox,
+        }
+    }
+
+    fn detection_geometry(
+        min_lon: f64,
+        min_lat: f64,
+        max_lon: f64,
+        max_lat: f64,
+    ) -> DetectionZoneGeometry {
+        DetectionZoneGeometry {
+            crs: "EPSG:32614".to_string(),
+            bbox: GeoBounds {
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat,
+            },
         }
     }
 
