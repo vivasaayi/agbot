@@ -431,9 +431,45 @@ fn assert_product_provenance_alignment(
                 "product {product_label} declares spatial_ref but manifest height is missing"
             )
         })?;
-        assert_raster_spatial_ref(Some(spatial_ref), width, height).map_err(|err| {
-            anyhow::anyhow!("product {product_label} spatial_ref assertion failed: {err}")
+        let asserted =
+            assert_raster_spatial_ref(Some(spatial_ref), width, height).map_err(|err| {
+                anyhow::anyhow!("product {product_label} spatial_ref assertion failed: {err}")
+            })?;
+        let manifest_crs = manifest_state
+            .geospatial
+            .crs
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "product {product_label} declares spatial_ref but manifest CRS is missing"
+                )
+            })?;
+        let product_crs = asserted
+            .crs
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("product {product_label} spatial_ref missing CRS"))?;
+        if manifest_crs != product_crs {
+            anyhow::bail!(
+                "product {product_label} CRS mismatch: manifest {manifest_crs} != product {product_crs}"
+            );
+        }
+        let manifest_extent = manifest_state.geospatial.extent.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "product {product_label} declares spatial_ref but manifest extent is missing"
+            )
         })?;
+        let product_extent = asserted
+            .bbox
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("product {product_label} spatial_ref missing extent"))?;
+        assert_extent_edge("min_lon", manifest_extent.min_lon, product_extent.min_lon)?;
+        assert_extent_edge("min_lat", manifest_extent.min_lat, product_extent.min_lat)?;
+        assert_extent_edge("max_lon", manifest_extent.max_lon, product_extent.max_lon)?;
+        assert_extent_edge("max_lat", manifest_extent.max_lat, product_extent.max_lat)?;
     }
 
     Ok(())
@@ -501,8 +537,18 @@ fn legend_profile_for_product(kind: &str) -> (&'static str, (f32, f32)) {
         || normalized.contains("visual")
     {
         ("grayscale", (0.0, 255.0))
-    } else if normalized.contains("lidar") {
+    } else if normalized.contains("lidar")
+        || normalized.contains("elevation")
+        || normalized == "dsm"
+        || normalized == "dtm"
+        || normalized == "chm"
+    {
         ("jet", (0.0, 1.0))
+    } else if normalized.contains("occupancy")
+        || normalized.contains("obstacle")
+        || normalized.contains("density")
+    {
+        ("hot", (0.0, 1.0))
     } else {
         ("grayscale", (0.0, 1.0))
     }
@@ -1356,6 +1402,10 @@ mod tests {
             .expect("thermal legend should be available");
         let source = product_legend_for_kind("source", &sample_extent())
             .expect("source legend should be available");
+        let lidar_elevation = product_legend_for_kind("lidar_elevation", &sample_extent())
+            .expect("LiDAR elevation legend should be available");
+        let occupancy = product_legend_for_kind("occupancy_density", &sample_extent())
+            .expect("occupancy legend should be available");
 
         assert_eq!(ndvi.colormap, "viridis");
         assert_eq!(
@@ -1369,6 +1419,102 @@ mod tests {
         );
         assert_eq!(source.colormap, "grayscale");
         assert_eq!(source.stops.len(), 5);
+        assert_eq!(lidar_elevation.colormap, "jet");
+        assert_eq!(
+            lidar_elevation
+                .value_range
+                .map(|range| (range.min, range.max)),
+            Some((0.0, 1.0))
+        );
+        assert_eq!(occupancy.colormap, "hot");
+        assert_eq!(
+            occupancy.value_range.map(|range| (range.min, range.max)),
+            Some((0.0, 1.0))
+        );
+    }
+
+    #[test]
+    fn switch_active_product_accepts_lidar_overlay_with_product_spatial_ref() {
+        let mut manifest = sample_manifest_state();
+        manifest.products.push(SceneProduct {
+            spatial_ref: Some(valid_spatial_ref()),
+            ..sample_product("lidar_elevation")
+        });
+        let mut viewer = ViewerState {
+            selected_layer: 0,
+            zoom_level: 1.0,
+            scene_id_input: "scene-1".to_string(),
+        };
+        let mut config = TileConfig {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            scene_id: Some("scene-1".to_string()),
+            product_kind: DEFAULT_PRODUCT_KIND.to_string(),
+        };
+
+        let selection = switch_active_product(&manifest, &mut viewer, &mut config, 3)
+            .expect("LiDAR overlay should switch");
+
+        assert_eq!(selection.product_kind, "lidar_elevation");
+        assert_eq!(selection.legend.colormap, "jet");
+        assert_eq!(viewer.selected_layer, 3);
+    }
+
+    #[test]
+    fn switch_active_product_refuses_ungeoreferenced_lidar_product() {
+        let mut manifest = sample_manifest_state();
+        let mut bad_spatial_ref = valid_spatial_ref();
+        bad_spatial_ref.georeferenced = false;
+        manifest.products.push(SceneProduct {
+            spatial_ref: Some(bad_spatial_ref),
+            ..sample_product("lidar_elevation")
+        });
+        let mut viewer = ViewerState {
+            selected_layer: 0,
+            zoom_level: 1.0,
+            scene_id_input: "scene-1".to_string(),
+        };
+        let mut config = TileConfig {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            scene_id: Some("scene-1".to_string()),
+            product_kind: DEFAULT_PRODUCT_KIND.to_string(),
+        };
+
+        let err = switch_active_product(&manifest, &mut viewer, &mut config, 3)
+            .expect_err("ungeoreferenced LiDAR product should be refused");
+
+        assert!(err
+            .to_string()
+            .contains("product lidar_elevation spatial_ref assertion failed"));
+        assert_eq!(viewer.selected_layer, 0);
+        assert_eq!(config.product_kind, DEFAULT_PRODUCT_KIND);
+    }
+
+    #[test]
+    fn switch_active_product_refuses_lidar_product_extent_mismatch() {
+        let mut manifest = sample_manifest_state();
+        let mut bad_spatial_ref = valid_spatial_ref();
+        bad_spatial_ref.bbox.as_mut().expect("bbox exists").max_lon = -88.4;
+        manifest.products.push(SceneProduct {
+            spatial_ref: Some(bad_spatial_ref),
+            ..sample_product("lidar_elevation")
+        });
+        let mut viewer = ViewerState {
+            selected_layer: 0,
+            zoom_level: 1.0,
+            scene_id_input: "scene-1".to_string(),
+        };
+        let mut config = TileConfig {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            scene_id: Some("scene-1".to_string()),
+            product_kind: DEFAULT_PRODUCT_KIND.to_string(),
+        };
+
+        let err = switch_active_product(&manifest, &mut viewer, &mut config, 3)
+            .expect_err("misaligned LiDAR product should be refused");
+
+        assert!(err.to_string().contains("extent"));
+        assert_eq!(viewer.selected_layer, 0);
+        assert_eq!(config.product_kind, DEFAULT_PRODUCT_KIND);
     }
 
     fn sample_extent() -> SceneExtent {

@@ -12,7 +12,9 @@ pub mod ndvi;
 pub mod thermal;
 
 pub use composite::CompositeOverlayEngine;
-pub use lidar_overlay::LidarOverlayProcessor;
+pub use lidar_overlay::{
+    LidarOverlayProcessor, LidarProductOverlay, LidarRasterOverlayKind, LidarRasterOverlayProduct,
+};
 pub use ndvi::NdviProcessor;
 pub use thermal::ThermalProcessor;
 
