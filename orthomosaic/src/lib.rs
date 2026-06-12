@@ -1,3 +1,4 @@
+use provenance::{EvidenceObject, EvidenceStore};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     assert_raster_spatial_ref, GeoBounds, GpsCoords, RasterResolution, RasterSpatialRef,
@@ -571,6 +572,63 @@ pub struct TiledOutputHandoff {
     pub layers: Vec<TiledOutputLayer>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MosaicQualityVerdict {
+    Publishable,
+    NotPublishable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MosaicPublishStatus {
+    Published,
+    Blocked,
+}
+
+impl MosaicPublishStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MosaicPublishStatus::Published => "published",
+            MosaicPublishStatus::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MosaicProvenanceRecord {
+    pub frames: Vec<String>,
+    pub camera_model: String,
+    #[serde(default)]
+    pub gcps: Vec<String>,
+    pub params: serde_json::Value,
+    pub software_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MosaicPublishGateRequest {
+    pub scene_id: String,
+    pub product_kind: String,
+    pub requested_at: String,
+    pub qa_report_ref: String,
+    pub quality_verdict: MosaicQualityVerdict,
+    pub provenance: MosaicProvenanceRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MosaicPublishGateDecision {
+    pub scene_id: String,
+    pub product_kind: String,
+    pub status: MosaicPublishStatus,
+    pub quality_verdict: MosaicQualityVerdict,
+    pub qa_report_ref: String,
+    pub provenance_hash: String,
+    pub downstream_consumers: Vec<String>,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    pub provenance: MosaicProvenanceRecord,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FeatureMatchingError {
     #[error("frame set must include at least one frame")]
@@ -711,6 +769,30 @@ pub enum TiledOutputHandoffError {
         product_kind: String,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum MosaicPublishGateError {
+    #[error("scene_id cannot be empty")]
+    EmptySceneId,
+    #[error("product_kind cannot be empty")]
+    EmptyProductKind,
+    #[error("requested_at cannot be empty")]
+    EmptyRequestedAt,
+    #[error("qa_report_ref cannot be empty")]
+    EmptyQaReportRef,
+    #[error("provenance must include at least one frame")]
+    EmptyFrames,
+    #[error("provenance frame id cannot be empty")]
+    EmptyFrameId,
+    #[error("provenance camera_model cannot be empty")]
+    EmptyCameraModel,
+    #[error("provenance software_version cannot be empty")]
+    EmptySoftwareVersion,
+    #[error("provenance GCP id cannot be empty")]
+    EmptyGcpId,
+    #[error("provenance hash failed: {reason}")]
+    ProvenanceHashFailed { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1474,6 +1556,53 @@ pub fn build_tiled_output_handoff(
     })
 }
 
+pub fn evaluate_mosaic_publish_gate(
+    request: MosaicPublishGateRequest,
+) -> Result<MosaicPublishGateDecision, MosaicPublishGateError> {
+    let scene_id = normalize_optional_text(Some(request.scene_id))
+        .ok_or(MosaicPublishGateError::EmptySceneId)?;
+    let product_kind = normalize_optional_text(Some(request.product_kind))
+        .map(|value| value.to_ascii_lowercase())
+        .ok_or(MosaicPublishGateError::EmptyProductKind)?;
+    let _requested_at = normalize_optional_text(Some(request.requested_at))
+        .ok_or(MosaicPublishGateError::EmptyRequestedAt)?;
+    let qa_report_ref = normalize_optional_text(Some(request.qa_report_ref))
+        .ok_or(MosaicPublishGateError::EmptyQaReportRef)?;
+    let provenance = normalize_mosaic_provenance(request.provenance)?;
+    let provenance_hash = mosaic_provenance_hash(
+        &scene_id,
+        &product_kind,
+        &qa_report_ref,
+        request.quality_verdict,
+        &provenance,
+    )?;
+
+    let (status, downstream_consumers, blocked_reason) = match request.quality_verdict {
+        MosaicQualityVerdict::Publishable => (
+            MosaicPublishStatus::Published,
+            vec!["imagery_processor".to_string(), "lidar_mapper".to_string()],
+            None,
+        ),
+        MosaicQualityVerdict::NotPublishable => (
+            MosaicPublishStatus::Blocked,
+            Vec::new(),
+            Some("quality_report_not_publishable".to_string()),
+        ),
+    };
+
+    Ok(MosaicPublishGateDecision {
+        scene_id,
+        product_kind,
+        status,
+        quality_verdict: request.quality_verdict,
+        qa_report_ref,
+        provenance_hash,
+        downstream_consumers,
+        blocked_reason,
+        provenance,
+    })
+}
+
 impl FrameQaRecord {
     fn rect(&self) -> Rect {
         Rect {
@@ -1916,6 +2045,66 @@ fn tile_pyramid(width_px: u32, height_px: u32, tile_size_px: u32) -> Vec<TilePyr
     levels
 }
 
+fn normalize_mosaic_provenance(
+    provenance: MosaicProvenanceRecord,
+) -> Result<MosaicProvenanceRecord, MosaicPublishGateError> {
+    if provenance.frames.is_empty() {
+        return Err(MosaicPublishGateError::EmptyFrames);
+    }
+    let frames = provenance
+        .frames
+        .into_iter()
+        .map(|frame_id| {
+            normalize_optional_text(Some(frame_id)).ok_or(MosaicPublishGateError::EmptyFrameId)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let camera_model = normalize_optional_text(Some(provenance.camera_model))
+        .ok_or(MosaicPublishGateError::EmptyCameraModel)?;
+    let gcps = provenance
+        .gcps
+        .into_iter()
+        .map(|gcp_id| {
+            normalize_optional_text(Some(gcp_id)).ok_or(MosaicPublishGateError::EmptyGcpId)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let software_version = normalize_optional_text(Some(provenance.software_version))
+        .ok_or(MosaicPublishGateError::EmptySoftwareVersion)?;
+
+    Ok(MosaicProvenanceRecord {
+        frames,
+        camera_model,
+        gcps,
+        params: provenance.params,
+        software_version,
+    })
+}
+
+fn mosaic_provenance_hash(
+    scene_id: &str,
+    product_kind: &str,
+    qa_report_ref: &str,
+    quality_verdict: MosaicQualityVerdict,
+    provenance: &MosaicProvenanceRecord,
+) -> Result<String, MosaicPublishGateError> {
+    let payload = serde_json::json!({
+        "scene_id": scene_id,
+        "product_kind": product_kind,
+        "qa_report_ref": qa_report_ref,
+        "quality_verdict": quality_verdict,
+        "provenance": provenance,
+    });
+    let evidence = EvidenceObject {
+        evidence_kind: "orthomosaic_publish_provenance".to_string(),
+        payload,
+    };
+    EvidenceStore::default()
+        .store_evidence(evidence)
+        .map(|stored| stored.digest)
+        .map_err(|error| MosaicPublishGateError::ProvenanceHashFailed {
+            reason: error.to_string(),
+        })
+}
+
 fn dsm_cell_index(
     point: &DensePoint,
     config: &DsmConfig,
@@ -2316,7 +2505,8 @@ mod tests {
         CameraImuPose, DensePoint, DensePointCloud, DsmConfig, FeatureMatchingConfig,
         FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
         FrameSetIngestRequest, FrameSetQaConfig, GcpMarkedImagePoint, GcpRegistrationError,
-        GcpRegistrationRequest, GcpSurveyedCoordinate, GroundControlPoint, OrthomosaicConfig,
+        GcpRegistrationRequest, GcpSurveyedCoordinate, GroundControlPoint, MosaicProvenanceRecord,
+        MosaicPublishGateRequest, MosaicPublishStatus, MosaicQualityVerdict, OrthomosaicConfig,
         OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest, ReconstructionStatus,
         ReprojectionReportConfig, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
         TiledOutputHandoffError, TiledOutputHandoffRequest, TiledRasterProductRequest,
@@ -2963,6 +3153,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mosaic_publish_gate_marks_publishable_with_deterministic_provenance() {
+        let decision = super::evaluate_mosaic_publish_gate(mosaic_publish_request(
+            MosaicQualityVerdict::Publishable,
+        ))
+        .expect("publishable QA should pass gate");
+        let repeated = super::evaluate_mosaic_publish_gate(mosaic_publish_request(
+            MosaicQualityVerdict::Publishable,
+        ))
+        .expect("same provenance should hash deterministically");
+
+        assert_eq!(decision.status, MosaicPublishStatus::Published);
+        assert_eq!(decision.qa_report_ref, "qa-report-001");
+        assert_eq!(
+            decision.downstream_consumers,
+            vec!["imagery_processor", "lidar_mapper"]
+        );
+        assert!(decision.blocked_reason.is_none());
+        assert_eq!(decision.provenance_hash, repeated.provenance_hash);
+        assert!(decision.provenance_hash.starts_with("sha256:"));
+        assert_eq!(decision.provenance.frames, vec!["frame-001", "frame-002"]);
+        assert_eq!(decision.provenance.gcps, vec!["GCP-1"]);
+    }
+
+    #[test]
+    fn mosaic_publish_gate_blocks_not_publishable_quality_report() {
+        let decision = super::evaluate_mosaic_publish_gate(mosaic_publish_request(
+            MosaicQualityVerdict::NotPublishable,
+        ))
+        .expect("failing QA should produce a blocked decision");
+
+        assert_eq!(decision.status, MosaicPublishStatus::Blocked);
+        assert_eq!(
+            decision.quality_verdict,
+            MosaicQualityVerdict::NotPublishable
+        );
+        assert_eq!(
+            decision.blocked_reason.as_deref(),
+            Some("quality_report_not_publishable")
+        );
+        assert!(decision.downstream_consumers.is_empty());
+        assert!(decision.provenance_hash.starts_with("sha256:"));
+    }
+
     fn qa_frame_set(frames: Vec<FrameIngestRequest>) -> super::FrameSetRecord {
         build_frame_set_record(
             FrameSetIngestRequest {
@@ -3211,6 +3445,26 @@ mod tests {
             }),
             geo_transform: Some([-96.7, 0.05, 0.0, 41.2, 0.0, -0.05]),
             resolution: Some(RasterResolution { x: 0.05, y: 0.05 }),
+        }
+    }
+
+    fn mosaic_publish_request(quality_verdict: MosaicQualityVerdict) -> MosaicPublishGateRequest {
+        MosaicPublishGateRequest {
+            scene_id: " ortho-scene-1 ".to_string(),
+            product_kind: " orthomosaic ".to_string(),
+            requested_at: " 2026-06-01T12:09:00Z ".to_string(),
+            qa_report_ref: " qa-report-001 ".to_string(),
+            quality_verdict,
+            provenance: MosaicProvenanceRecord {
+                frames: vec![" frame-001 ".to_string(), " frame-002 ".to_string()],
+                camera_model: " MicaSense RedEdge ".to_string(),
+                gcps: vec![" GCP-1 ".to_string()],
+                params: serde_json::json!({
+                    "feature_detector": "orb",
+                    "resolution_m_per_px": 0.05
+                }),
+                software_version: " agbot-orthomosaic 0.1.0 ".to_string(),
+            },
         }
     }
 

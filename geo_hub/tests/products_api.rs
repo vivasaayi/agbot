@@ -3065,6 +3065,134 @@ async fn orthomosaic_tile_handoff_refuses_missing_crs_without_product_rows() -> 
 }
 
 #[tokio::test]
+async fn orthomosaic_publish_gate_marks_publishable_product_with_provenance() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "ortho-publish-scene";
+    seed_orthomosaic_publish_product(&ctx, scene_id, "orthomosaic").await?;
+
+    let first = post_orthomosaic_publish_gate(&ctx, scene_id, "orthomosaic", "publishable").await?;
+    let repeated =
+        post_orthomosaic_publish_gate(&ctx, scene_id, "orthomosaic", "publishable").await?;
+
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("published")
+    );
+    assert_eq!(
+        first.get("qa_report_ref").and_then(|value| value.as_str()),
+        Some("qa-report-001")
+    );
+    assert_eq!(
+        first
+            .get("provenance_hash")
+            .and_then(|value| value.as_str()),
+        repeated
+            .get("provenance_hash")
+            .and_then(|value| value.as_str())
+    );
+    assert!(first
+        .get("provenance_hash")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.starts_with("sha256:")));
+    assert_eq!(
+        first
+            .pointer("/downstream_consumers/0")
+            .and_then(|value| value.as_str()),
+        Some("imagery_processor")
+    );
+
+    let row = sqlx::query(
+        "SELECT publish_status, qa_report_ref, provenance_hash, downstream_consumers_json FROM products WHERE scene_id = ?1 AND kind = ?2",
+    )
+    .bind(scene_id)
+    .bind("orthomosaic")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("publish_status"), "published");
+    assert_eq!(row.get::<String, _>("qa_report_ref"), "qa-report-001");
+    assert_eq!(
+        row.get::<String, _>("provenance_hash"),
+        first
+            .get("provenance_hash")
+            .and_then(|value| value.as_str())
+            .expect("provenance hash should exist")
+    );
+
+    let layer_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/layers/{scene_id}/orthomosaic"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(layer_response.status(), StatusCode::OK);
+    let body = to_bytes(layer_response.into_body(), 64 * 1024).await?;
+    let layer_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        layer_json
+            .get("publish_status")
+            .and_then(|value| value.as_str()),
+        Some("published")
+    );
+    assert_eq!(
+        layer_json
+            .get("provenance_hash")
+            .and_then(|value| value.as_str()),
+        first
+            .get("provenance_hash")
+            .and_then(|value| value.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn orthomosaic_publish_gate_blocks_failed_quality_without_consumers() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "ortho-publish-blocked";
+    seed_orthomosaic_publish_product(&ctx, scene_id, "orthomosaic").await?;
+
+    let decision =
+        post_orthomosaic_publish_gate(&ctx, scene_id, "orthomosaic", "not_publishable").await?;
+
+    assert_eq!(
+        decision.get("status").and_then(|value| value.as_str()),
+        Some("blocked")
+    );
+    assert_eq!(
+        decision
+            .get("blocked_reason")
+            .and_then(|value| value.as_str()),
+        Some("quality_report_not_publishable")
+    );
+    assert!(decision
+        .get("downstream_consumers")
+        .and_then(|value| value.as_array())
+        .is_some_and(Vec::is_empty));
+
+    let row = sqlx::query(
+        "SELECT publish_status, downstream_consumers_json FROM products WHERE scene_id = ?1 AND kind = ?2",
+    )
+    .bind(scene_id)
+    .bind("orthomosaic")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("publish_status"), "blocked");
+    let consumers: Vec<String> =
+        serde_json::from_str(&row.get::<String, _>("downstream_consumers_json"))?;
+    assert!(consumers.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn crop_intelligence_model_registry_registers_and_lists_versions() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -6688,6 +6816,95 @@ async fn seed_completed_orthomosaic_reconstruction(
     .await?;
 
     Ok(())
+}
+
+async fn seed_orthomosaic_publish_product(
+    ctx: &TestContext,
+    scene_id: &str,
+    kind: &str,
+) -> Result<()> {
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let spatial_ref = orthomosaic_tile_spatial_ref_json();
+    insert_scene_with_spatial_ref(ctx, scene_id, &scene_dir, spatial_ref.clone()).await?;
+    link_scene_context(ctx, scene_id, "ortho-field-1", "season-2026").await?;
+    let product_path = scene_dir
+        .join("products")
+        .join(kind)
+        .join(format!("{kind}.png"));
+    std::fs::create_dir_all(product_path.parent().expect("product parent exists"))?;
+    write_gray_png(&product_path, 120)?;
+    sqlx::query(
+        r#"
+        INSERT INTO products (
+            product_id, scene_id, field_id, season_id, kind, path,
+            width_px, height_px, gsd_m_per_px,
+            spatial_ref_json, source_image_ids_json, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(format!("{scene_id}:{kind}"))
+    .bind(scene_id)
+    .bind("ortho-field-1")
+    .bind("season-2026")
+    .bind(kind)
+    .bind(product_path.to_string_lossy().to_string())
+    .bind(2_i64)
+    .bind(2_i64)
+    .bind(0.05_f64)
+    .bind(spatial_ref.to_string())
+    .bind(json!(["frame-001", "frame-002"]).to_string())
+    .bind("2026-06-01T12:08:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn post_orthomosaic_publish_gate(
+    ctx: &TestContext,
+    scene_id: &str,
+    kind: &str,
+    quality_verdict: &str,
+) -> Result<serde_json::Value> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/orthomosaic/products/{scene_id}/{kind}/publish-gate"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "scene_id": scene_id,
+                        "product_kind": kind,
+                        "requested_at": "2026-06-01T12:09:00Z",
+                        "qa_report_ref": "qa-report-001",
+                        "quality_verdict": quality_verdict,
+                        "provenance": {
+                            "frames": ["frame-001", "frame-002"],
+                            "camera_model": "MicaSense RedEdge",
+                            "gcps": ["GCP-1"],
+                            "params": {
+                                "feature_detector": "orb",
+                                "resolution_m_per_px": 0.05
+                            },
+                            "software_version": "agbot-orthomosaic 0.1.0"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    serde_json::from_slice(&body).map_err(Into::into)
 }
 
 fn orthomosaic_tile_spatial_ref_json() -> serde_json::Value {

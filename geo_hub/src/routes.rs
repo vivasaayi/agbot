@@ -48,9 +48,11 @@ use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, ImageFor
 use interop::{export_raster_geotiff, RasterProduct};
 use orthomosaic::{
     build_frame_set_record, build_reconstruction_job, build_tiled_output_handoff,
-    transition_reconstruction_status, FramePoseRecord, FrameSetIngestError, FrameSetIngestRequest,
-    FrameSetRecord, ReconstructionJobError, ReconstructionJobRecord, ReconstructionJobRequest,
-    ReconstructionStatus, TiledOutputHandoff, TiledOutputHandoffError, TiledOutputHandoffRequest,
+    evaluate_mosaic_publish_gate, transition_reconstruction_status, FramePoseRecord,
+    FrameSetIngestError, FrameSetIngestRequest, FrameSetRecord, MosaicPublishGateDecision,
+    MosaicPublishGateError, MosaicPublishGateRequest, ReconstructionJobError,
+    ReconstructionJobRecord, ReconstructionJobRequest, ReconstructionStatus, TiledOutputHandoff,
+    TiledOutputHandoffError, TiledOutputHandoffRequest,
 };
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
@@ -129,6 +131,10 @@ pub struct ProductSummary {
     pub gsd_m_per_px: Option<f64>,
     pub spatial_ref: Option<RasterSpatialRef>,
     pub source_image_ids: Vec<String>,
+    pub publish_status: Option<String>,
+    pub qa_report_ref: Option<String>,
+    pub provenance_hash: Option<String>,
+    pub downstream_consumers: Vec<String>,
     pub url_path: String,
     pub tile_url_template: String,
 }
@@ -164,6 +170,10 @@ pub struct LayerMetadata {
     pub gsd_m_per_px: Option<f64>,
     pub spatial_ref: RasterSpatialRef,
     pub source_image_ids: Vec<String>,
+    pub publish_status: Option<String>,
+    pub qa_report_ref: Option<String>,
+    pub provenance_hash: Option<String>,
+    pub downstream_consumers: Vec<String>,
     pub freshness: LayerFreshness,
     pub source: String,
     pub url_path: String,
@@ -1290,6 +1300,10 @@ async fn create_rgb_product(state: &AppState, scene_id: &str, scene_dir: &FsPath
                                                 width_px = NULL,
                                                 height_px = NULL,
                                                 gsd_m_per_px = NULL,
+                                                publish_status = NULL,
+                                                qa_report_ref = NULL,
+                                                provenance_hash = NULL,
+                                                downstream_consumers_json = NULL,
                                                 created_at = datetime('now')
         "#,
     )
@@ -1379,6 +1393,10 @@ async fn upsert_product_path(
                                                 width_px = NULL,
                                                 height_px = NULL,
                                                 gsd_m_per_px = NULL,
+                                                publish_status = NULL,
+                                                qa_report_ref = NULL,
+                                                provenance_hash = NULL,
+                                                downstream_consumers_json = NULL,
                                                 created_at = datetime('now')
         "#,
     )
@@ -2425,6 +2443,60 @@ pub async fn handoff_orthomosaic_tiles(
     }
 
     Ok(Json(handoff))
+}
+
+pub async fn apply_orthomosaic_publish_gate(
+    Path((scene_id, kind)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<MosaicPublishGateRequest>,
+) -> AppResult<Json<MosaicPublishGateDecision>> {
+    let scene_id = normalize_optional_text(Some(scene_id))
+        .ok_or_else(|| AppError::BadRequest("scene_id is required".to_string()))?;
+    let kind = normalize_optional_text(Some(kind))
+        .map(|value| value.to_ascii_lowercase())
+        .ok_or_else(|| AppError::BadRequest("product kind is required".to_string()))?;
+    let product_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM products WHERE scene_id = ?1 AND lower(kind) = lower(?2)",
+    )
+    .bind(&scene_id)
+    .bind(&kind)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    if product_exists == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    let decision = evaluate_mosaic_publish_gate(request).map_err(mosaic_publish_gate_error)?;
+    if decision.scene_id != scene_id || decision.product_kind != kind {
+        return Err(AppError::BadRequest(format!(
+            "publish gate request must target product {scene_id}:{kind}"
+        )));
+    }
+    let downstream_consumers_json = serde_json::to_string(&decision.downstream_consumers)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        UPDATE products
+        SET publish_status = ?3,
+            qa_report_ref = ?4,
+            provenance_hash = ?5,
+            downstream_consumers_json = ?6
+        WHERE scene_id = ?1 AND lower(kind) = lower(?2)
+        "#,
+    )
+    .bind(&scene_id)
+    .bind(&kind)
+    .bind(decision.status.as_str())
+    .bind(&decision.qa_report_ref)
+    .bind(&decision.provenance_hash)
+    .bind(downstream_consumers_json)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(decision))
 }
 
 pub async fn register_crop_model(
@@ -4120,7 +4192,8 @@ async fn collect_scene_products(
     let rows = sqlx::query(
         r#"
         SELECT product_id, field_id, season_id, kind, path, width_px, height_px, gsd_m_per_px,
-               spatial_ref_json, source_image_ids_json
+               spatial_ref_json, source_image_ids_json,
+               publish_status, qa_report_ref, provenance_hash, downstream_consumers_json
         FROM products
         WHERE scene_id = ?1
         "#,
@@ -4162,6 +4235,10 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
             p.gsd_m_per_px AS product_gsd_m_per_px,
             p.spatial_ref_json AS product_spatial_ref_json,
             p.source_image_ids_json,
+            p.publish_status,
+            p.qa_report_ref,
+            p.provenance_hash,
+            p.downstream_consumers_json,
             s.scene_id,
             s.sensor,
             s.acquired_at,
@@ -4203,6 +4280,10 @@ async fn load_layer_row(
             p.gsd_m_per_px AS product_gsd_m_per_px,
             p.spatial_ref_json AS product_spatial_ref_json,
             p.source_image_ids_json,
+            p.publish_status,
+            p.qa_report_ref,
+            p.provenance_hash,
+            p.downstream_consumers_json,
             s.scene_id,
             s.sensor,
             s.acquired_at,
@@ -4364,6 +4445,10 @@ async fn layer_from_row(
         gsd_m_per_px,
         spatial_ref,
         source_image_ids: decode_source_image_ids(row.get("source_image_ids_json"))?,
+        publish_status: row.get("publish_status"),
+        qa_report_ref: row.get("qa_report_ref"),
+        provenance_hash: row.get("provenance_hash"),
+        downstream_consumers: decode_downstream_consumers(row.get("downstream_consumers_json"))?,
         freshness: LayerFreshness {
             acquired_at: row.get("acquired_at"),
             ingested_at: row.get("ingested_at"),
@@ -4471,6 +4556,10 @@ fn build_product_summary(scene_id: &str, kind: &str, path: &FsPath) -> ProductSu
         gsd_m_per_px: None,
         spatial_ref: None,
         source_image_ids: Vec::new(),
+        publish_status: None,
+        qa_report_ref: None,
+        provenance_hash: None,
+        downstream_consumers: Vec::new(),
         url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
         tile_url_template: format!(
             "/api/scenes/{scene_id}/products/{kind}/tiles/{{z}}/{{x}}/{{y}}.png"
@@ -4517,6 +4606,10 @@ fn product_summary_from_row(
         gsd_m_per_px: row.get("gsd_m_per_px"),
         spatial_ref,
         source_image_ids: decode_source_image_ids(row.get("source_image_ids_json"))?,
+        publish_status: row.get("publish_status"),
+        qa_report_ref: row.get("qa_report_ref"),
+        provenance_hash: row.get("provenance_hash"),
+        downstream_consumers: decode_downstream_consumers(row.get("downstream_consumers_json"))?,
         url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
         tile_url_template: format!(
             "/api/scenes/{scene_id}/products/{kind}/tiles/{{z}}/{{x}}/{{y}}.png"
@@ -4530,6 +4623,17 @@ fn decode_source_image_ids(value: Option<String>) -> AppResult<Vec<String>> {
     };
     serde_json::from_str::<Vec<String>>(&json).map_err(|err| {
         AppError::Anyhow(Error::new(err).context("failed to decode product source_image_ids_json"))
+    })
+}
+
+fn decode_downstream_consumers(value: Option<String>) -> AppResult<Vec<String>> {
+    let Some(json) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<String>>(&json).map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode product downstream_consumers_json"),
+        )
     })
 }
 
@@ -4995,6 +5099,10 @@ fn reconstruction_job_error(error: ReconstructionJobError) -> AppError {
 }
 
 fn tiled_output_handoff_error(error: TiledOutputHandoffError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn mosaic_publish_gate_error(error: MosaicPublishGateError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 

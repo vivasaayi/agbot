@@ -173,6 +173,10 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             gsd_m_per_px REAL,
             spatial_ref_json TEXT,
             source_image_ids_json TEXT,
+            publish_status TEXT,
+            qa_report_ref TEXT,
+            provenance_hash TEXT,
+            downstream_consumers_json TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(scene_id) REFERENCES scenes(scene_id) ON DELETE CASCADE,
             UNIQUE(scene_id, kind)
@@ -243,6 +247,38 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         "products",
         "source_image_ids_json",
         "ALTER TABLE products ADD COLUMN source_image_ids_json TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "publish_status",
+        "ALTER TABLE products ADD COLUMN publish_status TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "qa_report_ref",
+        "ALTER TABLE products ADD COLUMN qa_report_ref TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "provenance_hash",
+        "ALTER TABLE products ADD COLUMN provenance_hash TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "downstream_consumers_json",
+        "ALTER TABLE products ADD COLUMN downstream_consumers_json TEXT",
     )
     .await?;
 

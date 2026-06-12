@@ -73,6 +73,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::handoff_orthomosaic_tiles),
         )
         .route(
+            "/api/orthomosaic/products/:scene_id/:kind/publish-gate",
+            post(routes::apply_orthomosaic_publish_gate),
+        )
+        .route(
             "/api/crop-intelligence/models",
             get(routes::list_crop_models).post(routes::register_crop_model),
         )

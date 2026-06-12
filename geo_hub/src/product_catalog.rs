@@ -69,6 +69,10 @@ pub async fn publish_product(
             gsd_m_per_px = NULL,
             spatial_ref_json = excluded.spatial_ref_json,
             source_image_ids_json = excluded.source_image_ids_json,
+            publish_status = NULL,
+            qa_report_ref = NULL,
+            provenance_hash = NULL,
+            downstream_consumers_json = NULL,
             created_at = datetime('now')
         "#,
     )
@@ -169,6 +173,10 @@ pub async fn publish_georeferenced_product(
             gsd_m_per_px = excluded.gsd_m_per_px,
             spatial_ref_json = excluded.spatial_ref_json,
             source_image_ids_json = excluded.source_image_ids_json,
+            publish_status = NULL,
+            qa_report_ref = NULL,
+            provenance_hash = NULL,
+            downstream_consumers_json = NULL,
             created_at = datetime('now')
         "#,
     )
