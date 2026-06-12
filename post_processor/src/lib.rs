@@ -10,11 +10,15 @@ pub mod lidar_analysis;
 pub mod ndvi_analysis;
 pub mod report_generator;
 pub mod thermal_analysis;
+pub mod zonal_statistics;
 
 pub use lidar_analysis::{LidarAnalysisConfig, LidarAnalysisProcessor};
 pub use ndvi_analysis::{NdviAnalysisConfig, NdviAnalysisProcessor};
 pub use report_generator::ReportGenerator;
 pub use thermal_analysis::{ThermalAnalysisConfig, ThermalAnalysisProcessor};
+pub use zonal_statistics::{
+    compute_zonal_statistics, ProductGrid, ProductGridStatistics, ZonalStatisticsError,
+};
 
 /// Post-processing pipeline for agricultural drone data
 #[derive(Debug, Clone, Serialize, Deserialize)]
