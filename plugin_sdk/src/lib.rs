@@ -66,6 +66,31 @@ pub enum ManifestRejectionReason {
     UnknownExtensionPointKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityDecision {
+    Permitted,
+    Denied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityViolationReason {
+    UnknownPlugin,
+    MalformedCapability,
+    UndeclaredCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityAuditEntry {
+    pub audit_id: String,
+    pub plugin_id: String,
+    pub required_capability: String,
+    pub decision: CapabilityDecision,
+    pub reason: Option<CapabilityViolationReason>,
+    pub attempted_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestViolation {
     pub field: ManifestField,
@@ -84,6 +109,7 @@ pub enum PluginRegistrationError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PluginHost {
     registrations: BTreeMap<String, PluginRegistrationRecord>,
+    capability_audit: Vec<CapabilityAuditEntry>,
 }
 
 impl PluginHost {
@@ -118,6 +144,43 @@ impl PluginHost {
 
     pub fn list_plugins(&self) -> Vec<PluginRegistrationRecord> {
         self.registrations.values().cloned().collect()
+    }
+
+    pub fn check_capability(
+        &mut self,
+        plugin_id: &str,
+        required_capability: &str,
+        attempted_at: &str,
+    ) -> CapabilityAuditEntry {
+        let plugin_id = normalize_optional_text(plugin_id.to_string()).unwrap_or_default();
+        let required_capability =
+            normalize_optional_text(required_capability.to_string()).unwrap_or_default();
+        let attempted_at = normalize_optional_text(attempted_at.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let reason =
+            capability_violation_reason(self.registrations.get(&plugin_id), &required_capability);
+        let decision = if reason.is_some() {
+            CapabilityDecision::Denied
+        } else {
+            CapabilityDecision::Permitted
+        };
+        let entry = CapabilityAuditEntry {
+            audit_id: format!(
+                "capability-audit-{number:06}",
+                number = self.capability_audit.len() + 1
+            ),
+            plugin_id,
+            required_capability,
+            decision,
+            reason,
+            attempted_at,
+        };
+        self.capability_audit.push(entry.clone());
+        entry
+    }
+
+    pub fn capability_audit_entries(&self) -> Vec<CapabilityAuditEntry> {
+        self.capability_audit.clone()
     }
 }
 
@@ -236,6 +299,27 @@ fn is_well_formed_capability(value: &str) -> bool {
     !scope.trim().is_empty() && !resource.trim().is_empty()
 }
 
+fn capability_violation_reason(
+    registration: Option<&PluginRegistrationRecord>,
+    required_capability: &str,
+) -> Option<CapabilityViolationReason> {
+    if !is_well_formed_capability(required_capability) {
+        return Some(CapabilityViolationReason::MalformedCapability);
+    }
+    let Some(registration) = registration else {
+        return Some(CapabilityViolationReason::UnknownPlugin);
+    };
+    if registration
+        .capabilities
+        .iter()
+        .any(|capability| capability == required_capability)
+    {
+        None
+    } else {
+        Some(CapabilityViolationReason::UndeclaredCapability)
+    }
+}
+
 fn normalize_optional_text(value: String) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -244,8 +328,8 @@ fn normalize_optional_text(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ManifestField, ManifestRejectionReason, PluginHost, PluginRegistrationError,
-        RawPluginManifest,
+        CapabilityDecision, CapabilityViolationReason, ManifestField, ManifestRejectionReason,
+        PluginHost, PluginRegistrationError, RawPluginManifest,
     };
     use shared::plugin_extensions::ExtensionPointKind;
 
@@ -359,6 +443,57 @@ mod tests {
         assert!(host.list_plugins().is_empty());
     }
 
+    #[test]
+    fn declared_capability_permits_plugin_call() {
+        let mut host = PluginHost::default();
+        host.register_plugin(read_scene_manifest())
+            .expect("plugin should register");
+
+        let decision =
+            host.check_capability("plugin.scene_reader", "read:scene", "2026-06-12T12:00:00Z");
+
+        assert_eq!(decision.decision, CapabilityDecision::Permitted);
+        assert_eq!(decision.reason, None);
+        assert_eq!(decision.required_capability, "read:scene");
+        assert_eq!(host.capability_audit_entries(), vec![decision]);
+    }
+
+    #[test]
+    fn undeclared_capability_is_denied_and_audited() {
+        let mut host = PluginHost::default();
+        host.register_plugin(read_scene_manifest())
+            .expect("plugin should register");
+
+        let decision =
+            host.check_capability("plugin.scene_reader", "write:field", "2026-06-12T12:01:00Z");
+
+        assert_eq!(decision.decision, CapabilityDecision::Denied);
+        assert_eq!(
+            decision.reason,
+            Some(CapabilityViolationReason::UndeclaredCapability)
+        );
+        assert_eq!(decision.audit_id, "capability-audit-000001");
+        assert_eq!(host.capability_audit_entries(), vec![decision]);
+    }
+
+    #[test]
+    fn network_capability_without_declaration_is_denied_and_audited() {
+        let mut host = PluginHost::default();
+        host.register_plugin(read_scene_manifest())
+            .expect("plugin should register");
+
+        let decision =
+            host.check_capability("plugin.scene_reader", "net:http", "2026-06-12T12:02:00Z");
+
+        assert_eq!(decision.decision, CapabilityDecision::Denied);
+        assert_eq!(
+            decision.reason,
+            Some(CapabilityViolationReason::UndeclaredCapability)
+        );
+        assert_eq!(decision.required_capability, "net:http");
+        assert_eq!(host.capability_audit_entries().len(), 1);
+    }
+
     fn custom_index_manifest() -> RawPluginManifest {
         RawPluginManifest {
             plugin_id: "plugin.custom_ndvi".to_string(),
@@ -368,6 +503,18 @@ mod tests {
             host_api_version: "2026.1".to_string(),
             capabilities: vec!["read:scene".to_string(), "write:product".to_string()],
             entrypoint: "custom_ndvi::run".to_string(),
+        }
+    }
+
+    fn read_scene_manifest() -> RawPluginManifest {
+        RawPluginManifest {
+            plugin_id: "plugin.scene_reader".to_string(),
+            name: "Scene Reader".to_string(),
+            version: "1.0.0".to_string(),
+            kind: "processor".to_string(),
+            host_api_version: "2026.1".to_string(),
+            capabilities: vec!["read:scene".to_string()],
+            entrypoint: "scene_reader::run".to_string(),
         }
     }
 }
