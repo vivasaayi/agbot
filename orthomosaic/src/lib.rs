@@ -389,6 +389,43 @@ pub struct OrthomosaicRaster {
     pub extent_round_trips: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DensePoint {
+    pub x_m: f64,
+    pub y_m: f64,
+    pub z_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DensePointCloud {
+    pub frame_set_id: String,
+    pub points: Vec<DensePoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DsmConfig {
+    pub output_crs: String,
+    pub resolution_m_per_px: f64,
+    pub min_x_m: f64,
+    pub min_y_m: f64,
+    pub max_x_m: f64,
+    pub max_y_m: f64,
+    pub nodata_value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DsmRaster {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub elevation_m: Vec<f64>,
+    pub point_support_counts: Vec<u32>,
+    pub nodata_mask: Vec<bool>,
+    pub extent_round_trips: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FeatureMatchingError {
     #[error("frame set must include at least one frame")]
@@ -464,6 +501,26 @@ pub enum OrthomosaicError {
     },
     #[error("QA report is missing frame {frame_id}")]
     MissingQaFrame { frame_id: String },
+    #[error("georeferencing-error: {reason}")]
+    GeoreferencingError { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DsmError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("dense point cloud must include at least one point")]
+    EmptyPointCloud,
+    #[error("DSM config output_crs cannot be empty")]
+    EmptyOutputCrs,
+    #[error("DSM config field {field} must be finite")]
+    NonFiniteConfig { field: &'static str },
+    #[error("DSM config resolution_m_per_px must be finite and positive")]
+    InvalidResolution,
+    #[error("DSM config extent is invalid")]
+    InvalidExtent,
+    #[error("dense point contains a non-finite coordinate")]
+    NonFinitePoint,
     #[error("georeferencing-error: {reason}")]
     GeoreferencingError { reason: String },
 }
@@ -951,6 +1008,93 @@ pub fn run_orthorectified_mosaic(
     })
 }
 
+pub fn generate_dsm(
+    cloud: &DensePointCloud,
+    config: DsmConfig,
+    generated_at: String,
+) -> Result<DsmRaster, DsmError> {
+    let output_crs =
+        normalize_optional_text(Some(config.output_crs.clone())).ok_or(DsmError::EmptyOutputCrs)?;
+    validate_dsm_config(&config)?;
+    let generated_at =
+        normalize_optional_text(Some(generated_at)).ok_or(DsmError::EmptyGeneratedAt)?;
+    if cloud.points.is_empty() {
+        return Err(DsmError::EmptyPointCloud);
+    }
+    if cloud
+        .points
+        .iter()
+        .any(|point| !point.x_m.is_finite() || !point.y_m.is_finite() || !point.z_m.is_finite())
+    {
+        return Err(DsmError::NonFinitePoint);
+    }
+
+    let width_px = ((config.max_x_m - config.min_x_m) / config.resolution_m_per_px).ceil() as u32;
+    let height_px = ((config.max_y_m - config.min_y_m) / config.resolution_m_per_px).ceil() as u32;
+    if width_px == 0 || height_px == 0 {
+        return Err(DsmError::InvalidExtent);
+    }
+
+    let cell_count = width_px as usize * height_px as usize;
+    let mut elevation_m = vec![config.nodata_value; cell_count];
+    let mut point_support_counts = vec![0u32; cell_count];
+    let mut nodata_mask = vec![true; cell_count];
+
+    for point in &cloud.points {
+        let Some(index) = dsm_cell_index(point, &config, width_px, height_px) else {
+            continue;
+        };
+        point_support_counts[index] += 1;
+        if nodata_mask[index] || point.z_m > elevation_m[index] {
+            elevation_m[index] = point.z_m;
+        }
+        nodata_mask[index] = false;
+    }
+
+    let adjusted_max_x = config.min_x_m + width_px as f64 * config.resolution_m_per_px;
+    let adjusted_min_y = config.max_y_m - height_px as f64 * config.resolution_m_per_px;
+    let spatial_ref = RasterSpatialRef {
+        georeferenced: true,
+        crs: Some(output_crs),
+        bbox: Some(GeoBounds {
+            min_lat: adjusted_min_y,
+            min_lon: config.min_x_m,
+            max_lat: config.max_y_m,
+            max_lon: adjusted_max_x,
+        }),
+        geo_transform: Some([
+            config.min_x_m,
+            config.resolution_m_per_px,
+            0.0,
+            config.max_y_m,
+            0.0,
+            -config.resolution_m_per_px,
+        ]),
+        resolution: Some(RasterResolution {
+            x: config.resolution_m_per_px,
+            y: config.resolution_m_per_px,
+        }),
+    };
+    let spatial_ref =
+        assert_raster_spatial_ref(Some(&spatial_ref), width_px, height_px).map_err(|error| {
+            DsmError::GeoreferencingError {
+                reason: error.to_string(),
+            }
+        })?;
+
+    Ok(DsmRaster {
+        frame_set_id: cloud.frame_set_id.clone(),
+        generated_at,
+        width_px,
+        height_px,
+        spatial_ref,
+        elevation_m,
+        point_support_counts,
+        nodata_mask,
+        extent_round_trips: true,
+    })
+}
+
 impl FrameQaRecord {
     fn rect(&self) -> Rect {
         Rect {
@@ -1214,6 +1358,49 @@ fn mosaic_extent(frames: &[OrthorectifiedFrameRecord]) -> Option<Rect> {
         extent.max_y = extent.max_y.max(frame.max_y_m);
     }
     (extent.area() > 0.0).then_some(extent)
+}
+
+fn validate_dsm_config(config: &DsmConfig) -> Result<(), DsmError> {
+    if !config.resolution_m_per_px.is_finite() || config.resolution_m_per_px <= 0.0 {
+        return Err(DsmError::InvalidResolution);
+    }
+    for (field, value) in [
+        ("min_x_m", config.min_x_m),
+        ("min_y_m", config.min_y_m),
+        ("max_x_m", config.max_x_m),
+        ("max_y_m", config.max_y_m),
+        ("nodata_value", config.nodata_value),
+    ] {
+        if !value.is_finite() {
+            return Err(DsmError::NonFiniteConfig { field });
+        }
+    }
+    if config.max_x_m <= config.min_x_m || config.max_y_m <= config.min_y_m {
+        return Err(DsmError::InvalidExtent);
+    }
+    Ok(())
+}
+
+fn dsm_cell_index(
+    point: &DensePoint,
+    config: &DsmConfig,
+    width_px: u32,
+    height_px: u32,
+) -> Option<usize> {
+    if point.x_m < config.min_x_m
+        || point.x_m >= config.max_x_m
+        || point.y_m < config.min_y_m
+        || point.y_m >= config.max_y_m
+    {
+        return None;
+    }
+    let col = ((point.x_m - config.min_x_m) / config.resolution_m_per_px).floor() as u32;
+    let row = ((config.max_y_m - point.y_m) / config.resolution_m_per_px).floor() as u32;
+    if col < width_px && row < height_px {
+        Some(row as usize * width_px as usize + col as usize)
+    } else {
+        None
+    }
 }
 
 fn validate_field_extent(field_extent: &FieldCoverageExtent) -> Result<(), FrameSetQaError> {
@@ -1588,9 +1775,10 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_frame_set_record, build_reconstruction_job, run_feature_matching, run_frame_set_qa,
-        run_orthorectified_mosaic, run_sparse_sfm, transition_reconstruction_status, CameraExif,
-        CameraImuPose, FeatureMatchingConfig, FieldCoverageExtent, FrameIngestRequest,
+        build_frame_set_record, build_reconstruction_job, generate_dsm, run_feature_matching,
+        run_frame_set_qa, run_orthorectified_mosaic, run_sparse_sfm,
+        transition_reconstruction_status, CameraExif, CameraImuPose, DensePoint, DensePointCloud,
+        DsmConfig, FeatureMatchingConfig, FieldCoverageExtent, FrameIngestRequest,
         FrameQaReasonCode, FrameSetIngestError, FrameSetIngestRequest, FrameSetQaConfig,
         OrthomosaicConfig, OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest,
         ReconstructionStatus, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
@@ -2047,6 +2235,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dsm_generation_rasterizes_dense_points_with_geospatial_round_trip() {
+        let dsm = generate_dsm(
+            &dense_cloud_fixture(),
+            dsm_config(),
+            "2026-06-01T12:05:00Z".to_string(),
+        )
+        .expect("DSM should generate");
+
+        assert_eq!(dsm.width_px, 2);
+        assert_eq!(dsm.height_px, 2);
+        assert_eq!(dsm.point_support_counts[0], 2);
+        assert_close(dsm.elevation_m[0], 102.0);
+        assert_eq!(dsm.point_support_counts[3], 1);
+        assert_close(dsm.elevation_m[3], 90.0);
+        let asserted =
+            assert_raster_spatial_ref(Some(&dsm.spatial_ref), dsm.width_px, dsm.height_px)
+                .expect("DSM spatial ref should round-trip");
+        assert_eq!(asserted.crs.as_deref(), Some("EPSG:32614"));
+        assert_close(asserted.resolution.unwrap().x, 10.0);
+    }
+
+    #[test]
+    fn dsm_generation_marks_unsupported_cells_nodata_without_interpolation() {
+        let dsm = generate_dsm(
+            &dense_cloud_fixture(),
+            dsm_config(),
+            "2026-06-01T12:05:00Z".to_string(),
+        )
+        .expect("DSM should generate");
+
+        assert!(dsm.nodata_mask[1]);
+        assert!(dsm.nodata_mask[2]);
+        assert_eq!(dsm.point_support_counts[1], 0);
+        assert_eq!(dsm.point_support_counts[2], 0);
+        assert_eq!(dsm.elevation_m[1], dsm_config().nodata_value);
+        assert_eq!(dsm.elevation_m[2], dsm_config().nodata_value);
+    }
+
     fn qa_frame_set(frames: Vec<FrameIngestRequest>) -> super::FrameSetRecord {
         build_frame_set_record(
             FrameSetIngestRequest {
@@ -2166,6 +2393,41 @@ mod tests {
         .expect("sparse SfM should solve");
 
         (frame_set, qa, sfm)
+    }
+
+    fn dense_cloud_fixture() -> DensePointCloud {
+        DensePointCloud {
+            frame_set_id: "frame-set-qa".to_string(),
+            points: vec![
+                DensePoint {
+                    x_m: 5.0,
+                    y_m: 15.0,
+                    z_m: 100.0,
+                },
+                DensePoint {
+                    x_m: 6.0,
+                    y_m: 16.0,
+                    z_m: 102.0,
+                },
+                DensePoint {
+                    x_m: 15.0,
+                    y_m: 5.0,
+                    z_m: 90.0,
+                },
+            ],
+        }
+    }
+
+    fn dsm_config() -> DsmConfig {
+        DsmConfig {
+            output_crs: "EPSG:32614".to_string(),
+            resolution_m_per_px: 10.0,
+            min_x_m: 0.0,
+            min_y_m: 0.0,
+            max_x_m: 20.0,
+            max_y_m: 20.0,
+            nodata_value: -9999.0,
+        }
     }
 
     fn meters_per_degree_lon(latitude: f64) -> f64 {
