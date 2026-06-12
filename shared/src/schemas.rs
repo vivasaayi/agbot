@@ -353,6 +353,242 @@ fn normalize_fleet_node_capabilities(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetNodeComponentHealth {
+    Ok,
+    Warn,
+    Critical,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetNodeComponentStatus {
+    pub component: String,
+    pub health: FleetNodeComponentHealth,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetNodeHeartbeat {
+    pub node_id: String,
+    pub version: String,
+    #[serde(default)]
+    pub components: Vec<FleetNodeComponentStatus>,
+    pub uptime_seconds: u64,
+    pub at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub runtime_mode: FleetNodeRuntimeMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetNodeHealthState {
+    Fresh,
+    Stale,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetNodeHealthSnapshot {
+    pub node_id: String,
+    pub version: String,
+    pub components: Vec<FleetNodeComponentStatus>,
+    pub capabilities: Vec<String>,
+    pub runtime_mode: FleetNodeRuntimeMode,
+    pub uptime_seconds: u64,
+    pub last_heartbeat_at: chrono::DateTime<chrono::Utc>,
+    pub heartbeat_age_seconds: u64,
+    pub state: FleetNodeHealthState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetHeartbeatEvaluation {
+    pub updated_record: FleetNodeRecord,
+    pub health: FleetNodeHealthSnapshot,
+}
+
+impl FleetHeartbeatEvaluation {
+    pub fn from_heartbeat(
+        record: &FleetNodeRecord,
+        heartbeat: &FleetNodeHeartbeat,
+        evaluated_at: chrono::DateTime<chrono::Utc>,
+        stale_after: std::time::Duration,
+        down_after: std::time::Duration,
+    ) -> Result<Self, FleetNodeHeartbeatError> {
+        apply_fleet_node_heartbeat(
+            record,
+            heartbeat.clone(),
+            evaluated_at,
+            stale_after,
+            down_after,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FleetNodeHeartbeatError {
+    #[error("heartbeat node_id cannot be empty")]
+    EmptyNodeId,
+    #[error("heartbeat node_id {actual} does not match enrolled node {expected}")]
+    NodeIdMismatch { expected: String, actual: String },
+    #[error("heartbeat version cannot be empty")]
+    EmptyVersion,
+    #[error("heartbeat components cannot be empty")]
+    EmptyComponents,
+    #[error("heartbeat component name cannot be empty")]
+    EmptyComponentName,
+    #[error("heartbeat capabilities cannot be empty")]
+    EmptyCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FleetNodeOperationError {
+    #[error("flight mode required for node {node_id}, actual mode {actual:?}")]
+    FlightModeRequired {
+        node_id: String,
+        actual: FleetNodeRuntimeMode,
+    },
+}
+
+pub fn apply_fleet_node_heartbeat(
+    record: &FleetNodeRecord,
+    heartbeat: FleetNodeHeartbeat,
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+    stale_after: std::time::Duration,
+    down_after: std::time::Duration,
+) -> Result<FleetHeartbeatEvaluation, FleetNodeHeartbeatError> {
+    let heartbeat = normalize_fleet_node_heartbeat(heartbeat)?;
+    if heartbeat.node_id != record.node_id {
+        return Err(FleetNodeHeartbeatError::NodeIdMismatch {
+            expected: record.node_id.clone(),
+            actual: heartbeat.node_id,
+        });
+    }
+
+    let heartbeat_age_seconds = evaluated_at
+        .signed_duration_since(heartbeat.at)
+        .num_seconds()
+        .max(0) as u64;
+    let state = if heartbeat_age_seconds > down_after.as_secs() {
+        FleetNodeHealthState::Down
+    } else if heartbeat_age_seconds > stale_after.as_secs() {
+        FleetNodeHealthState::Stale
+    } else {
+        FleetNodeHealthState::Fresh
+    };
+
+    let mut updated_record = record.clone();
+    updated_record.capabilities = heartbeat.capabilities.clone();
+    updated_record.runtime_mode = heartbeat.runtime_mode;
+
+    Ok(FleetHeartbeatEvaluation {
+        updated_record,
+        health: FleetNodeHealthSnapshot {
+            node_id: heartbeat.node_id,
+            version: heartbeat.version,
+            components: heartbeat.components,
+            capabilities: heartbeat.capabilities,
+            runtime_mode: heartbeat.runtime_mode,
+            uptime_seconds: heartbeat.uptime_seconds,
+            last_heartbeat_at: heartbeat.at,
+            heartbeat_age_seconds,
+            state,
+        },
+    })
+}
+
+pub fn assert_flight_operation_allowed(
+    record: &FleetNodeRecord,
+) -> Result<(), FleetNodeOperationError> {
+    if record.runtime_mode == FleetNodeRuntimeMode::Flight {
+        Ok(())
+    } else {
+        Err(FleetNodeOperationError::FlightModeRequired {
+            node_id: record.node_id.clone(),
+            actual: record.runtime_mode,
+        })
+    }
+}
+
+fn normalize_fleet_node_heartbeat(
+    heartbeat: FleetNodeHeartbeat,
+) -> Result<FleetNodeHeartbeat, FleetNodeHeartbeatError> {
+    let node_id =
+        normalize_heartbeat_text(heartbeat.node_id, FleetNodeHeartbeatError::EmptyNodeId)?;
+    let version =
+        normalize_heartbeat_text(heartbeat.version, FleetNodeHeartbeatError::EmptyVersion)?;
+    let capabilities = normalize_heartbeat_capabilities(heartbeat.capabilities)?;
+    let components = heartbeat
+        .components
+        .into_iter()
+        .map(normalize_heartbeat_component)
+        .collect::<Result<Vec<_>, _>>()?;
+    if components.is_empty() {
+        return Err(FleetNodeHeartbeatError::EmptyComponents);
+    }
+
+    Ok(FleetNodeHeartbeat {
+        node_id,
+        version,
+        components,
+        uptime_seconds: heartbeat.uptime_seconds,
+        at: heartbeat.at,
+        capabilities,
+        runtime_mode: heartbeat.runtime_mode,
+    })
+}
+
+fn normalize_heartbeat_component(
+    component: FleetNodeComponentStatus,
+) -> Result<FleetNodeComponentStatus, FleetNodeHeartbeatError> {
+    Ok(FleetNodeComponentStatus {
+        component: normalize_heartbeat_text(
+            component.component,
+            FleetNodeHeartbeatError::EmptyComponentName,
+        )?,
+        health: component.health,
+        message: component.message.and_then(|message| {
+            let message = message.trim();
+            (!message.is_empty()).then(|| message.to_string())
+        }),
+    })
+}
+
+fn normalize_heartbeat_capabilities(
+    capabilities: Vec<String>,
+) -> Result<Vec<String>, FleetNodeHeartbeatError> {
+    let capabilities = capabilities
+        .into_iter()
+        .filter_map(|capability| {
+            let capability = capability.trim();
+            (!capability.is_empty()).then(|| capability.to_ascii_lowercase())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if capabilities.is_empty() {
+        Err(FleetNodeHeartbeatError::EmptyCapabilities)
+    } else {
+        Ok(capabilities)
+    }
+}
+
+fn normalize_heartbeat_text(
+    value: String,
+    error: FleetNodeHeartbeatError,
+) -> Result<String, FleetNodeHeartbeatError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FarmFieldError {
     #[error("farm_id cannot be empty")]
@@ -2369,19 +2605,21 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-        validate_field_boundary, AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
+        apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
+        bind_fleet_node_identity, bounds_from_points, validate_field_boundary,
+        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
         AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord, CropPlanRecord,
         FarmFieldError, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError,
-        FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
-        ReportDeliverableRegistry, ReportFormat, ReportPersistenceError, ReportRecord,
-        ReportVisibility, SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
-        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry,
-        WorkOrderStatus,
+        FieldRecord, FleetHeartbeatEvaluation, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, MultispectralImage,
+        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
+        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
+        RecommendationStatus, RecommendationStatusChangeType, ReportDeliverableRegistry,
+        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, WorkOrderChangeType,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -2467,6 +2705,120 @@ mod tests {
         .expect_err("blank hardware identity should be rejected");
 
         assert_eq!(error, FleetNodeEnrollmentError::EmptyHardwareId);
+    }
+
+    #[test]
+    fn fleet_node_heartbeat_refreshes_capabilities_and_reports_fresh_health() {
+        let record = sample_fleet_node(FleetNodeRuntimeMode::Simulation);
+
+        let evaluation = apply_fleet_node_heartbeat(
+            &record,
+            sample_fleet_heartbeat("2026-06-12T12:00:00Z", FleetNodeRuntimeMode::Flight),
+            dt("2026-06-12T12:00:05Z"),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("heartbeat should evaluate");
+
+        assert_eq!(
+            evaluation.updated_record.runtime_mode,
+            FleetNodeRuntimeMode::Flight
+        );
+        assert_eq!(
+            evaluation.updated_record.capabilities,
+            vec!["lidar".to_string(), "multispectral".to_string()]
+        );
+        assert_eq!(evaluation.health.state, FleetNodeHealthState::Fresh);
+        assert_eq!(evaluation.health.version, "agbot-node 1.4.0");
+        assert_eq!(evaluation.health.heartbeat_age_seconds, 5);
+        assert_eq!(evaluation.health.components.len(), 2);
+    }
+
+    #[test]
+    fn fleet_node_health_marks_stale_then_down_after_silent_gap() {
+        let record = sample_fleet_node(FleetNodeRuntimeMode::Flight);
+        let heartbeat =
+            sample_fleet_heartbeat("2026-06-12T12:00:00Z", FleetNodeRuntimeMode::Flight);
+
+        let stale = FleetHeartbeatEvaluation::from_heartbeat(
+            &record,
+            &heartbeat,
+            dt("2026-06-12T12:00:20Z"),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("stale health should evaluate");
+        let down = FleetHeartbeatEvaluation::from_heartbeat(
+            &record,
+            &heartbeat,
+            dt("2026-06-12T12:01:10Z"),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("down health should evaluate");
+
+        assert_eq!(stale.health.state, FleetNodeHealthState::Stale);
+        assert_eq!(stale.health.heartbeat_age_seconds, 20);
+        assert_eq!(down.health.state, FleetNodeHealthState::Down);
+        assert_eq!(down.health.heartbeat_age_seconds, 70);
+    }
+
+    #[test]
+    fn flight_only_operation_rejects_simulation_node() {
+        let record = sample_fleet_node(FleetNodeRuntimeMode::Simulation);
+
+        let error = assert_flight_operation_allowed(&record)
+            .expect_err("simulation node should not accept flight-only work");
+
+        assert_eq!(
+            error,
+            FleetNodeOperationError::FlightModeRequired {
+                node_id: "node-001".to_string(),
+                actual: FleetNodeRuntimeMode::Simulation
+            }
+        );
+    }
+
+    fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
+        FleetNodeRecord {
+            node_id: "node-001".to_string(),
+            hardware_id: "hw-drone-001".to_string(),
+            kind: FleetNodeKind::Drone,
+            capabilities: vec!["multispectral".to_string()],
+            owner_org_id: "org-alpha".to_string(),
+            runtime_mode,
+            enrolled_at: "2026-06-12T11:00:00Z".to_string(),
+            status: FleetNodeStatus::Enrolled,
+        }
+    }
+
+    fn sample_fleet_heartbeat(at: &str, runtime_mode: FleetNodeRuntimeMode) -> FleetNodeHeartbeat {
+        FleetNodeHeartbeat {
+            node_id: "node-001".to_string(),
+            version: "agbot-node 1.4.0".to_string(),
+            components: vec![
+                FleetNodeComponentStatus {
+                    component: "flight_controller".to_string(),
+                    health: FleetNodeComponentHealth::Ok,
+                    message: None,
+                },
+                FleetNodeComponentStatus {
+                    component: "camera".to_string(),
+                    health: FleetNodeComponentHealth::Ok,
+                    message: Some("ready".to_string()),
+                },
+            ],
+            uptime_seconds: 3600,
+            at: dt(at),
+            capabilities: vec![" LiDAR ".to_string(), "multispectral".to_string()],
+            runtime_mode,
+        }
+    }
+
+    fn dt(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
     }
 
     #[test]
