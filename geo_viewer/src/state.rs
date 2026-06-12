@@ -152,9 +152,19 @@ pub struct SceneManifest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SceneProduct {
+    #[serde(default)]
+    pub product_id: Option<String>,
     pub kind: String,
+    #[serde(default)]
+    pub field_id: Option<String>,
+    #[serde(default)]
+    pub season_id: Option<String>,
     pub filename: String,
     pub content_type: String,
+    #[serde(default)]
+    pub spatial_ref: Option<RasterSpatialRef>,
+    #[serde(default)]
+    pub source_image_ids: Vec<String>,
     pub url_path: String,
     pub tile_url_template: String,
 }
@@ -333,6 +343,7 @@ pub fn active_product_selection(
     if product.tile_url_template.trim().is_empty() {
         anyhow::bail!("product {} is missing a tile URL template", product.kind);
     }
+    assert_product_provenance_alignment(product, manifest_state)?;
 
     Ok(ActiveProductSelection {
         selected_layer: target_idx,
@@ -340,6 +351,92 @@ pub fn active_product_selection(
         tile_source: product.tile_source(&config.base_url),
         legend: product_legend_for_kind(&product.kind, &placement.extent)?,
     })
+}
+
+fn assert_product_provenance_alignment(
+    product: &SceneProduct,
+    manifest_state: &SceneManifestState,
+) -> Result<()> {
+    let product_label = product
+        .product_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(product.kind.as_str());
+
+    if product
+        .product_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        anyhow::bail!("product {} has an empty product_id", product.kind);
+    }
+    for source_image_id in &product.source_image_ids {
+        if source_image_id.trim().is_empty() {
+            anyhow::bail!("product {product_label} has an empty source image id");
+        }
+    }
+    if let Some(field_id) = product
+        .field_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let manifest_field = manifest_state
+            .field_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "product {product_label} declares field_id but manifest is unlinked"
+                )
+            })?;
+        if manifest_field != field_id {
+            anyhow::bail!(
+                "product {product_label} field_id {field_id} does not match manifest field_id {manifest_field}"
+            );
+        }
+    }
+    if let Some(season_id) = product
+        .season_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let manifest_season = manifest_state
+            .season_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "product {product_label} declares season_id but manifest has no season_id"
+                )
+            })?;
+        if manifest_season != season_id {
+            anyhow::bail!(
+                "product {product_label} season_id {season_id} does not match manifest season_id {manifest_season}"
+            );
+        }
+    }
+    if let Some(spatial_ref) = product.spatial_ref.as_ref() {
+        let width = manifest_state.width.ok_or_else(|| {
+            anyhow::anyhow!(
+                "product {product_label} declares spatial_ref but manifest width is missing"
+            )
+        })?;
+        let height = manifest_state.height.ok_or_else(|| {
+            anyhow::anyhow!(
+                "product {product_label} declares spatial_ref but manifest height is missing"
+            )
+        })?;
+        assert_raster_spatial_ref(Some(spatial_ref), width, height).map_err(|err| {
+            anyhow::anyhow!("product {product_label} spatial_ref assertion failed: {err}")
+        })?;
+    }
+
+    Ok(())
 }
 
 pub fn switch_active_product(
@@ -882,9 +979,14 @@ mod tests {
     #[test]
     fn tile_source_formats_tile_url_from_template() {
         let product = SceneProduct {
+            product_id: None,
             kind: "ndvi".to_string(),
+            field_id: None,
+            season_id: None,
             filename: "ndvi.png".to_string(),
             content_type: "image/png".to_string(),
+            spatial_ref: None,
+            source_image_ids: Vec::new(),
             url_path: "/api/scenes/scene-1/products/ndvi".to_string(),
             tile_url_template: "/api/scenes/scene-1/products/ndvi/tiles/{z}/{x}/{y}.png"
                 .to_string(),
@@ -974,9 +1076,28 @@ mod tests {
                 },
                 "available_products": [
                     {
+                        "product_id": "scene-1:ndvi",
                         "kind": "ndvi",
+                        "field_id": "field-1",
+                        "season_id": "2026",
                         "filename": "ndvi.png",
                         "content_type": "image/png",
+                        "spatial_ref": {
+                            "georeferenced": true,
+                            "crs": "EPSG:4326",
+                            "bbox": {
+                                "min_lon": -89.5,
+                                "min_lat": 40.0,
+                                "max_lon": -88.5,
+                                "max_lat": 41.0
+                            },
+                            "geo_transform": [-89.5, 0.01, 0.0, 41.0, 0.0, -0.01],
+                            "resolution": {
+                                "x": 0.01,
+                                "y": 0.01
+                            }
+                        },
+                        "source_image_ids": ["image-1"],
                         "url_path": "/api/scenes/scene-1/products/ndvi",
                         "tile_url_template": "/api/scenes/scene-1/products/ndvi/tiles/{z}/{x}/{y}.png"
                     }
@@ -990,6 +1111,29 @@ mod tests {
         assert_eq!(manifest.geospatial.crs.as_deref(), Some("EPSG:4326"));
         assert_eq!(manifest.available_products.len(), 1);
         assert_eq!(manifest.available_products[0].kind, "ndvi");
+        assert_eq!(
+            manifest.available_products[0].product_id.as_deref(),
+            Some("scene-1:ndvi")
+        );
+        assert_eq!(
+            manifest.available_products[0].field_id.as_deref(),
+            Some("field-1")
+        );
+        assert_eq!(
+            manifest.available_products[0].season_id.as_deref(),
+            Some("2026")
+        );
+        assert_eq!(
+            manifest.available_products[0].source_image_ids,
+            vec!["image-1".to_string()]
+        );
+        assert_eq!(
+            manifest.available_products[0]
+                .spatial_ref
+                .as_ref()
+                .and_then(|spatial_ref| spatial_ref.crs.as_deref()),
+            Some("EPSG:4326")
+        );
     }
 
     #[test]
@@ -1283,9 +1427,14 @@ mod tests {
 
     fn sample_product(kind: &str) -> SceneProduct {
         SceneProduct {
+            product_id: None,
             kind: kind.to_string(),
+            field_id: None,
+            season_id: None,
             filename: format!("{kind}.png"),
             content_type: "image/png".to_string(),
+            spatial_ref: None,
+            source_image_ids: Vec::new(),
             url_path: format!("/api/scenes/scene-1/products/{kind}"),
             tile_url_template: format!(
                 "/api/scenes/scene-1/products/{kind}/tiles/{{z}}/{{x}}/{{y}}.png"

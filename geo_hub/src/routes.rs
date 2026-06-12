@@ -1,6 +1,8 @@
 use crate::{
     error::{AppError, AppResult},
-    ingest, landsat, shapefile,
+    ingest, landsat,
+    product_catalog::ProductPublishError,
+    shapefile,
     state::{AppState, SceneSearchCacheKey},
 };
 use anyhow::Error;
@@ -73,9 +75,14 @@ pub struct SceneDetail {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProductSummary {
+    pub product_id: Option<String>,
     pub kind: String,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
     pub filename: String,
     pub content_type: String,
+    pub spatial_ref: Option<RasterSpatialRef>,
+    pub source_image_ids: Vec<String>,
     pub url_path: String,
     pub tile_url_template: String,
 }
@@ -101,11 +108,13 @@ pub struct LayerListResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerMetadata {
     pub layer_id: String,
+    pub product_id: Option<String>,
     pub scene_id: String,
     pub field_id: Option<String>,
     pub season_id: Option<String>,
     pub product_kind: String,
     pub spatial_ref: RasterSpatialRef,
+    pub source_image_ids: Vec<String>,
     pub freshness: LayerFreshness,
     pub source: String,
     pub url_path: String,
@@ -2415,6 +2424,7 @@ async fn resolve_product_path(state: &AppState, scene_id: &str, kind: &str) -> A
     match ingest::ensure_product(&state.pool, scene_id, kind).await {
         Ok(path) => Ok(path),
         Err(err) if is_missing_scene_error(&err) => Err(AppError::NotFound),
+        Err(err) if is_product_publish_error(&err) => Err(AppError::BadRequest(err.to_string())),
         Err(err) => Err(AppError::Anyhow(err)),
     }
 }
@@ -2564,11 +2574,17 @@ async fn collect_scene_products(
         }
     }
 
-    let rows = sqlx::query("SELECT kind, path FROM products WHERE scene_id = ?1")
-        .bind(scene_id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(Error::from)?;
+    let rows = sqlx::query(
+        r#"
+        SELECT product_id, field_id, season_id, kind, path, spatial_ref_json, source_image_ids_json
+        FROM products
+        WHERE scene_id = ?1
+        "#,
+    )
+    .bind(scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
 
     for row in rows {
         let kind: String = row.get("kind");
@@ -2579,9 +2595,10 @@ async fn collect_scene_products(
         if !exists {
             continue;
         }
-        products
-            .entry(kind.clone())
-            .or_insert_with(|| build_product_summary(scene_id, &kind, &path));
+        products.insert(
+            kind.clone(),
+            product_summary_from_row(scene_id, &row, &path)?,
+        );
     }
 
     Ok(products.into_values().collect())
@@ -2591,8 +2608,13 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
     let rows = sqlx::query(
         r#"
         SELECT
+            p.product_id,
             p.kind,
             p.path,
+            p.field_id AS product_field_id,
+            p.season_id AS product_season_id,
+            p.spatial_ref_json AS product_spatial_ref_json,
+            p.source_image_ids_json,
             s.scene_id,
             s.sensor,
             s.acquired_at,
@@ -2602,7 +2624,7 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
             i.ingested_at,
             i.coverage_fraction,
             i.source_path,
-            sr.spatial_ref_json
+            sr.spatial_ref_json AS scene_spatial_ref_json
         FROM products p
         JOIN scenes s ON s.scene_id = p.scene_id
         LEFT JOIN scene_ingests i ON i.scene_id = s.scene_id
@@ -2624,8 +2646,13 @@ async fn load_layer_row(
     let row = sqlx::query(
         r#"
         SELECT
+            p.product_id,
             p.kind,
             p.path,
+            p.field_id AS product_field_id,
+            p.season_id AS product_season_id,
+            p.spatial_ref_json AS product_spatial_ref_json,
+            p.source_image_ids_json,
             s.scene_id,
             s.sensor,
             s.acquired_at,
@@ -2635,7 +2662,7 @@ async fn load_layer_row(
             i.ingested_at,
             i.coverage_fraction,
             i.source_path,
-            sr.spatial_ref_json
+            sr.spatial_ref_json AS scene_spatial_ref_json
         FROM products p
         JOIN scenes s ON s.scene_id = p.scene_id
         LEFT JOIN scene_ingests i ON i.scene_id = s.scene_id
@@ -2715,7 +2742,10 @@ async fn layer_from_row(
 
     let scene_id: String = row.get("scene_id");
     let product_kind: String = row.get("kind");
-    let Some(spatial_ref_json) = row.get::<Option<String>, _>("spatial_ref_json") else {
+    let Some(spatial_ref_json) = row
+        .get::<Option<String>, _>("product_spatial_ref_json")
+        .or_else(|| row.get::<Option<String>, _>("scene_spatial_ref_json"))
+    else {
         return if strict {
             Err(AppError::BadRequest(format!(
                 "metadata-integrity: layer {scene_id}:{product_kind} has no asserted spatial_ref"
@@ -2743,14 +2773,25 @@ async fn layer_from_row(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| row.get("sensor"));
     let url_path = format!("/api/scenes/{scene_id}/products/{product_kind}");
+    let field_id = row
+        .get::<Option<String>, _>("product_field_id")
+        .or_else(|| row.get::<Option<String>, _>("field_id"));
+    let season_id = row
+        .get::<Option<String>, _>("product_season_id")
+        .or_else(|| row.get::<Option<String>, _>("season_id"));
+    let product_id = row
+        .get::<Option<String>, _>("product_id")
+        .filter(|value| !value.trim().is_empty());
 
     Ok(Some(LayerMetadata {
         layer_id: format!("{scene_id}:{product_kind}"),
+        product_id,
         scene_id,
-        field_id: row.get("field_id"),
-        season_id: row.get("season_id"),
+        field_id,
+        season_id,
         product_kind,
         spatial_ref,
+        source_image_ids: decode_source_image_ids(row.get("source_image_ids_json"))?,
         freshness: LayerFreshness {
             acquired_at: row.get("acquired_at"),
             ingested_at: row.get("ingested_at"),
@@ -2788,6 +2829,11 @@ fn is_missing_scene_error(err: &anyhow::Error) -> bool {
             .downcast_ref::<sqlx::Error>()
             .is_some_and(|sqlx_err| matches!(sqlx_err, sqlx::Error::RowNotFound))
     })
+}
+
+fn is_product_publish_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|source| source.downcast_ref::<ProductPublishError>().is_some())
 }
 
 fn content_type_for_path(path: &FsPath) -> &'static str {
@@ -2838,18 +2884,75 @@ async fn select_preferred_product_path(entries: &mut fs::ReadDir) -> AppResult<O
 
 fn build_product_summary(scene_id: &str, kind: &str, path: &FsPath) -> ProductSummary {
     ProductSummary {
+        product_id: None,
         kind: kind.to_string(),
+        field_id: None,
+        season_id: None,
         filename: path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("unknown")
             .to_string(),
         content_type: content_type_for_path(path).to_string(),
+        spatial_ref: None,
+        source_image_ids: Vec::new(),
         url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
         tile_url_template: format!(
             "/api/scenes/{scene_id}/products/{kind}/tiles/{{z}}/{{x}}/{{y}}.png"
         ),
     }
+}
+
+fn product_summary_from_row(
+    scene_id: &str,
+    row: &sqlx::sqlite::SqliteRow,
+    path: &FsPath,
+) -> AppResult<ProductSummary> {
+    let kind: String = row.get("kind");
+    let spatial_ref = row
+        .get::<Option<String>, _>("spatial_ref_json")
+        .map(|json| {
+            serde_json::from_str::<RasterSpatialRef>(&json).map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode product spatial_ref_json"),
+                )
+            })
+        })
+        .transpose()?;
+
+    Ok(ProductSummary {
+        product_id: row
+            .get::<Option<String>, _>("product_id")
+            .filter(|value| !value.trim().is_empty()),
+        kind: kind.clone(),
+        field_id: row
+            .get::<Option<String>, _>("field_id")
+            .filter(|value| !value.trim().is_empty()),
+        season_id: row
+            .get::<Option<String>, _>("season_id")
+            .filter(|value| !value.trim().is_empty()),
+        filename: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        content_type: content_type_for_path(path).to_string(),
+        spatial_ref,
+        source_image_ids: decode_source_image_ids(row.get("source_image_ids_json"))?,
+        url_path: format!("/api/scenes/{scene_id}/products/{kind}"),
+        tile_url_template: format!(
+            "/api/scenes/{scene_id}/products/{kind}/tiles/{{z}}/{{x}}/{{y}}.png"
+        ),
+    })
+}
+
+fn decode_source_image_ids(value: Option<String>) -> AppResult<Vec<String>> {
+    let Some(json) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<String>>(&json).map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode product source_image_ids_json"))
+    })
 }
 
 async fn assert_scene_product_spatial_integrity(state: &AppState, scene_id: &str) -> AppResult<()> {

@@ -7,6 +7,7 @@ use geo_hub::state::AppState;
 use geo_hub::{db, server, HubConfig};
 use image::{GrayImage, Luma};
 use serde_json::json;
+use sqlx::Row;
 use std::{path::Path, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use tower::util::ServiceExt;
@@ -3132,7 +3133,7 @@ async fn product_request_rejects_spatial_ref_integrity_mismatch() -> Result<()> 
 }
 
 #[tokio::test]
-async fn generates_ndvi_via_db_fallback_and_persists_product_row() -> Result<()> {
+async fn generates_ndvi_via_db_fallback_and_persists_product_provenance() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
 
@@ -3197,9 +3198,11 @@ async fn generates_ndvi_via_db_fallback_and_persists_product_row() -> Result<()>
     .bind("2025-01-01T00:00:00Z")
     .execute(&ctx.pool)
     .await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
 
     let response = ctx
         .app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -3227,15 +3230,202 @@ async fn generates_ndvi_via_db_fallback_and_persists_product_row() -> Result<()>
     assert!(body.len() > 8);
     assert_eq!(&body.as_ref()[..8], b"\x89PNG\r\n\x1a\n");
 
-    let product_path: String =
-        sqlx::query_scalar("SELECT path FROM products WHERE scene_id = ?1 AND kind = ?2")
-            .bind(scene_id)
-            .bind("ndvi")
-            .fetch_one(&ctx.pool)
-            .await?;
-
+    let row = sqlx::query(
+        r#"
+        SELECT product_id, field_id, season_id, spatial_ref_json, source_image_ids_json, path
+        FROM products
+        WHERE scene_id = ?1 AND kind = ?2
+        "#,
+    )
+    .bind(scene_id)
+    .bind("ndvi")
+    .fetch_one(&ctx.pool)
+    .await?;
+    let product_path: String = row.get("path");
     assert!(Path::new(&product_path).exists());
     assert!(product_path.ends_with(".png"));
+    assert_eq!(
+        row.get::<String, _>("product_id"),
+        "scene_from_db:ndvi".to_string()
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("field_id").as_deref(),
+        Some("field-alpha")
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("season_id").as_deref(),
+        Some("2026")
+    );
+    let persisted_spatial_ref: serde_json::Value =
+        serde_json::from_str(&row.get::<String, _>("spatial_ref_json"))?;
+    assert_eq!(
+        persisted_spatial_ref
+            .pointer("/bbox/max_lon")
+            .and_then(|value| value.as_f64()),
+        Some(2.0)
+    );
+    let source_image_ids: Vec<String> =
+        serde_json::from_str(&row.get::<String, _>("source_image_ids_json"))?;
+    assert_eq!(source_image_ids, vec![image_id.to_string()]);
+
+    let scene_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(scene_response.status(), StatusCode::OK);
+    let scene_body = to_bytes(scene_response.into_body(), 64 * 1024).await?;
+    let scene_json: serde_json::Value = serde_json::from_slice(&scene_body)?;
+    assert_eq!(
+        scene_json
+            .pointer("/available_products/0/product_id")
+            .and_then(|value| value.as_str()),
+        Some("scene_from_db:ndvi")
+    );
+    assert_eq!(
+        scene_json
+            .pointer("/available_products/0/field_id")
+            .and_then(|value| value.as_str()),
+        Some("field-alpha")
+    );
+    assert_eq!(
+        scene_json
+            .pointer("/available_products/0/season_id")
+            .and_then(|value| value.as_str()),
+        Some("2026")
+    );
+    assert_eq!(
+        scene_json
+            .pointer("/available_products/0/source_image_ids/0")
+            .and_then(|value| value.as_str()),
+        Some(image_id.to_string().as_str())
+    );
+
+    let layer_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/layers/{scene_id}/ndvi"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(layer_response.status(), StatusCode::OK);
+    let layer_body = to_bytes(layer_response.into_body(), 64 * 1024).await?;
+    let layer_json: serde_json::Value = serde_json::from_slice(&layer_body)?;
+    assert_eq!(
+        layer_json
+            .get("product_id")
+            .and_then(|value| value.as_str()),
+        Some("scene_from_db:ndvi")
+    );
+    assert_eq!(
+        layer_json
+            .pointer("/source_image_ids/0")
+            .and_then(|value| value.as_str()),
+        Some(image_id.to_string().as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn unlinked_scene_product_publish_is_rejected_without_orphan_row() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let scene_id = "scene_unlinked";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+
+    let b4_path = scene_dir.join("B4.png");
+    let b5_path = scene_dir.join("B5.png");
+    let b6_path = scene_dir.join("B6.png");
+    write_gray_png(&b4_path, 40)?;
+    write_gray_png(&b5_path, 140)?;
+    write_gray_png(&b6_path, 90)?;
+
+    let metadata_json = json!({
+        "metadata": {
+            "timestamp": "2025-01-01T00:00:00Z",
+            "gps_position": null,
+            "bands": ["B4", "B5", "B6"],
+            "exposure_time": 1.0,
+            "gain": 1.0,
+            "width": 2,
+            "height": 2,
+            "spatial_ref": {
+                "georeferenced": true,
+                "crs": "LOCAL_TEST",
+                "bbox": {
+                    "min_lon": 0.0,
+                    "min_lat": 0.0,
+                    "max_lon": 2.0,
+                    "max_lat": 2.0
+                },
+                "geo_transform": [0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                "resolution": {
+                    "x": 1.0,
+                    "y": 1.0
+                }
+            }
+        },
+        "file_paths": {
+            "B4": b4_path.to_string_lossy().to_string(),
+            "B5": b5_path.to_string_lossy().to_string(),
+            "B6": b6_path.to_string_lossy().to_string()
+        },
+        "image_id": Uuid::new_v4()
+    })
+    .to_string();
+
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (scene_id, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(scene_id)
+    .bind("landsat8")
+    .bind("2025-01-01T00:00:00Z")
+    .bind(scene_dir.to_string_lossy().to_string())
+    .bind(metadata_json)
+    .bind(None::<f64>)
+    .bind("2025-01-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/products/ndvi"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&body).contains("unlinked scene"));
+
+    let product_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM products WHERE scene_id = ?1")
+            .bind(scene_id)
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(product_count, 0);
 
     Ok(())
 }

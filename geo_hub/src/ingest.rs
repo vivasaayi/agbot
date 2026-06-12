@@ -1,4 +1,4 @@
-use crate::{config::HubConfig, db::DbPool};
+use crate::{config::HubConfig, db::DbPool, product_catalog};
 use anyhow::{anyhow, Result};
 use clap::Args;
 use imagery_processor::{IndexKind, IndicesArgs, OutputFormat, Processor, SensorPreset};
@@ -529,6 +529,7 @@ async fn cleanup_failed_ingest(pool: &DbPool, scene_id: &str, scene_dir: &Path) 
 
 pub async fn ensure_product(pool: &DbPool, scene_id: &str, kind: &str) -> Result<PathBuf> {
     if let Some(path) = existing_product(pool, scene_id, kind).await? {
+        product_catalog::publish_product(pool, scene_id, kind, &path).await?;
         return Ok(path);
     }
 
@@ -599,19 +600,7 @@ pub async fn ensure_product(pool: &DbPool, scene_id: &str, kind: &str) -> Result
 
     let product_path = find_latest_file(&product_dir, &["png", "tif", "tiff"]).await?;
 
-    sqlx::query(
-        r#"
-        INSERT INTO products (scene_id, kind, path, created_at)
-        VALUES (?1, ?2, ?3, datetime('now'))
-        ON CONFLICT(scene_id, kind) DO UPDATE SET path = excluded.path,
-                                                created_at = datetime('now')
-        "#,
-    )
-    .bind(scene_id)
-    .bind(kind)
-    .bind(product_path.to_string_lossy().to_string())
-    .execute(pool)
-    .await?;
+    product_catalog::publish_product(pool, scene_id, kind, &product_path).await?;
 
     Ok(product_path)
 }

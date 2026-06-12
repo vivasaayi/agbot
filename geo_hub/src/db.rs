@@ -162,9 +162,14 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id TEXT,
             scene_id TEXT NOT NULL,
+            field_id TEXT,
+            season_id TEXT,
             kind TEXT NOT NULL,
             path TEXT NOT NULL,
+            spatial_ref_json TEXT,
+            source_image_ids_json TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(scene_id) REFERENCES scenes(scene_id) ON DELETE CASCADE,
             UNIQUE(scene_id, kind)
@@ -172,6 +177,46 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         "#,
     )
     .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "product_id",
+        "ALTER TABLE products ADD COLUMN product_id TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "field_id",
+        "ALTER TABLE products ADD COLUMN field_id TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "season_id",
+        "ALTER TABLE products ADD COLUMN season_id TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "spatial_ref_json",
+        "ALTER TABLE products ADD COLUMN spatial_ref_json TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "source_image_ids_json",
+        "ALTER TABLE products ADD COLUMN source_image_ids_json TEXT",
+    )
     .await?;
 
     sqlx::query(
@@ -338,6 +383,14 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     sqlx::query(
         r#"
         CREATE INDEX IF NOT EXISTS idx_reports_scene_id ON reports(scene_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_products_product_id ON products(product_id);
         "#,
     )
     .execute(pool)
