@@ -11,6 +11,7 @@ pub mod fleet_alerts;
 pub mod logging;
 pub mod observability;
 pub mod plugin_extensions;
+pub mod resource_budget;
 pub mod schemas;
 pub mod secrets;
 pub mod types;
@@ -22,6 +23,7 @@ pub use logging::{
     logging_operation_span, with_correlation_id, LoggingContext, LoggingNodeIdSource,
 };
 pub use observability::*;
+pub use resource_budget::*;
 pub use secrets::*;
 pub use types::*;
 
