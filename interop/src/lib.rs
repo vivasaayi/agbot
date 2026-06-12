@@ -9,6 +9,7 @@ const WEB_MERCATOR_RADIUS_METERS: f64 = 6_378_137.0;
 #[serde(rename_all = "snake_case")]
 pub enum ImportFormat {
     GeoJson,
+    GeoPackage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +61,25 @@ pub struct InteropImportResult {
     pub features: Vec<ReprojectedFeature>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorRoundTripReport {
+    pub format: ImportFormat,
+    pub source_crs: String,
+    pub exported_crs: String,
+    pub feature_count: usize,
+    pub original_extent: InteropExtent,
+    pub round_tripped_extent: InteropExtent,
+    pub max_coordinate_drift: f64,
+    pub exported_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeoPackageLayerReport {
+    pub layer_name: String,
+    pub crs: String,
+    pub feature_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InteropRejectionReason {
@@ -69,6 +89,7 @@ pub enum InteropRejectionReason {
     UnsupportedGeometry { geometry_type: String },
     InvalidGeometry,
     EmptyFeatureCollection,
+    LayerMissingCrs { layer_name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
@@ -97,7 +118,170 @@ pub fn validate_and_reproject_import(
 
     match payload.format {
         ImportFormat::GeoJson => parse_geojson_and_reproject(&filename, &payload.bytes, target_crs),
+        ImportFormat::GeoPackage => Err(rejected(&filename, InteropRejectionReason::ParseError)),
     }
+}
+
+pub fn round_trip_vector_layer(
+    payload: ImportPayload,
+    transform: CrsTransform,
+) -> Result<VectorRoundTripReport, InteropError> {
+    let imported = validate_and_reproject_import(payload, transform)?;
+    let exported_bytes = export_geojson(&imported)?;
+    let round_tripped = validate_and_reproject_import(
+        ImportPayload {
+            format: ImportFormat::GeoJson,
+            filename: "round-trip.geojson".to_string(),
+            bytes: exported_bytes.clone(),
+        },
+        CrsTransform {
+            target_crs: imported.target_crs.clone(),
+        },
+    )?;
+    let max_coordinate_drift = extent_drift(imported.extent, round_tripped.extent);
+    Ok(VectorRoundTripReport {
+        format: ImportFormat::GeoJson,
+        source_crs: imported.source_crs,
+        exported_crs: imported.target_crs,
+        feature_count: imported.feature_count,
+        original_extent: imported.extent,
+        round_tripped_extent: round_tripped.extent,
+        max_coordinate_drift,
+        exported_bytes,
+    })
+}
+
+pub fn validate_geopackage_layers(
+    payload: ImportPayload,
+) -> Result<Vec<GeoPackageLayerReport>, InteropError> {
+    let filename = normalized_filename(payload.filename);
+    let document = serde_json::from_slice::<Value>(&payload.bytes)
+        .map_err(|_| rejected(&filename, InteropRejectionReason::ParseError))?;
+    let layers = document
+        .get("layers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| rejected(&filename, InteropRejectionReason::ParseError))?;
+    let mut reports = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let layer = layer
+            .as_object()
+            .ok_or_else(|| rejected(&filename, InteropRejectionReason::ParseError))?;
+        let layer_name = layer
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let Some(crs) = layer
+            .get("crs")
+            .and_then(Value::as_str)
+            .and_then(normalize_crs)
+        else {
+            return Err(rejected(
+                &filename,
+                InteropRejectionReason::LayerMissingCrs { layer_name },
+            ));
+        };
+        reject_unsupported_crs(&filename, &crs)?;
+        let feature_count = layer
+            .get("feature_count")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        reports.push(GeoPackageLayerReport {
+            layer_name,
+            crs,
+            feature_count,
+        });
+    }
+    Ok(reports)
+}
+
+fn export_geojson(imported: &InteropImportResult) -> Result<Vec<u8>, InteropError> {
+    let features = imported
+        .features
+        .iter()
+        .map(|feature| {
+            let mut feature_object = Map::new();
+            feature_object.insert("type".to_string(), Value::String("Feature".to_string()));
+            feature_object.insert(
+                "properties".to_string(),
+                Value::Object(feature.properties.clone()),
+            );
+            feature_object.insert(
+                "geometry".to_string(),
+                geometry_to_geojson(&feature.geometry),
+            );
+            Value::Object(feature_object)
+        })
+        .collect::<Vec<_>>();
+    let mut crs_properties = Map::new();
+    crs_properties.insert(
+        "name".to_string(),
+        Value::String(imported.target_crs.clone()),
+    );
+    let mut crs = Map::new();
+    crs.insert("type".to_string(), Value::String("name".to_string()));
+    crs.insert("properties".to_string(), Value::Object(crs_properties));
+    let mut document = Map::new();
+    document.insert(
+        "type".to_string(),
+        Value::String("FeatureCollection".to_string()),
+    );
+    document.insert("crs".to_string(), Value::Object(crs));
+    document.insert("features".to_string(), Value::Array(features));
+    serde_json::to_vec(&Value::Object(document))
+        .map_err(|_| rejected("<export>", InteropRejectionReason::ParseError))
+}
+
+fn geometry_to_geojson(geometry: &ReprojectedGeometry) -> Value {
+    let (geometry_type, coordinates) = match geometry {
+        ReprojectedGeometry::Point { coordinate } => ("Point", coordinate_to_geojson(*coordinate)),
+        ReprojectedGeometry::LineString { coordinates } => (
+            "LineString",
+            Value::Array(
+                coordinates
+                    .iter()
+                    .map(|coordinate| coordinate_to_geojson(*coordinate))
+                    .collect(),
+            ),
+        ),
+        ReprojectedGeometry::Polygon { rings } => (
+            "Polygon",
+            Value::Array(
+                rings
+                    .iter()
+                    .map(|ring| {
+                        Value::Array(
+                            ring.iter()
+                                .map(|coordinate| coordinate_to_geojson(*coordinate))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+        ),
+    };
+    let mut object = Map::new();
+    object.insert("type".to_string(), Value::String(geometry_type.to_string()));
+    object.insert("coordinates".to_string(), coordinates);
+    Value::Object(object)
+}
+
+fn coordinate_to_geojson(coordinate: InteropCoordinate) -> Value {
+    Value::Array(vec![Value::from(coordinate.x), Value::from(coordinate.y)])
+}
+
+fn extent_drift(left: InteropExtent, right: InteropExtent) -> f64 {
+    [
+        (left.min_x - right.min_x).abs(),
+        (left.min_y - right.min_y).abs(),
+        (left.max_x - right.max_x).abs(),
+        (left.max_y - right.max_y).abs(),
+    ]
+    .into_iter()
+    .fold(0.0, f64::max)
 }
 
 fn parse_geojson_and_reproject(
@@ -395,8 +579,9 @@ impl ExtentBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_and_reproject_import, CrsTransform, ImportFormat, ImportPayload, InteropError,
-        InteropRejectionReason, ReprojectedGeometry,
+        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
+        CrsTransform, ImportFormat, ImportPayload, InteropError, InteropRejectionReason,
+        ReprojectedGeometry,
     };
 
     #[test]
@@ -474,6 +659,56 @@ mod tests {
             InteropError::Rejected {
                 filename: "broken.geojson".to_string(),
                 reason: InteropRejectionReason::ParseError
+            }
+        );
+    }
+
+    #[test]
+    fn vector_round_trip_geojson_preserves_crs_extent_and_geometry() {
+        let report = round_trip_vector_layer(
+            ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: "field-alpha.geojson".to_string(),
+                bytes: valid_geojson("EPSG:4326").as_bytes().to_vec(),
+            },
+            CrsTransform {
+                target_crs: "EPSG:3857".to_string(),
+            },
+        )
+        .expect("GeoJSON should round-trip");
+
+        assert_eq!(report.format, ImportFormat::GeoJson);
+        assert_eq!(report.source_crs, "EPSG:4326");
+        assert_eq!(report.exported_crs, "EPSG:3857");
+        assert_eq!(report.feature_count, 1);
+        assert!(report.max_coordinate_drift <= 0.000001);
+        assert!(std::str::from_utf8(&report.exported_bytes)
+            .expect("export should be utf8")
+            .contains("\"EPSG:3857\""));
+    }
+
+    #[test]
+    fn geopackage_layer_without_declared_crs_is_flagged_not_assumed() {
+        let error = validate_geopackage_layers(ImportPayload {
+            format: ImportFormat::GeoPackage,
+            filename: "multi-layer.gpkg.json".to_string(),
+            bytes: br#"{
+                "layers": [
+                    { "name": "field-alpha", "crs": "EPSG:4326", "feature_count": 1 },
+                    { "name": "legacy-layer", "feature_count": 2 }
+                ]
+            }"#
+            .to_vec(),
+        })
+        .expect_err("undeclared CRS layer should be rejected");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "multi-layer.gpkg.json".to_string(),
+                reason: InteropRejectionReason::LayerMissingCrs {
+                    layer_name: "legacy-layer".to_string()
+                }
             }
         );
     }
