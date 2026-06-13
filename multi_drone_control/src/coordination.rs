@@ -9,9 +9,11 @@ use uuid::Uuid;
 pub struct CoordinationEngine {
     active_drones: HashMap<Uuid, DroneState>,
     coordination_rules: Vec<CoordinationRule>,
+    coordination_rule_audit_log: Vec<CoordinationRuleAuditEvent>,
     communication_range: f64, // meters
     update_interval: std::time::Duration,
     telemetry_freshness_timeout: ChronoDuration,
+    heartbeat_timeout: ChronoDuration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +80,44 @@ pub struct SwarmTelemetryReport {
     pub stale_drones: usize,
     pub status: SwarmTelemetryStatus,
     pub drones: Vec<DroneTelemetrySnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DroneLinkHealth {
+    Healthy,
+    Degraded,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DroneLinkStatus {
+    pub drone_id: Uuid,
+    pub last_heartbeat: DateTime<Utc>,
+    pub heartbeat_age_seconds: i64,
+    pub link_quality: f32,
+    pub health: DroneLinkHealth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationRuleAuditEvent {
+    pub rule_id: Uuid,
+    pub rule_name: String,
+    pub drone_id: Option<Uuid>,
+    pub triggered_at: DateTime<Utc>,
+    pub condition: String,
+    pub action: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkQualityReport {
+    pub generated_at: DateTime<Utc>,
+    pub total_links: usize,
+    pub healthy_links: usize,
+    pub degraded_links: usize,
+    pub timed_out_links: usize,
+    pub links: Vec<DroneLinkStatus>,
+    pub audit_events: Vec<CoordinationRuleAuditEvent>,
 }
 
 pub struct CoordinationRule {
@@ -240,9 +280,11 @@ impl CoordinationEngine {
         Self {
             active_drones: HashMap::new(),
             coordination_rules: Self::default_rules(),
+            coordination_rule_audit_log: Vec::new(),
             communication_range: 1000.0, // 1km
             update_interval: std::time::Duration::from_millis(500),
             telemetry_freshness_timeout: ChronoDuration::seconds(5),
+            heartbeat_timeout: ChronoDuration::seconds(30),
         }
     }
 
@@ -314,6 +356,46 @@ impl CoordinationEngine {
         );
         self.telemetry_freshness_timeout = timeout;
         Ok(())
+    }
+
+    pub fn set_heartbeat_timeout(&mut self, timeout: ChronoDuration) -> Result<()> {
+        ensure!(
+            timeout > ChronoDuration::zero(),
+            "heartbeat timeout must be positive"
+        );
+        self.heartbeat_timeout = timeout;
+        for rule in &mut self.coordination_rules {
+            if let RuleCondition::CommunicationLoss { timeout_seconds } = &mut rule.condition {
+                *timeout_seconds = timeout.num_seconds().max(1) as u32;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn record_heartbeat(
+        &mut self,
+        drone_id: Uuid,
+        received_at: DateTime<Utc>,
+        link_quality: f32,
+    ) -> Result<DroneLinkStatus> {
+        ensure!(
+            link_quality.is_finite() && (0.0..=1.0).contains(&link_quality),
+            "link quality must be finite and between 0.0 and 1.0"
+        );
+        let snapshot = {
+            let state = self
+                .active_drones
+                .get_mut(&drone_id)
+                .ok_or_else(|| anyhow::anyhow!("Drone not registered: {}", drone_id))?;
+            state.last_update = received_at;
+            state.communication_quality = link_quality;
+            state.clone()
+        };
+        Ok(self.link_status_for(&snapshot, received_at))
+    }
+
+    pub fn coordination_rule_audit_log(&self) -> &[CoordinationRuleAuditEvent] {
+        &self.coordination_rule_audit_log
     }
 
     pub async fn swarm_telemetry_report_at(
@@ -392,6 +474,106 @@ impl CoordinationEngine {
             (_, _, 0) => SwarmTelemetryStatus::Fresh,
             (_, 0, _) => SwarmTelemetryStatus::Stale,
             _ => SwarmTelemetryStatus::Degraded,
+        }
+    }
+
+    pub async fn evaluate_link_rules_at(
+        &mut self,
+        checked_at: DateTime<Utc>,
+    ) -> Result<LinkQualityReport> {
+        let mut report = self.build_link_quality_report(checked_at);
+        let mut audit_events = Vec::new();
+
+        for rule in self.coordination_rules.iter().filter(|rule| {
+            rule.enabled && matches!(rule.condition, RuleCondition::CommunicationLoss { .. })
+        }) {
+            for link in report
+                .links
+                .iter()
+                .filter(|link| link.health == DroneLinkHealth::TimedOut)
+            {
+                audit_events.push(CoordinationRuleAuditEvent {
+                    rule_id: rule.id,
+                    rule_name: rule.name.clone(),
+                    drone_id: Some(link.drone_id),
+                    triggered_at: checked_at,
+                    condition: "communication_loss".to_string(),
+                    action: Self::rule_action_label(&rule.action).to_string(),
+                    message: format!(
+                        "Drone {} heartbeat timed out after {}s",
+                        link.drone_id, link.heartbeat_age_seconds
+                    ),
+                });
+            }
+        }
+
+        self.coordination_rule_audit_log
+            .extend(audit_events.iter().cloned());
+        report.audit_events = audit_events;
+        Ok(report)
+    }
+
+    fn build_link_quality_report(&self, checked_at: DateTime<Utc>) -> LinkQualityReport {
+        let mut links = self
+            .active_drones
+            .values()
+            .map(|state| self.link_status_for(state, checked_at))
+            .collect::<Vec<_>>();
+        links.sort_by_key(|link| link.drone_id);
+
+        let healthy_links = links
+            .iter()
+            .filter(|link| link.health == DroneLinkHealth::Healthy)
+            .count();
+        let degraded_links = links
+            .iter()
+            .filter(|link| link.health == DroneLinkHealth::Degraded)
+            .count();
+        let timed_out_links = links
+            .iter()
+            .filter(|link| link.health == DroneLinkHealth::TimedOut)
+            .count();
+
+        LinkQualityReport {
+            generated_at: checked_at,
+            total_links: links.len(),
+            healthy_links,
+            degraded_links,
+            timed_out_links,
+            links,
+            audit_events: Vec::new(),
+        }
+    }
+
+    fn link_status_for(&self, state: &DroneState, checked_at: DateTime<Utc>) -> DroneLinkStatus {
+        let heartbeat_age_seconds = Self::telemetry_age_seconds(state.last_update, checked_at);
+        let health = if checked_at.signed_duration_since(state.last_update) > self.heartbeat_timeout
+        {
+            DroneLinkHealth::TimedOut
+        } else if state.communication_quality >= 0.7 {
+            DroneLinkHealth::Healthy
+        } else {
+            DroneLinkHealth::Degraded
+        };
+
+        DroneLinkStatus {
+            drone_id: state.id,
+            last_heartbeat: state.last_update,
+            heartbeat_age_seconds,
+            link_quality: state.communication_quality,
+            health,
+        }
+    }
+
+    fn rule_action_label(action: &RuleAction) -> &'static str {
+        match action {
+            RuleAction::ChangeSpeed { .. } => "ChangeSpeed",
+            RuleAction::ChangeAltitude { .. } => "ChangeAltitude",
+            RuleAction::ReturnToBase => "ReturnToBase",
+            RuleAction::LandImmediate => "LandImmediate",
+            RuleAction::FormFormation { .. } => "FormFormation",
+            RuleAction::SendAlert { .. } => "SendAlert",
+            RuleAction::Custom(_) => "Custom",
         }
     }
 
@@ -698,6 +880,71 @@ mod tests {
         assert_eq!(status.stale_drones, 1);
         assert!(json.contains("\"freshness\":\"Stale\""));
         assert!(json.contains("\"status\":\"Degraded\""));
+    }
+
+    #[tokio::test]
+    async fn regular_heartbeats_keep_link_healthy_without_rule_audit() {
+        let mut engine = CoordinationEngine::new();
+        engine
+            .set_heartbeat_timeout(chrono::Duration::seconds(10))
+            .unwrap();
+        let checked_at = fixed_time();
+        let drone_id = Uuid::from_u128(31);
+
+        engine
+            .register_drone(
+                drone_id,
+                test_state(drone_id, checked_at - chrono::Duration::seconds(30), 0.84),
+            )
+            .await
+            .unwrap();
+        engine
+            .record_heartbeat(drone_id, checked_at - chrono::Duration::seconds(2), 0.93)
+            .await
+            .unwrap();
+
+        let report = engine.evaluate_link_rules_at(checked_at).await.unwrap();
+
+        assert_eq!(report.healthy_links, 1);
+        assert_eq!(report.timed_out_links, 0);
+        assert_eq!(report.links[0].health, DroneLinkHealth::Healthy);
+        assert_eq!(report.links[0].link_quality, 0.93);
+        assert!(report.audit_events.is_empty());
+        assert!(engine.coordination_rule_audit_log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_fires_comm_loss_rule_and_is_audited() {
+        let mut engine = CoordinationEngine::new();
+        engine
+            .set_heartbeat_timeout(chrono::Duration::seconds(10))
+            .unwrap();
+        let checked_at = fixed_time();
+        let stale_id = Uuid::from_u128(32);
+
+        engine
+            .register_drone(
+                stale_id,
+                test_state(stale_id, checked_at - chrono::Duration::seconds(45), 0.59),
+            )
+            .await
+            .unwrap();
+
+        let report = engine.evaluate_link_rules_at(checked_at).await.unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert_eq!(report.healthy_links, 0);
+        assert_eq!(report.timed_out_links, 1);
+        assert_eq!(report.links[0].drone_id, stale_id);
+        assert_eq!(report.links[0].health, DroneLinkHealth::TimedOut);
+        assert_eq!(report.links[0].heartbeat_age_seconds, 45);
+        assert_eq!(report.audit_events.len(), 1);
+        assert_eq!(report.audit_events[0].rule_name, "Communication Loss");
+        assert_eq!(report.audit_events[0].drone_id, Some(stale_id));
+        assert_eq!(report.audit_events[0].triggered_at, checked_at);
+        assert_eq!(engine.coordination_rule_audit_log().len(), 1);
+        assert!(json.contains("\"health\":\"TimedOut\""));
+        assert!(json.contains("\"condition\":\"communication_loss\""));
     }
 
     #[test]
