@@ -129,12 +129,13 @@ fn grower_report_lines(request: &GrowerReportRequest) -> Vec<String> {
     } else {
         for recommendation in &request.recommendations {
             lines.push(format!(
-                "{} | {} | {} | {} | evidence {}",
+                "{} | {} | {} | {} | evidence {} | annotations {}",
                 recommendation.recommendation_id,
                 recommendation.title,
                 priority_str(recommendation.priority),
                 status_str(recommendation.status),
-                nonempty_values(&recommendation.evidence_refs).join("|")
+                nonempty_values(&recommendation.evidence_refs).join("|"),
+                nonempty_values(&recommendation.annotation_ids).join("|")
             ));
         }
     }
@@ -251,6 +252,8 @@ mod tests {
         assert!(text.contains("zone-1"));
         assert!(text.contains("Scout anomaly zone zone-1"));
         assert!(text.contains("layer:ndvi-2026-05-01"));
+        assert!(text.contains("ann-01"));
+        assert!(text.contains("ann-02"));
         assert!(text.contains("%%EOF"));
     }
 
@@ -343,7 +346,7 @@ mod tests {
                 "zone:zone-1".to_string(),
                 "layer:ndvi-2026-05-01".to_string(),
             ],
-            annotation_ids: Vec::new(),
+            annotation_ids: vec!["ann-01".to_string(), "ann-02".to_string()],
             created_at: "2026-05-01T00:00:00Z".to_string(),
             updated_at: "2026-05-01T00:00:00Z".to_string(),
         }

@@ -15,6 +15,8 @@ pub struct ZoneRecommendationRequest {
     pub zone: Option<AnomalyZone>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub annotation_ids: Vec<String>,
     pub created_at: String,
 }
 
@@ -35,6 +37,7 @@ pub fn create_recommendation_from_zone(
     let zone = request.zone.ok_or(ZoneRecommendationError::MissingZone)?;
     let action_category = "scout".to_string();
     let evidence_refs = zone_evidence_refs(&zone, request.evidence_refs);
+    let annotation_ids = normalize_annotation_ids(request.annotation_ids);
     let recommendation = RecommendationRecord {
         recommendation_id: request.recommendation_id,
         scene_id: request.scene_id,
@@ -51,7 +54,7 @@ pub fn create_recommendation_from_zone(
         priority: priority_for_zone_area(zone.area_m2),
         status: RecommendationStatus::Open,
         evidence_refs,
-        annotation_ids: Vec::new(),
+        annotation_ids,
         created_at: request.created_at.clone(),
         updated_at: request.created_at,
     };
@@ -84,6 +87,18 @@ fn zone_evidence_refs(zone: &AnomalyZone, evidence_refs: Vec<String>) -> Vec<Str
     refs
 }
 
+fn normalize_annotation_ids(annotation_ids: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for annotation_id in annotation_ids {
+        let annotation_id = annotation_id.trim();
+        if annotation_id.is_empty() || normalized.iter().any(|existing| existing == annotation_id) {
+            continue;
+        }
+        normalized.push(annotation_id.to_string());
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -109,6 +124,11 @@ mod tests {
                 author_user_id: "advisor-1".to_string(),
                 zone: Some(zone("zone-1", 3_000.0)),
                 evidence_refs: vec!["layer:ndvi-2026-05-01".to_string()],
+                annotation_ids: vec![
+                    "ann-1".to_string(),
+                    " ann-1 ".to_string(),
+                    "ann-2".to_string(),
+                ],
                 created_at: "2026-05-01T00:00:00Z".to_string(),
             },
         )
@@ -127,6 +147,10 @@ mod tests {
                 "zone:zone-1".to_string(),
                 "layer:ndvi-2026-05-01".to_string()
             ]
+        );
+        assert_eq!(
+            recommendation.annotation_ids,
+            vec!["ann-1".to_string(), "ann-2".to_string()]
         );
 
         let stored = registry.recommendations_for_org("org-a");
@@ -177,6 +201,7 @@ mod tests {
                 author_user_id: "advisor-1".to_string(),
                 zone: None,
                 evidence_refs: vec!["layer:ndvi-2026-05-01".to_string()],
+                annotation_ids: Vec::new(),
                 created_at: "2026-05-01T00:00:00Z".to_string(),
             },
         )
