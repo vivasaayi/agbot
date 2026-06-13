@@ -4,6 +4,7 @@ pub mod gdal_util;
 use crate::{IndicesArgs, SensorPreset};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use shared::{
     error::AgroError,
     schemas::{
@@ -264,6 +265,85 @@ pub async fn write_png_spatial_sidecar(
     let sidecar_path = png_spatial_sidecar_path(product_path);
     tokio::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar)?).await?;
     Ok(sidecar_path)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProductOutputHash {
+    pub algorithm: String,
+    pub value: String,
+}
+
+impl Default for ProductOutputHash {
+    fn default() -> Self {
+        Self {
+            algorithm: "sha256".to_string(),
+            value: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProductReproducibilityEvidence {
+    pub format_version: u8,
+    pub source_image_ids: Vec<uuid::Uuid>,
+    pub method: String,
+    pub parameters: serde_json::Value,
+    pub calibration: Option<RadiometricCalibrationEvidence>,
+    pub mask_ref: Option<String>,
+    pub statistics: serde_json::Value,
+    pub coverage: serde_json::Value,
+    pub output_hashes: BTreeMap<String, ProductOutputHash>,
+}
+
+impl ProductReproducibilityEvidence {
+    pub fn new(
+        source_image_ids: Vec<uuid::Uuid>,
+        method: impl Into<String>,
+        parameters: serde_json::Value,
+        calibration: Option<RadiometricCalibrationEvidence>,
+        mask_ref: Option<String>,
+        statistics: serde_json::Value,
+        coverage: serde_json::Value,
+        output_hashes: BTreeMap<String, ProductOutputHash>,
+    ) -> Self {
+        Self {
+            format_version: 1,
+            source_image_ids,
+            method: method.into(),
+            parameters,
+            calibration,
+            mask_ref,
+            statistics,
+            coverage,
+            output_hashes,
+        }
+    }
+}
+
+impl Default for ProductReproducibilityEvidence {
+    fn default() -> Self {
+        Self {
+            format_version: 1,
+            source_image_ids: Vec::new(),
+            method: String::new(),
+            parameters: serde_json::Value::Null,
+            calibration: None,
+            mask_ref: None,
+            statistics: serde_json::Value::Null,
+            coverage: serde_json::Value::Null,
+            output_hashes: BTreeMap::new(),
+        }
+    }
+}
+
+pub async fn file_output_hash(product_path: &Path) -> AgroResult<ProductOutputHash> {
+    let bytes = tokio::fs::read(product_path).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(ProductOutputHash {
+        algorithm: "sha256".to_string(),
+        value: format!("{:x}", hasher.finalize()),
+    })
 }
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]

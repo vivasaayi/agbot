@@ -3,9 +3,9 @@
 use image::{GrayImage, ImageBuffer, Luma};
 use imagery_processor::{
     io::{
-        geotiff_spatial_sidecar_path, png_spatial_sidecar_path, write_geotiff_spatial_sidecar,
-        write_png_spatial_sidecar, BandIngestEvidence, CalibrationStatus, GeoTiffSpatialSidecar,
-        PngGeoreferenceStatus, PngSpatialSidecar,
+        file_output_hash, geotiff_spatial_sidecar_path, png_spatial_sidecar_path,
+        write_geotiff_spatial_sidecar, write_png_spatial_sidecar, BandIngestEvidence,
+        CalibrationStatus, GeoTiffSpatialSidecar, PngGeoreferenceStatus, PngSpatialSidecar,
     },
     pipeline::{
         classify::run_classify, indices::run_indices, masks::run_masks, thermal::run_thermal,
@@ -681,6 +681,77 @@ async fn indices_png_writes_matching_spatial_sidecar() {
     assert_eq!(sidecar.bbox, expected.bbox);
     assert_eq!(sidecar.resolution, expected.resolution);
     assert_eq!(sidecar.geo_transform, expected.geo_transform);
+}
+
+#[tokio::test]
+async fn indices_retain_product_provenance_and_deterministic_hash() {
+    let root = temp_test_dir("indices_reproducibility_evidence");
+    let input_dir = root.join("input");
+    let first_output_dir = root.join("output_a");
+    let second_output_dir = root.join("output_b");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    let mask_path = input_dir.join("mask.png");
+    write_gray_image(&red_path, 2, 1, &[10, 10]);
+    write_gray_image(&nir_path, 2, 1, &[30, 30]);
+    write_gray_image(&mask_path, 2, 1, &[255, 0]);
+    write_metadata(
+        &input_dir,
+        2,
+        1,
+        &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+    );
+
+    let mut first_args = base_indices_args(input_dir.clone(), first_output_dir.clone());
+    first_args.mask = Some(mask_path.clone());
+    let mut second_args = base_indices_args(input_dir, second_output_dir.clone());
+    second_args.mask = Some(mask_path.clone());
+
+    run_indices(&first_args).await.unwrap();
+    run_indices(&second_args).await.unwrap();
+
+    let first_meta = read_result_meta(&first_output_dir);
+    let second_meta = read_result_meta(&second_output_dir);
+    let provenance = &first_meta["reproducibility"];
+    assert_eq!(provenance["source_image_ids"].as_array().unwrap().len(), 1);
+    assert_eq!(provenance["method"].as_str().unwrap(), "index");
+    assert_eq!(provenance["parameters"]["index"].as_str().unwrap(), "ndvi");
+    assert_eq!(
+        provenance["parameters"]["resolved_bands"]["red"]
+            .as_str()
+            .unwrap(),
+        "Red"
+    );
+    assert_eq!(
+        provenance["mask_ref"].as_str().unwrap(),
+        mask_path.to_string_lossy()
+    );
+    assert_eq!(
+        provenance["calibration"]["status"].as_str().unwrap(),
+        "UncalibratedDn"
+    );
+    assert!((provenance["statistics"]["mean"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+    assert!(
+        (provenance["coverage"]["valid_pixel_coverage"]
+            .as_f64()
+            .unwrap()
+            - 0.5)
+            .abs()
+            < 1e-6
+    );
+
+    let first_hash = provenance["output_hashes"]["product"]["value"]
+        .as_str()
+        .unwrap();
+    let second_hash = second_meta["reproducibility"]["output_hashes"]["product"]["value"]
+        .as_str()
+        .unwrap();
+    let first_output = PathBuf::from(first_meta["output_path"].as_str().unwrap());
+    let actual_hash = file_output_hash(&first_output).await.unwrap();
+    assert_eq!(first_hash, second_hash);
+    assert_eq!(first_hash, actual_hash.value);
 }
 
 #[tokio::test]

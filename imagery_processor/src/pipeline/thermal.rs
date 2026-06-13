@@ -4,7 +4,7 @@ use shared::{
     schemas::{assert_raster_spatial_ref, MultispectralImage},
     AgroResult,
 };
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 use tracing::{error, info};
 
 use crate::{OutputFormat, TemperatureUnit, ThermalArgs};
@@ -533,6 +533,62 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
         TemperatureUnit::Kelvin => lst_stats,
         TemperatureUnit::Celsius => lst_stats.with_offset(-273.15),
     };
+    let mut output_hashes = BTreeMap::new();
+    output_hashes.insert(
+        "product".to_string(),
+        crate::io::file_output_hash(&out_path).await?,
+    );
+    let total_pixel_count = (w as usize) * (h as usize);
+    let valid_pixel_coverage = if total_pixel_count == 0 {
+        0.0
+    } else {
+        valid_count as f32 / total_pixel_count as f32
+    };
+    let reproducibility = crate::io::ProductReproducibilityEvidence::new(
+        vec![image.image_id],
+        "thermal",
+        serde_json::json!({
+            "out_format": format!("{:?}", args.out_format).to_lowercase(),
+            "unit": format!("{:?}", args.unit).to_lowercase(),
+            "products": args.products.iter().map(|product| format!("{:?}", product).to_lowercase()).collect::<Vec<_>>(),
+            "thermal_band": args.thermal_band,
+            "thermal_band2": args.thermal_band2,
+            "split_window": args.split_window,
+            "emissivity_from_ndvi": args.emissivity_from_ndvi,
+            "ndvi_image": args.ndvi_image.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "red": args.red,
+            "nir": args.nir,
+            "thermal_coefficients": {
+                "ml": ml,
+                "al": al,
+                "k1": k1,
+                "k2": k2,
+                "lambda_um": lambda,
+            },
+        }),
+        None,
+        args.mask
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+        serde_json::json!({
+            "radiance": stats_json(radiance_stats),
+            "brightness_temperature": stats_json(bt_stats),
+            "lst": stats_json(lst_output_stats),
+            "emissivity": {
+                "min": emissivity_plan.stats.min_value(),
+                "max": emissivity_plan.stats.max_value(),
+                "mean": emissivity_plan.stats.mean(),
+                "count": emissivity_plan.stats.count,
+            },
+            "split_window_delta": stats_json(split_delta_stats),
+        }),
+        serde_json::json!({
+            "total_pixel_count": total_pixel_count,
+            "valid_pixel_count": valid_count,
+            "valid_pixel_coverage": valid_pixel_coverage,
+        }),
+        output_hashes,
+    );
 
     let meta = serde_json::json!({
         "timestamp": chrono::Utc::now(),
@@ -576,6 +632,7 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
             "lambda_um": lambda,
         },
         "spatial_ref": spatial_ref,
+        "reproducibility": reproducibility,
     });
 
     let meta_path = args.output_dir.join(format!(

@@ -1,5 +1,5 @@
 use shared::AgroResult;
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 use tracing::info;
 
 use crate::ClassifyArgs;
@@ -240,10 +240,38 @@ pub async fn run_classify(args: &ClassifyArgs) -> AgroResult<()> {
         shared::error::AgroError::Processing(format!("Failed to save classification image: {}", e))
     })?;
     let spatial_ref_sidecar = propagate_png_sidecar(&args.input_image, &args.output_path).await?;
+    let mut output_hashes = BTreeMap::new();
+    output_hashes.insert(
+        "product".to_string(),
+        crate::io::file_output_hash(&args.output_path).await?,
+    );
 
     // Simple JSON stats: proportion of positive class for threshold, or cluster counts
     if let Some(th) = args.threshold {
         let count_pos = class_counts[1];
+        let class_count_evidence = threshold_class_counts(class_counts[0], class_counts[1]);
+        let provenance = crate::io::ProductReproducibilityEvidence::new(
+            Vec::new(),
+            "classification",
+            serde_json::json!({
+                "mode": "threshold",
+                "input_image": args.input_image.to_string_lossy(),
+                "threshold": th,
+            }),
+            None,
+            None,
+            serde_json::json!({
+                "positive_ratio": count_pos as f64 / total as f64,
+                "effective_class_count": effective_class_count,
+                "class_boundaries": class_boundaries.clone(),
+                "class_counts": class_count_evidence.clone(),
+            }),
+            serde_json::json!({
+                "total_pixel_count": total,
+                "classified_pixel_count": total,
+            }),
+            output_hashes,
+        );
         let meta = serde_json::json!({
             "method": "threshold",
             "threshold": th,
@@ -251,13 +279,39 @@ pub async fn run_classify(args: &ClassifyArgs) -> AgroResult<()> {
             "total_pixel_count": total,
             "effective_class_count": effective_class_count,
             "class_boundaries": class_boundaries,
-            "class_counts": threshold_class_counts(class_counts[0], class_counts[1]),
+            "class_counts": class_count_evidence,
             "spatial_ref_sidecar": spatial_ref_sidecar,
+            "reproducibility": provenance,
         });
         let json_path = args.output_path.with_extension("json");
         tokio::fs::write(json_path, serde_json::to_string_pretty(&meta)?).await?;
     } else if let Some(k) = args.kmeans {
         let center_gray_values = centers_from_json(&class_centers)?;
+        let class_count_evidence = kmeans_class_counts(&class_counts, &center_gray_values);
+        let provenance = crate::io::ProductReproducibilityEvidence::new(
+            Vec::new(),
+            "classification",
+            serde_json::json!({
+                "mode": "kmeans",
+                "input_image": args.input_image.to_string_lossy(),
+                "k": k,
+                "seed": args.seed,
+            }),
+            None,
+            None,
+            serde_json::json!({
+                "effective_class_count": effective_class_count,
+                "class_centers": class_centers.clone(),
+                "class_boundaries": class_boundaries.clone(),
+                "class_counts": class_count_evidence.clone(),
+                "cluster_counts": class_counts.clone(),
+            }),
+            serde_json::json!({
+                "total_pixel_count": total,
+                "classified_pixel_count": total,
+            }),
+            output_hashes,
+        );
         let meta = serde_json::json!({
             "method": "kmeans",
             "k": k,
@@ -266,9 +320,10 @@ pub async fn run_classify(args: &ClassifyArgs) -> AgroResult<()> {
             "effective_class_count": effective_class_count,
             "class_centers": class_centers,
             "class_boundaries": class_boundaries,
-            "class_counts": kmeans_class_counts(&class_counts, &center_gray_values),
+            "class_counts": class_count_evidence,
             "cluster_counts": class_counts,
             "spatial_ref_sidecar": spatial_ref_sidecar,
+            "reproducibility": provenance,
         });
         let json_path = args.output_path.with_extension("json");
         tokio::fs::write(json_path, serde_json::to_string_pretty(&meta)?).await?;

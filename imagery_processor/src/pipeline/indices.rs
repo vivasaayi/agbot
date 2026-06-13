@@ -527,6 +527,54 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
     };
 
+    let mut output_hashes = BTreeMap::new();
+    output_hashes.insert(
+        "product".to_string(),
+        crate::io::file_output_hash(&out_path).await?,
+    );
+    let mask_ref = args
+        .mask
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let band_overrides = args
+        .band_overrides
+        .iter()
+        .map(|override_spec| {
+            serde_json::json!({
+                "role": override_spec.role.key(),
+                "band_name": override_spec.band_name,
+            })
+        })
+        .collect::<Vec<_>>();
+    let reproducibility = crate::io::ProductReproducibilityEvidence::new(
+        vec![image.image_id],
+        "index",
+        serde_json::json!({
+            "index": format!("{:?}", args.index).to_lowercase(),
+            "out_format": format!("{:?}", args.out_format).to_lowercase(),
+            "sensor": args.sensor.map(|sensor| format!("{:?}", sensor).to_lowercase()),
+            "resolved_bands": evidence.resolved_bands.clone(),
+            "band_overrides": band_overrides,
+        }),
+        Some(evidence.radiometric_calibration.clone()),
+        mask_ref,
+        serde_json::json!({
+            "min": stats.min,
+            "max": stats.max,
+            "mean": stats.mean,
+            "statistics_outcome": stats.outcome,
+            "invalid_pixel_reasons": stats.invalid_pixel_reasons.clone(),
+        }),
+        serde_json::json!({
+            "total_pixel_count": stats.total_pixel_count,
+            "clear_pixel_count": stats.clear_pixel_count,
+            "valid_pixel_count": stats.valid_pixel_count,
+            "clear_pixel_coverage": stats.clear_pixel_coverage,
+            "valid_pixel_coverage": stats.valid_pixel_coverage,
+        }),
+        output_hashes,
+    );
+
     let meta = IndexResultMeta {
         timestamp: chrono::Utc::now(),
         source_images: vec![image.image_id],
@@ -544,6 +592,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         invalid_pixel_reasons: stats.invalid_pixel_reasons,
         radiometric_calibration: evidence.radiometric_calibration.clone(),
         spatial_ref: evidence.spatial_ref.clone(),
+        reproducibility,
     };
 
     let meta_name = format!(

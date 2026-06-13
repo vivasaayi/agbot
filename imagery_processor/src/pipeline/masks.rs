@@ -65,6 +65,7 @@ struct MaskEvidence {
     height: u32,
     class_counts: BTreeMap<String, u32>,
     outputs: BTreeMap<String, String>,
+    reproducibility: crate::io::ProductReproducibilityEvidence,
 }
 
 async fn process_one(metadata_file: &PathBuf, args: &MasksArgs) -> AgroResult<()> {
@@ -126,6 +127,10 @@ async fn process_one(metadata_file: &PathBuf, args: &MasksArgs) -> AgroResult<()
     } else {
         args.kinds.clone()
     };
+    let selected_kinds = kinds
+        .iter()
+        .map(|kind| mask_kind_key(*kind))
+        .collect::<Vec<_>>();
 
     let class_counts = count_qa_classes(&qa_u16);
     let mut outputs = BTreeMap::new();
@@ -198,6 +203,41 @@ async fn process_one(metadata_file: &PathBuf, args: &MasksArgs) -> AgroResult<()
         );
     }
 
+    let mut output_hashes = BTreeMap::new();
+    for (kind, output_path) in &outputs {
+        output_hashes.insert(
+            kind.clone(),
+            crate::io::file_output_hash(PathBuf::from(output_path).as_path()).await?,
+        );
+    }
+    let total_pixel_count = (w as usize) * (h as usize);
+    let clear_pixel_count = class_counts.get("clear").copied().unwrap_or_default() as usize;
+    let clear_pixel_coverage = if total_pixel_count == 0 {
+        0.0
+    } else {
+        clear_pixel_count as f32 / total_pixel_count as f32
+    };
+    let reproducibility = crate::io::ProductReproducibilityEvidence::new(
+        vec![image.image_id],
+        "mask",
+        serde_json::json!({
+            "qa_band": args.qa_band.clone(),
+            "out_format": format!("{:?}", args.out_format).to_lowercase(),
+            "kinds": selected_kinds,
+        }),
+        None,
+        None,
+        serde_json::json!({
+            "class_counts": class_counts.clone(),
+        }),
+        serde_json::json!({
+            "total_pixel_count": total_pixel_count,
+            "clear_pixel_count": clear_pixel_count,
+            "clear_pixel_coverage": clear_pixel_coverage,
+        }),
+        output_hashes,
+    );
+
     let evidence = MaskEvidence {
         image_id: image.image_id,
         qa_band: args.qa_band.clone(),
@@ -205,6 +245,7 @@ async fn process_one(metadata_file: &PathBuf, args: &MasksArgs) -> AgroResult<()
         height: h,
         class_counts,
         outputs,
+        reproducibility,
     };
     let evidence_path = args
         .output_dir
