@@ -3067,6 +3067,168 @@ async fn content_item_create_rejects_empty_body_without_writing() -> Result<()> 
 }
 
 #[tokio::test]
+async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-collab", "field-collab", "season-2026").await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "channel_id": "channel-001",
+                        "org_id": "org-alpha",
+                        "field_ref": "field:field-collab",
+                        "member_account_ids": ["user-a", "user-b"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let post = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-001/messages?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "message_id": "message-001",
+                        "author_id": "user-a",
+                        "body": "Scout north pivot"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(post.status(), StatusCode::OK);
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/channels/channel-001?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = to_bytes(get.into_body(), 64 * 1024).await?;
+    let thread: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        thread
+            .pointer("/channel/channel_id")
+            .and_then(|value| value.as_str()),
+        Some("channel-001")
+    );
+    assert_eq!(
+        thread
+            .pointer("/messages")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(1)
+    );
+    let audit_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM collab_message_audits
+        WHERE message_id = 'message-001'
+          AND org_id = 'org-alpha'
+          AND actor_id = 'user-a'
+          AND event_type = 'message_posted'
+        "#,
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/channels?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let channels: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(channels.len(), 1);
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/channels/channel-001?org_id=org-beta")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_message_rejects_missing_channel_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let post = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-missing/messages?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "message_id": "message-missing",
+                        "author_id": "user-a",
+                        "body": "hello"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(post.status(), StatusCode::BAD_REQUEST);
+
+    let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collab_messages")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(message_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

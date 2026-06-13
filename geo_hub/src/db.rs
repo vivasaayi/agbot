@@ -879,6 +879,50 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS collab_channels (
+            channel_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            field_ref TEXT NOT NULL,
+            member_account_ids_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_messages (
+            message_id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            body TEXT NOT NULL,
+            sent_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_message_audits (
+            audit_id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,
@@ -1371,6 +1415,33 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_cms_content_versions_content
         ON cms_content_versions(content_id, created_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_collab_channels_org_field
+        ON collab_channels(org_id, field_ref);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_collab_messages_channel
+        ON collab_messages(channel_id, sent_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_collab_message_audits_message
+        ON collab_message_audits(message_id, occurred_at);
         "#,
     )
     .execute(pool)

@@ -63,21 +63,24 @@ use orthomosaic::{
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     append_content_version, assert_raster_spatial_ref, bind_fleet_node_identity,
-    bounds_from_points, build_marketplace_account_record, build_soil_moisture_reading,
-    build_sustainability_record, build_tractor_record, compute_drought_index,
-    create_versioned_content, normalize_weather_provider_forecast, parse_content_status,
-    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
-    parse_marketplace_party_type, parse_soil_moisture_qa_flag,
-    parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
-    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
-    transition_marketplace_account_status, validate_field_boundary, weather_fetch_failure_record,
-    AnnotationGeometry, AnnotationRecord, ContentCreateRequest, ContentEditRequest, ContentError,
-    ContentRecord, ContentStatus, ContentType, ContentVersionRecord, DroughtIndexComputeRequest,
-    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
-    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
-    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    bounds_from_points, build_collaboration_channel, build_collaboration_message,
+    build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
+    build_tractor_record, compute_drought_index, create_versioned_content,
+    normalize_weather_provider_forecast, parse_content_status, parse_content_type,
+    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_party_type,
+    parse_soil_moisture_qa_flag, parse_soil_moisture_rejection_reason,
+    parse_sustainability_metric_type, soil_moisture_rejection_reason_for_error,
+    soil_moisture_rejection_record, transition_marketplace_account_status, validate_field_boundary,
+    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
+    CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
+    CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
+    ContentType, ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError,
+    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
     MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage,
     RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
     RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
@@ -518,6 +521,17 @@ pub struct ContentItemListQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentItemScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CollaborationChannelListQuery {
+    pub org_id: Option<String>,
+    pub field_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CollaborationScopeQuery {
     pub org_id: Option<String>,
 }
 
@@ -2951,6 +2965,96 @@ pub async fn list_content_items(
         .map(|row| decode_content_record(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
+}
+
+pub async fn create_collaboration_channel(
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationChannelCreateRequest>,
+) -> AppResult<Json<CollaborationChannelRecord>> {
+    let channel = build_collaboration_channel(
+        request,
+        format!("collab-channel-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    validate_collaboration_field_ref(&state, &channel.org_id, &channel.field_ref).await?;
+    insert_collaboration_channel(&state, &channel).await?;
+
+    Ok(Json(channel))
+}
+
+pub async fn list_collaboration_channels(
+    Query(query): Query<CollaborationChannelListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CollaborationChannelRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for collaboration channels".to_string(),
+        )
+    })?;
+    let field_ref = normalize_optional_text(query.field_ref);
+    let rows = sqlx::query(
+        r#"
+        SELECT channel_id, org_id, field_ref, member_account_ids_json, created_at
+        FROM collab_channels
+        WHERE org_id = ?1
+          AND (?2 IS NULL OR field_ref = ?2)
+        ORDER BY created_at ASC, channel_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(field_ref)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_collaboration_channel(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_collaboration_channel(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationChannelThread>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+
+    load_collaboration_thread(&state, &channel_id, &org_id)
+        .await?
+        .ok_or(AppError::NotFound)
+        .map(Json)
+}
+
+pub async fn post_collaboration_message(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationMessageCreateRequest>,
+) -> AppResult<Json<CollaborationMessageRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let channel = load_collaboration_channel(&state, &channel_id).await?;
+    let Some(channel) = channel else {
+        return Err(AppError::BadRequest(format!(
+            "collaboration channel {channel_id} does not exist"
+        )));
+    };
+    if channel.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let message = build_collaboration_message(
+        request,
+        Some(&channel),
+        format!("collab-message-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_message(&state, &message, &channel.org_id).await?;
+
+    Ok(Json(message))
 }
 
 pub async fn list_time_series_points(
@@ -6404,6 +6508,10 @@ fn content_error(error: ContentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn collaboration_error(error: CollaborationError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
     value.parse::<SoilSensorType>().map_err(soil_iot_error)
 }
@@ -7673,6 +7781,38 @@ fn decode_content_version_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Con
         content_id: row.get("content_id"),
         body: row.get("body"),
         created_at: row.get("created_at"),
+    })
+}
+
+fn decode_collaboration_channel(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationChannelRecord> {
+    let member_account_ids =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("member_account_ids_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode collab member_account_ids_json"),
+                )
+            })?;
+
+    Ok(CollaborationChannelRecord {
+        channel_id: row.get("channel_id"),
+        org_id: row.get("org_id"),
+        field_ref: row.get("field_ref"),
+        member_account_ids,
+        created_at: row.get("created_at"),
+    })
+}
+
+fn decode_collaboration_message(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationMessageRecord> {
+    Ok(CollaborationMessageRecord {
+        message_id: row.get("message_id"),
+        channel_id: row.get("channel_id"),
+        author_id: row.get("author_id"),
+        body: row.get("body"),
+        sent_at: row.get("sent_at"),
     })
 }
 
@@ -8963,6 +9103,151 @@ async fn load_content_versions(
     rows.into_iter()
         .map(|row| decode_content_version_record(&row))
         .collect()
+}
+
+async fn insert_collaboration_channel(
+    state: &AppState,
+    channel: &CollaborationChannelRecord,
+) -> AppResult<()> {
+    let member_account_ids_json = serde_json::to_string(&channel.member_account_ids)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_channels (
+            channel_id, org_id, field_ref, member_account_ids_json, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(&channel.channel_id)
+    .bind(&channel.org_id)
+    .bind(&channel.field_ref)
+    .bind(member_account_ids_json)
+    .bind(&channel.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_collaboration_message(
+    state: &AppState,
+    message: &CollaborationMessageRecord,
+    org_id: &str,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_messages (message_id, channel_id, author_id, body, sent_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(&message.message_id)
+    .bind(&message.channel_id)
+    .bind(&message.author_id)
+    .bind(&message.body)
+    .bind(&message.sent_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO collab_message_audits (
+            audit_id, message_id, channel_id, org_id, actor_id, event_type, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(format!("collab-message-audit-{}", Uuid::new_v4()))
+    .bind(&message.message_id)
+    .bind(&message.channel_id)
+    .bind(org_id)
+    .bind(&message.author_id)
+    .bind("message_posted")
+    .bind(&message.sent_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_collaboration_channel(
+    state: &AppState,
+    channel_id: &str,
+) -> AppResult<Option<CollaborationChannelRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT channel_id, org_id, field_ref, member_account_ids_json, created_at
+        FROM collab_channels
+        WHERE channel_id = ?1
+        "#,
+    )
+    .bind(channel_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_collaboration_channel(&row))
+        .transpose()
+}
+
+async fn load_collaboration_thread(
+    state: &AppState,
+    channel_id: &str,
+    org_id: &str,
+) -> AppResult<Option<CollaborationChannelThread>> {
+    let Some(channel) = load_collaboration_channel(state, channel_id).await? else {
+        return Ok(None);
+    };
+    if channel.org_id != org_id {
+        return Ok(None);
+    }
+    let messages = load_collaboration_messages(state, channel_id).await?;
+
+    Ok(Some(CollaborationChannelThread { channel, messages }))
+}
+
+async fn load_collaboration_messages(
+    state: &AppState,
+    channel_id: &str,
+) -> AppResult<Vec<CollaborationMessageRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT message_id, channel_id, author_id, body, sent_at
+        FROM collab_messages
+        WHERE channel_id = ?1
+        ORDER BY rowid ASC
+        "#,
+    )
+    .bind(channel_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_collaboration_message(&row))
+        .collect()
+}
+
+async fn validate_collaboration_field_ref(
+    state: &AppState,
+    org_id: &str,
+    field_ref: &str,
+) -> AppResult<()> {
+    let Some(field_id) = field_ref.strip_prefix("field:") else {
+        return Err(AppError::BadRequest(
+            "collaboration field_ref must use field:<field_id>".to_string(),
+        ));
+    };
+    let field_id = normalize_optional_text(Some(field_id.to_string()))
+        .ok_or_else(|| AppError::BadRequest("collaboration field_ref is required".to_string()))?;
+
+    assert_field_owned_by_org(state, org_id, &field_id).await
 }
 
 async fn load_soil_iot_device(

@@ -2126,6 +2126,160 @@ fn normalize_content_text(value: String) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationChannelCreateRequest {
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    pub org_id: String,
+    pub field_ref: String,
+    #[serde(default)]
+    pub member_account_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationChannelRecord {
+    pub channel_id: String,
+    pub org_id: String,
+    pub field_ref: String,
+    pub member_account_ids: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationMessageCreateRequest {
+    #[serde(default)]
+    pub message_id: Option<String>,
+    pub author_id: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationMessageRecord {
+    pub message_id: String,
+    pub channel_id: String,
+    pub author_id: String,
+    pub body: String,
+    pub sent_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationChannelThread {
+    pub channel: CollaborationChannelRecord,
+    pub messages: Vec<CollaborationMessageRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CollaborationError {
+    #[error("collaboration channel_id cannot be empty")]
+    EmptyChannelId,
+    #[error("collaboration org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("collaboration field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("collaboration channel members cannot be empty")]
+    EmptyMembers,
+    #[error("collaboration message_id cannot be empty")]
+    EmptyMessageId,
+    #[error("collaboration author_id cannot be empty")]
+    EmptyAuthorId,
+    #[error("collaboration message body cannot be empty")]
+    EmptyBody,
+    #[error("collaboration timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("collaboration channel not found: {channel_id:?}")]
+    ChannelNotFound { channel_id: Option<String> },
+    #[error("author {author_id} is not a member of channel {channel_id}")]
+    AuthorNotChannelMember {
+        channel_id: String,
+        author_id: String,
+    },
+}
+
+pub fn build_collaboration_channel(
+    request: CollaborationChannelCreateRequest,
+    generated_channel_id: String,
+    created_at: String,
+) -> Result<CollaborationChannelRecord, CollaborationError> {
+    let channel_id = normalize_collaboration_optional_text(request.channel_id)
+        .or_else(|| normalize_collaboration_text(generated_channel_id))
+        .ok_or(CollaborationError::EmptyChannelId)?;
+    let org_id =
+        normalize_collaboration_text(request.org_id).ok_or(CollaborationError::EmptyOrgId)?;
+    let field_ref =
+        normalize_collaboration_text(request.field_ref).ok_or(CollaborationError::EmptyFieldRef)?;
+    let member_account_ids = normalize_collaboration_members(request.member_account_ids)?;
+    let created_at =
+        normalize_collaboration_text(created_at).ok_or(CollaborationError::EmptyTimestamp)?;
+
+    Ok(CollaborationChannelRecord {
+        channel_id,
+        org_id,
+        field_ref,
+        member_account_ids,
+        created_at,
+    })
+}
+
+pub fn build_collaboration_message(
+    request: CollaborationMessageCreateRequest,
+    channel: Option<&CollaborationChannelRecord>,
+    generated_message_id: String,
+    sent_at: String,
+) -> Result<CollaborationMessageRecord, CollaborationError> {
+    let message_id = normalize_collaboration_optional_text(request.message_id)
+        .or_else(|| normalize_collaboration_text(generated_message_id))
+        .ok_or(CollaborationError::EmptyMessageId)?;
+    let author_id =
+        normalize_collaboration_text(request.author_id).ok_or(CollaborationError::EmptyAuthorId)?;
+    let body = normalize_collaboration_text(request.body).ok_or(CollaborationError::EmptyBody)?;
+    let sent_at =
+        normalize_collaboration_text(sent_at).ok_or(CollaborationError::EmptyTimestamp)?;
+    let channel = channel.ok_or(CollaborationError::ChannelNotFound { channel_id: None })?;
+    if !channel
+        .member_account_ids
+        .iter()
+        .any(|member_id| member_id == &author_id)
+    {
+        return Err(CollaborationError::AuthorNotChannelMember {
+            channel_id: channel.channel_id.clone(),
+            author_id,
+        });
+    }
+
+    Ok(CollaborationMessageRecord {
+        message_id,
+        channel_id: channel.channel_id.clone(),
+        author_id,
+        body,
+        sent_at,
+    })
+}
+
+fn normalize_collaboration_members(
+    members: Vec<String>,
+) -> Result<Vec<String>, CollaborationError> {
+    let members = members
+        .into_iter()
+        .filter_map(normalize_collaboration_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        Err(CollaborationError::EmptyMembers)
+    } else {
+        Ok(members)
+    }
+}
+
+fn normalize_collaboration_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(normalize_collaboration_text)
+}
+
+fn normalize_collaboration_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetNodeComponentHealth {
@@ -4683,13 +4837,14 @@ mod tests {
     use super::{
         append_content_version, apply_fleet_node_heartbeat, assert_flight_operation_allowed,
         assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-        build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
-        compute_drought_index, create_versioned_content, normalize_weather_provider_forecast,
-        sign_fleet_config_bundle, soil_moisture_rejection_record,
-        transition_marketplace_account_status, validate_field_boundary,
-        verify_and_apply_fleet_config_bundle, weather_fetch_failure_record,
-        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
-        AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        build_collaboration_channel, build_collaboration_message, build_marketplace_account_record,
+        build_soil_moisture_reading, build_sustainability_record, compute_drought_index,
+        create_versioned_content, normalize_weather_provider_forecast, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, transition_marketplace_account_status,
+        validate_field_boundary, verify_and_apply_fleet_config_bundle,
+        weather_fetch_failure_record, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
         ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
         DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
         FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
@@ -5350,6 +5505,103 @@ mod tests {
         .expect_err("empty body should reject");
 
         assert_eq!(error, ContentError::EmptyBody);
+    }
+
+    #[test]
+    fn collaboration_channel_create_and_message_normalizes_membership() {
+        let channel = build_collaboration_channel(
+            CollaborationChannelCreateRequest {
+                channel_id: Some(" channel-001 ".to_string()),
+                org_id: " org-alpha ".to_string(),
+                field_ref: " field:field-alpha ".to_string(),
+                member_account_ids: vec![
+                    " user-a ".to_string(),
+                    "user-b".to_string(),
+                    "user-a".to_string(),
+                ],
+            },
+            "generated-channel".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+        )
+        .expect("channel should normalize");
+
+        assert_eq!(channel.channel_id, "channel-001");
+        assert_eq!(channel.org_id, "org-alpha");
+        assert_eq!(channel.field_ref, "field:field-alpha");
+        assert_eq!(channel.member_account_ids, vec!["user-a", "user-b"]);
+
+        let message = build_collaboration_message(
+            CollaborationMessageCreateRequest {
+                message_id: Some(" message-001 ".to_string()),
+                author_id: " user-a ".to_string(),
+                body: " Scout north pivot ".to_string(),
+            },
+            Some(&channel),
+            "generated-message".to_string(),
+            "2026-06-13T15:05:00Z".to_string(),
+        )
+        .expect("member can post");
+
+        assert_eq!(message.message_id, "message-001");
+        assert_eq!(message.channel_id, "channel-001");
+        assert_eq!(message.author_id, "user-a");
+        assert_eq!(message.body, "Scout north pivot");
+        assert_eq!(message.sent_at, "2026-06-13T15:05:00Z");
+    }
+
+    #[test]
+    fn collaboration_message_rejects_missing_channel_without_record() {
+        let error = build_collaboration_message(
+            CollaborationMessageCreateRequest {
+                message_id: Some("message-missing".to_string()),
+                author_id: "user-a".to_string(),
+                body: "hello".to_string(),
+            },
+            None,
+            "generated-message".to_string(),
+            "2026-06-13T15:05:00Z".to_string(),
+        )
+        .expect_err("missing channel should reject");
+
+        assert_eq!(
+            error,
+            CollaborationError::ChannelNotFound { channel_id: None }
+        );
+    }
+
+    #[test]
+    fn collaboration_message_rejects_non_member_author() {
+        let channel = build_collaboration_channel(
+            CollaborationChannelCreateRequest {
+                channel_id: Some("channel-001".to_string()),
+                org_id: "org-alpha".to_string(),
+                field_ref: "field:field-alpha".to_string(),
+                member_account_ids: vec!["user-a".to_string()],
+            },
+            "generated-channel".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+        )
+        .expect("channel should create");
+
+        let error = build_collaboration_message(
+            CollaborationMessageCreateRequest {
+                message_id: Some("message-denied".to_string()),
+                author_id: "user-b".to_string(),
+                body: "hello".to_string(),
+            },
+            Some(&channel),
+            "generated-message".to_string(),
+            "2026-06-13T15:05:00Z".to_string(),
+        )
+        .expect_err("non-member author should reject");
+
+        assert_eq!(
+            error,
+            CollaborationError::AuthorNotChannelMember {
+                channel_id: "channel-001".to_string(),
+                author_id: "user-b".to_string()
+            }
+        );
     }
 
     #[test]

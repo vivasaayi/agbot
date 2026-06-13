@@ -227,6 +227,18 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::append_content_item_version),
         )
         .route(
+            "/api/collaboration/channels",
+            get(routes::list_collaboration_channels).post(routes::create_collaboration_channel),
+        )
+        .route(
+            "/api/collaboration/channels/:channel_id",
+            get(routes::get_collaboration_channel),
+        )
+        .route(
+            "/api/collaboration/channels/:channel_id/messages",
+            post(routes::post_collaboration_message),
+        )
+        .route(
             "/api/time-series/points",
             get(routes::list_time_series_points),
         )
