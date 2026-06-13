@@ -14,6 +14,7 @@ pub mod ndvi_analysis;
 pub mod product_anomalies;
 pub mod report_generator;
 pub mod thermal_analysis;
+pub mod thermal_spots;
 pub mod vegetation_summary;
 pub mod zonal_statistics;
 pub mod zone_delineation;
@@ -35,6 +36,10 @@ pub use product_anomalies::{
 };
 pub use report_generator::ReportGenerator;
 pub use thermal_analysis::{ThermalAnalysisConfig, ThermalAnalysisProcessor};
+pub use thermal_spots::{
+    detect_thermal_spots, ThermalSpot, ThermalSpotError, ThermalSpotRequest, ThermalSpotSummary,
+    ThermalSpotType,
+};
 pub use vegetation_summary::{
     summarize_vegetation, VegetationSourceProduct, VegetationSummary, VegetationSummaryError,
     VegetationSummaryInput, VegetationTrend, DEFAULT_LOW_VIGOR_NDVI_THRESHOLD,
