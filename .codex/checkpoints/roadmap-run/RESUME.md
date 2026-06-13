@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: bb9f75f8ada8db1df31a3f576b55221c29de43ad (`batch-02-20`)
-- **Latest checkpoint commit**: 3f189ae0c044a714f40e25b03a2cd5fb9127ed8a (`batch-02-19` metadata)
-- **Current batch**: `batch-02-20` / STORY `02-20` — deterministic ray-traced camera frames committed
-- **Completed feature rows**: 267 committed; 1 skipped; 1 blocked; 229 pending rows remain in the full-roadmap inventory
+- **Last implementation commit**: 50f1d317a3193c0742cb6af92f4012dc2ad8d1a5 (`batch-02-21`)
+- **Latest checkpoint commit**: f2262ac024d967e42b7569912c5b6660b59c7176 (`batch-02-20` metadata)
+- **Current batch**: `batch-02-21` / STORY `02-21` — telemetry and encoded video streaming committed
+- **Completed feature rows**: 268 committed; 1 skipped; 1 blocked; 228 pending rows remain in the full-roadmap inventory
 - **Blocker**: STORY `07-11` is blocked on the documented storage-authority confirmation question.
 
 ## Latest verification
