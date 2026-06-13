@@ -13,6 +13,7 @@ pub mod dispatch_safety;
 pub mod flight_path;
 pub mod guarded_dispatch;
 pub mod mavlink_integration;
+pub mod mission_audit;
 pub mod mission_optimizer;
 pub mod preflight_checklist;
 pub mod survey_template;
@@ -42,6 +43,10 @@ pub use flight_path::{FlightPath, PathSegment, SurveyPattern};
 pub use guarded_dispatch::{
     dispatch_guarded_simulation_command, GuardedDispatchAuditEvent, GuardedDispatchAuditEventKind,
     GuardedDispatchCommand, GuardedDispatchContext, GuardedDispatchError, GuardedDispatchOutcome,
+};
+pub use mission_audit::{
+    validate_mission_audit_timeline, MissionAuditEvent, MissionAuditEventKind, MissionAuditGap,
+    MissionAuditGapCode, MissionAuditLog, MissionAuditTimeline, MissionAuditValidationReport,
 };
 pub use mission_optimizer::{
     assert_mission_budget_allows_arming, evaluate_mission_budget, MissionBudgetConfig,
