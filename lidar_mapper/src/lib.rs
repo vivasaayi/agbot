@@ -76,6 +76,7 @@ pub struct LidarScanIngest {
 pub const OCCUPANCY_GRID_LOCAL_CRS: &str = "LOCAL_LIDAR_METERS";
 const OUTLIER_DISTANCE_EPSILON_METERS: f64 = 1.0e-9;
 const GRID_COORDINATE_EPSILON: f64 = 1.0e-6;
+const DEFAULT_LIDAR_COVERAGE_FLOOR: f32 = 0.80;
 const POINT_CLOUD_FRAME_CRS_NOTE: &str =
     "LOCAL_LIDAR_METERS: x/y are derived from polar LiDAR angle and distance in meters; z=0 for 2D scans";
 
@@ -97,6 +98,36 @@ pub struct LidarOccupancyGridEvidence {
     pub quality_threshold: u8,
     pub occupancy_threshold: f32,
     pub flip_y: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LidarCoverageStatus {
+    Pass,
+    LowCoverage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarCellDensity {
+    pub grid_x: i32,
+    pub grid_y: i32,
+    pub points: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarCoverageDensityEvidence {
+    pub width: u32,
+    pub height: u32,
+    pub min_grid_x: i32,
+    pub min_grid_y: i32,
+    pub total_cells: usize,
+    pub covered_cells: usize,
+    pub total_points: usize,
+    pub max_points_per_cell: usize,
+    pub mean_points_per_cell: f32,
+    pub covered_cell_fraction: f32,
+    pub coverage_floor: f32,
+    pub status: LidarCoverageStatus,
+    pub cell_densities: Vec<LidarCellDensity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -369,6 +400,10 @@ impl LidarMapper {
         let grid = self.build_occupancy_grid(&all_scans)?;
         self.save_occupancy_spatial_ref(&grid, output_dir).await?;
         self.save_occupancy_grid_evidence(&grid.evidence, output_dir)
+            .await?;
+        let coverage_evidence =
+            self.coverage_density_evidence(&grid, DEFAULT_LIDAR_COVERAGE_FLOOR)?;
+        self.save_coverage_density_evidence(&coverage_evidence, output_dir)
             .await?;
 
         // Save grid as image
@@ -1251,6 +1286,98 @@ impl LidarMapper {
         Ok(())
     }
 
+    pub fn coverage_density_evidence(
+        &self,
+        grid: &LidarOccupancyGrid,
+        coverage_floor: f32,
+    ) -> AgroResult<LidarCoverageDensityEvidence> {
+        let coverage_floor = Self::normalize_coverage_floor(coverage_floor);
+        let width = grid.width.max(1);
+        let height = grid.height.max(1);
+        let total_cells = (width * height) as usize;
+        let mut covered_cells = 0usize;
+        let mut total_points = 0usize;
+        let mut max_points_per_cell = 0usize;
+        let mut cell_densities = Vec::with_capacity(total_cells);
+
+        for y_offset in 0..height {
+            for x_offset in 0..width {
+                let grid_x = grid.min_grid_x + x_offset as i32;
+                let grid_y = grid.min_grid_y + y_offset as i32;
+                let points = grid
+                    .cells
+                    .get(&(grid_x, grid_y))
+                    .map(|cell| cell.total_observations)
+                    .unwrap_or(0);
+                if points > 0 {
+                    covered_cells += 1;
+                }
+                total_points += points;
+                max_points_per_cell = max_points_per_cell.max(points);
+                cell_densities.push(LidarCellDensity {
+                    grid_x,
+                    grid_y,
+                    points,
+                });
+            }
+        }
+
+        let covered_cell_fraction = if total_cells == 0 {
+            0.0
+        } else {
+            covered_cells as f32 / total_cells as f32
+        };
+        let mean_points_per_cell = if total_cells == 0 {
+            0.0
+        } else {
+            total_points as f32 / total_cells as f32
+        };
+        let status = if covered_cell_fraction >= coverage_floor {
+            LidarCoverageStatus::Pass
+        } else {
+            LidarCoverageStatus::LowCoverage
+        };
+
+        Ok(LidarCoverageDensityEvidence {
+            width,
+            height,
+            min_grid_x: grid.min_grid_x,
+            min_grid_y: grid.min_grid_y,
+            total_cells,
+            covered_cells,
+            total_points,
+            max_points_per_cell,
+            mean_points_per_cell,
+            covered_cell_fraction,
+            coverage_floor,
+            status,
+            cell_densities,
+        })
+    }
+
+    fn normalize_coverage_floor(coverage_floor: f32) -> f32 {
+        if coverage_floor.is_finite() {
+            coverage_floor.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_LIDAR_COVERAGE_FLOOR
+        }
+    }
+
+    async fn save_coverage_density_evidence(
+        &self,
+        evidence: &LidarCoverageDensityEvidence,
+        output_dir: &PathBuf,
+    ) -> AgroResult<()> {
+        let output_path = output_dir.join("lidar_coverage_density_evidence.json");
+        let content = serde_json::to_vec_pretty(evidence)?;
+        tokio::fs::write(&output_path, content).await?;
+        info!(
+            "Saved LiDAR coverage density evidence to: {:?}",
+            output_path
+        );
+        Ok(())
+    }
+
     async fn save_grid_image(
         &self,
         grid: &HashMap<(i32, i32), GridCell>,
@@ -1748,6 +1875,103 @@ mod tests {
         let persisted_path = output_dir.join("lidar_occupancy_grid_evidence.json");
         assert!(persisted_path.exists());
         let persisted: LidarOccupancyGridEvidence =
+            serde_json::from_str(&fs::read_to_string(persisted_path).unwrap()).unwrap();
+        assert_eq!(persisted, evidence);
+    }
+
+    #[test]
+    fn coverage_density_records_full_scan_grid() {
+        let mapper = test_mapper();
+        let grid = heatmap_test_grid(
+            &mapper,
+            vec![
+                (
+                    (0, 0),
+                    GridCell {
+                        occupied: false,
+                        obstacle_count: 0,
+                        total_observations: 2,
+                    },
+                ),
+                (
+                    (1, 0),
+                    GridCell {
+                        occupied: false,
+                        obstacle_count: 0,
+                        total_observations: 3,
+                    },
+                ),
+                (
+                    (0, 1),
+                    GridCell {
+                        occupied: false,
+                        obstacle_count: 0,
+                        total_observations: 1,
+                    },
+                ),
+                (
+                    (1, 1),
+                    GridCell {
+                        occupied: true,
+                        obstacle_count: 1,
+                        total_observations: 4,
+                    },
+                ),
+            ],
+            2,
+            2,
+        );
+
+        let evidence = mapper.coverage_density_evidence(&grid, 0.75).unwrap();
+
+        assert_eq!(evidence.status, LidarCoverageStatus::Pass);
+        assert_eq!(evidence.width, 2);
+        assert_eq!(evidence.height, 2);
+        assert_eq!(evidence.total_cells, 4);
+        assert_eq!(evidence.covered_cells, 4);
+        assert_eq!(evidence.total_points, 10);
+        assert_eq!(evidence.max_points_per_cell, 4);
+        assert_eq!(evidence.coverage_floor, 0.75);
+        assert!((evidence.covered_cell_fraction - 1.0).abs() < f32::EPSILON);
+        assert!((evidence.mean_points_per_cell - 2.5).abs() < f32::EPSILON);
+        assert_eq!(evidence.cell_densities.len(), 4);
+        assert_eq!(evidence.cell_densities[0].points, 2);
+        assert_eq!(evidence.cell_densities[3].points, 4);
+    }
+
+    #[tokio::test]
+    async fn coverage_density_flags_and_persists_sparse_grid() {
+        let mapper = test_mapper();
+        let output_dir = temp_dir("coverage_density_evidence");
+        let grid = heatmap_test_grid(
+            &mapper,
+            vec![(
+                (0, 0),
+                GridCell {
+                    occupied: false,
+                    obstacle_count: 0,
+                    total_observations: 1,
+                },
+            )],
+            3,
+            3,
+        );
+
+        let evidence = mapper.coverage_density_evidence(&grid, 0.5).unwrap();
+
+        assert_eq!(evidence.status, LidarCoverageStatus::LowCoverage);
+        assert_eq!(evidence.total_cells, 9);
+        assert_eq!(evidence.covered_cells, 1);
+        assert_eq!(evidence.total_points, 1);
+        assert!((evidence.covered_cell_fraction - (1.0 / 9.0)).abs() < 1e-6);
+        assert!(evidence.cell_densities.iter().any(|cell| cell.points == 0));
+
+        mapper
+            .save_coverage_density_evidence(&evidence, &output_dir)
+            .await
+            .unwrap();
+        let persisted_path = output_dir.join("lidar_coverage_density_evidence.json");
+        let persisted: LidarCoverageDensityEvidence =
             serde_json::from_str(&fs::read_to_string(persisted_path).unwrap()).unwrap();
         assert_eq!(persisted, evidence);
     }
