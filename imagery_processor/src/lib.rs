@@ -181,6 +181,238 @@ pub enum IndexKind {
     Evi2,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
+pub enum IndexBandRole {
+    Blue,
+    Green,
+    Red,
+    Nir,
+    RedEdge,
+    Swir1,
+    Swir2,
+}
+
+impl IndexBandRole {
+    pub fn key(self) -> &'static str {
+        match self {
+            IndexBandRole::Blue => "blue",
+            IndexBandRole::Green => "green",
+            IndexBandRole::Red => "red",
+            IndexBandRole::Nir => "nir",
+            IndexBandRole::RedEdge => "red_edge",
+            IndexBandRole::Swir1 => "swir1",
+            IndexBandRole::Swir2 => "swir2",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            IndexBandRole::Blue => "Blue",
+            IndexBandRole::Green => "Green",
+            IndexBandRole::Red => "Red",
+            IndexBandRole::Nir => "NIR",
+            IndexBandRole::RedEdge => "Red-edge",
+            IndexBandRole::Swir1 => "SWIR1",
+            IndexBandRole::Swir2 => "SWIR2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum IndexCatalogError {
+    #[error("{index:?} requires missing {band:?} band")]
+    MissingRequiredBand {
+        index: IndexKind,
+        band: IndexBandRole,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IndexBandValues {
+    values: BTreeMap<IndexBandRole, f32>,
+}
+
+impl IndexBandValues {
+    pub fn with_band(mut self, band: IndexBandRole, value: f32) -> Self {
+        self.values.insert(band, value);
+        self
+    }
+
+    pub fn insert(&mut self, band: IndexBandRole, value: f32) {
+        self.values.insert(band, value);
+    }
+
+    fn required(&self, index: IndexKind, band: IndexBandRole) -> Result<f32, IndexCatalogError> {
+        self.values
+            .get(&band)
+            .copied()
+            .ok_or(IndexCatalogError::MissingRequiredBand { index, band })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IndexPixelValue {
+    Valid(f32),
+    Invalid { reason: &'static str },
+}
+
+impl IndexPixelValue {
+    pub fn value(self) -> Option<f32> {
+        match self {
+            IndexPixelValue::Valid(value) => Some(value),
+            IndexPixelValue::Invalid { .. } => None,
+        }
+    }
+
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            IndexPixelValue::Valid(_) => None,
+            IndexPixelValue::Invalid { reason } => Some(reason),
+        }
+    }
+
+    fn map_value(self, transform: impl FnOnce(f32) -> f32) -> Self {
+        match self {
+            IndexPixelValue::Valid(value) => IndexPixelValue::Valid(transform(value)),
+            invalid => invalid,
+        }
+    }
+}
+
+impl IndexKind {
+    pub fn catalog() -> &'static [IndexKind] {
+        &[
+            IndexKind::Ndvi,
+            IndexKind::Ndre,
+            IndexKind::Evi,
+            IndexKind::Savi,
+            IndexKind::Vari,
+            IndexKind::Gndvi,
+            IndexKind::Ndwi,
+            IndexKind::Mndwi,
+            IndexKind::Msavi,
+            IndexKind::Nbr,
+            IndexKind::Ndmi,
+            IndexKind::Evi2,
+        ]
+    }
+
+    pub fn required_bands(self) -> &'static [IndexBandRole] {
+        match self {
+            IndexKind::Ndvi | IndexKind::Savi | IndexKind::Msavi | IndexKind::Evi2 => {
+                &[IndexBandRole::Red, IndexBandRole::Nir]
+            }
+            IndexKind::Ndre => &[IndexBandRole::RedEdge, IndexBandRole::Nir],
+            IndexKind::Evi => &[IndexBandRole::Blue, IndexBandRole::Red, IndexBandRole::Nir],
+            IndexKind::Vari => &[
+                IndexBandRole::Blue,
+                IndexBandRole::Green,
+                IndexBandRole::Red,
+            ],
+            IndexKind::Gndvi | IndexKind::Ndwi => &[IndexBandRole::Green, IndexBandRole::Nir],
+            IndexKind::Mndwi => &[IndexBandRole::Green, IndexBandRole::Swir1],
+            IndexKind::Nbr => &[IndexBandRole::Nir, IndexBandRole::Swir2],
+            IndexKind::Ndmi => &[IndexBandRole::Nir, IndexBandRole::Swir1],
+        }
+    }
+
+    pub fn expected_value_range(self) -> (f32, f32) {
+        (-1.0, 1.0)
+    }
+
+    pub fn compute_value(
+        self,
+        values: &IndexBandValues,
+    ) -> Result<IndexPixelValue, IndexCatalogError> {
+        let pixel_value = match self {
+            IndexKind::Ndvi => normalized_difference(
+                values.required(self, IndexBandRole::Nir)?,
+                values.required(self, IndexBandRole::Red)?,
+            )
+            .map_value(|value| value.clamp(-1.0, 1.0)),
+            IndexKind::Ndre => normalized_difference(
+                values.required(self, IndexBandRole::Nir)?,
+                values.required(self, IndexBandRole::RedEdge)?,
+            )
+            .map_value(|value| value.clamp(-1.0, 1.0)),
+            IndexKind::Evi => {
+                let nir = values.required(self, IndexBandRole::Nir)?;
+                let red = values.required(self, IndexBandRole::Red)?;
+                let blue = values.required(self, IndexBandRole::Blue)?;
+                ratio_or_invalid(2.5 * (nir - red), nir + 6.0 * red - 7.5 * blue + 1.0)
+            }
+            IndexKind::Savi => {
+                let nir = values.required(self, IndexBandRole::Nir)?;
+                let red = values.required(self, IndexBandRole::Red)?;
+                let soil_brightness = 0.5;
+                ratio_or_invalid(
+                    (1.0 + soil_brightness) * (nir - red),
+                    nir + red + soil_brightness,
+                )
+            }
+            IndexKind::Vari => {
+                let green = values.required(self, IndexBandRole::Green)?;
+                let red = values.required(self, IndexBandRole::Red)?;
+                let blue = values.required(self, IndexBandRole::Blue)?;
+                ratio_or_invalid(green - red, green + red - blue)
+            }
+            IndexKind::Gndvi => normalized_difference(
+                values.required(self, IndexBandRole::Nir)?,
+                values.required(self, IndexBandRole::Green)?,
+            ),
+            IndexKind::Ndwi => normalized_difference(
+                values.required(self, IndexBandRole::Green)?,
+                values.required(self, IndexBandRole::Nir)?,
+            ),
+            IndexKind::Mndwi => normalized_difference(
+                values.required(self, IndexBandRole::Green)?,
+                values.required(self, IndexBandRole::Swir1)?,
+            ),
+            IndexKind::Msavi => {
+                let nir = values.required(self, IndexBandRole::Nir)?;
+                let red = values.required(self, IndexBandRole::Red)?;
+                let term = (2.0 * nir + 1.0).powi(2) - 8.0 * (nir - red);
+                if term < 0.0 {
+                    IndexPixelValue::Invalid {
+                        reason: "math_domain",
+                    }
+                } else {
+                    IndexPixelValue::Valid((2.0 * nir + 1.0 - term.sqrt()) * 0.5)
+                }
+            }
+            IndexKind::Nbr => normalized_difference(
+                values.required(self, IndexBandRole::Nir)?,
+                values.required(self, IndexBandRole::Swir2)?,
+            ),
+            IndexKind::Ndmi => normalized_difference(
+                values.required(self, IndexBandRole::Nir)?,
+                values.required(self, IndexBandRole::Swir1)?,
+            ),
+            IndexKind::Evi2 => {
+                let nir = values.required(self, IndexBandRole::Nir)?;
+                let red = values.required(self, IndexBandRole::Red)?;
+                ratio_or_invalid(2.5 * (nir - red), nir + 2.4 * red + 1.0)
+            }
+        };
+
+        Ok(pixel_value)
+    }
+}
+
+fn normalized_difference(left: f32, right: f32) -> IndexPixelValue {
+    ratio_or_invalid(left - right, left + right)
+}
+
+fn ratio_or_invalid(numerator: f32, denominator: f32) -> IndexPixelValue {
+    if denominator.abs() <= f32::EPSILON {
+        IndexPixelValue::Invalid {
+            reason: "divide_by_zero",
+        }
+    } else {
+        IndexPixelValue::Valid(numerator / denominator)
+    }
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, ValueEnum, Debug)]
 pub enum OutputFormat {
     Png,
@@ -284,4 +516,94 @@ pub struct IndexResultMeta {
     pub invalid_pixel_reasons: BTreeMap<String, usize>,
     pub radiometric_calibration: crate::io::RadiometricCalibrationEvidence,
     pub spatial_ref: shared::schemas::RasterSpatialRef,
+}
+
+#[cfg(test)]
+mod index_catalog_tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "actual {actual} did not match expected {expected}"
+        );
+    }
+
+    fn reflectance_vector() -> IndexBandValues {
+        IndexBandValues::default()
+            .with_band(IndexBandRole::Blue, 0.1)
+            .with_band(IndexBandRole::Green, 0.4)
+            .with_band(IndexBandRole::Red, 0.2)
+            .with_band(IndexBandRole::Nir, 0.6)
+            .with_band(IndexBandRole::RedEdge, 0.3)
+            .with_band(IndexBandRole::Swir1, 0.25)
+            .with_band(IndexBandRole::Swir2, 0.15)
+    }
+
+    #[test]
+    fn full_index_catalog_declares_required_bands() {
+        assert_eq!(IndexKind::catalog().len(), 12);
+        assert_eq!(
+            IndexKind::Ndvi.required_bands(),
+            &[IndexBandRole::Red, IndexBandRole::Nir]
+        );
+        assert_eq!(
+            IndexKind::Evi.required_bands(),
+            &[IndexBandRole::Blue, IndexBandRole::Red, IndexBandRole::Nir]
+        );
+        assert_eq!(
+            IndexKind::Mndwi.required_bands(),
+            &[IndexBandRole::Green, IndexBandRole::Swir1]
+        );
+        assert_eq!(
+            IndexKind::Nbr.required_bands(),
+            &[IndexBandRole::Nir, IndexBandRole::Swir2]
+        );
+    }
+
+    #[test]
+    fn full_index_catalog_computes_known_vectors() {
+        let values = reflectance_vector();
+        let cases = [
+            (IndexKind::Ndvi, 0.5),
+            (IndexKind::Ndre, 0.33333334),
+            (IndexKind::Evi, 0.4878049),
+            (IndexKind::Savi, 0.4615385),
+            (IndexKind::Vari, 0.4),
+            (IndexKind::Gndvi, 0.2),
+            (IndexKind::Ndwi, -0.2),
+            (IndexKind::Mndwi, 0.23076923),
+            (IndexKind::Msavi, 0.4596876),
+            (IndexKind::Nbr, 0.6),
+            (IndexKind::Ndmi, 0.4117647),
+            (IndexKind::Evi2, 0.48076925),
+        ];
+
+        for (index, expected) in cases {
+            let actual = index.compute_value(&values).unwrap().value().unwrap();
+            assert_close(actual, expected);
+            let (min, max) = index.expected_value_range();
+            assert!(
+                actual >= min && actual <= max,
+                "{index:?} produced {actual}, outside [{min}, {max}]"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_required_band_is_named_by_index_and_role() {
+        let values = IndexBandValues::default()
+            .with_band(IndexBandRole::Red, 0.2)
+            .with_band(IndexBandRole::Nir, 0.6);
+
+        let error = IndexKind::Evi.compute_value(&values).unwrap_err();
+
+        assert_eq!(
+            error,
+            IndexCatalogError::MissingRequiredBand {
+                index: IndexKind::Evi,
+                band: IndexBandRole::Blue
+            }
+        );
+    }
 }

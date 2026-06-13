@@ -434,7 +434,8 @@ async fn indices_persist_sentinel2_band_ingest_evidence() {
     assert_eq!(evidence.height, 1);
     assert_eq!(evidence.resolved_bands.get("red").unwrap(), "B04");
     assert_eq!(evidence.resolved_bands.get("nir").unwrap(), "B08");
-    assert_eq!(evidence.resolved_bands.get("red_edge").unwrap(), "B05");
+    assert_eq!(evidence.band_index_to_name.get(&2).unwrap(), "B05");
+    assert!(evidence.resolved_bands.get("red_edge").is_none());
 }
 
 #[tokio::test]
@@ -813,7 +814,39 @@ async fn indices_error_when_required_extra_band_is_missing() {
     args.index = IndexKind::Gndvi;
 
     let error = run_indices(&args).await.unwrap_err().to_string();
-    assert!(error.contains("Green band"));
+    assert!(error.contains("required band 'Green'"));
+}
+
+#[tokio::test]
+async fn mndwi_uses_only_declared_green_and_swir1_bands() {
+    let root = temp_test_dir("mndwi_declared_bands");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let green_path = input_dir.join("green.png");
+    let swir1_path = input_dir.join("swir1.png");
+    write_gray_image(&green_path, 1, 1, &[40]);
+    write_gray_image(&swir1_path, 1, 1, &[25]);
+    write_metadata(
+        &input_dir,
+        1,
+        1,
+        &[
+            ("Green", green_path.as_path()),
+            ("SWIR1", swir1_path.as_path()),
+        ],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.index = IndexKind::Mndwi;
+
+    run_indices(&args).await.unwrap();
+
+    let meta = read_result_meta(&output_dir);
+    assert_eq!(meta["index"].as_str().unwrap(), "mndwi");
+    assert_eq!(meta["valid_pixel_count"].as_u64().unwrap(), 1);
+    assert!((meta["mean"].as_f64().unwrap() - (15.0 / 65.0)).abs() < 1e-6);
 }
 
 #[tokio::test]

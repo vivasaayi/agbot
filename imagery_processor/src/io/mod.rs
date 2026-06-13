@@ -221,21 +221,6 @@ pub fn resolve_band_ingest_evidence(
     sensor: Option<SensorPreset>,
     overrides: &BandOverrides,
 ) -> Result<BandIngestEvidence, BandIngestError> {
-    let mut band_index_to_name: BTreeMap<usize, String> = image
-        .metadata
-        .bands
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (index, name.clone()))
-        .collect();
-    if band_index_to_name.is_empty() {
-        let mut band_names = image.file_paths.keys().cloned().collect::<Vec<_>>();
-        band_names.sort();
-        for (index, name) in band_names.into_iter().enumerate() {
-            band_index_to_name.insert(index, name);
-        }
-    }
-
     let (def_red, def_nir, def_red_edge) = sensor
         .map(|preset| preset.default_bands())
         .unwrap_or((None, None, None));
@@ -258,6 +243,29 @@ pub fn resolve_band_ingest_evidence(
     let mut resolved_bands = BTreeMap::from([("red".to_string(), red), ("nir".to_string(), nir)]);
     if sensor.is_some() || overrides.red_edge.is_some() {
         resolved_bands.insert("red_edge".to_string(), red_edge);
+    }
+
+    resolve_band_ingest_evidence_for_resolved_bands(image, sensor, resolved_bands)
+}
+
+pub fn resolve_band_ingest_evidence_for_resolved_bands(
+    image: &MultispectralImage,
+    sensor: Option<SensorPreset>,
+    resolved_bands: BTreeMap<String, String>,
+) -> Result<BandIngestEvidence, BandIngestError> {
+    let mut band_index_to_name: BTreeMap<usize, String> = image
+        .metadata
+        .bands
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (index, name.clone()))
+        .collect();
+    if band_index_to_name.is_empty() {
+        let mut band_names = image.file_paths.keys().cloned().collect::<Vec<_>>();
+        band_names.sort();
+        for (index, name) in band_names.into_iter().enumerate() {
+            band_index_to_name.insert(index, name);
+        }
     }
 
     for band_name in resolved_bands.values() {
