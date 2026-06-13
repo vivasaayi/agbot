@@ -5,6 +5,7 @@ use shared::schemas::{
     FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint, RasterResolution,
     RasterSpatialRef, RasterSpatialRefError,
 };
+use std::collections::BTreeSet;
 
 const WGS84: &str = "EPSG:4326";
 const WEB_MERCATOR: &str = "EPSG:3857";
@@ -19,6 +20,7 @@ const PRESCRIPTION_UNIT_ATTRIBUTE: &str = "UNIT";
 const PRESCRIPTION_RATE_FIELD_WIDTH: u8 = 18;
 const PRESCRIPTION_RATE_DECIMALS: u8 = 6;
 const GEOMETRY_EPSILON: f64 = 1e-9;
+const TASKDATA_FILENAME: &str = "TASKDATA.XML";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -192,6 +194,35 @@ pub struct PrescriptionShapefileReport {
     pub files: PrescriptionShapefileFiles,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDataValidation {
+    pub valid: bool,
+    pub task_count: usize,
+    pub zone_count: usize,
+    pub product_count: usize,
+    pub prescription_grid_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrescriptionTaskDataReport {
+    pub prescription_id: String,
+    pub field_id: String,
+    pub field_crs: String,
+    pub zone_count: usize,
+    pub unit_designator: String,
+    pub taskdata_xml: Vec<u8>,
+    pub validation: TaskDataValidation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct NormalizedPrescription {
+    prescription_id: String,
+    field_id: String,
+    field_crs: String,
+    field_extent: InteropExtent,
+    zones: Vec<NormalizedPrescriptionZone>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct NormalizedPrescriptionZone {
     zone_id: String,
@@ -244,6 +275,18 @@ pub enum PrescriptionRejectionReason {
         right_zone_id: String,
     },
     ZoneCoverageGap,
+    UnsupportedTaskDataUnit {
+        zone_id: String,
+        unit: String,
+    },
+    MixedTaskDataUnits {
+        zone_id: String,
+        expected_unit: String,
+        actual_unit: String,
+    },
+    InvalidTaskDataSchema {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,59 +576,210 @@ pub fn import_field_boundary(
 pub fn export_prescription_shapefile(
     request: PrescriptionShapefileRequest,
 ) -> Result<PrescriptionShapefileReport, InteropError> {
-    let filename = normalized_filename(request.prescription_id.clone());
-    let prescription_id =
-        normalize_prescription_text(&request.prescription_id).ok_or_else(|| {
-            prescription_rejected(&filename, PrescriptionRejectionReason::EmptyPrescriptionId)
-        })?;
-    let field_id = normalize_prescription_text(&request.field.field_id).ok_or_else(|| {
-        prescription_rejected(&filename, PrescriptionRejectionReason::EmptyFieldId)
-    })?;
-    let field_crs = normalize_crs(&request.field.crs)
-        .ok_or_else(|| prescription_rejected(&filename, PrescriptionRejectionReason::EmptyCrs))?;
-    let field_boundary = normalize_prescription_ring(&request.field.boundary).ok_or_else(|| {
-        prescription_rejected(&filename, PrescriptionRejectionReason::InvalidFieldGeometry)
-    })?;
-    let field_extent = extent_from_coordinates(&field_boundary).ok_or_else(|| {
-        prescription_rejected(&filename, PrescriptionRejectionReason::InvalidFieldGeometry)
-    })?;
-    let field_area = polygon_area(&field_boundary);
-    if field_area <= GEOMETRY_EPSILON || ring_self_intersects_coordinates(&field_boundary) {
-        return Err(prescription_rejected(
-            &filename,
-            PrescriptionRejectionReason::InvalidFieldGeometry,
-        ));
-    }
-    if request.zones.is_empty() {
-        return Err(prescription_rejected(
-            &filename,
-            PrescriptionRejectionReason::EmptyZoneSet,
-        ));
-    }
-
-    let mut zones = Vec::with_capacity(request.zones.len());
-    for zone in request.zones {
-        zones.push(normalize_prescription_zone(
-            &filename,
-            zone,
-            &field_crs,
-            &field_boundary,
-            field_extent,
-        )?);
-    }
-    assert_prescription_zones_do_not_overlap(&filename, &zones)?;
-    assert_prescription_zones_tile_field(&filename, field_area, &zones)?;
-
-    let files = write_prescription_shapefile_bundle(&field_crs, field_extent, &zones);
+    let prescription = normalize_prescription_request(request)?;
+    let files = write_prescription_shapefile_bundle(
+        &prescription.field_crs,
+        prescription.field_extent,
+        &prescription.zones,
+    );
     Ok(PrescriptionShapefileReport {
-        prescription_id,
-        field_id,
-        field_crs,
-        extent: field_extent,
-        zone_count: zones.len(),
+        prescription_id: prescription.prescription_id,
+        field_id: prescription.field_id,
+        field_crs: prescription.field_crs,
+        extent: prescription.field_extent,
+        zone_count: prescription.zones.len(),
         rate_attribute: PRESCRIPTION_RATE_ATTRIBUTE.to_string(),
         unit_attribute: PRESCRIPTION_UNIT_ATTRIBUTE.to_string(),
         files,
+    })
+}
+
+pub fn export_prescription_taskdata(
+    request: PrescriptionShapefileRequest,
+) -> Result<PrescriptionTaskDataReport, InteropError> {
+    let prescription = normalize_prescription_request(request)?;
+    let unit_designator = taskdata_unit_designator(&prescription)?;
+    let taskdata_xml = write_taskdata_xml(&prescription, &unit_designator).into_bytes();
+    let validation = validate_taskdata_xml(&taskdata_xml)?;
+    Ok(PrescriptionTaskDataReport {
+        prescription_id: prescription.prescription_id,
+        field_id: prescription.field_id,
+        field_crs: prescription.field_crs,
+        zone_count: prescription.zones.len(),
+        unit_designator,
+        taskdata_xml,
+        validation,
+    })
+}
+
+pub fn validate_taskdata_xml(bytes: &[u8]) -> Result<TaskDataValidation, InteropError> {
+    let xml = std::str::from_utf8(bytes)
+        .map_err(|_| taskdata_schema_rejected("TaskData XML is not valid UTF-8".to_string()))?;
+    let root_start = xml
+        .find("<ISO11783_TaskData")
+        .ok_or_else(|| taskdata_schema_rejected("missing ISO11783_TaskData root".to_string()))?;
+    if xml[..root_start].contains('<') && !xml[..root_start].trim_start().starts_with("<?xml") {
+        return Err(taskdata_schema_rejected(
+            "missing ISO11783_TaskData root".to_string(),
+        ));
+    }
+    let root_end = xml
+        .rfind("</ISO11783_TaskData>")
+        .ok_or_else(|| taskdata_schema_rejected("missing ISO11783_TaskData close".to_string()))?;
+    if root_end <= root_start {
+        return Err(taskdata_schema_rejected(
+            "malformed ISO11783_TaskData root".to_string(),
+        ));
+    }
+    if xml[root_end + "</ISO11783_TaskData>".len()..]
+        .trim()
+        .contains('<')
+    {
+        return Err(taskdata_schema_rejected(
+            "unexpected XML outside ISO11783_TaskData root".to_string(),
+        ));
+    }
+    let root_tag = next_xml_tag(&xml[root_start..])
+        .ok_or_else(|| taskdata_schema_rejected("malformed ISO11783_TaskData root".to_string()))?;
+    if root_tag.name != "ISO11783_TaskData" || root_tag.closing || root_tag.self_closing {
+        return Err(taskdata_schema_rejected(
+            "missing ISO11783_TaskData root".to_string(),
+        ));
+    }
+    let body_start = root_start + root_tag.end;
+    let body = &xml[body_start..root_end];
+    let root_attrs = parse_xml_attributes(root_tag.raw)?;
+    required_attr(&root_attrs, "VersionMajor")?;
+    required_attr(&root_attrs, "VersionMinor")?;
+
+    let task_tags = collect_xml_tags(body, "TSK")?;
+    if task_tags.len() != 1 {
+        return Err(taskdata_schema_rejected("missing TSK task".to_string()));
+    }
+    let product_tags = collect_xml_tags(body, "PDT")?;
+    if product_tags.len() != 1 {
+        return Err(taskdata_schema_rejected("missing PDT product".to_string()));
+    }
+    let pgp_tags = collect_xml_tags(body, "PGP")?;
+    if pgp_tags.len() != 1 {
+        return Err(taskdata_schema_rejected(
+            "missing PGP prescription grid".to_string(),
+        ));
+    }
+    let field_tags = collect_xml_tags(body, "PFD")?;
+    if field_tags.len() != 1 {
+        return Err(taskdata_schema_rejected("missing PFD field".to_string()));
+    }
+    let zone_tags = collect_xml_tags(body, "TZN")?;
+    if zone_tags.is_empty() {
+        return Err(taskdata_schema_rejected("missing TZN zones".to_string()));
+    }
+
+    let product_attrs = parse_xml_attributes(product_tags[0].raw)?;
+    let product_id = required_attr(&product_attrs, "A")?;
+    let product_unit = required_attr(&product_attrs, "C")?;
+    let pgp_attrs = parse_xml_attributes(pgp_tags[0].raw)?;
+    if required_attr(&pgp_attrs, "B")? != product_id {
+        return Err(taskdata_schema_rejected(
+            "PGP product reference does not resolve".to_string(),
+        ));
+    }
+    let pgp_unit = required_attr(&pgp_attrs, "C")?;
+    if pgp_unit != product_unit {
+        return Err(taskdata_schema_rejected(
+            "inconsistent TaskData units".to_string(),
+        ));
+    }
+
+    let field_attrs = parse_xml_attributes(field_tags[0].raw)?;
+    let field_crs = required_attr(&field_attrs, "Crs")?;
+    let task_attrs = parse_xml_attributes(task_tags[0].raw)?;
+    let task_crs = required_attr(&task_attrs, "Crs")?;
+    if task_crs != field_crs {
+        return Err(taskdata_schema_rejected(
+            "inconsistent CRS declarations".to_string(),
+        ));
+    }
+    required_attr(&task_attrs, "A")?;
+    required_attr(&task_attrs, "B")?;
+
+    let mut zone_ids = BTreeSet::new();
+    let mut zone_count = 0usize;
+    for tag in &zone_tags {
+        if tag.self_closing {
+            return Err(taskdata_schema_rejected(
+                "TZN zone must contain polygon points".to_string(),
+            ));
+        }
+        let attrs = parse_xml_attributes(tag.raw)?;
+        let zone_id = required_attr(&attrs, "A")?;
+        if !zone_ids.insert(zone_id.to_string()) {
+            return Err(taskdata_schema_rejected(
+                "duplicate TZN zone id".to_string(),
+            ));
+        }
+        required_attr(&attrs, "B")?;
+        let rate = required_attr(&attrs, "C")?;
+        if rate
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .is_none()
+        {
+            return Err(taskdata_schema_rejected("invalid TZN rate".to_string()));
+        }
+        let zone_unit = required_attr(&attrs, "D")?;
+        if zone_unit != product_unit {
+            return Err(taskdata_schema_rejected(
+                "inconsistent TaskData units".to_string(),
+            ));
+        }
+        let zone_crs = required_attr(&attrs, "Crs")?;
+        if zone_crs != field_crs {
+            return Err(taskdata_schema_rejected(
+                "inconsistent CRS declarations".to_string(),
+            ));
+        }
+        let zone_body = tag_body(body, tag, "TZN")?;
+        let polygon_tags = collect_xml_tags(zone_body, "PLN")?;
+        if polygon_tags.len() != 1 {
+            return Err(taskdata_schema_rejected(
+                "TZN zone must contain one PLN polygon".to_string(),
+            ));
+        }
+        let point_tags = collect_xml_tags(zone_body, "PNT")?;
+        if point_tags.len() < 4 {
+            return Err(taskdata_schema_rejected(
+                "TZN polygon has too few PNT points".to_string(),
+            ));
+        }
+        for point_tag in point_tags {
+            let point_attrs = parse_xml_attributes(point_tag.raw)?;
+            required_attr(&point_attrs, "A")?;
+            let x = required_attr(&point_attrs, "B")?;
+            let y = required_attr(&point_attrs, "C")?;
+            if x.parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .is_none()
+                || y.parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite())
+                    .is_none()
+            {
+                return Err(taskdata_schema_rejected(
+                    "invalid PNT coordinate".to_string(),
+                ));
+            }
+        }
+        zone_count += 1;
+    }
+    Ok(TaskDataValidation {
+        valid: true,
+        task_count: task_tags.len(),
+        zone_count,
+        product_count: product_tags.len(),
+        prescription_grid_count: pgp_tags.len(),
     })
 }
 
@@ -731,6 +925,61 @@ impl From<FieldBoundaryValidationError> for FieldBoundaryRejectionReason {
             FieldBoundaryValidationError::EmptyArea => Self::EmptyArea,
         }
     }
+}
+
+fn normalize_prescription_request(
+    request: PrescriptionShapefileRequest,
+) -> Result<NormalizedPrescription, InteropError> {
+    let filename = normalized_filename(request.prescription_id.clone());
+    let prescription_id =
+        normalize_prescription_text(&request.prescription_id).ok_or_else(|| {
+            prescription_rejected(&filename, PrescriptionRejectionReason::EmptyPrescriptionId)
+        })?;
+    let field_id = normalize_prescription_text(&request.field.field_id).ok_or_else(|| {
+        prescription_rejected(&filename, PrescriptionRejectionReason::EmptyFieldId)
+    })?;
+    let field_crs = normalize_crs(&request.field.crs)
+        .ok_or_else(|| prescription_rejected(&filename, PrescriptionRejectionReason::EmptyCrs))?;
+    let field_boundary = normalize_prescription_ring(&request.field.boundary).ok_or_else(|| {
+        prescription_rejected(&filename, PrescriptionRejectionReason::InvalidFieldGeometry)
+    })?;
+    let field_extent = extent_from_coordinates(&field_boundary).ok_or_else(|| {
+        prescription_rejected(&filename, PrescriptionRejectionReason::InvalidFieldGeometry)
+    })?;
+    let field_area = polygon_area(&field_boundary);
+    if field_area <= GEOMETRY_EPSILON || ring_self_intersects_coordinates(&field_boundary) {
+        return Err(prescription_rejected(
+            &filename,
+            PrescriptionRejectionReason::InvalidFieldGeometry,
+        ));
+    }
+    if request.zones.is_empty() {
+        return Err(prescription_rejected(
+            &filename,
+            PrescriptionRejectionReason::EmptyZoneSet,
+        ));
+    }
+
+    let mut zones = Vec::with_capacity(request.zones.len());
+    for zone in request.zones {
+        zones.push(normalize_prescription_zone(
+            &filename,
+            zone,
+            &field_crs,
+            &field_boundary,
+            field_extent,
+        )?);
+    }
+    assert_prescription_zones_do_not_overlap(&filename, &zones)?;
+    assert_prescription_zones_tile_field(&filename, field_area, &zones)?;
+
+    Ok(NormalizedPrescription {
+        prescription_id,
+        field_id,
+        field_crs,
+        field_extent,
+        zones,
+    })
 }
 
 fn normalize_prescription_zone(
@@ -983,6 +1232,271 @@ fn write_prescription_dbf(zones: &[NormalizedPrescriptionZone]) -> Vec<u8> {
     }
     bytes.push(0x1A);
     bytes
+}
+
+fn taskdata_unit_designator(prescription: &NormalizedPrescription) -> Result<String, InteropError> {
+    let mut unit_designator = None::<String>;
+    for zone in &prescription.zones {
+        let mapped = taskdata_unit_mapping(&zone.unit).ok_or_else(|| {
+            prescription_rejected(
+                &prescription.prescription_id,
+                PrescriptionRejectionReason::UnsupportedTaskDataUnit {
+                    zone_id: zone.zone_id.clone(),
+                    unit: zone.unit.clone(),
+                },
+            )
+        })?;
+        if let Some(expected) = &unit_designator {
+            if expected != mapped {
+                return Err(prescription_rejected(
+                    &prescription.prescription_id,
+                    PrescriptionRejectionReason::MixedTaskDataUnits {
+                        zone_id: zone.zone_id.clone(),
+                        expected_unit: expected.clone(),
+                        actual_unit: mapped.to_string(),
+                    },
+                ));
+            }
+        } else {
+            unit_designator = Some(mapped.to_string());
+        }
+    }
+    Ok(unit_designator.expect("prescription has at least one zone"))
+}
+
+fn taskdata_unit_mapping(unit: &str) -> Option<&'static str> {
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "kg_ha" | "kg/ha" | "kg-ha" => Some("kg/ha"),
+        "l_ha" | "l/ha" | "l-ha" => Some("l/ha"),
+        "seed_ha" | "seeds_ha" | "seeds/ha" => Some("seeds/ha"),
+        _ => None,
+    }
+}
+
+fn write_taskdata_xml(prescription: &NormalizedPrescription, unit_designator: &str) -> String {
+    let mut xml = String::new();
+    xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    xml.push_str("<ISO11783_TaskData VersionMajor=\"4\" VersionMinor=\"3\" ManagementSoftwareManufacturer=\"AGBot\" ManagementSoftwareVersion=\"interop.taskdata.v1\">\n");
+    xml.push_str(&format!(
+        "  <CTR A=\"CTR1\" B=\"{}\" />\n",
+        escape_xml("AGBot")
+    ));
+    xml.push_str(&format!(
+        "  <FRM A=\"FRM1\" B=\"{}\" />\n",
+        escape_xml(&prescription.field_id)
+    ));
+    xml.push_str(&format!(
+        "  <PFD A=\"PFD1\" B=\"{}\" Crs=\"{}\" MinX=\"{:.6}\" MinY=\"{:.6}\" MaxX=\"{:.6}\" MaxY=\"{:.6}\" />\n",
+        escape_xml(&prescription.field_id),
+        escape_xml(&prescription.field_crs),
+        prescription.field_extent.min_x,
+        prescription.field_extent.min_y,
+        prescription.field_extent.max_x,
+        prescription.field_extent.max_y
+    ));
+    xml.push_str(&format!(
+        "  <PDT A=\"PDT1\" B=\"{}\" C=\"{}\" />\n",
+        escape_xml("AGBot prescription product"),
+        escape_xml(unit_designator)
+    ));
+    xml.push_str(&format!(
+        "  <TSK A=\"TSK1\" B=\"{}\" C=\"CTR1\" D=\"FRM1\" E=\"PFD1\" Crs=\"{}\">\n",
+        escape_xml(&prescription.prescription_id),
+        escape_xml(&prescription.field_crs)
+    ));
+    xml.push_str(&format!(
+        "  <PGP A=\"PGP1\" B=\"PDT1\" C=\"{}\" />\n",
+        escape_xml(unit_designator)
+    ));
+    for (zone_index, zone) in prescription.zones.iter().enumerate() {
+        let zone_ref = format!("TZN{}", zone_index + 1);
+        xml.push_str(&format!(
+            "    <TZN A=\"{}\" B=\"{}\" C=\"{:.6}\" D=\"{}\" Crs=\"{}\">\n",
+            zone_ref,
+            escape_xml(&zone.zone_id),
+            zone.rate,
+            escape_xml(unit_designator),
+            escape_xml(&prescription.field_crs)
+        ));
+        xml.push_str(&format!(
+            "      <PLN A=\"PLN{}\" B=\"polygon\">\n",
+            zone_index + 1
+        ));
+        for (point_index, coordinate) in zone.polygon.iter().enumerate() {
+            xml.push_str(&format!(
+                "        <PNT A=\"PNT{}-{}\" B=\"{:.6}\" C=\"{:.6}\" />\n",
+                zone_index + 1,
+                point_index + 1,
+                coordinate.x,
+                coordinate.y
+            ));
+        }
+        xml.push_str("      </PLN>\n");
+        xml.push_str("    </TZN>\n");
+    }
+    xml.push_str("  </TSK>\n");
+    xml.push_str("</ISO11783_TaskData>\n");
+    xml
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn taskdata_schema_rejected(reason: String) -> InteropError {
+    InteropError::Rejected {
+        filename: TASKDATA_FILENAME.to_string(),
+        reason: InteropRejectionReason::InvalidPrescription {
+            reason: PrescriptionRejectionReason::InvalidTaskDataSchema { reason },
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XmlTag<'a> {
+    name: &'a str,
+    raw: &'a str,
+    end: usize,
+    closing: bool,
+    self_closing: bool,
+}
+
+fn collect_xml_tags<'a>(xml: &'a str, name: &str) -> Result<Vec<XmlTag<'a>>, InteropError> {
+    let mut tags = Vec::new();
+    let mut offset = 0usize;
+    while let Some(relative_start) = xml[offset..].find('<') {
+        let start = offset + relative_start;
+        let Some(tag) = next_xml_tag(&xml[start..]) else {
+            return Err(taskdata_schema_rejected("malformed XML tag".to_string()));
+        };
+        let absolute = XmlTag {
+            end: start + tag.end,
+            ..tag
+        };
+        if absolute.name == name && !absolute.closing {
+            tags.push(absolute);
+        }
+        offset = absolute.end;
+    }
+    Ok(tags)
+}
+
+fn next_xml_tag(xml: &str) -> Option<XmlTag<'_>> {
+    let start = xml.find('<')?;
+    let end = xml[start..].find('>')? + start + 1;
+    let raw = &xml[start + 1..end - 1];
+    if raw.starts_with('?') || raw.starts_with('!') {
+        return Some(XmlTag {
+            name: "",
+            raw,
+            end,
+            closing: false,
+            self_closing: raw.ends_with('/'),
+        });
+    }
+    let trimmed = raw.trim();
+    let closing = trimmed.starts_with('/');
+    let tag_text = trimmed.trim_start_matches('/').trim_end_matches('/').trim();
+    let name_end = tag_text.find(char::is_whitespace).unwrap_or(tag_text.len());
+    let name = &tag_text[..name_end];
+    Some(XmlTag {
+        name,
+        raw,
+        end,
+        closing,
+        self_closing: trimmed.ends_with('/'),
+    })
+}
+
+fn tag_body<'a>(xml: &'a str, tag: &XmlTag<'a>, name: &str) -> Result<&'a str, InteropError> {
+    let close = format!("</{name}>");
+    let close_start = xml[tag.end..]
+        .find(&close)
+        .map(|offset| tag.end + offset)
+        .ok_or_else(|| taskdata_schema_rejected(format!("missing {name} close")))?;
+    Ok(&xml[tag.end..close_start])
+}
+
+fn parse_xml_attributes(raw: &str) -> Result<Map<String, Value>, InteropError> {
+    let tag_text = raw
+        .trim()
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .trim();
+    let mut cursor = tag_text.find(char::is_whitespace).unwrap_or(tag_text.len());
+    let mut attrs = Map::new();
+    while cursor < tag_text.len() {
+        while cursor < tag_text.len() && tag_text.as_bytes()[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= tag_text.len() {
+            break;
+        }
+        let key_start = cursor;
+        while cursor < tag_text.len()
+            && tag_text.as_bytes()[cursor] != b'='
+            && !tag_text.as_bytes()[cursor].is_ascii_whitespace()
+        {
+            cursor += 1;
+        }
+        let key = tag_text[key_start..cursor].trim();
+        while cursor < tag_text.len() && tag_text.as_bytes()[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= tag_text.len() || tag_text.as_bytes()[cursor] != b'=' {
+            return Err(taskdata_schema_rejected(
+                "malformed XML attribute".to_string(),
+            ));
+        }
+        cursor += 1;
+        while cursor < tag_text.len() && tag_text.as_bytes()[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= tag_text.len() || tag_text.as_bytes()[cursor] != b'"' {
+            return Err(taskdata_schema_rejected(
+                "malformed XML attribute".to_string(),
+            ));
+        }
+        cursor += 1;
+        let value_start = cursor;
+        let Some(relative_end) = tag_text[cursor..].find('"') else {
+            return Err(taskdata_schema_rejected(
+                "malformed XML attribute".to_string(),
+            ));
+        };
+        cursor += relative_end;
+        let value = unescape_xml(&tag_text[value_start..cursor]);
+        cursor += 1;
+        if attrs
+            .insert(key.to_string(), Value::String(value))
+            .is_some()
+        {
+            return Err(taskdata_schema_rejected(
+                "duplicate XML attribute".to_string(),
+            ));
+        }
+    }
+    Ok(attrs)
+}
+
+fn required_attr<'a>(attrs: &'a Map<String, Value>, name: &str) -> Result<&'a str, InteropError> {
+    attrs
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| taskdata_schema_rejected(format!("missing required {name} attribute")))
+}
+
+fn unescape_xml(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1670,12 +2184,13 @@ impl ExtentBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_prescription_shapefile, export_raster_geotiff, import_field_boundary,
-        reopen_raster_geotiff, round_trip_vector_layer, validate_and_reproject_import,
-        validate_geopackage_layers, CrsTransform, FieldBoundaryImportRequest,
-        FieldBoundaryRejectionReason, ImportFormat, ImportPayload, InteropCoordinate, InteropError,
-        InteropExtent, InteropRejectionReason, PrescriptionField, PrescriptionRejectionReason,
-        PrescriptionShapefileRequest, PrescriptionZone, RasterProduct, ReprojectedGeometry,
+        export_prescription_shapefile, export_prescription_taskdata, export_raster_geotiff,
+        import_field_boundary, reopen_raster_geotiff, round_trip_vector_layer,
+        validate_and_reproject_import, validate_geopackage_layers, validate_taskdata_xml,
+        CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason, ImportFormat,
+        ImportPayload, InteropCoordinate, InteropError, InteropExtent, InteropRejectionReason,
+        PrescriptionField, PrescriptionRejectionReason, PrescriptionShapefileRequest,
+        PrescriptionZone, RasterProduct, ReprojectedGeometry,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -2083,6 +2598,165 @@ mod tests {
                         zone_id: "zone-east".to_string(),
                         expected_crs: "EPSG:32614".to_string(),
                         actual_crs: "EPSG:4326".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn prescription_taskdata_exports_schema_valid_isobus_xml() {
+        let report = export_prescription_taskdata(prescription_request())
+            .expect("aligned prescription zones should export as TaskData");
+
+        assert_eq!(report.prescription_id, "rx-alpha-2026");
+        assert_eq!(report.field_id, "field-alpha");
+        assert_eq!(report.field_crs, "EPSG:32614");
+        assert_eq!(report.zone_count, 2);
+        assert_eq!(report.unit_designator, "kg/ha");
+        assert!(report.validation.valid);
+        assert_eq!(report.validation.task_count, 1);
+        assert_eq!(report.validation.zone_count, 2);
+        assert_eq!(report.validation.product_count, 1);
+        assert_eq!(report.validation.prescription_grid_count, 1);
+        let xml = String::from_utf8(report.taskdata_xml.clone()).expect("TaskData should be utf8");
+        assert!(xml.contains("<ISO11783_TaskData"));
+        assert!(xml.contains("<TSK "));
+        assert!(xml.contains("<TZN "));
+        assert!(xml.contains("<PDT "));
+        assert!(xml.contains("<PGP "));
+        assert!(xml.contains("EPSG:32614"));
+        assert!(xml.contains("32.500000"));
+        assert!(xml.contains("12.250000"));
+        assert!(xml.contains("kg/ha"));
+
+        let validation = validate_taskdata_xml(&report.taskdata_xml)
+            .expect("emitted TaskData should validate independently");
+        assert!(validation.valid);
+        assert_eq!(validation.zone_count, 2);
+    }
+
+    #[test]
+    fn prescription_taskdata_refuses_unit_without_isobus_mapping() {
+        let mut request = prescription_request();
+        request.zones[0].unit = "bushel_ac".to_string();
+
+        let error =
+            export_prescription_taskdata(request).expect_err("unsupported unit should refuse XML");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "rx-alpha-2026".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::UnsupportedTaskDataUnit {
+                        zone_id: "zone-west".to_string(),
+                        unit: "bushel_ac".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn prescription_taskdata_refuses_zone_outside_field() {
+        let mut request = prescription_request();
+        request.zones[1].polygon = rectangle(500_010.0, 4_499_980.0, 500_030.0, 4_500_000.0);
+
+        let error =
+            export_prescription_taskdata(request).expect_err("out-of-field zone should refuse XML");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "rx-alpha-2026".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::ZoneOutsideField {
+                        zone_id: "zone-east".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn taskdata_schema_validation_rejects_missing_prescription_grid() {
+        let report = export_prescription_taskdata(prescription_request())
+            .expect("aligned prescription zones should export as TaskData");
+        let mut xml = String::from_utf8(report.taskdata_xml).expect("TaskData should be utf8");
+        xml = xml.replace("  <PGP A=\"PGP1\" B=\"PDT1\" C=\"kg/ha\" />\n", "");
+
+        let error = validate_taskdata_xml(xml.as_bytes())
+            .expect_err("missing PGP should fail schema validation");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "TASKDATA.XML".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::InvalidTaskDataSchema {
+                        reason: "missing PGP prescription grid".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn taskdata_schema_validation_rejects_malformed_or_fake_xml() {
+        let error = validate_taskdata_xml(
+            b"<not-taskdata><ISO11783_TaskData /><TSK /><TZN /><PDT /><PGP Crs=\"EPSG:32614\" />",
+        )
+        .expect_err("fake token document should fail validation");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "TASKDATA.XML".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::InvalidTaskDataSchema {
+                        reason: "missing ISO11783_TaskData root".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn taskdata_schema_validation_rejects_inconsistent_crs_or_units() {
+        let report = export_prescription_taskdata(prescription_request())
+            .expect("aligned prescription zones should export as TaskData");
+        let mut xml =
+            String::from_utf8(report.taskdata_xml.clone()).expect("TaskData should be utf8");
+        xml = xml.replacen("Crs=\"EPSG:32614\"", "Crs=\"EPSG:4326\"", 1);
+
+        let error = validate_taskdata_xml(xml.as_bytes())
+            .expect_err("conflicting CRS should fail schema validation");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "TASKDATA.XML".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::InvalidTaskDataSchema {
+                        reason: "inconsistent CRS declarations".to_string(),
+                    }
+                }
+            }
+        );
+
+        let mut xml = String::from_utf8(report.taskdata_xml).expect("TaskData should be utf8");
+        xml = xml.replacen("D=\"kg/ha\"", "D=\"l/ha\"", 1);
+        let error = validate_taskdata_xml(xml.as_bytes())
+            .expect_err("conflicting zone unit should fail schema validation");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "TASKDATA.XML".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::InvalidTaskDataSchema {
+                        reason: "inconsistent TaskData units".to_string(),
                     }
                 }
             }
