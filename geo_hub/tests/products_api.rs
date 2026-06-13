@@ -1764,6 +1764,224 @@ async fn fleet_node_enrollment_rejects_missing_hardware_identity() -> Result<()>
 }
 
 #[tokio::test]
+async fn tractor_registry_registers_lists_and_audits_rejected_motion_commands() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_tractor_registry_field(&ctx).await?;
+
+    let register_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tractors")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tractor_id": "tractor-001",
+                        "org_id": "org-alpha",
+                        "field_id": "field-tractor",
+                        "capabilities": ["RTK", "planter", "rtk"],
+                        "implement_ref": {
+                            "implement_id": "implement-planter-1",
+                            "implement_type": "Planter",
+                            "working_width_m": 9.1
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(register_response.status(), StatusCode::OK);
+    let body = to_bytes(register_response.into_body(), 64 * 1024).await?;
+    let registered: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        registered
+            .get("tractor_id")
+            .and_then(|value| value.as_str()),
+        Some("tractor-001")
+    );
+    assert_eq!(
+        registered
+            .pointer("/capabilities/0")
+            .and_then(|value| value.as_str()),
+        Some("planter")
+    );
+    assert_eq!(
+        registered
+            .pointer("/capabilities/1")
+            .and_then(|value| value.as_str()),
+        Some("rtk")
+    );
+    assert_eq!(
+        registered.get("status").and_then(|value| value.as_str()),
+        Some("registered")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/tractors?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].get("tractor_id").and_then(|value| value.as_str()),
+        Some("tractor-001")
+    );
+
+    let unknown_command = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tractors/tractor-missing/motion-commands/validate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "command_id": "cmd-unknown",
+                        "command_type": "move",
+                        "requested_by": "ops@example.com"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(unknown_command.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(unknown_command.into_body(), 64 * 1024).await?;
+    let unknown: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        unknown.get("reason").and_then(|value| value.as_str()),
+        Some("unknown_tractor")
+    );
+    assert_eq!(
+        unknown
+            .pointer("/audit/reason_code")
+            .and_then(|value| value.as_str()),
+        Some("tractor_not_registered")
+    );
+
+    let out_of_service_register = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tractors")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tractor_id": "tractor-oos",
+                        "org_id": "org-alpha",
+                        "field_id": "field-tractor",
+                        "capabilities": ["sprayer"],
+                        "implement_ref": {
+                            "implement_id": "implement-sprayer-1",
+                            "implement_type": "sprayer"
+                        },
+                        "status": "out_of_service"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(out_of_service_register.status(), StatusCode::OK);
+
+    let out_of_service_command = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tractors/tractor-oos/motion-commands/validate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "command_id": "cmd-oos",
+                        "command_type": "move",
+                        "requested_by": "ops@example.com"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(out_of_service_command.status(), StatusCode::CONFLICT);
+    let body = to_bytes(out_of_service_command.into_body(), 64 * 1024).await?;
+    let out_of_service: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        out_of_service
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("tractor_out_of_service")
+    );
+
+    let audit_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tractor_command_audits")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(audit_count, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tractor_registration_rejects_cross_tenant_field_link() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_tractor_registry_field(&ctx).await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tractors")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tractor_id": "tractor-cross-tenant",
+                        "org_id": "org-beta",
+                        "field_id": "field-tractor",
+                        "capabilities": ["rtk"],
+                        "implement_ref": {
+                            "implement_id": "implement-1",
+                            "implement_type": "planter"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let tractor_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tractor_vehicles")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(tractor_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -7240,6 +7458,62 @@ async fn enroll_test_fleet_node(ctx: &TestContext, hardware_id: &str) -> Result<
         .and_then(|value| value.as_str())
         .expect("node_id should exist")
         .to_string())
+}
+
+async fn seed_tractor_registry_field(ctx: &TestContext) -> Result<()> {
+    let farm_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-tractor",
+                        "owner": "org-alpha",
+                        "name": "Tractor Farm"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(farm_response.status(), StatusCode::OK);
+
+    let field_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-tractor",
+                        "field_id": "field-tractor",
+                        "name": "Tractor Field",
+                        "boundary": {
+                            "crs": "EPSG:4326",
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 },
+                                { "longitude": -96.7, "latitude": 41.1 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(field_response.status(), StatusCode::OK);
+    Ok(())
 }
 
 async fn register_test_component(

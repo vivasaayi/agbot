@@ -448,6 +448,468 @@ fn normalize_fleet_node_capabilities(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TractorLifecycleStatus {
+    Registered,
+    Available,
+    InUse,
+    OutOfService,
+}
+
+impl TractorLifecycleStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TractorLifecycleStatus::Registered => "registered",
+            TractorLifecycleStatus::Available => "available",
+            TractorLifecycleStatus::InUse => "in_use",
+            TractorLifecycleStatus::OutOfService => "out_of_service",
+        }
+    }
+}
+
+impl Default for TractorLifecycleStatus {
+    fn default() -> Self {
+        TractorLifecycleStatus::Registered
+    }
+}
+
+impl std::str::FromStr for TractorLifecycleStatus {
+    type Err = TractorRegistryError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "registered" => Ok(TractorLifecycleStatus::Registered),
+            "available" => Ok(TractorLifecycleStatus::Available),
+            "in_use" => Ok(TractorLifecycleStatus::InUse),
+            "out_of_service" => Ok(TractorLifecycleStatus::OutOfService),
+            _ => Err(TractorRegistryError::UnsupportedStatus {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorImplementRef {
+    pub implement_id: String,
+    pub implement_type: String,
+    #[serde(default)]
+    pub working_width_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorRegistrationRequest {
+    #[serde(default)]
+    pub tractor_id: Option<String>,
+    pub org_id: String,
+    pub field_id: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub implement_ref: TractorImplementRef,
+    #[serde(default)]
+    pub status: Option<TractorLifecycleStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorRecord {
+    pub tractor_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub capabilities: Vec<String>,
+    pub implement_ref: TractorImplementRef,
+    pub status: TractorLifecycleStatus,
+    pub registered_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorMotionCommandRequest {
+    #[serde(default)]
+    pub command_id: Option<String>,
+    pub tractor_id: String,
+    pub command_type: String,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorCommandAuditDecision {
+    Allowed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorCommandRejectionReason {
+    UnknownTractor,
+    TractorOutOfService,
+}
+
+impl TractorCommandRejectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TractorCommandRejectionReason::UnknownTractor => "tractor_not_registered",
+            TractorCommandRejectionReason::TractorOutOfService => "tractor_out_of_service",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorCommandAuditRecord {
+    pub audit_id: String,
+    #[serde(default)]
+    pub command_id: Option<String>,
+    pub tractor_id: String,
+    #[serde(default)]
+    pub org_id: Option<String>,
+    #[serde(default)]
+    pub field_id: Option<String>,
+    pub command_type: String,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    pub decision: TractorCommandAuditDecision,
+    pub reason_code: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorCommandRejection {
+    pub tractor_id: String,
+    pub reason: TractorCommandRejectionReason,
+    #[serde(default)]
+    pub status: Option<TractorLifecycleStatus>,
+    pub audit: TractorCommandAuditRecord,
+}
+
+impl TractorCommandRejection {
+    pub fn status_code(&self) -> u16 {
+        match self.reason {
+            TractorCommandRejectionReason::UnknownTractor => 404,
+            TractorCommandRejectionReason::TractorOutOfService => 409,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TractorRegistryError {
+    #[error("tractor_id cannot be empty")]
+    EmptyTractorId,
+    #[error("tractor org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("tractor field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("tractor capabilities cannot be empty")]
+    EmptyCapabilities,
+    #[error("tractor implement_id cannot be empty")]
+    EmptyImplementId,
+    #[error("tractor implement_type cannot be empty")]
+    EmptyImplementType,
+    #[error("tractor registered_at cannot be empty")]
+    EmptyRegisteredAt,
+    #[error("tractor command_type cannot be empty")]
+    EmptyCommandType,
+    #[error("unsupported tractor status {value}")]
+    UnsupportedStatus { value: String },
+    #[error("tractor already registered: {tractor_id}")]
+    DuplicateTractor { tractor_id: String },
+    #[error("tractor not found: {tractor_id}")]
+    TractorNotFound { tractor_id: String },
+    #[error("field not found: {field_id}")]
+    FieldNotFound { field_id: String },
+    #[error("field {field_id} belongs to {actual_org_id}, not {expected_org_id}")]
+    FieldTenantMismatch {
+        field_id: String,
+        expected_org_id: String,
+        actual_org_id: String,
+    },
+    #[error("invalid tractor lifecycle transition for {tractor_id}: {from:?} -> {to:?}")]
+    InvalidLifecycleTransition {
+        tractor_id: String,
+        from: TractorLifecycleStatus,
+        to: TractorLifecycleStatus,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TractorRegistry {
+    tractors: HashMap<String, TractorRecord>,
+    #[serde(default)]
+    command_audits: Vec<TractorCommandAuditRecord>,
+}
+
+impl TractorRegistry {
+    pub fn register_tractor(
+        &mut self,
+        request: TractorRegistrationRequest,
+        farm_fields: &FarmFieldRegistry,
+        registered_at: String,
+    ) -> Result<TractorRecord, TractorRegistryError> {
+        let tractor_id = normalize_tractor_text(request.tractor_id.clone().unwrap_or_default())
+            .ok_or(TractorRegistryError::EmptyTractorId)?;
+        if self.tractors.contains_key(&tractor_id) {
+            return Err(TractorRegistryError::DuplicateTractor { tractor_id });
+        }
+
+        let field_id = normalize_tractor_text(request.field_id.clone())
+            .ok_or(TractorRegistryError::EmptyFieldId)?;
+        let field = farm_fields.field_by_id(&field_id).ok_or_else(|| {
+            TractorRegistryError::FieldNotFound {
+                field_id: field_id.clone(),
+            }
+        })?;
+        let record = build_tractor_record(
+            TractorRegistrationRequest {
+                tractor_id: Some(tractor_id.clone()),
+                field_id,
+                ..request
+            },
+            &field,
+            registered_at,
+        )?;
+        self.tractors.insert(tractor_id, record.clone());
+        Ok(record)
+    }
+
+    pub fn list_tractors_for_org(
+        &self,
+        org_id: &str,
+        field_id: Option<&str>,
+        status: Option<TractorLifecycleStatus>,
+    ) -> Vec<TractorRecord> {
+        let org_id = org_id.trim();
+        let field_id = field_id.and_then(|field_id| {
+            let field_id = field_id.trim();
+            (!field_id.is_empty()).then_some(field_id)
+        });
+        let mut records = self
+            .tractors
+            .values()
+            .filter(|record| record.org_id == org_id)
+            .filter(|record| field_id.is_none_or(|field_id| record.field_id == field_id))
+            .filter(|record| status.is_none_or(|status| record.status == status))
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.tractor_id.cmp(&right.tractor_id));
+        records
+    }
+
+    pub fn tractor(&self, tractor_id: &str) -> Option<TractorRecord> {
+        self.tractors.get(tractor_id.trim()).cloned()
+    }
+
+    pub fn transition_tractor_status(
+        &mut self,
+        tractor_id: &str,
+        to: TractorLifecycleStatus,
+        updated_at: String,
+    ) -> Result<TractorRecord, TractorRegistryError> {
+        let tractor_id = normalize_tractor_text(tractor_id.to_string())
+            .ok_or(TractorRegistryError::EmptyTractorId)?;
+        let record = self.tractors.get_mut(&tractor_id).ok_or_else(|| {
+            TractorRegistryError::TractorNotFound {
+                tractor_id: tractor_id.clone(),
+            }
+        })?;
+        let from = record.status;
+        if !valid_tractor_lifecycle_transition(from, to) {
+            return Err(TractorRegistryError::InvalidLifecycleTransition {
+                tractor_id,
+                from,
+                to,
+            });
+        }
+        record.status = to;
+        record.updated_at =
+            normalize_tractor_text(updated_at).unwrap_or_else(|| record.updated_at.clone());
+        Ok(record.clone())
+    }
+
+    pub fn validate_motion_command(
+        &mut self,
+        request: TractorMotionCommandRequest,
+        at: String,
+    ) -> Result<TractorRecord, TractorCommandRejection> {
+        let tractor_id = request.tractor_id.trim().to_string();
+        let command_type = request.command_type.trim().to_string();
+        let command_type = if command_type.is_empty() {
+            "unknown".to_string()
+        } else {
+            command_type
+        };
+        let requested_by = request.requested_by.and_then(normalize_tractor_text);
+        let command_id = request.command_id.and_then(normalize_tractor_text);
+        let at = normalize_tractor_text(at).unwrap_or_default();
+
+        let Some(record) = self.tractors.get(&tractor_id).cloned() else {
+            let audit = self.append_tractor_command_audit(
+                command_id,
+                tractor_id.clone(),
+                None,
+                None,
+                command_type,
+                requested_by,
+                TractorCommandRejectionReason::UnknownTractor,
+                at,
+            );
+            return Err(TractorCommandRejection {
+                tractor_id,
+                reason: TractorCommandRejectionReason::UnknownTractor,
+                status: None,
+                audit,
+            });
+        };
+
+        if record.status == TractorLifecycleStatus::OutOfService {
+            let audit = self.append_tractor_command_audit(
+                command_id,
+                tractor_id.clone(),
+                Some(record.org_id.clone()),
+                Some(record.field_id.clone()),
+                command_type,
+                requested_by,
+                TractorCommandRejectionReason::TractorOutOfService,
+                at,
+            );
+            return Err(TractorCommandRejection {
+                tractor_id,
+                reason: TractorCommandRejectionReason::TractorOutOfService,
+                status: Some(record.status),
+                audit,
+            });
+        }
+
+        Ok(record)
+    }
+
+    pub fn command_audits(&self) -> &[TractorCommandAuditRecord] {
+        &self.command_audits
+    }
+
+    fn append_tractor_command_audit(
+        &mut self,
+        command_id: Option<String>,
+        tractor_id: String,
+        org_id: Option<String>,
+        field_id: Option<String>,
+        command_type: String,
+        requested_by: Option<String>,
+        reason: TractorCommandRejectionReason,
+        at: String,
+    ) -> TractorCommandAuditRecord {
+        let audit = TractorCommandAuditRecord {
+            audit_id: format!("tractor-command-audit-{}", self.command_audits.len() + 1),
+            command_id,
+            tractor_id,
+            org_id,
+            field_id,
+            command_type,
+            requested_by,
+            decision: TractorCommandAuditDecision::Rejected,
+            reason_code: reason.as_str().to_string(),
+            at,
+        };
+        self.command_audits.push(audit.clone());
+        audit
+    }
+}
+
+pub fn build_tractor_record(
+    request: TractorRegistrationRequest,
+    field: &FieldRecord,
+    registered_at: String,
+) -> Result<TractorRecord, TractorRegistryError> {
+    let tractor_id = normalize_tractor_text(request.tractor_id.unwrap_or_default())
+        .ok_or(TractorRegistryError::EmptyTractorId)?;
+    let org_id = normalize_tractor_text(request.org_id).ok_or(TractorRegistryError::EmptyOrgId)?;
+    let field_id =
+        normalize_tractor_text(request.field_id).ok_or(TractorRegistryError::EmptyFieldId)?;
+    if field.field_id != field_id {
+        return Err(TractorRegistryError::FieldNotFound { field_id });
+    }
+    if field.org_id != org_id {
+        return Err(TractorRegistryError::FieldTenantMismatch {
+            field_id,
+            expected_org_id: org_id,
+            actual_org_id: field.org_id.clone(),
+        });
+    }
+
+    let capabilities = normalize_tractor_capabilities(request.capabilities)?;
+    let implement_ref = normalize_tractor_implement_ref(request.implement_ref)?;
+    let registered_at =
+        normalize_tractor_text(registered_at).ok_or(TractorRegistryError::EmptyRegisteredAt)?;
+    Ok(TractorRecord {
+        tractor_id,
+        org_id,
+        field_id,
+        capabilities,
+        implement_ref,
+        status: request.status.unwrap_or_default(),
+        registered_at: registered_at.clone(),
+        updated_at: registered_at,
+    })
+}
+
+fn valid_tractor_lifecycle_transition(
+    from: TractorLifecycleStatus,
+    to: TractorLifecycleStatus,
+) -> bool {
+    from == to
+        || matches!(
+            (from, to),
+            (
+                TractorLifecycleStatus::Registered,
+                TractorLifecycleStatus::Available
+            ) | (
+                TractorLifecycleStatus::Available,
+                TractorLifecycleStatus::InUse
+            ) | (
+                TractorLifecycleStatus::InUse,
+                TractorLifecycleStatus::OutOfService
+            )
+        )
+}
+
+fn normalize_tractor_implement_ref(
+    implement_ref: TractorImplementRef,
+) -> Result<TractorImplementRef, TractorRegistryError> {
+    Ok(TractorImplementRef {
+        implement_id: normalize_tractor_text(implement_ref.implement_id)
+            .ok_or(TractorRegistryError::EmptyImplementId)?,
+        implement_type: normalize_tractor_text(implement_ref.implement_type)
+            .map(|value| value.to_ascii_lowercase())
+            .ok_or(TractorRegistryError::EmptyImplementType)?,
+        working_width_m: implement_ref
+            .working_width_m
+            .filter(|working_width_m| working_width_m.is_finite() && *working_width_m > 0.0),
+    })
+}
+
+fn normalize_tractor_capabilities(
+    capabilities: Vec<String>,
+) -> Result<Vec<String>, TractorRegistryError> {
+    let capabilities = capabilities
+        .into_iter()
+        .filter_map(normalize_tractor_text)
+        .map(|capability| capability.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if capabilities.is_empty() {
+        Err(TractorRegistryError::EmptyCapabilities)
+    } else {
+        Ok(capabilities)
+    }
+}
+
+fn normalize_tractor_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FleetNodeComponentHealth {
     Ok,
     Warn,
@@ -3017,8 +3479,10 @@ mod tests {
         RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
         ReportDeliverableRegistry, ReportFormat, ReportPersistenceError, ReportRecord,
         ReportVisibility, SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
-        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry,
-        WorkOrderStatus,
+        TractorCommandAuditDecision, TractorCommandRejectionReason, TractorImplementRef,
+        TractorLifecycleStatus, TractorMotionCommandRequest, TractorRegistrationRequest,
+        TractorRegistry, WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
+        WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -3292,6 +3756,129 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tractor_registry_links_registered_vehicle_to_owned_field() {
+        let farm_fields = tractor_test_farm_fields();
+        let mut registry = TractorRegistry::default();
+
+        let record = registry
+            .register_tractor(
+                TractorRegistrationRequest {
+                    tractor_id: Some(" tractor-001 ".to_string()),
+                    org_id: " org-alpha ".to_string(),
+                    field_id: " field-north ".to_string(),
+                    capabilities: vec![
+                        "planter".to_string(),
+                        " RTK ".to_string(),
+                        "rtk".to_string(),
+                    ],
+                    implement_ref: TractorImplementRef {
+                        implement_id: " implement-planter-1 ".to_string(),
+                        implement_type: " Planter ".to_string(),
+                        working_width_m: Some(9.1),
+                    },
+                    status: None,
+                },
+                &farm_fields,
+                "2026-06-13T10:00:00Z".to_string(),
+            )
+            .expect("tractor should register against owned field");
+
+        assert_eq!(record.tractor_id, "tractor-001");
+        assert_eq!(record.org_id, "org-alpha");
+        assert_eq!(record.field_id, "field-north");
+        assert_eq!(
+            record.capabilities,
+            vec!["planter".to_string(), "rtk".to_string()]
+        );
+        assert_eq!(record.implement_ref.implement_id, "implement-planter-1");
+        assert_eq!(record.implement_ref.implement_type, "planter");
+        assert_eq!(record.status, TractorLifecycleStatus::Registered);
+
+        let listed = registry.list_tractors_for_org("org-alpha", None, None);
+        assert_eq!(listed, vec![record]);
+    }
+
+    #[test]
+    fn tractor_lifecycle_progression_and_motion_rejection_are_audited() {
+        let farm_fields = tractor_test_farm_fields();
+        let mut registry = TractorRegistry::default();
+        registry
+            .register_tractor(
+                tractor_registration_request("tractor-001"),
+                &farm_fields,
+                "2026-06-13T10:00:00Z".to_string(),
+            )
+            .expect("tractor registers");
+
+        registry
+            .transition_tractor_status(
+                "tractor-001",
+                TractorLifecycleStatus::Available,
+                "2026-06-13T10:05:00Z".to_string(),
+            )
+            .expect("registered tractor becomes available");
+        registry
+            .transition_tractor_status(
+                "tractor-001",
+                TractorLifecycleStatus::InUse,
+                "2026-06-13T10:06:00Z".to_string(),
+            )
+            .expect("available tractor enters use");
+        registry
+            .transition_tractor_status(
+                "tractor-001",
+                TractorLifecycleStatus::OutOfService,
+                "2026-06-13T10:07:00Z".to_string(),
+            )
+            .expect("in-use tractor can be taken out of service");
+
+        let error = registry
+            .validate_motion_command(
+                TractorMotionCommandRequest {
+                    command_id: Some("cmd-001".to_string()),
+                    tractor_id: "tractor-001".to_string(),
+                    command_type: "move".to_string(),
+                    requested_by: Some("ops@example.com".to_string()),
+                },
+                "2026-06-13T10:08:00Z".to_string(),
+            )
+            .expect_err("out-of-service tractor rejects motion");
+
+        assert_eq!(
+            error.reason,
+            TractorCommandRejectionReason::TractorOutOfService
+        );
+        assert_eq!(error.status_code(), 409);
+        assert_eq!(registry.command_audits().len(), 1);
+        assert_eq!(
+            registry.command_audits()[0].decision,
+            TractorCommandAuditDecision::Rejected
+        );
+        assert_eq!(
+            registry.command_audits()[0].reason_code,
+            "tractor_out_of_service"
+        );
+
+        let unknown = registry
+            .validate_motion_command(
+                TractorMotionCommandRequest {
+                    command_id: Some("cmd-unknown".to_string()),
+                    tractor_id: "tractor-missing".to_string(),
+                    command_type: "move".to_string(),
+                    requested_by: Some("ops@example.com".to_string()),
+                },
+                "2026-06-13T10:09:00Z".to_string(),
+            )
+            .expect_err("unknown tractor rejects motion");
+        assert_eq!(
+            unknown.reason,
+            TractorCommandRejectionReason::UnknownTractor
+        );
+        assert_eq!(unknown.status_code(), 404);
+        assert_eq!(registry.command_audits().len(), 2);
+    }
+
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
         FleetNodeRecord {
             node_id: "node-001".to_string(),
@@ -3333,6 +3920,43 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339(value)
             .unwrap()
             .with_timezone(&chrono::Utc)
+    }
+
+    fn tractor_test_farm_fields() -> FarmFieldRegistry {
+        let mut registry = FarmFieldRegistry::default();
+        registry
+            .insert_farm(test_farm_record(
+                "farm-alpha",
+                "org-alpha",
+                "Alpha Farm",
+                FarmFieldEntityStatus::Active,
+            ))
+            .expect("farm inserts");
+        registry
+            .insert_field(test_field_record(
+                "field-north",
+                "farm-alpha",
+                "org-alpha",
+                "North Field",
+                FarmFieldEntityStatus::Active,
+            ))
+            .expect("field inserts");
+        registry
+    }
+
+    fn tractor_registration_request(tractor_id: &str) -> TractorRegistrationRequest {
+        TractorRegistrationRequest {
+            tractor_id: Some(tractor_id.to_string()),
+            org_id: "org-alpha".to_string(),
+            field_id: "field-north".to_string(),
+            capabilities: vec!["rtk".to_string(), "planter".to_string()],
+            implement_ref: TractorImplementRef {
+                implement_id: "implement-planter-1".to_string(),
+                implement_type: "planter".to_string(),
+                working_width_m: Some(9.1),
+            },
+            status: None,
+        }
     }
 
     #[test]

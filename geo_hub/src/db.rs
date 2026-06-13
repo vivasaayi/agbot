@@ -499,6 +499,42 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS tractor_vehicles (
+            tractor_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL,
+            implement_ref_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            registered_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS tractor_command_audits (
+            audit_id TEXT PRIMARY KEY,
+            command_id TEXT,
+            tractor_id TEXT NOT NULL,
+            org_id TEXT,
+            field_id TEXT,
+            command_type TEXT NOT NULL,
+            requested_by TEXT,
+            decision TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS fleet_components (
             component_id TEXT PRIMARY KEY,
             component_type TEXT NOT NULL,
@@ -940,6 +976,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_fleet_nodes_owner_org_id
         ON fleet_nodes(owner_org_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_tractor_vehicles_org_field_status
+        ON tractor_vehicles(org_id, field_id, status);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_tractor_command_audits_tractor_id
+        ON tractor_command_audits(tractor_id);
         "#,
     )
     .execute(pool)

@@ -62,13 +62,16 @@ use orthomosaic::{
 };
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
+    assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points, build_tractor_record,
     validate_field_boundary, AnnotationGeometry, AnnotationRecord, FarmFieldEntityStatus,
     FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
     FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
     FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
     ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
     RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
+    TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
+    TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
+    TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
     DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
@@ -373,6 +376,20 @@ pub struct ImportShapefileRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FleetNodeListQuery {
     pub owner_org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TractorListQuery {
+    pub org_id: Option<String>,
+    pub field_id: Option<String>,
+    pub status: Option<TractorLifecycleStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TractorMotionCommandValidationRequest {
+    pub command_id: Option<String>,
+    pub command_type: String,
+    pub requested_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1708,6 +1725,125 @@ pub async fn get_fleet_node(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(node))
+}
+
+pub async fn register_tractor(
+    State(state): State<AppState>,
+    Json(mut request): Json<TractorRegistrationRequest>,
+) -> AppResult<Json<TractorRecord>> {
+    if request
+        .tractor_id
+        .as_ref()
+        .is_none_or(|tractor_id| tractor_id.trim().is_empty())
+    {
+        request.tractor_id = Some(Uuid::new_v4().to_string());
+    }
+
+    let field_id = normalize_optional_text(Some(request.field_id.clone()))
+        .ok_or_else(|| AppError::BadRequest("tractor field_id is required".to_string()))?;
+    let field = load_field(&state, &field_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("field {field_id} does not exist")))?;
+    let record = build_tractor_record(request, &field, current_record_timestamp())
+        .map_err(tractor_registry_error)?;
+    if load_tractor(&state, &record.tractor_id).await?.is_some() {
+        return Err(AppError::BadRequest(format!(
+            "tractor {} is already registered",
+            record.tractor_id
+        )));
+    }
+    insert_tractor_record(&state, &record).await?;
+    Ok(Json(record))
+}
+
+pub async fn list_tractors(
+    Query(query): Query<TractorListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<TractorRecord>>> {
+    let org_id = normalize_optional_text(query.org_id);
+    let field_id = normalize_optional_text(query.field_id);
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT tractor_id, org_id, field_id, capabilities_json, implement_ref_json, status,
+               registered_at, updated_at
+        FROM tractor_vehicles
+        WHERE (?1 IS NULL OR org_id = ?1)
+          AND (?2 IS NULL OR field_id = ?2)
+          AND (?3 IS NULL OR status = ?3)
+        ORDER BY tractor_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(field_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_tractor_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_tractor(
+    Path(tractor_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<TractorRecord>> {
+    let tractor = load_tractor(&state, &tractor_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(tractor))
+}
+
+pub async fn validate_tractor_motion_command(
+    Path(tractor_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<TractorMotionCommandValidationRequest>,
+) -> AppResult<Response> {
+    let command_type = normalize_optional_text(Some(request.command_type))
+        .ok_or_else(|| AppError::BadRequest("tractor command_type is required".to_string()))?;
+    let command = TractorMotionCommandRequest {
+        command_id: normalize_optional_text(request.command_id),
+        tractor_id: tractor_id.clone(),
+        command_type,
+        requested_by: normalize_optional_text(request.requested_by),
+    };
+
+    let Some(tractor) = load_tractor(&state, &tractor_id).await? else {
+        let audit = build_tractor_command_audit(
+            &command,
+            None,
+            TractorCommandRejectionReason::UnknownTractor,
+        );
+        insert_tractor_command_audit(&state, &audit).await?;
+        let rejection = TractorCommandRejection {
+            tractor_id,
+            reason: TractorCommandRejectionReason::UnknownTractor,
+            status: None,
+            audit,
+        };
+        return Ok((tractor_rejection_status(&rejection), Json(rejection)).into_response());
+    };
+
+    if tractor.status == TractorLifecycleStatus::OutOfService {
+        let audit = build_tractor_command_audit(
+            &command,
+            Some(&tractor),
+            TractorCommandRejectionReason::TractorOutOfService,
+        );
+        insert_tractor_command_audit(&state, &audit).await?;
+        let rejection = TractorCommandRejection {
+            tractor_id,
+            reason: TractorCommandRejectionReason::TractorOutOfService,
+            status: Some(tractor.status),
+            audit,
+        };
+        return Ok((tractor_rejection_status(&rejection), Json(rejection)).into_response());
+    }
+
+    Ok(Json(tractor).into_response())
 }
 
 pub async fn register_fleet_component(
@@ -5465,6 +5601,14 @@ fn fleet_enrollment_error(error: FleetNodeEnrollmentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn tractor_registry_error(error: TractorRegistryError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn tractor_rejection_status(rejection: &TractorCommandRejection) -> StatusCode {
+    StatusCode::from_u16(rejection.status_code()).unwrap_or(StatusCode::BAD_REQUEST)
+}
+
 fn parse_fleet_node_kind(value: String) -> AppResult<FleetNodeKind> {
     value.parse::<FleetNodeKind>().map_err(|err| {
         AppError::Anyhow(Error::new(err).context("failed to decode fleet node kind"))
@@ -5481,6 +5625,12 @@ fn parse_fleet_node_status(value: String) -> AppResult<FleetNodeStatus> {
     value.parse::<FleetNodeStatus>().map_err(|err| {
         AppError::Anyhow(Error::new(err).context("failed to decode fleet node status"))
     })
+}
+
+fn parse_tractor_lifecycle_status(value: String) -> AppResult<TractorLifecycleStatus> {
+    value
+        .parse::<TractorLifecycleStatus>()
+        .map_err(|err| AppError::Anyhow(Error::new(err).context("failed to decode tractor status")))
 }
 
 fn fleet_health_error(error: FleetHealthError) -> AppError {
@@ -6496,6 +6646,29 @@ fn decode_fleet_node_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FleetNod
     })
 }
 
+fn decode_tractor_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<TractorRecord> {
+    let capabilities_json: String = row.get("capabilities_json");
+    let capabilities = serde_json::from_str::<Vec<String>>(&capabilities_json).map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode tractor capabilities_json"))
+    })?;
+    let implement_ref_json: String = row.get("implement_ref_json");
+    let implement_ref =
+        serde_json::from_str::<TractorImplementRef>(&implement_ref_json).map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode tractor implement_ref_json"))
+        })?;
+
+    Ok(TractorRecord {
+        tractor_id: row.get("tractor_id"),
+        org_id: row.get("org_id"),
+        field_id: row.get("field_id"),
+        capabilities,
+        implement_ref,
+        status: parse_tractor_lifecycle_status(row.get::<String, _>("status"))?,
+        registered_at: row.get("registered_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 fn decode_fleet_component_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FleetComponentRecord> {
     let service_history_json: String = row.get("service_history_json");
     let service_history = serde_json::from_str::<Vec<ServiceHistoryEntry>>(&service_history_json)
@@ -6958,6 +7131,104 @@ async fn load_fleet_node_by_hardware_id(
     .map_err(Error::from)?;
 
     row.map(|row| decode_fleet_node_record(&row)).transpose()
+}
+
+async fn load_tractor(state: &AppState, tractor_id: &str) -> AppResult<Option<TractorRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT tractor_id, org_id, field_id, capabilities_json, implement_ref_json, status,
+               registered_at, updated_at
+        FROM tractor_vehicles
+        WHERE tractor_id = ?1
+        "#,
+    )
+    .bind(tractor_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_tractor_record(&row)).transpose()
+}
+
+async fn insert_tractor_record(state: &AppState, record: &TractorRecord) -> AppResult<()> {
+    let capabilities_json =
+        serde_json::to_string(&record.capabilities).map_err(|err| AppError::Anyhow(err.into()))?;
+    let implement_ref_json =
+        serde_json::to_string(&record.implement_ref).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO tractor_vehicles (
+            tractor_id, org_id, field_id, capabilities_json, implement_ref_json, status,
+            registered_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&record.tractor_id)
+    .bind(&record.org_id)
+    .bind(&record.field_id)
+    .bind(capabilities_json)
+    .bind(implement_ref_json)
+    .bind(record.status.as_str())
+    .bind(&record.registered_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+fn build_tractor_command_audit(
+    command: &TractorMotionCommandRequest,
+    tractor: Option<&TractorRecord>,
+    reason: TractorCommandRejectionReason,
+) -> TractorCommandAuditRecord {
+    TractorCommandAuditRecord {
+        audit_id: format!("tractor-command-audit-{}", Uuid::new_v4()),
+        command_id: command.command_id.clone(),
+        tractor_id: command.tractor_id.clone(),
+        org_id: tractor.map(|tractor| tractor.org_id.clone()),
+        field_id: tractor.map(|tractor| tractor.field_id.clone()),
+        command_type: command.command_type.clone(),
+        requested_by: command.requested_by.clone(),
+        decision: TractorCommandAuditDecision::Rejected,
+        reason_code: reason.as_str().to_string(),
+        at: current_record_timestamp(),
+    }
+}
+
+async fn insert_tractor_command_audit(
+    state: &AppState,
+    audit: &TractorCommandAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO tractor_command_audits (
+            audit_id, command_id, tractor_id, org_id, field_id, command_type, requested_by,
+            decision, reason_code, at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.command_id)
+    .bind(&audit.tractor_id)
+    .bind(&audit.org_id)
+    .bind(&audit.field_id)
+    .bind(&audit.command_type)
+    .bind(&audit.requested_by)
+    .bind(match audit.decision {
+        TractorCommandAuditDecision::Allowed => "allowed",
+        TractorCommandAuditDecision::Rejected => "rejected",
+    })
+    .bind(&audit.reason_code)
+    .bind(&audit.at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
 }
 
 async fn validate_enrolled_airframe(state: &AppState, airframe_id: &str) -> AppResult<()> {

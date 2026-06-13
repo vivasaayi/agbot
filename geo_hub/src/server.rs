@@ -53,6 +53,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/fleet/nodes/enroll", post(routes::enroll_fleet_node))
         .route("/api/fleet/nodes/:node_id", get(routes::get_fleet_node))
         .route(
+            "/api/tractors",
+            get(routes::list_tractors).post(routes::register_tractor),
+        )
+        .route("/api/tractors/:tractor_id", get(routes::get_tractor))
+        .route(
+            "/api/tractors/:tractor_id/motion-commands/validate",
+            post(routes::validate_tractor_motion_command),
+        )
+        .route(
             "/api/orthomosaic/frame-sets",
             get(routes::list_orthomosaic_frame_sets).post(routes::ingest_orthomosaic_frame_set),
         )
