@@ -75,16 +75,26 @@ pub struct LidarScanIngest {
 
 pub const OCCUPANCY_GRID_LOCAL_CRS: &str = "LOCAL_LIDAR_METERS";
 const OUTLIER_DISTANCE_EPSILON_METERS: f64 = 1.0e-9;
+const GRID_COORDINATE_EPSILON: f64 = 1.0e-6;
 
 #[derive(Debug, Clone)]
 pub struct LidarOccupancyGrid {
     pub cells: HashMap<(i32, i32), GridCell>,
     pub spatial_ref: RasterSpatialRef,
     pub resolution: RasterResolution,
+    pub evidence: LidarOccupancyGridEvidence,
     pub width: u32,
     pub height: u32,
     pub min_grid_x: i32,
     pub min_grid_y: i32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LidarOccupancyGridEvidence {
+    pub distance_threshold_m: f32,
+    pub quality_threshold: u8,
+    pub occupancy_threshold: f32,
+    pub flip_y: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -339,6 +349,8 @@ impl LidarMapper {
         // Create occupancy grid
         let grid = self.build_occupancy_grid(&all_scans)?;
         self.save_occupancy_spatial_ref(&grid, output_dir).await?;
+        self.save_occupancy_grid_evidence(&grid.evidence, output_dir)
+            .await?;
 
         // Save grid as image
         self.save_grid_image(&grid.cells, output_dir).await?;
@@ -1042,8 +1054,7 @@ impl LidarMapper {
     pub fn build_occupancy_grid(&self, scans: &[LidarScan]) -> AgroResult<LidarOccupancyGrid> {
         let resolution = self.config.processing.lidar_grid_resolution;
         let spatial_resolution = Self::assert_positive_grid_resolution(resolution)?;
-        let dist_thresh = self.config.processing.lidar_obstacle_distance_threshold;
-        let qual_thresh = self.config.processing.lidar_quality_threshold;
+        let evidence = self.occupancy_grid_evidence()?;
         let mut grid: HashMap<(i32, i32), GridCell> = HashMap::new();
 
         info!("Creating occupancy grid with resolution: {} m", resolution);
@@ -1055,28 +1066,32 @@ impl LidarMapper {
                 let distance_m = point.distance / 1000.0; // Convert mm to m
 
                 let x = distance_m * angle_rad.cos();
-                let y = distance_m * angle_rad.sin();
+                let mut y = distance_m * angle_rad.sin();
+                if evidence.flip_y {
+                    y = -y;
+                }
 
                 // Convert to grid coordinates
-                let grid_x = (x / resolution) as i32;
-                let grid_y = (y / resolution) as i32;
+                let grid_x = Self::grid_coordinate(x as f64, resolution);
+                let grid_y = Self::grid_coordinate(y as f64, resolution);
 
                 let cell = grid.entry((grid_x, grid_y)).or_default();
                 cell.total_observations += 1;
 
                 // Count as obstacle if within threshold
-                if distance_m < dist_thresh && (point.quality as u8) > qual_thresh {
+                if distance_m < evidence.distance_threshold_m
+                    && (point.quality as u8) > evidence.quality_threshold
+                {
                     cell.obstacle_count += 1;
                 }
             }
         }
 
         // Determine final occupancy based on threshold
-        let occ_thresh = self.config.processing.lidar_occupancy_threshold;
         for cell in grid.values_mut() {
             if cell.total_observations > 0 {
                 let ratio = cell.obstacle_count as f32 / cell.total_observations as f32;
-                cell.occupied = ratio > occ_thresh;
+                cell.occupied = ratio > evidence.occupancy_threshold;
             }
         }
         info!("Generated occupancy grid with {} cells", grid.len());
@@ -1087,11 +1102,45 @@ impl LidarMapper {
             cells: grid,
             spatial_ref,
             resolution: spatial_resolution,
+            evidence,
             width,
             height,
             min_grid_x,
             min_grid_y,
         })
+    }
+
+    fn occupancy_grid_evidence(&self) -> AgroResult<LidarOccupancyGridEvidence> {
+        let distance_threshold_m = self.config.processing.lidar_obstacle_distance_threshold;
+        if !distance_threshold_m.is_finite() || distance_threshold_m <= 0.0 {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR occupancy grid requires a positive distance threshold".into(),
+            ));
+        }
+
+        let occupancy_threshold = self.config.processing.lidar_occupancy_threshold;
+        if !occupancy_threshold.is_finite() || !(0.0..=1.0).contains(&occupancy_threshold) {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR occupancy threshold must be in the range [0, 1]".into(),
+            ));
+        }
+
+        Ok(LidarOccupancyGridEvidence {
+            distance_threshold_m,
+            quality_threshold: self.config.processing.lidar_quality_threshold,
+            occupancy_threshold,
+            flip_y: self.config.processing.lidar_image_flip_y,
+        })
+    }
+
+    fn grid_coordinate(value_m: f64, resolution_m: f32) -> i32 {
+        let scaled = value_m / resolution_m as f64;
+        let nearest = scaled.round();
+        if (scaled - nearest).abs() <= GRID_COORDINATE_EPSILON {
+            nearest as i32
+        } else {
+            scaled.floor() as i32
+        }
     }
 
     fn assert_positive_grid_resolution(resolution: f32) -> AgroResult<RasterResolution> {
@@ -1168,6 +1217,18 @@ impl LidarMapper {
             "Saved occupancy grid spatial reference to: {:?}",
             output_path
         );
+        Ok(())
+    }
+
+    async fn save_occupancy_grid_evidence(
+        &self,
+        evidence: &LidarOccupancyGridEvidence,
+        output_dir: &PathBuf,
+    ) -> AgroResult<()> {
+        let output_path = output_dir.join("lidar_occupancy_grid_evidence.json");
+        let content = serde_json::to_vec_pretty(evidence)?;
+        tokio::fs::write(&output_path, content).await?;
+        info!("Saved LiDAR occupancy grid evidence to: {:?}", output_path);
         Ok(())
     }
 
@@ -1328,6 +1389,24 @@ mod tests {
     fn test_mapper_with_resolution(resolution: f32) -> LidarMapper {
         let mut config = AgroConfig::load().unwrap();
         config.processing.lidar_grid_resolution = resolution;
+        LidarMapper {
+            config: Arc::new(config),
+        }
+    }
+
+    fn test_mapper_with_occupancy_controls(
+        resolution: f32,
+        distance_threshold_m: f32,
+        quality_threshold: u8,
+        occupancy_threshold: f32,
+        flip_y: bool,
+    ) -> LidarMapper {
+        let mut config = AgroConfig::load().unwrap();
+        config.processing.lidar_grid_resolution = resolution;
+        config.processing.lidar_obstacle_distance_threshold = distance_threshold_m;
+        config.processing.lidar_quality_threshold = quality_threshold;
+        config.processing.lidar_occupancy_threshold = occupancy_threshold;
+        config.processing.lidar_image_flip_y = flip_y;
         LidarMapper {
             config: Arc::new(config),
         }
@@ -1530,11 +1609,101 @@ mod tests {
     }
 
     #[test]
+    fn build_occupancy_grid_records_thresholds_and_threshold_controls_occupancy() {
+        let scan = LidarScan {
+            timestamp: Utc::now(),
+            points: vec![point(0.0, 1000.0), point(0.0, 1800.0)],
+            scan_id: Uuid::new_v4(),
+        };
+        let low_threshold_mapper = test_mapper_with_occupancy_controls(10.0, 1.5, 0, 0.25, false);
+        let high_threshold_mapper = test_mapper_with_occupancy_controls(10.0, 1.5, 0, 0.75, false);
+
+        let low_threshold_grid = low_threshold_mapper
+            .build_occupancy_grid(std::slice::from_ref(&scan))
+            .unwrap();
+        let high_threshold_grid = high_threshold_mapper.build_occupancy_grid(&[scan]).unwrap();
+
+        assert!(low_threshold_grid.cells.get(&(0, 0)).unwrap().occupied);
+        assert!(!high_threshold_grid.cells.get(&(0, 0)).unwrap().occupied);
+        assert_eq!(low_threshold_grid.evidence.distance_threshold_m, 1.5);
+        assert_eq!(low_threshold_grid.evidence.quality_threshold, 0);
+        assert_eq!(low_threshold_grid.evidence.occupancy_threshold, 0.25);
+        assert!(!low_threshold_grid.evidence.flip_y);
+    }
+
+    #[tokio::test]
+    async fn save_occupancy_grid_evidence_persists_thresholds_and_flip() {
+        let mapper = test_mapper_with_occupancy_controls(1.0, 2.5, 42, 0.75, true);
+        let output_dir = temp_dir("occupancy_evidence");
+        let evidence = mapper.occupancy_grid_evidence().unwrap();
+
+        mapper
+            .save_occupancy_grid_evidence(&evidence, &output_dir)
+            .await
+            .unwrap();
+
+        let persisted_path = output_dir.join("lidar_occupancy_grid_evidence.json");
+        assert!(persisted_path.exists());
+        let persisted: LidarOccupancyGridEvidence =
+            serde_json::from_str(&fs::read_to_string(persisted_path).unwrap()).unwrap();
+        assert_eq!(persisted, evidence);
+    }
+
+    #[test]
+    fn build_occupancy_grid_flips_y_coordinates_and_extent_consistently() {
+        let scan = LidarScan {
+            timestamp: Utc::now(),
+            points: vec![point(90.0, 1000.0)],
+            scan_id: Uuid::new_v4(),
+        };
+        let unflipped = test_mapper_with_occupancy_controls(1.0, 5.0, 0, 0.5, false)
+            .build_occupancy_grid(std::slice::from_ref(&scan))
+            .unwrap();
+        let flipped = test_mapper_with_occupancy_controls(1.0, 5.0, 0, 0.5, true)
+            .build_occupancy_grid(&[scan])
+            .unwrap();
+
+        assert!(unflipped.cells.contains_key(&(0, 1)));
+        assert_eq!(unflipped.min_grid_y, 1);
+        assert_eq!(
+            unflipped.spatial_ref.bbox,
+            Some(GeoBounds {
+                min_lon: 0.0,
+                min_lat: 1.0,
+                max_lon: 1.0,
+                max_lat: 2.0,
+            })
+        );
+
+        assert!(flipped.cells.contains_key(&(0, -1)));
+        assert_eq!(flipped.min_grid_y, -1);
+        assert!(flipped.evidence.flip_y);
+        assert_eq!(
+            flipped.spatial_ref.bbox,
+            Some(GeoBounds {
+                min_lon: 0.0,
+                min_lat: -1.0,
+                max_lon: 1.0,
+                max_lat: 0.0,
+            })
+        );
+    }
+
+    #[test]
     fn build_occupancy_grid_rejects_non_positive_resolution() {
         for resolution in [0.0, -1.0] {
             let mapper = test_mapper_with_resolution(resolution);
             let err = mapper.build_occupancy_grid(&[]).unwrap_err();
             assert!(err.to_string().contains("positive resolution"));
+        }
+    }
+
+    #[test]
+    fn build_occupancy_grid_rejects_out_of_range_occupancy_threshold() {
+        for threshold in [-0.1, 1.1, f32::NAN] {
+            let mapper = test_mapper_with_occupancy_controls(1.0, 5.0, 0, threshold, false);
+            let err = mapper.build_occupancy_grid(&[]).unwrap_err();
+            assert!(err.to_string().contains("occupancy threshold"));
         }
     }
 
