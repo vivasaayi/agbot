@@ -23,6 +23,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using agbot::flight_sim::DroneMode;
 using agbot::flight_sim::DroneSimulation;
@@ -32,6 +33,7 @@ using agbot::flight_sim::GeoCoordinate;
 using agbot::flight_sim::MissionLoader;
 using agbot::flight_sim::ManualControlInput;
 using agbot::flight_sim::ControlMode;
+using agbot::flight_sim::SimulationEventType;
 using agbot::flight_sim::TileCoordinate;
 using agbot::flight_sim::TelemetryRecorder;
 using agbot::flight_sim::TelemetryReplay;
@@ -197,6 +199,81 @@ void test_mission_completes() {
     assert(simulation.state().mode == DroneMode::Completed);
     assert(simulation.state().target_waypoint_index == 4);
     assert(simulation.state().battery_percent > 90.0);
+}
+
+void test_simulation_events_follow_documented_normal_order() {
+    auto mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation simulation(std::move(mission));
+
+    constexpr double dt_s = 1.0 / 60.0;
+    for (int i = 0; i < 60 * 45 && !simulation.is_complete(); ++i) {
+        simulation.step(dt_s);
+    }
+
+    const auto& events = simulation.events();
+    assert(!events.empty());
+    assert(events.size() % 4 == 0);
+
+    std::vector<DroneMode> status_modes;
+    for (std::size_t index = 0; index < events.size(); index += 4) {
+        assert(events[index].type == SimulationEventType::Position);
+        assert(events[index + 1].type == SimulationEventType::Sensor);
+        assert(events[index + 2].type == SimulationEventType::Battery);
+        assert(events[index + 3].type == SimulationEventType::Status);
+        assert(events[index + 3].mode == events[index].mode);
+        assert(events[index + 3].battery_percent == events[index + 2].battery_percent);
+        if (status_modes.empty() || status_modes.back() != events[index + 3].mode) {
+            status_modes.push_back(events[index + 3].mode);
+        }
+    }
+
+    bool saw_takeoff = false;
+    bool saw_flying = false;
+    bool saw_loiter = false;
+    bool saw_landing = false;
+    bool saw_completed = false;
+    for (const DroneMode mode : status_modes) {
+        if (mode == DroneMode::Takeoff) {
+            saw_takeoff = true;
+        } else if (mode == DroneMode::Flying) {
+            assert(saw_takeoff);
+            saw_flying = true;
+        } else if (mode == DroneMode::Loiter) {
+            assert(saw_flying);
+            saw_loiter = true;
+        } else if (mode == DroneMode::Landing) {
+            assert(saw_loiter);
+            saw_landing = true;
+        } else if (mode == DroneMode::Completed) {
+            assert(saw_landing);
+            saw_completed = true;
+        }
+    }
+    assert(saw_takeoff);
+    assert(saw_flying);
+    assert(saw_loiter);
+    assert(saw_landing);
+    assert(saw_completed);
+}
+
+void test_simulation_emergency_event_suppresses_normal_events() {
+    auto mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation simulation(std::move(mission));
+    simulation.step(1.0 / 60.0);
+    simulation.clear_events();
+
+    simulation.request_emergency_abort();
+    simulation.step(1.0 / 60.0);
+    simulation.step(1.0 / 60.0);
+
+    const auto& events = simulation.events();
+    assert(events.size() == 1);
+    assert(events.front().type == SimulationEventType::Emergency);
+    assert(events.front().mode == DroneMode::Failsafe);
+    assert(events.front().safety_code.has_value());
+    assert(events.front().safety_code.value() == agbot::flight_sim::SafetyViolationCode::EmergencyAbort);
+    assert(simulation.state().mode == DroneMode::Failsafe);
+    assert(simulation.last_safety_violation().has_value());
 }
 
 void test_manual_controls_move_drone() {
@@ -1030,6 +1107,8 @@ int main() {
     test_mission_preview_overlay_aligns_field_boundary_and_coverage();
     test_mission_preview_overlay_reports_missing_boundary();
     test_mission_completes();
+    test_simulation_events_follow_documented_normal_order();
+    test_simulation_emergency_event_suppresses_normal_events();
     test_manual_controls_move_drone();
     test_steady_wind_disturbs_ground_track();
     test_mission_round_trip();

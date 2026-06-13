@@ -62,6 +62,7 @@ void DroneSimulation::reset() {
     manual_input_ = {};
     emergency_abort_requested_ = false;
     last_safety_violation_.reset();
+    event_log_.clear();
 }
 
 void DroneSimulation::step(double dt_s) {
@@ -142,6 +143,20 @@ Vec3 DroneSimulation::wind() const {
     return wind_mps_;
 }
 
+const std::vector<SimulationEvent>& DroneSimulation::events() const {
+    return event_log_;
+}
+
+std::vector<SimulationEvent> DroneSimulation::drain_events() {
+    std::vector<SimulationEvent> drained = std::move(event_log_);
+    event_log_.clear();
+    return drained;
+}
+
+void DroneSimulation::clear_events() {
+    event_log_.clear();
+}
+
 const std::optional<SafetyViolation>& DroneSimulation::last_safety_violation() const {
     return last_safety_violation_;
 }
@@ -181,7 +196,11 @@ void DroneSimulation::step_fixed(double dt_s) {
         step_autopilot(dt_s);
     }
 
-    fail_if_safety_violated();
+    if (fail_if_safety_violated()) {
+        return;
+    }
+
+    emit_normal_event_frame();
 }
 
 void DroneSimulation::step_autopilot(double dt_s) {
@@ -327,6 +346,7 @@ bool DroneSimulation::fail_if_safety_violated() {
         state_.mode = DroneMode::Failsafe;
         state_.velocity = {};
         state_.armed = false;
+        emit_event(SimulationEventType::Emergency, violation->message, violation->code);
         return true;
     }
     return false;
@@ -345,6 +365,30 @@ void DroneSimulation::advance_waypoint() {
     if (const Waypoint* waypoint = target_waypoint()) {
         state_.mode = mode_for_waypoint(*waypoint);
     }
+}
+
+void DroneSimulation::emit_event(
+    SimulationEventType type,
+    std::string message,
+    std::optional<SafetyViolationCode> safety_code) {
+    event_log_.push_back({
+        type,
+        state_.mission_time_s,
+        state_.mode,
+        state_.position,
+        state_.velocity,
+        state_.battery_percent,
+        state_.target_waypoint_index,
+        safety_code,
+        std::move(message),
+    });
+}
+
+void DroneSimulation::emit_normal_event_frame() {
+    emit_event(SimulationEventType::Position, "position sample broadcast");
+    emit_event(SimulationEventType::Sensor, "sensor sample broadcast");
+    emit_event(SimulationEventType::Battery, "battery sample broadcast");
+    emit_event(SimulationEventType::Status, "status sample broadcast");
 }
 
 const Waypoint* DroneSimulation::target_waypoint() const {
@@ -384,6 +428,22 @@ const char* to_string(ControlMode mode) {
             return "manual";
         case ControlMode::Replay:
             return "replay";
+    }
+    return "unknown";
+}
+
+const char* to_string(SimulationEventType type) {
+    switch (type) {
+        case SimulationEventType::Position:
+            return "position";
+        case SimulationEventType::Sensor:
+            return "sensor";
+        case SimulationEventType::Battery:
+            return "battery";
+        case SimulationEventType::Status:
+            return "status";
+        case SimulationEventType::Emergency:
+            return "emergency";
     }
     return "unknown";
 }

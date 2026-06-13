@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace agbot::flight_sim {
 
@@ -50,6 +52,26 @@ struct DroneState {
     bool armed = false;
 };
 
+enum class SimulationEventType {
+    Position,
+    Sensor,
+    Battery,
+    Status,
+    Emergency,
+};
+
+struct SimulationEvent {
+    SimulationEventType type = SimulationEventType::Status;
+    double time_s = 0.0;
+    DroneMode mode = DroneMode::Idle;
+    Vec3 position;
+    Vec3 velocity;
+    double battery_percent = 100.0;
+    std::size_t target_waypoint_index = 0;
+    std::optional<SafetyViolationCode> safety_code;
+    std::string message;
+};
+
 struct SimulationConfig {
     double min_battery_percent = 12.0;
     double idle_battery_drain_percent_per_s = 0.001;
@@ -82,6 +104,9 @@ public:
     [[nodiscard]] const DroneState& state() const;
     [[nodiscard]] ControlMode control_mode() const;
     [[nodiscard]] Vec3 wind() const;
+    [[nodiscard]] const std::vector<SimulationEvent>& events() const;
+    [[nodiscard]] std::vector<SimulationEvent> drain_events();
+    void clear_events();
     [[nodiscard]] const std::optional<SafetyViolation>& last_safety_violation() const;
     [[nodiscard]] bool is_complete() const;
     [[nodiscard]] double progress() const;
@@ -93,6 +118,11 @@ private:
     void move_towards_velocity(Vec3 desired_velocity, double dt_s);
     bool fail_if_safety_violated();
     void advance_waypoint();
+    void emit_event(
+        SimulationEventType type,
+        std::string message = {},
+        std::optional<SafetyViolationCode> safety_code = std::nullopt);
+    void emit_normal_event_frame();
     [[nodiscard]] const Waypoint* target_waypoint() const;
 
     Mission mission_;
@@ -102,9 +132,11 @@ private:
     Vec3 wind_mps_;
     bool emergency_abort_requested_ = false;
     std::optional<SafetyViolation> last_safety_violation_;
+    std::vector<SimulationEvent> event_log_;
 };
 
 [[nodiscard]] const char* to_string(DroneMode mode);
 [[nodiscard]] const char* to_string(ControlMode mode);
+[[nodiscard]] const char* to_string(SimulationEventType type);
 
 } // namespace agbot::flight_sim
