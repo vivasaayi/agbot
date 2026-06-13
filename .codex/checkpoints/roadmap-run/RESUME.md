@@ -2,20 +2,21 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: c3239dbdc65da3d17c324a0436e55b351450640e (`batch-06-17`)
-- **Latest checkpoint commit**: pending checkpoint commit for `batch-06-17` metadata
-- **Current batch**: `batch-06-17` / STORY `06-17` — LiDAR elevation/CHM export committed
-- **Completed feature rows**: 285 committed; 1 skipped; 1 blocked; 211 pending rows remain in the full-roadmap inventory
+- **Last implementation commit**: 954448424688a50872b71528a7e8da0a15e551b6 (`batch-07-07`)
+- **Latest checkpoint commit**: pending checkpoint commit for `batch-07-07` metadata
+- **Current batch**: `batch-07-07` / STORY `07-07` — Geo Hub ingest health and retry/backoff committed
+- **Completed feature rows**: 286 committed; 1 skipped; 1 blocked; 210 pending rows remain in the full-roadmap inventory
 - **Blocker**: STORY `07-11` is blocked on the documented storage-authority confirmation question.
 
 ## Latest verification
 
-- `cargo test -p lidar_mapper` — pass
-- `cargo check -p lidar_mapper` — pass
+- `cargo test -p geo_hub` — pass
+- `cargo check -p geo_hub` — pass
 - `cargo fmt --all --check` — pass
 - `git diff --check` — pass
 - `git diff --cached --check` — pass
-- `cargo test -p lidar_mapper export_elevation_product -- --nocapture` — pass
+- `cargo test -p geo_hub ingest_landsat_retries -- --nocapture` — pass
+- `cargo test -p geo_hub ingest_health_endpoint_reports_counts_and_last_error -- --nocapture` — pass
 
 ## Next action
 
