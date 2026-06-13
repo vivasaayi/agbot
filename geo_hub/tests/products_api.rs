@@ -589,10 +589,16 @@ async fn import_fields_geojson_creates_fields_from_feature_collection() -> Resul
     assert_eq!(list_response.status(), StatusCode::OK);
     let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
     let fields_json: serde_json::Value = serde_json::from_slice(&body)?;
-    assert_eq!(fields_json.as_array().map(|fields| fields.len()), Some(1));
     assert_eq!(
         fields_json
-            .pointer("/0/extent/max_lat")
+            .pointer("/items")
+            .and_then(|fields| fields.as_array())
+            .map(|fields| fields.len()),
+        Some(1)
+    );
+    assert_eq!(
+        fields_json
+            .pointer("/items/0/extent/max_lat")
             .and_then(|v| v.as_f64()),
         Some(41.4)
     );
@@ -1018,10 +1024,16 @@ async fn farm_crud_and_field_history_roundtrip() -> Result<()> {
     assert_eq!(fields_response.status(), StatusCode::OK);
     let body = to_bytes(fields_response.into_body(), 64 * 1024).await?;
     let fields_json: serde_json::Value = serde_json::from_slice(&body)?;
-    assert_eq!(fields_json.as_array().map(|items| items.len()), Some(2));
     assert_eq!(
         fields_json
-            .pointer("/0/farm_id")
+            .pointer("/items")
+            .and_then(|items| items.as_array())
+            .map(|items| items.len()),
+        Some(2)
+    );
+    assert_eq!(
+        fields_json
+            .pointer("/items/0/farm_id")
             .and_then(|value| value.as_str()),
         Some("farm-1")
     );
@@ -1076,6 +1088,275 @@ async fn farm_crud_and_field_history_roundtrip() -> Result<()> {
         .await
         .expect("router should handle request");
     assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn farm_field_lists_paginate_scope_and_filter_lifecycle_status() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    for (farm_id, owner, name, status) in [
+        ("farm-active", "org-alpha", "Active Farm", None),
+        (
+            "farm-archived",
+            "org-alpha",
+            "Archived Farm",
+            Some("archived"),
+        ),
+        ("farm-foreign", "org-beta", "Foreign Farm", None),
+    ] {
+        let mut body = json!({
+            "farm_id": farm_id,
+            "owner": owner,
+            "name": name
+        });
+        if let Some(status) = status {
+            body["status"] = json!(status);
+        }
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/farms")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    for (field_id, farm_id, name, status) in [
+        ("field-alpha", "farm-active", "Alpha Field", None),
+        ("field-beta", "farm-active", "Beta Field", None),
+        ("field-gamma", "farm-active", "Gamma Field", None),
+        (
+            "field-archived",
+            "farm-active",
+            "Archived Field",
+            Some("archived"),
+        ),
+        ("field-foreign", "farm-foreign", "Foreign Field", None),
+    ] {
+        let mut body = json!({
+            "farm_id": farm_id,
+            "field_id": field_id,
+            "name": name,
+            "boundary": {
+                "coordinates": [
+                    { "longitude": -96.7, "latitude": 41.1 },
+                    { "longitude": -96.2, "latitude": 41.1 },
+                    { "longitude": -96.2, "latitude": 41.4 }
+                ]
+            }
+        });
+        if let Some(status) = status {
+            body["status"] = json!(status);
+        }
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fields")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let page_two = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields?org_id=org-alpha&page=2&page_size=2")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(page_two.status(), StatusCode::OK);
+    let body = to_bytes(page_two.into_body(), 64 * 1024).await?;
+    let page_two_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        page_two_json
+            .get("total_count")
+            .and_then(|value| value.as_u64()),
+        Some(3)
+    );
+    assert_eq!(
+        page_two_json.get("page").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        page_two_json
+            .get("page_size")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        page_two_json
+            .pointer("/items/0/field_id")
+            .and_then(|value| value.as_str()),
+        Some("field-gamma")
+    );
+    assert_eq!(
+        page_two_json
+            .pointer("/items/0/status")
+            .and_then(|value| value.as_str()),
+        Some("active")
+    );
+    assert!(page_two_json
+        .pointer("/items/0/updated_at")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.is_empty()));
+
+    let beyond = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields?org_id=org-alpha&page=4&page_size=2")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(beyond.status(), StatusCode::OK);
+    let body = to_bytes(beyond.into_body(), 64 * 1024).await?;
+    let beyond_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        beyond_json
+            .get("total_count")
+            .and_then(|value| value.as_u64()),
+        Some(3)
+    );
+    assert_eq!(
+        beyond_json
+            .pointer("/items")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let archived_fields = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields?org_id=org-alpha&status=archived")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(archived_fields.status(), StatusCode::OK);
+    let body = to_bytes(archived_fields.into_body(), 64 * 1024).await?;
+    let archived_fields_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        archived_fields_json
+            .pointer("/items/0/field_id")
+            .and_then(|value| value.as_str()),
+        Some("field-archived")
+    );
+
+    let active_farms = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/farms?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(active_farms.status(), StatusCode::OK);
+    let body = to_bytes(active_farms.into_body(), 64 * 1024).await?;
+    let active_farms_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        active_farms_json
+            .pointer("/items/0/farm_id")
+            .and_then(|value| value.as_str()),
+        Some("farm-active")
+    );
+    assert_eq!(
+        active_farms_json
+            .pointer("/items/0/status")
+            .and_then(|value| value.as_str()),
+        Some("active")
+    );
+    assert_eq!(
+        active_farms_json
+            .pointer("/items")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let archived_farms = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/farms?org_id=org-alpha&status=archived")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(archived_farms.status(), StatusCode::OK);
+    let body = to_bytes(archived_farms.into_body(), 64 * 1024).await?;
+    let archived_farms_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        archived_farms_json
+            .pointer("/items/0/farm_id")
+            .and_then(|value| value.as_str()),
+        Some("farm-archived")
+    );
+
+    let archived_boundaries = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/boundaries?org_id=org-alpha&status=archived")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(archived_boundaries.status(), StatusCode::OK);
+    let body = to_bytes(archived_boundaries.into_body(), 64 * 1024).await?;
+    let archived_boundaries_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        archived_boundaries_json
+            .pointer("/items/0/field_id")
+            .and_then(|value| value.as_str()),
+        Some("field-archived")
+    );
+    assert_eq!(
+        archived_boundaries_json
+            .pointer("/items/0/boundary/coordinates")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(3)
+    );
 
     Ok(())
 }

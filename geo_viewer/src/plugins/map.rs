@@ -294,7 +294,8 @@ mod tests {
     use crate::state::{SceneExtent, SceneGeospatialMetadata, SceneManifestState, TileId};
     use bevy::prelude::Vec2;
     use shared::schemas::{
-        FieldBoundary, FieldRecord, GeoBounds, GeoPoint, RasterResolution, RasterSpatialRef,
+        FarmFieldEntityStatus, FieldBoundary, FieldRecord, GeoBounds, GeoPoint, RasterResolution,
+        RasterSpatialRef,
     };
 
     fn sample_extent() -> SceneExtent {
@@ -527,7 +528,9 @@ mod tests {
                 max_lon: -88.5,
                 max_lat: 41.0,
             },
+            status: FarmFieldEntityStatus::Active,
             created_at: "2026-05-01T00:00:00Z".to_string(),
+            updated_at: "2026-05-01T00:00:00Z".to_string(),
         }
     }
 }

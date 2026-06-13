@@ -181,6 +181,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/fields/import/shapefile",
             post(routes::import_fields_shapefile),
         )
+        .route("/api/fields/boundaries", get(routes::list_field_boundaries))
         .route("/api/fields/:field_id", get(routes::get_field))
         .route(
             "/api/fields/:field_id/farm/:farm_id",

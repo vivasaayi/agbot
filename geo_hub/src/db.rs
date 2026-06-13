@@ -23,7 +23,9 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             owner TEXT NOT NULL DEFAULT 'unassigned',
             name TEXT NOT NULL,
             notes TEXT,
-            created_at TEXT NOT NULL
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT ''
         );
         "#,
     )
@@ -41,7 +43,9 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             season TEXT,
             notes TEXT,
             boundary_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT ''
         );
         "#,
     )
@@ -88,6 +92,46 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         "ALTER TABLE fields ADD COLUMN owner TEXT NOT NULL DEFAULT 'unassigned'",
     )
     .await?;
+
+    ensure_column(
+        pool,
+        "farms",
+        "status",
+        "ALTER TABLE farms ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "farms",
+        "updated_at",
+        "ALTER TABLE farms ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "fields",
+        "status",
+        "ALTER TABLE fields ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "fields",
+        "updated_at",
+        "ALTER TABLE fields ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+
+    sqlx::query("UPDATE farms SET updated_at = created_at WHERE trim(updated_at) = ''")
+        .execute(pool)
+        .await?;
+
+    sqlx::query("UPDATE fields SET updated_at = created_at WHERE trim(updated_at) = ''")
+        .execute(pool)
+        .await?;
 
     ensure_column(
         pool,

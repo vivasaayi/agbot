@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use shared::schemas::{
-    assert_raster_spatial_ref, validate_field_boundary, FieldBoundary,
+    assert_raster_spatial_ref, validate_field_boundary, FarmFieldEntityStatus, FieldBoundary,
     FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint, RasterResolution,
     RasterSpatialRef, RasterSpatialRefError,
 };
@@ -671,7 +671,9 @@ pub fn import_field_boundary(
         )),
         boundary: validated.boundary,
         extent: validated.extent,
-        created_at: request.created_at,
+        status: FarmFieldEntityStatus::Active,
+        created_at: request.created_at.clone(),
+        updated_at: request.created_at,
     };
 
     Ok(FieldBoundaryImportReport {

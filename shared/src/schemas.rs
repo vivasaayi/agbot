@@ -44,6 +44,76 @@ fn default_record_owner() -> String {
     DEFAULT_RECORD_OWNER.to_string()
 }
 
+const DEFAULT_FARM_FIELD_PAGE_SIZE: usize = 50;
+const MAX_FARM_FIELD_PAGE_SIZE: usize = 250;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FarmFieldEntityStatus {
+    Active,
+    Archived,
+}
+
+impl FarmFieldEntityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FarmFieldEntityStatus::Active => "active",
+            FarmFieldEntityStatus::Archived => "archived",
+        }
+    }
+}
+
+impl Default for FarmFieldEntityStatus {
+    fn default() -> Self {
+        FarmFieldEntityStatus::Active
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FarmFieldListQuery {
+    #[serde(default)]
+    pub page: Option<usize>,
+    #[serde(default)]
+    pub page_size: Option<usize>,
+    #[serde(default)]
+    pub status: Option<FarmFieldEntityStatus>,
+}
+
+impl FarmFieldListQuery {
+    pub fn normalized_page(&self) -> usize {
+        self.page.unwrap_or(1).max(1)
+    }
+
+    pub fn normalized_page_size(&self) -> usize {
+        match self.page_size {
+            Some(0) | None => DEFAULT_FARM_FIELD_PAGE_SIZE,
+            Some(size) => size.min(MAX_FARM_FIELD_PAGE_SIZE),
+        }
+    }
+
+    fn status_filter(&self) -> FarmFieldEntityStatus {
+        self.status.unwrap_or_default()
+    }
+}
+
+impl Default for FarmFieldListQuery {
+    fn default() -> Self {
+        Self {
+            page: Some(1),
+            page_size: Some(DEFAULT_FARM_FIELD_PAGE_SIZE),
+            status: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FarmFieldListPage<T> {
+    pub items: Vec<T>,
+    pub total_count: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FarmRecord {
     pub farm_id: String,
@@ -54,7 +124,11 @@ pub struct FarmRecord {
     pub name: String,
     pub notes: Option<String>,
     #[serde(default)]
+    pub status: FarmFieldEntityStatus,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -75,7 +149,26 @@ pub struct FieldRecord {
     pub boundary: FieldBoundary,
     pub extent: GeoBounds,
     #[serde(default)]
+    pub status: FarmFieldEntityStatus,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldBoundaryRecord {
+    pub field_id: String,
+    pub farm_id: Option<String>,
+    pub org_id: String,
+    pub owner: String,
+    pub name: String,
+    pub boundary: FieldBoundary,
+    pub extent: GeoBounds,
+    pub area_ha: Option<f64>,
+    pub status: FarmFieldEntityStatus,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -959,10 +1052,20 @@ impl FarmFieldRegistry {
     }
 
     pub fn farms_for_org(&self, org_id: &str) -> Vec<FarmRecord> {
+        self.list_farms_for_org(org_id, FarmFieldListQuery::default())
+            .items
+    }
+
+    pub fn list_farms_for_org(
+        &self,
+        org_id: &str,
+        query: FarmFieldListQuery,
+    ) -> FarmFieldListPage<FarmRecord> {
+        let status = query.status_filter();
         let mut farms = self
             .farms
             .values()
-            .filter(|farm| farm.org_id == org_id)
+            .filter(|farm| farm.org_id == org_id && farm.status == status)
             .cloned()
             .collect::<Vec<_>>();
         farms.sort_by(|left, right| {
@@ -970,14 +1073,24 @@ impl FarmFieldRegistry {
                 .cmp(&right.name)
                 .then(left.farm_id.cmp(&right.farm_id))
         });
-        farms
+        paginate_farm_field_entities(farms, query)
     }
 
     pub fn fields_for_org(&self, org_id: &str) -> Vec<FieldRecord> {
+        self.list_fields_for_org(org_id, FarmFieldListQuery::default())
+            .items
+    }
+
+    pub fn list_fields_for_org(
+        &self,
+        org_id: &str,
+        query: FarmFieldListQuery,
+    ) -> FarmFieldListPage<FieldRecord> {
+        let status = query.status_filter();
         let mut fields = self
             .fields
             .values()
-            .filter(|field| field.org_id == org_id)
+            .filter(|field| field.org_id == org_id && field.status == status)
             .cloned()
             .collect::<Vec<_>>();
         fields.sort_by(|left, right| {
@@ -985,7 +1098,43 @@ impl FarmFieldRegistry {
                 .cmp(&right.name)
                 .then(left.field_id.cmp(&right.field_id))
         });
-        fields
+        paginate_farm_field_entities(fields, query)
+    }
+
+    pub fn list_boundaries_for_org(
+        &self,
+        org_id: &str,
+        query: FarmFieldListQuery,
+    ) -> FarmFieldListPage<FieldBoundaryRecord> {
+        let status = query.status_filter();
+        let mut fields = self
+            .fields
+            .values()
+            .filter(|field| field.org_id == org_id && field.status == status)
+            .cloned()
+            .collect::<Vec<_>>();
+        fields.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.field_id.cmp(&right.field_id))
+        });
+        let boundaries = fields
+            .into_iter()
+            .map(|field| FieldBoundaryRecord {
+                field_id: field.field_id,
+                farm_id: field.farm_id,
+                org_id: field.org_id,
+                owner: field.owner,
+                name: field.name,
+                boundary: field.boundary,
+                extent: field.extent,
+                area_ha: field.area_ha,
+                status: field.status,
+                created_at: field.created_at,
+                updated_at: field.updated_at,
+            })
+            .collect::<Vec<_>>();
+        paginate_farm_field_entities(boundaries, query)
     }
 
     pub fn farm_for_org(&self, org_id: &str, farm_id: &str) -> Option<FarmRecord> {
@@ -1177,10 +1326,35 @@ impl FarmFieldRegistry {
     }
 }
 
+fn paginate_farm_field_entities<T>(
+    items: Vec<T>,
+    query: FarmFieldListQuery,
+) -> FarmFieldListPage<T> {
+    let page = query.normalized_page();
+    let page_size = query.normalized_page_size();
+    let total_count = items.len();
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = if start >= total_count {
+        Vec::new()
+    } else {
+        items.into_iter().skip(start).take(page_size).collect()
+    };
+
+    FarmFieldListPage {
+        items,
+        total_count,
+        page,
+        page_size,
+    }
+}
+
 fn normalize_farm_record(mut farm: FarmRecord) -> Result<FarmRecord, FarmFieldError> {
     farm.farm_id = normalize_farm_field_text(farm.farm_id).ok_or(FarmFieldError::EmptyFarmId)?;
     farm.org_id = normalize_farm_field_text(farm.org_id).ok_or(FarmFieldError::EmptyOrgId)?;
     farm.name = normalize_farm_field_text(farm.name).ok_or(FarmFieldError::EmptyName)?;
+    farm.created_at = normalize_farm_field_text(farm.created_at).unwrap_or_default();
+    farm.updated_at =
+        normalize_farm_field_text(farm.updated_at).unwrap_or_else(|| farm.created_at.clone());
     Ok(farm)
 }
 
@@ -1190,6 +1364,9 @@ fn normalize_field_record(mut field: FieldRecord) -> Result<FieldRecord, FarmFie
     field.org_id = normalize_farm_field_text(field.org_id).ok_or(FarmFieldError::EmptyOrgId)?;
     field.name = normalize_farm_field_text(field.name).ok_or(FarmFieldError::EmptyName)?;
     field.farm_id = field.farm_id.and_then(normalize_farm_field_text);
+    field.created_at = normalize_farm_field_text(field.created_at).unwrap_or_default();
+    field.updated_at =
+        normalize_farm_field_text(field.updated_at).unwrap_or_else(|| field.created_at.clone());
     Ok(field)
 }
 
@@ -2824,9 +3001,10 @@ mod tests {
         bind_fleet_node_identity, bounds_from_points, sign_fleet_config_bundle,
         validate_field_boundary, verify_and_apply_fleet_config_bundle, AnnotationAuditRegistry,
         AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
-        AuditedAnnotationRecord, CropPlanRecord, FarmFieldError, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        AuditedAnnotationRecord, CropPlanRecord, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus, FleetConfigBundle,
+        FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
         FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeEnrollmentError,
         FleetNodeEnrollmentRequest, FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind,
         FleetNodeOperationError, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds,
@@ -3360,7 +3538,9 @@ mod tests {
                 max_lon: -96.2,
                 max_lat: 41.4,
             },
+            status: FarmFieldEntityStatus::Active,
             created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
         };
 
         let value = serde_json::to_value(&field).expect("field should serialize");
@@ -3378,7 +3558,9 @@ mod tests {
             owner: "org-a".to_string(),
             name: "Prairie Farm".to_string(),
             notes: None,
+            status: FarmFieldEntityStatus::Active,
             created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
         };
         let field = FieldRecord {
             farm_id: Some(farm.farm_id.clone()),
@@ -3392,7 +3574,9 @@ mod tests {
             notes: None,
             boundary: test_boundary(),
             extent: test_extent(),
+            status: FarmFieldEntityStatus::Active,
             created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
         };
 
         registry.insert_farm(farm).expect("farm persists");
@@ -3410,6 +3594,168 @@ mod tests {
     }
 
     #[test]
+    fn farm_field_registry_paginates_active_fields_by_org() {
+        let mut registry = FarmFieldRegistry::default();
+        registry
+            .insert_farm(test_farm_record(
+                "farm-a",
+                "org-a",
+                "Prairie Farm",
+                FarmFieldEntityStatus::Active,
+            ))
+            .expect("farm persists");
+        registry
+            .insert_farm(test_farm_record(
+                "farm-b",
+                "org-b",
+                "Other Farm",
+                FarmFieldEntityStatus::Active,
+            ))
+            .expect("other org farm persists");
+
+        for (field_id, name) in [
+            ("field-a", "Alpha Field"),
+            ("field-b", "Beta Field"),
+            ("field-c", "Gamma Field"),
+        ] {
+            registry
+                .insert_field(test_field_record(
+                    field_id,
+                    "farm-a",
+                    "org-a",
+                    name,
+                    FarmFieldEntityStatus::Active,
+                ))
+                .expect("field persists");
+        }
+        registry
+            .insert_field(test_field_record(
+                "field-x",
+                "farm-b",
+                "org-b",
+                "Foreign Field",
+                FarmFieldEntityStatus::Active,
+            ))
+            .expect("other org field persists");
+
+        let page = registry.list_fields_for_org(
+            "org-a",
+            FarmFieldListQuery {
+                page: Some(2),
+                page_size: Some(2),
+                status: Some(FarmFieldEntityStatus::Active),
+            },
+        );
+
+        assert_eq!(page.total_count, 3);
+        assert_eq!(page.page, 2);
+        assert_eq!(page.page_size, 2);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|field| field.field_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["field-c"]
+        );
+
+        let beyond = registry.list_fields_for_org(
+            "org-a",
+            FarmFieldListQuery {
+                page: Some(4),
+                page_size: Some(2),
+                status: Some(FarmFieldEntityStatus::Active),
+            },
+        );
+        assert_eq!(beyond.total_count, 3);
+        assert!(beyond.items.is_empty());
+    }
+
+    #[test]
+    fn farm_field_registry_default_lists_exclude_archived_entities() {
+        let mut registry = FarmFieldRegistry::default();
+        registry
+            .insert_farm(test_farm_record(
+                "farm-a",
+                "org-a",
+                "Active Farm",
+                FarmFieldEntityStatus::Active,
+            ))
+            .expect("farm persists");
+        registry
+            .insert_farm(test_farm_record(
+                "farm-archived",
+                "org-a",
+                "Archived Farm",
+                FarmFieldEntityStatus::Archived,
+            ))
+            .expect("archived farm persists");
+        registry
+            .insert_field(test_field_record(
+                "field-active",
+                "farm-a",
+                "org-a",
+                "Active Field",
+                FarmFieldEntityStatus::Active,
+            ))
+            .expect("active field persists");
+        registry
+            .insert_field(test_field_record(
+                "field-archived",
+                "farm-a",
+                "org-a",
+                "Archived Field",
+                FarmFieldEntityStatus::Archived,
+            ))
+            .expect("archived field persists");
+
+        assert_eq!(
+            registry
+                .farms_for_org("org-a")
+                .iter()
+                .map(|farm| farm.farm_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["farm-a"]
+        );
+        assert_eq!(
+            registry
+                .fields_for_org("org-a")
+                .iter()
+                .map(|field| field.field_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["field-active"]
+        );
+        assert_eq!(
+            registry
+                .list_boundaries_for_org("org-a", FarmFieldListQuery::default())
+                .items
+                .iter()
+                .map(|boundary| boundary.field_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["field-active"]
+        );
+
+        let archived_fields = registry.list_fields_for_org(
+            "org-a",
+            FarmFieldListQuery {
+                status: Some(FarmFieldEntityStatus::Archived),
+                ..FarmFieldListQuery::default()
+            },
+        );
+        assert_eq!(archived_fields.total_count, 1);
+        assert_eq!(archived_fields.items[0].field_id, "field-archived");
+
+        let archived_farms = registry.list_farms_for_org(
+            "org-a",
+            FarmFieldListQuery {
+                status: Some(FarmFieldEntityStatus::Archived),
+                ..FarmFieldListQuery::default()
+            },
+        );
+        assert_eq!(archived_farms.total_count, 1);
+        assert_eq!(archived_farms.items[0].farm_id, "farm-archived");
+    }
+
+    #[test]
     fn field_with_cross_org_farm_is_rejected_without_writing() {
         let mut registry = FarmFieldRegistry::default();
         registry
@@ -3419,7 +3765,9 @@ mod tests {
                 owner: "org-a".to_string(),
                 name: "Prairie Farm".to_string(),
                 notes: None,
+                status: FarmFieldEntityStatus::Active,
                 created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect("farm persists");
 
@@ -3436,7 +3784,9 @@ mod tests {
                 notes: None,
                 boundary: test_boundary(),
                 extent: test_extent(),
+                status: FarmFieldEntityStatus::Active,
                 created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect_err("cross-org farm link is rejected");
 
@@ -3472,7 +3822,9 @@ mod tests {
                 owner: "org-a".to_string(),
                 name: "Prairie Farm".to_string(),
                 notes: None,
+                status: FarmFieldEntityStatus::Active,
                 created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect("farm persists");
 
@@ -3489,7 +3841,9 @@ mod tests {
                 notes: None,
                 boundary: unclosed_test_boundary(),
                 extent: test_extent(),
+                status: FarmFieldEntityStatus::Active,
                 created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect_err("unclosed boundary is rejected");
 
@@ -3779,6 +4133,49 @@ mod tests {
         }
     }
 
+    fn test_farm_record(
+        farm_id: &str,
+        org_id: &str,
+        name: &str,
+        status: FarmFieldEntityStatus,
+    ) -> FarmRecord {
+        FarmRecord {
+            farm_id: farm_id.to_string(),
+            org_id: org_id.to_string(),
+            owner: org_id.to_string(),
+            name: name.to_string(),
+            notes: None,
+            status,
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_field_record(
+        field_id: &str,
+        farm_id: &str,
+        org_id: &str,
+        name: &str,
+        status: FarmFieldEntityStatus,
+    ) -> FieldRecord {
+        FieldRecord {
+            farm_id: Some(farm_id.to_string()),
+            field_id: field_id.to_string(),
+            org_id: org_id.to_string(),
+            owner: org_id.to_string(),
+            name: name.to_string(),
+            area_ha: None,
+            crop: None,
+            season: None,
+            notes: None,
+            boundary: test_boundary(),
+            extent: test_extent(),
+            status,
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
+        }
+    }
+
     fn registry_with_field() -> FarmFieldRegistry {
         let mut registry = FarmFieldRegistry::default();
         registry
@@ -3788,7 +4185,9 @@ mod tests {
                 owner: "org-a".to_string(),
                 name: "Prairie Farm".to_string(),
                 notes: None,
+                status: FarmFieldEntityStatus::Active,
                 created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect("farm persists");
         registry
@@ -3804,7 +4203,9 @@ mod tests {
                 notes: None,
                 boundary: test_boundary(),
                 extent: test_extent(),
+                status: FarmFieldEntityStatus::Active,
                 created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect("field persists");
         registry

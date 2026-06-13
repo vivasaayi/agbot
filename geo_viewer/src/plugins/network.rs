@@ -26,7 +26,8 @@ use bevy::{
 };
 use futures_lite::future;
 use image::{self, DynamicImage};
-use shared::schemas::{FarmRecord, FieldRecord};
+use serde::de::DeserializeOwned;
+use shared::schemas::{FarmFieldListPage, FarmRecord, FieldRecord};
 use tracing::info;
 
 pub struct ViewerNetworkPlugin;
@@ -597,8 +598,8 @@ pub fn start_field_list_fetch(
             anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
         }
         let bytes = response.bytes().context("failed to read field list body")?;
-        let fields = serde_json::from_slice::<Vec<FieldRecord>>(&bytes)
-            .context("failed to decode fields")?;
+        let fields =
+            decode_list_or_page::<FieldRecord>(&bytes).context("failed to decode fields")?;
         Ok(fields)
     }));
 
@@ -617,12 +618,24 @@ pub fn start_farm_list_fetch(
             anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
         }
         let bytes = response.bytes().context("failed to read farm list body")?;
-        let farms =
-            serde_json::from_slice::<Vec<FarmRecord>>(&bytes).context("failed to decode farms")?;
+        let farms = decode_list_or_page::<FarmRecord>(&bytes).context("failed to decode farms")?;
         Ok(farms)
     }));
 
     Ok(())
+}
+
+fn decode_list_or_page<T>(bytes: &[u8]) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+{
+    if let Ok(items) = serde_json::from_slice::<Vec<T>>(bytes) {
+        return Ok(items);
+    }
+
+    let page = serde_json::from_slice::<FarmFieldListPage<T>>(bytes)
+        .context("failed to decode paged farm/field list")?;
+    Ok(page.items)
 }
 
 pub fn start_farm_field_history_fetch(

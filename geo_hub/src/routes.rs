@@ -63,7 +63,8 @@ use orthomosaic::{
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-    validate_field_boundary, AnnotationGeometry, AnnotationRecord, FarmRecord, FieldBoundary,
+    validate_field_boundary, AnnotationGeometry, AnnotationRecord, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
     FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
     FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
     ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
@@ -220,6 +221,7 @@ pub struct CreateFieldRequest {
     pub crop: Option<String>,
     pub season: Option<String>,
     pub notes: Option<String>,
+    pub status: Option<FarmFieldEntityStatus>,
     pub boundary: FieldBoundary,
 }
 
@@ -230,12 +232,37 @@ pub struct CreateFarmRequest {
     pub owner: Option<String>,
     pub name: String,
     pub notes: Option<String>,
+    pub status: Option<FarmFieldEntityStatus>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateFarmRequest {
     pub name: String,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FarmFieldApiListQuery {
+    pub org_id: Option<String>,
+    pub owner: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+    pub status: Option<FarmFieldEntityStatus>,
+}
+
+impl FarmFieldApiListQuery {
+    fn org_filter(&self) -> Option<String> {
+        normalize_optional_text(self.org_id.clone())
+            .or_else(|| normalize_optional_text(self.owner.clone()))
+    }
+
+    fn list_query(&self) -> FarmFieldListQuery {
+        FarmFieldListQuery {
+            page: self.page,
+            page_size: self.page_size,
+            status: self.status,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1555,8 +1582,8 @@ async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<Ve
         field.org_id = field.owner.clone();
         sqlx::query(
             r#"
-            INSERT INTO fields (field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            INSERT INTO fields (field_id, farm_id, owner, name, crop, season, notes, boundary_json, status, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(field_id) DO UPDATE SET
                 farm_id = excluded.farm_id,
                 owner = excluded.owner,
@@ -1564,7 +1591,9 @@ async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<Ve
                 crop = excluded.crop,
                 season = excluded.season,
                 notes = excluded.notes,
-                boundary_json = excluded.boundary_json
+                boundary_json = excluded.boundary_json,
+                status = excluded.status,
+                updated_at = excluded.updated_at
             "#,
         )
         .bind(&field.field_id)
@@ -1575,7 +1604,9 @@ async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<Ve
         .bind(&field.season)
         .bind(&field.notes)
         .bind(serde_json::to_string(&field.boundary).map_err(|err| AppError::Anyhow(err.into()))?)
+        .bind(field.status.as_str())
         .bind(&field.created_at)
+        .bind(&field.updated_at)
         .execute(&state.pool)
         .await
         .map_err(Error::from)?;
@@ -2956,19 +2987,82 @@ pub async fn query_airspace_zones_for_point(
     Ok(Json(zones))
 }
 
-pub async fn list_farms(State(state): State<AppState>) -> AppResult<Json<Vec<FarmRecord>>> {
-    let rows =
-        sqlx::query("SELECT farm_id, owner, name, notes, created_at FROM farms ORDER BY name ASC")
-            .fetch_all(&state.pool)
-            .await
-            .map_err(Error::from)?;
+fn farm_field_page_window(
+    query: &FarmFieldListQuery,
+) -> (FarmFieldEntityStatus, usize, usize, i64, i64) {
+    let status = query.status.unwrap_or_default();
+    let page = query.normalized_page();
+    let page_size = query.normalized_page_size();
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    (
+        status,
+        page,
+        page_size,
+        i64::try_from(page_size).unwrap_or(i64::MAX),
+        i64::try_from(offset).unwrap_or(i64::MAX),
+    )
+}
 
-    let mut farms = Vec::with_capacity(rows.len());
-    for row in rows {
-        farms.push(decode_farm_record(&row));
+fn farm_field_list_page<T>(
+    items: Vec<T>,
+    total_count: i64,
+    page: usize,
+    page_size: usize,
+) -> FarmFieldListPage<T> {
+    FarmFieldListPage {
+        items,
+        total_count: usize::try_from(total_count).unwrap_or(usize::MAX),
+        page,
+        page_size,
     }
+}
 
-    Ok(Json(farms))
+pub async fn list_farms(
+    Query(query): Query<FarmFieldApiListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<FarmFieldListPage<FarmRecord>>> {
+    let org_filter = query.org_filter();
+    let list_query = query.list_query();
+    let (status, page, page_size, limit, offset) = farm_field_page_window(&list_query);
+
+    let total_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM farms WHERE (?1 IS NULL OR owner = ?1) AND status = ?2",
+    )
+    .bind(&org_filter)
+    .bind(status.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT farm_id, owner, name, notes, status, created_at,
+               COALESCE(NULLIF(updated_at, ''), created_at) AS updated_at
+        FROM farms
+        WHERE (?1 IS NULL OR owner = ?1) AND status = ?2
+        ORDER BY name ASC, farm_id ASC
+        LIMIT ?3 OFFSET ?4
+        "#,
+    )
+    .bind(&org_filter)
+    .bind(status.as_str())
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let farms = rows
+        .into_iter()
+        .map(|row| decode_farm_record(&row))
+        .collect::<Vec<_>>();
+
+    Ok(Json(farm_field_list_page(
+        farms,
+        total_count,
+        page,
+        page_size,
+    )))
 }
 
 pub async fn create_farm(
@@ -2979,15 +3073,17 @@ pub async fn create_farm(
 
     sqlx::query(
         r#"
-        INSERT INTO farms (farm_id, owner, name, notes, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        INSERT INTO farms (farm_id, owner, name, notes, status, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         "#,
     )
     .bind(&farm.farm_id)
     .bind(&farm.owner)
     .bind(&farm.name)
     .bind(&farm.notes)
+    .bind(farm.status.as_str())
     .bind(&farm.created_at)
+    .bind(&farm.updated_at)
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -3015,17 +3111,19 @@ pub async fn update_farm(
         .ok_or(AppError::NotFound)?;
     farm.name = normalize_farm_name(request.name)?;
     farm.notes = normalize_optional_text(request.notes);
+    farm.updated_at = current_record_timestamp();
 
     sqlx::query(
         r#"
         UPDATE farms
-        SET name = ?2, notes = ?3
+        SET name = ?2, notes = ?3, updated_at = ?4
         WHERE farm_id = ?1
         "#,
     )
     .bind(&farm.farm_id)
     .bind(&farm.name)
     .bind(&farm.notes)
+    .bind(&farm.updated_at)
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -3041,8 +3139,10 @@ pub async fn delete_farm(
         return Err(AppError::NotFound);
     }
 
-    sqlx::query("UPDATE fields SET farm_id = NULL WHERE farm_id = ?1")
+    let updated_at = current_record_timestamp();
+    sqlx::query("UPDATE fields SET farm_id = NULL, updated_at = ?2 WHERE farm_id = ?1")
         .bind(&farm_id)
+        .bind(&updated_at)
         .execute(&state.pool)
         .await
         .map_err(Error::from)?;
@@ -3057,14 +3157,74 @@ pub async fn delete_farm(
 
 pub async fn list_farm_fields(
     Path(farm_id): Path<String>,
+    Query(query): Query<FarmFieldApiListQuery>,
     State(state): State<AppState>,
-) -> AppResult<Json<Vec<FieldRecord>>> {
+) -> AppResult<Json<FarmFieldListPage<FieldRecord>>> {
+    if load_farm(&state, &farm_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let org_filter = query.org_filter();
+    let list_query = query.list_query();
+    let (status, page, page_size, limit, offset) = farm_field_page_window(&list_query);
+    let total_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fields WHERE farm_id = ?1 AND (?2 IS NULL OR owner = ?2) AND status = ?3",
+    )
+    .bind(&farm_id)
+    .bind(&org_filter)
+    .bind(status.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, status,
+               created_at, COALESCE(NULLIF(updated_at, ''), created_at) AS updated_at
+        FROM fields
+        WHERE farm_id = ?1 AND (?2 IS NULL OR owner = ?2) AND status = ?3
+        ORDER BY COALESCE(season, '') DESC, name ASC, field_id ASC
+        LIMIT ?4 OFFSET ?5
+        "#,
+    )
+    .bind(&farm_id)
+    .bind(&org_filter)
+    .bind(status.as_str())
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut fields = Vec::with_capacity(rows.len());
+    for row in rows {
+        fields.push(decode_field_record(&row)?);
+    }
+
+    Ok(Json(farm_field_list_page(
+        fields,
+        total_count,
+        page,
+        page_size,
+    )))
+}
+
+pub async fn list_farm_field_history(
+    Path(farm_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<FieldSeasonGroup>>> {
     if load_farm(&state, &farm_id).await?.is_none() {
         return Err(AppError::NotFound);
     }
 
     let rows = sqlx::query(
-        "SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at FROM fields WHERE farm_id = ?1 ORDER BY COALESCE(season, '') DESC, name ASC",
+        r#"
+        SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, status,
+               created_at, COALESCE(NULLIF(updated_at, ''), created_at) AS updated_at
+        FROM fields
+        WHERE farm_id = ?1 AND status = 'active'
+        ORDER BY COALESCE(season, '') DESC, name ASC, field_id ASC
+        "#,
     )
     .bind(&farm_id)
     .fetch_all(&state.pool)
@@ -3075,22 +3235,39 @@ pub async fn list_farm_fields(
     for row in rows {
         fields.push(decode_field_record(&row)?);
     }
-
-    Ok(Json(fields))
-}
-
-pub async fn list_farm_field_history(
-    Path(farm_id): Path<String>,
-    State(state): State<AppState>,
-) -> AppResult<Json<Vec<FieldSeasonGroup>>> {
-    let fields = list_farm_fields(Path(farm_id), State(state)).await?.0;
     Ok(Json(group_fields_by_season(fields)))
 }
 
-pub async fn list_fields(State(state): State<AppState>) -> AppResult<Json<Vec<FieldRecord>>> {
-    let rows = sqlx::query(
-        "SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at FROM fields ORDER BY name ASC",
+pub async fn list_fields(
+    Query(query): Query<FarmFieldApiListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<FarmFieldListPage<FieldRecord>>> {
+    let org_filter = query.org_filter();
+    let list_query = query.list_query();
+    let (status, page, page_size, limit, offset) = farm_field_page_window(&list_query);
+    let total_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fields WHERE (?1 IS NULL OR owner = ?1) AND status = ?2",
     )
+    .bind(&org_filter)
+    .bind(status.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, status,
+               created_at, COALESCE(NULLIF(updated_at, ''), created_at) AS updated_at
+        FROM fields
+        WHERE (?1 IS NULL OR owner = ?1) AND status = ?2
+        ORDER BY name ASC, field_id ASC
+        LIMIT ?3 OFFSET ?4
+        "#,
+    )
+    .bind(&org_filter)
+    .bind(status.as_str())
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -3100,12 +3277,70 @@ pub async fn list_fields(State(state): State<AppState>) -> AppResult<Json<Vec<Fi
         fields.push(decode_field_record(&row)?);
     }
 
-    Ok(Json(fields))
+    Ok(Json(farm_field_list_page(
+        fields,
+        total_count,
+        page,
+        page_size,
+    )))
+}
+
+pub async fn list_field_boundaries(
+    Query(query): Query<FarmFieldApiListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<FarmFieldListPage<FieldBoundaryRecord>>> {
+    let org_filter = query.org_filter();
+    let list_query = query.list_query();
+    let (status, page, page_size, limit, offset) = farm_field_page_window(&list_query);
+    let total_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fields WHERE (?1 IS NULL OR owner = ?1) AND status = ?2",
+    )
+    .bind(&org_filter)
+    .bind(status.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, status,
+               created_at, COALESCE(NULLIF(updated_at, ''), created_at) AS updated_at
+        FROM fields
+        WHERE (?1 IS NULL OR owner = ?1) AND status = ?2
+        ORDER BY name ASC, field_id ASC
+        LIMIT ?3 OFFSET ?4
+        "#,
+    )
+    .bind(&org_filter)
+    .bind(status.as_str())
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut boundaries = Vec::with_capacity(rows.len());
+    for row in rows {
+        boundaries.push(field_boundary_record_from_field(decode_field_record(&row)?));
+    }
+
+    Ok(Json(farm_field_list_page(
+        boundaries,
+        total_count,
+        page,
+        page_size,
+    )))
 }
 
 pub async fn export_fields_geojson(State(state): State<AppState>) -> AppResult<Json<GeoJson>> {
     let rows = sqlx::query(
-        "SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at FROM fields ORDER BY name ASC",
+        r#"
+        SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, status,
+               created_at, COALESCE(NULLIF(updated_at, ''), created_at) AS updated_at
+        FROM fields
+        WHERE status = 'active'
+        ORDER BY name ASC, field_id ASC
+        "#,
     )
     .fetch_all(&state.pool)
     .await
@@ -3818,8 +4053,8 @@ pub async fn create_field(
 
     sqlx::query(
         r#"
-        INSERT INTO fields (field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        INSERT INTO fields (field_id, farm_id, owner, name, crop, season, notes, boundary_json, status, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         "#,
     )
     .bind(&field.field_id)
@@ -3830,7 +4065,9 @@ pub async fn create_field(
     .bind(&field.season)
     .bind(&field.notes)
     .bind(serde_json::to_string(&field.boundary).map_err(|err| AppError::Anyhow(err.into()))?)
+    .bind(field.status.as_str())
     .bind(&field.created_at)
+    .bind(&field.updated_at)
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -3859,10 +4096,12 @@ pub async fn link_field_to_farm(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    sqlx::query("UPDATE fields SET farm_id = ?2, owner = ?3 WHERE field_id = ?1")
+    let updated_at = current_record_timestamp();
+    sqlx::query("UPDATE fields SET farm_id = ?2, owner = ?3, updated_at = ?4 WHERE field_id = ?1")
         .bind(&field_id)
         .bind(&farm_id)
         .bind(&farm.owner)
+        .bind(&updated_at)
         .execute(&state.pool)
         .await
         .map_err(Error::from)?;
@@ -3870,6 +4109,7 @@ pub async fn link_field_to_farm(
     field.farm_id = Some(farm_id);
     field.owner = farm.owner.clone();
     field.org_id = farm.owner;
+    field.updated_at = updated_at;
     Ok(Json(field))
 }
 
@@ -5018,6 +5258,7 @@ fn build_field_record(mut request: CreateFieldRequest) -> AppResult<FieldRecord>
         AppError::BadRequest("field boundary must contain valid coordinates".to_string())
     })?;
 
+    let created_at = current_record_timestamp();
     Ok(FieldRecord {
         farm_id: request.farm_id,
         field_id,
@@ -5030,7 +5271,9 @@ fn build_field_record(mut request: CreateFieldRequest) -> AppResult<FieldRecord>
         notes: request.notes,
         boundary: request.boundary,
         extent,
-        created_at: current_record_timestamp(),
+        status: request.status.unwrap_or_default(),
+        created_at: created_at.clone(),
+        updated_at: created_at,
     })
 }
 
@@ -5040,13 +5283,16 @@ fn build_farm_record(request: CreateFarmRequest) -> AppResult<FarmRecord> {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let org_id = normalize_org_id(request.org_id, request.owner);
+    let created_at = current_record_timestamp();
     Ok(FarmRecord {
         farm_id,
         org_id: org_id.clone(),
         owner: org_id,
         name: normalize_farm_name(request.name)?,
         notes: normalize_optional_text(request.notes),
-        created_at: current_record_timestamp(),
+        status: request.status.unwrap_or_default(),
+        created_at: created_at.clone(),
+        updated_at: created_at,
     })
 }
 
@@ -5482,6 +5728,7 @@ async fn fields_from_shapefile(request: ImportShapefileRequest) -> AppResult<Vec
                 crop: request.crop.clone(),
                 season: request.season.clone(),
                 notes: request.notes.clone(),
+                status: None,
                 boundary: FieldBoundary {
                     coordinates: shape.coordinates,
                     crs: Some(source_crs.clone()),
@@ -6003,6 +6250,7 @@ fn build_field_from_feature(feature: geojson::Feature, index: usize) -> AppResul
             crop: property_string(&properties, "crop"),
             season: property_string(&properties, "season"),
             notes: property_string(&properties, "notes"),
+            status: None,
             boundary: FieldBoundary {
                 coordinates: Vec::new(),
                 crs,
@@ -6027,6 +6275,7 @@ fn build_field_from_geometry(
         crop: None,
         season: None,
         notes: None,
+        status: None,
         boundary: FieldBoundary {
             coordinates: Vec::new(),
             crs: None,
@@ -6045,6 +6294,7 @@ fn build_field_from_geometry(
         crop: template.crop,
         season: template.season,
         notes: template.notes,
+        status: template.status,
         boundary,
     })
 }
@@ -6183,7 +6433,9 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
         notes: row.get("notes"),
         boundary,
         extent,
+        status: decode_farm_field_status(row.get("status")),
         created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
     })
 }
 
@@ -6194,7 +6446,32 @@ fn decode_farm_record(row: &sqlx::sqlite::SqliteRow) -> FarmRecord {
         owner: row.get("owner"),
         name: row.get("name"),
         notes: row.get("notes"),
+        status: decode_farm_field_status(row.get("status")),
         created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn decode_farm_field_status(value: String) -> FarmFieldEntityStatus {
+    match value.trim() {
+        "archived" => FarmFieldEntityStatus::Archived,
+        _ => FarmFieldEntityStatus::Active,
+    }
+}
+
+fn field_boundary_record_from_field(field: FieldRecord) -> FieldBoundaryRecord {
+    FieldBoundaryRecord {
+        field_id: field.field_id,
+        farm_id: field.farm_id,
+        org_id: field.org_id,
+        owner: field.owner,
+        name: field.name,
+        boundary: field.boundary,
+        extent: field.extent,
+        area_ha: field.area_ha,
+        status: field.status,
+        created_at: field.created_at,
+        updated_at: field.updated_at,
     }
 }
 
@@ -6616,7 +6893,12 @@ fn decode_shared_report_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Share
 
 async fn load_field(state: &AppState, field_id: &str) -> AppResult<Option<FieldRecord>> {
     let row = sqlx::query(
-        "SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, created_at FROM fields WHERE field_id = ?1",
+        r#"
+        SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, status,
+               created_at, COALESCE(NULLIF(updated_at, ''), created_at) AS updated_at
+        FROM fields
+        WHERE field_id = ?1
+        "#,
     )
     .bind(field_id)
     .fetch_optional(&state.pool)
@@ -6627,12 +6909,18 @@ async fn load_field(state: &AppState, field_id: &str) -> AppResult<Option<FieldR
 }
 
 async fn load_farm(state: &AppState, farm_id: &str) -> AppResult<Option<FarmRecord>> {
-    let row =
-        sqlx::query("SELECT farm_id, owner, name, notes, created_at FROM farms WHERE farm_id = ?1")
-            .bind(farm_id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(Error::from)?;
+    let row = sqlx::query(
+        r#"
+        SELECT farm_id, owner, name, notes, status, created_at,
+               COALESCE(NULLIF(updated_at, ''), created_at) AS updated_at
+        FROM farms
+        WHERE farm_id = ?1
+        "#,
+    )
+    .bind(farm_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
 
     Ok(row.map(|row| decode_farm_record(&row)))
 }
@@ -8775,6 +9063,7 @@ mod tests {
             crop: Some("corn".to_string()),
             season: Some("2026".to_string()),
             notes: Some("test field".to_string()),
+            status: None,
             boundary: FieldBoundary {
                 crs: Some("EPSG:4326".to_string()),
                 coordinates: vec![
@@ -8819,6 +9108,7 @@ mod tests {
             crop: None,
             season: None,
             notes: None,
+            status: None,
             boundary: FieldBoundary {
                 crs: None,
                 coordinates: vec![
@@ -8849,6 +9139,7 @@ mod tests {
             crop: None,
             season: None,
             notes: None,
+            status: None,
             boundary: FieldBoundary {
                 crs: None,
                 coordinates: vec![

@@ -900,8 +900,8 @@ impl Default for ProcessingParameters {
 mod tests {
     use super::*;
     use shared::schemas::{
-        FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord, GeoBounds, GeoPoint,
-        SceneRecord, SeasonRecord,
+        FarmFieldEntityStatus, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord,
+        GeoBounds, GeoPoint, SceneRecord, SeasonRecord,
     };
     use tempfile::tempdir;
 
@@ -1144,7 +1144,9 @@ mod tests {
                 owner: "org-a".to_string(),
                 name: "Prairie Farm".to_string(),
                 notes: None,
+                status: FarmFieldEntityStatus::Active,
                 created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect("farm persists");
         catalog
@@ -1189,7 +1191,9 @@ mod tests {
                     max_lon: -95.9,
                     max_lat: 41.1,
                 },
+                status: FarmFieldEntityStatus::Active,
                 created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect("field persists");
         catalog
