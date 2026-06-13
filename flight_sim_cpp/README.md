@@ -172,6 +172,18 @@ flight_sim_cpp/build/agbot-sim diff flight_sim_cpp/out/telemetry.jsonl flight_si
 Identical traces exit 0 with `traces identical`. A divergence exits 1 and
 names the first differing step and telemetry field.
 
+## Golden Regression
+
+Run the committed deterministic reference suite:
+
+```bash
+flight_sim_cpp/build/agbot-sim regress
+```
+
+The suite replays the takeoff/land, goto, and orbit-loiter reference missions
+with their fixture seed, compares each generated trace with the committed
+golden trace, and checks the scenario manifest output hash and manifest hash.
+
 ## Run Viewer
 
 On macOS:

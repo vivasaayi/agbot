@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(agbot_flight_sim_core
+    src/DeterministicRegression.cpp
     src/DeterministicRunner.cpp
     src/DroneSimulation.cpp
     src/FaultInjection.cpp
@@ -69,6 +70,7 @@ add_executable(agbot_flight_sim_tests
 )
 target_link_libraries(agbot_flight_sim_tests PRIVATE agbot_flight_sim_core)
 add_test(NAME agbot_flight_sim_tests COMMAND agbot_flight_sim_tests)
+add_test(NAME agbot_flight_sim_golden_regression COMMAND agbot_sim regress)
 
 if(APPLE)
     enable_language(OBJCXX)

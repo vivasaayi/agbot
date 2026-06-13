@@ -1,0 +1,10 @@
+{
+  "name": "Reference Takeoff Land",
+  "home": { "x": 0.0, "y": 0.0, "z": 0.0 },
+  "cruise_speed_mps": 8.0,
+  "acceptance_radius_m": 0.5,
+  "waypoints": [
+    { "name": "takeoff", "action": "takeoff", "x": 0.0, "y": 8.0, "z": 0.0 },
+    { "name": "land", "action": "land", "x": 0.0, "y": 0.0, "z": 0.0 }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "Reference Orbit Loiter",
+  "home": { "x": 0.0, "y": 0.0, "z": 0.0 },
+  "cruise_speed_mps": 7.0,
+  "acceptance_radius_m": 0.5,
+  "waypoints": [
+    { "name": "takeoff", "action": "takeoff", "x": 0.0, "y": 12.0, "z": 0.0 },
+    { "name": "orbit_north", "action": "fly", "x": 0.0, "y": 12.0, "z": 12.0 },
+    { "name": "orbit_east", "action": "loiter", "x": 12.0, "y": 12.0, "z": 12.0, "hold_seconds": 0.5 },
+    { "name": "orbit_south", "action": "fly", "x": 12.0, "y": 12.0, "z": 0.0 },
+    { "name": "orbit_west", "action": "loiter", "x": 0.0, "y": 12.0, "z": 0.0, "hold_seconds": 0.5 },
+    { "name": "land", "action": "land", "x": 0.0, "y": 0.0, "z": 0.0 }
+  ]
+}

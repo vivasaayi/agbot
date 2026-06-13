@@ -1,3 +1,4 @@
+#include "agbot_flight_sim/DeterministicRegression.hpp"
 #include "agbot_flight_sim/DeterministicRunner.hpp"
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/FaultInjection.hpp"
@@ -839,6 +840,24 @@ agbot::flight_sim::RunConfig unit_run_config() {
     return config;
 }
 
+agbot::flight_sim::GoldenRegressionCase golden_case_from_result(
+    const std::string& case_id,
+    const agbot::flight_sim::Mission& mission,
+    const agbot::flight_sim::RunConfig& config,
+    const agbot::flight_sim::RunResult& result) {
+    const std::string manifest_json = result.manifest.to_json();
+    agbot::flight_sim::GoldenRegressionCase regression_case;
+    regression_case.case_id = case_id;
+    regression_case.mission = mission;
+    regression_case.config = config;
+    regression_case.golden_trace_jsonl = result.trace_jsonl;
+    regression_case.golden_manifest_json = manifest_json;
+    regression_case.golden_contract_version = result.manifest.contract_version;
+    regression_case.golden_output_hash = result.manifest.output_hash;
+    regression_case.golden_manifest_hash = agbot::flight_sim::sha256_hex(manifest_json);
+    return regression_case;
+}
+
 agbot::flight_sim::ElevationComposite available_terrain_for_center(const GeoCoordinate& center) {
     const TileCoordinate tile_coordinate = agbot::flight_sim::tile_for_geo(center, 14);
     std::vector<std::uint8_t> pixels(2 * 2 * 4, 0);
@@ -966,6 +985,65 @@ void test_deterministic_runner_is_byte_identical() {
     assert(a.manifest.to_json() == b.manifest.to_json());
     assert(a.manifest.sample_count > 0);
     assert(a.manifest.completed);
+}
+
+void test_golden_regression_matches_committed_reference_missions() {
+    const auto cases = agbot::flight_sim::load_golden_regression_cases();
+    const auto report = agbot::flight_sim::run_golden_regression_suite(cases);
+
+    assert(cases.size() == 3);
+    assert(report.passed());
+    assert(report.to_json().find("\"status\":\"pass\"") != std::string::npos);
+    assert(report.to_json().find("reference_takeoff_land") != std::string::npos);
+    assert(report.to_json().find("reference_goto") != std::string::npos);
+    assert(report.to_json().find("reference_orbit_loiter") != std::string::npos);
+}
+
+void test_golden_regression_names_divergent_field() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto config = unit_run_config();
+    const auto run = agbot::flight_sim::run_deterministic(mission, config);
+    auto regression_case = golden_case_from_result("unit_drift", mission, config, run);
+    const std::size_t y_position = regression_case.golden_trace_jsonl.find("\"position\":{\"x\":0.000,\"y\":0.000");
+    assert(y_position != std::string::npos);
+    const std::size_t y_value = regression_case.golden_trace_jsonl.find("\"y\":0.000", y_position);
+    assert(y_value != std::string::npos);
+    regression_case.golden_trace_jsonl.replace(y_value, 9, "\"y\":0.500");
+
+    const auto result = agbot::flight_sim::run_golden_regression_case(regression_case);
+
+    assert(!result.passed);
+    assert(result.code == "trace_diverged");
+    assert(result.message.find("step 0 field position.y") != std::string::npos);
+    assert(result.to_json().find("\"field_path\":\"position.y\"") != std::string::npos);
+}
+
+void test_golden_regression_rejects_incompatible_contract_version() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto config = unit_run_config();
+    const auto run = agbot::flight_sim::run_deterministic(mission, config);
+    auto regression_case = golden_case_from_result("unit_contract_drift", mission, config, run);
+    regression_case.golden_contract_version = "0.9.0";
+
+    const auto result = agbot::flight_sim::run_golden_regression_case(regression_case);
+
+    assert(!result.passed);
+    assert(result.code == "incompatible_contract_version");
+    assert(result.message.find("incompatible contract version") != std::string::npos);
+}
+
+void test_golden_regression_detects_manifest_hash_drift() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto config = unit_run_config();
+    const auto run = agbot::flight_sim::run_deterministic(mission, config);
+    auto regression_case = golden_case_from_result("unit_manifest_drift", mission, config, run);
+    regression_case.golden_manifest_hash = std::string(64, '0');
+
+    const auto result = agbot::flight_sim::run_golden_regression_case(regression_case);
+
+    assert(!result.passed);
+    assert(result.code == "manifest_hash_mismatch");
+    assert(result.message.find("scenario manifest hash mismatch") != std::string::npos);
 }
 
 // Story 02-25: the seed actually drives the PRNG stream. The autopilot physics
@@ -1529,6 +1607,10 @@ int main() {
     test_multispectral_capture_emits_georeferenced_bands_round_trip();
     test_multispectral_capture_reports_no_coverage_outside_terrain();
     test_deterministic_runner_is_byte_identical();
+    test_golden_regression_matches_committed_reference_missions();
+    test_golden_regression_names_divergent_field();
+    test_golden_regression_rejects_incompatible_contract_version();
+    test_golden_regression_detects_manifest_hash_drift();
     test_deterministic_runner_seed_drives_prng();
     test_deterministic_runner_emits_capture_shaped_lidar_jsonl();
     test_run_manifest_records_contract_and_hashes();

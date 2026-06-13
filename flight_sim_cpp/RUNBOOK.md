@@ -146,7 +146,8 @@ The command leaves the cache directory present and removes cached entries under 
 ## CI Failure Triage
 
 1. Run `just flight-sim-test`.
-2. If golden traces differ, run `flight_sim_cpp/build/agbot-sim diff <golden.jsonl> <new.jsonl>` and inspect the first divergent field.
-3. If the runner refuses to start, verify `--seed` is present, every `--fault` has a seed, and the mission path exists.
-4. If health fails on `last_run_manifest_present`, run a headless simulation and verify the sibling `.manifest.json` was written.
-5. If health fails on `trace_retention_compliant`, either lower the trace count by running with `--trace-retention-keep N` or raise the retention policy for that CI job.
+2. Run `flight_sim_cpp/build/agbot-sim regress` to get the reference case, environment, trace diff, and manifest hash status.
+3. If a golden trace differs, run `flight_sim_cpp/build/agbot-sim diff <golden.jsonl> <new.jsonl>` and inspect the first divergent field.
+4. If the runner refuses to start, verify `--seed` is present, every `--fault` has a seed, and the mission path exists.
+5. If health fails on `last_run_manifest_present`, run a headless simulation and verify the sibling `.manifest.json` was written.
+6. If health fails on `trace_retention_compliant`, either lower the trace count by running with `--trace-retention-keep N` or raise the retention policy for that CI job.

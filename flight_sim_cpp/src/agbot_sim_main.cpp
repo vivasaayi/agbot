@@ -1,3 +1,4 @@
+#include "agbot_flight_sim/DeterministicRegression.hpp"
 #include "agbot_flight_sim/TraceDiff.hpp"
 #include "agbot_flight_sim/SimulationOps.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
@@ -56,9 +57,23 @@ std::string escape_json(std::string_view value) {
 void print_usage() {
     std::cout << "Usage:\n"
               << "  agbot-sim diff <trace-a.jsonl> <trace-b.jsonl>\n"
+              << "  agbot-sim regress [--golden-dir PATH]\n"
               << "  agbot-sim validate <mission.json> [--max-altitude M] [--geofence min_x,max_x,min_z,max_z]\n"
               << "  agbot-sim health --seed N --last-manifest PATH [--trace-dir PATH] [--cache-dir PATH] [--retention-keep N]\n"
               << "  agbot-sim cache clear [--cache-dir PATH]\n";
+}
+
+std::filesystem::path parse_regression_args(int argc, char** argv) {
+    std::filesystem::path golden_dir = agbot::flight_sim::default_golden_regression_dir();
+    for (int index = 2; index < argc; ++index) {
+        const std::string current = argv[index];
+        if (current == "--golden-dir" && index + 1 < argc) {
+            golden_dir = argv[++index];
+        } else {
+            throw std::runtime_error("unknown regress argument: " + current);
+        }
+    }
+    return golden_dir;
 }
 
 std::vector<double> parse_double_csv(const std::string& text, std::size_t expected_count) {
@@ -159,6 +174,12 @@ int main(int argc, char** argv) {
             const auto report = agbot::flight_sim::validate_mission(mission, args.config);
             std::cout << report.to_json() << "\n";
             return report.blocked ? 1 : 0;
+        }
+        if (argc >= 2 && std::string(argv[1]) == "regress") {
+            const auto golden_dir = parse_regression_args(argc, argv);
+            const auto report = agbot::flight_sim::run_golden_regression_suite(golden_dir);
+            std::cout << report.to_json() << "\n";
+            return report.passed() ? 0 : 1;
         }
         if (argc >= 2 && std::string(argv[1]) == "health") {
             const HealthArgs args = parse_health_args(argc, argv);
