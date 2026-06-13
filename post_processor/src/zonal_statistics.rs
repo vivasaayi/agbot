@@ -1,8 +1,11 @@
+use crate::evidence::{evidence_parameters, make_analysis_evidence};
 use crate::AnalysisStatistics;
+use serde_json::Value;
 use shared::schemas::{
     assert_raster_spatial_ref, GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
 };
 use std::collections::HashMap;
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct ProductGrid {
@@ -22,9 +25,10 @@ pub struct ProductGridStatistics {
     pub coverage_fraction: f32,
     pub nodata_pixel_count: u32,
     pub nodata_mask: Vec<bool>,
+    pub evidence: crate::evidence::AnalysisEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Error)]
 pub enum ZonalStatisticsError {
     #[error("product grid dimensions do not match values/mask lengths: expected {expected}, values {values}, mask {mask}")]
     DimensionMismatch {
@@ -38,10 +42,13 @@ pub enum ZonalStatisticsError {
     InvalidValue { index: usize },
     #[error("product grid contains no valid data across {total_pixel_count} pixels")]
     NoValidData { total_pixel_count: u32 },
+    #[error("evidence metadata failed: {0}")]
+    Evidence(#[from] crate::evidence::AnalysisEvidenceError),
 }
 
 pub fn compute_zonal_statistics(
     grid: &ProductGrid,
+    layer_ref: &str,
 ) -> Result<ProductGridStatistics, ZonalStatisticsError> {
     let expected = grid.width as usize * grid.height as usize;
     if grid.values.len() != expected || grid.nodata_mask.len() != expected {
@@ -86,6 +93,34 @@ pub fn compute_zonal_statistics(
         })
         .sum::<f32>()
         / valid_values.len() as f32;
+    let evidence = make_analysis_evidence(
+        layer_ref,
+        "zonal_statistics_v1",
+        evidence_parameters(&[
+            (
+                "method",
+                Value::String("compute_zonal_statistics".to_string()),
+            ),
+            ("include_nodata_mask", Value::Bool(true)),
+            (
+                "coverage_area_basis",
+                Value::String("valid_pixels".to_string()),
+            ),
+            ("stats_precision", Value::String("f32".to_string())),
+        ]),
+        &(
+            layer_ref,
+            "zonal_statistics_v1",
+            grid.width,
+            grid.height,
+            &grid.values,
+            &grid.nodata_mask,
+            &spatial_ref.crs,
+            &spatial_ref.bbox,
+            &spatial_ref.resolution,
+            &spatial_ref.geo_transform,
+        ),
+    )?;
     let resolution = spatial_ref
         .resolution
         .expect("asserted spatial ref always has resolution");
@@ -113,6 +148,7 @@ pub fn compute_zonal_statistics(
         coverage_fraction: valid_pixel_count as f32 / total_pixel_count as f32,
         nodata_pixel_count,
         nodata_mask: grid.nodata_mask.clone(),
+        evidence,
     })
 }
 
@@ -142,7 +178,8 @@ mod tests {
             spatial_ref: spatial_ref(),
         };
 
-        let result = compute_zonal_statistics(&grid).expect("statistics compute");
+        let result =
+            compute_zonal_statistics(&grid, "layer:ndvi-2026-05-01").expect("statistics compute");
 
         assert_eq!(result.statistics.min_value, 0.1);
         assert_eq!(result.statistics.max_value, 0.9);
@@ -158,6 +195,29 @@ mod tests {
         assert_eq!(result.extent, extent());
         assert_eq!(result.resolution, RasterResolution { x: 10.0, y: 10.0 });
         assert_eq!(result.nodata_mask, vec![false; 4]);
+        assert_eq!(result.evidence.layer_ref, "layer:ndvi-2026-05-01");
+        assert_eq!(result.evidence.method, "zonal_statistics_v1");
+        assert_eq!(
+            result.evidence.parameters.get("coverage_area_basis"),
+            Some(&Value::String("valid_pixels".to_string()))
+        );
+    }
+
+    #[test]
+    fn reproducible_statistics_emit_same_evidence_hash_for_same_inputs() {
+        let grid = ProductGrid {
+            width: 2,
+            height: 2,
+            values: vec![0.1, 0.3, 0.5, 0.9],
+            nodata_mask: vec![false; 4],
+            spatial_ref: spatial_ref(),
+        };
+
+        let first = compute_zonal_statistics(&grid, "layer:ndvi-2026-05-01").expect("first stats");
+        let second =
+            compute_zonal_statistics(&grid, "layer:ndvi-2026-05-01").expect("second stats");
+
+        assert_eq!(first.evidence.input_hash, second.evidence.input_hash);
     }
 
     #[test]
@@ -170,7 +230,8 @@ mod tests {
             spatial_ref: spatial_ref(),
         };
 
-        let result = compute_zonal_statistics(&grid).expect("statistics compute");
+        let result =
+            compute_zonal_statistics(&grid, "layer:ndvi-2026-05-01").expect("statistics compute");
 
         assert_eq!(result.statistics.min_value, 0.1);
         assert_eq!(result.statistics.max_value, 0.9);
@@ -181,6 +242,7 @@ mod tests {
         assert_eq!(result.nodata_pixel_count, 1);
         assert_eq!(result.coverage_fraction, 0.75);
         assert_eq!(result.nodata_mask, vec![false, true, false, false]);
+        assert_eq!(result.evidence.layer_ref, "layer:ndvi-2026-05-01");
     }
 
     #[test]
@@ -193,7 +255,8 @@ mod tests {
             spatial_ref: spatial_ref(),
         };
 
-        let error = compute_zonal_statistics(&grid).expect_err("all nodata is rejected");
+        let error = compute_zonal_statistics(&grid, "layer:ndvi-2026-05-01")
+            .expect_err("all nodata is rejected");
 
         assert_eq!(
             error,

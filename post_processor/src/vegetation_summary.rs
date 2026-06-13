@@ -77,7 +77,7 @@ pub fn summarize_vegetation(
         return Err(VegetationSummaryError::InvalidLowVigorThreshold);
     }
 
-    let stats = compute_zonal_statistics(&input.grid)?;
+    let stats = compute_zonal_statistics(&input.grid, &input.product_ref)?;
     let low_vigor_fraction = low_vigor_fraction(&input.grid, input.low_vigor_threshold);
     let source_product = VegetationSourceProduct {
         product_ref: input.product_ref.clone(),

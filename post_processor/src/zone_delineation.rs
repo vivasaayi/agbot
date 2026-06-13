@@ -1,8 +1,9 @@
+use crate::evidence::AnalysisEvidence;
 use crate::product_anomalies::ProductAnomaly;
 use crate::zonal_statistics::ProductGrid;
 use serde::{Deserialize, Serialize};
 use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRefError};
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnomalyZonePolygon {
@@ -17,6 +18,7 @@ pub struct AnomalyZone {
     pub area_m2: f32,
     pub centroid: (f64, f64),
     pub crs: String,
+    pub evidence: Vec<AnalysisEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -61,6 +63,7 @@ pub fn delineate_anomaly_zones(
         .expect("asserted spatial ref always has CRS");
 
     let mut flagged = BTreeSet::new();
+    let mut anomaly_lookup = HashMap::new();
     for anomaly in anomalies {
         if anomaly.index >= expected {
             return Err(ZoneDelineationError::AnomalyOutOfBounds {
@@ -69,6 +72,10 @@ pub fn delineate_anomaly_zones(
             });
         }
         flagged.insert(anomaly.index);
+        anomaly_lookup
+            .entry(anomaly.index)
+            .or_insert_with(Vec::new)
+            .push(anomaly.evidence.clone());
     }
 
     let flagged_lookup = flagged.iter().copied().collect::<HashSet<_>>();
@@ -101,6 +108,7 @@ pub fn delineate_anomaly_zones(
             resolution.x * resolution.y,
             &crs,
             component,
+            &anomaly_lookup,
         ));
     }
 
@@ -135,6 +143,7 @@ fn zone_from_component(
     pixel_area: f64,
     crs: &str,
     cell_indices: Vec<usize>,
+    anomaly_lookup: &HashMap<usize, Vec<AnalysisEvidence>>,
 ) -> AnomalyZone {
     let width = width as usize;
     let mut min_row = usize::MAX;
@@ -161,6 +170,16 @@ fn zone_from_component(
     let top_right = transform_point(transform, (max_col + 1) as f64, min_row as f64);
     let bottom_right = transform_point(transform, (max_col + 1) as f64, (max_row + 1) as f64);
     let bottom_left = transform_point(transform, min_col as f64, (max_row + 1) as f64);
+    let mut evidence = Vec::new();
+    for index in &cell_indices {
+        if let Some(index_evidence) = anomaly_lookup.get(index) {
+            for item in index_evidence {
+                if !evidence.iter().any(|existing| existing == item) {
+                    evidence.push(item.clone());
+                }
+            }
+        }
+    }
 
     AnomalyZone {
         zone_id: format!("zone-{zone_number}"),
@@ -171,6 +190,7 @@ fn zone_from_component(
         area_m2: (count * pixel_area) as f32,
         centroid: (centroid_x / count, centroid_y / count),
         crs: crs.to_string(),
+        evidence,
     }
 }
 
@@ -184,8 +204,10 @@ fn transform_point(transform: &[f64; 6], col: f64, row: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::{evidence_parameters, make_analysis_evidence};
     use crate::product_anomalies::{ProductAnomaly, ProductAnomalyReasonCode};
     use crate::zonal_statistics::ProductGrid;
+    use serde_json::json;
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
     #[test]
@@ -194,7 +216,6 @@ mod tests {
         let anomalies = vec![anomaly(0), anomaly(1)];
 
         let zones = delineate_anomaly_zones(&grid, &anomalies).expect("zones compute");
-
         assert_eq!(zones.len(), 1);
         assert_eq!(zones[0].zone_id, "zone-1");
         assert_eq!(zones[0].cell_indices, vec![0, 1]);
@@ -211,6 +232,11 @@ mod tests {
                 (500000.0, 4500020.0)
             ]
         );
+        assert_eq!(zones[0].evidence.len(), 2);
+        assert_ne!(
+            zones[0].evidence[0].input_hash,
+            zones[0].evidence[1].input_hash
+        );
     }
 
     #[test]
@@ -225,6 +251,8 @@ mod tests {
         assert_eq!(zones[1].cell_indices, vec![5]);
         assert_eq!(zones[0].area_m2, 100.0);
         assert_eq!(zones[1].area_m2, 100.0);
+        assert_eq!(zones[0].evidence.len(), 1);
+        assert_eq!(zones[1].evidence.len(), 1);
     }
 
     #[test]
@@ -238,6 +266,7 @@ mod tests {
         assert_eq!(zones[0].cell_indices, vec![4]);
         assert_eq!(zones[0].area_m2, 100.0);
         assert_eq!(zones[0].centroid, (500015.0, 4500005.0));
+        assert_eq!(zones[0].evidence.len(), 1);
         assert_eq!(
             zones[0].polygon.coordinates,
             vec![
@@ -258,6 +287,16 @@ mod tests {
             value: 0.1,
             threshold: 0.2,
             reason_code: ProductAnomalyReasonCode::BelowAbsoluteThreshold,
+            evidence: make_analysis_evidence(
+                "layer-1",
+                "anomaly_detection_v1",
+                evidence_parameters(&[
+                    ("method", json!("threshold_and_statistical_band")),
+                    ("reason_code", json!("below_absolute_threshold")),
+                ]),
+                &(index, 0.1_f32),
+            )
+            .expect("evidence"),
         }
     }
 

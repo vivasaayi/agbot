@@ -219,6 +219,7 @@ mod tests {
             area_m2,
             centroid: (500010.0, 4500015.0),
             crs: "EPSG:32614".to_string(),
+            evidence: Vec::new(),
         }
     }
 }

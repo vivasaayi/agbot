@@ -1,5 +1,8 @@
+use crate::evidence::{evidence_parameters, evidence_reason, make_analysis_evidence};
 use crate::zonal_statistics::{ProductGrid, ProductGridStatistics};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +21,7 @@ pub struct ProductAnomaly {
     pub value: f32,
     pub threshold: f32,
     pub reason_code: ProductAnomalyReasonCode,
+    pub evidence: crate::evidence::AnalysisEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -27,7 +31,7 @@ pub struct AnomalyDetectionConfig {
     pub std_dev_multiplier: Option<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Error)]
 pub enum AnomalyDetectionError {
     #[error("product grid dimensions do not match values/mask lengths: expected {expected}, values {values}, mask {mask}")]
     DimensionMismatch {
@@ -39,12 +43,15 @@ pub enum AnomalyDetectionError {
     InvalidStdDevMultiplier,
     #[error("product grid value at index {index} is not finite")]
     InvalidValue { index: usize },
+    #[error("evidence metadata failed: {0}")]
+    Evidence(#[from] crate::evidence::AnalysisEvidenceError),
 }
 
 pub fn flag_product_anomalies(
     grid: &ProductGrid,
     stats: &ProductGridStatistics,
     config: &AnomalyDetectionConfig,
+    layer_ref: &str,
 ) -> Result<Vec<ProductAnomaly>, AnomalyDetectionError> {
     let expected = grid.width as usize * grid.height as usize;
     if grid.values.len() != expected || grid.nodata_mask.len() != expected {
@@ -86,6 +93,13 @@ pub fn flag_product_anomalies(
                     *value,
                     threshold,
                     ProductAnomalyReasonCode::BelowAbsoluteThreshold,
+                    make_anomaly_evidence(
+                        layer_ref,
+                        ProductAnomalyReasonCode::BelowAbsoluteThreshold,
+                        threshold,
+                        config,
+                        &stats.evidence.input_hash,
+                    )?,
                 ));
             }
         }
@@ -97,6 +111,13 @@ pub fn flag_product_anomalies(
                     *value,
                     threshold,
                     ProductAnomalyReasonCode::AboveAbsoluteThreshold,
+                    make_anomaly_evidence(
+                        layer_ref,
+                        ProductAnomalyReasonCode::AboveAbsoluteThreshold,
+                        threshold,
+                        config,
+                        &stats.evidence.input_hash,
+                    )?,
                 ));
             }
         }
@@ -109,6 +130,13 @@ pub fn flag_product_anomalies(
                     *value,
                     low_threshold,
                     ProductAnomalyReasonCode::BelowStatisticalBand,
+                    make_anomaly_evidence(
+                        layer_ref,
+                        ProductAnomalyReasonCode::BelowStatisticalBand,
+                        low_threshold,
+                        config,
+                        &stats.evidence.input_hash,
+                    )?,
                 ));
             } else if *value > high_threshold {
                 flags.push(anomaly(
@@ -117,6 +145,13 @@ pub fn flag_product_anomalies(
                     *value,
                     high_threshold,
                     ProductAnomalyReasonCode::AboveStatisticalBand,
+                    make_anomaly_evidence(
+                        layer_ref,
+                        ProductAnomalyReasonCode::AboveStatisticalBand,
+                        high_threshold,
+                        config,
+                        &stats.evidence.input_hash,
+                    )?,
                 ));
             }
         }
@@ -130,12 +165,60 @@ pub fn flag_product_anomalies(
     Ok(flags)
 }
 
+fn make_anomaly_evidence(
+    layer_ref: &str,
+    reason_code: ProductAnomalyReasonCode,
+    threshold: f32,
+    config: &AnomalyDetectionConfig,
+    baseline_stats_hash: &str,
+) -> Result<crate::evidence::AnalysisEvidence, crate::evidence::AnalysisEvidenceError> {
+    let method = "anomaly_detection_v1";
+    let parameters = evidence_parameters(&[
+        ("method", json!("threshold_and_statistical_band")),
+        ("reason_code", evidence_reason(reason_code_str(reason_code))),
+        ("threshold_used", json!(threshold)),
+        ("low_threshold", optional_threshold(config.low_threshold)),
+        ("high_threshold", optional_threshold(config.high_threshold)),
+        (
+            "std_dev_multiplier",
+            match config.std_dev_multiplier {
+                Some(value) => json!(value),
+                None => Value::Null,
+            },
+        ),
+        ("baseline_stats_hash", json!(baseline_stats_hash)),
+    ]);
+    make_analysis_evidence(
+        layer_ref,
+        method,
+        parameters,
+        &(
+            layer_ref,
+            method,
+            reason_code_str(reason_code),
+            threshold,
+            config.low_threshold,
+            config.high_threshold,
+            config.std_dev_multiplier,
+            baseline_stats_hash,
+        ),
+    )
+}
+
+fn optional_threshold(value: Option<f32>) -> Value {
+    match value {
+        Some(value) => json!(value),
+        None => Value::Null,
+    }
+}
+
 fn anomaly(
     grid: &ProductGrid,
     index: usize,
     value: f32,
     threshold: f32,
     reason_code: ProductAnomalyReasonCode,
+    evidence: crate::evidence::AnalysisEvidence,
 ) -> ProductAnomaly {
     ProductAnomaly {
         index,
@@ -144,6 +227,7 @@ fn anomaly(
         value,
         threshold,
         reason_code,
+        evidence,
     }
 }
 
@@ -156,6 +240,15 @@ fn reason_rank(reason_code: ProductAnomalyReasonCode) -> u8 {
     }
 }
 
+fn reason_code_str(reason_code: ProductAnomalyReasonCode) -> &'static str {
+    match reason_code {
+        ProductAnomalyReasonCode::BelowAbsoluteThreshold => "below_absolute_threshold",
+        ProductAnomalyReasonCode::AboveAbsoluteThreshold => "above_absolute_threshold",
+        ProductAnomalyReasonCode::BelowStatisticalBand => "below_statistical_band",
+        ProductAnomalyReasonCode::AboveStatisticalBand => "above_statistical_band",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,14 +258,16 @@ mod tests {
     #[test]
     fn absolute_threshold_flags_carry_reason_threshold_and_value() {
         let grid = product_grid(vec![0.1, 0.4, 0.8, 0.95]);
-        let stats = compute_zonal_statistics(&grid).expect("stats compute");
+        let stats =
+            compute_zonal_statistics(&grid, "layer:ndvi-2026-05-01").expect("stats compute");
         let config = AnomalyDetectionConfig {
             low_threshold: Some(0.2),
             high_threshold: Some(0.9),
             std_dev_multiplier: None,
         };
 
-        let flags = flag_product_anomalies(&grid, &stats, &config).expect("flags compute");
+        let flags = flag_product_anomalies(&grid, &stats, &config, "layer:ndvi-2026-05-01")
+            .expect("flags compute");
 
         assert_eq!(flags.len(), 2);
         assert_eq!(flags[0].index, 0);
@@ -191,6 +286,10 @@ mod tests {
             flags[1].reason_code,
             ProductAnomalyReasonCode::AboveAbsoluteThreshold
         );
+        assert_eq!(
+            flags[1].evidence.layer_ref,
+            "layer:ndvi-2026-05-01".to_string()
+        );
     }
 
     #[test]
@@ -202,14 +301,16 @@ mod tests {
             nodata_mask: vec![false; 5],
             spatial_ref: spatial_ref(5, 1),
         };
-        let stats = compute_zonal_statistics(&grid).expect("stats compute");
+        let stats =
+            compute_zonal_statistics(&grid, "layer:ndvi-2026-05-01").expect("stats compute");
         let config = AnomalyDetectionConfig {
             low_threshold: None,
             high_threshold: None,
             std_dev_multiplier: Some(1.0),
         };
 
-        let flags = flag_product_anomalies(&grid, &stats, &config).expect("flags compute");
+        let flags = flag_product_anomalies(&grid, &stats, &config, "layer:ndvi-2026-05-01")
+            .expect("flags compute");
 
         assert_eq!(flags.len(), 2);
         assert_eq!(
@@ -229,16 +330,45 @@ mod tests {
     #[test]
     fn uniform_raster_returns_no_statistical_false_positives() {
         let grid = product_grid(vec![0.5, 0.5, 0.5, 0.5]);
-        let stats = compute_zonal_statistics(&grid).expect("stats compute");
+        let stats =
+            compute_zonal_statistics(&grid, "layer:ndvi-2026-05-01").expect("stats compute");
         let config = AnomalyDetectionConfig {
             low_threshold: None,
             high_threshold: None,
             std_dev_multiplier: Some(1.0),
         };
 
-        let flags = flag_product_anomalies(&grid, &stats, &config).expect("flags compute");
+        let flags = flag_product_anomalies(&grid, &stats, &config, "layer:ndvi-2026-05-01")
+            .expect("flags compute");
 
         assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn anomaly_evidence_is_stable_for_identical_inputs() {
+        let grid = product_grid(vec![0.1, 0.5, 0.9, 0.1]);
+        let stats =
+            compute_zonal_statistics(&grid, "layer:ndvi-2026-05-01").expect("stats compute");
+        let config = AnomalyDetectionConfig {
+            low_threshold: Some(0.2),
+            high_threshold: Some(0.8),
+            std_dev_multiplier: None,
+        };
+
+        let first = flag_product_anomalies(&grid, &stats, &config, "layer:ndvi-2026-05-01")
+            .expect("first flags");
+        let second = flag_product_anomalies(&grid, &stats, &config, "layer:ndvi-2026-05-01")
+            .expect("second flags");
+
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first[0].evidence.input_hash, second[0].evidence.input_hash);
+        assert_eq!(first[1].evidence.input_hash, second[1].evidence.input_hash);
+        assert_eq!(first[0].evidence.layer_ref, second[0].evidence.layer_ref);
+        assert_eq!(first[0].evidence.method, "anomaly_detection_v1");
+        assert_eq!(
+            first[0].evidence.parameters.get("reason_code"),
+            Some(&evidence_reason("below_absolute_threshold"))
+        );
     }
 
     fn product_grid(values: Vec<f32>) -> ProductGrid {

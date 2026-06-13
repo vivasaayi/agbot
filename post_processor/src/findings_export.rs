@@ -188,6 +188,7 @@ mod tests {
                 area_m2: 3_000.0,
                 centroid: (500010.0, 4500015.0),
                 crs: "EPSG:32614".to_string(),
+                evidence: Vec::new(),
             },
             reason: ProductAnomalyReasonCode::BelowAbsoluteThreshold,
             priority: RecommendationPriority::High,

@@ -84,7 +84,7 @@ pub fn detect_thermal_spots(
         return Err(ThermalSpotError::InvalidThreshold);
     }
 
-    let stats = compute_zonal_statistics(&request.grid)?;
+    let stats = compute_zonal_statistics(&request.grid, &request.product_ref)?;
     let anomalies = flag_product_anomalies(
         &request.grid,
         &stats,
@@ -93,6 +93,7 @@ pub fn detect_thermal_spots(
             high_threshold: request.high_threshold_c,
             std_dev_multiplier: None,
         },
+        &request.product_ref,
     )?;
 
     let mut spots = Vec::new();
