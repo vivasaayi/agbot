@@ -19,9 +19,10 @@ use crate::plugins::recommendations::{
 use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
     active_product_selection, assert_manifest_layer_placement, layer_metadata_readout,
-    select_catalog_scene, switch_active_product, AnnotationCreateTask, AnnotationDeleteTask,
-    AnnotationFetchTask, AnnotationOverlayState, AnnotationUpdateTask, CursorMapState, DraftMode,
-    FarmFieldHistoryFetchTask, FarmListFetchTask, FieldCatalogState, FieldImportState,
+    open_compare_mode, select_catalog_scene, set_compare_divider, switch_active_product,
+    sync_compare_shared_view, AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask,
+    AnnotationOverlayState, AnnotationUpdateTask, CompareLayout, CompareModeState, CursorMapState,
+    DraftMode, FarmFieldHistoryFetchTask, FarmListFetchTask, FieldCatalogState, FieldImportState,
     FieldImportTask, FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask, MapViewState,
     ProductLegend, RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
     RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask,
@@ -107,6 +108,7 @@ fn render_ui(
     mut contexts: EguiContexts,
     mut viewer_state: ResMut<ViewerState>,
     mut config: ResMut<TileConfig>,
+    mut compare_state: ResMut<CompareModeState>,
     mut catalog_ui: CatalogUiState,
     mut field_import_ui: FieldImportUiState,
     mut scene_ui: SceneUiState,
@@ -181,6 +183,15 @@ fn render_ui(
             &mut config,
             &mut commands,
             fetch_tasks,
+            tile_state,
+        );
+        render_compare_panel(
+            ui,
+            &mut compare_state,
+            manifest_state,
+            &viewer_state,
+            &config,
+            map_view,
             tile_state,
         );
         render_scene_panel(
@@ -533,6 +544,131 @@ fn render_fields_panel(
             recommendations.items.len()
         ));
         ui.add_space(8.0);
+    }
+}
+
+fn render_compare_panel(
+    ui: &mut egui::Ui,
+    compare_state: &mut CompareModeState,
+    manifest_state: &SceneManifestState,
+    viewer_state: &ViewerState,
+    config: &TileConfig,
+    map_view: &MapViewState,
+    tile_state: &mut TileRenderState,
+) {
+    ui.add_space(8.0);
+    ui.heading("Compare");
+
+    if let Some(session) = compare_state.active.as_mut() {
+        sync_compare_shared_view(session, viewer_state, map_view);
+        session.layout = compare_state.layout;
+    }
+
+    let product_count = manifest_state.products.len();
+    if product_count < 2 {
+        ui.label("No comparable product pair loaded");
+        if ui.button("Close Compare").clicked() {
+            compare_state.active = None;
+        }
+        return;
+    }
+
+    if compare_state.right_product_index >= product_count {
+        compare_state.right_product_index = product_count - 1;
+    }
+    if compare_state.right_product_index == viewer_state.selected_layer {
+        compare_state.right_product_index = (0..product_count)
+            .find(|idx| *idx != viewer_state.selected_layer)
+            .unwrap_or(viewer_state.selected_layer);
+    }
+
+    let left_label = manifest_state
+        .products
+        .get(viewer_state.selected_layer)
+        .map(|product| product.kind.to_uppercase())
+        .unwrap_or_else(|| "(invalid)".to_string());
+    ui.label(format!("Left: {left_label}"));
+
+    egui::ComboBox::from_label("Right")
+        .selected_text(
+            manifest_state
+                .products
+                .get(compare_state.right_product_index)
+                .map(|product| product.kind.to_uppercase())
+                .unwrap_or_else(|| "(invalid)".to_string()),
+        )
+        .show_ui(ui, |ui| {
+            for (idx, product) in manifest_state.products.iter().enumerate() {
+                if idx == viewer_state.selected_layer {
+                    continue;
+                }
+                ui.selectable_value(
+                    &mut compare_state.right_product_index,
+                    idx,
+                    product.kind.to_uppercase(),
+                );
+            }
+        });
+
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut compare_state.layout, CompareLayout::Swipe, "Swipe");
+        ui.selectable_value(
+            &mut compare_state.layout,
+            CompareLayout::SideBySide,
+            "Side by side",
+        );
+    });
+
+    ui.horizontal(|ui| {
+        if ui.button("Open Compare").clicked() {
+            match open_compare_mode(
+                manifest_state,
+                viewer_state.selected_layer,
+                manifest_state,
+                compare_state.right_product_index,
+                &config.base_url,
+                viewer_state,
+                map_view,
+                compare_state.layout,
+            ) {
+                Ok(session) => {
+                    compare_state.active = Some(session);
+                    compare_state.last_error = None;
+                }
+                Err(err) => {
+                    let message = format!("compare refused: {err}");
+                    compare_state.last_error = Some(message.clone());
+                    tile_state.status = TileStatus::Error(message);
+                }
+            }
+        }
+        if ui.button("Close Compare").clicked() {
+            compare_state.active = None;
+            compare_state.last_error = None;
+        }
+    });
+
+    if let Some(session) = compare_state.active.as_mut() {
+        if session.layout == CompareLayout::Swipe {
+            let mut divider = session.shared_view.divider_fraction;
+            if ui
+                .add(egui::Slider::new(&mut divider, 0.0..=1.0).text("Divider"))
+                .changed()
+            {
+                set_compare_divider(session, divider);
+            }
+        }
+        ui.small(format!(
+            "{}:{} <-> {}:{}",
+            session.left.scene_id,
+            session.left.product_kind,
+            session.right.scene_id,
+            session.right.product_kind
+        ));
+    }
+
+    if let Some(error) = compare_state.last_error.as_deref() {
+        ui.label(error);
     }
 }
 

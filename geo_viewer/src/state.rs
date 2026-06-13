@@ -268,6 +268,199 @@ pub struct ActiveProductSelection {
     pub legend: ProductLegend,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompareLayout {
+    #[default]
+    Swipe,
+    SideBySide,
+}
+
+#[derive(Resource, Debug, Clone, PartialEq)]
+pub struct CompareModeState {
+    pub active: Option<CompareModeSession>,
+    pub right_product_index: usize,
+    pub layout: CompareLayout,
+    pub last_error: Option<String>,
+}
+
+impl Default for CompareModeState {
+    fn default() -> Self {
+        Self {
+            active: None,
+            right_product_index: 1,
+            layout: CompareLayout::Swipe,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompareModeSession {
+    pub left: CompareLayer,
+    pub right: CompareLayer,
+    pub placement: LayerPlacement,
+    pub shared_view: CompareSharedView,
+    pub layout: CompareLayout,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompareLayer {
+    pub scene_id: String,
+    pub product_index: usize,
+    pub product_kind: String,
+    pub tile_source: TileSource,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub acquired_at: Option<String>,
+    pub placement: LayerPlacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompareSharedView {
+    pub center: Vec2,
+    pub zoom_level: f32,
+    pub divider_fraction: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn open_compare_mode(
+    left_manifest: &SceneManifestState,
+    left_product_index: usize,
+    right_manifest: &SceneManifestState,
+    right_product_index: usize,
+    base_url: &str,
+    viewer_state: &ViewerState,
+    map_view: &MapViewState,
+    layout: CompareLayout,
+) -> Result<CompareModeSession> {
+    let left = compare_layer_for_manifest("left", left_manifest, left_product_index, base_url)?;
+    let right = compare_layer_for_manifest("right", right_manifest, right_product_index, base_url)?;
+    assert_compare_field_match(&left, &right)?;
+    assert_compare_placement_match(&left.placement, &right.placement)?;
+
+    Ok(CompareModeSession {
+        placement: left.placement.clone(),
+        shared_view: CompareSharedView {
+            center: map_view.center,
+            zoom_level: viewer_state.zoom_level,
+            divider_fraction: 0.5,
+        },
+        layout,
+        left,
+        right,
+    })
+}
+
+pub fn sync_compare_shared_view(
+    session: &mut CompareModeSession,
+    viewer_state: &ViewerState,
+    map_view: &MapViewState,
+) {
+    session.shared_view.center = map_view.center;
+    session.shared_view.zoom_level = viewer_state.zoom_level;
+}
+
+pub fn set_compare_divider(session: &mut CompareModeSession, divider_fraction: f32) {
+    session.shared_view.divider_fraction = if divider_fraction.is_finite() {
+        divider_fraction.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+}
+
+fn compare_layer_for_manifest(
+    side: &'static str,
+    manifest_state: &SceneManifestState,
+    product_index: usize,
+    base_url: &str,
+) -> Result<CompareLayer> {
+    let scene_id = required_compare_text(manifest_state.scene_id.as_deref(), side, "scene_id")?;
+    let product = manifest_state.products.get(product_index).ok_or_else(|| {
+        anyhow::anyhow!("compare {side} product index {product_index} is not available")
+    })?;
+    if product.kind.trim().is_empty() {
+        anyhow::bail!("compare {side} product kind is required");
+    }
+    if product.tile_url_template.trim().is_empty() {
+        anyhow::bail!(
+            "compare {side} product {} is missing a tile URL template",
+            product.kind
+        );
+    }
+
+    let placement = assert_manifest_layer_placement(
+        &manifest_state.geospatial,
+        manifest_state.width,
+        manifest_state.height,
+    )
+    .map_err(|err| anyhow::anyhow!("compare {side} layer assertion failed: {err}"))?;
+    assert_product_provenance_alignment(product, manifest_state)
+        .map_err(|err| anyhow::anyhow!("compare {side} product assertion failed: {err}"))?;
+
+    Ok(CompareLayer {
+        scene_id,
+        product_index,
+        product_kind: product.kind.clone(),
+        tile_source: product.tile_source(base_url),
+        field_id: non_empty_owned(manifest_state.field_id.as_deref())
+            .or_else(|| non_empty_owned(product.field_id.as_deref())),
+        season_id: non_empty_owned(manifest_state.season_id.as_deref())
+            .or_else(|| non_empty_owned(product.season_id.as_deref())),
+        acquired_at: non_empty_owned(manifest_state.acquired_at.as_deref()),
+        placement,
+    })
+}
+
+fn required_compare_text(value: Option<&str>, side: &str, label: &str) -> Result<String> {
+    non_empty_owned(value).ok_or_else(|| anyhow::anyhow!("compare {side} {label} is required"))
+}
+
+fn non_empty_owned(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn assert_compare_field_match(left: &CompareLayer, right: &CompareLayer) -> Result<()> {
+    let left_field = left
+        .field_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("compare left field_id is required"))?;
+    let right_field = right
+        .field_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("compare right field_id is required"))?;
+    if left_field != right_field {
+        anyhow::bail!(
+            "compare mismatch: field_id {left_field} cannot share view with {right_field}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_compare_placement_match(left: &LayerPlacement, right: &LayerPlacement) -> Result<()> {
+    if left.crs != right.crs {
+        anyhow::bail!(
+            "compare mismatch: CRS {} cannot share view with {}",
+            left.crs,
+            right.crs
+        );
+    }
+    assert_compare_extent_edge("min_lon", left.extent.min_lon, right.extent.min_lon)?;
+    assert_compare_extent_edge("min_lat", left.extent.min_lat, right.extent.min_lat)?;
+    assert_compare_extent_edge("max_lon", left.extent.max_lon, right.extent.max_lon)?;
+    assert_compare_extent_edge("max_lat", left.extent.max_lat, right.extent.max_lat)?;
+    Ok(())
+}
+
+fn assert_compare_extent_edge(edge: &'static str, left: f64, right: f64) -> Result<()> {
+    if (left - right).abs() > GEO_EXTENT_ASSERTION_TOLERANCE {
+        anyhow::bail!("compare mismatch: extent {edge} {left} cannot share view with {right}");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProductLegend {
     pub product_kind: String,
@@ -1014,10 +1207,11 @@ pub fn ensure_scene_id(config: &TileConfig, action: &str) -> Result<String> {
 mod tests {
     use super::{
         assert_manifest_layer_placement, layer_metadata_readout, manifest_world_dimensions,
-        product_legend_for_kind, product_placement_for_manifest, select_catalog_scene,
-        summarize_tile_presences, switch_active_product, FieldCatalogState, FieldSceneSummary,
-        SceneExtent, SceneGeospatialMetadata, SceneManifest, SceneManifestState, SceneProduct,
-        TileConfig, TileId, TilePresence, ViewerState, DEFAULT_PRODUCT_KIND,
+        open_compare_mode, product_legend_for_kind, product_placement_for_manifest,
+        select_catalog_scene, set_compare_divider, summarize_tile_presences, switch_active_product,
+        sync_compare_shared_view, CompareLayout, FieldCatalogState, FieldSceneSummary,
+        MapViewState, SceneExtent, SceneGeospatialMetadata, SceneManifest, SceneManifestState,
+        SceneProduct, TileConfig, TileId, TilePresence, ViewerState, DEFAULT_PRODUCT_KIND,
     };
     use bevy::prelude::Vec2;
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
@@ -1517,6 +1711,168 @@ mod tests {
         assert_eq!(config.product_kind, DEFAULT_PRODUCT_KIND);
     }
 
+    #[test]
+    fn compare_mode_opens_shared_georeferenced_view_for_comparable_scenes() {
+        let left = sample_manifest_state();
+        let right = compare_manifest("scene-2", "2025");
+        let viewer = ViewerState {
+            selected_layer: 0,
+            zoom_level: 2.25,
+            scene_id_input: "scene-1".to_string(),
+        };
+        let map_view = MapViewState {
+            center: Vec2::new(42.0, -17.5),
+            base_scale: 0.75,
+            needs_fit: false,
+        };
+
+        let mut session = open_compare_mode(
+            &left,
+            0,
+            &right,
+            0,
+            "http://127.0.0.1:8080",
+            &viewer,
+            &map_view,
+            CompareLayout::Swipe,
+        )
+        .expect("matching field scenes should open compare mode");
+
+        assert_eq!(session.left.scene_id, "scene-1");
+        assert_eq!(session.right.scene_id, "scene-2");
+        assert_eq!(session.left.field_id.as_deref(), Some("field-1"));
+        assert_eq!(session.right.field_id.as_deref(), Some("field-1"));
+        assert_eq!(session.left.season_id.as_deref(), Some("2026"));
+        assert_eq!(session.right.season_id.as_deref(), Some("2025"));
+        assert_eq!(session.left.product_kind, "ndvi");
+        assert_eq!(session.right.product_kind, "ndvi");
+        assert_eq!(session.placement.crs, "EPSG:4326");
+        assert_eq!(session.placement.extent, sample_extent());
+        assert_eq!(session.shared_view.center, Vec2::new(42.0, -17.5));
+        assert_eq!(session.shared_view.zoom_level, 2.25);
+        assert_eq!(session.shared_view.divider_fraction, 0.5);
+
+        let moved_viewer = ViewerState {
+            selected_layer: 1,
+            zoom_level: 3.5,
+            scene_id_input: "scene-1".to_string(),
+        };
+        let moved_map = MapViewState {
+            center: Vec2::new(-80.0, 14.0),
+            base_scale: 0.5,
+            needs_fit: false,
+        };
+        sync_compare_shared_view(&mut session, &moved_viewer, &moved_map);
+        set_compare_divider(&mut session, 0.85);
+
+        assert_eq!(session.shared_view.center, Vec2::new(-80.0, 14.0));
+        assert_eq!(session.shared_view.zoom_level, 3.5);
+        assert_eq!(session.shared_view.divider_fraction, 0.85);
+    }
+
+    #[test]
+    fn compare_mode_refuses_incompatible_scene_crs() {
+        let left = sample_manifest_state();
+        let mut right = compare_manifest("scene-2", "2025");
+        right.geospatial.crs = Some("EPSG:3857".to_string());
+        right
+            .geospatial
+            .spatial_ref
+            .as_mut()
+            .expect("right manifest spatial ref")
+            .crs = Some("EPSG:3857".to_string());
+        for product in &mut right.products {
+            if let Some(spatial_ref) = product.spatial_ref.as_mut() {
+                spatial_ref.crs = Some("EPSG:3857".to_string());
+            }
+        }
+
+        let err = open_compare_mode(
+            &left,
+            0,
+            &right,
+            0,
+            "http://127.0.0.1:8080",
+            &sample_viewer_state(),
+            &sample_map_view(),
+            CompareLayout::Swipe,
+        )
+        .expect_err("CRS mismatch should refuse compare");
+
+        assert!(err.to_string().contains("compare mismatch"));
+        assert!(err.to_string().contains("CRS"));
+    }
+
+    #[test]
+    fn compare_mode_refuses_incompatible_scene_extent() {
+        let left = sample_manifest_state();
+        let mut right = compare_manifest("scene-2", "2025");
+        let shifted_extent = SceneExtent {
+            max_lon: -88.25,
+            ..sample_extent()
+        };
+        let shifted_ref = RasterSpatialRef {
+            bbox: Some(GeoBounds {
+                min_lon: shifted_extent.min_lon,
+                min_lat: shifted_extent.min_lat,
+                max_lon: shifted_extent.max_lon,
+                max_lat: shifted_extent.max_lat,
+            }),
+            geo_transform: Some([-89.5, 0.0125, 0.0, 41.0, 0.0, -0.02]),
+            resolution: Some(RasterResolution { x: 0.0125, y: 0.02 }),
+            ..valid_spatial_ref()
+        };
+        right.geospatial.extent = Some(shifted_extent.clone());
+        right.geospatial.spatial_ref = Some(shifted_ref.clone());
+        for product in &mut right.products {
+            product.spatial_ref = Some(shifted_ref.clone());
+        }
+
+        let err = open_compare_mode(
+            &left,
+            0,
+            &right,
+            0,
+            "http://127.0.0.1:8080",
+            &sample_viewer_state(),
+            &sample_map_view(),
+            CompareLayout::SideBySide,
+        )
+        .expect_err("extent mismatch should refuse compare");
+
+        assert!(err.to_string().contains("compare mismatch"));
+        assert!(err.to_string().contains("extent"));
+    }
+
+    #[test]
+    fn compare_mode_refuses_product_spatial_ref_mismatch() {
+        let left = sample_manifest_state();
+        let mut right = compare_manifest("scene-2", "2025");
+        right.products[0]
+            .spatial_ref
+            .as_mut()
+            .expect("product spatial ref")
+            .bbox
+            .as_mut()
+            .expect("product bbox")
+            .max_lon = -88.25;
+
+        let err = open_compare_mode(
+            &left,
+            0,
+            &right,
+            0,
+            "http://127.0.0.1:8080",
+            &sample_viewer_state(),
+            &sample_map_view(),
+            CompareLayout::Swipe,
+        )
+        .expect_err("bad product spatial ref should refuse compare");
+
+        assert!(err.to_string().contains("product"));
+        assert!(err.to_string().contains("extent"));
+    }
+
     fn sample_extent() -> SceneExtent {
         SceneExtent {
             min_lon: -89.5,
@@ -1585,6 +1941,41 @@ mod tests {
             tile_url_template: format!(
                 "/api/scenes/scene-1/products/{kind}/tiles/{{z}}/{{x}}/{{y}}.png"
             ),
+        }
+    }
+
+    fn compare_manifest(scene_id: &str, season_id: &str) -> SceneManifestState {
+        let mut manifest = sample_manifest_state();
+        manifest.scene_id = Some(scene_id.to_string());
+        manifest.season_id = Some(season_id.to_string());
+        manifest.acquired_at = Some(format!("{season_id}-05-01T00:00:00Z"));
+        for product in &mut manifest.products {
+            product.product_id = Some(format!("{scene_id}:{}", product.kind));
+            product.field_id = Some("field-1".to_string());
+            product.season_id = Some(season_id.to_string());
+            product.spatial_ref = Some(valid_spatial_ref());
+            product.url_path = format!("/api/scenes/{scene_id}/products/{}", product.kind);
+            product.tile_url_template = format!(
+                "/api/scenes/{scene_id}/products/{}/tiles/{{z}}/{{x}}/{{y}}.png",
+                product.kind
+            );
+        }
+        manifest
+    }
+
+    fn sample_viewer_state() -> ViewerState {
+        ViewerState {
+            selected_layer: 0,
+            zoom_level: 1.5,
+            scene_id_input: "scene-1".to_string(),
+        }
+    }
+
+    fn sample_map_view() -> MapViewState {
+        MapViewState {
+            center: Vec2::ZERO,
+            base_scale: 1.0,
+            needs_fit: false,
         }
     }
 
