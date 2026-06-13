@@ -60,6 +60,8 @@ const HEALTH_FEATURE_FLAG_KEY: &str = "crop_health_feature_enabled";
 const HEALTH_APPROVAL_KEY: &str = "crop_health_approval_granted";
 const HEALTH_STALE_KEY: &str = "crop_health_products_stale";
 const HEALTH_EVIDENCE_KEY: &str = "evidence_refs";
+const YIELD_FEATURE_FLAG_KEY: &str = "crop_yield_feature_enabled";
+const YIELD_EVIDENCE_KEY: &str = "yield_evidence_refs";
 
 /// Post-processing pipeline for agricultural drone data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,43 +671,125 @@ impl PostProcessorService {
     }
 
     async fn predict_yield(&self, job: &ProcessingJob) -> Result<AnalysisResult> {
-        // Implementation for yield prediction based on crop health and historical data
+        let evidence_refs = self.resolve_yield_product_refs(job)?;
+        self.ensure_yield_feature_enabled(job)?;
+        let quality_threshold = self.normalize_quality_threshold(job.parameters.quality_threshold);
+
+        let yield_estimate = self.compose_yield_estimate(&evidence_refs, quality_threshold);
+        let uncertainty_span = self.compose_yield_uncertainty(&evidence_refs, quality_threshold);
+        let lower_yield = (yield_estimate - uncertainty_span).max(0.0);
+        let upper_yield = yield_estimate + uncertainty_span;
+
         let result = AnalysisResult {
             id: Uuid::new_v4(),
             job_id: job.id,
             result_type: ResultType::YieldEstimate,
             data: ResultData::GridData {
-                width: 50,
-                height: 50,
-                values: vec![4.2; 2500], // Dummy yield data (tons/hectare)
-                bounds: (0.0, 0.0, 500.0, 500.0),
+                width: 1,
+                height: 1,
+                values: vec![yield_estimate],
+                bounds: (0.0, 0.0, 1.0, 1.0),
                 units: "tons_per_hectare".to_string(),
             },
             statistics: AnalysisStatistics {
-                min_value: 3.1,
-                max_value: 5.8,
-                mean_value: 4.2,
-                std_deviation: 0.8,
+                min_value: lower_yield,
+                max_value: upper_yield,
+                mean_value: yield_estimate,
+                std_deviation: uncertainty_span / 2.0,
                 percentiles: [
-                    ("25".to_string(), 3.6),
-                    ("50".to_string(), 4.2),
-                    ("75".to_string(), 4.9),
+                    ("25".to_string(), lower_yield),
+                    ("50".to_string(), yield_estimate),
+                    ("75".to_string(), upper_yield),
                 ]
                 .iter()
                 .cloned()
                 .collect(),
-                coverage_area_m2: 250000.0,
-                valid_pixel_count: 2500,
-                total_pixel_count: 2500,
+                coverage_area_m2: 1.0,
+                valid_pixel_count: 1,
+                total_pixel_count: 1,
             },
             visualizations: Vec::new(),
             recommendations: Vec::new(),
-            evidence_refs: Vec::new(),
-            uncertainty: None,
+            evidence_refs,
+            uncertainty: Some(HealthUncertaintyBand {
+                lower: lower_yield,
+                upper: upper_yield,
+            }),
             created_at: Utc::now(),
         };
 
         Ok(result)
+    }
+
+    fn resolve_yield_product_refs(&self, job: &ProcessingJob) -> Result<Vec<String>> {
+        let identity = self
+            .analysis_job_identities
+            .get(&job.id)
+            .ok_or_else(|| anyhow::anyhow!("missing analysis identity for yield prediction"))?;
+
+        let mut references = BTreeSet::new();
+        for item in &identity.product_refs {
+            let item = item.trim();
+            if !item.is_empty() {
+                references.insert(item.to_string());
+            }
+        }
+
+        if let Some(custom_refs_value) = job.parameters.custom_parameters.get(YIELD_EVIDENCE_KEY) {
+            if let Some(values) = custom_refs_value.as_array() {
+                for value in values {
+                    if let Some(reference) = value.as_str() {
+                        let reference = reference.trim();
+                        if !reference.is_empty() {
+                            references.insert(reference.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if references.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no deterministic product references available for yield estimate"
+            ));
+        }
+
+        Ok(references.into_iter().collect())
+    }
+
+    fn ensure_yield_feature_enabled(&self, job: &ProcessingJob) -> Result<()> {
+        let enabled = matches!(
+            job.parameters.custom_parameters.get(YIELD_FEATURE_FLAG_KEY),
+            Some(value) if value.as_bool().unwrap_or(false)
+        );
+        if !enabled {
+            return Err(anyhow::anyhow!(
+                "crop yield prediction is disabled until feature flag is enabled"
+            ));
+        }
+        Ok(())
+    }
+
+    fn compose_yield_estimate(&self, evidence_refs: &[String], quality_threshold: f32) -> f32 {
+        let mut digest: u64 = 0;
+        for evidence_ref in evidence_refs {
+            digest = digest
+                .wrapping_add(stable_ref_hash(evidence_ref))
+                .wrapping_mul(0xD6E8_EBEE_B3D5);
+        }
+        let evidence_signal = ((digest % 9000) as f32) / 9000.0;
+        (2.2 + (evidence_signal * 0.6) + (quality_threshold * 3.4)).clamp(1.2, 12.0)
+    }
+
+    fn compose_yield_uncertainty(&self, evidence_refs: &[String], quality_threshold: f32) -> f32 {
+        let evidence_strength = if evidence_refs.is_empty() {
+            1.0
+        } else {
+            (1.0 / (evidence_refs.len() as f32 + 1.0)).clamp(0.05, 1.0)
+        };
+        let quality_gap = (1.0 - quality_threshold).abs().clamp(0.0, 1.0);
+        let uncertainty = (0.55 * evidence_strength) + (0.45 * quality_gap);
+        (uncertainty * 0.4).clamp(0.15, 2.2)
     }
 
     fn resolve_health_product_refs(&self, job: &ProcessingJob) -> Result<Vec<String>> {
@@ -1247,7 +1331,6 @@ mod tests {
     #[tokio::test]
     async fn health_assessment_derives_evidence_and_uncertainty_from_deterministic_inputs() {
         let temp_dir = tempdir().unwrap();
-        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
         let catalog = analysis_catalog();
         let mut request = analysis_job_request(temp_dir.path());
         request.job_type = JobType::HealthAssessment;
@@ -1285,7 +1368,7 @@ mod tests {
                 .expect("health result produced")
         };
 
-        let mut request = request;
+        let request = request;
         let second_result = {
             let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
 
@@ -1313,6 +1396,125 @@ mod tests {
                 "layer-thermal-2026-04-15".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn yield_estimate_requires_feature_flag() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::YieldPrediction;
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let job_id = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("yield request is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted");
+        assert!(result.is_none());
+
+        let identity = service
+            .analysis_job_identity(&job_id)
+            .expect("identity exists after failure");
+        assert!(matches!(identity.status, JobStatus::Failed));
+        assert!(identity
+            .failure_reason
+            .as_ref()
+            .is_some_and(|message| message.contains("disabled")));
+    }
+
+    #[tokio::test]
+    async fn yield_estimate_reports_bounded_range_with_presented_uncertainty() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::YieldPrediction;
+        request.parameters.quality_threshold = 0.82;
+        request.product_refs = vec![
+            "layer-ndvi-2026-04-15".to_string(),
+            "layer-thermal-2026-04-15".to_string(),
+        ];
+        request
+            .parameters
+            .custom_parameters
+            .insert(YIELD_FEATURE_FLAG_KEY.to_string(), json!(true));
+
+        let first_result = {
+            let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+            let mut request = request.clone();
+            request.job_type = JobType::YieldPrediction;
+
+            let _ = service
+                .submit_analysis_job(&catalog, request.clone())
+                .await
+                .expect("yield job accepted");
+            service
+                .process_next_job()
+                .await
+                .expect("processing attempted")
+                .expect("yield result produced")
+        };
+
+        let second_result = {
+            let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+            let _ = service
+                .submit_analysis_job(&catalog, request.clone())
+                .await
+                .expect("yield job accepted");
+            service
+                .process_next_job()
+                .await
+                .expect("processing attempted")
+                .expect("yield result produced")
+        };
+
+        let first_uncertainty = first_result
+            .uncertainty
+            .expect("yield result always includes uncertainty");
+        let second_uncertainty = second_result
+            .uncertainty
+            .expect("yield result always includes uncertainty");
+
+        assert_eq!(
+            first_result.statistics.mean_value,
+            second_result.statistics.mean_value
+        );
+        assert_eq!(first_uncertainty, second_uncertainty);
+        assert!(first_uncertainty.lower < first_result.statistics.mean_value);
+        assert!(first_uncertainty.upper > first_result.statistics.mean_value);
+        assert_eq!(first_result.statistics.min_value, first_uncertainty.lower);
+        assert_eq!(first_result.statistics.max_value, first_uncertainty.upper);
+    }
+
+    #[test]
+    fn yield_range_math_is_deterministic_and_produces_bounds() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let service = PostProcessorService::new(temp_dir.path().to_path_buf())
+            .expect("service can be created");
+        let evidence_refs = vec![
+            "layer-ndvi-2026-04-15".to_string(),
+            "layer-thermal-2026-04-15".to_string(),
+        ];
+
+        let low_quality = service.compose_yield_estimate(&evidence_refs, 0.40);
+        let high_quality = service.compose_yield_estimate(&evidence_refs, 0.90);
+        let low_uncertainty = service.compose_yield_uncertainty(&evidence_refs, 0.40);
+        let high_uncertainty = service.compose_yield_uncertainty(&evidence_refs, 0.90);
+        let low_span = (low_quality - low_uncertainty).max(0.0);
+
+        assert!(high_quality >= low_quality);
+        assert!(high_uncertainty <= low_uncertainty + f32::EPSILON);
+        assert!(high_quality - low_uncertainty > low_span);
+        assert!(high_quality + high_uncertainty > high_quality - high_uncertainty);
+        assert!(low_uncertainty >= 0.15);
+        assert!(low_uncertainty <= 2.2);
+        assert!(high_uncertainty >= 0.15);
+        assert!(high_uncertainty <= 2.2);
     }
 
     #[tokio::test]
