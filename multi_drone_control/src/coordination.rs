@@ -3,7 +3,7 @@ use anyhow::{ensure, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use shared::GeoCoordinate;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
@@ -122,6 +122,25 @@ pub struct LinkQualityReport {
     pub timed_out_links: usize,
     pub links: Vec<DroneLinkStatus>,
     pub audit_events: Vec<CoordinationRuleAuditEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CoordinationRuleExecutionKind {
+    ReturnToBase,
+    LandImmediate,
+    AvoidanceAltitude { delta: f32 },
+    LandAtNearestEmergencySite,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinationRuleExecution {
+    pub rule_id: Uuid,
+    pub rule_name: String,
+    pub drone_id: Uuid,
+    pub priority: u8,
+    pub action: CoordinationRuleExecutionKind,
+    pub condition: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -286,6 +305,7 @@ pub enum RuleAction {
     ChangeAltitude { delta: f32 },
     ReturnToBase,
     LandImmediate,
+    LandAtNearestEmergencySite,
     FormFormation { formation_type: String },
     SendAlert { message: String },
     Custom(Box<dyn Fn(&mut DroneState) + Send + Sync>),
@@ -298,6 +318,7 @@ impl Clone for RuleAction {
             RuleAction::ChangeAltitude { delta } => RuleAction::ChangeAltitude { delta: *delta },
             RuleAction::ReturnToBase => RuleAction::ReturnToBase,
             RuleAction::LandImmediate => RuleAction::LandImmediate,
+            RuleAction::LandAtNearestEmergencySite => RuleAction::LandAtNearestEmergencySite,
             RuleAction::FormFormation { formation_type } => RuleAction::FormFormation {
                 formation_type: formation_type.clone(),
             },
@@ -325,6 +346,9 @@ impl std::fmt::Debug for RuleAction {
                 .finish(),
             RuleAction::ReturnToBase => f.debug_struct("ReturnToBase").finish(),
             RuleAction::LandImmediate => f.debug_struct("LandImmediate").finish(),
+            RuleAction::LandAtNearestEmergencySite => {
+                f.debug_struct("LandAtNearestEmergencySite").finish()
+            }
             RuleAction::FormFormation { formation_type } => f
                 .debug_struct("FormFormation")
                 .field("formation_type", formation_type)
@@ -368,10 +392,10 @@ impl CoordinationEngine {
             },
             CoordinationRule {
                 id: Uuid::new_v4(),
-                name: "Low Battery Return".to_string(),
+                name: "Low Battery Land".to_string(),
                 priority: 2,
                 condition: RuleCondition::BatteryLow { threshold: 0.2 },
-                action: RuleAction::ReturnToBase,
+                action: RuleAction::LandAtNearestEmergencySite,
                 enabled: true,
             },
             CoordinationRule {
@@ -381,7 +405,7 @@ impl CoordinationEngine {
                 condition: RuleCondition::CommunicationLoss {
                     timeout_seconds: 30,
                 },
-                action: RuleAction::LandImmediate,
+                action: RuleAction::ReturnToBase,
                 enabled: true,
             },
         ]
@@ -413,6 +437,20 @@ impl CoordinationEngine {
             return Err(anyhow::anyhow!("Drone not registered: {}", drone_id));
         }
         Ok(())
+    }
+
+    pub async fn update_drone_state_with_rules(
+        &mut self,
+        drone_id: Uuid,
+        state: DroneState,
+    ) -> Result<Vec<CoordinationRuleExecution>> {
+        if let Some(existing_state) = self.active_drones.get_mut(&drone_id) {
+            *existing_state = state;
+
+            self.evaluate_rules(drone_id).await
+        } else {
+            Err(anyhow::anyhow!("Drone not registered: {}", drone_id))
+        }
     }
 
     pub fn set_telemetry_freshness_timeout(&mut self, timeout: ChronoDuration) -> Result<()> {
@@ -637,49 +675,188 @@ impl CoordinationEngine {
             RuleAction::ChangeAltitude { .. } => "ChangeAltitude",
             RuleAction::ReturnToBase => "ReturnToBase",
             RuleAction::LandImmediate => "LandImmediate",
+            RuleAction::LandAtNearestEmergencySite => "LandAtNearestEmergencySite",
             RuleAction::FormFormation { .. } => "FormFormation",
             RuleAction::SendAlert { .. } => "SendAlert",
             RuleAction::Custom(_) => "Custom",
         }
     }
 
-    pub async fn evaluate_rules(&self, _drone_id: Uuid) -> Result<()> {
+    pub async fn evaluate_rules(
+        &mut self,
+        _drone_id: Uuid,
+    ) -> Result<Vec<CoordinationRuleExecution>> {
+        let checked_at = Utc::now();
         let states: Vec<&DroneState> = self.active_drones.values().collect();
+        let mut candidates = Vec::new();
 
         for rule in &self.coordination_rules {
             if !rule.enabled {
                 continue;
             }
 
-            let should_trigger = match &rule.condition {
-                RuleCondition::ProximityAlert { distance_threshold } => {
-                    self.check_proximity_violations(*distance_threshold, &states)
-                }
+            let (condition, affected_drone_ids) = match &rule.condition {
+                RuleCondition::ProximityAlert { distance_threshold } => (
+                    "proximity".to_string(),
+                    self.proximity_violations(*distance_threshold, &states),
+                ),
                 RuleCondition::BatteryLow { threshold } => {
-                    states.iter().any(|s| s.battery_level < *threshold)
+                    let affected = states
+                        .iter()
+                        .filter(|state| state.battery_level < *threshold)
+                        .map(|state| state.id)
+                        .collect::<Vec<_>>();
+                    ("battery_low".to_string(), affected)
                 }
                 RuleCondition::CommunicationLoss { timeout_seconds } => {
                     let timeout = chrono::Duration::seconds(*timeout_seconds as i64);
-                    let cutoff = Utc::now() - timeout;
-                    states.iter().any(|s| s.last_update < cutoff)
+                    let cutoff = checked_at - timeout;
+                    let affected = states
+                        .iter()
+                        .filter(|state| state.last_update < cutoff)
+                        .map(|state| state.id)
+                        .collect::<Vec<_>>();
+                    ("communication_loss".to_string(), affected)
                 }
-                RuleCondition::WeatherCondition { condition: _ } => {
-                    // TODO: Integrate with weather data
-                    false
+                RuleCondition::WeatherCondition { condition } => {
+                    (format!("weather:{condition}"), Vec::new())
                 }
-                RuleCondition::Custom(_) => {
-                    // TODO: Implement custom rule evaluation
-                    false
-                }
+                RuleCondition::Custom(_) => ("custom".to_string(), Vec::new()),
             };
 
-            if should_trigger {
-                tracing::warn!("Coordination rule triggered: {}", rule.name);
-                // TODO: Execute rule action
+            if let Some(action) = self.action_to_execution(&rule.action) {
+                for drone_id in affected_drone_ids {
+                    candidates.push(CoordinationRuleExecution {
+                        rule_id: rule.id,
+                        rule_name: rule.name.clone(),
+                        drone_id,
+                        priority: rule.priority,
+                        action,
+                        condition: condition.clone(),
+                        message: format!(
+                            "Rule {} (priority {}) triggered for drone {}",
+                            rule.name, rule.priority, drone_id
+                        ),
+                    });
+                }
+            }
+        }
+
+        candidates.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.rule_name.cmp(&right.rule_name))
+                .then_with(|| left.rule_id.cmp(&right.rule_id))
+                .then_with(|| left.drone_id.cmp(&right.drone_id))
+        });
+
+        let mut selected = HashMap::new();
+        for candidate in candidates {
+            selected
+                .entry(candidate.drone_id)
+                .or_insert_with(|| candidate);
+        }
+        let mut actions = selected.values().cloned().collect::<Vec<_>>();
+        actions.sort_by_key(|execution| execution.drone_id);
+
+        for action in &actions {
+            self.apply_rule_action(action)?;
+            self.coordination_rule_audit_log
+                .push(self.execution_as_audit_event(action, checked_at));
+            tracing::warn!(
+                "Coordination rule executed: {} on {}",
+                action.rule_name,
+                action.drone_id
+            );
+        }
+
+        Ok(actions)
+    }
+
+    fn action_to_execution(&self, action: &RuleAction) -> Option<CoordinationRuleExecutionKind> {
+        match action {
+            RuleAction::ChangeAltitude { delta } => {
+                Some(CoordinationRuleExecutionKind::AvoidanceAltitude { delta: *delta })
+            }
+            RuleAction::ReturnToBase => Some(CoordinationRuleExecutionKind::ReturnToBase),
+            RuleAction::LandImmediate => Some(CoordinationRuleExecutionKind::LandImmediate),
+            RuleAction::LandAtNearestEmergencySite => {
+                Some(CoordinationRuleExecutionKind::LandAtNearestEmergencySite)
+            }
+            RuleAction::ChangeSpeed { .. }
+            | RuleAction::FormFormation { .. }
+            | RuleAction::SendAlert { .. }
+            | RuleAction::Custom(_) => None,
+        }
+    }
+
+    fn execution_as_audit_event(
+        &self,
+        action: &CoordinationRuleExecution,
+        checked_at: DateTime<Utc>,
+    ) -> CoordinationRuleAuditEvent {
+        CoordinationRuleAuditEvent {
+            rule_id: action.rule_id,
+            rule_name: action.rule_name.clone(),
+            drone_id: Some(action.drone_id),
+            triggered_at: checked_at,
+            condition: action.condition.clone(),
+            action: match action.action {
+                CoordinationRuleExecutionKind::ReturnToBase => "ReturnToBase".to_string(),
+                CoordinationRuleExecutionKind::LandImmediate => "LandImmediate".to_string(),
+                CoordinationRuleExecutionKind::LandAtNearestEmergencySite => {
+                    "LandAtNearestEmergencySite".to_string()
+                }
+                CoordinationRuleExecutionKind::AvoidanceAltitude { .. } => {
+                    "AvoidanceAltitude".to_string()
+                }
+            },
+            message: action.message.clone(),
+        }
+    }
+
+    fn apply_rule_action(&mut self, action: &CoordinationRuleExecution) -> Result<()> {
+        let state = self
+            .active_drones
+            .get_mut(&action.drone_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Drone not registered for rule action: {}", action.drone_id)
+            })?;
+
+        match action.action {
+            CoordinationRuleExecutionKind::ReturnToBase => {
+                state.status = DroneOperationStatus::Returning;
+            }
+            CoordinationRuleExecutionKind::LandImmediate => {
+                state.status = DroneOperationStatus::Emergency;
+                state.position.altitude_m = 0.0;
+            }
+            CoordinationRuleExecutionKind::LandAtNearestEmergencySite => {
+                state.status = DroneOperationStatus::Emergency;
+                state.position.altitude_m = 0.0;
+            }
+            CoordinationRuleExecutionKind::AvoidanceAltitude { delta } => {
+                state.position.altitude_m = (state.position.altitude_m + delta).max(0.0);
             }
         }
 
         Ok(())
+    }
+
+    fn proximity_violations(&self, threshold: f64, states: &[&DroneState]) -> Vec<Uuid> {
+        let mut drone_ids = HashSet::new();
+        for (left_index, left_state) in states.iter().enumerate() {
+            for right_state in states.iter().skip(left_index + 1) {
+                if self.calculate_distance(&left_state.position, &right_state.position) < threshold
+                {
+                    drone_ids.insert(left_state.id);
+                    drone_ids.insert(right_state.id);
+                }
+            }
+        }
+        let mut sorted_ids = drone_ids.into_iter().collect::<Vec<_>>();
+        sorted_ids.sort();
+        sorted_ids
     }
 
     fn check_proximity_violations(&self, threshold: f64, states: &[&DroneState]) -> bool {
@@ -1218,6 +1395,25 @@ mod tests {
         }
     }
 
+    fn test_state_with_battery(
+        drone_id: Uuid,
+        position: GeoCoordinate,
+        last_update: DateTime<Utc>,
+        battery_level: f32,
+    ) -> DroneState {
+        DroneState {
+            id: drone_id,
+            position,
+            velocity: (0.0, 0.0, 0.0),
+            heading: 0.0,
+            battery_level,
+            status: DroneOperationStatus::ExecutingMission,
+            current_mission: None,
+            last_update,
+            communication_quality: 0.95,
+        }
+    }
+
     fn geo_offset(origin: &GeoCoordinate, east_m: f64, north_m: f64) -> GeoCoordinate {
         const EARTH_RADIUS_M: f64 = 6_371_000.0;
         let latitude = origin.latitude + (north_m / EARTH_RADIUS_M).to_degrees();
@@ -1405,6 +1601,105 @@ mod tests {
         assert_eq!(engine.coordination_rule_audit_log().len(), 1);
         assert!(json.contains("\"health\":\"TimedOut\""));
         assert!(json.contains("\"condition\":\"communication_loss\""));
+    }
+
+    #[tokio::test]
+    async fn evaluate_rules_applies_highest_priority_when_multiple_rules_match() {
+        let mut engine = CoordinationEngine::new();
+        let low_priority_rule_id = Uuid::from_u128(1001);
+        let high_priority_rule_id = Uuid::from_u128(1002);
+        engine.coordination_rules = vec![
+            CoordinationRule {
+                id: low_priority_rule_id,
+                name: "Low Battery Land".to_string(),
+                priority: 2,
+                condition: RuleCondition::BatteryLow { threshold: 0.2 },
+                action: RuleAction::LandAtNearestEmergencySite,
+                enabled: true,
+            },
+            CoordinationRule {
+                id: high_priority_rule_id,
+                name: "Comm Loss RTB".to_string(),
+                priority: 1,
+                condition: RuleCondition::CommunicationLoss { timeout_seconds: 1 },
+                action: RuleAction::ReturnToBase,
+                enabled: true,
+            },
+        ];
+
+        let drone_id = Uuid::from_u128(1003);
+        let stale_state = test_state_with_battery(
+            drone_id,
+            GeoCoordinate {
+                latitude: 40.0,
+                longitude: -74.0,
+                altitude_m: 100.0,
+            },
+            Utc::now() - chrono::Duration::seconds(20),
+            0.1,
+        );
+
+        engine
+            .register_drone(drone_id, stale_state.clone())
+            .await
+            .unwrap();
+
+        let actions = engine
+            .update_drone_state_with_rules(drone_id, stale_state)
+            .await
+            .unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].drone_id, drone_id);
+        assert_eq!(actions[0].priority, 1);
+        assert_eq!(
+            actions[0].action,
+            CoordinationRuleExecutionKind::ReturnToBase
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_rules_prefers_proximity_avoidance_over_low_battery() {
+        let mut engine = CoordinationEngine::new();
+        let checked_at = fixed_time();
+        let drone_a = Uuid::from_u128(1101);
+        let drone_b = Uuid::from_u128(1102);
+        let leader = GeoCoordinate {
+            latitude: 40.0,
+            longitude: -74.0,
+            altitude_m: 100.0,
+        };
+
+        engine
+            .register_drone(
+                drone_a,
+                test_state_with_battery(drone_a, geo_offset(&leader, 0.0, 0.0), checked_at, 0.1),
+            )
+            .await
+            .unwrap();
+        engine
+            .register_drone(
+                drone_b,
+                test_state_with_battery(drone_b, geo_offset(&leader, 10.0, 0.0), checked_at, 0.1),
+            )
+            .await
+            .unwrap();
+
+        let actions = engine
+            .update_drone_state_with_rules(
+                drone_a,
+                test_state_with_battery(drone_a, geo_offset(&leader, 0.0, 0.0), checked_at, 0.1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|action| matches!(
+            action.action,
+            CoordinationRuleExecutionKind::AvoidanceAltitude { .. }
+        )));
+        assert!(actions.iter().any(|action| action.drone_id == drone_a));
+        assert!(actions.iter().any(|action| action.drone_id == drone_b));
     }
 
     #[tokio::test]

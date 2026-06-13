@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use shared::RuntimeMode;
+use shared::{GeoCoordinate, RuntimeMode};
 use std::collections::HashMap;
 use std::env;
 use std::str::FromStr;
@@ -26,11 +26,13 @@ pub use coordinated_approval::{
     CoordinatedExecutionDryRun, CoordinatedExecutionStatus, OperatorApproval,
 };
 pub use coordination::{
-    CoordinationEngine, CoordinationRuleAuditEvent, CoordinationStatus, DroneLinkHealth,
-    DroneLinkStatus, DroneTelemetryFreshness, DroneTelemetrySnapshot, FormationAssignment,
+    CoordinationEngine, CoordinationRuleAuditEvent, CoordinationRuleExecution,
+    CoordinationRuleExecutionKind, CoordinationStatus, DroneLinkHealth, DroneLinkStatus,
+    DroneTelemetryFreshness, DroneTelemetrySnapshot, FormationAssignment,
     FormationOptimizationConfig, FormationOptimizationReport, LinkQualityReport,
     SwarmTelemetryReport, SwarmTelemetryStatus,
 };
+use coordination::{DroneOperationStatus, DroneState};
 pub use mission_assignment::{
     AssignmentBatchReport, AssignmentFailureReason, DroneAssignment, MissionAssignmentEngine,
     UnassignableMission,
@@ -879,8 +881,160 @@ impl MultiDroneControlService {
     }
 
     pub async fn update_drone_status(&self, status: DroneStatus) {
-        let mut statuses = self.drone_statuses.write().await;
-        statuses.insert(status.id, status);
+        let mut status = status;
+
+        let executed_rules = {
+            let drone_state = Self::drone_state_from_status(&status);
+            status.status =
+                Self::drone_operation_status_as_service_status(&drone_state.status, &status.status);
+
+            let mut engine = self.coordination_engine.write().await;
+            match engine
+                .update_drone_state_with_rules(drone_state.id, drone_state.clone())
+                .await
+            {
+                Ok(actions) => actions,
+                Err(_) => {
+                    if let Err(error) = engine
+                        .register_drone(drone_state.id, drone_state.clone())
+                        .await
+                    {
+                        tracing::warn!(
+                            "failed to register drone {} for coordination rules: {error}",
+                            drone_state.id
+                        );
+                        Vec::new()
+                    } else {
+                        engine
+                            .update_drone_state_with_rules(drone_state.id, drone_state.clone())
+                            .await
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(
+                                    "failed to evaluate coordination rules for drone {}: {error}",
+                                    drone_state.id
+                                );
+                                Vec::new()
+                            })
+                    }
+                }
+            }
+        };
+
+        let emergency_sites = {
+            let controller = self.controller.read().await;
+            controller
+                .global_constraints
+                .emergency_landing_sites
+                .clone()
+        };
+
+        {
+            let mut statuses = self.drone_statuses.write().await;
+            statuses.insert(status.id, status.clone());
+            for execution in executed_rules {
+                Self::apply_coordination_rule_execution(
+                    &mut statuses,
+                    &execution,
+                    &emergency_sites,
+                );
+            }
+        }
+    }
+
+    fn drone_state_from_status(status: &DroneStatus) -> DroneState {
+        DroneState {
+            id: status.id,
+            position: GeoCoordinate {
+                latitude: status.position.0,
+                longitude: status.position.1,
+                altitude_m: status.position.2,
+            },
+            velocity: status.velocity,
+            heading: 0.0,
+            battery_level: status.battery_level,
+            status: Self::drone_operation_status_from_service_status(&status.status),
+            current_mission: status.assigned_mission,
+            last_update: status.last_update,
+            communication_quality: 1.0,
+        }
+    }
+
+    fn drone_operation_status_from_service_status(status: &str) -> DroneOperationStatus {
+        match status.to_lowercase().as_str() {
+            "idle" => DroneOperationStatus::Idle,
+            "in_transit" => DroneOperationStatus::InTransit,
+            "returning" | "return_to_base" => DroneOperationStatus::Returning,
+            "emergency" | "emergency_landing" => DroneOperationStatus::Emergency,
+            "maintenance" => DroneOperationStatus::Maintenance,
+            "executing_mission" | "in_mission" => DroneOperationStatus::ExecutingMission,
+            _ => DroneOperationStatus::ExecutingMission,
+        }
+    }
+
+    fn drone_operation_status_as_service_status(
+        operation_status: &DroneOperationStatus,
+        fallback_status: &str,
+    ) -> String {
+        match operation_status {
+            DroneOperationStatus::Idle => "idle".to_string(),
+            DroneOperationStatus::InTransit => "in_transit".to_string(),
+            DroneOperationStatus::ExecutingMission => fallback_status.to_string(),
+            DroneOperationStatus::Returning => "return_to_base".to_string(),
+            DroneOperationStatus::Emergency => "emergency".to_string(),
+            DroneOperationStatus::Maintenance => "maintenance".to_string(),
+        }
+    }
+
+    fn apply_coordination_rule_execution(
+        statuses: &mut HashMap<Uuid, DroneStatus>,
+        execution: &CoordinationRuleExecution,
+        emergency_sites: &[(f64, f64)],
+    ) {
+        let Some(status) = statuses.get_mut(&execution.drone_id) else {
+            return;
+        };
+
+        match execution.action {
+            CoordinationRuleExecutionKind::ReturnToBase => {
+                status.status = "return_to_base".to_string();
+            }
+            CoordinationRuleExecutionKind::LandImmediate => {
+                status.status = "emergency".to_string();
+                status.position.2 = 0.0;
+            }
+            CoordinationRuleExecutionKind::LandAtNearestEmergencySite => {
+                if let Some((site_x, site_y)) = Self::nearest_emergency_site(
+                    (status.position.0, status.position.1),
+                    emergency_sites,
+                ) {
+                    status.status = "emergency".to_string();
+                    status.position = (site_x, site_y, 0.0);
+                } else {
+                    status.status = "emergency".to_string();
+                    status.position.2 = 0.0;
+                }
+            }
+            CoordinationRuleExecutionKind::AvoidanceAltitude { delta } => {
+                status.position.2 = (status.position.2 + delta).max(0.0);
+            }
+        }
+    }
+
+    fn nearest_emergency_site(
+        position: (f64, f64),
+        emergency_sites: &[(f64, f64)],
+    ) -> Option<(f64, f64)> {
+        emergency_sites.iter().copied().min_by(|left, right| {
+            Self::distance_2d(position, *left)
+                .partial_cmp(&Self::distance_2d(position, *right))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+
+    fn distance_2d(left: (f64, f64), right: (f64, f64)) -> f64 {
+        let dx = left.0 - right.0;
+        let dy = left.1 - right.1;
+        (dx * dx + dy * dy).sqrt()
     }
 
     pub async fn get_drone_status(&self, drone_id: &Uuid) -> Option<DroneStatus> {
@@ -1938,6 +2092,129 @@ mod tests {
         let service = MultiDroneControlService::new("Test Service".to_string());
         let drones = service.list_active_drones().await;
         assert!(drones.is_empty());
+    }
+
+    #[tokio::test]
+    async fn service_update_drone_status_applies_low_battery_rule_to_nearest_site() {
+        let service = MultiDroneControlService::new("Test Service".to_string());
+        {
+            let mut controller = service.controller.write().await;
+            controller.global_constraints.emergency_landing_sites =
+                vec![(10.0, 10.0), (100.0, 100.0)];
+        }
+        let drone_id = Uuid::new_v4();
+        let stale_position = (15.0, 12.0, 120.0);
+
+        service
+            .update_drone_status(DroneStatus {
+                id: drone_id,
+                position: stale_position,
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.1,
+                status: "executing_mission".to_string(),
+                assigned_mission: None,
+                last_update: Utc::now(),
+            })
+            .await;
+
+        let status = service.get_drone_status(&drone_id).await.unwrap();
+        let audit_log = service
+            .coordination_engine
+            .read()
+            .await
+            .coordination_rule_audit_log()
+            .to_vec();
+        let matching_audits = audit_log
+            .iter()
+            .filter(|event| event.drone_id == Some(drone_id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(status.status, "emergency");
+        assert_eq!(status.position, (10.0, 10.0, 0.0));
+        assert_eq!(matching_audits.len(), 1);
+        assert_eq!(matching_audits[0].action, "LandAtNearestEmergencySite");
+    }
+
+    #[tokio::test]
+    async fn service_update_drone_status_prefers_return_to_base_over_low_battery_on_conflict() {
+        let service = MultiDroneControlService::new("Test Service".to_string());
+        let drone_id = Uuid::new_v4();
+        let stale_time = Utc::now() - chrono::Duration::seconds(90);
+
+        service
+            .update_drone_status(DroneStatus {
+                id: drone_id,
+                position: (20.0, 20.0, 90.0),
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.1,
+                status: "executing_mission".to_string(),
+                assigned_mission: None,
+                last_update: stale_time,
+            })
+            .await;
+
+        let status = service.get_drone_status(&drone_id).await.unwrap();
+        let audit_log = service
+            .coordination_engine
+            .read()
+            .await
+            .coordination_rule_audit_log()
+            .to_vec();
+        let matching_audit = audit_log
+            .iter()
+            .find(|event| event.drone_id == Some(drone_id))
+            .expect("rule should be executed");
+
+        assert_eq!(status.status, "return_to_base");
+        assert_eq!(matching_audit.action, "ReturnToBase");
+    }
+
+    #[tokio::test]
+    async fn service_update_drone_status_applies_proximity_avoidance_for_neighbors() {
+        let service = MultiDroneControlService::new("Test Service".to_string());
+        let west_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        service
+            .update_drone_status(DroneStatus {
+                id: west_id,
+                position: (40.0, -74.0, 100.0),
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.8,
+                status: "executing_mission".to_string(),
+                assigned_mission: None,
+                last_update: now,
+            })
+            .await;
+        let east_id = Uuid::new_v4();
+        service
+            .update_drone_status(DroneStatus {
+                id: east_id,
+                position: (41.0, -74.0, 100.0),
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.8,
+                status: "executing_mission".to_string(),
+                assigned_mission: None,
+                last_update: now,
+            })
+            .await;
+        service
+            .update_drone_status(DroneStatus {
+                id: east_id,
+                position: (40.0002, -74.0003, 100.0),
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.1,
+                status: "executing_mission".to_string(),
+                assigned_mission: None,
+                last_update: now,
+            })
+            .await;
+
+        let west_status = service.get_drone_status(&west_id).await.unwrap();
+        let east_status = service.get_drone_status(&east_id).await.unwrap();
+
+        assert_eq!(west_status.position.2, 110.0);
+        assert_eq!(east_status.position.2, 110.0);
     }
 
     #[tokio::test]
