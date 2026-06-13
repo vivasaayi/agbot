@@ -1,5 +1,7 @@
 #include "agbot_flight_sim/TraceDiff.hpp"
 #include "agbot_flight_sim/SimulationOps.hpp"
+#include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/MissionValidation.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -10,13 +12,14 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
 std::string read_all(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
-        throw std::runtime_error("unable to open trace: " + path.string());
+        throw std::runtime_error("unable to open file: " + path.string());
     }
     std::ostringstream buffer;
     buffer << file.rdbuf();
@@ -53,8 +56,50 @@ std::string escape_json(std::string_view value) {
 void print_usage() {
     std::cout << "Usage:\n"
               << "  agbot-sim diff <trace-a.jsonl> <trace-b.jsonl>\n"
+              << "  agbot-sim validate <mission.json> [--max-altitude M] [--geofence min_x,max_x,min_z,max_z]\n"
               << "  agbot-sim health --seed N --last-manifest PATH [--trace-dir PATH] [--cache-dir PATH] [--retention-keep N]\n"
               << "  agbot-sim cache clear [--cache-dir PATH]\n";
+}
+
+std::vector<double> parse_double_csv(const std::string& text, std::size_t expected_count) {
+    std::vector<double> values;
+    std::stringstream stream(text);
+    std::string part;
+    while (std::getline(stream, part, ',')) {
+        values.push_back(std::stod(part));
+    }
+    if (values.size() != expected_count) {
+        throw std::runtime_error("expected " + std::to_string(expected_count) + " comma-separated values");
+    }
+    return values;
+}
+
+struct ValidationArgs {
+    std::filesystem::path mission_path;
+    agbot::flight_sim::MissionValidationConfig config;
+};
+
+ValidationArgs parse_validation_args(int argc, char** argv) {
+    if (argc < 3) {
+        throw std::runtime_error("validate requires a mission path");
+    }
+    ValidationArgs args;
+    args.mission_path = argv[2];
+    for (int index = 3; index < argc; ++index) {
+        const std::string current = argv[index];
+        if (current == "--max-altitude" && index + 1 < argc) {
+            args.config.safety.max_altitude_m = std::stod(argv[++index]);
+        } else if (current == "--geofence" && index + 1 < argc) {
+            const auto values = parse_double_csv(argv[++index], 4);
+            args.config.safety.min_x_m = values[0];
+            args.config.safety.max_x_m = values[1];
+            args.config.safety.min_z_m = values[2];
+            args.config.safety.max_z_m = values[3];
+        } else {
+            throw std::runtime_error("unknown validate argument: " + current);
+        }
+    }
+    return args;
 }
 
 struct HealthArgs {
@@ -107,6 +152,13 @@ int main(int argc, char** argv) {
         if (argc == 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
             print_usage();
             return 0;
+        }
+        if (argc >= 2 && std::string(argv[1]) == "validate") {
+            const ValidationArgs args = parse_validation_args(argc, argv);
+            const auto mission = agbot::flight_sim::MissionLoader::load_from_text(read_all(args.mission_path));
+            const auto report = agbot::flight_sim::validate_mission(mission, args.config);
+            std::cout << report.to_json() << "\n";
+            return report.blocked ? 1 : 0;
         }
         if (argc >= 2 && std::string(argv[1]) == "health") {
             const HealthArgs args = parse_health_args(argc, argv);

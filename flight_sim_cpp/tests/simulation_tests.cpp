@@ -6,6 +6,7 @@
 #include "agbot_flight_sim/LidarSimulator.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/MissionPreview.hpp"
+#include "agbot_flight_sim/MissionValidation.hpp"
 #include "agbot_flight_sim/MultispectralCamera.hpp"
 #include "agbot_flight_sim/SensorModel.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
@@ -199,6 +200,49 @@ void test_mission_preview_overlay_reports_missing_boundary() {
     assert(overlay.status == "no boundary");
     assert(overlay.boundary_local.empty());
     assert(overlay.coverage_fraction == 0.0);
+}
+
+void test_mission_validation_report_is_deterministic_and_reports_metrics() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto report = agbot::flight_sim::validate_mission(mission);
+    const auto repeat = agbot::flight_sim::validate_mission(mission);
+
+    assert(report.to_json() == repeat.to_json());
+    assert(report.mission_name == "Unit Test Mission");
+    assert(report.waypoint_count == 4);
+    assert(report.estimated_duration_s > 0.0);
+    assert(report.estimated_battery_used_percent > 0.0);
+    assert(report.battery_margin_percent > 0.0);
+    assert(report.terrain_gap_count == 0);
+    assert(report.terrain_policy == "not_georeferenced");
+    assert(!report.blocked);
+    assert(report.to_json().find("\"blocked\":false") != std::string::npos);
+}
+
+void test_mission_validation_reports_terrain_gaps_as_runnable_with_gaps() {
+    const auto mission = MissionLoader::load_from_text(kGeoMissionJson);
+    const auto report = agbot::flight_sim::validate_mission(mission);
+
+    assert(report.terrain_gap_count > 0);
+    assert(report.terrain_policy == "runnable_with_gaps");
+    assert(!report.blocked);
+    assert(report.to_json().find("\"terrain_flat_fallback\"") != std::string::npos);
+}
+
+void test_mission_validation_blocks_waypoints_outside_geofence() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    agbot::flight_sim::MissionValidationConfig config;
+    config.safety.min_x_m = -5.0;
+    config.safety.max_x_m = 5.0;
+    config.safety.min_z_m = -5.0;
+    config.safety.max_z_m = 5.0;
+
+    const auto report = agbot::flight_sim::validate_mission(mission, config);
+
+    assert(report.blocked);
+    assert(!report.issues.empty());
+    assert(report.to_json().find("\"geofence_violation\"") != std::string::npos);
+    assert(report.to_json().find("\"severity\":\"blocker\"") != std::string::npos);
 }
 
 void test_mission_completes() {
@@ -1453,6 +1497,9 @@ int main() {
     test_loads_geodetic_mission();
     test_mission_preview_overlay_aligns_field_boundary_and_coverage();
     test_mission_preview_overlay_reports_missing_boundary();
+    test_mission_validation_report_is_deterministic_and_reports_metrics();
+    test_mission_validation_reports_terrain_gaps_as_runnable_with_gaps();
+    test_mission_validation_blocks_waypoints_outside_geofence();
     test_mission_completes();
     test_simulation_events_follow_documented_normal_order();
     test_simulation_emergency_event_suppresses_normal_events();
