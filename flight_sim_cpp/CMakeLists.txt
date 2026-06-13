@@ -20,6 +20,7 @@ add_library(agbot_flight_sim_core
     src/MissionPreview.cpp
     src/MissionValidation.cpp
     src/MultispectralCamera.cpp
+    src/RayTracedCamera.cpp
     src/SafetyRules.cpp
     src/SceneSynthesis.cpp
     src/SensorModel.cpp

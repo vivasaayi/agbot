@@ -10,6 +10,7 @@
 #include "agbot_flight_sim/MissionPreview.hpp"
 #include "agbot_flight_sim/MissionValidation.hpp"
 #include "agbot_flight_sim/MultispectralCamera.hpp"
+#include "agbot_flight_sim/RayTracedCamera.hpp"
 #include "agbot_flight_sim/SensorModel.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
 #include "agbot_flight_sim/SceneSynthesis.hpp"
@@ -881,6 +882,77 @@ void test_scene_synthesis_marks_missing_source_coverage_unpopulated() {
     assert(manifest.unpopulated_areas[0].reason == "missing_source_coverage");
     assert(manifest.to_json().find("\"status\":\"unpopulated\"") != std::string::npos);
     assert(manifest.to_json().find("missing_source_coverage") != std::string::npos);
+}
+
+agbot::flight_sim::SceneSynthesisManifest test_scene_manifest_for_camera(
+    const agbot::flight_sim::TerrainProfile& profile) {
+    agbot::flight_sim::SceneSynthesisInput input;
+    input.seed = 42;
+    input.profile = profile;
+    input.buildings.push_back({
+        "osm-building-center",
+        "equipment_shed",
+        {
+            {40.00042, -96.00058, 0.0},
+            {40.00042, -96.00042, 0.0},
+            {40.00058, -96.00042, 0.0},
+            {40.00058, -96.00058, 0.0},
+            {40.00042, -96.00058, 0.0},
+        },
+        6.0,
+    });
+    return agbot::flight_sim::synthesize_scene_manifest(input);
+}
+
+void test_ray_traced_camera_projects_scene_object_with_reproducible_depth() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    const auto profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 16);
+    const auto scene = test_scene_manifest_for_camera(profile);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {0.0, 40.0, 0.0};
+    state.mission_time_s = 2.5;
+
+    agbot::flight_sim::RayTracedCameraConfig config;
+    config.width = 5;
+    config.height = 5;
+    config.horizontal_fov_deg = 50.0;
+    config.vertical_fov_deg = 50.0;
+
+    const auto frame = agbot::flight_sim::raytrace_camera_frame(state, profile, scene, config);
+    const auto repeat = agbot::flight_sim::raytrace_camera_frame(state, profile, scene, config);
+
+    assert(frame.status == "ok");
+    assert(frame.width == 5);
+    assert(frame.height == 5);
+    assert(frame.frame_hash == repeat.frame_hash);
+    assert(frame.to_json() == repeat.to_json());
+    const auto& center_pixel = frame.pixel_at(2, 2);
+    const auto& corner_pixel = frame.pixel_at(0, 0);
+    assert(center_pixel.object_id == "scene_object:" + agbot::flight_sim::to_hex(center_pixel.object_seed));
+    assert(center_pixel.class_name == "equipment_shed");
+    assert(center_pixel.depth_m < corner_pixel.depth_m);
+    assert(frame.to_json().find("\"scene_hash\":\"" + scene.scene_hash + "\"") != std::string::npos);
+    assert(frame.to_json().find("\"pose\":{\"x\":") != std::string::npos);
+}
+
+void test_ray_traced_camera_reports_no_scene_coverage_outside_extent() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    const auto profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 16);
+    const auto scene = test_scene_manifest_for_camera(profile);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {10'000.0, 40.0, 10'000.0};
+    state.mission_time_s = 3.0;
+
+    const auto frame = agbot::flight_sim::raytrace_camera_frame(state, profile, scene, {});
+
+    assert(frame.status == "no_scene_coverage");
+    assert(frame.pixels.empty());
+    assert(frame.reason.find("outside scene extent") != std::string::npos);
+    assert(frame.to_json().find("\"status\":\"no_scene_coverage\"") != std::string::npos);
 }
 
 void test_builds_terrain_mesh_from_heightmap() {
@@ -1758,6 +1830,8 @@ int main() {
     test_missing_map_texture_tile_is_marked_unavailable_fallback();
     test_scene_synthesis_manifest_is_seeded_and_georeferenced();
     test_scene_synthesis_marks_missing_source_coverage_unpopulated();
+    test_ray_traced_camera_projects_scene_object_with_reproducible_depth();
+    test_ray_traced_camera_reports_no_scene_coverage_outside_extent();
     test_builds_terrain_mesh_from_heightmap();
     test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance();
     test_lidar_raycast_seeded_cloud_json_is_reproducible();
