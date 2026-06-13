@@ -286,6 +286,55 @@ pub struct LidarGroundSegmentationResult {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LidarObjectClusteringParams {
+    pub cluster_distance_m: f64,
+    pub min_cluster_size: usize,
+}
+
+impl Default for LidarObjectClusteringParams {
+    fn default() -> Self {
+        Self {
+            cluster_distance_m: 1.0,
+            min_cluster_size: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LidarClusterBoundingBox {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub min_z: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+    pub max_z: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarObjectCluster {
+    pub id: usize,
+    pub point_indices: Vec<usize>,
+    pub point_count: usize,
+    pub bbox: LidarClusterBoundingBox,
+    pub centroid: LidarPoint3,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarObjectClusteringEvidence {
+    pub points_in: usize,
+    pub non_ground_points: usize,
+    pub clusters_emitted: usize,
+    pub noise_points: usize,
+    pub params: LidarObjectClusteringParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarObjectClusteringResult {
+    pub clusters: Vec<LidarObjectCluster>,
+    pub evidence: LidarObjectClusteringEvidence,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct LidarElevationRasterParams {
     pub resolution_m: f64,
     pub nodata: f32,
@@ -922,6 +971,150 @@ impl LidarMapper {
             ));
         }
         Ok(())
+    }
+
+    pub fn cluster_non_ground_objects(
+        &self,
+        points: &[LidarPoint3],
+        classifications: &[LidarPointClassification],
+        params: LidarObjectClusteringParams,
+    ) -> AgroResult<LidarObjectClusteringResult> {
+        Self::validate_object_clustering_params(params)?;
+        if points.len() != classifications.len() {
+            return Err(shared::error::AgroError::Processing(format!(
+                "LiDAR object clustering expected {} classifications for {} points",
+                points.len(),
+                classifications.len()
+            )));
+        }
+        for point in points {
+            if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
+                return Err(shared::error::AgroError::Processing(
+                    "LiDAR object clustering requires finite point coordinates".into(),
+                ));
+            }
+        }
+
+        let mut non_ground_indices = Vec::new();
+        for (expected_index, classification) in classifications.iter().enumerate() {
+            if classification.point_index != expected_index {
+                return Err(shared::error::AgroError::Processing(format!(
+                    "LiDAR object clustering classification index mismatch at point {expected_index}"
+                )));
+            }
+            if classification.class == LidarPointClass::NonGround {
+                non_ground_indices.push(expected_index);
+            }
+        }
+
+        let mut visited = vec![false; points.len()];
+        let mut clusters = Vec::new();
+        let mut noise_points = 0usize;
+
+        for &seed_index in &non_ground_indices {
+            if visited[seed_index] {
+                continue;
+            }
+
+            let mut queue = vec![seed_index];
+            let mut cursor = 0usize;
+            visited[seed_index] = true;
+            while cursor < queue.len() {
+                let current_index = queue[cursor];
+                cursor += 1;
+                for &candidate_index in &non_ground_indices {
+                    if visited[candidate_index] {
+                        continue;
+                    }
+                    if Self::point_distance(points[current_index], points[candidate_index])
+                        <= params.cluster_distance_m
+                    {
+                        visited[candidate_index] = true;
+                        queue.push(candidate_index);
+                    }
+                }
+            }
+
+            queue.sort_unstable();
+            if queue.len() >= params.min_cluster_size {
+                clusters.push(Self::build_object_cluster(clusters.len(), &queue, points)?);
+            } else {
+                noise_points += queue.len();
+            }
+        }
+
+        Ok(LidarObjectClusteringResult {
+            evidence: LidarObjectClusteringEvidence {
+                points_in: points.len(),
+                non_ground_points: non_ground_indices.len(),
+                clusters_emitted: clusters.len(),
+                noise_points,
+                params,
+            },
+            clusters,
+        })
+    }
+
+    fn validate_object_clustering_params(params: LidarObjectClusteringParams) -> AgroResult<()> {
+        if !params.cluster_distance_m.is_finite() || params.cluster_distance_m <= 0.0 {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR object clustering requires a positive finite cluster distance".into(),
+            ));
+        }
+        if params.min_cluster_size == 0 {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR object clustering requires min_cluster_size >= 1".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn build_object_cluster(
+        id: usize,
+        point_indices: &[usize],
+        points: &[LidarPoint3],
+    ) -> AgroResult<LidarObjectCluster> {
+        let first_index = *point_indices.first().ok_or_else(|| {
+            shared::error::AgroError::Processing(
+                "LiDAR object clustering cannot build an empty cluster".into(),
+            )
+        })?;
+        let first = points[first_index];
+        let mut bbox = LidarClusterBoundingBox {
+            min_x: first.x,
+            min_y: first.y,
+            min_z: first.z,
+            max_x: first.x,
+            max_y: first.y,
+            max_z: first.z,
+        };
+        let mut sum = Vector3::zeros();
+        for &point_index in point_indices {
+            let point = points[point_index];
+            bbox.min_x = bbox.min_x.min(point.x);
+            bbox.min_y = bbox.min_y.min(point.y);
+            bbox.min_z = bbox.min_z.min(point.z);
+            bbox.max_x = bbox.max_x.max(point.x);
+            bbox.max_y = bbox.max_y.max(point.y);
+            bbox.max_z = bbox.max_z.max(point.z);
+            sum += point.as_vector();
+        }
+        let centroid_vector = sum / point_indices.len() as f64;
+
+        Ok(LidarObjectCluster {
+            id,
+            point_indices: point_indices.to_vec(),
+            point_count: point_indices.len(),
+            bbox,
+            centroid: LidarPoint3::new(centroid_vector.x, centroid_vector.y, centroid_vector.z),
+        })
+    }
+
+    fn point_distance(left: LidarPoint3, right: LidarPoint3) -> f64 {
+        let dx = left.x - right.x;
+        let dy = left.y - right.y;
+        let dz = left.z - right.z;
+        dx.hypot(dy).hypot(dz)
     }
 
     pub fn build_elevation_products(
@@ -2393,6 +2586,90 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("no ground surface"));
+    }
+
+    #[test]
+    fn cluster_non_ground_points_finds_two_objects_with_bbox_centroids() {
+        let mapper = test_mapper();
+        let points = vec![
+            LidarPoint3::new(0.0, 0.0, 1.0),
+            LidarPoint3::new(0.2, 0.0, 1.2),
+            LidarPoint3::new(0.0, 0.2, 1.1),
+            LidarPoint3::new(5.0, 5.0, 2.0),
+            LidarPoint3::new(5.2, 5.0, 2.1),
+            LidarPoint3::new(5.0, 5.2, 2.2),
+            LidarPoint3::new(10.0, 10.0, 0.0),
+        ];
+        let classifications = vec![
+            classification(0, LidarPointClass::NonGround),
+            classification(1, LidarPointClass::NonGround),
+            classification(2, LidarPointClass::NonGround),
+            classification(3, LidarPointClass::NonGround),
+            classification(4, LidarPointClass::NonGround),
+            classification(5, LidarPointClass::NonGround),
+            classification(6, LidarPointClass::Ground),
+        ];
+        let params = LidarObjectClusteringParams {
+            cluster_distance_m: 0.5,
+            min_cluster_size: 2,
+        };
+
+        let result = mapper
+            .cluster_non_ground_objects(&points, &classifications, params)
+            .unwrap();
+
+        assert_eq!(result.clusters.len(), 2);
+        assert_eq!(result.evidence.points_in, 7);
+        assert_eq!(result.evidence.non_ground_points, 6);
+        assert_eq!(result.evidence.noise_points, 0);
+        assert_eq!(result.evidence.params, params);
+
+        let first = &result.clusters[0];
+        assert_eq!(first.id, 0);
+        assert_eq!(first.point_count, 3);
+        assert_eq!(first.point_indices, vec![0, 1, 2]);
+        assert!((first.centroid.x - (0.2 / 3.0)).abs() <= 1.0e-9);
+        assert!((first.centroid.y - (0.2 / 3.0)).abs() <= 1.0e-9);
+        assert!((first.centroid.z - 1.1).abs() <= 1.0e-9);
+        assert_eq!(first.bbox.min_x, 0.0);
+        assert_eq!(first.bbox.max_x, 0.2);
+        assert_eq!(first.bbox.min_z, 1.0);
+        assert_eq!(first.bbox.max_z, 1.2);
+
+        let second = &result.clusters[1];
+        assert_eq!(second.id, 1);
+        assert_eq!(second.point_count, 3);
+        assert_eq!(second.point_indices, vec![3, 4, 5]);
+        assert!((second.centroid.x - (15.2 / 3.0)).abs() <= 1.0e-9);
+        assert!((second.centroid.y - (15.2 / 3.0)).abs() <= 1.0e-9);
+    }
+
+    #[test]
+    fn cluster_non_ground_points_drops_subthreshold_noise() {
+        let mapper = test_mapper();
+        let points = vec![
+            LidarPoint3::new(0.0, 0.0, 1.0),
+            LidarPoint3::new(0.2, 0.0, 1.0),
+            LidarPoint3::new(5.0, 5.0, 2.0),
+        ];
+        let classifications = vec![
+            classification(0, LidarPointClass::NonGround),
+            classification(1, LidarPointClass::NonGround),
+            classification(2, LidarPointClass::NonGround),
+        ];
+        let params = LidarObjectClusteringParams {
+            cluster_distance_m: 0.5,
+            min_cluster_size: 2,
+        };
+
+        let result = mapper
+            .cluster_non_ground_objects(&points, &classifications, params)
+            .unwrap();
+
+        assert_eq!(result.clusters.len(), 1);
+        assert_eq!(result.clusters[0].point_indices, vec![0, 1]);
+        assert_eq!(result.evidence.noise_points, 1);
+        assert_eq!(result.evidence.clusters_emitted, 1);
     }
 
     #[test]
