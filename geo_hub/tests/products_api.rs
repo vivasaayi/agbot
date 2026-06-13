@@ -5060,6 +5060,164 @@ async fn crop_intelligence_unregistered_model_inference_is_rejected_and_audited(
 }
 
 #[tokio::test]
+async fn crop_intelligence_inference_run_submit_status_and_result_roundtrip() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "crop-run-scene";
+    seed_orthomosaic_publish_product(&ctx, scene_id, "orthomosaic").await?;
+    post_orthomosaic_publish_gate(&ctx, scene_id, "orthomosaic", "publishable").await?;
+
+    let submit = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/inference-runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "run_id": "crop-run-001",
+                        "mosaic_ref": format!("{scene_id}:orthomosaic"),
+                        "field_id": "ortho-field-1",
+                        "season_id": "season-2026"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(submit.status(), StatusCode::OK);
+    let body = to_bytes(submit.into_body(), 64 * 1024).await?;
+    let queued: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        queued.get("status").and_then(|value| value.as_str()),
+        Some("queued")
+    );
+    assert_eq!(
+        queued.get("model_version").and_then(|value| value.as_str()),
+        Some("deterministic")
+    );
+
+    let status = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/crop-intelligence/inference-runs/crop-run-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(status.status(), StatusCode::OK);
+
+    let early_result = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/crop-intelligence/inference-runs/crop-run-001/result")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(early_result.status(), StatusCode::BAD_REQUEST);
+
+    for status in ["running", "completed"] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/crop-intelligence/inference-runs/crop-run-001/status")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "status": status }).to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let result = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/crop-intelligence/inference-runs/crop-run-001/result")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(result.status(), StatusCode::OK);
+    let body = to_bytes(result.into_body(), 64 * 1024).await?;
+    let completed: serde_json::Value = serde_json::from_slice(&body)?;
+    let expected_mosaic_ref = format!("{scene_id}:orthomosaic");
+    assert_eq!(
+        completed.get("status").and_then(|value| value.as_str()),
+        Some("completed")
+    );
+    assert_eq!(
+        completed.get("mosaic_ref").and_then(|value| value.as_str()),
+        Some(expected_mosaic_ref.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn crop_intelligence_inference_run_rejects_unpublished_mosaic_without_writing() -> Result<()>
+{
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "crop-run-unpublished";
+    seed_orthomosaic_publish_product(&ctx, scene_id, "orthomosaic").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/inference-runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "run_id": "crop-run-blocked",
+                        "mosaic_ref": format!("{scene_id}:orthomosaic"),
+                        "field_id": "ortho-field-1",
+                        "season_id": "season-2026"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("not published"));
+
+    let run_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crop_inference_runs WHERE run_id = 'crop-run-blocked'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(run_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn crop_intelligence_verifies_and_corrects_detections_with_label_feedback() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

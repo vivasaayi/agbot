@@ -988,6 +988,25 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS crop_inference_runs (
+            run_id TEXT PRIMARY KEY,
+            mosaic_ref TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            model_id TEXT,
+            model_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            failure_reason_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS crop_detection_verifications (
             detection_id TEXT PRIMARY KEY,
             task TEXT NOT NULL,
@@ -1487,6 +1506,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_crop_model_events_model_version
         ON crop_model_events(model_id, version);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_crop_inference_runs_field_season
+        ON crop_inference_runs(field_id, season_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_crop_inference_runs_mosaic_ref
+        ON crop_inference_runs(mosaic_ref);
         "#,
     )
     .execute(pool)

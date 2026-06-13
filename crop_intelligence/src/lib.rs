@@ -85,6 +85,69 @@ pub struct ModelGateResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceRunStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl InferenceRunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InferenceRunStatus::Queued => "queued",
+            InferenceRunStatus::Running => "running",
+            InferenceRunStatus::Completed => "completed",
+            InferenceRunStatus::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for InferenceRunStatus {
+    type Err = InferenceRunError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "queued" => Ok(InferenceRunStatus::Queued),
+            "running" => Ok(InferenceRunStatus::Running),
+            "completed" => Ok(InferenceRunStatus::Completed),
+            "failed" => Ok(InferenceRunStatus::Failed),
+            _ => Err(InferenceRunError::UnsupportedStatus {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct InferenceRunSubmissionRequest {
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub mosaic_ref: String,
+    pub field_id: String,
+    pub season_id: String,
+    #[serde(default)]
+    pub model: Option<InferenceModelReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferenceRunRecord {
+    pub run_id: String,
+    pub mosaic_ref: String,
+    pub field_id: String,
+    pub season_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    pub model_version: String,
+    pub status: InferenceRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason_code: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlantCountConfig {
     pub min_component_pixels: usize,
 }
@@ -473,6 +536,38 @@ pub enum CropModelRegistryError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InferenceRunError {
+    #[error("run_id cannot be empty")]
+    EmptyRunId,
+    #[error("mosaic_ref cannot be empty")]
+    EmptyMosaicRef,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("season_id cannot be empty")]
+    EmptySeasonId,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("updated_at cannot be empty")]
+    EmptyUpdatedAt,
+    #[error("failed inference runs require a failure_reason_code")]
+    EmptyFailureReason,
+    #[error("non-failed inference runs cannot carry a failure_reason_code")]
+    UnexpectedFailureReason,
+    #[error("inference run status {value} is invalid")]
+    UnsupportedStatus { value: String },
+    #[error("invalid inference run transition {from:?} -> {to:?}")]
+    InvalidTransition {
+        from: InferenceRunStatus,
+        to: InferenceRunStatus,
+    },
+    #[error("inference model gate failed: {source}")]
+    ModelGate {
+        #[source]
+        source: CropModelRegistryError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StandCountError {
     #[error("field_id cannot be empty")]
     EmptyFieldId,
@@ -689,6 +784,78 @@ pub fn validate_model_reference(
         version,
         registered,
     })
+}
+
+pub fn build_inference_run_record(
+    request: InferenceRunSubmissionRequest,
+    generated_run_id: String,
+    created_at: String,
+    model_registered: Option<bool>,
+) -> Result<InferenceRunRecord, InferenceRunError> {
+    let run_id = normalize_optional_run_text(request.run_id)
+        .or_else(|| normalize_run_text(generated_run_id))
+        .ok_or(InferenceRunError::EmptyRunId)?;
+    let mosaic_ref =
+        normalize_run_text(request.mosaic_ref).ok_or(InferenceRunError::EmptyMosaicRef)?;
+    let field_id = normalize_run_text(request.field_id).ok_or(InferenceRunError::EmptyFieldId)?;
+    let season_id =
+        normalize_run_text(request.season_id).ok_or(InferenceRunError::EmptySeasonId)?;
+    let created_at = normalize_run_text(created_at).ok_or(InferenceRunError::EmptyCreatedAt)?;
+    let (model_id, model_version) = if let Some(model) = request.model {
+        let gate = validate_model_reference(model, model_registered.unwrap_or(false))
+            .map_err(|source| InferenceRunError::ModelGate { source })?;
+        (Some(gate.model_id), gate.version)
+    } else {
+        (None, "deterministic".to_string())
+    };
+
+    Ok(InferenceRunRecord {
+        run_id,
+        mosaic_ref,
+        field_id,
+        season_id,
+        model_id,
+        model_version,
+        status: InferenceRunStatus::Queued,
+        failure_reason_code: None,
+        created_at: created_at.clone(),
+        updated_at: created_at,
+    })
+}
+
+pub fn transition_inference_run_status(
+    mut record: InferenceRunRecord,
+    next_status: InferenceRunStatus,
+    failure_reason_code: Option<String>,
+    updated_at: String,
+) -> Result<InferenceRunRecord, InferenceRunError> {
+    validate_inference_run_transition(record.status, next_status)?;
+    let updated_at = normalize_run_text(updated_at).ok_or(InferenceRunError::EmptyUpdatedAt)?;
+    let failure_reason_code = normalize_optional_run_text(failure_reason_code);
+    if next_status == InferenceRunStatus::Failed && failure_reason_code.is_none() {
+        return Err(InferenceRunError::EmptyFailureReason);
+    }
+    if next_status != InferenceRunStatus::Failed && failure_reason_code.is_some() {
+        return Err(InferenceRunError::UnexpectedFailureReason);
+    }
+
+    record.status = next_status;
+    record.failure_reason_code = failure_reason_code;
+    record.updated_at = updated_at;
+
+    Ok(record)
+}
+
+pub fn validate_inference_run_transition(
+    current: InferenceRunStatus,
+    next: InferenceRunStatus,
+) -> Result<(), InferenceRunError> {
+    match (current, next) {
+        (InferenceRunStatus::Queued, InferenceRunStatus::Running)
+        | (InferenceRunStatus::Running, InferenceRunStatus::Completed)
+        | (InferenceRunStatus::Running, InferenceRunStatus::Failed) => Ok(()),
+        (from, to) => Err(InferenceRunError::InvalidTransition { from, to }),
+    }
 }
 
 pub fn run_stand_count(
@@ -1210,6 +1377,15 @@ fn normalize_required_text(
     }
 }
 
+fn normalize_run_text(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn normalize_optional_run_text(value: Option<String>) -> Option<String> {
+    value.and_then(normalize_run_text)
+}
+
 fn validate_metrics(metrics: &serde_json::Value) -> Result<(), CropModelRegistryError> {
     match metrics.as_object() {
         Some(metrics) if !metrics.is_empty() => Ok(()),
@@ -1648,16 +1824,18 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_detection_verification, assemble_detection_finding, build_model_version_record,
-        run_canopy_cover, run_disease_lesion_detection, run_stand_count, run_weed_mapping,
+        apply_detection_verification, assemble_detection_finding, build_inference_run_record,
+        build_model_version_record, run_canopy_cover, run_disease_lesion_detection,
+        run_stand_count, run_weed_mapping, transition_inference_run_status,
         validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
         CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
         CropDetectionVerificationAction, CropDetectionVerificationRequest, CropModelRegistryError,
         CropModelTask, DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
-        FindingPromotionRequest, InferenceModelReference, ModelVersionRegistrationRequest,
-        PlantCountConfig, PlantCountTile, PlantCountZeroReason, WeedMappingConfig,
-        WeedMappingError, WeedZoneCandidate,
+        FindingPromotionRequest, InferenceModelReference, InferenceRunError, InferenceRunStatus,
+        InferenceRunSubmissionRequest, ModelVersionRegistrationRequest, PlantCountConfig,
+        PlantCountTile, PlantCountZeroReason, WeedMappingConfig, WeedMappingError,
+        WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -1731,6 +1909,145 @@ mod tests {
             CropModelRegistryError::UnregisteredModel {
                 model_id: "unknown-model".to_string(),
                 version: "v0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn deterministic_inference_run_is_queued_and_transitions_in_order() {
+        let run = build_inference_run_record(
+            InferenceRunSubmissionRequest {
+                run_id: Some(" run-001 ".to_string()),
+                mosaic_ref: " mosaic:scene-1:orthomosaic ".to_string(),
+                field_id: " field-1 ".to_string(),
+                season_id: " season-2026 ".to_string(),
+                model: None,
+            },
+            "generated-run".to_string(),
+            " 2026-06-13T15:00:00Z ".to_string(),
+            None,
+        )
+        .expect("deterministic run should be queued");
+
+        assert_eq!(run.run_id, "run-001");
+        assert_eq!(run.mosaic_ref, "mosaic:scene-1:orthomosaic");
+        assert_eq!(run.field_id, "field-1");
+        assert_eq!(run.season_id, "season-2026");
+        assert_eq!(run.model_id, None);
+        assert_eq!(run.model_version, "deterministic");
+        assert_eq!(run.status, InferenceRunStatus::Queued);
+
+        let running = transition_inference_run_status(
+            run,
+            InferenceRunStatus::Running,
+            None,
+            "2026-06-13T15:01:00Z".to_string(),
+        )
+        .expect("queued run should start");
+        let completed = transition_inference_run_status(
+            running,
+            InferenceRunStatus::Completed,
+            None,
+            "2026-06-13T15:05:00Z".to_string(),
+        )
+        .expect("running run should complete");
+
+        assert_eq!(completed.status, InferenceRunStatus::Completed);
+        assert_eq!(completed.failure_reason_code, None);
+        assert_eq!(completed.updated_at, "2026-06-13T15:05:00Z");
+    }
+
+    #[test]
+    fn inference_run_failure_records_reason_code() {
+        let run = build_inference_run_record(
+            InferenceRunSubmissionRequest {
+                run_id: Some("run-002".to_string()),
+                mosaic_ref: "mosaic:scene-1:orthomosaic".to_string(),
+                field_id: "field-1".to_string(),
+                season_id: "season-2026".to_string(),
+                model: None,
+            },
+            "generated-run".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+            None,
+        )
+        .expect("run should be queued");
+        let running = transition_inference_run_status(
+            run,
+            InferenceRunStatus::Running,
+            None,
+            "2026-06-13T15:01:00Z".to_string(),
+        )
+        .expect("run should start");
+        let failed = transition_inference_run_status(
+            running,
+            InferenceRunStatus::Failed,
+            Some("tile_decode_failed".to_string()),
+            "2026-06-13T15:02:00Z".to_string(),
+        )
+        .expect("running run can fail");
+
+        assert_eq!(failed.status, InferenceRunStatus::Failed);
+        assert_eq!(
+            failed.failure_reason_code.as_deref(),
+            Some("tile_decode_failed")
+        );
+    }
+
+    #[test]
+    fn inference_run_rejects_invalid_transition_and_unregistered_model() {
+        let run = build_inference_run_record(
+            InferenceRunSubmissionRequest {
+                run_id: Some("run-003".to_string()),
+                mosaic_ref: "mosaic:scene-1:orthomosaic".to_string(),
+                field_id: "field-1".to_string(),
+                season_id: "season-2026".to_string(),
+                model: None,
+            },
+            "generated-run".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+            None,
+        )
+        .expect("run should be queued");
+        let transition_error = transition_inference_run_status(
+            run,
+            InferenceRunStatus::Completed,
+            None,
+            "2026-06-13T15:01:00Z".to_string(),
+        )
+        .expect_err("queued run cannot skip running");
+        assert_eq!(
+            transition_error,
+            InferenceRunError::InvalidTransition {
+                from: InferenceRunStatus::Queued,
+                to: InferenceRunStatus::Completed
+            }
+        );
+
+        let model_error = build_inference_run_record(
+            InferenceRunSubmissionRequest {
+                run_id: Some("run-004".to_string()),
+                mosaic_ref: "mosaic:scene-1:orthomosaic".to_string(),
+                field_id: "field-1".to_string(),
+                season_id: "season-2026".to_string(),
+                model: Some(InferenceModelReference {
+                    model_id: "unknown".to_string(),
+                    version: "v0".to_string(),
+                }),
+            },
+            "generated-run".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+            Some(false),
+        )
+        .expect_err("unknown model cannot create an inference run");
+
+        assert_eq!(
+            model_error,
+            InferenceRunError::ModelGate {
+                source: CropModelRegistryError::UnregisteredModel {
+                    model_id: "unknown".to_string(),
+                    version: "v0".to_string()
+                }
             }
         );
     }

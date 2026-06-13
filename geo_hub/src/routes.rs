@@ -28,13 +28,15 @@ use compliance::{
     CreateComplianceRecordRequest,
 };
 use crop_intelligence::{
-    apply_detection_verification, assemble_detection_finding, build_model_version_record,
+    apply_detection_verification, assemble_detection_finding, build_inference_run_record,
+    build_model_version_record, transition_inference_run_status,
     validate_detection_finding_promotion, validate_model_reference, CropDetectionCorrectionLabel,
     CropDetectionFindingError, CropDetectionFindingRecord, CropDetectionFindingRequest,
     CropDetectionVerificationAction, CropDetectionVerificationError,
     CropDetectionVerificationRecord, CropDetectionVerificationRequest, CropModelRegistryError,
     CropModelTask, DetectionVerificationState, DetectionZoneGeometry, FindingPromotionDecision,
-    FindingPromotionError, FindingPromotionRequest, InferenceModelReference, ModelGateResponse,
+    FindingPromotionError, FindingPromotionRequest, InferenceModelReference, InferenceRunError,
+    InferenceRunRecord, InferenceRunStatus, InferenceRunSubmissionRequest, ModelGateResponse,
     ModelVersionRecord, ModelVersionRegistrationRequest,
 };
 use fleet_health::{
@@ -581,6 +583,13 @@ pub struct UpdateReconstructionStatusRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CropModelListQuery {
     pub task: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateCropInferenceRunStatusRequest {
+    pub status: InferenceRunStatus,
+    #[serde(default)]
+    pub failure_reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3603,6 +3612,103 @@ pub async fn validate_crop_model_for_inference(
     }
 }
 
+pub async fn submit_crop_inference_run(
+    State(state): State<AppState>,
+    Json(request): Json<InferenceRunSubmissionRequest>,
+) -> AppResult<Json<InferenceRunRecord>> {
+    let model_registered = if let Some(model) = request.model.as_ref() {
+        Some(crop_model_exists(&state, model.model_id.trim(), model.version.trim()).await?)
+    } else {
+        None
+    };
+    let record = match build_inference_run_record(
+        request,
+        format!("crop-inference-run-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+        model_registered,
+    ) {
+        Ok(record) => record,
+        Err(InferenceRunError::ModelGate {
+            source: CropModelRegistryError::UnregisteredModel { model_id, version },
+        }) => {
+            audit_crop_model_event(
+                &state,
+                &model_id,
+                &version,
+                "unregistered_model_rejected",
+                Some("inference run rejected because model version is not registered"),
+            )
+            .await?;
+            return Err(AppError::BadRequest(format!(
+                "unregistered model {model_id}@{version}"
+            )));
+        }
+        Err(error) => return Err(crop_inference_run_error(error)),
+    };
+    if !crop_inference_mosaic_is_published(
+        &state,
+        &record.mosaic_ref,
+        &record.field_id,
+        &record.season_id,
+    )
+    .await?
+    {
+        return Err(AppError::BadRequest(format!(
+            "mosaic {} is not published and provenance-gated for field {} season {}",
+            record.mosaic_ref, record.field_id, record.season_id
+        )));
+    }
+    insert_crop_inference_run(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn get_crop_inference_run(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<InferenceRunRecord>> {
+    load_crop_inference_run(&state, &run_id)
+        .await?
+        .ok_or(AppError::NotFound)
+        .map(Json)
+}
+
+pub async fn get_crop_inference_run_result(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<InferenceRunRecord>> {
+    let record = load_crop_inference_run(&state, &run_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if record.status != InferenceRunStatus::Completed {
+        return Err(AppError::BadRequest(format!(
+            "inference run {run_id} has not completed"
+        )));
+    }
+
+    Ok(Json(record))
+}
+
+pub async fn update_crop_inference_run_status(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateCropInferenceRunStatusRequest>,
+) -> AppResult<Json<InferenceRunRecord>> {
+    let record = load_crop_inference_run(&state, &run_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let updated = transition_inference_run_status(
+        record,
+        request.status,
+        request.failure_reason_code,
+        current_record_timestamp(),
+    )
+    .map_err(crop_inference_run_error)?;
+    update_crop_inference_run(&state, &updated).await?;
+
+    Ok(Json(updated))
+}
+
 pub async fn verify_crop_detection(
     Path(detection_id): Path<String>,
     State(state): State<AppState>,
@@ -6546,6 +6652,10 @@ fn crop_model_registry_error(error: CropModelRegistryError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn crop_inference_run_error(error: InferenceRunError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn crop_detection_verification_error(error: CropDetectionVerificationError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -9470,6 +9580,122 @@ async fn load_orthomosaic_reconstruction(
 
     row.map(|row| decode_orthomosaic_reconstruction_record(&row))
         .transpose()
+}
+
+async fn crop_inference_mosaic_is_published(
+    state: &AppState,
+    mosaic_ref: &str,
+    field_id: &str,
+    season_id: &str,
+) -> AppResult<bool> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM products
+        WHERE product_id = ?1
+          AND field_id = ?2
+          AND season_id = ?3
+          AND lower(publish_status) = 'published'
+          AND provenance_hash IS NOT NULL
+          AND trim(provenance_hash) <> ''
+        "#,
+    )
+    .bind(mosaic_ref)
+    .bind(field_id)
+    .bind(season_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(count > 0)
+}
+
+async fn insert_crop_inference_run(state: &AppState, record: &InferenceRunRecord) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO crop_inference_runs (
+            run_id, mosaic_ref, field_id, season_id, model_id, model_version,
+            status, failure_reason_code, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(&record.run_id)
+    .bind(&record.mosaic_ref)
+    .bind(&record.field_id)
+    .bind(&record.season_id)
+    .bind(&record.model_id)
+    .bind(&record.model_version)
+    .bind(record.status.as_str())
+    .bind(&record.failure_reason_code)
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn update_crop_inference_run(state: &AppState, record: &InferenceRunRecord) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE crop_inference_runs
+        SET status = ?2,
+            failure_reason_code = ?3,
+            updated_at = ?4
+        WHERE run_id = ?1
+        "#,
+    )
+    .bind(&record.run_id)
+    .bind(record.status.as_str())
+    .bind(&record.failure_reason_code)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_crop_inference_run(
+    state: &AppState,
+    run_id: &str,
+) -> AppResult<Option<InferenceRunRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT run_id, mosaic_ref, field_id, season_id, model_id, model_version,
+               status, failure_reason_code, created_at, updated_at
+        FROM crop_inference_runs
+        WHERE run_id = ?1
+        "#,
+    )
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_crop_inference_run(&row)).transpose()
+}
+
+fn decode_crop_inference_run(row: &sqlx::sqlite::SqliteRow) -> AppResult<InferenceRunRecord> {
+    let status = row
+        .get::<String, _>("status")
+        .parse::<InferenceRunStatus>()
+        .map_err(crop_inference_run_error)?;
+
+    Ok(InferenceRunRecord {
+        run_id: row.get("run_id"),
+        mosaic_ref: row.get("mosaic_ref"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        model_id: row.get("model_id"),
+        model_version: row.get("model_version"),
+        status,
+        failure_reason_code: row.get("failure_reason_code"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
 }
 
 async fn crop_model_exists(state: &AppState, model_id: &str, version: &str) -> AppResult<bool> {

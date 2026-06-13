@@ -102,6 +102,22 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_crop_models).post(routes::register_crop_model),
         )
         .route(
+            "/api/crop-intelligence/inference-runs",
+            post(routes::submit_crop_inference_run),
+        )
+        .route(
+            "/api/crop-intelligence/inference-runs/:run_id",
+            get(routes::get_crop_inference_run),
+        )
+        .route(
+            "/api/crop-intelligence/inference-runs/:run_id/status",
+            put(routes::update_crop_inference_run_status),
+        )
+        .route(
+            "/api/crop-intelligence/inference-runs/:run_id/result",
+            get(routes::get_crop_inference_run_result),
+        )
+        .route(
             "/api/crop-intelligence/detections/:detection_id/verification",
             post(routes::verify_crop_detection),
         )
