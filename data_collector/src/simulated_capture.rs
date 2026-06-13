@@ -403,6 +403,110 @@ mod tests {
         }
     }
 
+    fn record_schema_without_origin(record: &FlightDataRecord) -> serde_json::Value {
+        let mut value = serde_json::to_value(record).expect("record serializes");
+        let object = value.as_object_mut().expect("record serializes to object");
+        object.remove("id");
+        if let Some(metadata) = object
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.remove("source");
+            metadata.remove("runtime_mode");
+            metadata.remove("simulation_mission_id");
+        }
+        value
+    }
+
+    #[test]
+    fn simulated_adapter_matches_real_hardware_record_schema() {
+        let timestamp = Utc.timestamp_opt(1_800_000_120, 0).unwrap();
+        let scan = lidar_scan(timestamp);
+        let manifest = multispectral_manifest();
+        let frame = frame_with(vec![
+            SimulatedSensorObservation::Lidar {
+                sensor_id: "rplidar-a3-front".to_string(),
+                calibration_ref: "rplidar-a3-cal-2026".to_string(),
+                scan: scan.clone(),
+            },
+            SimulatedSensorObservation::Multispectral {
+                sensor_id: "multispectral-front".to_string(),
+                calibration_ref: "multispectral-cal-2026".to_string(),
+                manifest: manifest.clone(),
+            },
+        ]);
+        let session_id = frame.session_id;
+        let flight_id = frame.flight_id;
+        let drone_id = frame.drone_id;
+        let simulation_mission_id = frame.simulation_mission_id;
+        let observed_at = frame.observed_at;
+
+        let direct_lidar = lidar_scan_to_record(
+            flight_id,
+            drone_id,
+            &scan,
+            FlightDataProvenance::complete(
+                session_id,
+                "rplidar-a3-front".to_string(),
+                gps(),
+                observed_at,
+                "rplidar-a3-cal-2026".to_string(),
+            ),
+        )
+        .expect("direct lidar record builds");
+        let direct_multispectral = multispectral_capture_to_record(
+            flight_id,
+            drone_id,
+            &manifest,
+            FlightDataProvenance::complete(
+                session_id,
+                "multispectral-front".to_string(),
+                gps(),
+                observed_at,
+                "multispectral-cal-2026".to_string(),
+            ),
+        )
+        .expect("direct multispectral record builds");
+
+        let batch = simulated_capture_frame_to_batch(frame).expect("sim frame converts");
+
+        assert_eq!(batch.records.len(), 2);
+        assert_eq!(
+            record_schema_without_origin(&batch.records[0]),
+            record_schema_without_origin(&direct_lidar)
+        );
+        assert_eq!(
+            record_schema_without_origin(&batch.records[1]),
+            record_schema_without_origin(&direct_multispectral)
+        );
+        assert!(batch
+            .records
+            .iter()
+            .all(|record| record.metadata.get("simulation_mission_id")
+                == Some(&simulation_mission_id.to_string())));
+    }
+
+    #[test]
+    fn simulated_failure_uses_collection_failure_request_shape() {
+        let frame = frame_with(vec![SimulatedSensorObservation::Failure {
+            sensor_id: "rplidar-a3-front".to_string(),
+            data_type: DataType::LidarScan,
+            kind: CollectionFailureKind::MalformedFrame,
+            message: "RPLIDAR frame is empty".to_string(),
+        }]);
+        let observed_at = frame.observed_at;
+
+        let batch = simulated_capture_frame_to_batch(frame).expect("failure converts");
+
+        assert_eq!(batch.failures.len(), 1);
+        let failure = &batch.failures[0];
+        assert_eq!(failure.occurred_at, Some(observed_at));
+        assert_eq!(failure.sensor_id, "rplidar-a3-front");
+        assert_eq!(failure.data_type, DataType::LidarScan);
+        assert_eq!(failure.kind, CollectionFailureKind::MalformedFrame);
+        assert_eq!(failure.message, "RPLIDAR frame is empty");
+    }
+
     #[test]
     fn flight_sim_cpp_lidar_json_maps_range_m_into_shared_scan() {
         let json = r#"{
