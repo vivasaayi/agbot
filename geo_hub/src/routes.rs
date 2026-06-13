@@ -62,14 +62,18 @@ use orthomosaic::{
 };
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points, build_tractor_record,
-    normalize_weather_provider_forecast, validate_field_boundary, weather_fetch_failure_record,
-    AnnotationGeometry, AnnotationRecord, FarmFieldEntityStatus, FarmFieldListPage,
-    FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord, FieldRecord,
-    FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord,
-    FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
-    MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
-    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
+    assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
+    build_soil_moisture_reading, build_tractor_record, normalize_weather_provider_forecast,
+    parse_soil_moisture_qa_flag, parse_soil_moisture_rejection_reason,
+    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
+    validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
+    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
+    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+    GpsCoords, ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef,
+    RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
+    ReportVisibility, SoilMoistureReadingError, SoilMoistureReadingRecord,
+    SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
     TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
     TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
     TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
@@ -438,6 +442,23 @@ pub struct SoilDeviceListQuery {
     pub field_id: Option<String>,
     pub zone_id: Option<String>,
     pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoilMoistureReadingListQuery {
+    pub field_id: Option<String>,
+    pub zone_ref: Option<String>,
+    pub source: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoilMoistureRejectionListQuery {
+    pub field_id: Option<String>,
+    pub reason: Option<SoilMoistureRejectionReason>,
+    pub start: Option<String>,
+    pub end: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2411,6 +2432,144 @@ pub async fn ingest_soil_iot_reading(
     }
 
     Ok(Json(reading))
+}
+
+pub async fn ingest_soil_moisture_reading(
+    State(state): State<AppState>,
+    Json(request): Json<SoilMoistureReadingRequest>,
+) -> AppResult<Response> {
+    let ingested_at = current_record_timestamp();
+    let field_id = match normalize_optional_text(request.field_id.clone()) {
+        Some(field_id) => field_id,
+        None => {
+            return reject_soil_moisture_reading(
+                &state,
+                &request,
+                SoilMoistureRejectionReason::MissingFieldLinkage,
+                ingested_at,
+            )
+            .await;
+        }
+    };
+
+    let Some(field) = load_field(&state, &field_id).await? else {
+        return reject_soil_moisture_reading(
+            &state,
+            &request,
+            SoilMoistureRejectionReason::FieldNotFound,
+            ingested_at,
+        )
+        .await;
+    };
+
+    let record = match build_soil_moisture_reading(
+        request.clone(),
+        &field,
+        format!("water-moisture-{}", Uuid::new_v4()),
+        ingested_at.clone(),
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            return reject_soil_moisture_reading(
+                &state,
+                &request,
+                soil_moisture_rejection_reason_for_error(&error),
+                ingested_at,
+            )
+            .await;
+        }
+    };
+
+    insert_soil_moisture_reading(&state, &record).await?;
+    insert_soil_moisture_time_series_point(&state, &record).await?;
+
+    Ok(Json(record).into_response())
+}
+
+pub async fn list_soil_moisture_readings(
+    Query(query): Query<SoilMoistureReadingListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SoilMoistureReadingRecord>>> {
+    let field_id = normalize_optional_text(query.field_id);
+    let zone_ref = normalize_optional_text(query.zone_ref);
+    let source = normalize_optional_text(query.source);
+    let start = normalize_optional_text(query.start);
+    let end = normalize_optional_text(query.end);
+    let rows = sqlx::query(
+        r#"
+        SELECT reading_id, field_id, zone_ref, value, source, captured_at, qa_flag, ingested_at
+        FROM water_moisture_readings
+        WHERE (?1 IS NULL OR field_id = ?1)
+          AND (?2 IS NULL OR zone_ref = ?2)
+          AND (?3 IS NULL OR source = ?3)
+          AND (?4 IS NULL OR captured_at >= ?4)
+          AND (?5 IS NULL OR captured_at <= ?5)
+        ORDER BY captured_at ASC, reading_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(zone_ref)
+    .bind(source)
+    .bind(start)
+    .bind(end)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_soil_moisture_reading(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn list_soil_moisture_rejections(
+    Query(query): Query<SoilMoistureRejectionListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SoilMoistureRejectionRecord>>> {
+    let field_id = normalize_optional_text(query.field_id);
+    let reason = query.reason.map(|reason| reason.as_str().to_string());
+    let start = normalize_optional_text(query.start);
+    let end = normalize_optional_text(query.end);
+    let rows = sqlx::query(
+        r#"
+        SELECT rejection_id, reading_id, field_id, zone_ref, source, captured_at, reason, rejected_at
+        FROM water_moisture_reading_rejections
+        WHERE (?1 IS NULL OR field_id = ?1)
+          AND (?2 IS NULL OR reason = ?2)
+          AND (?3 IS NULL OR rejected_at >= ?3)
+          AND (?4 IS NULL OR rejected_at <= ?4)
+        ORDER BY rejected_at ASC, rejection_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(reason)
+    .bind(start)
+    .bind(end)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_soil_moisture_rejection(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+async fn reject_soil_moisture_reading(
+    state: &AppState,
+    request: &SoilMoistureReadingRequest,
+    reason: SoilMoistureRejectionReason,
+    rejected_at: String,
+) -> AppResult<Response> {
+    let rejection = soil_moisture_rejection_record(
+        format!("water-moisture-rejection-{}", Uuid::new_v4()),
+        request,
+        reason,
+        rejected_at,
+    )
+    .map_err(soil_moisture_error)?;
+    insert_soil_moisture_rejection(state, &rejection).await?;
+    Ok((StatusCode::BAD_REQUEST, Json(rejection)).into_response())
 }
 
 pub async fn list_time_series_points(
@@ -5844,6 +6003,10 @@ fn gateway_ingest_error(error: GatewayIngestError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn soil_moisture_error(error: SoilMoistureReadingError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
     value.parse::<SoilSensorType>().map_err(soil_iot_error)
 }
@@ -6999,6 +7162,38 @@ fn soil_reading_time_series_metadata(reading: &GeolocatedSoilReading) -> AppResu
     .map_err(|err| AppError::Anyhow(Error::new(err)))
 }
 
+fn decode_soil_moisture_reading(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SoilMoistureReadingRecord> {
+    Ok(SoilMoistureReadingRecord {
+        reading_id: row.get("reading_id"),
+        field_id: row.get("field_id"),
+        zone_ref: row.get("zone_ref"),
+        value: row.get("value"),
+        source: row.get("source"),
+        captured_at: row.get("captured_at"),
+        qa_flag: parse_soil_moisture_qa_flag(&row.get::<String, _>("qa_flag"))
+            .map_err(soil_moisture_error)?,
+        ingested_at: row.get("ingested_at"),
+    })
+}
+
+fn decode_soil_moisture_rejection(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SoilMoistureRejectionRecord> {
+    Ok(SoilMoistureRejectionRecord {
+        rejection_id: row.get("rejection_id"),
+        reading_id: row.get("reading_id"),
+        field_id: row.get("field_id"),
+        zone_ref: row.get("zone_ref"),
+        source: row.get("source"),
+        captured_at: row.get("captured_at"),
+        reason: parse_soil_moisture_rejection_reason(&row.get::<String, _>("reason"))
+            .map_err(soil_moisture_error)?,
+        rejected_at: row.get("rejected_at"),
+    })
+}
+
 fn decode_soil_iot_device(row: &sqlx::sqlite::SqliteRow) -> AppResult<SoilDeviceRecord> {
     Ok(SoilDeviceRecord {
         device_id: row.get("device_id"),
@@ -7830,6 +8025,88 @@ async fn insert_soil_iot_device(state: &AppState, record: &SoilDeviceRecord) -> 
     .map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn insert_soil_moisture_reading(
+    state: &AppState,
+    record: &SoilMoistureReadingRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT OR REPLACE INTO water_moisture_readings (
+            reading_id, field_id, zone_ref, value, source, captured_at, qa_flag, ingested_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&record.reading_id)
+    .bind(&record.field_id)
+    .bind(&record.zone_ref)
+    .bind(record.value)
+    .bind(&record.source)
+    .bind(&record.captured_at)
+    .bind(record.qa_flag.as_str())
+    .bind(&record.ingested_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_soil_moisture_rejection(
+    state: &AppState,
+    rejection: &SoilMoistureRejectionRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO water_moisture_reading_rejections (
+            rejection_id, reading_id, field_id, zone_ref, source, captured_at, reason, rejected_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&rejection.rejection_id)
+    .bind(&rejection.reading_id)
+    .bind(&rejection.field_id)
+    .bind(&rejection.zone_ref)
+    .bind(&rejection.source)
+    .bind(&rejection.captured_at)
+    .bind(rejection.reason.as_str())
+    .bind(&rejection.rejected_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_soil_moisture_time_series_point(
+    state: &AppState,
+    record: &SoilMoistureReadingRecord,
+) -> AppResult<()> {
+    let metadata = serde_json::json!({
+        "reading_id": record.reading_id,
+        "field_id": record.field_id,
+        "zone_ref": record.zone_ref,
+        "source": record.source,
+        "captured_at": record.captured_at,
+        "qa_flag": record.qa_flag.as_str()
+    })
+    .to_string();
+    let point = SeriesPoint {
+        entity_ref: format!("field:{}:zone:{}", record.field_id, record.zone_ref),
+        metric: "soil_moisture_percent".to_string(),
+        unit: "percent".to_string(),
+        t: record.captured_at.clone(),
+        value: SeriesValue::Scalar {
+            value: record.value,
+        },
+        source_ref: record.reading_id.clone(),
+        created_at: record.ingested_at.clone(),
+    };
+
+    insert_time_series_point_record(state, &point, Some(metadata)).await
 }
 
 async fn load_soil_iot_device(

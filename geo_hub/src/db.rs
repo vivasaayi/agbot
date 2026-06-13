@@ -762,6 +762,40 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS water_moisture_readings (
+            reading_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            zone_ref TEXT NOT NULL,
+            value REAL NOT NULL,
+            source TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            qa_flag TEXT NOT NULL,
+            ingested_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS water_moisture_reading_rejections (
+            rejection_id TEXT PRIMARY KEY,
+            reading_id TEXT,
+            field_id TEXT,
+            zone_ref TEXT,
+            source TEXT,
+            captured_at TEXT,
+            reason TEXT NOT NULL,
+            rejected_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,
@@ -1155,6 +1189,33 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_soil_iot_devices_org_id
         ON soil_iot_devices(org_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_water_moisture_readings_field_zone
+        ON water_moisture_readings(field_id, zone_ref, captured_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_water_moisture_readings_source
+        ON water_moisture_readings(source, captured_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_water_moisture_rejections_field
+        ON water_moisture_reading_rejections(field_id, rejected_at);
         "#,
     )
     .execute(pool)

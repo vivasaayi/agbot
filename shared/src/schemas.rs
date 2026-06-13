@@ -1129,6 +1129,253 @@ fn normalize_weather_text(value: String) -> Option<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SoilMoistureQaFlag {
+    Valid,
+    Suspect,
+    Invalid,
+}
+
+impl Default for SoilMoistureQaFlag {
+    fn default() -> Self {
+        SoilMoistureQaFlag::Valid
+    }
+}
+
+impl SoilMoistureQaFlag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SoilMoistureQaFlag::Valid => "valid",
+            SoilMoistureQaFlag::Suspect => "suspect",
+            SoilMoistureQaFlag::Invalid => "invalid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilMoistureReadingRequest {
+    #[serde(default)]
+    pub reading_id: Option<String>,
+    #[serde(default)]
+    pub field_id: Option<String>,
+    #[serde(default)]
+    pub zone_ref: Option<String>,
+    pub value: f64,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub captured_at: String,
+    #[serde(default)]
+    pub qa_flag: SoilMoistureQaFlag,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilMoistureReadingRecord {
+    pub reading_id: String,
+    pub field_id: String,
+    pub zone_ref: String,
+    pub value: f64,
+    pub source: String,
+    pub captured_at: String,
+    pub qa_flag: SoilMoistureQaFlag,
+    pub ingested_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoilMoistureRejectionReason {
+    MissingFieldLinkage,
+    MissingZoneLinkage,
+    FieldNotFound,
+    InvalidValue,
+    EmptySource,
+    EmptyCapturedAt,
+}
+
+impl SoilMoistureRejectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SoilMoistureRejectionReason::MissingFieldLinkage => "missing_field_linkage",
+            SoilMoistureRejectionReason::MissingZoneLinkage => "missing_zone_linkage",
+            SoilMoistureRejectionReason::FieldNotFound => "field_not_found",
+            SoilMoistureRejectionReason::InvalidValue => "invalid_value",
+            SoilMoistureRejectionReason::EmptySource => "empty_source",
+            SoilMoistureRejectionReason::EmptyCapturedAt => "empty_captured_at",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilMoistureRejectionRecord {
+    pub rejection_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<String>,
+    pub reason: SoilMoistureRejectionReason,
+    pub rejected_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SoilMoistureReadingError {
+    #[error("soil moisture reading_id cannot be empty")]
+    EmptyReadingId,
+    #[error("soil moisture reading requires field linkage")]
+    MissingFieldLinkage,
+    #[error("soil moisture reading requires zone linkage")]
+    MissingZoneLinkage,
+    #[error("soil moisture field not found: {field_id}")]
+    FieldNotFound { field_id: String },
+    #[error("soil moisture value is invalid: {value}")]
+    InvalidValue { value: String },
+    #[error("soil moisture source cannot be empty")]
+    EmptySource,
+    #[error("soil moisture captured_at cannot be empty")]
+    EmptyCapturedAt,
+    #[error("soil moisture ingested_at cannot be empty")]
+    EmptyIngestedAt,
+    #[error("soil moisture rejection_id cannot be empty")]
+    EmptyRejectionId,
+    #[error("soil moisture rejected_at cannot be empty")]
+    EmptyRejectedAt,
+    #[error("unsupported soil moisture QA flag {value}")]
+    UnsupportedQaFlag { value: String },
+    #[error("unsupported soil moisture rejection reason {value}")]
+    UnsupportedRejectionReason { value: String },
+}
+
+pub fn build_soil_moisture_reading(
+    request: SoilMoistureReadingRequest,
+    field: &FieldRecord,
+    generated_reading_id: String,
+    ingested_at: String,
+) -> Result<SoilMoistureReadingRecord, SoilMoistureReadingError> {
+    let reading_id = normalize_soil_moisture_optional_text(request.reading_id)
+        .or_else(|| normalize_soil_moisture_text(generated_reading_id))
+        .ok_or(SoilMoistureReadingError::EmptyReadingId)?;
+    let field_id = normalize_soil_moisture_optional_text(request.field_id)
+        .ok_or(SoilMoistureReadingError::MissingFieldLinkage)?;
+    if field.field_id != field_id {
+        return Err(SoilMoistureReadingError::FieldNotFound { field_id });
+    }
+    let zone_ref = normalize_soil_moisture_optional_text(request.zone_ref)
+        .ok_or(SoilMoistureReadingError::MissingZoneLinkage)?;
+    if !(request.value.is_finite() && (0.0..=100.0).contains(&request.value)) {
+        return Err(SoilMoistureReadingError::InvalidValue {
+            value: request.value.to_string(),
+        });
+    }
+    let source = normalize_soil_moisture_text(request.source)
+        .ok_or(SoilMoistureReadingError::EmptySource)?;
+    let captured_at = normalize_soil_moisture_text(request.captured_at)
+        .ok_or(SoilMoistureReadingError::EmptyCapturedAt)?;
+    let ingested_at = normalize_soil_moisture_text(ingested_at)
+        .ok_or(SoilMoistureReadingError::EmptyIngestedAt)?;
+
+    Ok(SoilMoistureReadingRecord {
+        reading_id,
+        field_id,
+        zone_ref,
+        value: request.value,
+        source,
+        captured_at,
+        qa_flag: request.qa_flag,
+        ingested_at,
+    })
+}
+
+pub fn soil_moisture_rejection_record(
+    rejection_id: String,
+    request: &SoilMoistureReadingRequest,
+    reason: SoilMoistureRejectionReason,
+    rejected_at: String,
+) -> Result<SoilMoistureRejectionRecord, SoilMoistureReadingError> {
+    Ok(SoilMoistureRejectionRecord {
+        rejection_id: normalize_soil_moisture_text(rejection_id)
+            .ok_or(SoilMoistureReadingError::EmptyRejectionId)?,
+        reading_id: normalize_soil_moisture_optional_text(request.reading_id.clone()),
+        field_id: normalize_soil_moisture_optional_text(request.field_id.clone()),
+        zone_ref: normalize_soil_moisture_optional_text(request.zone_ref.clone()),
+        source: normalize_soil_moisture_text(request.source.clone()),
+        captured_at: normalize_soil_moisture_text(request.captured_at.clone()),
+        reason,
+        rejected_at: normalize_soil_moisture_text(rejected_at)
+            .ok_or(SoilMoistureReadingError::EmptyRejectedAt)?,
+    })
+}
+
+pub fn parse_soil_moisture_qa_flag(
+    value: &str,
+) -> Result<SoilMoistureQaFlag, SoilMoistureReadingError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "valid" => Ok(SoilMoistureQaFlag::Valid),
+        "suspect" => Ok(SoilMoistureQaFlag::Suspect),
+        "invalid" => Ok(SoilMoistureQaFlag::Invalid),
+        _ => Err(SoilMoistureReadingError::UnsupportedQaFlag {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_soil_moisture_rejection_reason(
+    value: &str,
+) -> Result<SoilMoistureRejectionReason, SoilMoistureReadingError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "missing_field_linkage" => Ok(SoilMoistureRejectionReason::MissingFieldLinkage),
+        "missing_zone_linkage" => Ok(SoilMoistureRejectionReason::MissingZoneLinkage),
+        "field_not_found" => Ok(SoilMoistureRejectionReason::FieldNotFound),
+        "invalid_value" => Ok(SoilMoistureRejectionReason::InvalidValue),
+        "empty_source" => Ok(SoilMoistureRejectionReason::EmptySource),
+        "empty_captured_at" => Ok(SoilMoistureRejectionReason::EmptyCapturedAt),
+        _ => Err(SoilMoistureReadingError::UnsupportedRejectionReason {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn soil_moisture_rejection_reason_for_error(
+    error: &SoilMoistureReadingError,
+) -> SoilMoistureRejectionReason {
+    match error {
+        SoilMoistureReadingError::MissingFieldLinkage => {
+            SoilMoistureRejectionReason::MissingFieldLinkage
+        }
+        SoilMoistureReadingError::MissingZoneLinkage => {
+            SoilMoistureRejectionReason::MissingZoneLinkage
+        }
+        SoilMoistureReadingError::FieldNotFound { .. } => {
+            SoilMoistureRejectionReason::FieldNotFound
+        }
+        SoilMoistureReadingError::InvalidValue { .. } => SoilMoistureRejectionReason::InvalidValue,
+        SoilMoistureReadingError::EmptySource => SoilMoistureRejectionReason::EmptySource,
+        SoilMoistureReadingError::EmptyCapturedAt => SoilMoistureRejectionReason::EmptyCapturedAt,
+        SoilMoistureReadingError::EmptyReadingId
+        | SoilMoistureReadingError::EmptyIngestedAt
+        | SoilMoistureReadingError::EmptyRejectionId
+        | SoilMoistureReadingError::EmptyRejectedAt
+        | SoilMoistureReadingError::UnsupportedQaFlag { .. }
+        | SoilMoistureReadingError::UnsupportedRejectionReason { .. } => {
+            SoilMoistureRejectionReason::InvalidValue
+        }
+    }
+}
+
+fn normalize_soil_moisture_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(normalize_soil_moisture_text)
+}
+
+fn normalize_soil_moisture_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FleetNodeComponentHealth {
     Ok,
     Warn,
@@ -3683,27 +3930,29 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 mod tests {
     use super::{
         apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
-        bind_fleet_node_identity, bounds_from_points, normalize_weather_provider_forecast,
-        sign_fleet_config_bundle, validate_field_boundary, verify_and_apply_fleet_config_bundle,
-        weather_fetch_failure_record, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        CropPlanRecord, FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery,
-        FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, MultispectralImage,
-        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
-        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
-        RecommendationStatus, RecommendationStatusChangeType, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
-        TractorCommandAuditDecision, TractorCommandRejectionReason, TractorImplementRef,
-        TractorLifecycleStatus, TractorMotionCommandRequest, TractorRegistrationRequest,
-        TractorRegistry, WeatherIngestError, WeatherProviderForecastPoint,
-        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
-        WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
+        bind_fleet_node_identity, bounds_from_points, build_soil_moisture_reading,
+        normalize_weather_provider_forecast, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, validate_field_boundary,
+        verify_and_apply_fleet_config_bundle, weather_fetch_failure_record,
+        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
+        AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord, CropPlanRecord,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeEnrollmentError,
+        FleetNodeEnrollmentRequest, FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind,
+        FleetNodeOperationError, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds,
+        GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
+        ReportDeliverableRegistry, ReportFormat, ReportPersistenceError, ReportRecord,
+        ReportVisibility, SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
+        SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
+        SoilMoistureRejectionReason, TractorCommandAuditDecision, TractorCommandRejectionReason,
+        TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
+        TractorRegistrationRequest, TractorRegistry, WeatherIngestError,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -4185,6 +4434,110 @@ mod tests {
         assert_eq!(failure.field_ref, "field-north");
         assert_eq!(failure.source, "NOAA-HRRR");
         assert_eq!(failure.reason, "provider unreachable");
+    }
+
+    #[test]
+    fn soil_moisture_reading_links_to_field_zone_and_qa_flag() {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+
+        let record = build_soil_moisture_reading(
+            SoilMoistureReadingRequest {
+                reading_id: Some(" moisture-001 ".to_string()),
+                field_id: Some(" field-north ".to_string()),
+                zone_ref: Some(" zone:north ".to_string()),
+                value: 34.5,
+                source: " probe:soil-001 ".to_string(),
+                captured_at: " 2026-06-13T09:30:00Z ".to_string(),
+                qa_flag: SoilMoistureQaFlag::Valid,
+            },
+            &field,
+            "generated-reading-id".to_string(),
+            " 2026-06-13T09:31:00Z ".to_string(),
+        )
+        .expect("linked moisture reading should normalize");
+
+        assert_eq!(record.reading_id, "moisture-001");
+        assert_eq!(record.field_id, "field-north");
+        assert_eq!(record.zone_ref, "zone:north");
+        assert_eq!(record.value, 34.5);
+        assert_eq!(record.source, "probe:soil-001");
+        assert_eq!(record.captured_at, "2026-06-13T09:30:00Z");
+        assert_eq!(record.qa_flag, SoilMoistureQaFlag::Valid);
+        assert_eq!(record.ingested_at, "2026-06-13T09:31:00Z");
+    }
+
+    #[test]
+    fn soil_moisture_reading_rejects_missing_zone_linkage_and_audits_reason() {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+        let request = SoilMoistureReadingRequest {
+            reading_id: Some("moisture-orphan".to_string()),
+            field_id: Some("field-north".to_string()),
+            zone_ref: Some(" ".to_string()),
+            value: 34.5,
+            source: "probe:soil-001".to_string(),
+            captured_at: "2026-06-13T09:30:00Z".to_string(),
+            qa_flag: SoilMoistureQaFlag::Valid,
+        };
+
+        let error = build_soil_moisture_reading(
+            request.clone(),
+            &field,
+            "generated-reading-id".to_string(),
+            "2026-06-13T09:31:00Z".to_string(),
+        )
+        .expect_err("zone linkage is required");
+        assert_eq!(error, SoilMoistureReadingError::MissingZoneLinkage);
+
+        let rejection = soil_moisture_rejection_record(
+            " rejection-001 ".to_string(),
+            &request,
+            SoilMoistureRejectionReason::MissingZoneLinkage,
+            " 2026-06-13T09:31:00Z ".to_string(),
+        )
+        .expect("rejection should normalize");
+
+        assert_eq!(rejection.rejection_id, "rejection-001");
+        assert_eq!(rejection.field_id.as_deref(), Some("field-north"));
+        assert_eq!(rejection.zone_ref, None);
+        assert_eq!(
+            rejection.reason,
+            SoilMoistureRejectionReason::MissingZoneLinkage
+        );
+        assert_eq!(rejection.rejected_at, "2026-06-13T09:31:00Z");
+    }
+
+    #[test]
+    fn soil_moisture_reading_rejects_invalid_percent_value() {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+
+        let error = build_soil_moisture_reading(
+            SoilMoistureReadingRequest {
+                reading_id: None,
+                field_id: Some("field-north".to_string()),
+                zone_ref: Some("zone:north".to_string()),
+                value: 140.0,
+                source: "probe:soil-001".to_string(),
+                captured_at: "2026-06-13T09:30:00Z".to_string(),
+                qa_flag: SoilMoistureQaFlag::Valid,
+            },
+            &field,
+            "generated-reading-id".to_string(),
+            "2026-06-13T09:31:00Z".to_string(),
+        )
+        .expect_err("moisture percent outside 0..=100 should reject");
+
+        assert_eq!(
+            error,
+            SoilMoistureReadingError::InvalidValue {
+                value: "140".to_string()
+            }
+        );
     }
 
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {

@@ -179,6 +179,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::ingest_soil_iot_reading),
         )
         .route(
+            "/api/water-management/moisture-readings",
+            get(routes::list_soil_moisture_readings).post(routes::ingest_soil_moisture_reading),
+        )
+        .route(
+            "/api/water-management/moisture-reading-rejections",
+            get(routes::list_soil_moisture_rejections),
+        )
+        .route(
             "/api/time-series/points",
             get(routes::list_time_series_points),
         )

@@ -2184,6 +2184,194 @@ async fn weather_forecast_pull_records_provider_failure_without_partial_insert()
 }
 
 #[tokio::test]
+async fn water_management_moisture_reading_persists_field_zone_qa_and_series() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_water_management_field(&ctx).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/water-management/moisture-readings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "reading_id": "moisture-001",
+                        "field_id": "field-water",
+                        "zone_ref": "zone:north",
+                        "value": 31.25,
+                        "source": "probe:soil-001",
+                        "captured_at": "2026-06-13T09:30:00Z",
+                        "qa_flag": "valid"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let reading: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        reading.get("reading_id").and_then(|value| value.as_str()),
+        Some("moisture-001")
+    );
+    assert_eq!(
+        reading.get("field_id").and_then(|value| value.as_str()),
+        Some("field-water")
+    );
+    assert_eq!(
+        reading.get("zone_ref").and_then(|value| value.as_str()),
+        Some("zone:north")
+    );
+    assert_eq!(
+        reading.get("qa_flag").and_then(|value| value.as_str()),
+        Some("valid")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/api/water-management/moisture-readings?field_id=field-water&zone_ref=zone:north",
+                )
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0]
+            .get("captured_at")
+            .and_then(|value| value.as_str()),
+        Some("2026-06-13T09:30:00Z")
+    );
+
+    let accepted_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM water_moisture_readings")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(accepted_count, 1);
+
+    let series_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/api/time-series/points?entity_ref=field:field-water:zone:zone:north&metric=soil_moisture_percent",
+                )
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(series_response.status(), StatusCode::OK);
+    let body = to_bytes(series_response.into_body(), 64 * 1024).await?;
+    let points: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(points.len(), 1);
+    assert_eq!(
+        points[0]
+            .pointer("/value/value")
+            .and_then(|value| value.as_f64()),
+        Some(31.25)
+    );
+    assert_eq!(
+        points[0]
+            .pointer("/metadata/qa_flag")
+            .and_then(|value| value.as_str()),
+        Some("valid")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn water_management_moisture_reading_rejects_unlinked_reading_with_audit() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_water_management_field(&ctx).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/water-management/moisture-readings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "reading_id": "moisture-orphan",
+                        "field_id": "field-water",
+                        "value": 31.25,
+                        "source": "probe:soil-001",
+                        "captured_at": "2026-06-13T09:30:00Z",
+                        "qa_flag": "valid"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let rejection: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        rejection.get("reason").and_then(|value| value.as_str()),
+        Some("missing_zone_linkage")
+    );
+
+    let accepted_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM water_moisture_readings")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(accepted_count, 0);
+    let rejection_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM water_moisture_reading_rejections")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(rejection_count, 1);
+    let series_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM time_series_points")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(series_count, 0);
+
+    let list_rejections = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/water-management/moisture-reading-rejections?field_id=field-water")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_rejections.status(), StatusCode::OK);
+    let body = to_bytes(list_rejections.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].get("zone_ref").and_then(|value| value.as_str()),
+        None
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -7754,6 +7942,62 @@ async fn seed_weather_forecast_field(ctx: &TestContext) -> Result<()> {
                         "farm_id": "farm-weather",
                         "field_id": "field-weather",
                         "name": "Weather Field",
+                        "boundary": {
+                            "crs": "EPSG:4326",
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 },
+                                { "longitude": -96.7, "latitude": 41.1 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(field_response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_water_management_field(ctx: &TestContext) -> Result<()> {
+    let farm_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-water",
+                        "owner": "org-alpha",
+                        "name": "Water Farm"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(farm_response.status(), StatusCode::OK);
+
+    let field_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-water",
+                        "field_id": "field-water",
+                        "name": "Water Field",
                         "boundary": {
                             "crs": "EPSG:4326",
                             "coordinates": [
