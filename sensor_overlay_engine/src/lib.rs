@@ -398,6 +398,36 @@ pub mod utils {
         pub metadata: OverlayRenderMetadata,
     }
 
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+    pub struct IdwInterpolationParams {
+        pub power: f32,
+        pub smoothing: f32,
+    }
+
+    impl Default for IdwInterpolationParams {
+        fn default() -> Self {
+            Self {
+                power: 2.0,
+                smoothing: 1e-6,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct IdwInterpolationMetadata {
+        pub method: String,
+        pub params: IdwInterpolationParams,
+        pub point_count: usize,
+        pub spatial_bounds: SpatialBounds,
+        pub resolution: (u32, u32),
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct InterpolatedGrid {
+        pub values: Vec<f32>,
+        pub metadata: IdwInterpolationMetadata,
+    }
+
     pub fn create_heatmap_image(
         values: &[f32],
         width: u32,
@@ -615,7 +645,42 @@ pub mod utils {
         bounds: &SpatialBounds,
         resolution: (u32, u32),
     ) -> Vec<f32> {
+        interpolate_grid_idw(
+            points,
+            bounds,
+            resolution,
+            IdwInterpolationParams::default(),
+        )
+        .map(|grid| grid.values)
+        .unwrap_or_else(|_| vec![0.0f32; (resolution.0 * resolution.1) as usize])
+    }
+
+    pub fn interpolate_grid_idw(
+        points: &[(f64, f64, f32)],
+        bounds: &SpatialBounds,
+        resolution: (u32, u32),
+        params: IdwInterpolationParams,
+    ) -> Result<InterpolatedGrid> {
         let (width, height) = resolution;
+        if width == 0 || height == 0 {
+            return Err(anyhow::anyhow!(
+                "IDW interpolation requires non-zero resolution"
+            ));
+        }
+        if points.is_empty() {
+            return Err(anyhow::anyhow!(
+                "IDW interpolation requires at least one point"
+            ));
+        }
+        if params.power <= 0.0 || !params.power.is_finite() {
+            return Err(anyhow::anyhow!("IDW interpolation power must be positive"));
+        }
+        if params.smoothing < 0.0 || !params.smoothing.is_finite() {
+            return Err(anyhow::anyhow!(
+                "IDW interpolation smoothing must be finite and non-negative"
+            ));
+        }
+
         let mut grid = vec![0.0f32; (width * height) as usize];
 
         let dx = (bounds.max_x - bounds.min_x) / width as f64;
@@ -637,7 +702,8 @@ pub mod utils {
                         weight_sum = 1.0;
                         break;
                     } else {
-                        let weight = 1.0 / (distance as f32 + 1e-6);
+                        let adjusted_distance = distance + params.smoothing as f64;
+                        let weight = (1.0 / adjusted_distance.powf(params.power as f64)) as f32;
                         weighted_sum += value * weight;
                         weight_sum += weight;
                     }
@@ -652,7 +718,16 @@ pub mod utils {
             }
         }
 
-        grid
+        Ok(InterpolatedGrid {
+            values: grid,
+            metadata: IdwInterpolationMetadata {
+                method: "idw".to_string(),
+                params,
+                point_count: points.len(),
+                spatial_bounds: bounds.clone(),
+                resolution,
+            },
+        })
     }
 }
 
@@ -683,6 +758,31 @@ mod tests {
         let values = vec![0.0, 0.5, 1.0, 0.25];
         let result = utils::create_heatmap_image(&values, 2, 2, "viridis");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn idw_interpolation_records_parameters_and_extent() {
+        let bounds = SpatialBounds::new(0.0, 0.0, 2.0, 1.0);
+        let params = utils::IdwInterpolationParams {
+            power: 2.0,
+            smoothing: 0.0,
+        };
+
+        let result = utils::interpolate_grid_idw(
+            &[(0.0, 0.0, 10.0), (1.0, 0.0, 20.0)],
+            &bounds,
+            (2, 1),
+            params,
+        )
+        .expect("IDW interpolation should succeed");
+
+        assert_eq!(result.values, vec![10.0, 20.0]);
+        assert_eq!(result.metadata.method, "idw");
+        assert_eq!(result.metadata.params.power, 2.0);
+        assert_eq!(result.metadata.params.smoothing, 0.0);
+        assert_eq!(result.metadata.point_count, 2);
+        assert_eq!(result.metadata.spatial_bounds, bounds);
+        assert_eq!(result.metadata.resolution, (2, 1));
     }
 
     #[test]

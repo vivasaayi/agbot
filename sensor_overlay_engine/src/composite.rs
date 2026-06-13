@@ -33,7 +33,7 @@ pub enum OverlayType {
     Rgb,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BlendingMode {
     Alpha,
     Multiply,
@@ -48,6 +48,36 @@ pub struct OpacitySettings {
     pub thermal_opacity: f32,
     pub lidar_opacity: f32,
     pub rgb_opacity: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompositeProductLayer {
+    pub name: String,
+    pub image: RgbaImage,
+    pub spatial_bounds: crate::SpatialBounds,
+    pub opacity: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompositeLayerBlendEvidence {
+    pub name: String,
+    pub opacity: f32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompositeBlendMetadata {
+    pub blending_mode: BlendingMode,
+    pub spatial_bounds: crate::SpatialBounds,
+    pub resolution: (u32, u32),
+    pub layers: Vec<CompositeLayerBlendEvidence>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompositeProductOverlay {
+    pub image: RgbaImage,
+    pub metadata: CompositeBlendMetadata,
 }
 
 impl Default for CompositeConfig {
@@ -79,6 +109,45 @@ impl CompositeOverlayEngine {
             thermal_processor,
             lidar_processor,
         }
+    }
+
+    pub fn blend_georeferenced_layers(
+        &self,
+        layers: &[CompositeProductLayer],
+    ) -> Result<CompositeProductOverlay> {
+        let first = layers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("composite requires at least one layer"))?;
+        let resolution = (first.image.width(), first.image.height());
+        let spatial_bounds = first.spatial_bounds.clone();
+        let mut composite = ImageBuffer::from_pixel(resolution.0, resolution.1, Rgba([0, 0, 0, 0]));
+        let mut layer_evidence = Vec::with_capacity(layers.len());
+
+        for layer in layers {
+            assert_composite_layer_extent(layer, &spatial_bounds, resolution)?;
+            let opacity = layer.opacity.clamp(0.0, 1.0);
+            for (x, y, overlay_pixel) in layer.image.enumerate_pixels() {
+                let base_pixel = composite.get_pixel(x, y);
+                let blended = self.blend_pixels(*base_pixel, *overlay_pixel, opacity);
+                composite.put_pixel(x, y, blended);
+            }
+            layer_evidence.push(CompositeLayerBlendEvidence {
+                name: layer.name.clone(),
+                opacity,
+                width: layer.image.width(),
+                height: layer.image.height(),
+            });
+        }
+
+        Ok(CompositeProductOverlay {
+            image: composite,
+            metadata: CompositeBlendMetadata {
+                blending_mode: self.config.blending_mode.clone(),
+                spatial_bounds,
+                resolution,
+                layers: layer_evidence,
+            },
+        })
     }
 
     /// Process a complete multi-sensor field scan and create composite overlays
@@ -482,6 +551,41 @@ impl CompositeOverlayEngine {
     }
 }
 
+fn assert_composite_layer_extent(
+    layer: &CompositeProductLayer,
+    expected_bounds: &crate::SpatialBounds,
+    expected_resolution: (u32, u32),
+) -> Result<()> {
+    let layer_resolution = (layer.image.width(), layer.image.height());
+    if layer_resolution != expected_resolution {
+        return Err(anyhow::anyhow!(
+            "extent-mismatch: layer '{}' resolution {:?} does not match {:?}",
+            layer.name,
+            layer_resolution,
+            expected_resolution
+        ));
+    }
+
+    if !spatial_bounds_match(&layer.spatial_bounds, expected_bounds) {
+        return Err(anyhow::anyhow!(
+            "extent-mismatch: layer '{}' bounds {:?} do not match {:?}",
+            layer.name,
+            layer.spatial_bounds,
+            expected_bounds
+        ));
+    }
+
+    Ok(())
+}
+
+fn spatial_bounds_match(left: &crate::SpatialBounds, right: &crate::SpatialBounds) -> bool {
+    const GEO_TOLERANCE: f64 = 1e-9;
+    (left.min_x - right.min_x).abs() <= GEO_TOLERANCE
+        && (left.min_y - right.min_y).abs() <= GEO_TOLERANCE
+        && (left.max_x - right.max_x).abs() <= GEO_TOLERANCE
+        && (left.max_y - right.max_y).abs() <= GEO_TOLERANCE
+}
+
 // Data structures
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -563,6 +667,76 @@ mod tests {
 
         assert_eq!(blended.0[0], 127); // 50% blend of red channel
         assert_eq!(blended.0[1], 127); // 50% blend of green channel
+    }
+
+    #[test]
+    fn georeferenced_composite_preserves_extent_and_records_blend_params() {
+        let config = CompositeConfig::default();
+        let ndvi_processor = NdviProcessor::new(NdviConfig::default());
+        let thermal_processor = ThermalProcessor::new(ThermalConfig::default());
+        let lidar_processor = LidarOverlayProcessor::new(LidarConfig::default());
+        let engine =
+            CompositeOverlayEngine::new(config, ndvi_processor, thermal_processor, lidar_processor);
+        let bounds = crate::SpatialBounds::new(-74.1, 40.6, -73.9, 40.8);
+        let base = ImageBuffer::from_pixel(1, 1, Rgba([255, 0, 0, 255]));
+        let overlay = ImageBuffer::from_pixel(1, 1, Rgba([0, 255, 0, 255]));
+
+        let composite = engine
+            .blend_georeferenced_layers(&[
+                CompositeProductLayer {
+                    name: "ndvi".to_string(),
+                    image: base,
+                    spatial_bounds: bounds.clone(),
+                    opacity: 1.0,
+                },
+                CompositeProductLayer {
+                    name: "thermal".to_string(),
+                    image: overlay,
+                    spatial_bounds: bounds.clone(),
+                    opacity: 0.5,
+                },
+            ])
+            .expect("shared extent layers should composite");
+
+        assert_eq!(composite.metadata.spatial_bounds, bounds);
+        assert_eq!(composite.metadata.resolution, (1, 1));
+        assert_eq!(composite.metadata.layers.len(), 2);
+        assert_eq!(composite.metadata.layers[0].name, "ndvi");
+        assert_eq!(composite.metadata.layers[1].opacity, 0.5);
+        assert_eq!(composite.image.get_pixel(0, 0).0, [127, 127, 0, 255]);
+    }
+
+    #[test]
+    fn georeferenced_composite_rejects_extent_mismatch() {
+        let config = CompositeConfig::default();
+        let ndvi_processor = NdviProcessor::new(NdviConfig::default());
+        let thermal_processor = ThermalProcessor::new(ThermalConfig::default());
+        let lidar_processor = LidarOverlayProcessor::new(LidarConfig::default());
+        let engine =
+            CompositeOverlayEngine::new(config, ndvi_processor, thermal_processor, lidar_processor);
+        let first_bounds = crate::SpatialBounds::new(0.0, 0.0, 1.0, 1.0);
+        let second_bounds = crate::SpatialBounds::new(0.0, 0.0, 2.0, 1.0);
+        let image = ImageBuffer::from_pixel(1, 1, Rgba([255, 0, 0, 255]));
+
+        let error = engine
+            .blend_georeferenced_layers(&[
+                CompositeProductLayer {
+                    name: "ndvi".to_string(),
+                    image: image.clone(),
+                    spatial_bounds: first_bounds,
+                    opacity: 1.0,
+                },
+                CompositeProductLayer {
+                    name: "thermal".to_string(),
+                    image,
+                    spatial_bounds: second_bounds,
+                    opacity: 1.0,
+                },
+            ])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("extent-mismatch"));
     }
 
     #[test]
