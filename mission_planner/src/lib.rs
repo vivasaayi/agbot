@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub mod abort_recovery;
 pub mod api;
 pub mod automated_failsafe;
+pub mod autonomous_execution;
 pub mod database;
 pub mod dispatch_safety;
 pub mod flight_path;
@@ -32,6 +33,11 @@ pub use automated_failsafe::{
     assert_failsafe_ready_for_arming, evaluate_automated_failsafe, AutomatedFailsafeAuditEvent,
     AutomatedFailsafeAuditEventKind, AutomatedFailsafeConfig, AutomatedFailsafeError,
     AutomatedFailsafeEvaluation, AutomatedFailsafeState, AutomatedFailsafeTrigger,
+};
+pub use autonomous_execution::{
+    execute_autonomous_mission_in_simulation, AutonomousExecutionError,
+    AutonomousExecutionErrorCode, AutonomousExecutionOutcome, AutonomousExecutionPlan,
+    AutonomousOperatorApproval, AutonomousRuntimeMode,
 };
 pub use database::{DatabaseService, MissionStats};
 pub use dispatch_safety::{
