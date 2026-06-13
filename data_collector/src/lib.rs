@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::schemas::GpsCoords;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -278,6 +278,107 @@ impl CaptureSessionRequest {
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
         self.tags = tags;
         self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureLinkageReference {
+    pub flight_id: Uuid,
+    pub field_id: Uuid,
+    pub scene_id: Uuid,
+}
+
+impl CaptureLinkageReference {
+    pub fn new(flight_id: Uuid, field_id: Uuid, scene_id: Uuid) -> Self {
+        Self {
+            flight_id,
+            field_id,
+            scene_id,
+        }
+    }
+
+    pub fn from_request(request: &CaptureSessionRequest) -> Self {
+        Self::new(request.flight_id, request.field_id, request.scene_id)
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum CaptureLinkageError {
+    #[error("capture session references unknown flight_id: {flight_id}")]
+    UnknownFlight { flight_id: Uuid },
+    #[error("capture session references unknown field_id: {field_id}")]
+    UnknownField { field_id: Uuid },
+    #[error("capture session references unknown scene_id: {scene_id}")]
+    UnknownScene { scene_id: Uuid },
+    #[error(
+        "capture session scene {scene_id} belongs to field {expected_field_id}, not {field_id}"
+    )]
+    SceneFieldMismatch {
+        scene_id: Uuid,
+        expected_field_id: Uuid,
+        field_id: Uuid,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+struct CaptureLinkageCatalog {
+    flights: HashSet<Uuid>,
+    fields: HashSet<Uuid>,
+    scenes_by_field: HashMap<Uuid, Uuid>,
+}
+
+impl CaptureLinkageCatalog {
+    fn register(
+        &mut self,
+        reference: CaptureLinkageReference,
+    ) -> std::result::Result<(), CaptureLinkageError> {
+        if let Some(expected_field_id) = self.scenes_by_field.get(&reference.scene_id) {
+            if *expected_field_id != reference.field_id {
+                return Err(CaptureLinkageError::SceneFieldMismatch {
+                    scene_id: reference.scene_id,
+                    expected_field_id: *expected_field_id,
+                    field_id: reference.field_id,
+                });
+            }
+        }
+
+        self.flights.insert(reference.flight_id);
+        self.fields.insert(reference.field_id);
+        self.scenes_by_field
+            .insert(reference.scene_id, reference.field_id);
+        Ok(())
+    }
+
+    fn validate(
+        &self,
+        reference: CaptureLinkageReference,
+    ) -> std::result::Result<(), CaptureLinkageError> {
+        if !self.flights.contains(&reference.flight_id) {
+            return Err(CaptureLinkageError::UnknownFlight {
+                flight_id: reference.flight_id,
+            });
+        }
+
+        if !self.fields.contains(&reference.field_id) {
+            return Err(CaptureLinkageError::UnknownField {
+                field_id: reference.field_id,
+            });
+        }
+
+        let expected_field_id = self.scenes_by_field.get(&reference.scene_id).ok_or(
+            CaptureLinkageError::UnknownScene {
+                scene_id: reference.scene_id,
+            },
+        )?;
+        if *expected_field_id != reference.field_id {
+            return Err(CaptureLinkageError::SceneFieldMismatch {
+                scene_id: reference.scene_id,
+                expected_field_id: *expected_field_id,
+                field_id: reference.field_id,
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -569,6 +670,7 @@ pub struct SessionSummary {
 pub struct DataCollectorService {
     storage: StorageEngine,
     active_sessions: HashMap<Uuid, FlightSession>,
+    linkage_catalog: CaptureLinkageCatalog,
     indexer: DataIndexer,
     auto_export: bool,
     retention_days: u32,
@@ -601,10 +703,26 @@ impl DataCollectorService {
         Ok(Self {
             storage,
             active_sessions: HashMap::new(),
+            linkage_catalog: CaptureLinkageCatalog::default(),
             indexer,
             auto_export: false,
             retention_days: 365,
         })
+    }
+
+    pub fn register_capture_linkage(
+        &mut self,
+        reference: CaptureLinkageReference,
+    ) -> std::result::Result<(), CaptureLinkageError> {
+        self.linkage_catalog.register(reference)
+    }
+
+    pub fn validate_capture_linkage(
+        &self,
+        request: &CaptureSessionRequest,
+    ) -> std::result::Result<(), CaptureLinkageError> {
+        self.linkage_catalog
+            .validate(CaptureLinkageReference::from_request(request))
     }
 
     pub async fn start_session(
@@ -622,10 +740,12 @@ impl DataCollectorService {
         );
         request.mission_id = mission_id;
 
+        self.register_capture_linkage(CaptureLinkageReference::from_request(&request))?;
         self.start_capture_session(request).await
     }
 
     pub async fn start_capture_session(&mut self, request: CaptureSessionRequest) -> Result<Uuid> {
+        self.validate_capture_linkage(&request)?;
         let session = FlightSession::new(request);
 
         let session_id = session.id;
@@ -1153,6 +1273,16 @@ mod tests {
         }
     }
 
+    async fn start_linked_capture_session(
+        service: &mut DataCollectorService,
+        request: CaptureSessionRequest,
+    ) -> Uuid {
+        service
+            .register_capture_linkage(CaptureLinkageReference::from_request(&request))
+            .unwrap();
+        service.start_capture_session(request).await.unwrap()
+    }
+
     #[tokio::test]
     async fn test_service_creation() {
         let temp_dir = tempdir().unwrap();
@@ -1167,7 +1297,7 @@ mod tests {
 
         let request = capture_request();
         let drone_id = request.drone_id;
-        let session_id = service.start_capture_session(request).await.unwrap();
+        let session_id = start_linked_capture_session(&mut service, request).await;
 
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         assert_eq!(session.drone_id, drone_id);
@@ -1188,7 +1318,7 @@ mod tests {
         let scene_id = request.scene_id;
         let owner_id = request.owner_id.clone();
 
-        let session_id = service.start_capture_session(request).await.unwrap();
+        let session_id = start_linked_capture_session(&mut service, request).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
 
         assert_eq!(session.id, session_id);
@@ -1211,14 +1341,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_capture_session_validates_registered_linkage() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let request = capture_request();
+        let expected_linkage = CaptureLinkageReference::from_request(&request);
+
+        service
+            .register_capture_linkage(expected_linkage)
+            .expect("fixture linkage is registered");
+        let session_id = service.start_capture_session(request).await.unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let record = telemetry_record(&session);
+
+        service.collect_data(&session_id, record).await.unwrap();
+
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Collecting);
+        assert_eq!(session.flight_id, expected_linkage.flight_id);
+        assert_eq!(session.field_id, expected_linkage.field_id);
+        assert_eq!(session.scene_id, expected_linkage.scene_id);
+    }
+
+    #[tokio::test]
+    async fn test_start_capture_session_rejects_unknown_flight_linkage() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let mut request = capture_request();
+        service
+            .register_capture_linkage(CaptureLinkageReference::from_request(&request))
+            .unwrap();
+        let unknown_flight_id = Uuid::new_v4();
+        request.flight_id = unknown_flight_id;
+
+        let err = service.start_capture_session(request).await.unwrap_err();
+        let linkage_error = err.downcast_ref::<CaptureLinkageError>().unwrap();
+
+        assert_eq!(
+            linkage_error,
+            &CaptureLinkageError::UnknownFlight {
+                flight_id: unknown_flight_id
+            }
+        );
+        assert!(service.list_sessions(None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_collect_data_transitions_started_session_to_collecting() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
 
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         let record = telemetry_record(&session);
         let record_id = record.id;
@@ -1250,7 +1423,7 @@ mod tests {
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
 
         let request = capture_request().with_mission_id(Uuid::new_v4());
-        let session_id = service.start_capture_session(request).await.unwrap();
+        let session_id = start_linked_capture_session(&mut service, request).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
 
         let batch = service
@@ -1284,10 +1457,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
 
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         let record = telemetry_record(&session);
         let record_timestamp = record.timestamp;
@@ -1317,10 +1487,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
 
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         let mut record = telemetry_record(&session);
         record.timestamp = Utc::now() - chrono::Duration::seconds(120);
@@ -1337,10 +1504,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
 
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         let record = telemetry_record(&session);
 
@@ -1389,10 +1553,7 @@ mod tests {
     async fn test_search_data_returns_persisted_records_after_restart() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         let record = telemetry_record(&session);
         let record_id = record.id;
@@ -1424,10 +1585,7 @@ mod tests {
     async fn test_export_session_json_loads_real_records() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         let record = telemetry_record(&session);
         let record_id = record.id;
@@ -1460,10 +1618,7 @@ mod tests {
     async fn test_export_session_csv_loads_real_records() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         let record = telemetry_record(&session);
         let record_id = record.id;
@@ -1489,10 +1644,7 @@ mod tests {
     async fn test_export_session_json_allows_empty_session() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
 
         let output_path = temp_dir.path().join("empty-session-export.json");
         service
@@ -1509,10 +1661,7 @@ mod tests {
     async fn test_record_provenance_is_required_for_all_types_and_payloads() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
 
         for data_type in all_data_types() {
@@ -1540,10 +1689,7 @@ mod tests {
     async fn test_missing_gps_or_timestamp_is_rejected_as_provenance_error() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
 
         let mut missing_gps = provenance(&session);
@@ -1585,10 +1731,7 @@ mod tests {
     async fn test_collect_data_rejects_incomplete_provenance_record() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
         let session = service.get_session(&session_id).await.unwrap().unwrap();
         let mut record = telemetry_record(&session);
         record.gps_coords = None;
@@ -1606,10 +1749,7 @@ mod tests {
     async fn test_fail_session_transitions_to_failed_terminal_state() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
-        let session_id = service
-            .start_capture_session(capture_request())
-            .await
-            .unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
 
         let failed_session = service.fail_session(&session_id).await.unwrap();
 
