@@ -908,6 +908,225 @@ fn normalize_tractor_text(value: String) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherForecastValue {
+    pub value: f64,
+    pub unit: String,
+    pub source: String,
+    pub fetched_at: String,
+    pub valid_time: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherForecastVariables {
+    pub temperature_celsius: WeatherForecastValue,
+    pub wind_speed_mps: WeatherForecastValue,
+    pub precipitation_mm: WeatherForecastValue,
+    pub humidity_percent: WeatherForecastValue,
+    pub radiation_w_m2: WeatherForecastValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherForecastRecord {
+    pub forecast_id: String,
+    pub field_ref: String,
+    pub valid_time: String,
+    pub vars: WeatherForecastVariables,
+    pub source: String,
+    pub fetched_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherProviderForecastPoint {
+    pub valid_time: String,
+    pub temperature_celsius: f64,
+    pub wind_speed_mps: f64,
+    pub precipitation_mm: f64,
+    pub humidity_percent: f64,
+    pub radiation_w_m2: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherProviderForecastResponse {
+    pub source: String,
+    pub fetched_at: String,
+    pub points: Vec<WeatherProviderForecastPoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeatherFetchFailureRecord {
+    pub failure_id: String,
+    pub field_ref: String,
+    pub source: String,
+    pub fetched_at: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherIngestError {
+    #[error("weather field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("weather source cannot be empty")]
+    EmptySource,
+    #[error("weather fetched_at cannot be empty")]
+    EmptyFetchedAt,
+    #[error("weather valid_time cannot be empty")]
+    EmptyValidTime,
+    #[error("weather forecast contains no points")]
+    EmptyForecastPoints,
+    #[error("weather value {variable} is invalid: {value}")]
+    InvalidValue { variable: String, value: String },
+    #[error("weather failure_id cannot be empty")]
+    EmptyFailureId,
+    #[error("weather failure reason cannot be empty")]
+    EmptyFailureReason,
+}
+
+pub fn normalize_weather_provider_forecast(
+    field_ref: String,
+    response: WeatherProviderForecastResponse,
+) -> Result<Vec<WeatherForecastRecord>, WeatherIngestError> {
+    let field_ref = normalize_weather_text(field_ref).ok_or(WeatherIngestError::EmptyFieldRef)?;
+    let source = normalize_weather_text(response.source).ok_or(WeatherIngestError::EmptySource)?;
+    let fetched_at =
+        normalize_weather_text(response.fetched_at).ok_or(WeatherIngestError::EmptyFetchedAt)?;
+    if response.points.is_empty() {
+        return Err(WeatherIngestError::EmptyForecastPoints);
+    }
+
+    response
+        .points
+        .into_iter()
+        .map(|point| {
+            let valid_time = normalize_weather_text(point.valid_time)
+                .ok_or(WeatherIngestError::EmptyValidTime)?;
+            let vars = WeatherForecastVariables {
+                temperature_celsius: weather_value(
+                    "temperature_celsius",
+                    point.temperature_celsius,
+                    "deg_c",
+                    &source,
+                    &fetched_at,
+                    &valid_time,
+                    f64::is_finite,
+                )?,
+                wind_speed_mps: weather_value(
+                    "wind_speed_mps",
+                    point.wind_speed_mps,
+                    "m/s",
+                    &source,
+                    &fetched_at,
+                    &valid_time,
+                    |value| value.is_finite() && value >= 0.0,
+                )?,
+                precipitation_mm: weather_value(
+                    "precipitation_mm",
+                    point.precipitation_mm,
+                    "mm",
+                    &source,
+                    &fetched_at,
+                    &valid_time,
+                    |value| value.is_finite() && value >= 0.0,
+                )?,
+                humidity_percent: weather_value(
+                    "humidity_percent",
+                    point.humidity_percent,
+                    "percent",
+                    &source,
+                    &fetched_at,
+                    &valid_time,
+                    |value| value.is_finite() && (0.0..=100.0).contains(&value),
+                )?,
+                radiation_w_m2: weather_value(
+                    "radiation_w_m2",
+                    point.radiation_w_m2,
+                    "W/m^2",
+                    &source,
+                    &fetched_at,
+                    &valid_time,
+                    |value| value.is_finite() && value >= 0.0,
+                )?,
+            };
+
+            Ok(WeatherForecastRecord {
+                forecast_id: stable_weather_forecast_id(&field_ref, &source, &valid_time),
+                field_ref: field_ref.clone(),
+                valid_time,
+                vars,
+                source: source.clone(),
+                fetched_at: fetched_at.clone(),
+            })
+        })
+        .collect()
+}
+
+pub fn weather_fetch_failure_record(
+    failure_id: String,
+    field_ref: String,
+    source: String,
+    fetched_at: String,
+    reason: String,
+) -> Result<WeatherFetchFailureRecord, WeatherIngestError> {
+    Ok(WeatherFetchFailureRecord {
+        failure_id: normalize_weather_text(failure_id).ok_or(WeatherIngestError::EmptyFailureId)?,
+        field_ref: normalize_weather_text(field_ref).ok_or(WeatherIngestError::EmptyFieldRef)?,
+        source: normalize_weather_text(source).ok_or(WeatherIngestError::EmptySource)?,
+        fetched_at: normalize_weather_text(fetched_at).ok_or(WeatherIngestError::EmptyFetchedAt)?,
+        reason: normalize_weather_text(reason).ok_or(WeatherIngestError::EmptyFailureReason)?,
+    })
+}
+
+fn weather_value(
+    variable: &str,
+    value: f64,
+    unit: &str,
+    source: &str,
+    fetched_at: &str,
+    valid_time: &str,
+    validator: impl Fn(f64) -> bool,
+) -> Result<WeatherForecastValue, WeatherIngestError> {
+    if !validator(value) {
+        return Err(WeatherIngestError::InvalidValue {
+            variable: variable.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(WeatherForecastValue {
+        value,
+        unit: unit.to_string(),
+        source: source.to_string(),
+        fetched_at: fetched_at.to_string(),
+        valid_time: valid_time.to_string(),
+    })
+}
+
+fn stable_weather_forecast_id(field_ref: &str, source: &str, valid_time: &str) -> String {
+    format!(
+        "weather:{}:{}:{}",
+        sanitize_weather_id_part(field_ref),
+        sanitize_weather_id_part(source),
+        sanitize_weather_id_part(valid_time)
+    )
+}
+
+fn sanitize_weather_id_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn normalize_weather_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetNodeComponentHealth {
@@ -3464,25 +3683,27 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 mod tests {
     use super::{
         apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
-        bind_fleet_node_identity, bounds_from_points, sign_fleet_config_bundle,
-        validate_field_boundary, verify_and_apply_fleet_config_bundle, AnnotationAuditRegistry,
-        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
-        AuditedAnnotationRecord, CropPlanRecord, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus, FleetConfigBundle,
-        FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeEnrollmentError,
-        FleetNodeEnrollmentRequest, FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind,
-        FleetNodeOperationError, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds,
-        GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
-        ReportDeliverableRegistry, ReportFormat, ReportPersistenceError, ReportRecord,
-        ReportVisibility, SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
+        bind_fleet_node_identity, bounds_from_points, normalize_weather_provider_forecast,
+        sign_fleet_config_bundle, validate_field_boundary, verify_and_apply_fleet_config_bundle,
+        weather_fetch_failure_record, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CropPlanRecord, FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery,
+        FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, MultispectralImage,
+        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
+        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
+        RecommendationStatus, RecommendationStatusChangeType, ReportDeliverableRegistry,
+        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
         TractorCommandAuditDecision, TractorCommandRejectionReason, TractorImplementRef,
         TractorLifecycleStatus, TractorMotionCommandRequest, TractorRegistrationRequest,
-        TractorRegistry, WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
-        WorkOrderRegistry, WorkOrderStatus,
+        TractorRegistry, WeatherIngestError, WeatherProviderForecastPoint,
+        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
+        WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -3877,6 +4098,93 @@ mod tests {
         );
         assert_eq!(unknown.status_code(), 404);
         assert_eq!(registry.command_audits().len(), 2);
+    }
+
+    #[test]
+    fn weather_provider_forecast_normalizes_values_with_source_and_fetch_time() {
+        let records = normalize_weather_provider_forecast(
+            " field-north ".to_string(),
+            WeatherProviderForecastResponse {
+                source: " NOAA-HRRR ".to_string(),
+                fetched_at: " 2026-06-13T10:00:00Z ".to_string(),
+                points: vec![WeatherProviderForecastPoint {
+                    valid_time: " 2026-06-13T11:00:00Z ".to_string(),
+                    temperature_celsius: 22.5,
+                    wind_speed_mps: 4.2,
+                    precipitation_mm: 0.1,
+                    humidity_percent: 64.0,
+                    radiation_w_m2: 720.0,
+                }],
+            },
+        )
+        .expect("provider response should normalize");
+
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.field_ref, "field-north");
+        assert_eq!(record.source, "NOAA-HRRR");
+        assert_eq!(record.fetched_at, "2026-06-13T10:00:00Z");
+        assert_eq!(record.valid_time, "2026-06-13T11:00:00Z");
+        assert_eq!(
+            record.forecast_id,
+            "weather:field-north:NOAA-HRRR:2026-06-13T11-00-00Z"
+        );
+        assert_eq!(record.vars.temperature_celsius.value, 22.5);
+        assert_eq!(record.vars.temperature_celsius.unit, "deg_c");
+        assert_eq!(record.vars.temperature_celsius.source, "NOAA-HRRR");
+        assert_eq!(
+            record.vars.temperature_celsius.fetched_at,
+            "2026-06-13T10:00:00Z"
+        );
+        assert_eq!(
+            record.vars.radiation_w_m2.valid_time,
+            "2026-06-13T11:00:00Z"
+        );
+    }
+
+    #[test]
+    fn weather_provider_forecast_rejects_invalid_values_without_partial_records() {
+        let error = normalize_weather_provider_forecast(
+            "field-north".to_string(),
+            WeatherProviderForecastResponse {
+                source: "sample".to_string(),
+                fetched_at: "2026-06-13T10:00:00Z".to_string(),
+                points: vec![WeatherProviderForecastPoint {
+                    valid_time: "2026-06-13T11:00:00Z".to_string(),
+                    temperature_celsius: 22.5,
+                    wind_speed_mps: -1.0,
+                    precipitation_mm: 0.0,
+                    humidity_percent: 64.0,
+                    radiation_w_m2: 720.0,
+                }],
+            },
+        )
+        .expect_err("negative wind speed is invalid");
+
+        assert_eq!(
+            error,
+            WeatherIngestError::InvalidValue {
+                variable: "wind_speed_mps".to_string(),
+                value: "-1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn weather_fetch_failure_record_captures_provider_reason() {
+        let failure = weather_fetch_failure_record(
+            " failure-001 ".to_string(),
+            " field-north ".to_string(),
+            " NOAA-HRRR ".to_string(),
+            " 2026-06-13T10:00:00Z ".to_string(),
+            " provider unreachable ".to_string(),
+        )
+        .expect("failure record should normalize");
+
+        assert_eq!(failure.failure_id, "failure-001");
+        assert_eq!(failure.field_ref, "field-north");
+        assert_eq!(failure.source, "NOAA-HRRR");
+        assert_eq!(failure.reason, "provider unreachable");
     }
 
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {

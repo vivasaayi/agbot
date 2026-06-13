@@ -1982,6 +1982,208 @@ async fn tractor_registration_rejects_cross_tenant_field_link() -> Result<()> {
 }
 
 #[tokio::test]
+async fn weather_forecast_pull_normalizes_values_with_per_value_evidence() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_weather_forecast_field(&ctx).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/weather/forecasts/pull")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "field_id": "field-weather",
+                        "provider": "sample",
+                        "latitude": 41.2,
+                        "longitude": -96.5,
+                        "fetched_at": "2026-06-13T10:00:00Z",
+                        "valid_time": "2026-06-13T11:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let records: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        records
+            .pointer("/0/field_ref")
+            .and_then(|value| value.as_str()),
+        Some("field:field-weather")
+    );
+    assert_eq!(
+        records
+            .pointer("/0/source")
+            .and_then(|value| value.as_str()),
+        Some("sample")
+    );
+    assert_eq!(
+        records
+            .pointer("/0/vars/temperature_celsius/source")
+            .and_then(|value| value.as_str()),
+        Some("sample")
+    );
+    assert_eq!(
+        records
+            .pointer("/0/vars/temperature_celsius/fetched_at")
+            .and_then(|value| value.as_str()),
+        Some("2026-06-13T10:00:00Z")
+    );
+    assert_eq!(
+        records
+            .pointer("/0/vars/wind_speed_mps/unit")
+            .and_then(|value| value.as_str()),
+        Some("m/s")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/weather/forecasts?field_id=field-weather")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        listed
+            .pointer("/0/forecast_id")
+            .and_then(|value| value.as_str()),
+        Some("weather:field-field-weather:sample:2026-06-13T11-00-00Z")
+    );
+
+    let forecast_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM weather_forecasts")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(forecast_count, 1);
+    let series_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM time_series_points WHERE entity_ref = ?1")
+            .bind("field:field-weather")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(series_count, 5);
+
+    let wind_series = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/time-series/points?entity_ref=field:field-weather&metric=wind_speed_mps")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(wind_series.status(), StatusCode::OK);
+    let body = to_bytes(wind_series.into_body(), 64 * 1024).await?;
+    let wind: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        wind.pointer("/0/source_ref")
+            .and_then(|value| value.as_str()),
+        Some("weather:field-field-weather:sample:2026-06-13T11-00-00Z")
+    );
+    assert_eq!(
+        wind.pointer("/0/metadata/source")
+            .and_then(|value| value.as_str()),
+        Some("sample")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn weather_forecast_pull_records_provider_failure_without_partial_insert() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_weather_forecast_field(&ctx).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/weather/forecasts/pull")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "field_id": "field-weather",
+                        "provider": "unreachable",
+                        "latitude": 41.2,
+                        "longitude": -96.5,
+                        "fetched_at": "2026-06-13T10:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let failure: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        failure.get("field_ref").and_then(|value| value.as_str()),
+        Some("field:field-weather")
+    );
+    assert_eq!(
+        failure.get("reason").and_then(|value| value.as_str()),
+        Some("provider unreachable")
+    );
+
+    let forecast_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM weather_forecasts")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(forecast_count, 0);
+    let failure_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM weather_fetch_failures")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(failure_count, 1);
+    let series_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM time_series_points")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(series_count, 0);
+
+    let list_failures = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/weather/fetch-failures?field_id=field-weather")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_failures.status(), StatusCode::OK);
+    let body = to_bytes(list_failures.into_body(), 64 * 1024).await?;
+    let failures: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        failures
+            .pointer("/0/reason")
+            .and_then(|value| value.as_str()),
+        Some("provider unreachable")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -7496,6 +7698,62 @@ async fn seed_tractor_registry_field(ctx: &TestContext) -> Result<()> {
                         "farm_id": "farm-tractor",
                         "field_id": "field-tractor",
                         "name": "Tractor Field",
+                        "boundary": {
+                            "crs": "EPSG:4326",
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 },
+                                { "longitude": -96.7, "latitude": 41.1 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(field_response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_weather_forecast_field(ctx: &TestContext) -> Result<()> {
+    let farm_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-weather",
+                        "owner": "org-alpha",
+                        "name": "Weather Farm"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(farm_response.status(), StatusCode::OK);
+
+    let field_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-weather",
+                        "field_id": "field-weather",
+                        "name": "Weather Field",
                         "boundary": {
                             "crs": "EPSG:4326",
                             "coordinates": [

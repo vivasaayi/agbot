@@ -62,6 +62,18 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::validate_tractor_motion_command),
         )
         .route(
+            "/api/weather/forecasts",
+            get(routes::list_weather_forecasts),
+        )
+        .route(
+            "/api/weather/forecasts/pull",
+            post(routes::pull_weather_forecast),
+        )
+        .route(
+            "/api/weather/fetch-failures",
+            get(routes::list_weather_fetch_failures),
+        )
+        .route(
             "/api/orthomosaic/frame-sets",
             get(routes::list_orthomosaic_frame_sets).post(routes::ingest_orthomosaic_frame_set),
         )

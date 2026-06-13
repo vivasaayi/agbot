@@ -63,16 +63,19 @@ use orthomosaic::{
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points, build_tractor_record,
-    validate_field_boundary, AnnotationGeometry, AnnotationRecord, FarmFieldEntityStatus,
-    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
-    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
-    ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
+    normalize_weather_provider_forecast, validate_field_boundary, weather_fetch_failure_record,
+    AnnotationGeometry, AnnotationRecord, FarmFieldEntityStatus, FarmFieldListPage,
+    FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord, FieldRecord,
+    FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord,
+    FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
+    MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
     RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
     TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
     TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
     TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
-    DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
+    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
+    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
+    GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_device_record, GatewayIngestError,
@@ -390,6 +393,30 @@ pub struct TractorMotionCommandValidationRequest {
     pub command_id: Option<String>,
     pub command_type: String,
     pub requested_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullWeatherForecastRequest {
+    pub field_id: String,
+    pub provider: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    #[serde(default)]
+    pub fetched_at: Option<String>,
+    #[serde(default)]
+    pub valid_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WeatherForecastListQuery {
+    pub field_id: Option<String>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WeatherFetchFailureListQuery {
+    pub field_id: Option<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1844,6 +1871,125 @@ pub async fn validate_tractor_motion_command(
     }
 
     Ok(Json(tractor).into_response())
+}
+
+pub async fn pull_weather_forecast(
+    State(state): State<AppState>,
+    Json(request): Json<PullWeatherForecastRequest>,
+) -> AppResult<Response> {
+    validate_lat_lon(request.latitude, request.longitude)?;
+    let field_id = normalize_optional_text(Some(request.field_id))
+        .ok_or_else(|| AppError::BadRequest("weather field_id is required".to_string()))?;
+    load_field(&state, &field_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("field {field_id} does not exist")))?;
+    let field_ref = canonical_weather_field_ref(&field_id);
+    let provider = normalize_optional_text(Some(request.provider))
+        .ok_or_else(|| AppError::BadRequest("weather provider is required".to_string()))?;
+    let fetched_at =
+        normalize_optional_text(request.fetched_at).unwrap_or_else(current_record_timestamp);
+
+    if provider.eq_ignore_ascii_case("unreachable") {
+        let failure = weather_fetch_failure_record(
+            format!("weather-fetch-failure-{}", Uuid::new_v4()),
+            field_ref,
+            provider,
+            fetched_at,
+            "provider unreachable".to_string(),
+        )
+        .map_err(weather_ingest_error)?;
+        insert_weather_fetch_failure(
+            &state,
+            &field_id,
+            &failure,
+            request.latitude,
+            request.longitude,
+            current_record_timestamp(),
+        )
+        .await?;
+        return Ok((StatusCode::BAD_GATEWAY, Json(failure)).into_response());
+    }
+
+    let provider_response =
+        sample_weather_provider_response(&provider, fetched_at, request.valid_time)?;
+    let records = normalize_weather_provider_forecast(field_ref, provider_response)
+        .map_err(weather_ingest_error)?;
+    for record in &records {
+        let created_at = current_record_timestamp();
+        insert_weather_forecast_record(
+            &state,
+            &field_id,
+            record,
+            request.latitude,
+            request.longitude,
+            created_at.clone(),
+        )
+        .await?;
+        insert_weather_time_series_points(&state, &field_id, record, created_at).await?;
+    }
+
+    Ok(Json(records).into_response())
+}
+
+pub async fn list_weather_forecasts(
+    Query(query): Query<WeatherForecastListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<WeatherForecastRecord>>> {
+    let field_id = normalize_optional_text(query.field_id);
+    let source = normalize_optional_text(query.source);
+    let rows = sqlx::query(
+        r#"
+        SELECT forecast_id, field_id, field_ref, valid_time, vars_json, source, fetched_at
+        FROM weather_forecasts
+        WHERE (?1 IS NULL OR field_id = ?1)
+          AND (?2 IS NULL OR source = ?2)
+        ORDER BY valid_time ASC, forecast_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(source)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_weather_forecast_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn list_weather_fetch_failures(
+    Query(query): Query<WeatherFetchFailureListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<WeatherFetchFailureRecord>>> {
+    let field_id = normalize_optional_text(query.field_id);
+    let source = normalize_optional_text(query.source);
+    let rows = sqlx::query(
+        r#"
+        SELECT failure_id, field_id, field_ref, source, fetched_at, reason
+        FROM weather_fetch_failures
+        WHERE (?1 IS NULL OR field_id = ?1)
+          AND (?2 IS NULL OR source = ?2)
+        ORDER BY fetched_at DESC, failure_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(source)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| WeatherFetchFailureRecord {
+                failure_id: row.get("failure_id"),
+                field_ref: row.get("field_ref"),
+                source: row.get("source"),
+                fetched_at: row.get("fetched_at"),
+                reason: row.get("reason"),
+            })
+            .collect(),
+    ))
 }
 
 pub async fn register_fleet_component(
@@ -5609,6 +5755,14 @@ fn tractor_rejection_status(rejection: &TractorCommandRejection) -> StatusCode {
     StatusCode::from_u16(rejection.status_code()).unwrap_or(StatusCode::BAD_REQUEST)
 }
 
+fn weather_ingest_error(error: WeatherIngestError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn canonical_weather_field_ref(field_id: &str) -> String {
+    format!("field:{field_id}")
+}
+
 fn parse_fleet_node_kind(value: String) -> AppResult<FleetNodeKind> {
     value.parse::<FleetNodeKind>().map_err(|err| {
         AppError::Anyhow(Error::new(err).context("failed to decode fleet node kind"))
@@ -5631,6 +5785,33 @@ fn parse_tractor_lifecycle_status(value: String) -> AppResult<TractorLifecycleSt
     value
         .parse::<TractorLifecycleStatus>()
         .map_err(|err| AppError::Anyhow(Error::new(err).context("failed to decode tractor status")))
+}
+
+fn sample_weather_provider_response(
+    provider: &str,
+    fetched_at: String,
+    valid_time: Option<String>,
+) -> AppResult<WeatherProviderForecastResponse> {
+    if !provider.eq_ignore_ascii_case("sample") {
+        return Err(AppError::BadRequest(format!(
+            "unsupported weather provider {provider}"
+        )));
+    }
+    let valid_time = normalize_optional_text(valid_time)
+        .unwrap_or_else(|| (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+
+    Ok(WeatherProviderForecastResponse {
+        source: "sample".to_string(),
+        fetched_at,
+        points: vec![WeatherProviderForecastPoint {
+            valid_time,
+            temperature_celsius: 22.0,
+            wind_speed_mps: 4.5,
+            precipitation_mm: 0.2,
+            humidity_percent: 63.0,
+            radiation_w_m2: 710.0,
+        }],
+    })
 }
 
 fn fleet_health_error(error: FleetHealthError) -> AppError {
@@ -6669,6 +6850,23 @@ fn decode_tractor_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<TractorReco
     })
 }
 
+fn decode_weather_forecast_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<WeatherForecastRecord> {
+    let vars_json: String = row.get("vars_json");
+    let vars = serde_json::from_str::<WeatherForecastVariables>(&vars_json).map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode weather vars_json"))
+    })?;
+    Ok(WeatherForecastRecord {
+        forecast_id: row.get("forecast_id"),
+        field_ref: row.get("field_ref"),
+        valid_time: row.get("valid_time"),
+        vars,
+        source: row.get("source"),
+        fetched_at: row.get("fetched_at"),
+    })
+}
+
 fn decode_fleet_component_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FleetComponentRecord> {
     let service_history_json: String = row.get("service_history_json");
     let service_history = serde_json::from_str::<Vec<ServiceHistoryEntry>>(&service_history_json)
@@ -7224,6 +7422,115 @@ async fn insert_tractor_command_audit(
     })
     .bind(&audit.reason_code)
     .bind(&audit.at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_weather_forecast_record(
+    state: &AppState,
+    field_id: &str,
+    record: &WeatherForecastRecord,
+    latitude: f64,
+    longitude: f64,
+    created_at: String,
+) -> AppResult<()> {
+    let vars_json =
+        serde_json::to_string(&record.vars).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT OR REPLACE INTO weather_forecasts (
+            forecast_id, field_id, field_ref, valid_time, vars_json, source, fetched_at,
+            latitude, longitude, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(&record.forecast_id)
+    .bind(field_id)
+    .bind(&record.field_ref)
+    .bind(&record.valid_time)
+    .bind(vars_json)
+    .bind(&record.source)
+    .bind(&record.fetched_at)
+    .bind(latitude)
+    .bind(longitude)
+    .bind(created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_weather_time_series_points(
+    state: &AppState,
+    field_id: &str,
+    record: &WeatherForecastRecord,
+    created_at: String,
+) -> AppResult<()> {
+    let metadata = serde_json::json!({
+        "forecast_id": record.forecast_id,
+        "field_id": field_id,
+        "source": record.source,
+        "fetched_at": record.fetched_at,
+        "valid_time": record.valid_time
+    })
+    .to_string();
+
+    for (metric, value) in [
+        ("temperature_celsius", &record.vars.temperature_celsius),
+        ("wind_speed_mps", &record.vars.wind_speed_mps),
+        ("precipitation_mm", &record.vars.precipitation_mm),
+        ("humidity_percent", &record.vars.humidity_percent),
+        ("radiation_w_m2", &record.vars.radiation_w_m2),
+    ] {
+        insert_time_series_point_record(
+            state,
+            &SeriesPoint {
+                entity_ref: record.field_ref.clone(),
+                metric: metric.to_string(),
+                unit: value.unit.clone(),
+                t: record.valid_time.clone(),
+                value: SeriesValue::Scalar { value: value.value },
+                source_ref: record.forecast_id.clone(),
+                created_at: created_at.clone(),
+            },
+            Some(metadata.clone()),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn insert_weather_fetch_failure(
+    state: &AppState,
+    field_id: &str,
+    failure: &WeatherFetchFailureRecord,
+    latitude: f64,
+    longitude: f64,
+    created_at: String,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO weather_fetch_failures (
+            failure_id, field_id, field_ref, source, fetched_at, reason, latitude, longitude, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&failure.failure_id)
+    .bind(field_id)
+    .bind(&failure.field_ref)
+    .bind(&failure.source)
+    .bind(&failure.fetched_at)
+    .bind(&failure.reason)
+    .bind(latitude)
+    .bind(longitude)
+    .bind(created_at)
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;

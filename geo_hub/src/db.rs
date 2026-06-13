@@ -535,6 +535,59 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS weather_forecasts (
+            forecast_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            field_ref TEXT NOT NULL,
+            valid_time TEXT NOT NULL,
+            vars_json TEXT NOT NULL,
+            source TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS weather_fetch_failures (
+            failure_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            field_ref TEXT NOT NULL,
+            source TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "weather_forecasts",
+        "field_ref",
+        "ALTER TABLE weather_forecasts ADD COLUMN field_ref TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "weather_fetch_failures",
+        "field_ref",
+        "ALTER TABLE weather_fetch_failures ADD COLUMN field_ref TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS fleet_components (
             component_id TEXT PRIMARY KEY,
             component_type TEXT NOT NULL,
@@ -994,6 +1047,42 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_tractor_command_audits_tractor_id
         ON tractor_command_audits(tractor_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_weather_forecasts_field_valid
+        ON weather_forecasts(field_id, valid_time);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_weather_forecasts_field_ref_source_fetch
+        ON weather_forecasts(field_ref, source, fetched_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_weather_fetch_failures_field
+        ON weather_fetch_failures(field_id, fetched_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_weather_fetch_failures_field_ref_source_fetch
+        ON weather_fetch_failures(field_ref, source, fetched_at);
         "#,
     )
     .execute(pool)
