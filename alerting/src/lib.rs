@@ -226,6 +226,42 @@ pub struct AlertRoutingOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AlertLifecycleState {
+    Fired,
+    Acknowledged,
+    Resolved,
+    AutoResolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertLifecycleTransition {
+    pub alert_id: String,
+    pub from: AlertLifecycleState,
+    pub to: AlertLifecycleState,
+    pub actor_id: String,
+    pub at: String,
+    pub audit_detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertLifecycleRecord {
+    pub alert_id: String,
+    pub source_event_ref: String,
+    pub state: AlertLifecycleState,
+    pub fired_at: String,
+    pub transitions: Vec<AlertLifecycleTransition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertLifecycleAction {
+    pub alert_id: String,
+    pub state: AlertLifecycleState,
+    pub transition: Option<AlertLifecycleTransition>,
+    pub idempotent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
     Delivered,
     Failed,
@@ -385,6 +421,24 @@ pub enum AlertingError {
         recipient_id: String,
         first_role: String,
         second_role: String,
+    },
+    #[error("lifecycle actor_id cannot be empty")]
+    EmptyLifecycleActorId,
+    #[error("lifecycle timestamp cannot be empty")]
+    EmptyLifecycleTimestamp,
+    #[error("invalid lifecycle transition for {alert_id}: {from:?} -> {attempted:?}")]
+    InvalidLifecycleTransition {
+        alert_id: String,
+        from: AlertLifecycleState,
+        attempted: AlertLifecycleState,
+    },
+    #[error(
+        "invalid lifecycle timestamp order for {alert_id}: previous {previous_at} after attempted {attempted_at}"
+    )]
+    InvalidLifecycleTimestampOrder {
+        alert_id: String,
+        previous_at: String,
+        attempted_at: String,
     },
     #[error("severity evidence must be finite with warning <= critical <= emergency thresholds")]
     InvalidSeverityEvidence,
@@ -854,6 +908,95 @@ pub fn route_alert_to_recipients(
     })
 }
 
+pub fn open_alert_lifecycle(
+    alert: &FiredAlertRecord,
+) -> Result<AlertLifecycleRecord, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    Ok(AlertLifecycleRecord {
+        alert_id: alert.alert_id,
+        source_event_ref: alert.source_event_ref,
+        state: AlertLifecycleState::Fired,
+        fired_at: alert.fired_at,
+        transitions: Vec::new(),
+    })
+}
+
+pub fn acknowledge_alert(
+    lifecycle: &mut AlertLifecycleRecord,
+    actor_id: String,
+    acknowledged_at: String,
+) -> Result<AlertLifecycleAction, AlertingError> {
+    let actor_id = normalize_required_text(actor_id, AlertingError::EmptyLifecycleActorId)?;
+    let acknowledged_at =
+        normalize_required_text(acknowledged_at, AlertingError::EmptyLifecycleTimestamp)?;
+
+    match lifecycle.state {
+        AlertLifecycleState::Fired => apply_lifecycle_transition(
+            lifecycle,
+            AlertLifecycleState::Acknowledged,
+            actor_id,
+            acknowledged_at,
+        ),
+        AlertLifecycleState::Acknowledged => idempotent_lifecycle_action(lifecycle),
+        AlertLifecycleState::Resolved | AlertLifecycleState::AutoResolved => {
+            Err(AlertingError::InvalidLifecycleTransition {
+                alert_id: lifecycle.alert_id.clone(),
+                from: lifecycle.state,
+                attempted: AlertLifecycleState::Acknowledged,
+            })
+        }
+    }
+}
+
+pub fn resolve_alert(
+    lifecycle: &mut AlertLifecycleRecord,
+    actor_id: String,
+    resolved_at: String,
+) -> Result<AlertLifecycleAction, AlertingError> {
+    let actor_id = normalize_required_text(actor_id, AlertingError::EmptyLifecycleActorId)?;
+    let resolved_at = normalize_required_text(resolved_at, AlertingError::EmptyLifecycleTimestamp)?;
+
+    match lifecycle.state {
+        AlertLifecycleState::Acknowledged => apply_lifecycle_transition(
+            lifecycle,
+            AlertLifecycleState::Resolved,
+            actor_id,
+            resolved_at,
+        ),
+        AlertLifecycleState::Resolved | AlertLifecycleState::AutoResolved => {
+            idempotent_lifecycle_action(lifecycle)
+        }
+        AlertLifecycleState::Fired => Err(AlertingError::InvalidLifecycleTransition {
+            alert_id: lifecycle.alert_id.clone(),
+            from: lifecycle.state,
+            attempted: AlertLifecycleState::Resolved,
+        }),
+    }
+}
+
+pub fn auto_resolve_alert(
+    lifecycle: &mut AlertLifecycleRecord,
+    source_ref: String,
+    resolved_at: String,
+) -> Result<AlertLifecycleAction, AlertingError> {
+    let source_ref = normalize_required_text(source_ref, AlertingError::EmptyLifecycleActorId)?;
+    let resolved_at = normalize_required_text(resolved_at, AlertingError::EmptyLifecycleTimestamp)?;
+
+    match lifecycle.state {
+        AlertLifecycleState::Fired | AlertLifecycleState::Acknowledged => {
+            apply_lifecycle_transition(
+                lifecycle,
+                AlertLifecycleState::AutoResolved,
+                source_ref,
+                resolved_at,
+            )
+        }
+        AlertLifecycleState::Resolved | AlertLifecycleState::AutoResolved => {
+            idempotent_lifecycle_action(lifecycle)
+        }
+    }
+}
+
 pub fn deliver_alert<A: ChannelAdapter>(
     adapter: &mut A,
     alert: &FiredAlertRecord,
@@ -1174,6 +1317,87 @@ fn routing_decision(
     }
 }
 
+fn apply_lifecycle_transition(
+    lifecycle: &mut AlertLifecycleRecord,
+    to: AlertLifecycleState,
+    actor_id: String,
+    at: String,
+) -> Result<AlertLifecycleAction, AlertingError> {
+    let previous_at = validate_lifecycle_record(lifecycle)?;
+    if at < previous_at {
+        return Err(AlertingError::InvalidLifecycleTimestampOrder {
+            alert_id: lifecycle.alert_id.clone(),
+            previous_at,
+            attempted_at: at,
+        });
+    }
+
+    let from = lifecycle.state;
+    let transition = AlertLifecycleTransition {
+        alert_id: lifecycle.alert_id.clone(),
+        from,
+        to,
+        actor_id,
+        at,
+        audit_detail: format!(
+            "alert {} lifecycle transition {:?}->{:?} from source event {}",
+            lifecycle.alert_id, from, to, lifecycle.source_event_ref
+        ),
+    };
+    lifecycle.state = to;
+    lifecycle.transitions.push(transition.clone());
+
+    Ok(AlertLifecycleAction {
+        alert_id: lifecycle.alert_id.clone(),
+        state: lifecycle.state,
+        transition: Some(transition),
+        idempotent: false,
+    })
+}
+
+fn idempotent_lifecycle_action(
+    lifecycle: &AlertLifecycleRecord,
+) -> Result<AlertLifecycleAction, AlertingError> {
+    validate_lifecycle_record(lifecycle)?;
+    Ok(AlertLifecycleAction {
+        alert_id: lifecycle.alert_id.clone(),
+        state: lifecycle.state,
+        transition: None,
+        idempotent: true,
+    })
+}
+
+fn validate_lifecycle_record(lifecycle: &AlertLifecycleRecord) -> Result<String, AlertingError> {
+    normalize_required_text(lifecycle.alert_id.clone(), AlertingError::EmptyAlertId)?;
+    normalize_required_text(
+        lifecycle.source_event_ref.clone(),
+        AlertingError::EmptySourceEventRef,
+    )?;
+    let fired_at =
+        normalize_required_text(lifecycle.fired_at.clone(), AlertingError::EmptyFiredAt)?;
+    for transition in &lifecycle.transitions {
+        normalize_required_text(transition.alert_id.clone(), AlertingError::EmptyAlertId)?;
+        normalize_required_text(
+            transition.actor_id.clone(),
+            AlertingError::EmptyLifecycleActorId,
+        )?;
+        normalize_required_text(
+            transition.at.clone(),
+            AlertingError::EmptyLifecycleTimestamp,
+        )?;
+        normalize_required_text(
+            transition.audit_detail.clone(),
+            AlertingError::EmptyExplanation,
+        )?;
+    }
+
+    Ok(lifecycle
+        .transitions
+        .last()
+        .map(|transition| transition.at.clone())
+        .unwrap_or(fired_at))
+}
+
 fn retry_backoff_seconds(policy: &DeliveryRetryPolicy, failed_attempt_number: usize) -> u64 {
     let mut backoff = policy.base_backoff_seconds;
     for _ in 1..failed_attempt_number {
@@ -1311,12 +1535,13 @@ fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_alert_severity, compute_alert_dedup_key, deduplicate_alert_stream, deliver_alert,
-        evaluate_alert_rules, filter_alert_history, route_alert_to_recipients,
-        run_tracked_delivery, AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone,
-        AlertHistoryQuery, AlertRecipient, AlertRoutingRule, AlertRule, AlertSeverityEvidence,
-        AlertSeverityHint, AlertingError, DeliveryRetryPolicy, DeliveryState, DeliveryStatus,
-        InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
+        acknowledge_alert, auto_resolve_alert, classify_alert_severity, compute_alert_dedup_key,
+        deduplicate_alert_stream, deliver_alert, evaluate_alert_rules, filter_alert_history,
+        open_alert_lifecycle, resolve_alert, route_alert_to_recipients, run_tracked_delivery,
+        AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone, AlertHistoryQuery,
+        AlertLifecycleRecord, AlertLifecycleState, AlertRecipient, AlertRoutingRule, AlertRule,
+        AlertSeverityEvidence, AlertSeverityHint, AlertingError, DeliveryRetryPolicy,
+        DeliveryState, DeliveryStatus, InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
     };
 
     #[test]
@@ -1944,6 +2169,230 @@ mod tests {
                 second_role: "operator".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn lifecycle_records_acknowledgement_and_resolution_with_actor_timestamp() {
+        let alert = fired_alert(
+            "alert-lifecycle",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut lifecycle =
+            open_alert_lifecycle(&alert).expect("fired alert should open lifecycle");
+
+        assert_eq!(lifecycle.alert_id, "alert-lifecycle");
+        assert_eq!(lifecycle.state, AlertLifecycleState::Fired);
+        assert_eq!(lifecycle.fired_at, "2026-06-12T10:00:00Z");
+        assert!(lifecycle.transitions.is_empty());
+
+        let ack = acknowledge_alert(
+            &mut lifecycle,
+            "ops-001".to_string(),
+            "2026-06-12T10:01:00Z".to_string(),
+        )
+        .expect("fired alert should acknowledge");
+
+        assert_eq!(ack.state, AlertLifecycleState::Acknowledged);
+        assert!(!ack.idempotent);
+        let ack_transition = ack.transition.expect("ack should record transition");
+        assert_eq!(ack_transition.from, AlertLifecycleState::Fired);
+        assert_eq!(ack_transition.to, AlertLifecycleState::Acknowledged);
+        assert_eq!(ack_transition.actor_id, "ops-001");
+        assert_eq!(ack_transition.at, "2026-06-12T10:01:00Z");
+
+        let resolved = resolve_alert(
+            &mut lifecycle,
+            "ops-002".to_string(),
+            "2026-06-12T10:05:00Z".to_string(),
+        )
+        .expect("acknowledged alert should resolve");
+
+        assert_eq!(resolved.state, AlertLifecycleState::Resolved);
+        assert!(!resolved.idempotent);
+        assert_eq!(lifecycle.state, AlertLifecycleState::Resolved);
+        assert_eq!(lifecycle.transitions.len(), 2);
+        assert_eq!(
+            lifecycle.transitions[1].from,
+            AlertLifecycleState::Acknowledged
+        );
+        assert_eq!(lifecycle.transitions[1].to, AlertLifecycleState::Resolved);
+        assert_eq!(lifecycle.transitions[1].actor_id, "ops-002");
+        assert_eq!(lifecycle.transitions[1].at, "2026-06-12T10:05:00Z");
+    }
+
+    #[test]
+    fn resolving_already_resolved_alert_is_idempotent_without_duplicate_transition() {
+        let alert = fired_alert(
+            "alert-double-resolve",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut lifecycle =
+            open_alert_lifecycle(&alert).expect("fired alert should open lifecycle");
+        acknowledge_alert(
+            &mut lifecycle,
+            "ops-001".to_string(),
+            "2026-06-12T10:01:00Z".to_string(),
+        )
+        .expect("ack should succeed");
+        resolve_alert(
+            &mut lifecycle,
+            "ops-002".to_string(),
+            "2026-06-12T10:05:00Z".to_string(),
+        )
+        .expect("first resolve should succeed");
+
+        let duplicate = resolve_alert(
+            &mut lifecycle,
+            "ops-003".to_string(),
+            "2026-06-12T10:06:00Z".to_string(),
+        )
+        .expect("double resolve should be a no-op");
+
+        assert_eq!(duplicate.state, AlertLifecycleState::Resolved);
+        assert!(duplicate.idempotent);
+        assert_eq!(duplicate.transition, None);
+        assert_eq!(lifecycle.transitions.len(), 2);
+    }
+
+    #[test]
+    fn manual_resolution_requires_acknowledgement() {
+        let alert = fired_alert(
+            "alert-direct-resolve",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut lifecycle =
+            open_alert_lifecycle(&alert).expect("fired alert should open lifecycle");
+
+        let error = resolve_alert(
+            &mut lifecycle,
+            "ops-001".to_string(),
+            "2026-06-12T10:05:00Z".to_string(),
+        )
+        .expect_err("manual resolve should require acknowledgement first");
+
+        assert_eq!(
+            error,
+            AlertingError::InvalidLifecycleTransition {
+                alert_id: "alert-direct-resolve".to_string(),
+                from: AlertLifecycleState::Fired,
+                attempted: AlertLifecycleState::Resolved,
+            }
+        );
+        assert_eq!(lifecycle.state, AlertLifecycleState::Fired);
+        assert!(lifecycle.transitions.is_empty());
+    }
+
+    #[test]
+    fn auto_resolve_records_source_condition_clear_transition() {
+        let alert = fired_alert(
+            "alert-auto-resolve",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut lifecycle =
+            open_alert_lifecycle(&alert).expect("fired alert should open lifecycle");
+
+        let action = auto_resolve_alert(
+            &mut lifecycle,
+            "source:sensor_stale_clear".to_string(),
+            "2026-06-12T10:03:00Z".to_string(),
+        )
+        .expect("source-cleared condition should auto-resolve");
+
+        assert_eq!(action.state, AlertLifecycleState::AutoResolved);
+        assert!(!action.idempotent);
+        let transition = action
+            .transition
+            .expect("auto-resolve should record transition");
+        assert_eq!(transition.from, AlertLifecycleState::Fired);
+        assert_eq!(transition.to, AlertLifecycleState::AutoResolved);
+        assert_eq!(transition.actor_id, "source:sensor_stale_clear");
+        assert_eq!(transition.at, "2026-06-12T10:03:00Z");
+        assert_eq!(lifecycle.transitions.len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_rejects_transition_before_fired_or_previous_transition_time() {
+        let alert = fired_alert(
+            "alert-non-monotonic",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut lifecycle =
+            open_alert_lifecycle(&alert).expect("fired alert should open lifecycle");
+
+        let early_ack = acknowledge_alert(
+            &mut lifecycle,
+            "ops-001".to_string(),
+            "2026-06-12T09:59:59Z".to_string(),
+        )
+        .expect_err("ack before fired_at should be rejected");
+
+        assert_eq!(
+            early_ack,
+            AlertingError::InvalidLifecycleTimestampOrder {
+                alert_id: "alert-non-monotonic".to_string(),
+                previous_at: "2026-06-12T10:00:00Z".to_string(),
+                attempted_at: "2026-06-12T09:59:59Z".to_string(),
+            }
+        );
+        assert!(lifecycle.transitions.is_empty());
+
+        acknowledge_alert(
+            &mut lifecycle,
+            "ops-001".to_string(),
+            "2026-06-12T10:01:00Z".to_string(),
+        )
+        .expect("ack should succeed");
+        let early_resolve = resolve_alert(
+            &mut lifecycle,
+            "ops-002".to_string(),
+            "2026-06-12T10:00:30Z".to_string(),
+        )
+        .expect_err("resolve before ack timestamp should be rejected");
+
+        assert_eq!(
+            early_resolve,
+            AlertingError::InvalidLifecycleTimestampOrder {
+                alert_id: "alert-non-monotonic".to_string(),
+                previous_at: "2026-06-12T10:01:00Z".to_string(),
+                attempted_at: "2026-06-12T10:00:30Z".to_string(),
+            }
+        );
+        assert_eq!(lifecycle.transitions.len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_idempotent_path_validates_public_record_fields() {
+        let mut malformed = AlertLifecycleRecord {
+            alert_id: " ".to_string(),
+            source_event_ref: "candidate:malformed".to_string(),
+            state: AlertLifecycleState::Resolved,
+            fired_at: "2026-06-12T10:00:00Z".to_string(),
+            transitions: Vec::new(),
+        };
+
+        let error = resolve_alert(
+            &mut malformed,
+            "ops-001".to_string(),
+            "2026-06-12T10:05:00Z".to_string(),
+        )
+        .expect_err("idempotent resolve should still validate public lifecycle record");
+
+        assert_eq!(error, AlertingError::EmptyAlertId);
     }
 
     fn sensor_health_event() -> AlertEvent {
