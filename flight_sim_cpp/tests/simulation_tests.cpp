@@ -12,6 +12,7 @@
 #include "agbot_flight_sim/MultispectralCamera.hpp"
 #include "agbot_flight_sim/SensorModel.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
+#include "agbot_flight_sim/SceneSynthesis.hpp"
 #include "agbot_flight_sim/SimulationOps.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
@@ -811,6 +812,75 @@ void test_missing_map_texture_tile_is_marked_unavailable_fallback() {
     assert(manifest.find("tile unavailable") != std::string::npos);
     assert(manifest.find("\"texture_width\":0") != std::string::npos);
     assert(manifest.find("\"aligned\":true") != std::string::npos);
+}
+
+void test_scene_synthesis_manifest_is_seeded_and_georeferenced() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    const auto profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 16);
+
+    agbot::flight_sim::SceneSynthesisInput input;
+    input.seed = 2026;
+    input.profile = profile;
+    input.buildings.push_back({
+        "osm-building-1",
+        "barn",
+        {
+            {40.00020, -96.00080, 0.0},
+            {40.00020, -96.00065, 0.0},
+            {40.00035, -96.00065, 0.0},
+            {40.00035, -96.00080, 0.0},
+            {40.00020, -96.00080, 0.0},
+        },
+        7.0,
+    });
+    input.vegetation.push_back({
+        "landcover-corn-1",
+        "crop_rows",
+        "corn",
+        {
+            {40.00055, -96.00090, 0.0},
+            {40.00055, -96.00040, 0.0},
+            {40.00085, -96.00040, 0.0},
+            {40.00085, -96.00090, 0.0},
+            {40.00055, -96.00090, 0.0},
+        },
+        1.2,
+        0.70,
+    });
+
+    const auto manifest = agbot::flight_sim::synthesize_scene_manifest(input);
+    const auto repeat = agbot::flight_sim::synthesize_scene_manifest(input);
+
+    assert(manifest.status == agbot::flight_sim::SceneSynthesisStatus::Ready);
+    assert(manifest.object_count == 2);
+    assert(manifest.unpopulated_area_count == 0);
+    assert(manifest.scene_hash == repeat.scene_hash);
+    assert(manifest.to_json() == repeat.to_json());
+    assert(manifest.objects[0].source_id == "osm-building-1");
+    assert(manifest.objects[1].class_name == "crop_rows");
+    assert(manifest.objects[0].footprint_local_m.size() == input.buildings[0].footprint.size());
+    assert(manifest.objects[0].height_m == 7.0);
+    assert(manifest.objects[1].height_m >= 1.2);
+    assert(manifest.to_json().find("\"crs\":\"EPSG:4326\"") != std::string::npos);
+    assert(manifest.to_json().find("\"scene_hash\":\"") != std::string::npos);
+}
+
+void test_scene_synthesis_marks_missing_source_coverage_unpopulated() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    agbot::flight_sim::SceneSynthesisInput input;
+    input.seed = 2026;
+    input.profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 8);
+
+    const auto manifest = agbot::flight_sim::synthesize_scene_manifest(input);
+
+    assert(manifest.status == agbot::flight_sim::SceneSynthesisStatus::Unpopulated);
+    assert(manifest.object_count == 0);
+    assert(manifest.unpopulated_area_count == 1);
+    assert(manifest.unpopulated_areas[0].reason == "missing_source_coverage");
+    assert(manifest.to_json().find("\"status\":\"unpopulated\"") != std::string::npos);
+    assert(manifest.to_json().find("missing_source_coverage") != std::string::npos);
 }
 
 void test_builds_terrain_mesh_from_heightmap() {
@@ -1686,6 +1756,8 @@ int main() {
     test_missing_terrain_tile_is_sampled_and_manifested_as_flat_fallback();
     test_map_texture_tiles_align_to_terrain_profile();
     test_missing_map_texture_tile_is_marked_unavailable_fallback();
+    test_scene_synthesis_manifest_is_seeded_and_georeferenced();
+    test_scene_synthesis_marks_missing_source_coverage_unpopulated();
     test_builds_terrain_mesh_from_heightmap();
     test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance();
     test_lidar_raycast_seeded_cloud_json_is_reproducible();
