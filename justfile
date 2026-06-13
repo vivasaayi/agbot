@@ -36,7 +36,10 @@ help:
     @echo ""
     @echo "Deployment:"
     @echo "  docker    - Build Docker image"
-    @echo "  arm       - Cross-compile for ARM (Jetson/Pi)"
+    @echo "  arm64     - Cross-compile for ARM64 (Jetson)"
+    @echo "  arm       - Cross-compile for ARMv7 (Raspberry Pi)"
+    @echo "  arm64-ci  - Build, smoke, and package ARM64 artifacts"
+    @echo "  arm-ci    - Build, smoke, and package ARMv7 artifacts"
 
 # Setup project
 setup:
@@ -158,10 +161,36 @@ arm64:
     @echo "🔧 Cross-compiling for ARM64..."
     cross build --target aarch64-unknown-linux-gnu --release
 
+# Smoke-check ARM64 artifacts under cross/QEMU
+arm64-smoke: arm64
+    @echo "🧪 Smoke-checking ARM64 artifacts..."
+    scripts/smoke-arm-artifacts.sh aarch64-unknown-linux-gnu
+
+# Package ARM64 artifacts for CI upload
+arm64-package: arm64
+    @echo "📦 Packaging ARM64 artifacts..."
+    scripts/package-arm-artifacts.sh aarch64-unknown-linux-gnu
+
+# CI path for ARM64 artifacts
+arm64-ci: arm64 arm64-smoke arm64-package
+
 # Cross-compile for ARM (Raspberry Pi)
 arm:
     @echo "🔧 Cross-compiling for ARM..."
     cross build --target armv7-unknown-linux-gnueabihf --release
+
+# Smoke-check ARMv7 artifacts under cross/QEMU
+arm-smoke: arm
+    @echo "🧪 Smoke-checking ARMv7 artifacts..."
+    scripts/smoke-arm-artifacts.sh armv7-unknown-linux-gnueabihf
+
+# Package ARMv7 artifacts for CI upload
+arm-package: arm
+    @echo "📦 Packaging ARMv7 artifacts..."
+    scripts/package-arm-artifacts.sh armv7-unknown-linux-gnueabihf
+
+# CI path for ARMv7 artifacts
+arm-ci: arm arm-smoke arm-package
 
 # Install development tools
 install-tools:

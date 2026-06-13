@@ -1,0 +1,6 @@
+# Runtime binaries packaged for edge ARM deployments.
+mission_control
+sensor_collector
+imagery_processor
+lidar_mapper
+ground_station_ui

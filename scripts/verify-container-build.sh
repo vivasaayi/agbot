@@ -28,13 +28,15 @@ while read -r image; do
     fi
 done < <(awk 'toupper($1) == "FROM" { print $2 }' "$dockerfile")
 
-required_bins=(
-    mission_control
-    sensor_collector
-    imagery_processor
-    lidar_mapper
-    ground_station_ui
-)
+required_bins=()
+while IFS= read -r bin; do
+    [[ -z "$bin" || "$bin" == \#* ]] && continue
+    required_bins+=("$bin")
+done < "$repo_root/scripts/edge-runtime-bins.txt"
+
+if [[ "${#required_bins[@]}" -eq 0 ]]; then
+    fail "edge runtime binary list is empty"
+fi
 
 for bin in "${required_bins[@]}"; do
     if ! grep -Eq -- "--bin[[:space:]]+$bin([[:space:]\\]|$)" "$dockerfile"; then
