@@ -18,16 +18,17 @@ use crate::plugins::recommendations::{
 };
 use crate::plugins::reports::{clear_reports, start_report_fetch, start_report_generate};
 use crate::state::{
-    active_product_selection, assert_manifest_layer_placement, layer_metadata_readout,
-    open_compare_mode, select_catalog_scene, set_compare_divider, switch_active_product,
+    active_product_selection, assert_manifest_layer_placement, capture_saved_view, export_snapshot,
+    layer_metadata_readout, load_view_from_json, open_compare_mode, restore_saved_view,
+    save_view_to_json, select_catalog_scene, set_compare_divider, switch_active_product,
     sync_compare_shared_view, AnnotationCreateTask, AnnotationDeleteTask, AnnotationFetchTask,
     AnnotationOverlayState, AnnotationUpdateTask, CompareLayout, CompareModeState, CursorMapState,
     DraftMode, FarmFieldHistoryFetchTask, FarmListFetchTask, FieldCatalogState, FieldImportState,
     FieldImportTask, FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask, MapViewState,
     ProductLegend, RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
     RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask,
-    ReportOverlayState, SceneManifestState, ShapefileImportRequest, TileConfig, TileFetchTasks,
-    TileRenderState, TileStatus, ViewerState,
+    ReportOverlayState, SavedViewState, SceneManifestState, ShapefileImportRequest, TileConfig,
+    TileFetchTasks, TileRenderState, TileStatus, ViewerState,
 };
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -109,6 +110,7 @@ fn render_ui(
     mut viewer_state: ResMut<ViewerState>,
     mut config: ResMut<TileConfig>,
     mut compare_state: ResMut<CompareModeState>,
+    mut saved_view_state: ResMut<SavedViewState>,
     mut catalog_ui: CatalogUiState,
     mut field_import_ui: FieldImportUiState,
     mut scene_ui: SceneUiState,
@@ -220,6 +222,19 @@ fn render_ui(
             &mut commands,
         );
         render_view_panel(ui, &mut viewer_state, map_view);
+        render_saved_views_panel(
+            ui,
+            &mut saved_view_state,
+            field_catalog,
+            &mut config,
+            &mut viewer_state,
+            manifest_state,
+            map_view,
+            annotations,
+            recommendations,
+            reports,
+            tile_state,
+        );
         render_annotations_panel(
             ui,
             &config,
@@ -915,6 +930,179 @@ fn render_view_panel(
     if ui.button("Reset View").clicked() {
         map_view.center = Vec2::ZERO;
         map_view.needs_fit = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_saved_views_panel(
+    ui: &mut egui::Ui,
+    saved_view_state: &mut SavedViewState,
+    field_catalog: &mut FieldCatalogState,
+    config: &mut TileConfig,
+    viewer_state: &mut ViewerState,
+    manifest_state: &SceneManifestState,
+    map_view: &mut MapViewState,
+    annotations: &mut AnnotationOverlayState,
+    recommendations: &mut RecommendationOverlayState,
+    reports: &mut ReportOverlayState,
+    tile_state: &mut TileRenderState,
+) {
+    ui.add_space(8.0);
+    ui.heading("Saved Views");
+    ui.label("Name");
+    ui.text_edit_singleline(&mut saved_view_state.draft_name);
+    ui.label("Saved View JSON");
+    ui.text_edit_singleline(&mut saved_view_state.saved_view_path);
+    ui.label("Snapshot PNG");
+    ui.text_edit_singleline(&mut saved_view_state.snapshot_image_path);
+    ui.label("Snapshot Metadata");
+    ui.text_edit_singleline(&mut saved_view_state.snapshot_metadata_path);
+
+    ui.horizontal(|ui| {
+        if ui.button("Save View").clicked() {
+            match capture_saved_view(
+                &saved_view_state.draft_name,
+                config,
+                viewer_state,
+                map_view,
+                manifest_state,
+                annotations,
+                recommendations,
+                reports,
+            ) {
+                Ok(view) => {
+                    saved_view_state.last_saved = Some(view);
+                    saved_view_state.last_error = None;
+                }
+                Err(err) => {
+                    let message = format!("save view failed: {err}");
+                    saved_view_state.last_error = Some(message.clone());
+                    tile_state.status = TileStatus::Error(message);
+                }
+            }
+        }
+        if ui.button("Restore View").clicked() {
+            if let Some(view) = saved_view_state.last_saved.clone() {
+                match restore_saved_view(
+                    &view,
+                    field_catalog,
+                    config,
+                    viewer_state,
+                    map_view,
+                    annotations,
+                    recommendations,
+                    reports,
+                ) {
+                    Ok(()) => {
+                        saved_view_state.last_error = None;
+                    }
+                    Err(err) => {
+                        let message = format!("restore view failed: {err}");
+                        saved_view_state.last_error = Some(message.clone());
+                        tile_state.status = TileStatus::Error(message);
+                    }
+                }
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("Save JSON").clicked() {
+            match capture_saved_view(
+                &saved_view_state.draft_name,
+                config,
+                viewer_state,
+                map_view,
+                manifest_state,
+                annotations,
+                recommendations,
+                reports,
+            )
+            .and_then(|view| {
+                save_view_to_json(&saved_view_state.saved_view_path, &view)?;
+                Ok(view)
+            }) {
+                Ok(view) => {
+                    saved_view_state.last_saved = Some(view);
+                    saved_view_state.last_error = None;
+                }
+                Err(err) => {
+                    let message = format!("save json failed: {err}");
+                    saved_view_state.last_error = Some(message.clone());
+                    tile_state.status = TileStatus::Error(message);
+                }
+            }
+        }
+        if ui.button("Load JSON").clicked() {
+            match load_view_from_json(&saved_view_state.saved_view_path).and_then(|view| {
+                restore_saved_view(
+                    &view,
+                    field_catalog,
+                    config,
+                    viewer_state,
+                    map_view,
+                    annotations,
+                    recommendations,
+                    reports,
+                )?;
+                Ok(view)
+            }) {
+                Ok(view) => {
+                    saved_view_state.last_saved = Some(view);
+                    saved_view_state.last_error = None;
+                }
+                Err(err) => {
+                    let message = format!("load json failed: {err}");
+                    saved_view_state.last_error = Some(message.clone());
+                    tile_state.status = TileStatus::Error(message);
+                }
+            }
+        }
+    });
+
+    if ui.button("Export Snapshot").clicked() {
+        match capture_saved_view(
+            &saved_view_state.draft_name,
+            config,
+            viewer_state,
+            map_view,
+            manifest_state,
+            annotations,
+            recommendations,
+            reports,
+        )
+        .and_then(|view| {
+            export_snapshot(
+                &view,
+                manifest_state,
+                tile_state,
+                &saved_view_state.snapshot_image_path,
+                &saved_view_state.snapshot_metadata_path,
+            )
+            .map(|metadata| (view, metadata))
+        }) {
+            Ok((view, metadata)) => {
+                saved_view_state.last_saved = Some(view);
+                saved_view_state.last_snapshot = Some(metadata);
+                saved_view_state.last_error = None;
+            }
+            Err(err) => {
+                let message = format!("snapshot export failed: {err}");
+                saved_view_state.last_error = Some(message.clone());
+                tile_state.status = TileStatus::Error(message);
+            }
+        }
+    }
+
+    if let Some(snapshot) = saved_view_state.last_snapshot.as_ref() {
+        ui.small(format!(
+            "{} ({}x{}, {})",
+            snapshot.image_path, snapshot.width, snapshot.height, snapshot.georeference_label
+        ));
+    } else if let Some(view) = saved_view_state.last_saved.as_ref() {
+        ui.small(format!("Saved: {}", view.name));
+    }
+    if let Some(error) = saved_view_state.last_error.as_deref() {
+        ui.label(error);
     }
 }
 

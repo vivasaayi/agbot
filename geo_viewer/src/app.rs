@@ -9,7 +9,8 @@ use crate::state::{
     FieldImportTask, FieldListFetchTask, FieldScenesFetchTask, ManifestFetchTask, MapViewState,
     RecommendationCreateTask, RecommendationDeleteTask, RecommendationFetchTask,
     RecommendationOverlayState, RecommendationUpdateTask, ReportFetchTask, ReportGenerateTask,
-    ReportOverlayState, SceneManifestState, TileFetchTasks, TileRenderState, DEFAULT_TILE_ZOOM,
+    ReportOverlayState, SavedViewState, SceneManifestState, TileFetchTasks, TileRenderState,
+    DEFAULT_TILE_ZOOM,
 };
 use anyhow::Result;
 use bevy::{prelude::*, window::WindowResolution};
@@ -54,6 +55,7 @@ pub fn run() -> Result<()> {
         .insert_resource(ManifestFetchTask::default())
         .insert_resource(SceneManifestState::default())
         .insert_resource(CompareModeState::default())
+        .insert_resource(SavedViewState::default())
         .insert_resource(FieldCatalogState::default())
         .insert_resource(FieldImportState::default())
         .insert_resource(TileFetchTasks::default())

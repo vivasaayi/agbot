@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bevy::prelude::*;
 use bevy::tasks::Task;
-use image::DynamicImage;
+use image::{DynamicImage, Rgba, RgbaImage};
 use sensor_overlay_engine::{utils::OverlayValueRange, SpatialBounds};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
@@ -11,6 +11,7 @@ use shared::schemas::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 pub const APP_TITLE: &str = "Geo Viewer";
 pub const DEFAULT_PRODUCT_KIND: &str = "ndvi";
@@ -833,7 +834,7 @@ fn scene_extent_world_dimensions(extent: &SceneExtent) -> Vec2 {
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SceneExtent {
     pub min_lon: f64,
     pub min_lat: f64,
@@ -1135,6 +1136,332 @@ pub struct ReportOverlayState {
     pub draft_title: String,
 }
 
+#[derive(Resource, Debug, Clone, PartialEq)]
+pub struct SavedViewState {
+    pub draft_name: String,
+    pub saved_view_path: String,
+    pub snapshot_image_path: String,
+    pub snapshot_metadata_path: String,
+    pub last_saved: Option<SavedView>,
+    pub last_snapshot: Option<SnapshotExportMetadata>,
+    pub last_error: Option<String>,
+}
+
+impl Default for SavedViewState {
+    fn default() -> Self {
+        let temp_dir = std::env::temp_dir();
+        Self {
+            draft_name: "Field review".to_string(),
+            saved_view_path: temp_dir
+                .join("agbot_geo_viewer_saved_view.json")
+                .to_string_lossy()
+                .to_string(),
+            snapshot_image_path: temp_dir
+                .join("agbot_geo_viewer_snapshot.png")
+                .to_string_lossy()
+                .to_string(),
+            snapshot_metadata_path: temp_dir
+                .join("agbot_geo_viewer_snapshot.json")
+                .to_string_lossy()
+                .to_string(),
+            last_saved: None,
+            last_snapshot: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedView {
+    pub name: String,
+    pub field_id: Option<String>,
+    pub scene_id: Option<String>,
+    pub season_id: Option<String>,
+    pub active_product: String,
+    pub selected_layer: usize,
+    pub camera: SavedCameraState,
+    pub geospatial: SavedGeospatialState,
+    pub overlays: SavedOverlayState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedCameraState {
+    pub center_x: f32,
+    pub center_y: f32,
+    pub zoom_level: f32,
+    pub base_scale: f32,
+    pub needs_fit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedGeospatialState {
+    pub georeferenced: bool,
+    pub crs: Option<String>,
+    pub extent: Option<SceneExtent>,
+    pub resolution: Option<RasterResolution>,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedOverlayState {
+    pub selected_annotation_id: Option<String>,
+    pub annotation_filter_label: String,
+    pub show_points: bool,
+    pub show_polygons: bool,
+    pub show_low: bool,
+    pub show_medium: bool,
+    pub show_high: bool,
+    pub show_critical: bool,
+    pub show_other: bool,
+    pub selected_recommendation_id: Option<String>,
+    pub recommendation_status_filter: Option<RecommendationStatus>,
+    pub recommendation_priority_filter: Option<RecommendationPriority>,
+    pub report_draft_title: String,
+    pub annotation_count: usize,
+    pub recommendation_count: usize,
+    pub report_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotExportMetadata {
+    pub view: SavedView,
+    pub image_path: String,
+    pub metadata_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub georeferenced: bool,
+    pub georeference_label: String,
+    pub crs: Option<String>,
+    pub extent: Option<SceneExtent>,
+    pub georeference_warning: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn capture_saved_view(
+    name: &str,
+    config: &TileConfig,
+    viewer_state: &ViewerState,
+    map_view: &MapViewState,
+    manifest_state: &SceneManifestState,
+    annotations: &AnnotationOverlayState,
+    recommendations: &RecommendationOverlayState,
+    reports: &ReportOverlayState,
+) -> Result<SavedView> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("saved view name is required");
+    }
+
+    let active_product = manifest_state
+        .products
+        .get(viewer_state.selected_layer)
+        .map(|product| product.kind.clone())
+        .filter(|kind| !kind.trim().is_empty())
+        .unwrap_or_else(|| config.product_kind.clone());
+
+    Ok(SavedView {
+        name: name.to_string(),
+        field_id: non_empty_owned(manifest_state.field_id.as_deref()).or_else(|| {
+            manifest_state
+                .field
+                .as_ref()
+                .and_then(|field| non_empty_owned(Some(field.field_id.as_str())))
+        }),
+        scene_id: non_empty_owned(config.scene_id.as_deref())
+            .or_else(|| non_empty_owned(manifest_state.scene_id.as_deref())),
+        season_id: non_empty_owned(manifest_state.season_id.as_deref()),
+        active_product,
+        selected_layer: viewer_state.selected_layer,
+        camera: SavedCameraState {
+            center_x: map_view.center.x,
+            center_y: map_view.center.y,
+            zoom_level: viewer_state.zoom_level,
+            base_scale: map_view.base_scale,
+            needs_fit: map_view.needs_fit,
+        },
+        geospatial: saved_geospatial_state(manifest_state),
+        overlays: SavedOverlayState {
+            selected_annotation_id: annotations.selected_annotation_id.clone(),
+            annotation_filter_label: annotations.filter_label.clone(),
+            show_points: annotations.show_points,
+            show_polygons: annotations.show_polygons,
+            show_low: annotations.show_low,
+            show_medium: annotations.show_medium,
+            show_high: annotations.show_high,
+            show_critical: annotations.show_critical,
+            show_other: annotations.show_other,
+            selected_recommendation_id: recommendations.selected_recommendation_id.clone(),
+            recommendation_status_filter: recommendations.status_filter,
+            recommendation_priority_filter: recommendations.priority_filter,
+            report_draft_title: reports.draft_title.clone(),
+            annotation_count: annotations.items.len(),
+            recommendation_count: recommendations.items.len(),
+            report_count: reports.items.len(),
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn restore_saved_view(
+    view: &SavedView,
+    catalog: &mut FieldCatalogState,
+    config: &mut TileConfig,
+    viewer_state: &mut ViewerState,
+    map_view: &mut MapViewState,
+    annotations: &mut AnnotationOverlayState,
+    recommendations: &mut RecommendationOverlayState,
+    reports: &mut ReportOverlayState,
+) -> Result<()> {
+    if view.active_product.trim().is_empty() {
+        anyhow::bail!("saved view active_product is required");
+    }
+
+    catalog.selected_field_id = view.field_id.clone();
+    catalog.selected_scene_id = view.scene_id.clone();
+    catalog.selected_season_id = view.season_id.clone();
+    config.scene_id = view.scene_id.clone();
+    config.product_kind = view.active_product.clone();
+    viewer_state.selected_layer = view.selected_layer;
+    viewer_state.zoom_level = view.camera.zoom_level;
+    viewer_state.scene_id_input = view.scene_id.clone().unwrap_or_default();
+    map_view.center = Vec2::new(view.camera.center_x, view.camera.center_y);
+    map_view.base_scale = view.camera.base_scale;
+    map_view.needs_fit = view.camera.needs_fit;
+
+    annotations.selected_annotation_id = view.overlays.selected_annotation_id.clone();
+    annotations.filter_label = view.overlays.annotation_filter_label.clone();
+    annotations.show_points = view.overlays.show_points;
+    annotations.show_polygons = view.overlays.show_polygons;
+    annotations.show_low = view.overlays.show_low;
+    annotations.show_medium = view.overlays.show_medium;
+    annotations.show_high = view.overlays.show_high;
+    annotations.show_critical = view.overlays.show_critical;
+    annotations.show_other = view.overlays.show_other;
+    recommendations.selected_recommendation_id = view.overlays.selected_recommendation_id.clone();
+    recommendations.status_filter = view.overlays.recommendation_status_filter;
+    recommendations.priority_filter = view.overlays.recommendation_priority_filter;
+    reports.draft_title = view.overlays.report_draft_title.clone();
+
+    Ok(())
+}
+
+pub fn save_view_to_json(path: impl AsRef<Path>, view: &SavedView) -> Result<()> {
+    write_json_file(path, view)
+}
+
+pub fn load_view_from_json(path: impl AsRef<Path>) -> Result<SavedView> {
+    let bytes = std::fs::read(path.as_ref())?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub fn export_snapshot(
+    view: &SavedView,
+    manifest_state: &SceneManifestState,
+    tile_state: &TileRenderState,
+    image_path: impl AsRef<Path>,
+    metadata_path: impl AsRef<Path>,
+) -> Result<SnapshotExportMetadata> {
+    let geospatial = saved_geospatial_state(manifest_state);
+    let width = snapshot_dimension(tile_state.image_dimensions.x, 640);
+    let height = snapshot_dimension(tile_state.image_dimensions.y, 360);
+    let image_path = image_path.as_ref();
+    let metadata_path = metadata_path.as_ref();
+    ensure_parent_dir(image_path)?;
+    ensure_parent_dir(metadata_path)?;
+
+    let metadata = SnapshotExportMetadata {
+        view: view.clone(),
+        image_path: image_path.to_string_lossy().to_string(),
+        metadata_path: metadata_path.to_string_lossy().to_string(),
+        width,
+        height,
+        georeferenced: geospatial.georeferenced,
+        georeference_label: if geospatial.georeferenced {
+            "georeferenced"
+        } else {
+            "non_georeferenced"
+        }
+        .to_string(),
+        crs: geospatial.crs.clone(),
+        extent: geospatial.extent.clone(),
+        georeference_warning: geospatial.warning.clone(),
+    };
+
+    let mut image = RgbaImage::from_pixel(
+        width,
+        height,
+        if metadata.georeferenced {
+            Rgba([34, 112, 84, 255])
+        } else {
+            Rgba([128, 38, 38, 255])
+        },
+    );
+    if !metadata.georeferenced {
+        for y in 0..height.min(8) {
+            for x in 0..width {
+                image.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(image).save(image_path)?;
+    write_json_file(metadata_path, &metadata)?;
+
+    Ok(metadata)
+}
+
+fn saved_geospatial_state(manifest_state: &SceneManifestState) -> SavedGeospatialState {
+    match assert_manifest_layer_placement(
+        &manifest_state.geospatial,
+        manifest_state.width,
+        manifest_state.height,
+    ) {
+        Ok(placement) => SavedGeospatialState {
+            georeferenced: true,
+            crs: Some(placement.crs),
+            extent: Some(placement.extent),
+            resolution: Some(placement.resolution),
+            warning: None,
+        },
+        Err(err) => SavedGeospatialState {
+            georeferenced: false,
+            crs: manifest_state.geospatial.crs.clone(),
+            extent: manifest_state.geospatial.extent.clone(),
+            resolution: manifest_state
+                .geospatial
+                .spatial_ref
+                .as_ref()
+                .and_then(|spatial_ref| spatial_ref.resolution),
+            warning: Some(err.to_string()),
+        },
+    }
+}
+
+fn write_json_file(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
+    let path = path.as_ref();
+    ensure_parent_dir(path)?;
+    let bytes = serde_json::to_vec_pretty(value)?;
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn snapshot_dimension(value: f32, fallback: u32) -> u32 {
+    if value.is_finite() && value > 0.0 {
+        (value.round() as u32).clamp(1, 2048)
+    } else {
+        fallback
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DraftMode {
     #[default]
@@ -1206,15 +1533,22 @@ pub fn ensure_scene_id(config: &TileConfig, action: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_manifest_layer_placement, layer_metadata_readout, manifest_world_dimensions,
-        open_compare_mode, product_legend_for_kind, product_placement_for_manifest,
-        select_catalog_scene, set_compare_divider, summarize_tile_presences, switch_active_product,
-        sync_compare_shared_view, CompareLayout, FieldCatalogState, FieldSceneSummary,
-        MapViewState, SceneExtent, SceneGeospatialMetadata, SceneManifest, SceneManifestState,
-        SceneProduct, TileConfig, TileId, TilePresence, ViewerState, DEFAULT_PRODUCT_KIND,
+        assert_manifest_layer_placement, capture_saved_view, export_snapshot,
+        layer_metadata_readout, load_view_from_json, manifest_world_dimensions, open_compare_mode,
+        product_legend_for_kind, product_placement_for_manifest, restore_saved_view,
+        save_view_to_json, select_catalog_scene, set_compare_divider, summarize_tile_presences,
+        switch_active_product, sync_compare_shared_view, AnnotationOverlayState, CompareLayout,
+        FieldCatalogState, FieldSceneSummary, MapViewState, RecommendationOverlayState,
+        ReportOverlayState, SceneExtent, SceneGeospatialMetadata, SceneManifest,
+        SceneManifestState, SceneProduct, TileConfig, TileId, TilePresence, TileRenderState,
+        TileStatus, ViewerState, DEFAULT_PRODUCT_KIND, DEFAULT_TILE_ZOOM,
     };
     use bevy::prelude::Vec2;
-    use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
+    use shared::schemas::{
+        GeoBounds, RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationStatus,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
 
     #[test]
     fn tile_source_formats_tile_url_from_template() {
@@ -1873,6 +2207,180 @@ mod tests {
         assert!(err.to_string().contains("extent"));
     }
 
+    #[test]
+    fn saved_view_round_trip_restores_scene_product_camera_and_overlays() {
+        let manifest = sample_manifest_state();
+        let mut config = TileConfig {
+            base_url: "http://127.0.0.1:8080".to_string(),
+            scene_id: Some("scene-1".to_string()),
+            product_kind: "thermal".to_string(),
+        };
+        let mut viewer = ViewerState {
+            selected_layer: 1,
+            zoom_level: 2.75,
+            scene_id_input: "scene-1".to_string(),
+        };
+        let mut catalog = FieldCatalogState {
+            selected_field_id: Some("old-field".to_string()),
+            selected_scene_id: Some("old-scene".to_string()),
+            ..Default::default()
+        };
+        let map_view = MapViewState {
+            center: Vec2::new(125.0, -52.0),
+            base_scale: 0.45,
+            needs_fit: false,
+        };
+        let mut annotations = AnnotationOverlayState {
+            selected_annotation_id: Some("annotation-7".to_string()),
+            filter_label: "weeds".to_string(),
+            show_low: false,
+            show_polygons: false,
+            ..Default::default()
+        };
+        let mut recommendations = RecommendationOverlayState {
+            selected_recommendation_id: Some("rec-9".to_string()),
+            status_filter: Some(RecommendationStatus::Reviewed),
+            priority_filter: Some(RecommendationPriority::High),
+            ..Default::default()
+        };
+        let mut reports = ReportOverlayState {
+            draft_title: "Grower handoff".to_string(),
+            ..Default::default()
+        };
+
+        let view = capture_saved_view(
+            "North Field scout",
+            &config,
+            &viewer,
+            &map_view,
+            &manifest,
+            &annotations,
+            &recommendations,
+            &reports,
+        )
+        .expect("configured view should be captured");
+        let path = temp_artifact_path("saved_view", "json");
+        save_view_to_json(&path, &view).expect("saved view should persist");
+        let loaded = load_view_from_json(&path).expect("saved view should reload");
+
+        config.scene_id = None;
+        config.product_kind = "ndvi".to_string();
+        viewer.selected_layer = 0;
+        viewer.zoom_level = 1.0;
+        viewer.scene_id_input.clear();
+        annotations.selected_annotation_id = None;
+        annotations.filter_label.clear();
+        annotations.show_low = true;
+        annotations.show_polygons = true;
+        recommendations.selected_recommendation_id = None;
+        recommendations.status_filter = None;
+        recommendations.priority_filter = None;
+        reports.draft_title.clear();
+        let mut restored_map = MapViewState {
+            center: Vec2::ZERO,
+            base_scale: 1.0,
+            needs_fit: true,
+        };
+
+        restore_saved_view(
+            &loaded,
+            &mut catalog,
+            &mut config,
+            &mut viewer,
+            &mut restored_map,
+            &mut annotations,
+            &mut recommendations,
+            &mut reports,
+        )
+        .expect("saved view should restore into viewer state");
+
+        assert_eq!(loaded, view);
+        assert_eq!(catalog.selected_field_id.as_deref(), Some("field-1"));
+        assert_eq!(catalog.selected_scene_id.as_deref(), Some("scene-1"));
+        assert_eq!(config.scene_id.as_deref(), Some("scene-1"));
+        assert_eq!(config.product_kind, "thermal");
+        assert_eq!(viewer.selected_layer, 1);
+        assert_eq!(viewer.zoom_level, 2.75);
+        assert_eq!(viewer.scene_id_input, "scene-1");
+        assert_eq!(restored_map.center, Vec2::new(125.0, -52.0));
+        assert_eq!(restored_map.base_scale, 0.45);
+        assert!(!restored_map.needs_fit);
+        assert_eq!(
+            annotations.selected_annotation_id.as_deref(),
+            Some("annotation-7")
+        );
+        assert_eq!(annotations.filter_label, "weeds");
+        assert!(!annotations.show_low);
+        assert!(!annotations.show_polygons);
+        assert_eq!(
+            recommendations.selected_recommendation_id.as_deref(),
+            Some("rec-9")
+        );
+        assert_eq!(
+            recommendations.status_filter,
+            Some(RecommendationStatus::Reviewed)
+        );
+        assert_eq!(
+            recommendations.priority_filter,
+            Some(RecommendationPriority::High)
+        );
+        assert_eq!(reports.draft_title, "Grower handoff");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_export_marks_ungeoreferenced_state() {
+        let mut manifest = sample_manifest_state();
+        manifest.geospatial.georeferenced = false;
+        manifest.geospatial.crs = None;
+        manifest.geospatial.extent = None;
+        manifest.geospatial.spatial_ref = None;
+        let view = capture_saved_view(
+            "Unplaced scout",
+            &TileConfig {
+                base_url: "http://127.0.0.1:8080".to_string(),
+                scene_id: Some("scene-1".to_string()),
+                product_kind: "ndvi".to_string(),
+            },
+            &sample_viewer_state(),
+            &sample_map_view(),
+            &manifest,
+            &AnnotationOverlayState::default(),
+            &RecommendationOverlayState::default(),
+            &ReportOverlayState::default(),
+        )
+        .expect("ungeoreferenced views can still be captured");
+        let image_path = temp_artifact_path("snapshot", "png");
+        let metadata_path = temp_artifact_path("snapshot", "json");
+
+        let metadata = export_snapshot(
+            &view,
+            &manifest,
+            &sample_tile_render_state(),
+            &image_path,
+            &metadata_path,
+        )
+        .expect("snapshot export should run for ungeoreferenced state");
+
+        assert!(!metadata.georeferenced);
+        assert_eq!(metadata.georeference_label, "non_georeferenced");
+        assert!(metadata
+            .georeference_warning
+            .as_deref()
+            .expect("warning")
+            .contains("not georeferenced"));
+        assert!(image_path.exists());
+        let decoded: super::SnapshotExportMetadata =
+            serde_json::from_slice(&fs::read(&metadata_path).expect("metadata file"))
+                .expect("metadata json");
+        assert_eq!(decoded.georeference_label, "non_georeferenced");
+        assert_eq!(decoded.view.name, "Unplaced scout");
+
+        let _ = fs::remove_file(image_path);
+        let _ = fs::remove_file(metadata_path);
+    }
+
     fn sample_extent() -> SceneExtent {
         SceneExtent {
             min_lon: -89.5,
@@ -1977,6 +2485,26 @@ mod tests {
             base_scale: 1.0,
             needs_fit: false,
         }
+    }
+
+    fn sample_tile_render_state() -> TileRenderState {
+        TileRenderState {
+            tiles: BTreeMap::new(),
+            visible_tiles: BTreeSet::new(),
+            image_dimensions: Vec2::new(32.0, 16.0),
+            world_dimensions: Vec2::ZERO,
+            current_zoom: DEFAULT_TILE_ZOOM,
+            status: TileStatus::Ready,
+        }
+    }
+
+    fn temp_artifact_path(label: &str, extension: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "agbot_geo_viewer_{label}_{}_{}.{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test"),
+            extension
+        ))
     }
 
     #[test]
