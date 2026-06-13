@@ -76,6 +76,8 @@ pub struct LidarScanIngest {
 pub const OCCUPANCY_GRID_LOCAL_CRS: &str = "LOCAL_LIDAR_METERS";
 const OUTLIER_DISTANCE_EPSILON_METERS: f64 = 1.0e-9;
 const GRID_COORDINATE_EPSILON: f64 = 1.0e-6;
+const POINT_CLOUD_FRAME_CRS_NOTE: &str =
+    "LOCAL_LIDAR_METERS: x/y are derived from polar LiDAR angle and distance in meters; z=0 for 2D scans";
 
 #[derive(Debug, Clone)]
 pub struct LidarOccupancyGrid {
@@ -95,6 +97,14 @@ pub struct LidarOccupancyGridEvidence {
     pub quality_threshold: u8,
     pub occupancy_threshold: f32,
     pub flip_y: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarPointCloudProvenance {
+    pub scan_ids: Vec<Uuid>,
+    pub captured_at: Vec<DateTime<Utc>>,
+    pub point_count: usize,
+    pub frame_crs_note: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -1278,6 +1288,7 @@ impl LidarMapper {
 
     async fn save_point_cloud(&self, scans: &[LidarScan], output_dir: &PathBuf) -> AgroResult<()> {
         let mut points = Vec::new();
+        let provenance = Self::point_cloud_provenance(scans);
 
         for scan in scans {
             for point in &scan.points {
@@ -1312,12 +1323,35 @@ impl LidarMapper {
 
         let output_path = output_dir.join("point_cloud.pcd");
         tokio::fs::write(&output_path, pcd_content).await?;
+        self.save_point_cloud_provenance(&provenance, output_dir)
+            .await?;
 
         info!(
             "Saved point cloud with {} points to: {:?}",
             points.len(),
             output_path
         );
+        Ok(())
+    }
+
+    fn point_cloud_provenance(scans: &[LidarScan]) -> LidarPointCloudProvenance {
+        LidarPointCloudProvenance {
+            scan_ids: scans.iter().map(|scan| scan.scan_id).collect(),
+            captured_at: scans.iter().map(|scan| scan.timestamp).collect(),
+            point_count: scans.iter().map(|scan| scan.points.len()).sum(),
+            frame_crs_note: POINT_CLOUD_FRAME_CRS_NOTE.to_string(),
+        }
+    }
+
+    async fn save_point_cloud_provenance(
+        &self,
+        provenance: &LidarPointCloudProvenance,
+        output_dir: &PathBuf,
+    ) -> AgroResult<()> {
+        let output_path = output_dir.join("point_cloud_provenance.json");
+        let content = serde_json::to_vec_pretty(provenance)?;
+        tokio::fs::write(&output_path, content).await?;
+        info!("Saved point cloud provenance to: {:?}", output_path);
         Ok(())
     }
 
@@ -1446,6 +1480,15 @@ mod tests {
             distance,
             quality: 30,
         }
+    }
+
+    fn pcd_data_lines(content: &str) -> Vec<&str> {
+        content
+            .lines()
+            .skip_while(|line| *line != "DATA ascii")
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .collect()
     }
 
     fn normal_estimate(point_index: usize, z: f64) -> LidarNormalEstimate {
@@ -1647,6 +1690,84 @@ mod tests {
         let persisted: LidarOccupancyGridEvidence =
             serde_json::from_str(&fs::read_to_string(persisted_path).unwrap()).unwrap();
         assert_eq!(persisted, evidence);
+    }
+
+    #[tokio::test]
+    async fn save_point_cloud_writes_valid_pcd_and_provenance() {
+        let mapper = test_mapper();
+        let output_dir = temp_dir("point_cloud_export");
+        let captured_at = Utc::now();
+        let scan_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let second_captured_at = captured_at + chrono::Duration::seconds(10);
+        let scans = vec![
+            LidarScan {
+                timestamp: captured_at,
+                points: vec![point(0.0, 1000.0), point(0.0, 2000.0)],
+                scan_id,
+            },
+            LidarScan {
+                timestamp: second_captured_at,
+                points: vec![point(0.0, 3000.0)],
+                scan_id: second_id,
+            },
+        ];
+
+        mapper.save_point_cloud(&scans, &output_dir).await.unwrap();
+
+        let content = fs::read_to_string(output_dir.join("point_cloud.pcd")).unwrap();
+        assert!(content.starts_with("# .PCD v0.7 - Point Cloud Data file format\n"));
+        assert!(content.contains("VERSION 0.7\n"));
+        assert!(content.contains("FIELDS x y z\n"));
+        assert!(content.contains("SIZE 4 4 4\n"));
+        assert!(content.contains("TYPE F F F\n"));
+        assert!(content.contains("COUNT 1 1 1\n"));
+        assert!(content.contains("WIDTH 3\n"));
+        assert!(content.contains("HEIGHT 1\n"));
+        assert!(content.contains("POINTS 3\n"));
+        assert_eq!(
+            pcd_data_lines(&content),
+            vec![
+                "1.000 0.000 0.000",
+                "2.000 0.000 0.000",
+                "3.000 0.000 0.000"
+            ]
+        );
+
+        let provenance: LidarPointCloudProvenance = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("point_cloud_provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(provenance.scan_ids, vec![scan_id, second_id]);
+        assert_eq!(
+            provenance.captured_at,
+            vec![captured_at, second_captured_at]
+        );
+        assert_eq!(provenance.point_count, 3);
+        assert!(provenance.frame_crs_note.contains(OCCUPANCY_GRID_LOCAL_CRS));
+        assert!(provenance.frame_crs_note.contains("z=0"));
+    }
+
+    #[tokio::test]
+    async fn save_point_cloud_writes_valid_empty_pcd_and_provenance() {
+        let mapper = test_mapper();
+        let output_dir = temp_dir("point_cloud_empty_export");
+
+        mapper.save_point_cloud(&[], &output_dir).await.unwrap();
+
+        let content = fs::read_to_string(output_dir.join("point_cloud.pcd")).unwrap();
+        assert!(content.contains("WIDTH 0\n"));
+        assert!(content.contains("POINTS 0\n"));
+        assert_eq!(pcd_data_lines(&content), Vec::<&str>::new());
+
+        let provenance: LidarPointCloudProvenance = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("point_cloud_provenance.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(provenance.scan_ids.is_empty());
+        assert!(provenance.captured_at.is_empty());
+        assert_eq!(provenance.point_count, 0);
+        assert!(provenance.frame_crs_note.contains(OCCUPANCY_GRID_LOCAL_CRS));
     }
 
     #[test]
