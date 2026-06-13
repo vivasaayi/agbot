@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 26109619cdb1664d68777a434fa1ae9cbf3daad9 (`batch-02-19`)
-- **Latest checkpoint commit**: b06d4a9235fddb61c1127f9d6c21bcc09f7ab2cb (`batch-02-17` metadata)
-- **Current batch**: `batch-02-19` / STORY `02-19` — deterministic scene synthesis manifest committed
-- **Completed feature rows**: 266 committed; 1 skipped; 1 blocked; 230 pending rows remain in the full-roadmap inventory
+- **Last implementation commit**: bb9f75f8ada8db1df31a3f576b55221c29de43ad (`batch-02-20`)
+- **Latest checkpoint commit**: 3f189ae0c044a714f40e25b03a2cd5fb9127ed8a (`batch-02-19` metadata)
+- **Current batch**: `batch-02-20` / STORY `02-20` — deterministic ray-traced camera frames committed
+- **Completed feature rows**: 267 committed; 1 skipped; 1 blocked; 229 pending rows remain in the full-roadmap inventory
 - **Blocker**: STORY `07-11` is blocked on the documented storage-authority confirmation question.
 
 ## Latest verification
