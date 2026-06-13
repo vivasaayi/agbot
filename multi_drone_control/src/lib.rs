@@ -37,7 +37,8 @@ pub use swarm_command::{
     SwarmCommandStatus,
 };
 pub use synchronized_survey::{
-    evaluate_synchronized_survey_progress, plan_synchronized_survey, SurveyExecutionStatus,
+    evaluate_synchronized_survey_progress, plan_coverage_optimization, plan_synchronized_survey,
+    CoverageOptimizationConfig, CoverageOptimizationPlan, DroneCoverageTime, SurveyExecutionStatus,
     SurveyLane, SurveyProgressReport, SurveySeparationSample, SynchronizedSurveyConfig,
     SynchronizedSurveyError, SynchronizedSurveyPlan,
 };
