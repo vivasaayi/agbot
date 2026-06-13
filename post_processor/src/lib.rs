@@ -14,6 +14,7 @@ pub mod ndvi_analysis;
 pub mod product_anomalies;
 pub mod report_generator;
 pub mod thermal_analysis;
+pub mod vegetation_summary;
 pub mod zonal_statistics;
 pub mod zone_delineation;
 pub mod zone_recommendations;
@@ -34,6 +35,10 @@ pub use product_anomalies::{
 };
 pub use report_generator::ReportGenerator;
 pub use thermal_analysis::{ThermalAnalysisConfig, ThermalAnalysisProcessor};
+pub use vegetation_summary::{
+    summarize_vegetation, VegetationSourceProduct, VegetationSummary, VegetationSummaryError,
+    VegetationSummaryInput, VegetationTrend, DEFAULT_LOW_VIGOR_NDVI_THRESHOLD,
+};
 pub use zonal_statistics::{
     compute_zonal_statistics, ProductGrid, ProductGridStatistics, ZonalStatisticsError,
 };
@@ -216,7 +221,7 @@ pub struct AnalysisZone {
     pub classification: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisStatistics {
     pub min_value: f32,
     pub max_value: f32,
