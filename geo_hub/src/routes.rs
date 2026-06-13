@@ -63,25 +63,27 @@ use orthomosaic::{
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-    build_soil_moisture_reading, build_tractor_record, compute_drought_index,
-    normalize_weather_provider_forecast, parse_drought_index_type, parse_soil_moisture_qa_flag,
+    build_marketplace_account_record, build_soil_moisture_reading, build_tractor_record,
+    compute_drought_index, normalize_weather_provider_forecast, parse_drought_index_type,
+    parse_marketplace_account_status, parse_marketplace_party_type, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, soil_moisture_rejection_reason_for_error,
-    soil_moisture_rejection_record, validate_field_boundary, weather_fetch_failure_record,
-    AnnotationGeometry, AnnotationRecord, DroughtIndexComputeRequest, DroughtIndexError,
-    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
-    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
-    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
-    ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
-    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
-    SoilMoistureReadingError, SoilMoistureReadingRecord, SoilMoistureReadingRequest,
-    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, TractorCommandAuditDecision,
-    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
-    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
-    TractorRegistrationRequest, TractorRegistryError, WeatherFetchFailureRecord,
-    WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
-    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
-    GEO_EXTENT_ASSERTION_TOLERANCE,
+    soil_moisture_rejection_record, transition_marketplace_account_status, validate_field_boundary,
+    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord, DroughtIndexComputeRequest,
+    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
+    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
+    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage,
+    RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
+    RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
+    SoilMoistureReadingRecord, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
+    SoilMoistureRejectionRecord, TractorCommandAuditDecision, TractorCommandAuditRecord,
+    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
+    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
+    TractorRegistryError, WeatherFetchFailureRecord, WeatherForecastRecord,
+    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
+    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_device_record, GatewayIngestError,
@@ -469,6 +471,24 @@ pub struct DroughtIndexListQuery {
     pub index_type: Option<DroughtIndexType>,
     pub start: Option<String>,
     pub end: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceAccountListQuery {
+    pub org_id: Option<String>,
+    pub party_type: Option<MarketplacePartyType>,
+    pub status: Option<MarketplaceAccountStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceAccountScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceAccountStatusRequest {
+    pub org_id: String,
+    pub status: MarketplaceAccountStatus,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2634,6 +2654,99 @@ pub async fn list_drought_indices(
         .map(|row| decode_drought_index_record(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
+}
+
+pub async fn create_marketplace_account(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceAccountCreateRequest>,
+) -> AppResult<Json<MarketplaceAccountRecord>> {
+    let org_id = normalize_optional_text(Some(request.org_id.clone()))
+        .ok_or_else(|| AppError::BadRequest("marketplace org_id is required".to_string()))?;
+    let org_exists = marketplace_org_exists(&state, &org_id).await?;
+    let record = build_marketplace_account_record(
+        request,
+        org_exists,
+        format!("marketplace-account-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_account_error)?;
+    insert_marketplace_account_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_accounts(
+    Query(query): Query<MarketplaceAccountListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceAccountRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace accounts".to_string(),
+        )
+    })?;
+    let party_type = query
+        .party_type
+        .map(|party_type| party_type.as_str().to_string());
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT account_id, org_id, party_type, role_refs_json, status, created_at, updated_at
+        FROM marketplace_accounts
+        WHERE (?1 IS NULL OR org_id = ?1)
+          AND (?2 IS NULL OR party_type = ?2)
+          AND (?3 IS NULL OR status = ?3)
+        ORDER BY created_at ASC, account_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(party_type)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_account_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_account(
+    Path(account_id): Path<String>,
+    Query(query): Query<MarketplaceAccountScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceAccountRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let account = load_marketplace_account(&state, &account_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if account.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(account))
+}
+
+pub async fn update_marketplace_account_status(
+    Path(account_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceAccountStatusRequest>,
+) -> AppResult<Json<MarketplaceAccountRecord>> {
+    let org_id = normalize_optional_text(Some(request.org_id))
+        .ok_or_else(|| AppError::BadRequest("marketplace org_id is required".to_string()))?;
+    let account = load_marketplace_account(&state, &account_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if account.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let updated =
+        transition_marketplace_account_status(&account, request.status, current_record_timestamp())
+            .map_err(marketplace_account_error)?;
+    update_marketplace_account_record(&state, &updated).await?;
+
+    Ok(Json(updated))
 }
 
 pub async fn list_time_series_points(
@@ -6075,6 +6188,10 @@ fn drought_index_error(error: DroughtIndexError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn marketplace_account_error(error: MarketplaceAccountError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
     value.parse::<SoilSensorType>().map_err(soil_iot_error)
 }
@@ -7289,6 +7406,27 @@ fn decode_drought_index_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Droug
     })
 }
 
+fn decode_marketplace_account_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceAccountRecord> {
+    let role_refs = serde_json::from_str::<Vec<String>>(&row.get::<String, _>("role_refs_json"))
+        .map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode marketplace role_refs_json"))
+        })?;
+
+    Ok(MarketplaceAccountRecord {
+        account_id: row.get("account_id"),
+        org_id: row.get("org_id"),
+        party_type: parse_marketplace_party_type(&row.get::<String, _>("party_type"))
+            .map_err(marketplace_account_error)?,
+        role_refs,
+        status: parse_marketplace_account_status(&row.get::<String, _>("status"))
+            .map_err(marketplace_account_error)?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 fn decode_soil_iot_device(row: &sqlx::sqlite::SqliteRow) -> AppResult<SoilDeviceRecord> {
     Ok(SoilDeviceRecord {
         device_id: row.get("device_id"),
@@ -8288,6 +8426,93 @@ async fn insert_drought_index_time_series_point(
     };
 
     insert_time_series_point_record(state, &point, Some(metadata)).await
+}
+
+async fn insert_marketplace_account_record(
+    state: &AppState,
+    record: &MarketplaceAccountRecord,
+) -> AppResult<()> {
+    let role_refs_json =
+        serde_json::to_string(&record.role_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_accounts (
+            account_id, org_id, party_type, role_refs_json, status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&record.account_id)
+    .bind(&record.org_id)
+    .bind(record.party_type.as_str())
+    .bind(role_refs_json)
+    .bind(record.status.as_str())
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn update_marketplace_account_record(
+    state: &AppState,
+    record: &MarketplaceAccountRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE marketplace_accounts
+        SET status = ?2, updated_at = ?3
+        WHERE account_id = ?1
+        "#,
+    )
+    .bind(&record.account_id)
+    .bind(record.status.as_str())
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_marketplace_account(
+    state: &AppState,
+    account_id: &str,
+) -> AppResult<Option<MarketplaceAccountRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT account_id, org_id, party_type, role_refs_json, status, created_at, updated_at
+        FROM marketplace_accounts
+        WHERE account_id = ?1
+        "#,
+    )
+    .bind(account_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_account_record(&row))
+        .transpose()
+}
+
+async fn marketplace_org_exists(state: &AppState, org_id: &str) -> AppResult<bool> {
+    let exists: i64 = sqlx::query_scalar(
+        r#"
+        SELECT CASE
+            WHEN EXISTS(SELECT 1 FROM farms WHERE owner = ?1)
+              OR EXISTS(SELECT 1 FROM fields WHERE owner = ?1)
+            THEN 1 ELSE 0
+        END
+        "#,
+    )
+    .bind(org_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(exists != 0)
 }
 
 async fn load_soil_iot_device(

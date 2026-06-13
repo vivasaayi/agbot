@@ -195,6 +195,18 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::compute_drought_index_route),
         )
         .route(
+            "/api/marketplace/accounts",
+            get(routes::list_marketplace_accounts).post(routes::create_marketplace_account),
+        )
+        .route(
+            "/api/marketplace/accounts/:account_id",
+            get(routes::get_marketplace_account),
+        )
+        .route(
+            "/api/marketplace/accounts/:account_id/status",
+            post(routes::update_marketplace_account_status),
+        )
+        .route(
             "/api/time-series/points",
             get(routes::list_time_series_points),
         )

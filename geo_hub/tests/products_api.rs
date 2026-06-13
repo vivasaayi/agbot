@@ -2518,6 +2518,178 @@ async fn drought_index_compute_rejects_untraceable_index_without_persisting() ->
 }
 
 #[tokio::test]
+async fn marketplace_accounts_create_list_suspend_and_deny_cross_tenant_read() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_org(&ctx, "farm-market-beta", "org-beta").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/accounts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "account_id": "supplier-001",
+                        "org_id": "org-alpha",
+                        "party_type": "supplier",
+                        "role_refs": ["marketplace:seller", "inventory-admin"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let account: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        account.get("account_id").and_then(|value| value.as_str()),
+        Some("supplier-001")
+    );
+    assert_eq!(
+        account.get("party_type").and_then(|value| value.as_str()),
+        Some("supplier")
+    );
+    assert_eq!(
+        account.get("status").and_then(|value| value.as_str()),
+        Some("active")
+    );
+
+    let unscoped_list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/accounts")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(unscoped_list.status(), StatusCode::BAD_REQUEST);
+
+    let alpha_list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/accounts?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(alpha_list.status(), StatusCode::OK);
+    let body = to_bytes(alpha_list.into_body(), 64 * 1024).await?;
+    let accounts: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(accounts.len(), 1);
+
+    let beta_list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/accounts?org_id=org-beta")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(beta_list.status(), StatusCode::OK);
+    let body = to_bytes(beta_list.into_body(), 64 * 1024).await?;
+    let beta_accounts: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert!(beta_accounts.is_empty());
+
+    let cross_tenant = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/accounts/supplier-001?org_id=org-beta")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+
+    let suspend = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/accounts/supplier-001/status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "org_id": "org-alpha",
+                        "status": "suspended"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(suspend.status(), StatusCode::OK);
+    let body = to_bytes(suspend.into_body(), 64 * 1024).await?;
+    let suspended: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        suspended.get("status").and_then(|value| value.as_str()),
+        Some("suspended")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_account_create_rejects_unknown_org_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/accounts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "account_id": "supplier-missing",
+                        "org_id": "org-missing",
+                        "party_type": "supplier",
+                        "role_refs": ["marketplace:seller"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let account_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_accounts")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(account_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -8217,6 +8389,31 @@ async fn seed_drought_management_field(ctx: &TestContext) -> Result<()> {
         .await
         .expect("router should handle request");
     assert_eq!(field_response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_marketplace_org(ctx: &TestContext, farm_id: &str, org_id: &str) -> Result<()> {
+    let farm_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": farm_id,
+                        "owner": org_id,
+                        "name": format!("Marketplace {org_id}")
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(farm_response.status(), StatusCode::OK);
     Ok(())
 }
 

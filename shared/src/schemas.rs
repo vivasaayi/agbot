@@ -1548,6 +1548,215 @@ fn normalize_drought_text(value: String) -> Option<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum MarketplacePartyType {
+    Supplier,
+    Buyer,
+    Grower,
+}
+
+impl MarketplacePartyType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketplacePartyType::Supplier => "supplier",
+            MarketplacePartyType::Buyer => "buyer",
+            MarketplacePartyType::Grower => "grower",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceAccountStatus {
+    Pending,
+    Active,
+    Suspended,
+}
+
+impl Default for MarketplaceAccountStatus {
+    fn default() -> Self {
+        MarketplaceAccountStatus::Active
+    }
+}
+
+impl MarketplaceAccountStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketplaceAccountStatus::Pending => "pending",
+            MarketplaceAccountStatus::Active => "active",
+            MarketplaceAccountStatus::Suspended => "suspended",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceAccountCreateRequest {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub org_id: String,
+    pub party_type: MarketplacePartyType,
+    #[serde(default)]
+    pub role_refs: Vec<String>,
+    #[serde(default)]
+    pub status: Option<MarketplaceAccountStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketplaceAccountRecord {
+    pub account_id: String,
+    pub org_id: String,
+    pub party_type: MarketplacePartyType,
+    pub role_refs: Vec<String>,
+    pub status: MarketplaceAccountStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarketplaceAccountError {
+    #[error("marketplace account_id cannot be empty")]
+    EmptyAccountId,
+    #[error("marketplace account org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("marketplace account role_refs cannot be empty")]
+    EmptyRoleRefs,
+    #[error("marketplace organization not found: {org_id}")]
+    OrganizationNotFound { org_id: String },
+    #[error("marketplace account created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("marketplace account updated_at cannot be empty")]
+    EmptyUpdatedAt,
+    #[error(
+        "invalid marketplace account lifecycle transition for {account_id}: {from:?} -> {to:?}"
+    )]
+    InvalidStatusTransition {
+        account_id: String,
+        from: MarketplaceAccountStatus,
+        to: MarketplaceAccountStatus,
+    },
+    #[error("unsupported marketplace party type {value}")]
+    UnsupportedPartyType { value: String },
+    #[error("unsupported marketplace account status {value}")]
+    UnsupportedStatus { value: String },
+}
+
+pub fn build_marketplace_account_record(
+    request: MarketplaceAccountCreateRequest,
+    org_exists: bool,
+    generated_account_id: String,
+    created_at: String,
+) -> Result<MarketplaceAccountRecord, MarketplaceAccountError> {
+    let account_id = normalize_marketplace_optional_text(request.account_id)
+        .or_else(|| normalize_marketplace_text(generated_account_id))
+        .ok_or(MarketplaceAccountError::EmptyAccountId)?;
+    let org_id =
+        normalize_marketplace_text(request.org_id).ok_or(MarketplaceAccountError::EmptyOrgId)?;
+    if !org_exists {
+        return Err(MarketplaceAccountError::OrganizationNotFound { org_id });
+    }
+    let role_refs = normalize_marketplace_role_refs(request.role_refs)?;
+    let created_at =
+        normalize_marketplace_text(created_at).ok_or(MarketplaceAccountError::EmptyCreatedAt)?;
+    Ok(MarketplaceAccountRecord {
+        account_id,
+        org_id,
+        party_type: request.party_type,
+        role_refs,
+        status: request.status.unwrap_or_default(),
+        created_at: created_at.clone(),
+        updated_at: created_at,
+    })
+}
+
+pub fn transition_marketplace_account_status(
+    record: &MarketplaceAccountRecord,
+    to: MarketplaceAccountStatus,
+    updated_at: String,
+) -> Result<MarketplaceAccountRecord, MarketplaceAccountError> {
+    if !valid_marketplace_account_transition(record.status, to) {
+        return Err(MarketplaceAccountError::InvalidStatusTransition {
+            account_id: record.account_id.clone(),
+            from: record.status,
+            to,
+        });
+    }
+    let updated_at =
+        normalize_marketplace_text(updated_at).ok_or(MarketplaceAccountError::EmptyUpdatedAt)?;
+    let mut updated = record.clone();
+    updated.status = to;
+    updated.updated_at = updated_at;
+    Ok(updated)
+}
+
+pub fn parse_marketplace_party_type(
+    value: &str,
+) -> Result<MarketplacePartyType, MarketplaceAccountError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "supplier" => Ok(MarketplacePartyType::Supplier),
+        "buyer" => Ok(MarketplacePartyType::Buyer),
+        "grower" => Ok(MarketplacePartyType::Grower),
+        _ => Err(MarketplaceAccountError::UnsupportedPartyType {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_marketplace_account_status(
+    value: &str,
+) -> Result<MarketplaceAccountStatus, MarketplaceAccountError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pending" => Ok(MarketplaceAccountStatus::Pending),
+        "active" => Ok(MarketplaceAccountStatus::Active),
+        "suspended" => Ok(MarketplaceAccountStatus::Suspended),
+        _ => Err(MarketplaceAccountError::UnsupportedStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn valid_marketplace_account_transition(
+    from: MarketplaceAccountStatus,
+    to: MarketplaceAccountStatus,
+) -> bool {
+    from == to
+        || matches!(
+            (from, to),
+            (
+                MarketplaceAccountStatus::Pending,
+                MarketplaceAccountStatus::Active
+            ) | (
+                MarketplaceAccountStatus::Active,
+                MarketplaceAccountStatus::Suspended
+            )
+        )
+}
+
+fn normalize_marketplace_role_refs(
+    role_refs: Vec<String>,
+) -> Result<Vec<String>, MarketplaceAccountError> {
+    let role_refs = role_refs
+        .into_iter()
+        .filter_map(normalize_marketplace_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if role_refs.is_empty() {
+        Err(MarketplaceAccountError::EmptyRoleRefs)
+    } else {
+        Ok(role_refs)
+    }
+}
+
+fn normalize_marketplace_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(normalize_marketplace_text)
+}
+
+fn normalize_marketplace_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FleetNodeComponentHealth {
     Ok,
     Warn,
@@ -4102,9 +4311,10 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 mod tests {
     use super::{
         apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
-        bind_fleet_node_identity, bounds_from_points, build_soil_moisture_reading,
-        compute_drought_index, normalize_weather_provider_forecast, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, validate_field_boundary,
+        bind_fleet_node_identity, bounds_from_points, build_marketplace_account_record,
+        build_soil_moisture_reading, compute_drought_index, normalize_weather_provider_forecast,
+        sign_fleet_config_bundle, soil_moisture_rejection_record,
+        transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record,
         AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
         AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord, CropPlanRecord,
@@ -4115,17 +4325,19 @@ mod tests {
         FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeEnrollmentError,
         FleetNodeEnrollmentRequest, FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind,
         FleetNodeOperationError, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds,
-        GeoPoint, MultispectralImage, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
-        ReportDeliverableRegistry, ReportFormat, ReportPersistenceError, ReportRecord,
-        ReportVisibility, SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
-        SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
-        SoilMoistureRejectionReason, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
-        TractorRegistrationRequest, TractorRegistry, WeatherIngestError,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
+        GeoPoint, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+        MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, RasterResolution,
+        RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
+        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
+        RecommendationStatus, RecommendationStatusChangeType, ReportDeliverableRegistry,
+        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
+        SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
+        TractorCommandAuditDecision, TractorCommandRejectionReason, TractorImplementRef,
+        TractorLifecycleStatus, TractorMotionCommandRequest, TractorRegistrationRequest,
+        TractorRegistry, WeatherIngestError, WeatherProviderForecastPoint,
+        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
+        WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -4520,6 +4732,94 @@ mod tests {
         );
         assert_eq!(unknown.status_code(), 404);
         assert_eq!(registry.command_audits().len(), 2);
+    }
+
+    #[test]
+    fn marketplace_account_links_party_to_one_org_and_normalizes_roles() {
+        let record = build_marketplace_account_record(
+            MarketplaceAccountCreateRequest {
+                account_id: Some(" supplier-001 ".to_string()),
+                org_id: " org-alpha ".to_string(),
+                party_type: MarketplacePartyType::Supplier,
+                role_refs: vec![
+                    " marketplace:seller ".to_string(),
+                    "inventory-admin".to_string(),
+                    "marketplace:seller".to_string(),
+                ],
+                status: None,
+            },
+            true,
+            "generated-account".to_string(),
+            " 2026-06-13T10:00:00Z ".to_string(),
+        )
+        .expect("marketplace account should normalize");
+
+        assert_eq!(record.account_id, "supplier-001");
+        assert_eq!(record.org_id, "org-alpha");
+        assert_eq!(record.party_type, MarketplacePartyType::Supplier);
+        assert_eq!(
+            record.role_refs,
+            vec![
+                "inventory-admin".to_string(),
+                "marketplace:seller".to_string()
+            ]
+        );
+        assert_eq!(record.status, MarketplaceAccountStatus::Active);
+        assert_eq!(record.created_at, "2026-06-13T10:00:00Z");
+        assert_eq!(record.updated_at, "2026-06-13T10:00:00Z");
+    }
+
+    #[test]
+    fn marketplace_account_suspend_transition_is_auditable() {
+        let record = build_marketplace_account_record(
+            MarketplaceAccountCreateRequest {
+                account_id: Some("buyer-001".to_string()),
+                org_id: "org-alpha".to_string(),
+                party_type: MarketplacePartyType::Buyer,
+                role_refs: vec!["marketplace:buyer".to_string()],
+                status: None,
+            },
+            true,
+            "generated-account".to_string(),
+            "2026-06-13T10:00:00Z".to_string(),
+        )
+        .expect("buyer account creates");
+
+        let suspended = transition_marketplace_account_status(
+            &record,
+            MarketplaceAccountStatus::Suspended,
+            "2026-06-13T11:00:00Z".to_string(),
+        )
+        .expect("active account can be suspended");
+
+        assert_eq!(suspended.account_id, "buyer-001");
+        assert_eq!(suspended.status, MarketplaceAccountStatus::Suspended);
+        assert_eq!(suspended.updated_at, "2026-06-13T11:00:00Z");
+        assert_eq!(suspended.created_at, record.created_at);
+    }
+
+    #[test]
+    fn marketplace_account_rejects_unknown_org_without_record() {
+        let error = build_marketplace_account_record(
+            MarketplaceAccountCreateRequest {
+                account_id: Some("supplier-unknown".to_string()),
+                org_id: "org-missing".to_string(),
+                party_type: MarketplacePartyType::Supplier,
+                role_refs: vec!["marketplace:seller".to_string()],
+                status: None,
+            },
+            false,
+            "generated-account".to_string(),
+            "2026-06-13T10:00:00Z".to_string(),
+        )
+        .expect_err("unknown org should reject");
+
+        assert_eq!(
+            error,
+            MarketplaceAccountError::OrganizationNotFound {
+                org_id: "org-missing".to_string()
+            }
+        );
     }
 
     #[test]
