@@ -45,8 +45,11 @@ pub use guarded_dispatch::{
     GuardedDispatchCommand, GuardedDispatchContext, GuardedDispatchError, GuardedDispatchOutcome,
 };
 pub use mission_audit::{
-    validate_mission_audit_timeline, MissionAuditEvent, MissionAuditEventKind, MissionAuditGap,
-    MissionAuditGapCode, MissionAuditLog, MissionAuditTimeline, MissionAuditValidationReport,
+    replay_mission_from_audit, validate_mission_audit_timeline, MissionAuditEvent,
+    MissionAuditEventKind, MissionAuditGap, MissionAuditGapCode, MissionAuditLog,
+    MissionAuditTimeline, MissionAuditValidationReport, MissionReplay, MissionReplayCommand,
+    MissionReplayCommandStatus, MissionReplayError, MissionReplayErrorCode, MissionReplayEvent,
+    MissionReplayEventKind,
 };
 pub use mission_optimizer::{
     assert_mission_budget_allows_arming, evaluate_mission_budget, MissionBudgetConfig,

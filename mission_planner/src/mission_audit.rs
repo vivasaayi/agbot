@@ -5,6 +5,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use shared::schemas::Telemetry;
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
@@ -56,6 +57,57 @@ pub struct MissionAuditGap {
 pub struct MissionAuditValidationReport {
     pub mission_id: Uuid,
     pub gaps: Vec<MissionAuditGap>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MissionReplayEventKind {
+    Command,
+    Telemetry,
+    Safety,
+    ModeTransition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MissionReplayCommandStatus {
+    Sent,
+    Acked,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionReplayCommand {
+    pub correlation_id: Uuid,
+    pub mavlink_command: u16,
+    pub status: MissionReplayCommandStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionReplayEvent {
+    pub sequence: u64,
+    pub occurred_at: DateTime<Utc>,
+    pub kind: MissionReplayEventKind,
+    pub command: Option<MissionReplayCommand>,
+    pub telemetry: Option<Telemetry>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionReplay {
+    pub mission_id: Uuid,
+    pub events: Vec<MissionReplayEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MissionReplayErrorCode {
+    AuditGap,
+    CorruptPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionReplayError {
+    pub code: MissionReplayErrorCode,
+    pub message: String,
+    pub validation_report: Option<MissionAuditValidationReport>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -340,6 +392,131 @@ pub fn validate_mission_audit_timeline(
     }
 }
 
+pub fn replay_mission_from_audit(
+    timeline: &MissionAuditTimeline,
+) -> Result<MissionReplay, MissionReplayError> {
+    let validation_report = validate_mission_audit_timeline(timeline);
+    if !validation_report.is_clear() {
+        return Err(MissionReplayError {
+            code: MissionReplayErrorCode::AuditGap,
+            message: format!(
+                "mission audit gap prevents replay: {} gap(s)",
+                validation_report.gaps.len()
+            ),
+            validation_report: Some(validation_report),
+        });
+    }
+
+    let events = timeline
+        .events
+        .iter()
+        .map(replay_event_from_audit)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(MissionReplay {
+        mission_id: timeline.mission_id,
+        events,
+    })
+}
+
+fn replay_event_from_audit(
+    event: &MissionAuditEvent,
+) -> Result<MissionReplayEvent, MissionReplayError> {
+    match event.kind {
+        MissionAuditEventKind::CommandSent
+        | MissionAuditEventKind::CommandAcked
+        | MissionAuditEventKind::CommandFailed => {
+            let correlation_id = event.correlation_id.ok_or_else(|| {
+                corrupt_replay_payload(event, "command audit entry missing correlation_id")
+            })?;
+            let mavlink_command = event
+                .payload
+                .get("mavlink_command")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or_else(|| {
+                    corrupt_replay_payload(event, "command audit entry missing mavlink_command")
+                })?;
+            let status = match event.kind {
+                MissionAuditEventKind::CommandSent => MissionReplayCommandStatus::Sent,
+                MissionAuditEventKind::CommandAcked => MissionReplayCommandStatus::Acked,
+                MissionAuditEventKind::CommandFailed => MissionReplayCommandStatus::Failed,
+                MissionAuditEventKind::TelemetrySample
+                | MissionAuditEventKind::SafetyViolation
+                | MissionAuditEventKind::ModeTransition => unreachable!(),
+            };
+
+            Ok(MissionReplayEvent {
+                sequence: event.sequence,
+                occurred_at: event.occurred_at,
+                kind: MissionReplayEventKind::Command,
+                command: Some(MissionReplayCommand {
+                    correlation_id,
+                    mavlink_command,
+                    status,
+                }),
+                telemetry: None,
+                message: event.message.clone(),
+            })
+        }
+        MissionAuditEventKind::TelemetrySample => {
+            let telemetry = event
+                .payload
+                .get("telemetry")
+                .cloned()
+                .ok_or_else(|| {
+                    corrupt_replay_payload(event, "telemetry audit entry missing telemetry payload")
+                })
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|error| MissionReplayError {
+                        code: MissionReplayErrorCode::CorruptPayload,
+                        message: format!(
+                            "telemetry audit entry {} has corrupt payload: {error}",
+                            event.id
+                        ),
+                        validation_report: None,
+                    })
+                })?;
+
+            Ok(MissionReplayEvent {
+                sequence: event.sequence,
+                occurred_at: event.occurred_at,
+                kind: MissionReplayEventKind::Telemetry,
+                command: None,
+                telemetry: Some(telemetry),
+                message: event.message.clone(),
+            })
+        }
+        MissionAuditEventKind::SafetyViolation => Ok(MissionReplayEvent {
+            sequence: event.sequence,
+            occurred_at: event.occurred_at,
+            kind: MissionReplayEventKind::Safety,
+            command: None,
+            telemetry: None,
+            message: event.message.clone(),
+        }),
+        MissionAuditEventKind::ModeTransition => Ok(MissionReplayEvent {
+            sequence: event.sequence,
+            occurred_at: event.occurred_at,
+            kind: MissionReplayEventKind::ModeTransition,
+            command: None,
+            telemetry: None,
+            message: event.message.clone(),
+        }),
+    }
+}
+
+fn corrupt_replay_payload(
+    event: &MissionAuditEvent,
+    message: impl Into<String>,
+) -> MissionReplayError {
+    MissionReplayError {
+        code: MissionReplayErrorCode::CorruptPayload,
+        message: format!("audit event {} is corrupt: {}", event.id, message.into()),
+        validation_report: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +685,97 @@ mod tests {
         assert!(report.gaps[0]
             .message
             .contains("missing from mission audit"));
+    }
+
+    #[test]
+    fn mission_replay_reconstructs_positions_and_commands_from_audit() {
+        let mission_id = Uuid::new_v4();
+        let command_id = Uuid::new_v4();
+        let mut audit = MissionAuditLog::default();
+        audit.append(MissionAuditEvent::command_sent(
+            mission_id,
+            command_id,
+            crate::mavlink_integration::MAV_CMD_NAV_TAKEOFF,
+            Utc.timestamp_opt(100, 0).unwrap(),
+            "takeoff command sent",
+        ));
+        audit.append(MissionAuditEvent::from_telemetry_sample(&telemetry_sample(
+            mission_id, "drone-1", 101,
+        )));
+        audit.append(MissionAuditEvent::command_ack(
+            mission_id,
+            command_id,
+            crate::mavlink_integration::MAV_CMD_NAV_TAKEOFF,
+            Utc.timestamp_opt(102, 0).unwrap(),
+            "takeoff command acked",
+        ));
+
+        let replay = replay_mission_from_audit(&audit.timeline(mission_id))
+            .expect("complete audit should replay");
+
+        assert_eq!(replay.mission_id, mission_id);
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                MissionReplayEventKind::Command,
+                MissionReplayEventKind::Telemetry,
+                MissionReplayEventKind::Command,
+            ]
+        );
+        assert_eq!(
+            replay.events[0]
+                .command
+                .as_ref()
+                .map(|command| command.status),
+            Some(MissionReplayCommandStatus::Sent)
+        );
+        assert_eq!(
+            replay.events[1]
+                .telemetry
+                .as_ref()
+                .map(|telemetry| telemetry.position.latitude),
+            Some(41.0)
+        );
+        assert_eq!(
+            replay.events[2]
+                .command
+                .as_ref()
+                .map(|command| command.status),
+            Some(MissionReplayCommandStatus::Acked)
+        );
+        let encoded = serde_json::to_value(&replay).expect("replay exports as JSON");
+        assert_eq!(encoded["mission_id"], mission_id.to_string());
+        assert_eq!(encoded["events"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn mission_replay_reports_audit_gap_instead_of_fabricating_track() {
+        let mission_id = Uuid::new_v4();
+        let command_id = Uuid::new_v4();
+        let mut audit = MissionAuditLog::default();
+        audit.append(MissionAuditEvent::command_sent(
+            mission_id,
+            command_id,
+            crate::mavlink_integration::MAV_CMD_NAV_TAKEOFF,
+            Utc.timestamp_opt(100, 0).unwrap(),
+            "takeoff command sent",
+        ));
+
+        let error = replay_mission_from_audit(&audit.timeline(mission_id))
+            .expect_err("corrupted audit should not replay");
+
+        assert_eq!(error.code, MissionReplayErrorCode::AuditGap);
+        assert_eq!(
+            error
+                .validation_report
+                .as_ref()
+                .map(|report| report.gaps[0].code),
+            Some(MissionAuditGapCode::MissingCommandAck)
+        );
+        assert!(error.message.contains("audit gap"));
     }
 }
