@@ -15,6 +15,7 @@
 #include "agbot_flight_sim/SafetyRules.hpp"
 #include "agbot_flight_sim/SceneSynthesis.hpp"
 #include "agbot_flight_sim/SimulationOps.hpp"
+#include "agbot_flight_sim/TelemetryVideoStream.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
 #include "agbot_flight_sim/TraceDiff.hpp"
@@ -955,6 +956,79 @@ void test_ray_traced_camera_reports_no_scene_coverage_outside_extent() {
     assert(frame.to_json().find("\"status\":\"no_scene_coverage\"") != std::string::npos);
 }
 
+std::vector<agbot::flight_sim::RayTracedFrame> test_stream_frames(
+    const agbot::flight_sim::TerrainProfile& profile,
+    const agbot::flight_sim::SceneSynthesisManifest& scene) {
+    agbot::flight_sim::RayTracedCameraConfig config;
+    config.width = 4;
+    config.height = 4;
+    std::vector<agbot::flight_sim::RayTracedFrame> frames;
+    for (int index = 0; index < 2; ++index) {
+        agbot::flight_sim::DroneState state;
+        state.position = {static_cast<double>(index), 40.0, 0.0};
+        state.mission_time_s = 2.0 + static_cast<double>(index) * 0.5;
+        frames.push_back(agbot::flight_sim::raytrace_camera_frame(state, profile, scene, config));
+    }
+    return frames;
+}
+
+void test_telemetry_video_stream_sends_decodable_aligned_frames_to_collector() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    const auto profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 16);
+    const auto scene = test_scene_manifest_for_camera(profile);
+    const auto frames = test_stream_frames(profile, scene);
+    std::vector<agbot::flight_sim::StreamTelemetrySample> telemetry {
+        {"drone-a", frames[0].timestamp_s, {0.0, 40.0, 0.0}, "flying"},
+        {"drone-a", frames[1].timestamp_s, {1.0, 40.0, 0.0}, "flying"},
+    };
+    agbot::flight_sim::LocalTelemetryVideoCollector collector;
+
+    const auto report = agbot::flight_sim::stream_telemetry_and_video(
+        telemetry,
+        frames,
+        collector,
+        {});
+
+    assert(report.status == agbot::flight_sim::StreamDeliveryStatus::Delivered);
+    assert(report.sent_telemetry_count == telemetry.size());
+    assert(report.sent_video_count == frames.size());
+    assert(report.acked_telemetry_count == telemetry.size());
+    assert(report.acked_video_count == frames.size());
+    assert(report.decoded_video_count == frames.size());
+    assert(report.timestamp_alignment_ok);
+    assert(collector.video_receipts().size() == frames.size());
+    assert(collector.video_receipts()[0].decoded);
+    assert(report.to_json().find("\"codec\":\"agbot-ray-frame-v1\"") != std::string::npos);
+}
+
+void test_telemetry_video_stream_buffers_when_collector_unreachable() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    const auto profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 16);
+    const auto scene = test_scene_manifest_for_camera(profile);
+    const auto frames = test_stream_frames(profile, scene);
+    std::vector<agbot::flight_sim::StreamTelemetrySample> telemetry {
+        {"drone-a", frames[0].timestamp_s, {0.0, 40.0, 0.0}, "flying"},
+    };
+    agbot::flight_sim::LocalTelemetryVideoCollector collector;
+    collector.set_available(false);
+
+    const auto report = agbot::flight_sim::stream_telemetry_and_video(
+        telemetry,
+        frames,
+        collector,
+        {});
+
+    assert(report.status == agbot::flight_sim::StreamDeliveryStatus::DeliveryFailed);
+    assert(report.delivery_failure_reason == "collector_unreachable");
+    assert(report.buffered_telemetry_count == telemetry.size());
+    assert(report.buffered_video_count == frames.size());
+    assert(report.sent_telemetry_count == 0);
+    assert(report.sent_video_count == 0);
+    assert(report.to_json().find("\"delivery_failure_reason\":\"collector_unreachable\"") != std::string::npos);
+}
+
 void test_builds_terrain_mesh_from_heightmap() {
     const std::vector<float> heightmap {
         10.0f, 10.0f, 10.0f,
@@ -1832,6 +1906,8 @@ int main() {
     test_scene_synthesis_marks_missing_source_coverage_unpopulated();
     test_ray_traced_camera_projects_scene_object_with_reproducible_depth();
     test_ray_traced_camera_reports_no_scene_coverage_outside_extent();
+    test_telemetry_video_stream_sends_decodable_aligned_frames_to_collector();
+    test_telemetry_video_stream_buffers_when_collector_unreachable();
     test_builds_terrain_mesh_from_heightmap();
     test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance();
     test_lidar_raycast_seeded_cloud_json_is_reproducible();

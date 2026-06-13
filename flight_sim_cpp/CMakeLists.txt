@@ -26,6 +26,7 @@ add_library(agbot_flight_sim_core
     src/SensorModel.cpp
     src/SimulationOps.cpp
     src/TelemetryReplay.cpp
+    src/TelemetryVideoStream.cpp
     src/TelemetryRecorder.cpp
     src/TraceDiff.cpp
     src/TwinBackend.cpp
