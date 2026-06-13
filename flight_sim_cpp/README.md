@@ -79,12 +79,15 @@ Run with a deterministic sensor calibration/noise profile:
 flight_sim_cpp/build/agbot_flight_sim_headless \
   --seed 42 \
   --mission flight_sim_cpp/samples/sample_field_loop.json \
-  --sensor-profile cheap_gps \
+  --sensor-profile cheap_gps_b2 \
   --output flight_sim_cpp/out/sensor_profile.jsonl
 ```
 
-Supported profiles are `ideal`, `cheap_gps`, `rtk_gps`, and `noisy_imu`. The
-manifest records profile noise/bias settings under `sensor_config` and includes
+Supported profiles are stored under `flight_sim_cpp/calibration/`: `ideal`,
+`cheap_gps_b2`, `rtk_gps_a1`, `noisy_imu`, `lidar_a3`, and
+`multispectral_camera`. The aliases `cheap_gps` and `rtk_gps` still resolve to
+their versioned profiles. The manifest records profile name, version, calibration
+file, and noise/bias settings under `sensor_config` and includes
 `sensor_config_hash` in the deterministic run identity.
 
 Every headless run also emits a capture-shaped LiDAR sidecar next to telemetry:

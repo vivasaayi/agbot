@@ -1,5 +1,8 @@
 #include "agbot_flight_sim/SensorModel.hpp"
 
+#include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -47,12 +50,129 @@ double symmetric_unit(std::uint64_t seed, std::uint64_t step, std::uint64_t salt
     return unit * 2.0 - 1.0;
 }
 
+std::string trim_copy(std::string_view value) {
+    std::size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        ++start;
+    }
+    std::size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        --end;
+    }
+    return std::string(value.substr(start, end - start));
+}
+
+std::string unquote(std::string value) {
+    value = trim_copy(value);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+        return value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
+std::string canonical_profile_name(std::string_view name) {
+    const std::string normalized = trim_copy(name);
+    if (normalized == "cheap_gps") {
+        return "cheap_gps_b2";
+    }
+    if (normalized == "rtk_gps") {
+        return "rtk_gps_a1";
+    }
+    return normalized;
+}
+
+std::filesystem::path calibration_profile_path(std::string_view name) {
+    return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR)
+        / "calibration"
+        / (std::string(name) + ".toml");
+}
+
+void apply_profile_value(
+    SensorCalibrationProfile& profile,
+    const std::string& key,
+    const std::string& value) {
+    if (key == "name") {
+        profile.name = unquote(value);
+    } else if (key == "version") {
+        profile.version = unquote(value);
+    } else if (key == "sensor_kind") {
+        profile.sensor_kind = unquote(value);
+    } else if (key == "gps_position_noise_m") {
+        profile.gps_position_noise_m = std::stod(value);
+    } else if (key == "imu_attitude_noise_rad") {
+        profile.imu_attitude_noise_rad = std::stod(value);
+    } else if (key == "barometer_altitude_noise_m") {
+        profile.barometer_altitude_noise_m = std::stod(value);
+    } else if (key == "magnetometer_heading_noise_rad") {
+        profile.magnetometer_heading_noise_rad = std::stod(value);
+    } else if (key == "gps_position_bias_m") {
+        profile.gps_position_bias_m = std::stod(value);
+    } else if (key == "imu_yaw_bias_rad") {
+        profile.imu_yaw_bias_rad = std::stod(value);
+    } else if (key == "barometer_altitude_bias_m") {
+        profile.barometer_altitude_bias_m = std::stod(value);
+    } else if (key == "magnetometer_heading_bias_rad") {
+        profile.magnetometer_heading_bias_rad = std::stod(value);
+    } else if (key == "lidar_range_noise_m") {
+        profile.lidar_range_noise_m = std::stod(value);
+    } else if (key == "lidar_range_bias_m") {
+        profile.lidar_range_bias_m = std::stod(value);
+    } else if (key == "multispectral_radiometric_noise") {
+        profile.multispectral_radiometric_noise = std::stod(value);
+    } else if (key == "multispectral_alignment_error_px") {
+        profile.multispectral_alignment_error_px = std::stod(value);
+    } else {
+        throw std::runtime_error("unknown sensor profile key: " + key);
+    }
+}
+
+SensorCalibrationProfile load_sensor_profile_from_file(std::string_view requested_name) {
+    const std::string name = canonical_profile_name(requested_name);
+    if (name.empty()) {
+        throw std::runtime_error("unknown sensor profile: " + std::string(requested_name));
+    }
+
+    const std::filesystem::path path = calibration_profile_path(name);
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("unknown sensor profile: " + std::string(requested_name));
+    }
+
+    SensorCalibrationProfile profile;
+    profile.name = name;
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::size_t comment = line.find('#');
+        if (comment != std::string::npos) {
+            line.erase(comment);
+        }
+        line = trim_copy(line);
+        if (line.empty()) {
+            continue;
+        }
+        const std::size_t equals = line.find('=');
+        if (equals == std::string::npos) {
+            throw std::runtime_error("malformed sensor profile line in " + path.string());
+        }
+        const std::string key = trim_copy(std::string_view(line).substr(0, equals));
+        const std::string value = trim_copy(std::string_view(line).substr(equals + 1));
+        apply_profile_value(profile, key, value);
+    }
+
+    if (profile.name != name) {
+        throw std::runtime_error(
+            "sensor profile file name " + name + " does not match profile name " + profile.name);
+    }
+    return profile;
+}
+
 } // namespace
 
 std::string SensorReading::to_json() const {
     std::ostringstream output;
     output << std::fixed << std::setprecision(6)
            << "{\"profile\":\"" << escape_json(profile_name) << "\""
+           << ",\"profile_version\":\"" << escape_json(profile_version) << "\""
            << ",\"distribution\":\"deterministic_uniform\""
            << ",\"seed\":" << seed
            << ",\"step\":" << step
@@ -72,40 +192,11 @@ std::string SensorReading::to_json() const {
 }
 
 SensorCalibrationProfile ideal_sensor_profile() {
-    return {};
+    return load_sensor_profile_from_file("ideal");
 }
 
 SensorCalibrationProfile sensor_profile_by_name(std::string_view name) {
-    if (name == "ideal") {
-        return ideal_sensor_profile();
-    }
-    if (name == "cheap_gps") {
-        SensorCalibrationProfile profile;
-        profile.name = "cheap_gps";
-        profile.gps_position_noise_m = 1.5;
-        profile.barometer_altitude_noise_m = 0.2;
-        profile.magnetometer_heading_noise_rad = 0.01;
-        return profile;
-    }
-    if (name == "rtk_gps") {
-        SensorCalibrationProfile profile;
-        profile.name = "rtk_gps";
-        profile.gps_position_noise_m = 0.03;
-        profile.barometer_altitude_noise_m = 0.05;
-        profile.magnetometer_heading_noise_rad = 0.005;
-        return profile;
-    }
-    if (name == "noisy_imu") {
-        SensorCalibrationProfile profile;
-        profile.name = "noisy_imu";
-        profile.gps_position_noise_m = 0.5;
-        profile.imu_attitude_noise_rad = 0.04;
-        profile.barometer_altitude_noise_m = 0.3;
-        profile.magnetometer_heading_noise_rad = 0.04;
-        return profile;
-    }
-
-    throw std::runtime_error("unknown sensor profile: " + std::string(name));
+    return load_sensor_profile_from_file(name);
 }
 
 SensorReading calibrated_sensor_reading(
@@ -115,6 +206,7 @@ SensorReading calibrated_sensor_reading(
     std::uint64_t step) {
     SensorReading reading;
     reading.profile_name = profile.name;
+    reading.profile_version = profile.version;
     reading.seed = seed;
     reading.step = step;
     reading.gps_position_m = {
@@ -143,6 +235,9 @@ std::string sensor_config_json(const SensorCalibrationProfile& profile) {
     std::ostringstream output;
     output << std::fixed << std::setprecision(3)
            << "{\"profile\":\"" << escape_json(profile.name) << "\""
+           << ",\"version\":\"" << escape_json(profile.version) << "\""
+           << ",\"sensor_kind\":\"" << escape_json(profile.sensor_kind) << "\""
+           << ",\"calibration_file\":\"calibration/" << escape_json(profile.name) << ".toml\""
            << ",\"distribution\":\"deterministic_uniform\""
            << ",\"gps_position_noise_m\":" << profile.gps_position_noise_m
            << ",\"imu_attitude_noise_rad\":" << profile.imu_attitude_noise_rad
@@ -152,6 +247,10 @@ std::string sensor_config_json(const SensorCalibrationProfile& profile) {
            << ",\"imu_yaw_bias_rad\":" << profile.imu_yaw_bias_rad
            << ",\"barometer_altitude_bias_m\":" << profile.barometer_altitude_bias_m
            << ",\"magnetometer_heading_bias_rad\":" << profile.magnetometer_heading_bias_rad
+           << ",\"lidar_range_noise_m\":" << profile.lidar_range_noise_m
+           << ",\"lidar_range_bias_m\":" << profile.lidar_range_bias_m
+           << ",\"multispectral_radiometric_noise\":" << profile.multispectral_radiometric_noise
+           << ",\"multispectral_alignment_error_px\":" << profile.multispectral_alignment_error_px
            << "}";
     return output.str();
 }

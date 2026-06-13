@@ -1,0 +1,15 @@
+name = "cheap_gps_b2"
+version = "2026.1"
+sensor_kind = "gps"
+gps_position_noise_m = 1.5
+imu_attitude_noise_rad = 0.0
+barometer_altitude_noise_m = 0.2
+magnetometer_heading_noise_rad = 0.01
+gps_position_bias_m = 0.4
+imu_yaw_bias_rad = 0.0
+barometer_altitude_bias_m = 0.0
+magnetometer_heading_bias_rad = 0.0
+lidar_range_noise_m = 0.0
+lidar_range_bias_m = 0.0
+multispectral_radiometric_noise = 0.0
+multispectral_alignment_error_px = 0.0

@@ -10,6 +10,8 @@ namespace agbot::flight_sim {
 
 struct SensorCalibrationProfile {
     std::string name = "ideal";
+    std::string version = "2026.1";
+    std::string sensor_kind = "sensor_suite";
     double gps_position_noise_m = 0.0;
     double imu_attitude_noise_rad = 0.0;
     double barometer_altitude_noise_m = 0.0;
@@ -18,10 +20,15 @@ struct SensorCalibrationProfile {
     double imu_yaw_bias_rad = 0.0;
     double barometer_altitude_bias_m = 0.0;
     double magnetometer_heading_bias_rad = 0.0;
+    double lidar_range_noise_m = 0.0;
+    double lidar_range_bias_m = 0.0;
+    double multispectral_radiometric_noise = 0.0;
+    double multispectral_alignment_error_px = 0.0;
 };
 
 struct SensorReading {
     std::string profile_name;
+    std::string profile_version;
     std::uint64_t seed = 0;
     std::uint64_t step = 0;
     Vec3 gps_position_m;

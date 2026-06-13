@@ -24,6 +24,7 @@
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1049,6 +1050,7 @@ void test_zero_noise_sensor_profile_is_exact() {
     const auto reading = agbot::flight_sim::calibrated_sensor_reading(state, profile, 42, 7);
 
     assert(reading.profile_name == "ideal");
+    assert(reading.profile_version == "2026.1");
     assert(reading.gps_position_m.x == state.position.x);
     assert(reading.gps_position_m.y == state.position.y);
     assert(reading.gps_position_m.z == state.position.z);
@@ -1058,6 +1060,7 @@ void test_zero_noise_sensor_profile_is_exact() {
     assert(reading.barometer_altitude_m == state.position.y);
     assert(reading.magnetometer_heading_rad == state.yaw_rad);
     assert(reading.to_json().find("\"profile\":\"ideal\"") != std::string::npos);
+    assert(reading.to_json().find("\"profile_version\":\"2026.1\"") != std::string::npos);
 }
 
 void test_seeded_sensor_noise_is_reproducible_and_inspectable() {
@@ -1068,7 +1071,7 @@ void test_seeded_sensor_noise_is_reproducible_and_inspectable() {
     state.pitch_rad = -0.10;
     state.roll_rad = 0.05;
 
-    auto profile = agbot::flight_sim::sensor_profile_by_name("cheap_gps");
+    auto profile = agbot::flight_sim::sensor_profile_by_name("cheap_gps_b2");
     profile.imu_attitude_noise_rad = 0.02;
     profile.barometer_altitude_noise_m = 0.4;
     profile.magnetometer_heading_noise_rad = 0.03;
@@ -1085,8 +1088,49 @@ void test_seeded_sensor_noise_is_reproducible_and_inspectable() {
     assert(a.to_json().find("\"distribution\":\"deterministic_uniform\"") != std::string::npos);
 
     const std::string config = agbot::flight_sim::sensor_config_json(profile);
-    assert(config.find("\"profile\":\"cheap_gps\"") != std::string::npos);
+    assert(config.find("\"profile\":\"cheap_gps_b2\"") != std::string::npos);
+    assert(config.find("\"version\":\"2026.1\"") != std::string::npos);
+    assert(config.find("\"calibration_file\":\"calibration/cheap_gps_b2.toml\"") != std::string::npos);
     assert(config.find("\"gps_position_noise_m\":1.500") != std::string::npos);
+}
+
+void test_named_sensor_profiles_are_versioned_manifested_and_refuse_unknown() {
+    const auto rtk = agbot::flight_sim::sensor_profile_by_name("rtk_gps_a1");
+    assert(rtk.name == "rtk_gps_a1");
+    assert(rtk.version == "2026.1");
+    assert(rtk.sensor_kind == "gps");
+    assert(rtk.gps_position_noise_m == 0.03);
+
+    const auto cheap_alias = agbot::flight_sim::sensor_profile_by_name("cheap_gps");
+    assert(cheap_alias.name == "cheap_gps_b2");
+    assert(cheap_alias.gps_position_noise_m == 1.5);
+
+    const auto lidar = agbot::flight_sim::sensor_profile_by_name("lidar_a3");
+    assert(lidar.sensor_kind == "lidar");
+    assert(lidar.lidar_range_noise_m == 0.08);
+    assert(lidar.lidar_range_bias_m == 0.01);
+    assert(agbot::flight_sim::sensor_config_json(lidar).find("\"lidar_range_noise_m\":0.080") != std::string::npos);
+
+    const auto camera = agbot::flight_sim::sensor_profile_by_name("multispectral_camera");
+    assert(camera.sensor_kind == "multispectral_camera");
+    assert(camera.multispectral_radiometric_noise == 0.015);
+    assert(camera.multispectral_alignment_error_px == 0.25);
+
+    bool unknown_refused = false;
+    try {
+        (void)agbot::flight_sim::sensor_profile_by_name("mystery_sensor");
+    } catch (const std::runtime_error& error) {
+        unknown_refused = std::string(error.what()).find("unknown sensor profile") != std::string::npos;
+    }
+    assert(unknown_refused);
+
+    auto config = unit_run_config();
+    config.sensor_profile = rtk;
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto result = agbot::flight_sim::run_deterministic(mission, config);
+    assert(result.manifest.sensor_config_json.find("\"profile\":\"rtk_gps_a1\"") != std::string::npos);
+    assert(result.manifest.sensor_config_json.find("\"version\":\"2026.1\"") != std::string::npos);
+    assert(result.manifest.sensor_config_hash == agbot::flight_sim::sha256_hex(result.manifest.sensor_config_json));
 }
 
 // Story 02-24: the first TwinContractV1 slice names the shared wire schemas
@@ -1446,6 +1490,7 @@ int main() {
     test_steady_wind_is_reproducible_and_manifested();
     test_zero_noise_sensor_profile_is_exact();
     test_seeded_sensor_noise_is_reproducible_and_inspectable();
+    test_named_sensor_profiles_are_versioned_manifested_and_refuse_unknown();
     test_twin_contract_v1_schema_covers_required_types();
     test_twin_contract_matches_shared_command_telemetry_fixture();
     test_twin_contract_version_compatibility();
