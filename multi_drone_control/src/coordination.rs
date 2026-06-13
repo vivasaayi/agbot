@@ -1,9 +1,13 @@
+use crate::{swarm::generate_formation_slots, Formation};
 use anyhow::{ensure, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use shared::GeoCoordinate;
 use std::collections::HashMap;
 use uuid::Uuid;
+
+const EARTH_RADIUS_M: f64 = 6_371_000.0;
+const GEOMETRY_EPSILON: f64 = 1e-9;
 
 /// Multi-drone coordination system
 pub struct CoordinationEngine {
@@ -118,6 +122,68 @@ pub struct LinkQualityReport {
     pub timed_out_links: usize,
     pub links: Vec<DroneLinkStatus>,
     pub audit_events: Vec<CoordinationRuleAuditEvent>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct FormationOptimizationConfig {
+    pub minimum_separation_m: f64,
+}
+
+impl Default for FormationOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            minimum_separation_m: 25.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormationAssignment {
+    pub drone_id: Uuid,
+    pub slot_index: usize,
+    pub start_position: GeoCoordinate,
+    pub target_position: GeoCoordinate,
+    pub travel_distance_m: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormationOptimizationReport {
+    pub assignments: Vec<FormationAssignment>,
+    pub total_travel_m: f64,
+    pub minimum_path_separation_m: f64,
+    pub rejected_assignment_count: usize,
+    pub validated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalPoint {
+    east_m: f64,
+    north_m: f64,
+    altitude_m: f64,
+}
+
+#[derive(Debug, Clone)]
+struct FormationSlotTarget {
+    slot_index: usize,
+    local: LocalPoint,
+    geo: GeoCoordinate,
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentCandidate {
+    drone_id: Uuid,
+    slot_index: usize,
+    start_local: LocalPoint,
+    target_local: LocalPoint,
+    start_position: GeoCoordinate,
+    target_position: GeoCoordinate,
+    travel_distance_m: f64,
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentSearchResult {
+    assignments: Vec<AssignmentCandidate>,
+    total_travel_m: f64,
 }
 
 pub struct CoordinationRule {
@@ -679,10 +745,227 @@ impl CoordinationEngine {
         }
     }
 
-    pub async fn optimize_formations(&mut self) -> Result<()> {
-        // TODO: Implement formation optimization algorithms
-        tracing::info!("Formation optimization not yet implemented");
-        Ok(())
+    pub async fn optimize_formations(&mut self) -> Result<FormationOptimizationReport> {
+        if self.active_drones.is_empty() {
+            tracing::info!("Formation optimization skipped because no drones are active");
+            return Ok(FormationOptimizationReport {
+                assignments: Vec::new(),
+                total_travel_m: 0.0,
+                minimum_path_separation_m: 0.0,
+                rejected_assignment_count: 0,
+                validated: true,
+            });
+        }
+
+        let mut drones = self.active_drones.values().collect::<Vec<_>>();
+        drones.sort_by_key(|state| state.id);
+        let leader_position = drones[0].position.clone();
+        let drone_count = drones.len();
+        let cols = (drone_count as f64).sqrt().ceil() as u32;
+        let rows = ((drone_count as f64) / f64::from(cols)).ceil() as u32;
+        let formation = Formation::Grid {
+            rows,
+            cols,
+            spacing_m: FormationOptimizationConfig::default().minimum_separation_m as f32,
+        };
+
+        let report = self
+            .optimize_formation_slots(
+                &formation,
+                leader_position,
+                FormationOptimizationConfig::default(),
+            )
+            .await?;
+        tracing::info!(
+            assignments = report.assignments.len(),
+            total_travel_m = report.total_travel_m,
+            minimum_path_separation_m = report.minimum_path_separation_m,
+            "Optimized active formation slot assignment"
+        );
+        Ok(report)
+    }
+
+    pub async fn optimize_formation_slots(
+        &self,
+        formation: &Formation,
+        leader_position: GeoCoordinate,
+        config: FormationOptimizationConfig,
+    ) -> Result<FormationOptimizationReport> {
+        ensure!(
+            config.minimum_separation_m.is_finite() && config.minimum_separation_m > 0.0,
+            "minimum formation separation must be finite and positive"
+        );
+        ensure!(
+            leader_position.latitude.is_finite()
+                && leader_position.longitude.is_finite()
+                && leader_position.altitude_m.is_finite(),
+            "leader position must be finite"
+        );
+        ensure!(
+            !self.active_drones.is_empty(),
+            "formation optimization requires at least one active drone"
+        );
+
+        let mut drones = self.active_drones.values().collect::<Vec<_>>();
+        drones.sort_by_key(|state| state.id);
+        let slots = generate_formation_slots(formation, drones.len(), config.minimum_separation_m)?;
+        let mut slot_targets = slots
+            .into_iter()
+            .map(|slot| {
+                let local = LocalPoint {
+                    east_m: slot.offset_m.0,
+                    north_m: slot.offset_m.1,
+                    altitude_m: f64::from(slot.offset_m.2),
+                };
+                FormationSlotTarget {
+                    slot_index: slot.slot_index,
+                    local,
+                    geo: local_to_geo(&leader_position, local),
+                }
+            })
+            .collect::<Vec<_>>();
+        slot_targets.sort_by_key(|slot| slot.slot_index);
+
+        let mut used_slots = vec![false; slot_targets.len()];
+        let mut current = Vec::with_capacity(drones.len());
+        let mut rejected_assignment_count = 0;
+        let mut best = None;
+        Self::search_assignments(
+            &drones,
+            &slot_targets,
+            &leader_position,
+            config.minimum_separation_m,
+            0,
+            0.0,
+            &mut used_slots,
+            &mut current,
+            &mut best,
+            &mut rejected_assignment_count,
+        );
+
+        let best = best.ok_or_else(|| {
+            anyhow::anyhow!("no separation-respecting formation assignment found")
+        })?;
+        let minimum_path_separation_m = Self::minimum_assignment_separation(&best.assignments);
+        let validated =
+            best.assignments.len() < 2 || minimum_path_separation_m >= config.minimum_separation_m;
+        let assignments = best
+            .assignments
+            .into_iter()
+            .map(|assignment| FormationAssignment {
+                drone_id: assignment.drone_id,
+                slot_index: assignment.slot_index,
+                start_position: assignment.start_position,
+                target_position: assignment.target_position,
+                travel_distance_m: assignment.travel_distance_m,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(FormationOptimizationReport {
+            assignments,
+            total_travel_m: best.total_travel_m,
+            minimum_path_separation_m,
+            rejected_assignment_count,
+            validated,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_assignments(
+        drones: &[&DroneState],
+        slot_targets: &[FormationSlotTarget],
+        leader_position: &GeoCoordinate,
+        minimum_separation_m: f64,
+        drone_index: usize,
+        current_cost: f64,
+        used_slots: &mut [bool],
+        current: &mut Vec<AssignmentCandidate>,
+        best: &mut Option<AssignmentSearchResult>,
+        rejected_assignment_count: &mut usize,
+    ) {
+        if let Some(best) = best {
+            if current_cost >= best.total_travel_m {
+                return;
+            }
+        }
+
+        if drone_index == drones.len() {
+            *best = Some(AssignmentSearchResult {
+                assignments: current.clone(),
+                total_travel_m: current_cost,
+            });
+            return;
+        }
+
+        let drone = drones[drone_index];
+        let start_local = geo_to_local(leader_position, &drone.position);
+        for slot_index in 0..slot_targets.len() {
+            if used_slots[slot_index] {
+                continue;
+            }
+            let slot = &slot_targets[slot_index];
+            let candidate = AssignmentCandidate {
+                drone_id: drone.id,
+                slot_index: slot.slot_index,
+                start_local,
+                target_local: slot.local,
+                start_position: drone.position.clone(),
+                target_position: slot.geo.clone(),
+                travel_distance_m: local_distance(start_local, slot.local),
+            };
+            if !Self::candidate_is_safe(current, &candidate, minimum_separation_m) {
+                *rejected_assignment_count += 1;
+                continue;
+            }
+
+            used_slots[slot_index] = true;
+            current.push(candidate);
+            Self::search_assignments(
+                drones,
+                slot_targets,
+                leader_position,
+                minimum_separation_m,
+                drone_index + 1,
+                current_cost
+                    + current
+                        .last()
+                        .expect("candidate was pushed")
+                        .travel_distance_m,
+                used_slots,
+                current,
+                best,
+                rejected_assignment_count,
+            );
+            current.pop();
+            used_slots[slot_index] = false;
+        }
+    }
+
+    fn candidate_is_safe(
+        current: &[AssignmentCandidate],
+        candidate: &AssignmentCandidate,
+        minimum_separation_m: f64,
+    ) -> bool {
+        current.iter().all(|existing| {
+            assignment_pair_minimum_distance(existing, candidate) + GEOMETRY_EPSILON
+                >= minimum_separation_m
+        })
+    }
+
+    fn minimum_assignment_separation(assignments: &[AssignmentCandidate]) -> f64 {
+        if assignments.len() < 2 {
+            return 0.0;
+        }
+        let mut minimum = f64::INFINITY;
+        for left_index in 0..assignments.len() {
+            for right_index in (left_index + 1)..assignments.len() {
+                minimum = minimum.min(assignment_pair_minimum_distance(
+                    &assignments[left_index],
+                    &assignments[right_index],
+                ));
+            }
+        }
+        minimum
     }
 
     pub async fn handle_emergency(
@@ -717,6 +1000,153 @@ impl CoordinationEngine {
         tracing::info!("Action execution not yet implemented");
         Ok(())
     }
+}
+
+fn geo_to_local(origin: &GeoCoordinate, position: &GeoCoordinate) -> LocalPoint {
+    let origin_lat_rad = origin.latitude.to_radians();
+    LocalPoint {
+        east_m: (position.longitude - origin.longitude).to_radians()
+            * EARTH_RADIUS_M
+            * origin_lat_rad.cos(),
+        north_m: (position.latitude - origin.latitude).to_radians() * EARTH_RADIUS_M,
+        altitude_m: f64::from(position.altitude_m - origin.altitude_m),
+    }
+}
+
+fn local_to_geo(origin: &GeoCoordinate, local: LocalPoint) -> GeoCoordinate {
+    let origin_lat_rad = origin.latitude.to_radians();
+    GeoCoordinate {
+        latitude: origin.latitude + (local.north_m / EARTH_RADIUS_M).to_degrees(),
+        longitude: origin.longitude
+            + (local.east_m / (EARTH_RADIUS_M * origin_lat_rad.cos())).to_degrees(),
+        altitude_m: origin.altitude_m + local.altitude_m as f32,
+    }
+}
+
+fn local_distance(left: LocalPoint, right: LocalPoint) -> f64 {
+    ((left.east_m - right.east_m).powi(2)
+        + (left.north_m - right.north_m).powi(2)
+        + (left.altitude_m - right.altitude_m).powi(2))
+    .sqrt()
+}
+
+fn assignment_pair_minimum_distance(
+    left: &AssignmentCandidate,
+    right: &AssignmentCandidate,
+) -> f64 {
+    let synchronous_distance = minimum_synchronous_path_distance(
+        left.start_local,
+        left.target_local,
+        right.start_local,
+        right.target_local,
+    );
+    if segments_intersect_2d(
+        left.start_local,
+        left.target_local,
+        right.start_local,
+        right.target_local,
+    ) {
+        synchronous_distance.min(0.0)
+    } else {
+        synchronous_distance
+    }
+}
+
+fn minimum_synchronous_path_distance(
+    left_start: LocalPoint,
+    left_target: LocalPoint,
+    right_start: LocalPoint,
+    right_target: LocalPoint,
+) -> f64 {
+    let relative_start = LocalPoint {
+        east_m: left_start.east_m - right_start.east_m,
+        north_m: left_start.north_m - right_start.north_m,
+        altitude_m: left_start.altitude_m - right_start.altitude_m,
+    };
+    let relative_velocity = LocalPoint {
+        east_m: (left_target.east_m - left_start.east_m)
+            - (right_target.east_m - right_start.east_m),
+        north_m: (left_target.north_m - left_start.north_m)
+            - (right_target.north_m - right_start.north_m),
+        altitude_m: (left_target.altitude_m - left_start.altitude_m)
+            - (right_target.altitude_m - right_start.altitude_m),
+    };
+    let velocity_norm = relative_velocity.east_m.powi(2)
+        + relative_velocity.north_m.powi(2)
+        + relative_velocity.altitude_m.powi(2);
+    let closest_t = if velocity_norm <= GEOMETRY_EPSILON {
+        0.0
+    } else {
+        -((relative_start.east_m * relative_velocity.east_m)
+            + (relative_start.north_m * relative_velocity.north_m)
+            + (relative_start.altitude_m * relative_velocity.altitude_m))
+            / velocity_norm
+    }
+    .clamp(0.0, 1.0);
+
+    let closest = LocalPoint {
+        east_m: relative_start.east_m + relative_velocity.east_m * closest_t,
+        north_m: relative_start.north_m + relative_velocity.north_m * closest_t,
+        altitude_m: relative_start.altitude_m + relative_velocity.altitude_m * closest_t,
+    };
+    local_distance(
+        closest,
+        LocalPoint {
+            east_m: 0.0,
+            north_m: 0.0,
+            altitude_m: 0.0,
+        },
+    )
+}
+
+fn segments_intersect_2d(
+    left_start: LocalPoint,
+    left_target: LocalPoint,
+    right_start: LocalPoint,
+    right_target: LocalPoint,
+) -> bool {
+    if point_distance_2d(left_start, left_target) <= GEOMETRY_EPSILON
+        && point_distance_2d(right_start, right_target) <= GEOMETRY_EPSILON
+    {
+        return point_distance_2d(left_start, right_start) <= GEOMETRY_EPSILON;
+    }
+
+    let o1 = orientation_2d(left_start, left_target, right_start);
+    let o2 = orientation_2d(left_start, left_target, right_target);
+    let o3 = orientation_2d(right_start, right_target, left_start);
+    let o4 = orientation_2d(right_start, right_target, left_target);
+
+    if o1.abs() <= GEOMETRY_EPSILON && on_segment_2d(left_start, right_start, left_target) {
+        return true;
+    }
+    if o2.abs() <= GEOMETRY_EPSILON && on_segment_2d(left_start, right_target, left_target) {
+        return true;
+    }
+    if o3.abs() <= GEOMETRY_EPSILON && on_segment_2d(right_start, left_start, right_target) {
+        return true;
+    }
+    if o4.abs() <= GEOMETRY_EPSILON && on_segment_2d(right_start, left_target, right_target) {
+        return true;
+    }
+
+    ((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0))
+        && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0))
+}
+
+fn orientation_2d(a: LocalPoint, b: LocalPoint, c: LocalPoint) -> f64 {
+    (b.east_m - a.east_m) * (c.north_m - a.north_m)
+        - (b.north_m - a.north_m) * (c.east_m - a.east_m)
+}
+
+fn on_segment_2d(a: LocalPoint, b: LocalPoint, c: LocalPoint) -> bool {
+    b.east_m >= a.east_m.min(c.east_m) - GEOMETRY_EPSILON
+        && b.east_m <= a.east_m.max(c.east_m) + GEOMETRY_EPSILON
+        && b.north_m >= a.north_m.min(c.north_m) - GEOMETRY_EPSILON
+        && b.north_m <= a.north_m.max(c.north_m) + GEOMETRY_EPSILON
+}
+
+fn point_distance_2d(left: LocalPoint, right: LocalPoint) -> f64 {
+    ((left.east_m - right.east_m).powi(2) + (left.north_m - right.north_m).powi(2)).sqrt()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -767,6 +1197,36 @@ mod tests {
             current_mission: None,
             last_update,
             communication_quality: 0.95,
+        }
+    }
+
+    fn test_state_at(
+        drone_id: Uuid,
+        position: GeoCoordinate,
+        last_update: DateTime<Utc>,
+    ) -> DroneState {
+        DroneState {
+            id: drone_id,
+            position,
+            velocity: (0.0, 0.0, 0.0),
+            heading: 0.0,
+            battery_level: 0.8,
+            status: DroneOperationStatus::Idle,
+            current_mission: None,
+            last_update,
+            communication_quality: 0.95,
+        }
+    }
+
+    fn geo_offset(origin: &GeoCoordinate, east_m: f64, north_m: f64) -> GeoCoordinate {
+        const EARTH_RADIUS_M: f64 = 6_371_000.0;
+        let latitude = origin.latitude + (north_m / EARTH_RADIUS_M).to_degrees();
+        let longitude = origin.longitude
+            + (east_m / (EARTH_RADIUS_M * origin.latitude.to_radians().cos())).to_degrees();
+        GeoCoordinate {
+            latitude,
+            longitude,
+            altitude_m: origin.altitude_m,
         }
     }
 
@@ -945,6 +1405,121 @@ mod tests {
         assert_eq!(engine.coordination_rule_audit_log().len(), 1);
         assert!(json.contains("\"health\":\"TimedOut\""));
         assert!(json.contains("\"condition\":\"communication_loss\""));
+    }
+
+    #[tokio::test]
+    async fn formation_optimizer_assigns_grid_slots_deterministically() {
+        let mut engine = CoordinationEngine::new();
+        let checked_at = fixed_time();
+        let leader = GeoCoordinate {
+            latitude: 40.0,
+            longitude: -96.0,
+            altitude_m: 100.0,
+        };
+        let drone_ids = [
+            Uuid::from_u128(101),
+            Uuid::from_u128(102),
+            Uuid::from_u128(103),
+            Uuid::from_u128(104),
+        ];
+        for (drone_id, east_m, north_m) in [
+            (drone_ids[0], 1.0, 1.0),
+            (drone_ids[1], 29.0, 1.0),
+            (drone_ids[2], 1.0, 29.0),
+            (drone_ids[3], 29.0, 29.0),
+        ] {
+            engine
+                .register_drone(
+                    drone_id,
+                    test_state_at(drone_id, geo_offset(&leader, east_m, north_m), checked_at),
+                )
+                .await
+                .unwrap();
+        }
+
+        let report = engine
+            .optimize_formation_slots(
+                &crate::Formation::Grid {
+                    rows: 2,
+                    cols: 2,
+                    spacing_m: 30.0,
+                },
+                leader,
+                FormationOptimizationConfig {
+                    minimum_separation_m: 25.0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let assignments = report
+            .assignments
+            .iter()
+            .map(|assignment| (assignment.drone_id, assignment.slot_index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assignments,
+            vec![
+                (drone_ids[0], 0),
+                (drone_ids[1], 1),
+                (drone_ids[2], 2),
+                (drone_ids[3], 3),
+            ]
+        );
+        assert!(report.validated);
+        assert!(report.minimum_path_separation_m >= 25.0);
+        assert!(report.total_travel_m < 8.0);
+    }
+
+    #[tokio::test]
+    async fn formation_optimizer_rejects_crossing_slot_swap_and_resolves_safe_assignment() {
+        let mut engine = CoordinationEngine::new();
+        let checked_at = fixed_time();
+        let leader = GeoCoordinate {
+            latitude: 40.0,
+            longitude: -96.0,
+            altitude_m: 100.0,
+        };
+        let left_id = Uuid::from_u128(201);
+        let right_id = Uuid::from_u128(202);
+        engine
+            .register_drone(
+                left_id,
+                test_state_at(left_id, geo_offset(&leader, 30.0, 0.0), checked_at),
+            )
+            .await
+            .unwrap();
+        engine
+            .register_drone(
+                right_id,
+                test_state_at(right_id, geo_offset(&leader, 0.0, 0.0), checked_at),
+            )
+            .await
+            .unwrap();
+
+        let report = engine
+            .optimize_formation_slots(
+                &crate::Formation::Line {
+                    spacing_m: 30.0,
+                    heading_deg: 90.0,
+                },
+                leader,
+                FormationOptimizationConfig {
+                    minimum_separation_m: 25.0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let assignments = report
+            .assignments
+            .iter()
+            .map(|assignment| (assignment.drone_id, assignment.slot_index))
+            .collect::<Vec<_>>();
+        assert_eq!(assignments, vec![(left_id, 1), (right_id, 0)]);
+        assert!(report.rejected_assignment_count > 0);
+        assert!(report.validated);
+        assert!(report.minimum_path_separation_m >= 25.0);
     }
 
     #[test]

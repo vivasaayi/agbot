@@ -22,7 +22,8 @@ pub use coordinated_approval::{
 };
 pub use coordination::{
     CoordinationEngine, CoordinationRuleAuditEvent, CoordinationStatus, DroneLinkHealth,
-    DroneLinkStatus, DroneTelemetryFreshness, DroneTelemetrySnapshot, LinkQualityReport,
+    DroneLinkStatus, DroneTelemetryFreshness, DroneTelemetrySnapshot, FormationAssignment,
+    FormationOptimizationConfig, FormationOptimizationReport, LinkQualityReport,
     SwarmTelemetryReport, SwarmTelemetryStatus,
 };
 pub use mission_assignment::{DroneAssignment, MissionAssignmentEngine};
