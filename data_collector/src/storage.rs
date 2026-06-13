@@ -391,8 +391,9 @@ impl StorageEngine {
         &self,
         data: &crate::FlightDataRecord,
     ) -> Result<crate::FlightDataRecord> {
-        let _storage_path = self.store_record(data).await?;
-        Ok(data.clone())
+        let prepared = crate::prepare_record_for_storage(data)?;
+        let _storage_path = self.store_record(&prepared).await?;
+        Ok(prepared)
     }
 
     pub async fn load_session(&self, session_id: &Uuid) -> Result<Option<crate::FlightSession>> {
@@ -503,7 +504,10 @@ impl StorageEngine {
         &self,
         record_id: &uuid::Uuid,
     ) -> Result<Option<crate::FlightDataRecord>> {
-        self.retrieve_record(record_id).await
+        self.retrieve_record(record_id)
+            .await?
+            .map(|record| crate::verify_record_integrity(&record))
+            .transpose()
     }
 
     pub async fn load_all_data(&self) -> Result<Vec<crate::FlightDataRecord>> {
@@ -511,7 +515,8 @@ impl StorageEngine {
 
         for record_path in self.record_json_paths()? {
             let data = fs::read(&record_path).await?;
-            records.push(serde_json::from_slice::<DataRecord>(&data)?);
+            let record = serde_json::from_slice::<DataRecord>(&data)?;
+            records.push(crate::verify_record_integrity(&record)?);
         }
 
         records.sort_by(|a, b| {

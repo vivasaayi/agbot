@@ -174,6 +174,96 @@ impl FlightDataRecord {
     }
 }
 
+pub(crate) fn prepare_record_for_storage(record: &FlightDataRecord) -> Result<FlightDataRecord> {
+    let mut prepared = record.clone();
+    apply_quality_mask(&mut prepared);
+    prepared.metadata.remove(INTEGRITY_CHECKSUM_KEY);
+    prepared.metadata.remove(INTEGRITY_VERIFIED_KEY);
+    let checksum = record_integrity_checksum(&prepared)?;
+    prepared
+        .metadata
+        .insert(INTEGRITY_CHECKSUM_KEY.to_string(), checksum);
+    Ok(prepared)
+}
+
+pub(crate) fn verify_record_integrity(record: &FlightDataRecord) -> Result<FlightDataRecord> {
+    let expected = record
+        .metadata
+        .get(INTEGRITY_CHECKSUM_KEY)
+        .ok_or_else(|| anyhow::anyhow!("record {} is missing integrity checksum", record.id))?;
+    let actual = record_integrity_checksum(record)?;
+    if expected != &actual {
+        anyhow::bail!(
+            "record {} checksum mismatch: expected {}, computed {}",
+            record.id,
+            expected,
+            actual
+        );
+    }
+
+    let mut verified = record.clone();
+    verified
+        .metadata
+        .insert(INTEGRITY_VERIFIED_KEY.to_string(), "true".to_string());
+    Ok(verified)
+}
+
+fn record_integrity_checksum(record: &FlightDataRecord) -> Result<String> {
+    let mut canonical = record.clone();
+    canonical.metadata.clear();
+    let encoded = serde_json::to_vec(&canonical)?;
+    Ok(format!("{:016x}", fnv1a64(&encoded)))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn apply_quality_mask(record: &mut FlightDataRecord) {
+    record.metadata.remove(QA_MASKED_KEY);
+    record.metadata.remove(QA_REASON_KEY);
+
+    let reason = match &record.payload {
+        DataPayload::PointCloud { point_count, .. } if *point_count < 3 => {
+            Some("sparse_point_cloud")
+        }
+        DataPayload::SensorData {
+            sensor_type,
+            values,
+            ..
+        } if sensor_type.eq_ignore_ascii_case("multispectral")
+            && values
+                .values()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value)) =>
+        {
+            Some("spectral_value_out_of_range")
+        }
+        _ => None,
+    };
+
+    if let Some(reason) = reason {
+        record
+            .metadata
+            .insert(QA_MASKED_KEY.to_string(), "true".to_string());
+        record
+            .metadata
+            .insert(QA_REASON_KEY.to_string(), reason.to_string());
+    }
+}
+
+fn qa_mask_reason(record: &FlightDataRecord) -> Option<&str> {
+    if record.metadata.get(QA_MASKED_KEY).map(String::as_str) == Some("true") {
+        record.metadata.get(QA_REASON_KEY).map(String::as_str)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum DataType {
     Telemetry,
@@ -239,6 +329,10 @@ fn default_owner_id() -> String {
     "unassigned".to_string()
 }
 
+const INTEGRITY_CHECKSUM_KEY: &str = "integrity_checksum";
+const INTEGRITY_VERIFIED_KEY: &str = "integrity_verified";
+const QA_MASKED_KEY: &str = "qa_masked";
+const QA_REASON_KEY: &str = "qa_reason";
 const DEFAULT_CAPTURE_FRESHNESS_THRESHOLD_SECONDS: i64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -777,6 +871,7 @@ pub enum CollectionFailureKind {
     MalformedFrame,
     MissingBand,
     ReaderError,
+    QualityMasked,
     Unknown,
 }
 
@@ -1233,7 +1328,25 @@ impl DataCollectorService {
                 .data_types
                 .entry(stored_data.data_type.clone())
                 .or_insert(0) += 1;
-            session.record_successful_capture(&stored_data, Utc::now());
+            if let Some(reason) = qa_mask_reason(&stored_data) {
+                session.record_collection_failure(
+                    CollectionFailure {
+                        id: Uuid::new_v4(),
+                        occurred_at: stored_data.timestamp,
+                        sensor_id: stored_data.sensor_id.clone(),
+                        data_type: stored_data.data_type.clone(),
+                        kind: CollectionFailureKind::QualityMasked,
+                        message: format!("QA masked record {}: {}", stored_data.id, reason),
+                    },
+                    Utc::now(),
+                );
+                let failed_observations = session.summary.collection_failures.len() as u32;
+                let successful_records = session.summary.record_count.saturating_sub(1);
+                session.summary.coverage =
+                    CaptureCoverage::from_counts(successful_records, failed_observations);
+            } else {
+                session.record_successful_capture(&stored_data, Utc::now());
+            }
             session.clone()
         };
 
@@ -1779,6 +1892,30 @@ mod tests {
         .unwrap()
     }
 
+    fn sparse_point_cloud_record(session: &FlightSession) -> FlightDataRecord {
+        FlightDataRecord::new(
+            session.flight_id,
+            session.drone_id,
+            DataType::LidarScan,
+            DataPayload::PointCloud {
+                point_count: 1,
+                bounds: ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+                format: "ply".to_string(),
+                has_color: false,
+                has_intensity: true,
+            },
+            FlightDataProvenance::complete(
+                session.id,
+                "lidar-qa-01".to_string(),
+                gps_coords(),
+                Utc::now(),
+                "lidar-calibration-v1".to_string(),
+            ),
+            128,
+        )
+        .unwrap()
+    }
+
     fn all_data_types() -> Vec<DataType> {
         vec![
             DataType::Telemetry,
@@ -2088,6 +2225,81 @@ mod tests {
             .aggregate_evidence
             .telemetry_record_ids
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stored_record_checksum_verifies_and_detects_tamper() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let record = telemetry_record(&session);
+        let record_id = record.id;
+        let record_timestamp = record.timestamp;
+
+        service.collect_data(&session_id, record).await.unwrap();
+
+        let loaded = service
+            .storage
+            .load_data(&record_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded.metadata.contains_key("integrity_checksum"));
+        assert_eq!(
+            loaded
+                .metadata
+                .get("integrity_verified")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let stored_path = temp_dir
+            .path()
+            .join("records")
+            .join(record_timestamp.format("%Y/%m/%d").to_string())
+            .join(format!("telemetry_{}.json", record_id));
+        let mut tampered: FlightDataRecord =
+            serde_json::from_slice(&tokio::fs::read(&stored_path).await.unwrap()).unwrap();
+        tampered.size_bytes += 1;
+        tokio::fs::write(&stored_path, serde_json::to_vec_pretty(&tampered).unwrap())
+            .await
+            .unwrap();
+
+        let err = service.storage.load_data(&record_id).await.unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[tokio::test]
+    async fn sparse_point_cloud_is_qa_masked_and_excluded_from_coverage() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let record = sparse_point_cloud_record(&session);
+        let record_id = record.id;
+
+        service.collect_data(&session_id, record).await.unwrap();
+
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let loaded = service
+            .storage
+            .load_data(&record_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.metadata.get("qa_masked").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            loaded.metadata.get("qa_reason").map(String::as_str),
+            Some("sparse_point_cloud")
+        );
+        assert_eq!(session.summary.collection_failures.len(), 1);
+        assert_eq!(session.summary.coverage.successful_records, 0);
+        assert_eq!(session.summary.coverage.failed_observations, 1);
+        assert_eq!(session.summary.coverage.captured_fraction, 0.0);
     }
 
     #[tokio::test]
