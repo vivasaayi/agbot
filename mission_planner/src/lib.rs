@@ -42,7 +42,10 @@ pub use guarded_dispatch::{
     dispatch_guarded_simulation_command, GuardedDispatchAuditEvent, GuardedDispatchAuditEventKind,
     GuardedDispatchCommand, GuardedDispatchContext, GuardedDispatchError, GuardedDispatchOutcome,
 };
-pub use mission_optimizer::MissionOptimizer;
+pub use mission_optimizer::{
+    assert_mission_budget_allows_arming, evaluate_mission_budget, MissionBudgetConfig,
+    MissionBudgetError, MissionBudgetErrorCode, MissionBudgetReport, MissionOptimizer,
+};
 pub use preflight_checklist::{
     evaluate_preflight_checklist, GpsFixStatus, GpsFixType, PreflightArmError, PreflightCheckName,
     PreflightCheckResult, PreflightCheckStatus, PreflightChecklistConfig,

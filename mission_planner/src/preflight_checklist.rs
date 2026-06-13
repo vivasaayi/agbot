@@ -1,6 +1,7 @@
 use crate::{
     evaluate_dispatch_safety, DispatchSafetyConfig, DispatchSafetyReport, Mission,
-    MissionStateTransitionError, NoFlyZone, TelemetryFreshness, TelemetryLinkState,
+    MissionBudgetReport, MissionStateTransitionError, NoFlyZone, TelemetryFreshness,
+    TelemetryLinkState,
 };
 use geo::Point;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,8 @@ pub struct PreflightChecklistContext {
     pub no_fly_zones: Vec<NoFlyZone>,
     pub config: PreflightChecklistConfig,
     pub battery_percentage: u8,
+    #[serde(default)]
+    pub mission_budget_report: Option<MissionBudgetReport>,
     pub gps: GpsFixStatus,
     pub link_freshness: TelemetryFreshness,
     pub failsafe_configured: bool,
@@ -228,6 +231,23 @@ fn dispatch_safety_check(report: &DispatchSafetyReport) -> PreflightCheckResult 
 }
 
 fn battery_check(context: &PreflightChecklistContext) -> PreflightCheckResult {
+    if let Some(report) = &context.mission_budget_report {
+        let measured = format!(
+            "{:.1}% draw, {:.1}% margin",
+            report.battery_draw_percent, report.battery_margin_percent
+        );
+        let required = "margin >= 0.0% and within time budget".to_string();
+
+        if report.arm_blocked || report.over_battery_budget {
+            return PreflightCheckResult::failed(
+                PreflightCheckName::BatteryBudget,
+                "mission battery budget blocks arming",
+                Some(measured),
+                Some(required),
+            );
+        }
+    }
+
     let measured = format!("{}%", context.battery_percentage);
     let required = format!(">= {}%", context.config.minimum_launch_battery_percentage);
 
@@ -391,6 +411,7 @@ mod tests {
                 minimum_satellites: 8,
             },
             battery_percentage: 82,
+            mission_budget_report: None,
             gps: GpsFixStatus {
                 fix_type: GpsFixType::ThreeD,
                 hdop: 0.8,
@@ -462,6 +483,52 @@ mod tests {
                         .find(|check| check.name == PreflightCheckName::BatteryBudget)
                         .and_then(|check| check.measured_value.as_deref()),
                     Some("24%")
+                );
+            }
+            crate::PreflightArmError::State(error) => {
+                panic!("expected checklist error, got state error: {error}");
+            }
+        }
+        assert_eq!(mission.status, MissionStatus::Validated);
+    }
+
+    #[test]
+    fn preflight_checklist_blocks_over_budget_mission_by_name() {
+        let mut mission = sample_mission();
+        mission.validate().expect("fixture validates");
+        let mut context = checklist_context(mission.id);
+        context.mission_budget_report = Some(MissionBudgetReport {
+            mission_id: mission.id,
+            total_distance_m: 1_200.0,
+            estimated_time_seconds: 180,
+            estimated_time_minutes: 3,
+            battery_draw_percent: 86.5,
+            available_budget_percent: 80.0,
+            battery_margin_percent: -6.5,
+            over_time_budget: false,
+            over_battery_budget: true,
+            arm_blocked: true,
+        });
+
+        let error = mission
+            .arm_with_preflight_checklist(&context)
+            .expect_err("over-budget mission must block arming");
+
+        match error {
+            crate::PreflightArmError::Checklist(report) => {
+                assert_single_failure(&report, PreflightCheckName::BatteryBudget);
+                let battery_check = report
+                    .checks
+                    .iter()
+                    .find(|check| check.name == PreflightCheckName::BatteryBudget)
+                    .expect("battery budget check present");
+                assert_eq!(
+                    battery_check.measured_value.as_deref(),
+                    Some("86.5% draw, -6.5% margin")
+                );
+                assert_eq!(
+                    battery_check.required_value.as_deref(),
+                    Some("margin >= 0.0% and within time budget")
                 );
             }
             crate::PreflightArmError::State(error) => {
