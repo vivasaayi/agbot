@@ -832,6 +832,23 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS sustainability_records (
+            record_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            metric_type TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            audit_id TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,
@@ -1288,6 +1305,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_marketplace_accounts_party_type
         ON marketplace_accounts(party_type, org_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_records_field_season
+        ON sustainability_records(field_id, season_id, metric_type);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_records_audit
+        ON sustainability_records(audit_id);
         "#,
     )
     .execute(pool)

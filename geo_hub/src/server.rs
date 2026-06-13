@@ -207,6 +207,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::update_marketplace_account_status),
         )
         .route(
+            "/api/sustainability/records",
+            get(routes::list_sustainability_records).post(routes::create_sustainability_record),
+        )
+        .route(
+            "/api/sustainability/records/:record_id",
+            get(routes::get_sustainability_record),
+        )
+        .route(
             "/api/time-series/points",
             get(routes::list_time_series_points),
         )

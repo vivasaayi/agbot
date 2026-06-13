@@ -1757,6 +1757,177 @@ fn normalize_marketplace_text(value: String) -> Option<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SustainabilityMetricType {
+    CarbonFootprint,
+    Biomass,
+    Biodiversity,
+    SoilCarbon,
+    SustainabilityKpi,
+}
+
+impl SustainabilityMetricType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SustainabilityMetricType::CarbonFootprint => "carbon_footprint",
+            SustainabilityMetricType::Biomass => "biomass",
+            SustainabilityMetricType::Biodiversity => "biodiversity",
+            SustainabilityMetricType::SoilCarbon => "soil_carbon",
+            SustainabilityMetricType::SustainabilityKpi => "sustainability_kpi",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SustainabilityRecordCreateRequest {
+    #[serde(default)]
+    pub record_id: Option<String>,
+    pub field_id: String,
+    pub season_id: String,
+    pub operation_id: String,
+    pub metric_type: SustainabilityMetricType,
+    pub method_version: String,
+    #[serde(default)]
+    pub audit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SustainabilityRecord {
+    pub record_id: String,
+    pub field_id: String,
+    pub season_id: String,
+    pub operation_id: String,
+    pub metric_type: SustainabilityMetricType,
+    pub method_version: String,
+    pub created_at: String,
+    pub audit_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SustainabilityRecordLinkage {
+    pub field_id: String,
+    pub season_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SustainabilityRecordError {
+    #[error("sustainability record_id cannot be empty")]
+    EmptyRecordId,
+    #[error("sustainability field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("sustainability season_id cannot be empty")]
+    EmptySeasonId,
+    #[error("sustainability operation_id cannot be empty")]
+    EmptyOperationId,
+    #[error("sustainability method_version cannot be empty")]
+    EmptyMethodVersion,
+    #[error("sustainability created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("sustainability audit_id cannot be empty")]
+    EmptyAuditId,
+    #[error("sustainability field not found: {field_id}")]
+    FieldNotFound { field_id: String },
+    #[error("sustainability season not found: {season_id} for field {field_id}")]
+    SeasonNotFound { field_id: String, season_id: String },
+    #[error(
+        "sustainability season {requested_season_id} does not belong to field {field_id}; linked season is {linked_season_id}"
+    )]
+    SeasonFieldMismatch {
+        field_id: String,
+        requested_season_id: String,
+        linked_season_id: String,
+    },
+    #[error("unsupported sustainability metric type {value}")]
+    UnsupportedMetricType { value: String },
+}
+
+pub fn build_sustainability_record(
+    request: SustainabilityRecordCreateRequest,
+    linkage: Option<SustainabilityRecordLinkage>,
+    generated_record_id: String,
+    generated_audit_id: String,
+    created_at: String,
+) -> Result<SustainabilityRecord, SustainabilityRecordError> {
+    let record_id = normalize_sustainability_optional_text(request.record_id)
+        .or_else(|| normalize_sustainability_text(generated_record_id))
+        .ok_or(SustainabilityRecordError::EmptyRecordId)?;
+    let field_id = normalize_sustainability_text(request.field_id)
+        .ok_or(SustainabilityRecordError::EmptyFieldId)?;
+    let season_id = normalize_sustainability_text(request.season_id)
+        .ok_or(SustainabilityRecordError::EmptySeasonId)?;
+    let operation_id = normalize_sustainability_text(request.operation_id)
+        .ok_or(SustainabilityRecordError::EmptyOperationId)?;
+    let method_version = normalize_sustainability_text(request.method_version)
+        .ok_or(SustainabilityRecordError::EmptyMethodVersion)?;
+    let audit_id = normalize_sustainability_optional_text(request.audit_id)
+        .or_else(|| normalize_sustainability_text(generated_audit_id))
+        .ok_or(SustainabilityRecordError::EmptyAuditId)?;
+    let created_at = normalize_sustainability_text(created_at)
+        .ok_or(SustainabilityRecordError::EmptyCreatedAt)?;
+
+    let linkage = linkage.ok_or_else(|| SustainabilityRecordError::FieldNotFound {
+        field_id: field_id.clone(),
+    })?;
+    let linked_field_id = normalize_sustainability_text(linkage.field_id).ok_or_else(|| {
+        SustainabilityRecordError::FieldNotFound {
+            field_id: field_id.clone(),
+        }
+    })?;
+    if linked_field_id != field_id {
+        return Err(SustainabilityRecordError::FieldNotFound { field_id });
+    }
+    let linked_season_id =
+        normalize_sustainability_optional_text(linkage.season_id).ok_or_else(|| {
+            SustainabilityRecordError::SeasonNotFound {
+                field_id: field_id.clone(),
+                season_id: season_id.clone(),
+            }
+        })?;
+    if linked_season_id != season_id {
+        return Err(SustainabilityRecordError::SeasonFieldMismatch {
+            field_id,
+            requested_season_id: season_id,
+            linked_season_id,
+        });
+    }
+
+    Ok(SustainabilityRecord {
+        record_id,
+        field_id: linked_field_id,
+        season_id: linked_season_id,
+        operation_id,
+        metric_type: request.metric_type,
+        method_version,
+        created_at,
+        audit_id,
+    })
+}
+
+pub fn parse_sustainability_metric_type(
+    value: &str,
+) -> Result<SustainabilityMetricType, SustainabilityRecordError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "carbon_footprint" => Ok(SustainabilityMetricType::CarbonFootprint),
+        "biomass" => Ok(SustainabilityMetricType::Biomass),
+        "biodiversity" => Ok(SustainabilityMetricType::Biodiversity),
+        "soil_carbon" => Ok(SustainabilityMetricType::SoilCarbon),
+        "sustainability_kpi" => Ok(SustainabilityMetricType::SustainabilityKpi),
+        _ => Err(SustainabilityRecordError::UnsupportedMetricType {
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn normalize_sustainability_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(normalize_sustainability_text)
+}
+
+fn normalize_sustainability_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FleetNodeComponentHealth {
     Ok,
     Warn,
@@ -4312,27 +4483,29 @@ mod tests {
     use super::{
         apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
         bind_fleet_node_identity, bounds_from_points, build_marketplace_account_record,
-        build_soil_moisture_reading, compute_drought_index, normalize_weather_provider_forecast,
-        sign_fleet_config_bundle, soil_moisture_rejection_record,
-        transition_marketplace_account_status, validate_field_boundary,
-        verify_and_apply_fleet_config_bundle, weather_fetch_failure_record,
-        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
-        AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord, CropPlanRecord,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeEnrollmentError,
-        FleetNodeEnrollmentRequest, FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind,
-        FleetNodeOperationError, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds,
-        GeoPoint, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, RasterResolution,
-        RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
-        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
-        RecommendationStatus, RecommendationStatusChangeType, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
-        SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
+        build_soil_moisture_reading, build_sustainability_record, compute_drought_index,
+        normalize_weather_provider_forecast, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, transition_marketplace_account_status,
+        validate_field_boundary, verify_and_apply_fleet_config_bundle,
+        weather_fetch_failure_record, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod,
+        DroughtIndexType, FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery,
+        FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
+        MarketplacePartyType, MultispectralImage, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, ReportDeliverableRegistry, ReportFormat,
+        ReportPersistenceError, ReportRecord, ReportVisibility, SceneLayerMetadataError,
+        SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError,
+        SoilMoistureReadingRequest, SoilMoistureRejectionReason, SustainabilityMetricType,
+        SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
         TractorCommandAuditDecision, TractorCommandRejectionReason, TractorImplementRef,
         TractorLifecycleStatus, TractorMotionCommandRequest, TractorRegistrationRequest,
         TractorRegistry, WeatherIngestError, WeatherProviderForecastPoint,
@@ -4818,6 +4991,100 @@ mod tests {
             error,
             MarketplaceAccountError::OrganizationNotFound {
                 org_id: "org-missing".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sustainability_record_links_field_season_operation_and_audit() {
+        let record = build_sustainability_record(
+            SustainabilityRecordCreateRequest {
+                record_id: Some(" sustain-001 ".to_string()),
+                field_id: " field-alpha ".to_string(),
+                season_id: " season-2026 ".to_string(),
+                operation_id: " operation-planting-001 ".to_string(),
+                metric_type: SustainabilityMetricType::CarbonFootprint,
+                method_version: " carbon.identity.v1 ".to_string(),
+                audit_id: None,
+            },
+            Some(SustainabilityRecordLinkage {
+                field_id: "field-alpha".to_string(),
+                season_id: Some("season-2026".to_string()),
+            }),
+            "generated-record".to_string(),
+            "audit-generated".to_string(),
+            "2026-06-13T12:00:00Z".to_string(),
+        )
+        .expect("sustainability record should link through the field-season spine");
+
+        assert_eq!(record.record_id, "sustain-001");
+        assert_eq!(record.field_id, "field-alpha");
+        assert_eq!(record.season_id, "season-2026");
+        assert_eq!(record.operation_id, "operation-planting-001");
+        assert_eq!(
+            record.metric_type,
+            SustainabilityMetricType::CarbonFootprint
+        );
+        assert_eq!(record.method_version, "carbon.identity.v1");
+        assert_eq!(record.audit_id, "audit-generated");
+        assert_eq!(record.created_at, "2026-06-13T12:00:00Z");
+    }
+
+    #[test]
+    fn sustainability_record_rejects_unknown_field_without_record() {
+        let error = build_sustainability_record(
+            SustainabilityRecordCreateRequest {
+                record_id: Some("sustain-missing".to_string()),
+                field_id: "field-missing".to_string(),
+                season_id: "season-2026".to_string(),
+                operation_id: "operation-planting-001".to_string(),
+                metric_type: SustainabilityMetricType::CarbonFootprint,
+                method_version: "carbon.identity.v1".to_string(),
+                audit_id: Some("audit-missing".to_string()),
+            },
+            None,
+            "generated-record".to_string(),
+            "audit-generated".to_string(),
+            "2026-06-13T12:00:00Z".to_string(),
+        )
+        .expect_err("unknown field should reject before record creation");
+
+        assert_eq!(
+            error,
+            SustainabilityRecordError::FieldNotFound {
+                field_id: "field-missing".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sustainability_record_rejects_season_mismatch_without_record() {
+        let error = build_sustainability_record(
+            SustainabilityRecordCreateRequest {
+                record_id: Some("sustain-mismatch".to_string()),
+                field_id: "field-alpha".to_string(),
+                season_id: "season-2027".to_string(),
+                operation_id: "operation-planting-001".to_string(),
+                metric_type: SustainabilityMetricType::CarbonFootprint,
+                method_version: "carbon.identity.v1".to_string(),
+                audit_id: Some("audit-mismatch".to_string()),
+            },
+            Some(SustainabilityRecordLinkage {
+                field_id: "field-alpha".to_string(),
+                season_id: Some("season-2026".to_string()),
+            }),
+            "generated-record".to_string(),
+            "audit-generated".to_string(),
+            "2026-06-13T12:00:00Z".to_string(),
+        )
+        .expect_err("wrong season should reject before record creation");
+
+        assert_eq!(
+            error,
+            SustainabilityRecordError::SeasonFieldMismatch {
+                field_id: "field-alpha".to_string(),
+                requested_season_id: "season-2027".to_string(),
+                linked_season_id: "season-2026".to_string()
             }
         );
     }

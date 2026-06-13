@@ -2690,6 +2690,196 @@ async fn marketplace_account_create_rejects_unknown_org_without_writing() -> Res
 }
 
 #[tokio::test]
+async fn sustainability_records_create_get_and_list_field_scoped() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-sustain", "field-sustain", "season-2026").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "record_id": "sustain-001",
+                        "field_id": "field-sustain",
+                        "season_id": "season-2026",
+                        "operation_id": "operation-planting-001",
+                        "metric_type": "carbon_footprint",
+                        "method_version": "carbon.identity.v1"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let record: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        record.get("record_id").and_then(|value| value.as_str()),
+        Some("sustain-001")
+    );
+    assert_eq!(
+        record.get("field_id").and_then(|value| value.as_str()),
+        Some("field-sustain")
+    );
+    assert_eq!(
+        record.get("season_id").and_then(|value| value.as_str()),
+        Some("season-2026")
+    );
+    assert_eq!(
+        record.get("operation_id").and_then(|value| value.as_str()),
+        Some("operation-planting-001")
+    );
+    assert_eq!(
+        record.get("metric_type").and_then(|value| value.as_str()),
+        Some("carbon_footprint")
+    );
+    assert_eq!(
+        record
+            .get("method_version")
+            .and_then(|value| value.as_str()),
+        Some("carbon.identity.v1")
+    );
+    assert!(record
+        .get("audit_id")
+        .and_then(|value| value.as_str())
+        .is_some_and(|audit_id| !audit_id.is_empty()));
+
+    let unscoped_list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/records")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(unscoped_list.status(), StatusCode::BAD_REQUEST);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/records?field_id=field-sustain")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let records: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(records.len(), 1);
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/records/sustain-001?field_id=field-sustain")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let cross_field = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/records/sustain-001?field_id=field-other")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_field.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_record_create_rejects_unknown_field_or_season_without_writing() -> Result<()>
+{
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-sustain", "field-sustain", "season-2026").await?;
+
+    let missing_field = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "record_id": "sustain-missing-field",
+                        "field_id": "field-missing",
+                        "season_id": "season-2026",
+                        "operation_id": "operation-planting-001",
+                        "metric_type": "carbon_footprint",
+                        "method_version": "carbon.identity.v1"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(missing_field.status(), StatusCode::BAD_REQUEST);
+
+    let wrong_season = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "record_id": "sustain-wrong-season",
+                        "field_id": "field-sustain",
+                        "season_id": "season-2027",
+                        "operation_id": "operation-planting-001",
+                        "metric_type": "carbon_footprint",
+                        "method_version": "carbon.identity.v1"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(wrong_season.status(), StatusCode::BAD_REQUEST);
+
+    let record_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sustainability_records")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(record_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -8414,6 +8604,68 @@ async fn seed_marketplace_org(ctx: &TestContext, farm_id: &str, org_id: &str) ->
         .await
         .expect("router should handle request");
     assert_eq!(farm_response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_sustainability_field(
+    ctx: &TestContext,
+    farm_id: &str,
+    field_id: &str,
+    season_id: &str,
+) -> Result<()> {
+    let farm_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": farm_id,
+                        "owner": "org-alpha",
+                        "name": format!("Sustainability {farm_id}")
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(farm_response.status(), StatusCode::OK);
+
+    let field_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": farm_id,
+                        "field_id": field_id,
+                        "name": format!("Sustainability {field_id}"),
+                        "season": season_id,
+                        "boundary": {
+                            "crs": "EPSG:4326",
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 },
+                                { "longitude": -96.7, "latitude": 41.1 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(field_response.status(), StatusCode::OK);
     Ok(())
 }
 

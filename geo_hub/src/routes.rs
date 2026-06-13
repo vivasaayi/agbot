@@ -63,10 +63,11 @@ use orthomosaic::{
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-    build_marketplace_account_record, build_soil_moisture_reading, build_tractor_record,
-    compute_drought_index, normalize_weather_provider_forecast, parse_drought_index_type,
-    parse_marketplace_account_status, parse_marketplace_party_type, parse_soil_moisture_qa_flag,
-    parse_soil_moisture_rejection_reason, soil_moisture_rejection_reason_for_error,
+    build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
+    build_tractor_record, compute_drought_index, normalize_weather_provider_forecast,
+    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_party_type,
+    parse_soil_moisture_qa_flag, parse_soil_moisture_rejection_reason,
+    parse_sustainability_metric_type, soil_moisture_rejection_reason_for_error,
     soil_moisture_rejection_record, transition_marketplace_account_status, validate_field_boundary,
     weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord, DroughtIndexComputeRequest,
     DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
@@ -78,12 +79,14 @@ use shared::schemas::{
     RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
     RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
     SoilMoistureReadingRecord, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
-    SoilMoistureRejectionRecord, TractorCommandAuditDecision, TractorCommandAuditRecord,
-    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
-    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
-    TractorRegistryError, WeatherFetchFailureRecord, WeatherForecastRecord,
-    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
-    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
+    SoilMoistureRejectionRecord, SustainabilityMetricType, SustainabilityRecord,
+    SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
+    TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
+    TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
+    TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
+    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
+    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
+    GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_device_record, GatewayIngestError,
@@ -489,6 +492,18 @@ pub struct MarketplaceAccountScopeQuery {
 pub struct MarketplaceAccountStatusRequest {
     pub org_id: String,
     pub status: MarketplaceAccountStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityRecordListQuery {
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub metric_type: Option<SustainabilityMetricType>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityRecordScopeQuery {
+    pub field_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2747,6 +2762,83 @@ pub async fn update_marketplace_account_status(
     update_marketplace_account_record(&state, &updated).await?;
 
     Ok(Json(updated))
+}
+
+pub async fn create_sustainability_record(
+    State(state): State<AppState>,
+    Json(request): Json<SustainabilityRecordCreateRequest>,
+) -> AppResult<Json<SustainabilityRecord>> {
+    let field_id = normalize_optional_text(Some(request.field_id.clone())).unwrap_or_default();
+    let linkage = if field_id.is_empty() {
+        None
+    } else {
+        load_sustainability_record_linkage(&state, &field_id).await?
+    };
+    let record = build_sustainability_record(
+        request,
+        linkage,
+        format!("sustainability-record-{}", Uuid::new_v4()),
+        format!("sustainability-audit-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_record_error)?;
+    insert_sustainability_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_sustainability_records(
+    Query(query): Query<SustainabilityRecordListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SustainabilityRecord>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for sustainability records".to_string(),
+        )
+    })?;
+    let season_id = normalize_optional_text(query.season_id);
+    let metric_type = query
+        .metric_type
+        .map(|metric_type| metric_type.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT record_id, field_id, season_id, operation_id, metric_type, method_version,
+               created_at, audit_id
+        FROM sustainability_records
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR season_id = ?2)
+          AND (?3 IS NULL OR metric_type = ?3)
+        ORDER BY created_at ASC, record_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .bind(metric_type)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_sustainability_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_sustainability_record(
+    Path(record_id): Path<String>,
+    Query(query): Query<SustainabilityRecordScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SustainabilityRecord>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    let record = load_sustainability_record(&state, &record_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if record.field_id != field_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(record))
 }
 
 pub async fn list_time_series_points(
@@ -6192,6 +6284,10 @@ fn marketplace_account_error(error: MarketplaceAccountError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn sustainability_record_error(error: SustainabilityRecordError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
     value.parse::<SoilSensorType>().map_err(soil_iot_error)
 }
@@ -7427,6 +7523,20 @@ fn decode_marketplace_account_record(
     })
 }
 
+fn decode_sustainability_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<SustainabilityRecord> {
+    Ok(SustainabilityRecord {
+        record_id: row.get("record_id"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        operation_id: row.get("operation_id"),
+        metric_type: parse_sustainability_metric_type(&row.get::<String, _>("metric_type"))
+            .map_err(sustainability_record_error)?,
+        method_version: row.get("method_version"),
+        created_at: row.get("created_at"),
+        audit_id: row.get("audit_id"),
+    })
+}
+
 fn decode_soil_iot_device(row: &sqlx::sqlite::SqliteRow) -> AppResult<SoilDeviceRecord> {
     Ok(SoilDeviceRecord {
         device_id: row.get("device_id"),
@@ -8513,6 +8623,71 @@ async fn marketplace_org_exists(state: &AppState, org_id: &str) -> AppResult<boo
     .map_err(Error::from)?;
 
     Ok(exists != 0)
+}
+
+async fn insert_sustainability_record(
+    state: &AppState,
+    record: &SustainabilityRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_records (
+            record_id, field_id, season_id, operation_id, metric_type, method_version,
+            created_at, audit_id
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&record.record_id)
+    .bind(&record.field_id)
+    .bind(&record.season_id)
+    .bind(&record.operation_id)
+    .bind(record.metric_type.as_str())
+    .bind(&record.method_version)
+    .bind(&record.created_at)
+    .bind(&record.audit_id)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_record(
+    state: &AppState,
+    record_id: &str,
+) -> AppResult<Option<SustainabilityRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT record_id, field_id, season_id, operation_id, metric_type, method_version,
+               created_at, audit_id
+        FROM sustainability_records
+        WHERE record_id = ?1
+        "#,
+    )
+    .bind(record_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_record(&row))
+        .transpose()
+}
+
+async fn load_sustainability_record_linkage(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Option<SustainabilityRecordLinkage>> {
+    let row = sqlx::query("SELECT field_id, season FROM fields WHERE field_id = ?1")
+        .bind(field_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(Error::from)?;
+
+    Ok(row.map(|row| SustainabilityRecordLinkage {
+        field_id: row.get("field_id"),
+        season_id: row.get("season"),
+    }))
 }
 
 async fn load_soil_iot_device(
