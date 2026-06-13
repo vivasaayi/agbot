@@ -159,6 +159,31 @@ pub struct ReproducibilityManifestValidation {
     pub valid: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReproducibilityInputBytes {
+    pub digest: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReproducibilityMismatchReason {
+    MethodVersionMismatch,
+    OutputHashMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReproducibilityVerification {
+    pub product_id: String,
+    pub reproducible: bool,
+    pub expected_method_version: String,
+    pub actual_method_version: String,
+    pub expected_output_hash: String,
+    pub actual_output_hash: String,
+    pub input_count: usize,
+    pub reason: Option<ReproducibilityMismatchReason>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditAction {
     pub action_ref: String,
@@ -259,6 +284,8 @@ pub enum ProvenanceError {
     EmptyMethodVersion { product_id: String },
     #[error("manifest input digest cannot be empty for {product_id}")]
     EmptyManifestInputDigest { product_id: String },
+    #[error("manifest input digest {digest} appears more than once for {product_id}")]
+    DuplicateManifestInputDigest { product_id: String, digest: String },
     #[error("lineage already exists for artifact {artifact_id}")]
     DuplicateArtifactId { artifact_id: String },
     #[error("reproducibility manifest already exists for product {product_id}")]
@@ -274,6 +301,8 @@ pub enum ProvenanceError {
     UnknownEvidenceDigest { digest: String },
     #[error("manifest for product {product_id} references missing input digest {digest}")]
     MissingManifestInputDigest { product_id: String, digest: String },
+    #[error("rerun input digest {digest} is not listed in manifest for {product_id}")]
+    UnexpectedManifestInputDigest { product_id: String, digest: String },
     #[error("reproducibility manifest requires product artifact {artifact_id}, got {kind:?}")]
     ManifestRequiresProduct {
         artifact_id: String,
@@ -680,6 +709,51 @@ pub fn build_reproducibility_manifest(
     })
 }
 
+pub fn output_hash_for_bytes(bytes: &[u8]) -> String {
+    digest_for_bytes(EVIDENCE_DIGEST_ALGORITHM, bytes)
+}
+
+pub fn verify_reproducible_output(
+    manifest: &ReproducibilityManifest,
+    inputs: &[ReproducibilityInputBytes],
+    actual_method_version: &str,
+    rerun_output_bytes: &[u8],
+    expected_output_hash: &str,
+) -> Result<ReproducibilityVerification, ProvenanceError> {
+    let manifest = normalize_reproducibility_manifest(manifest.clone())?;
+    let actual_method_version = normalize_required_text(
+        actual_method_version.to_string(),
+        ProvenanceError::EmptyMethodVersion {
+            product_id: manifest.product_id.clone(),
+        },
+    )?;
+    let expected_output_hash = normalize_required_text(
+        expected_output_hash.to_string(),
+        ProvenanceError::EmptyEvidenceDigest,
+    )?;
+    validate_reproducibility_inputs(&manifest, inputs)?;
+    let actual_output_hash = output_hash_for_bytes(rerun_output_bytes);
+
+    let reason = if actual_method_version != manifest.method_version {
+        Some(ReproducibilityMismatchReason::MethodVersionMismatch)
+    } else if actual_output_hash != expected_output_hash {
+        Some(ReproducibilityMismatchReason::OutputHashMismatch)
+    } else {
+        None
+    };
+
+    Ok(ReproducibilityVerification {
+        product_id: manifest.product_id,
+        reproducible: reason.is_none(),
+        expected_method_version: manifest.method_version,
+        actual_method_version,
+        expected_output_hash,
+        actual_output_hash,
+        input_count: manifest.input_digests.len(),
+        reason,
+    })
+}
+
 fn audit_chain_breach(index: usize, reason: AuditChainBreachReason) -> AuditChainVerification {
     AuditChainVerification {
         verified: false,
@@ -790,6 +864,51 @@ fn normalize_reproducibility_manifest(
     Ok(manifest)
 }
 
+fn validate_reproducibility_inputs(
+    manifest: &ReproducibilityManifest,
+    inputs: &[ReproducibilityInputBytes],
+) -> Result<(), ProvenanceError> {
+    let manifest = normalize_reproducibility_manifest(manifest.clone())?;
+    let mut input_by_digest = BTreeMap::new();
+    for input in inputs {
+        let digest = normalize_required_text(
+            input.digest.clone(),
+            ProvenanceError::EmptyManifestInputDigest {
+                product_id: manifest.product_id.clone(),
+            },
+        )?;
+        if input_by_digest
+            .insert(digest.clone(), input.bytes.clone())
+            .is_some()
+        {
+            return Err(ProvenanceError::DuplicateManifestInputDigest {
+                product_id: manifest.product_id.clone(),
+                digest,
+            });
+        }
+    }
+
+    for digest in &manifest.input_digests {
+        if !input_by_digest.contains_key(digest) {
+            return Err(ProvenanceError::MissingManifestInputDigest {
+                product_id: manifest.product_id.clone(),
+                digest: digest.clone(),
+            });
+        }
+    }
+
+    for digest in input_by_digest.keys() {
+        if !manifest.input_digests.contains(digest) {
+            return Err(ProvenanceError::UnexpectedManifestInputDigest {
+                product_id: manifest.product_id.clone(),
+                digest: digest.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn canonical_evidence_bytes(object: &EvidenceObject) -> Result<Vec<u8>, ProvenanceError> {
     serde_json::to_vec(object).map_err(|error| ProvenanceError::EvidenceSerializationFailed {
         details: error.to_string(),
@@ -886,10 +1005,12 @@ fn normalize_optional_text_owned(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_reproducibility_manifest, verify_audit_chain, ActionContext, ActorIdentity,
-        ActorKind, ArtifactKind, AuditAction, AuditChainBreachReason, AuditLedger, AuditOutcome,
-        AuditRefusalReason, EvidenceObject, EvidenceStore, LineageLedger, LineageRecord,
-        ProvenanceError, ProvenanceParameters, ReproducibilityManifestStore,
+        build_reproducibility_manifest, output_hash_for_bytes, verify_audit_chain,
+        verify_reproducible_output, ActionContext, ActorIdentity, ActorKind, ArtifactKind,
+        AuditAction, AuditChainBreachReason, AuditLedger, AuditOutcome, AuditRefusalReason,
+        EvidenceObject, EvidenceStore, LineageLedger, LineageRecord, ProvenanceError,
+        ProvenanceParameters, ReproducibilityInputBytes, ReproducibilityManifestStore,
+        ReproducibilityMismatchReason,
     };
 
     #[test]
@@ -1309,6 +1430,149 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reproducible_rerun_matches_expected_output_hash() {
+        let manifest = sample_reproducibility_manifest();
+        let inputs = sample_reproducibility_inputs(&manifest);
+        let output_bytes = b"ndvi product bytes v2";
+        let expected_hash = output_hash_for_bytes(output_bytes);
+
+        let verification = verify_reproducible_output(
+            &manifest,
+            &inputs,
+            "05.ndvi_product.v2",
+            output_bytes,
+            &expected_hash,
+        )
+        .expect("verification should run");
+
+        assert!(verification.reproducible);
+        assert_eq!(verification.expected_output_hash, expected_hash);
+        assert_eq!(verification.actual_output_hash, expected_hash);
+        assert_eq!(verification.reason, None);
+        assert_eq!(verification.input_count, manifest.input_digests.len());
+    }
+
+    #[test]
+    fn rerun_flags_method_version_mismatch() {
+        let manifest = sample_reproducibility_manifest();
+        let inputs = sample_reproducibility_inputs(&manifest);
+        let output_bytes = b"ndvi product bytes v2";
+        let expected_hash = output_hash_for_bytes(output_bytes);
+
+        let verification = verify_reproducible_output(
+            &manifest,
+            &inputs,
+            "05.ndvi_product.v3",
+            output_bytes,
+            &expected_hash,
+        )
+        .expect("verification should flag mismatch");
+
+        assert!(!verification.reproducible);
+        assert_eq!(
+            verification.reason,
+            Some(ReproducibilityMismatchReason::MethodVersionMismatch)
+        );
+        assert_eq!(verification.expected_method_version, "05.ndvi_product.v2");
+        assert_eq!(verification.actual_method_version, "05.ndvi_product.v3");
+        assert_eq!(verification.actual_output_hash, expected_hash);
+    }
+
+    #[test]
+    fn rerun_flags_altered_input_hash_mismatch() {
+        let manifest = sample_reproducibility_manifest();
+        let inputs = sample_reproducibility_inputs(&manifest);
+        let expected_hash = output_hash_for_bytes(b"ndvi product bytes v2");
+        let altered_output_bytes = b"ndvi product bytes v2\n";
+
+        let verification = verify_reproducible_output(
+            &manifest,
+            &inputs,
+            "05.ndvi_product.v2",
+            altered_output_bytes,
+            &expected_hash,
+        )
+        .expect("verification should flag altered rerun output");
+
+        assert!(!verification.reproducible);
+        assert_eq!(
+            verification.reason,
+            Some(ReproducibilityMismatchReason::OutputHashMismatch)
+        );
+        assert_ne!(verification.actual_output_hash, expected_hash);
+    }
+
+    #[test]
+    fn rerun_refuses_missing_manifest_input_digest() {
+        let manifest = sample_reproducibility_manifest();
+        let inputs = vec![sample_reproducibility_inputs(&manifest)[0].clone()];
+
+        let error = verify_reproducible_output(
+            &manifest,
+            &inputs,
+            "05.ndvi_product.v2",
+            b"ndvi product bytes v2",
+            "sha256:expected-output",
+        )
+        .expect_err("missing manifest input should refuse rerun");
+
+        assert_eq!(
+            error,
+            ProvenanceError::MissingManifestInputDigest {
+                product_id: "product:ndvi:alpha-2026-06-12".to_string(),
+                digest: "sha256:calibration-input".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rerun_rejects_duplicate_or_extra_input_digests() {
+        let manifest = sample_reproducibility_manifest();
+        let mut duplicate_inputs = sample_reproducibility_inputs(&manifest);
+        duplicate_inputs.push(duplicate_inputs[0].clone());
+
+        let duplicate_error = verify_reproducible_output(
+            &manifest,
+            &duplicate_inputs,
+            "05.ndvi_product.v2",
+            b"ndvi product bytes v2",
+            "sha256:expected-output",
+        )
+        .expect_err("duplicate input digest should be rejected");
+
+        assert_eq!(
+            duplicate_error,
+            ProvenanceError::DuplicateManifestInputDigest {
+                product_id: "product:ndvi:alpha-2026-06-12".to_string(),
+                digest: "sha256:scene-input".to_string(),
+            }
+        );
+
+        let mut extra_inputs = sample_reproducibility_inputs(&manifest);
+        extra_inputs.push(ReproducibilityInputBytes {
+            digest: "sha256:unexpected".to_string(),
+            bytes: b"unexpected bytes".to_vec(),
+        });
+
+        let extra_error = verify_reproducible_output(
+            &manifest,
+            &extra_inputs,
+            "05.ndvi_product.v2",
+            b"ndvi product bytes v2",
+            "sha256:expected-output",
+        )
+        .expect_err("extra input digest should be rejected");
+
+        assert_eq!(
+            extra_error,
+            ProvenanceError::UnexpectedManifestInputDigest {
+                product_id: "product:ndvi:alpha-2026-06-12".to_string(),
+                digest: "sha256:unexpected".to_string(),
+            }
+        );
+    }
+
     fn seed_product(ledger: &mut LineageLedger) {
         ledger
             .record_lineage(scene_lineage())
@@ -1459,5 +1723,32 @@ mod tests {
                 "panel_reflectance": 0.72
             }),
         }
+    }
+
+    fn sample_reproducibility_manifest() -> super::ReproducibilityManifest {
+        build_reproducibility_manifest(
+            &product_lineage(),
+            vec![
+                "sha256:scene-input".to_string(),
+                "sha256:calibration-input".to_string(),
+            ],
+            "05.ndvi_product.v2".to_string(),
+        )
+        .expect("manifest should build")
+    }
+
+    fn sample_reproducibility_inputs(
+        manifest: &super::ReproducibilityManifest,
+    ) -> Vec<ReproducibilityInputBytes> {
+        vec![
+            ReproducibilityInputBytes {
+                digest: manifest.input_digests[0].clone(),
+                bytes: b"scene bytes v1".to_vec(),
+            },
+            ReproducibilityInputBytes {
+                digest: manifest.input_digests[1].clone(),
+                bytes: b"calibration bytes v1".to_vec(),
+            },
+        ]
     }
 }
