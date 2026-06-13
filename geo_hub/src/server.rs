@@ -27,6 +27,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/mobile/analyze", post(routes::mobile_analyze))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
+        .route("/api/ingest/health", get(routes::get_ingest_health))
         .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),

@@ -152,6 +152,66 @@ async fn tile_request_outside_zoom_grid_returns_not_found() -> Result<()> {
 }
 
 #[tokio::test]
+async fn ingest_health_endpoint_reports_counts_and_last_error() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_ingest_health_row(
+        &ctx,
+        "scene-active",
+        "Downloading",
+        None,
+        "2026-05-03T00:00:00Z",
+    )
+    .await?;
+    seed_ingest_health_row(&ctx, "scene-stored", "Stored", None, "2026-05-04T00:00:00Z").await?;
+    seed_ingest_health_row(
+        &ctx,
+        "scene-failed",
+        "Failed",
+        Some("download_error"),
+        "2026-05-05T00:00:00Z",
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/ingest/health")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        json.get("in_flight").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        json.get("succeeded").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(json.get("failed").and_then(|value| value.as_u64()), Some(1));
+    assert_eq!(
+        json.pointer("/last_error/scene_id")
+            .and_then(|value| value.as_str()),
+        Some("scene-failed")
+    );
+    assert_eq!(
+        json.pointer("/last_error/reason_code")
+            .and_then(|value| value.as_str()),
+        Some("download_error")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn missing_scene_returns_not_found() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -11222,6 +11282,38 @@ async fn insert_ingest_source(ctx: &TestContext, scene_id: &str, source_path: &s
     .bind(0.92_f64)
     .bind(source_path)
     .bind("2026-05-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn seed_ingest_health_row(
+    ctx: &TestContext,
+    scene_id: &str,
+    status: &str,
+    reason: Option<&str>,
+    updated_at: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO scene_ingests (
+            scene_id, status, status_reason, ingested_at, acquisition_date,
+            coverage_fraction, source_path, updated_at
+        )
+        VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, ?5)
+        ON CONFLICT(scene_id) DO UPDATE SET
+            status = excluded.status,
+            status_reason = excluded.status_reason,
+            source_path = excluded.source_path,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(scene_id)
+    .bind(status)
+    .bind(reason)
+    .bind(format!("fixture://{scene_id}"))
+    .bind(updated_at)
     .execute(&ctx.pool)
     .await?;
 

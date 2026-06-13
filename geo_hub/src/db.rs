@@ -184,6 +184,23 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS scene_ingest_attempts (
+            attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scene_id TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            reason_code TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            UNIQUE(scene_id, attempt_number)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS scene_spatial_refs (
             scene_id TEXT PRIMARY KEY,
             spatial_ref_json TEXT NOT NULL,

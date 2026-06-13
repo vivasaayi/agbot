@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 use tokio::fs;
 use tracing::{info, warn};
@@ -96,6 +96,89 @@ pub struct SceneIngestRecord {
     pub coverage_fraction: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SceneIngestAttemptStatus {
+    InProgress,
+    Succeeded,
+    Failed,
+}
+
+impl SceneIngestAttemptStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "InProgress",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for SceneIngestAttemptStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "InProgress" => Ok(Self::InProgress),
+            "Succeeded" => Ok(Self::Succeeded),
+            "Failed" => Ok(Self::Failed),
+            other => Err(anyhow!("unknown scene ingest attempt status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneIngestAttemptRecord {
+    pub scene_id: String,
+    pub attempt_number: usize,
+    pub status: SceneIngestAttemptStatus,
+    pub reason_code: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneIngestHealthError {
+    pub scene_id: String,
+    pub reason_code: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneIngestHealth {
+    pub in_flight: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub last_error: Option<SceneIngestHealthError>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IngestRetryPolicy {
+    pub max_attempts: usize,
+    pub initial_backoff: Duration,
+}
+
+impl Default for IngestRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(25),
+        }
+    }
+}
+
+impl IngestRetryPolicy {
+    fn max_attempts(self) -> usize {
+        self.max_attempts.max(1)
+    }
+
+    fn backoff_for_attempt(self, attempt_number: usize) -> Duration {
+        let multiplier = 1u32 << attempt_number.saturating_sub(1).min(6);
+        self.initial_backoff
+            .checked_mul(multiplier)
+            .unwrap_or(self.initial_backoff)
+    }
+}
+
 #[derive(Debug)]
 struct IngestStepError {
     reason_code: &'static str,
@@ -125,10 +208,20 @@ pub async fn ingest_landsat(
     config: &HubConfig,
     pool: &DbPool,
 ) -> Result<SceneIngestRecord> {
+    ingest_landsat_with_policy(args, config, pool, IngestRetryPolicy::default()).await
+}
+
+pub async fn ingest_landsat_with_policy(
+    args: IngestLandsatArgs,
+    config: &HubConfig,
+    pool: &DbPool,
+    retry_policy: IngestRetryPolicy,
+) -> Result<SceneIngestRecord> {
     let scenes_root = config.data_root.join("scenes");
     fs::create_dir_all(&scenes_root).await?;
     let scene_dir = scenes_root.join(&args.scene_id);
     let source_path = args.source_dir.to_string_lossy().to_string();
+    let max_attempts = retry_policy.max_attempts();
 
     record_ingest_status(
         pool,
@@ -153,31 +246,209 @@ pub async fn ingest_landsat(
     )
     .await?;
 
-    match ingest_landsat_inner(&args, pool, &scene_dir, &source_path).await {
-        Ok(record) => Ok(record),
-        Err(err) => {
-            if let Err(cleanup_err) = cleanup_failed_ingest(pool, &args.scene_id, &scene_dir).await
-            {
-                warn!(
-                    scene = %args.scene_id,
-                    error = %cleanup_err,
-                    "failed to clean up partial scene ingest"
-                );
+    for attempt_number in 1..=max_attempts {
+        record_ingest_attempt_started(pool, &args.scene_id, attempt_number).await?;
+
+        match ingest_landsat_inner(&args, pool, &scene_dir, &source_path).await {
+            Ok(record) => {
+                record_ingest_attempt_finished(
+                    pool,
+                    &args.scene_id,
+                    attempt_number,
+                    SceneIngestAttemptStatus::Succeeded,
+                    None,
+                )
+                .await?;
+                return Ok(record);
             }
-            let _ = record_ingest_status(
-                pool,
-                &args.scene_id,
-                SceneIngestStatus::Failed,
-                Some(err.reason_code),
-                None,
-                None,
-                None,
-                &source_path,
-            )
-            .await?;
-            Err(anyhow!(err.to_string()))
+            Err(err) => {
+                let reason_code = err.reason_code;
+                let retryable = is_retryable_ingest_error(&err) && attempt_number < max_attempts;
+                let message = err.to_string();
+                record_ingest_attempt_finished(
+                    pool,
+                    &args.scene_id,
+                    attempt_number,
+                    SceneIngestAttemptStatus::Failed,
+                    Some(reason_code),
+                )
+                .await?;
+
+                if let Err(cleanup_err) =
+                    cleanup_failed_ingest(pool, &args.scene_id, &scene_dir).await
+                {
+                    warn!(
+                        scene = %args.scene_id,
+                        error = %cleanup_err,
+                        "failed to clean up partial scene ingest"
+                    );
+                }
+
+                if retryable {
+                    record_ingest_status(
+                        pool,
+                        &args.scene_id,
+                        SceneIngestStatus::Downloading,
+                        Some(reason_code),
+                        None,
+                        None,
+                        None,
+                        &source_path,
+                    )
+                    .await?;
+                    let backoff = retry_policy.backoff_for_attempt(attempt_number);
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    continue;
+                }
+
+                let _ = record_ingest_status(
+                    pool,
+                    &args.scene_id,
+                    SceneIngestStatus::Failed,
+                    Some(reason_code),
+                    None,
+                    None,
+                    None,
+                    &source_path,
+                )
+                .await?;
+                return Err(anyhow!(message));
+            }
         }
     }
+
+    Err(anyhow!(
+        "scene ingest exhausted retry policy without a terminal state"
+    ))
+}
+
+fn is_retryable_ingest_error(err: &IngestStepError) -> bool {
+    err.reason_code == "download_error"
+}
+
+async fn record_ingest_attempt_started(
+    pool: &DbPool,
+    scene_id: &str,
+    attempt_number: usize,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO scene_ingest_attempts (
+            scene_id, attempt_number, status, reason_code, started_at, finished_at
+        )
+        VALUES (?1, ?2, ?3, NULL, datetime('now'), NULL)
+        ON CONFLICT(scene_id, attempt_number) DO UPDATE SET
+            status = excluded.status,
+            reason_code = NULL,
+            started_at = datetime('now'),
+            finished_at = NULL
+        "#,
+    )
+    .bind(scene_id)
+    .bind(attempt_number as i64)
+    .bind(SceneIngestAttemptStatus::InProgress.as_str())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn record_ingest_attempt_finished(
+    pool: &DbPool,
+    scene_id: &str,
+    attempt_number: usize,
+    status: SceneIngestAttemptStatus,
+    reason_code: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE scene_ingest_attempts
+        SET status = ?3, reason_code = ?4, finished_at = datetime('now')
+        WHERE scene_id = ?1 AND attempt_number = ?2
+        "#,
+    )
+    .bind(scene_id)
+    .bind(attempt_number as i64)
+    .bind(status.as_str())
+    .bind(reason_code)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn load_ingest_attempts(
+    pool: &DbPool,
+    scene_id: &str,
+) -> Result<Vec<SceneIngestAttemptRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT scene_id, attempt_number, status, reason_code, started_at, finished_at
+        FROM scene_ingest_attempts
+        WHERE scene_id = ?1
+        ORDER BY attempt_number ASC
+        "#,
+    )
+    .bind(scene_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let status_text: String = row.get("status");
+            let attempt_number: i64 = row.get("attempt_number");
+            Ok(SceneIngestAttemptRecord {
+                scene_id: row.get("scene_id"),
+                attempt_number: attempt_number as usize,
+                status: SceneIngestAttemptStatus::try_from(status_text.as_str())?,
+                reason_code: row.get("reason_code"),
+                started_at: row.get("started_at"),
+                finished_at: row.get("finished_at"),
+            })
+        })
+        .collect()
+}
+
+pub async fn load_ingest_health(pool: &DbPool) -> Result<SceneIngestHealth> {
+    let counts = sqlx::query(
+        r#"
+        SELECT
+            COALESCE(SUM(CASE WHEN lower(status) IN ('queued', 'downloading', 'processing') THEN 1 ELSE 0 END), 0) AS in_flight,
+            COALESCE(SUM(CASE WHEN lower(status) = 'stored' THEN 1 ELSE 0 END), 0) AS succeeded,
+            COALESCE(SUM(CASE WHEN lower(status) = 'failed' THEN 1 ELSE 0 END), 0) AS failed
+        FROM scene_ingests
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let last_error = sqlx::query(
+        r#"
+        SELECT scene_id, status_reason, updated_at
+        FROM scene_ingests
+        WHERE lower(status) = 'failed'
+        ORDER BY updated_at DESC, scene_id DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .map(|row| SceneIngestHealthError {
+        scene_id: row.get("scene_id"),
+        reason_code: row.get("status_reason"),
+        updated_at: row.get("updated_at"),
+    });
+
+    Ok(SceneIngestHealth {
+        in_flight: count_column(&counts, "in_flight"),
+        succeeded: count_column(&counts, "succeeded"),
+        failed: count_column(&counts, "failed"),
+        last_error,
+    })
+}
+
+fn count_column(row: &sqlx::sqlite::SqliteRow, name: &str) -> usize {
+    row.get::<i64, _>(name).max(0) as usize
 }
 
 async fn ingest_landsat_inner(
@@ -763,6 +1034,100 @@ mod tests {
             .fetch_optional(&pool)
             .await?;
         assert!(scene_row.is_none());
+
+        let attempts = load_ingest_attempts(&pool, "scene-failed").await?;
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts
+            .iter()
+            .all(|attempt| attempt.status == SceneIngestAttemptStatus::Failed));
+        assert!(attempts
+            .iter()
+            .all(|attempt| attempt.reason_code.as_deref() == Some("download_error")));
+
+        let health = load_ingest_health(&pool).await?;
+        assert_eq!(health.in_flight, 0);
+        assert_eq!(health.succeeded, 0);
+        assert_eq!(health.failed, 1);
+        assert_eq!(
+            health
+                .last_error
+                .as_ref()
+                .map(|error| error.scene_id.as_str()),
+            Some("scene-failed")
+        );
+        assert_eq!(
+            health
+                .last_error
+                .as_ref()
+                .and_then(|error| error.reason_code.as_deref()),
+            Some("download_error")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_landsat_retries_transient_download_error_and_records_attempts() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir)?;
+        write_scene_fixture(&source_dir, &[("B4", "B4.png"), ("B5", "B5.png")])?;
+        std::fs::remove_file(source_dir.join("B4.png"))?;
+        std::fs::create_dir(source_dir.join("B4.png"))?;
+
+        let config = test_config(&tmp);
+        config.ensure_data_dirs()?;
+        let pool = db::connect_pool(&config).await?;
+
+        let repair_pool = pool.clone();
+        let repair_dir = source_dir.clone();
+        let repair_task = tokio::spawn(async move {
+            loop {
+                let failed: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM scene_ingest_attempts WHERE scene_id = ?1 AND attempt_number = 1 AND status = 'Failed'",
+                )
+                .bind("scene-transient")
+                .fetch_optional(&repair_pool)
+                .await
+                .expect("attempt poll should query");
+                if failed.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            std::fs::remove_dir_all(repair_dir.join("B4.png"))
+                .expect("transient directory should be removable");
+            std::fs::write(repair_dir.join("B4.png"), b"band").expect("band should be restored");
+        });
+
+        let record = ingest_landsat_with_policy(
+            IngestLandsatArgs {
+                scene_id: "scene-transient".to_string(),
+                source_dir: source_dir.clone(),
+            },
+            &config,
+            &pool,
+            IngestRetryPolicy {
+                max_attempts: 2,
+                initial_backoff: std::time::Duration::from_millis(75),
+            },
+        )
+        .await?;
+        repair_task.await?;
+
+        assert_eq!(record.status, SceneIngestStatus::Stored);
+        let attempts = load_ingest_attempts(&pool, "scene-transient").await?;
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].status, SceneIngestAttemptStatus::Failed);
+        assert_eq!(attempts[0].reason_code.as_deref(), Some("download_error"));
+        assert_eq!(attempts[1].status, SceneIngestAttemptStatus::Succeeded);
+        assert!(attempts[1].reason_code.is_none());
+
+        let health = load_ingest_health(&pool).await?;
+        assert_eq!(health.in_flight, 0);
+        assert_eq!(health.succeeded, 1);
+        assert_eq!(health.failed, 0);
+        assert!(health.last_error.is_none());
 
         Ok(())
     }

@@ -846,6 +846,12 @@ pub async fn mobile_app() -> Html<&'static str> {
     Html(MOBILE_APP_HTML)
 }
 
+pub async fn get_ingest_health(
+    State(state): State<AppState>,
+) -> AppResult<Json<ingest::SceneIngestHealth>> {
+    Ok(Json(ingest::load_ingest_health(&state.pool).await?))
+}
+
 pub async fn mobile_search_scenes(
     State(state): State<AppState>,
     Json(request): Json<MobileSceneSearchRequest>,
