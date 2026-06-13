@@ -4,7 +4,8 @@ use axum_test::TestServer;
 use geo::{point, polygon};
 use mission_planner::{
     api::{CreateMissionRequest, UpdateMissionRequest},
-    DatabaseService, Mission, MissionApi, MissionPlannerService, Waypoint, WaypointType,
+    DatabaseService, Mission, MissionApi, MissionListFilter, MissionPlannerService, MissionStatus,
+    Waypoint, WaypointType,
 };
 use std::{collections::HashMap, env, sync::Arc};
 
@@ -16,10 +17,25 @@ async fn db_service_crud_search_and_stats_roundtrip() -> Result<()> {
     let db_url = test_database_url();
     let service = MissionPlannerService::new(&db_url).await?;
 
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let field_id = format!("field-{run_id}");
+    let season_id = format!("season-{run_id}");
     let mut mission = sample_mission("Coverage Alpha", "Initial mission");
+    mission.field_id = field_id.clone();
+    mission.season_id = season_id.clone();
     mission.estimated_duration_minutes = 18;
     mission.estimated_battery_usage = 0.42;
     let id = service.create_mission(mission.clone()).await?;
+
+    let mut matching_mission = sample_mission("Coverage Gamma", "Second matching mission");
+    matching_mission.field_id = field_id.clone();
+    matching_mission.season_id = season_id.clone();
+    let matching_id = service.create_mission(matching_mission).await?;
+
+    let mut other_mission = sample_mission("Coverage Delta", "Different field mission");
+    other_mission.field_id = format!("other-field-{run_id}");
+    other_mission.season_id = season_id.clone();
+    let other_id = service.create_mission(other_mission).await?;
 
     let fetched = service
         .get_mission(&id)
@@ -44,9 +60,53 @@ async fn db_service_crud_search_and_stats_roundtrip() -> Result<()> {
     assert_eq!(updated.name, "Coverage Beta");
     assert_eq!(updated.description, "Updated mission");
     assert_eq!(updated.metadata.get("priority"), Some(&"high".to_string()));
+    assert_eq!(updated.version, 2);
 
-    let listed = service.list_missions(Some(50), Some(0)).await?;
-    assert!(listed.iter().any(|m| m.id == id));
+    let listed = service
+        .list_missions_page(MissionListFilter {
+            limit: Some(1),
+            offset: Some(0),
+            field_id: Some(field_id.clone()),
+            season_id: Some(season_id.clone()),
+            status: Some(MissionStatus::Draft),
+            ..MissionListFilter::default()
+        })
+        .await?;
+    assert_eq!(listed.total, 2);
+    assert_eq!(listed.missions.len(), 1);
+
+    let second_page = service
+        .list_missions_page(MissionListFilter {
+            limit: Some(1),
+            offset: Some(1),
+            field_id: Some(field_id.clone()),
+            season_id: Some(season_id.clone()),
+            status: Some(MissionStatus::Draft),
+            created_after: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+            created_before: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+        })
+        .await?;
+    assert_eq!(second_page.total, 2);
+    assert_eq!(second_page.missions.len(), 1);
+    let paged_ids = listed
+        .missions
+        .iter()
+        .chain(second_page.missions.iter())
+        .map(|mission| mission.id)
+        .collect::<Vec<_>>();
+    assert!(paged_ids.contains(&id));
+    assert!(paged_ids.contains(&matching_id));
+    assert!(!paged_ids.contains(&other_id));
+
+    mission.description = "Second update".to_string();
+    mission.updated_at = chrono::Utc::now();
+    service.update_mission(mission.clone()).await?;
+    let history = service.get_mission_history(&id).await?;
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].version, 1);
+    assert_eq!(history[0].mission.name, "Coverage Alpha");
+    assert_eq!(history[1].version, 2);
+    assert_eq!(history[1].mission.name, "Coverage Beta");
 
     let found = service.search_missions("beta").await?;
     assert!(found.iter().any(|m| m.id == id));
@@ -56,6 +116,8 @@ async fn db_service_crud_search_and_stats_roundtrip() -> Result<()> {
     assert!(stats.average_duration_minutes > 0.0);
     assert!(stats.average_battery_usage >= 0.0);
 
+    service.delete_mission(&matching_id).await?;
+    service.delete_mission(&other_id).await?;
     service.delete_mission(&id).await?;
     assert!(service.get_mission(&id).await?.is_none());
 
@@ -71,6 +133,9 @@ async fn api_crud_search_stats_flow() -> Result<()> {
     let service = Arc::new(MissionPlannerService::with_database(db));
     let server = TestServer::new(MissionApi::router(service))?;
 
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let field_id = format!("field-api-{run_id}");
+    let season_id = format!("season-api-{run_id}");
     let mut metadata = HashMap::new();
     metadata.insert("source".to_string(), "integration-test".to_string());
     let create_request = CreateMissionRequest {
@@ -83,8 +148,8 @@ async fn api_crud_search_stats_flow() -> Result<()> {
             (x: 0.0, y: 0.2),
             (x: 0.0, y: 0.0),
         ],
-        field_id: Some("field-integration".to_string()),
-        season_id: Some("season-2026".to_string()),
+        field_id: Some(field_id.clone()),
+        season_id: Some(season_id.clone()),
         session_id: Some("session-integration".to_string()),
         owner_id: Some("owner-integration".to_string()),
         waypoints: Some(vec![
@@ -137,6 +202,36 @@ async fn api_crud_search_stats_flow() -> Result<()> {
             .and_then(|v| v.as_str()),
         Some("API Mission Updated")
     );
+    assert_eq!(
+        update_json
+            .pointer("/mission/version")
+            .and_then(|v| v.as_u64()),
+        Some(2)
+    );
+
+    let second_update_request = UpdateMissionRequest {
+        name: None,
+        description: Some("Updated twice via API".to_string()),
+        area_of_interest: None,
+        field_id: None,
+        season_id: None,
+        session_id: None,
+        owner_id: None,
+        waypoints: None,
+        metadata: None,
+    };
+    let second_update_resp = server
+        .put(&format!("/missions/{mission_id}"))
+        .json(&second_update_request)
+        .await;
+    assert_eq!(second_update_resp.status_code(), StatusCode::OK);
+    let second_update_json: serde_json::Value = second_update_resp.json();
+    assert_eq!(
+        second_update_json
+            .pointer("/mission/version")
+            .and_then(|v| v.as_u64()),
+        Some(3)
+    );
 
     let list_resp = server.get("/missions?limit=10&offset=0").await;
     assert_eq!(list_resp.status_code(), StatusCode::OK);
@@ -150,6 +245,44 @@ async fn api_crud_search_stats_flow() -> Result<()> {
             .and_then(|v| v.as_str())
             .is_some_and(|id| id == mission_id)
     }));
+
+    let created_after = (chrono::Utc::now() - chrono::Duration::minutes(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let created_before = (chrono::Utc::now() + chrono::Duration::minutes(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let filtered_resp = server
+        .get(&format!(
+            "/missions?field_id={field_id}&season_id={season_id}&status=Draft&created_after={created_after}&created_before={created_before}&limit=10&offset=0"
+        ))
+        .await;
+    assert_eq!(filtered_resp.status_code(), StatusCode::OK);
+    let filtered_json: serde_json::Value = filtered_resp.json();
+    assert!(filtered_json
+        .get("missions")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&Vec::new())
+        .iter()
+        .any(|m| m
+            .get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id == mission_id)));
+
+    let history_resp = server.get(&format!("/missions/{mission_id}/history")).await;
+    assert_eq!(history_resp.status_code(), StatusCode::OK);
+    let history_json: serde_json::Value = history_resp.json();
+    let revisions = history_json
+        .get("revisions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("revisions array missing in history response"))?;
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(
+        revisions[0].get("version").and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        revisions[1].get("version").and_then(|v| v.as_u64()),
+        Some(2)
+    );
 
     let search_resp = server.get("/missions/search?q=updated").await;
     assert_eq!(search_resp.status_code(), StatusCode::OK);

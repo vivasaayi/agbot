@@ -70,6 +70,8 @@ pub struct Mission {
     pub description: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default = "default_mission_version")]
+    pub version: u32,
     #[serde(default = "default_unassigned_id")]
     pub field_id: String,
     #[serde(default = "default_unassigned_id")]
@@ -87,6 +89,47 @@ pub struct Mission {
     pub estimated_battery_usage: f32,
     pub weather_constraints: WeatherConstraints,
     pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionListFilter {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub status: Option<MissionStatus>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
+}
+
+impl Default for MissionListFilter {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            offset: None,
+            field_id: None,
+            season_id: None,
+            status: None,
+            created_after: None,
+            created_before: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionListPage {
+    pub missions: Vec<Mission>,
+    pub total: usize,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionRevision {
+    pub mission_id: Uuid,
+    pub version: u32,
+    pub archived_at: DateTime<Utc>,
+    pub mission: Mission,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +185,10 @@ pub struct WeatherConstraints {
 
 fn default_unassigned_id() -> String {
     "unassigned".to_string()
+}
+
+fn default_mission_version() -> u32 {
+    1
 }
 
 impl MissionLinkage {
@@ -289,6 +336,7 @@ impl Mission {
             description,
             created_at: now,
             updated_at: now,
+            version: default_mission_version(),
             field_id: linkage.field_id,
             season_id: linkage.season_id,
             session_id: linkage.session_id,
@@ -302,6 +350,12 @@ impl Mission {
             weather_constraints: WeatherConstraints::default(),
             metadata: HashMap::new(),
         }
+    }
+
+    pub fn bump_version(&mut self) -> u32 {
+        self.version = self.version.saturating_add(1);
+        self.updated_at = Utc::now();
+        self.version
     }
 
     pub fn transition_status(
@@ -446,7 +500,7 @@ impl MissionPlannerService {
     }
 
     /// Update an existing mission
-    pub async fn update_mission(&self, mission: Mission) -> Result<()> {
+    pub async fn update_mission(&self, mission: Mission) -> Result<Mission> {
         self.db.update_mission(&mission).await
     }
 
@@ -457,6 +511,16 @@ impl MissionPlannerService {
         offset: Option<i64>,
     ) -> Result<Vec<Mission>> {
         self.db.list_missions(limit, offset).await
+    }
+
+    /// List missions with pagination and field/season/status/date filters.
+    pub async fn list_missions_page(&self, filter: MissionListFilter) -> Result<MissionListPage> {
+        self.db.list_missions_page(filter).await
+    }
+
+    /// Read retained prior revisions for a mission.
+    pub async fn get_mission_history(&self, id: &Uuid) -> Result<Vec<MissionRevision>> {
+        self.db.get_mission_history(id).await
     }
 
     /// Delete a mission
@@ -527,6 +591,27 @@ mod tests {
         assert!(mission.session_id.is_none());
         assert!(mission.waypoints.is_empty());
         assert!(mission.flight_paths.is_empty());
+    }
+
+    #[test]
+    fn test_mission_version_starts_at_one_and_bumps_deterministically() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+
+        let mut mission = Mission::new(
+            "Versioned Mission".to_string(),
+            "A mission with retained revisions".to_string(),
+            area,
+        );
+
+        assert_eq!(mission.version, 1);
+        assert_eq!(mission.bump_version(), 2);
+        assert_eq!(mission.version, 2);
     }
 
     #[test]
