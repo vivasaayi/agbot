@@ -327,6 +327,116 @@ async fn thermal_lst_records_intermediate_stats_and_spatial_ref() {
 }
 
 #[tokio::test]
+async fn thermal_lst_uses_ndvi_image_emissivity_and_records_evidence() {
+    let root = temp_test_dir("thermal_ndvi_emissivity");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let thermal_path = input_dir.join("thermal.png");
+    let ndvi_path = input_dir.join("ndvi.png");
+    write_gray16_image(&thermal_path, 2, 1, &[10, 20]);
+    write_gray_image(&ndvi_path, 2, 1, &[0, 255]);
+    write_metadata(&input_dir, 2, 1, &[("Thermal", thermal_path.as_path())]);
+
+    let mut args = base_thermal_args(input_dir, output_dir.clone());
+    args.emissivity_from_ndvi = true;
+    args.ndvi_image = Some(ndvi_path);
+
+    run_thermal(&args).await.unwrap();
+
+    let meta = read_thermal_meta(&output_dir);
+    assert_eq!(
+        meta["emissivity_evidence"]["method"].as_str().unwrap(),
+        "ndvi_thresholds"
+    );
+    assert_eq!(
+        meta["emissivity_evidence"]["source"].as_str().unwrap(),
+        "ndvi_image"
+    );
+    assert!((meta["emissivity_evidence"]["min"].as_f64().unwrap() - 0.97).abs() < 1e-6);
+    assert!((meta["emissivity_evidence"]["max"].as_f64().unwrap() - 0.99).abs() < 1e-6);
+    assert!((meta["emissivity"].as_f64().unwrap() - 0.98).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn thermal_split_window_records_two_band_method() {
+    let root = temp_test_dir("thermal_split_window");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let thermal_path = input_dir.join("thermal_b10.png");
+    let thermal2_path = input_dir.join("thermal_b11.png");
+    write_gray16_image(&thermal_path, 2, 1, &[10, 20]);
+    write_gray16_image(&thermal2_path, 2, 1, &[8, 18]);
+    write_metadata(
+        &input_dir,
+        2,
+        1,
+        &[
+            ("B10", thermal_path.as_path()),
+            ("B11", thermal2_path.as_path()),
+        ],
+    );
+
+    let mut args = base_thermal_args(input_dir, output_dir.clone());
+    args.thermal_band = "B10".to_string();
+    args.thermal_band2 = Some("B11".to_string());
+    args.split_window = true;
+
+    run_thermal(&args).await.unwrap();
+
+    let meta = read_thermal_meta(&output_dir);
+    assert_eq!(
+        meta["thermal_method"]["method"].as_str().unwrap(),
+        "split_window"
+    );
+    assert_eq!(
+        meta["thermal_method"]["primary_band"].as_str().unwrap(),
+        "B10"
+    );
+    assert_eq!(
+        meta["thermal_method"]["second_band"].as_str().unwrap(),
+        "B11"
+    );
+    assert!(meta["thermal_method"]["fallback_reason"].is_null());
+    assert_eq!(
+        meta["thermal_method"]["split_window_delta"]["count"]
+            .as_u64()
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn thermal_split_window_falls_back_when_second_band_missing() {
+    let root = temp_test_dir("thermal_split_window_fallback");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let thermal_path = input_dir.join("thermal.png");
+    write_gray16_image(&thermal_path, 2, 1, &[10, 20]);
+    write_metadata(&input_dir, 2, 1, &[("Thermal", thermal_path.as_path())]);
+
+    let mut args = base_thermal_args(input_dir, output_dir.clone());
+    args.split_window = true;
+
+    run_thermal(&args).await.unwrap();
+
+    let meta = read_thermal_meta(&output_dir);
+    assert_eq!(
+        meta["thermal_method"]["method"].as_str().unwrap(),
+        "single_channel"
+    );
+    assert_eq!(
+        meta["thermal_method"]["fallback_reason"].as_str().unwrap(),
+        "second thermal band not provided"
+    );
+}
+
+#[tokio::test]
 async fn thermal_errors_when_coefficients_are_missing() {
     let root = temp_test_dir("thermal_missing_coefficients");
     let input_dir = root.join("input");
