@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use shared::schemas::Telemetry;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use uuid::Uuid;
 
@@ -44,9 +44,97 @@ pub struct TelemetryGapEvent {
     pub duration_seconds: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LinkHealthConfig {
+    pub warning_rssi_dbm: f32,
+    pub warning_packet_loss_rate: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkHealthState {
+    Healthy,
+    Warning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkHealthWarning {
+    LowRssi,
+    HighPacketLoss,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionLinkHealthSample {
+    pub mission_id: Uuid,
+    pub drone_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub rssi_dbm: f32,
+    pub packet_loss_rate: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionLinkHealth {
+    pub mission_id: Uuid,
+    pub drone_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub rssi_dbm: f32,
+    pub packet_loss_rate: f32,
+    pub state: LinkHealthState,
+    pub warnings: Vec<LinkHealthWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkHealthTransition {
+    pub mission_id: Uuid,
+    pub drone_id: String,
+    pub from: LinkHealthState,
+    pub to: LinkHealthState,
+    pub previous_warnings: Vec<LinkHealthWarning>,
+    pub current_warnings: Vec<LinkHealthWarning>,
+    pub timestamp: DateTime<Utc>,
+    pub rssi_dbm: f32,
+    pub packet_loss_rate: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MavlinkFailsafeFlag {
+    Battery,
+    Ekf,
+    Geofence,
+    Gps,
+    RadioLoss,
+    RcLoss,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionFailsafeSample {
+    pub mission_id: Uuid,
+    pub drone_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub flags: Vec<MavlinkFailsafeFlag>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionFailsafeState {
+    pub mission_id: Uuid,
+    pub drone_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub active: bool,
+    pub flags: Vec<MavlinkFailsafeFlag>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailsafeTransition {
+    pub mission_id: Uuid,
+    pub drone_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub previous_flags: Vec<MavlinkFailsafeFlag>,
+    pub current_flags: Vec<MavlinkFailsafeFlag>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TelemetryRecordErrorCode {
     OutOfOrderTimestamp,
+    InvalidLinkHealthSample,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,9 +152,14 @@ struct TelemetryStreamKey {
 #[derive(Debug, Clone)]
 pub struct TelemetryHistory {
     config: TelemetryFreshnessConfig,
+    link_health_config: LinkHealthConfig,
     samples_by_mission: HashMap<Uuid, Vec<MissionTelemetrySample>>,
     latest_by_stream: HashMap<TelemetryStreamKey, MissionTelemetrySample>,
     gap_events: Vec<TelemetryGapEvent>,
+    latest_link_health: HashMap<TelemetryStreamKey, MissionLinkHealth>,
+    link_health_transitions: Vec<LinkHealthTransition>,
+    latest_failsafe_state: HashMap<TelemetryStreamKey, MissionFailsafeState>,
+    failsafe_transitions: Vec<FailsafeTransition>,
 }
 
 impl Default for TelemetryFreshnessConfig {
@@ -74,6 +167,15 @@ impl Default for TelemetryFreshnessConfig {
         Self {
             stale_after: Duration::seconds(5),
             gap_after: Duration::seconds(5),
+        }
+    }
+}
+
+impl Default for LinkHealthConfig {
+    fn default() -> Self {
+        Self {
+            warning_rssi_dbm: -85.0,
+            warning_packet_loss_rate: 0.10,
         }
     }
 }
@@ -88,9 +190,24 @@ impl TelemetryHistory {
     pub fn new(config: TelemetryFreshnessConfig) -> Self {
         Self {
             config,
+            link_health_config: LinkHealthConfig::default(),
             samples_by_mission: HashMap::new(),
             latest_by_stream: HashMap::new(),
             gap_events: Vec::new(),
+            latest_link_health: HashMap::new(),
+            link_health_transitions: Vec::new(),
+            latest_failsafe_state: HashMap::new(),
+            failsafe_transitions: Vec::new(),
+        }
+    }
+
+    pub fn with_link_health_config(
+        config: TelemetryFreshnessConfig,
+        link_health_config: LinkHealthConfig,
+    ) -> Self {
+        Self {
+            link_health_config,
+            ..Self::new(config)
         }
     }
 
@@ -200,6 +317,188 @@ impl TelemetryHistory {
             .collect()
     }
 
+    pub fn record_link_health(
+        &mut self,
+        sample: MissionLinkHealthSample,
+    ) -> Result<MissionLinkHealth, TelemetryRecordError> {
+        if !sample.rssi_dbm.is_finite()
+            || !sample.packet_loss_rate.is_finite()
+            || !(0.0..=1.0).contains(&sample.packet_loss_rate)
+        {
+            return Err(TelemetryRecordError {
+                code: TelemetryRecordErrorCode::InvalidLinkHealthSample,
+                message: "link health sample requires finite RSSI and packet loss in 0.0..=1.0"
+                    .to_string(),
+            });
+        }
+
+        let key = TelemetryStreamKey {
+            mission_id: sample.mission_id,
+            drone_id: sample.drone_id.clone(),
+        };
+        if let Some(previous) = self.latest_link_health.get(&key) {
+            if sample.timestamp <= previous.timestamp {
+                return Err(TelemetryRecordError {
+                    code: TelemetryRecordErrorCode::OutOfOrderTimestamp,
+                    message: format!(
+                        "link health timestamp {} must be later than previous sample {}",
+                        sample.timestamp, previous.timestamp
+                    ),
+                });
+            }
+        }
+
+        let warnings = self.link_health_warnings(sample.rssi_dbm, sample.packet_loss_rate);
+        let state = if warnings.is_empty() {
+            LinkHealthState::Healthy
+        } else {
+            LinkHealthState::Warning
+        };
+        let health = MissionLinkHealth {
+            mission_id: sample.mission_id,
+            drone_id: sample.drone_id,
+            timestamp: sample.timestamp,
+            rssi_dbm: sample.rssi_dbm,
+            packet_loss_rate: sample.packet_loss_rate,
+            state,
+            warnings,
+        };
+
+        if let Some(previous) = self.latest_link_health.get(&key) {
+            if previous.state != health.state || previous.warnings != health.warnings {
+                self.link_health_transitions.push(LinkHealthTransition {
+                    mission_id: health.mission_id,
+                    drone_id: health.drone_id.clone(),
+                    from: previous.state,
+                    to: health.state,
+                    previous_warnings: previous.warnings.clone(),
+                    current_warnings: health.warnings.clone(),
+                    timestamp: health.timestamp,
+                    rssi_dbm: health.rssi_dbm,
+                    packet_loss_rate: health.packet_loss_rate,
+                });
+            }
+        }
+
+        self.latest_link_health.insert(key, health.clone());
+        Ok(health)
+    }
+
+    pub fn latest_link_health(
+        &self,
+        mission_id: Uuid,
+        drone_id: &str,
+    ) -> Option<MissionLinkHealth> {
+        self.latest_link_health
+            .get(&TelemetryStreamKey {
+                mission_id,
+                drone_id: drone_id.to_string(),
+            })
+            .cloned()
+    }
+
+    pub fn link_health_transitions_for(
+        &self,
+        mission_id: Uuid,
+        drone_id: &str,
+    ) -> Vec<LinkHealthTransition> {
+        self.link_health_transitions
+            .iter()
+            .filter(|transition| {
+                transition.mission_id == mission_id && transition.drone_id == drone_id
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn record_failsafe_state(
+        &mut self,
+        sample: MissionFailsafeSample,
+    ) -> Result<Vec<FailsafeTransition>, TelemetryRecordError> {
+        let key = TelemetryStreamKey {
+            mission_id: sample.mission_id,
+            drone_id: sample.drone_id.clone(),
+        };
+        if let Some(previous) = self.latest_failsafe_state.get(&key) {
+            if sample.timestamp <= previous.timestamp {
+                return Err(TelemetryRecordError {
+                    code: TelemetryRecordErrorCode::OutOfOrderTimestamp,
+                    message: format!(
+                        "failsafe timestamp {} must be later than previous sample {}",
+                        sample.timestamp, previous.timestamp
+                    ),
+                });
+            }
+        }
+
+        let flags = normalize_failsafe_flags(sample.flags);
+        let previous_flags = self
+            .latest_failsafe_state
+            .get(&key)
+            .map(|state| state.flags.clone())
+            .unwrap_or_default();
+        let state = MissionFailsafeState {
+            mission_id: sample.mission_id,
+            drone_id: sample.drone_id.clone(),
+            timestamp: sample.timestamp,
+            active: !flags.is_empty(),
+            flags: flags.clone(),
+        };
+        self.latest_failsafe_state.insert(key, state);
+
+        if previous_flags == flags {
+            return Ok(Vec::new());
+        }
+
+        let transition = FailsafeTransition {
+            mission_id: sample.mission_id,
+            drone_id: sample.drone_id,
+            timestamp: sample.timestamp,
+            previous_flags,
+            current_flags: flags,
+        };
+        self.failsafe_transitions.push(transition.clone());
+        Ok(vec![transition])
+    }
+
+    pub fn latest_failsafe_state(
+        &self,
+        mission_id: Uuid,
+        drone_id: &str,
+    ) -> Option<MissionFailsafeState> {
+        self.latest_failsafe_state
+            .get(&TelemetryStreamKey {
+                mission_id,
+                drone_id: drone_id.to_string(),
+            })
+            .cloned()
+    }
+
+    pub fn failsafe_transitions_for(
+        &self,
+        mission_id: Uuid,
+        drone_id: &str,
+    ) -> Vec<FailsafeTransition> {
+        self.failsafe_transitions
+            .iter()
+            .filter(|transition| {
+                transition.mission_id == mission_id && transition.drone_id == drone_id
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn link_health_warnings(&self, rssi_dbm: f32, packet_loss_rate: f32) -> Vec<LinkHealthWarning> {
+        let mut warnings = Vec::new();
+        if rssi_dbm <= self.link_health_config.warning_rssi_dbm {
+            warnings.push(LinkHealthWarning::LowRssi);
+        }
+        if packet_loss_rate >= self.link_health_config.warning_packet_loss_rate {
+            warnings.push(LinkHealthWarning::HighPacketLoss);
+        }
+        warnings
+    }
+
     fn record_stale_gap_once(
         &mut self,
         key: &TelemetryStreamKey,
@@ -232,6 +531,14 @@ impl TelemetryHistory {
             duration_seconds,
         });
     }
+}
+
+fn normalize_failsafe_flags(flags: Vec<MavlinkFailsafeFlag>) -> Vec<MavlinkFailsafeFlag> {
+    flags
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 impl TelemetryStreamKey {
@@ -372,5 +679,180 @@ mod tests {
         assert_eq!(freshness.state, TelemetryLinkState::Fresh);
         assert_eq!(freshness.age_seconds, Some(3));
         assert!(history.gap_events_for(mission_id, "drone-1").is_empty());
+    }
+
+    #[test]
+    fn link_health_warning_records_transition_for_degrading_rssi_and_loss() {
+        let mission_id = Uuid::new_v4();
+        let mut history = TelemetryHistory::default();
+
+        let healthy = history
+            .record_link_health(MissionLinkHealthSample {
+                mission_id,
+                drone_id: "drone-1".to_string(),
+                timestamp: Utc.timestamp_opt(100, 0).unwrap(),
+                rssi_dbm: -68.0,
+                packet_loss_rate: 0.02,
+            })
+            .expect("healthy link sample records");
+        assert_eq!(healthy.state, LinkHealthState::Healthy);
+        assert!(healthy.warnings.is_empty());
+
+        let warning = history
+            .record_link_health(MissionLinkHealthSample {
+                mission_id,
+                drone_id: "drone-1".to_string(),
+                timestamp: Utc.timestamp_opt(101, 0).unwrap(),
+                rssi_dbm: -92.0,
+                packet_loss_rate: 0.18,
+            })
+            .expect("degrading link sample records");
+        assert_eq!(warning.state, LinkHealthState::Warning);
+        assert_eq!(
+            warning.warnings,
+            vec![
+                LinkHealthWarning::LowRssi,
+                LinkHealthWarning::HighPacketLoss
+            ]
+        );
+
+        let transitions = history.link_health_transitions_for(mission_id, "drone-1");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].from, LinkHealthState::Healthy);
+        assert_eq!(transitions[0].to, LinkHealthState::Warning);
+        assert!(transitions[0].previous_warnings.is_empty());
+        assert_eq!(
+            transitions[0].current_warnings,
+            vec![
+                LinkHealthWarning::LowRssi,
+                LinkHealthWarning::HighPacketLoss
+            ]
+        );
+        assert_eq!(transitions[0].timestamp, Utc.timestamp_opt(101, 0).unwrap());
+    }
+
+    #[test]
+    fn link_health_records_warning_detail_transition_without_state_change() {
+        let mission_id = Uuid::new_v4();
+        let mut history = TelemetryHistory::default();
+
+        history
+            .record_link_health(MissionLinkHealthSample {
+                mission_id,
+                drone_id: "drone-1".to_string(),
+                timestamp: Utc.timestamp_opt(100, 0).unwrap(),
+                rssi_dbm: -92.0,
+                packet_loss_rate: 0.02,
+            })
+            .expect("first warning sample records");
+        history
+            .record_link_health(MissionLinkHealthSample {
+                mission_id,
+                drone_id: "drone-1".to_string(),
+                timestamp: Utc.timestamp_opt(101, 0).unwrap(),
+                rssi_dbm: -92.0,
+                packet_loss_rate: 0.18,
+            })
+            .expect("second warning sample records");
+
+        let transitions = history.link_health_transitions_for(mission_id, "drone-1");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].from, LinkHealthState::Warning);
+        assert_eq!(transitions[0].to, LinkHealthState::Warning);
+        assert_eq!(
+            transitions[0].previous_warnings,
+            vec![LinkHealthWarning::LowRssi]
+        );
+        assert_eq!(
+            transitions[0].current_warnings,
+            vec![
+                LinkHealthWarning::LowRssi,
+                LinkHealthWarning::HighPacketLoss
+            ]
+        );
+    }
+
+    #[test]
+    fn mavlink_failsafe_flags_are_persisted_and_surfaced_on_transition() {
+        let mission_id = Uuid::new_v4();
+        let mut history = TelemetryHistory::default();
+
+        let transitions = history
+            .record_failsafe_state(MissionFailsafeSample {
+                mission_id,
+                drone_id: "drone-1".to_string(),
+                timestamp: Utc.timestamp_opt(200, 0).unwrap(),
+                flags: vec![MavlinkFailsafeFlag::RadioLoss, MavlinkFailsafeFlag::Battery],
+            })
+            .expect("failsafe transition should record");
+
+        assert_eq!(transitions.len(), 1);
+        assert!(transitions[0].previous_flags.is_empty());
+        assert_eq!(
+            transitions[0].current_flags,
+            vec![MavlinkFailsafeFlag::Battery, MavlinkFailsafeFlag::RadioLoss]
+        );
+
+        let state = history
+            .latest_failsafe_state(mission_id, "drone-1")
+            .expect("failsafe state should be retained");
+        assert!(state.active);
+        assert_eq!(
+            state.flags,
+            vec![MavlinkFailsafeFlag::Battery, MavlinkFailsafeFlag::RadioLoss]
+        );
+
+        let duplicate = history
+            .record_failsafe_state(MissionFailsafeSample {
+                mission_id,
+                drone_id: "drone-1".to_string(),
+                timestamp: Utc.timestamp_opt(201, 0).unwrap(),
+                flags: vec![MavlinkFailsafeFlag::RadioLoss, MavlinkFailsafeFlag::Battery],
+            })
+            .expect("duplicate failsafe state should record without transition");
+        assert!(duplicate.is_empty());
+        assert_eq!(
+            history
+                .failsafe_transitions_for(mission_id, "drone-1")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn mavlink_failsafe_rejects_out_of_order_samples_without_clobbering_latest() {
+        let mission_id = Uuid::new_v4();
+        let mut history = TelemetryHistory::default();
+
+        history
+            .record_failsafe_state(MissionFailsafeSample {
+                mission_id,
+                drone_id: "drone-1".to_string(),
+                timestamp: Utc.timestamp_opt(300, 0).unwrap(),
+                flags: vec![MavlinkFailsafeFlag::RadioLoss],
+            })
+            .expect("newest failsafe sample records");
+
+        let error = history
+            .record_failsafe_state(MissionFailsafeSample {
+                mission_id,
+                drone_id: "drone-1".to_string(),
+                timestamp: Utc.timestamp_opt(299, 0).unwrap(),
+                flags: vec![MavlinkFailsafeFlag::Battery],
+            })
+            .expect_err("older failsafe sample should be rejected");
+
+        assert_eq!(error.code, TelemetryRecordErrorCode::OutOfOrderTimestamp);
+        let latest = history
+            .latest_failsafe_state(mission_id, "drone-1")
+            .expect("latest state should remain");
+        assert_eq!(latest.timestamp, Utc.timestamp_opt(300, 0).unwrap());
+        assert_eq!(latest.flags, vec![MavlinkFailsafeFlag::RadioLoss]);
+        assert_eq!(
+            history
+                .failsafe_transitions_for(mission_id, "drone-1")
+                .len(),
+            1
+        );
     }
 }

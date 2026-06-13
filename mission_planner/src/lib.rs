@@ -54,8 +54,11 @@ pub use survey_template::{
     SurveyTemplateErrorCode, SurveyTemplateResult,
 };
 pub use telemetry::{
-    MissionTelemetrySample, TelemetryFreshness, TelemetryFreshnessConfig, TelemetryGapEvent,
-    TelemetryHistory, TelemetryLinkState, TelemetryRecordError, TelemetryRecordErrorCode,
+    FailsafeTransition, LinkHealthConfig, LinkHealthState, LinkHealthTransition, LinkHealthWarning,
+    MavlinkFailsafeFlag, MissionFailsafeSample, MissionFailsafeState, MissionLinkHealth,
+    MissionLinkHealthSample, MissionTelemetrySample, TelemetryFreshness, TelemetryFreshnessConfig,
+    TelemetryGapEvent, TelemetryHistory, TelemetryLinkState, TelemetryRecordError,
+    TelemetryRecordErrorCode,
 };
 pub use waypoint::{
     validate_waypoint_sanity, Action, Waypoint, WaypointType, WaypointValidationCode,
