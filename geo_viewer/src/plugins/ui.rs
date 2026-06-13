@@ -1520,10 +1520,7 @@ fn render_status_bar(
         .unwrap_or_else(|| "n/a".to_string());
     let extent_text = layer_readout.extent;
     let resolution_text = layer_readout.resolution;
-    let cursor_text = cursor_map
-        .geo_position
-        .map(|(longitude, latitude)| format!("{:.5}, {:.5}", latitude, longitude))
-        .unwrap_or_else(|| "n/a".to_string());
+    let cursor_text = cursor_readout_text(cursor_map);
     let annotation_count = annotations.items.len();
     let recommendation_count = recommendations.items.len();
     let open_recommendations = recommendations
@@ -1594,6 +1591,14 @@ fn render_status_bar(
     });
 }
 
+fn cursor_readout_text(cursor_map: &CursorMapState) -> String {
+    match (cursor_map.geo_position, cursor_map.world_position) {
+        (Some((longitude, latitude)), _) => format!("{:.5}, {:.5}", latitude, longitude),
+        (None, Some(_)) => "no georeference".to_string(),
+        (None, None) => "n/a".to_string(),
+    }
+}
+
 fn priority_label(priority: RecommendationPriority) -> &'static str {
     match priority {
         RecommendationPriority::Critical => "Critical",
@@ -1610,5 +1615,39 @@ fn status_label(status: RecommendationStatus) -> &'static str {
         RecommendationStatus::Completed => "Completed",
         RecommendationStatus::Dismissed => "Dismissed",
         RecommendationStatus::Closed => "Closed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_readout_text;
+    use crate::state::CursorMapState;
+    use bevy::prelude::Vec2;
+
+    #[test]
+    fn cursor_readout_formats_live_lat_lon() {
+        let cursor = CursorMapState {
+            world_position: Some(Vec2::new(10.0, 20.0)),
+            geo_position: Some((-88.5, 40.25)),
+        };
+
+        assert_eq!(cursor_readout_text(&cursor), "40.25000, -88.50000");
+    }
+
+    #[test]
+    fn cursor_readout_reports_no_georeference_when_world_position_has_no_geo() {
+        let cursor = CursorMapState {
+            world_position: Some(Vec2::new(10.0, 20.0)),
+            geo_position: None,
+        };
+
+        assert_eq!(cursor_readout_text(&cursor), "no georeference");
+    }
+
+    #[test]
+    fn cursor_readout_reports_na_without_cursor() {
+        let cursor = CursorMapState::default();
+
+        assert_eq!(cursor_readout_text(&cursor), "n/a");
     }
 }

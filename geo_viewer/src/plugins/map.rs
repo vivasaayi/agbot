@@ -1,6 +1,6 @@
 use crate::state::{
-    CursorMapState, MapCamera, MapViewState, SceneExtent, SceneManifestState, TileId,
-    TileRenderState, ViewerState, MAP_UNITS_PER_DEGREE,
+    assert_manifest_layer_placement, CursorMapState, MapCamera, MapViewState, SceneExtent,
+    SceneManifestState, TileId, TileRenderState, ViewerState, MAP_UNITS_PER_DEGREE,
 };
 use bevy::{
     input::mouse::{MouseMotion, MouseWheel},
@@ -121,11 +121,7 @@ pub fn update_cursor_map_state(
     };
 
     cursor_map.world_position = Some(world_position);
-    cursor_map.geo_position = manifest_state
-        .geospatial
-        .extent
-        .as_ref()
-        .map(|extent| scene_local_to_geo(extent, world_position));
+    cursor_map.geo_position = cursor_world_to_geo(&manifest_state, world_position);
 }
 
 pub fn render_field_boundary(mut gizmos: Gizmos, manifest_state: Res<SceneManifestState>) {
@@ -203,6 +199,20 @@ pub fn scene_local_to_geo(extent: &SceneExtent, world_position: Vec2) -> (f64, f
     (longitude, latitude)
 }
 
+pub fn cursor_world_to_geo(
+    manifest_state: &SceneManifestState,
+    world_position: Vec2,
+) -> Option<(f64, f64)> {
+    let placement = assert_manifest_layer_placement(
+        &manifest_state.geospatial,
+        manifest_state.width,
+        manifest_state.height,
+    )
+    .ok()?;
+
+    Some(scene_local_to_geo(&placement.extent, world_position))
+}
+
 pub fn tile_world_size(world_dimensions: Vec2, zoom: u8) -> Vec2 {
     let tiles_per_axis = 1_u32 << zoom;
     Vec2::new(
@@ -278,12 +288,14 @@ pub fn visible_tiles_for_view(
 #[cfg(test)]
 mod tests {
     use super::{
-        boundary_overlay_points, extent_world_size, geo_to_scene_local, scene_local_to_geo,
-        tile_center_world, tile_world_size, visible_tiles_for_view,
+        boundary_overlay_points, cursor_world_to_geo, extent_world_size, geo_to_scene_local,
+        scene_local_to_geo, tile_center_world, tile_world_size, visible_tiles_for_view,
     };
-    use crate::state::{SceneExtent, SceneGeospatialMetadata, TileId};
+    use crate::state::{SceneExtent, SceneGeospatialMetadata, SceneManifestState, TileId};
     use bevy::prelude::Vec2;
-    use shared::schemas::{FieldBoundary, FieldRecord, GeoBounds, GeoPoint};
+    use shared::schemas::{
+        FieldBoundary, FieldRecord, GeoBounds, GeoPoint, RasterResolution, RasterSpatialRef,
+    };
 
     fn sample_extent() -> SceneExtent {
         SceneExtent {
@@ -318,6 +330,47 @@ mod tests {
 
         assert!((longitude - -89.0).abs() < 0.000_001);
         assert!((latitude - 40.5).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn cursor_world_to_geo_requires_asserted_layer_transform() {
+        let manifest = SceneManifestState {
+            width: Some(100),
+            height: Some(50),
+            geospatial: sample_geospatial_with_spatial_ref(),
+            ..Default::default()
+        };
+
+        let (longitude, latitude) =
+            cursor_world_to_geo(&manifest, Vec2::ZERO).expect("valid transform should project");
+
+        assert!((longitude - -89.0).abs() < 0.000_001);
+        assert!((latitude - 40.5).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn cursor_world_to_geo_refuses_missing_or_ungeoreferenced_transform() {
+        let missing_spatial_ref = SceneManifestState {
+            width: Some(100),
+            height: Some(50),
+            geospatial: sample_geospatial(),
+            ..Default::default()
+        };
+        assert_eq!(cursor_world_to_geo(&missing_spatial_ref, Vec2::ZERO), None);
+
+        let ungeoreferenced = SceneManifestState {
+            width: Some(100),
+            height: Some(50),
+            geospatial: SceneGeospatialMetadata {
+                georeferenced: false,
+                crs: Some("EPSG:4326".to_string()),
+                center: None,
+                extent: Some(sample_extent()),
+                spatial_ref: Some(sample_spatial_ref()),
+            },
+            ..Default::default()
+        };
+        assert_eq!(cursor_world_to_geo(&ungeoreferenced, Vec2::ZERO), None);
     }
 
     #[test]
@@ -411,6 +464,28 @@ mod tests {
             center: None,
             extent: Some(sample_extent()),
             spatial_ref: None,
+        }
+    }
+
+    fn sample_geospatial_with_spatial_ref() -> SceneGeospatialMetadata {
+        SceneGeospatialMetadata {
+            spatial_ref: Some(sample_spatial_ref()),
+            ..sample_geospatial()
+        }
+    }
+
+    fn sample_spatial_ref() -> RasterSpatialRef {
+        RasterSpatialRef {
+            georeferenced: true,
+            crs: Some("EPSG:4326".to_string()),
+            bbox: Some(GeoBounds {
+                min_lon: -89.5,
+                min_lat: 40.0,
+                max_lon: -88.5,
+                max_lat: 41.0,
+            }),
+            geo_transform: Some([-89.5, 0.01, 0.0, 40.0, 0.0, 0.02]),
+            resolution: Some(RasterResolution { x: 0.01, y: 0.02 }),
         }
     }
 
