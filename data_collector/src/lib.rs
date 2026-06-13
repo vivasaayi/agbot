@@ -2798,6 +2798,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_export_session_kml_preserves_crs_extent_and_coordinate() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let first = telemetry_record_at(
+            &session,
+            Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap(),
+            40.0,
+            -105.0,
+            0.9,
+        );
+        let second = telemetry_record_at(
+            &session,
+            Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 5).unwrap(),
+            40.002,
+            -104.998,
+            0.89,
+        );
+
+        service.collect_data(&session_id, first).await.unwrap();
+        service.collect_data(&session_id, second).await.unwrap();
+
+        let output_path = temp_dir.path().join("session-export.kml");
+        service
+            .export_session(&session_id, ExportFormat::Kml, &output_path)
+            .await
+            .unwrap();
+
+        let exported = tokio::fs::read_to_string(&output_path).await.unwrap();
+        assert!(exported.contains("agbot:crs=\"EPSG:4326\""));
+        assert!(exported.contains("agbot:min_lat=\"40\""));
+        assert!(exported.contains("agbot:max_lat=\"40.002\""));
+        assert!(exported.contains("agbot:min_lon=\"-105\""));
+        assert!(exported.contains("agbot:max_lon=\"-104.998\""));
+        assert!(exported.contains("agbot:resolution_m=\""));
+        assert!(!exported.contains("agbot:resolution_m=\"0\""));
+        assert!(exported.contains("agbot:record_count=\"2\""));
+        assert!(exported.contains("<coordinates>-105,40,30</coordinates>"));
+    }
+
+    #[tokio::test]
+    async fn test_export_session_gated_formats_return_clean_error() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
+
+        for format in [ExportFormat::Parquet, ExportFormat::HDF5] {
+            let output_path = temp_dir.path().join(format!("{format:?}.bin"));
+            let err = service
+                .export_session(&session_id, format, &output_path)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not enabled"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_record_provenance_is_required_for_all_types_and_payloads() {
         let temp_dir = tempdir().unwrap();
         let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
