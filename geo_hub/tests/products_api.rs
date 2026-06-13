@@ -9053,6 +9053,27 @@ async fn shared_report_link_allows_public_access_until_revoked() -> Result<()> {
 }
 
 #[tokio::test]
+async fn shared_report_link_unknown_token_is_rejected() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let denied_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/report-shares/not-a-real-token")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied_response.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn expired_report_share_link_is_denied() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
