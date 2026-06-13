@@ -463,6 +463,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
             out.save(&p).map_err(|e| {
                 shared::error::AgroError::Processing(format!("Failed to save index image: {}", e))
             })?;
+            crate::io::write_png_spatial_sidecar(&p, Some(&evidence.spatial_ref)).await?;
             p
         }
         OutputFormat::Geotiff => {

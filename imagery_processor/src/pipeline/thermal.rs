@@ -274,6 +274,7 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
             out_vis.save(&p).map_err(|e| {
                 shared::error::AgroError::Processing(format!("Failed to save thermal image: {}", e))
             })?;
+            crate::io::write_png_spatial_sidecar(&p, Some(&spatial_ref)).await?;
             p
         }
         OutputFormat::Geotiff => {

@@ -1,5 +1,8 @@
 use anyhow::Context;
-use shared::{schemas::MultispectralImage, AgroResult};
+use shared::{
+    schemas::{assert_raster_spatial_ref, MultispectralImage},
+    AgroResult,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tracing::{error, info};
@@ -110,6 +113,7 @@ async fn process_one(metadata_file: &PathBuf, args: &MasksArgs) -> AgroResult<()
         }
         (w, h, v)
     };
+    let spatial_ref = assert_raster_spatial_ref(image.metadata.spatial_ref.as_ref(), w, h).ok();
 
     let kinds = if args.kinds.is_empty() {
         vec![
@@ -157,6 +161,7 @@ async fn process_one(metadata_file: &PathBuf, args: &MasksArgs) -> AgroResult<()
                 mask.save(&p).map_err(|e| {
                     shared::error::AgroError::Processing(format!("Save mask failed: {}", e))
                 })?;
+                crate::io::write_png_spatial_sidecar(&p, spatial_ref.as_ref()).await?;
                 p
             }
             OutputFormat::Geotiff => {

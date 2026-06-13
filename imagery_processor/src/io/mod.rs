@@ -179,6 +179,93 @@ fn geotiff_spatial_ref_error(message: &str) -> AgroError {
     AgroError::Processing(format!("GeoTIFF spatial sidecar error: {message}"))
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PngGeoreferenceStatus {
+    Georeferenced,
+    NotGeoreferenced,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PngSpatialSidecar {
+    pub format_version: u8,
+    pub status: PngGeoreferenceStatus,
+    pub reason: Option<String>,
+    pub crs: Option<String>,
+    pub bbox: Option<GeoBounds>,
+    pub resolution: Option<RasterResolution>,
+    pub geo_transform: Option<[f64; 6]>,
+}
+
+impl PngSpatialSidecar {
+    pub fn from_spatial_ref(spatial_ref: Option<&RasterSpatialRef>) -> Self {
+        let Some(spatial_ref) = spatial_ref else {
+            return Self::not_georeferenced("missing spatial_ref");
+        };
+
+        if !spatial_ref.georeferenced {
+            return Self::not_georeferenced("spatial_ref not georeferenced");
+        }
+
+        let Some(crs) = spatial_ref
+            .crs
+            .as_ref()
+            .filter(|crs| !crs.trim().is_empty())
+        else {
+            return Self::not_georeferenced("missing CRS");
+        };
+        let Some(bbox) = spatial_ref.bbox.clone() else {
+            return Self::not_georeferenced("missing extent bbox");
+        };
+        let Some(resolution) = spatial_ref.resolution else {
+            return Self::not_georeferenced("missing resolution");
+        };
+        let Some(geo_transform) = spatial_ref.geo_transform else {
+            return Self::not_georeferenced("missing transform");
+        };
+
+        Self {
+            format_version: 1,
+            status: PngGeoreferenceStatus::Georeferenced,
+            reason: None,
+            crs: Some(crs.trim().to_string()),
+            bbox: Some(bbox),
+            resolution: Some(resolution),
+            geo_transform: Some(geo_transform),
+        }
+    }
+
+    fn not_georeferenced(reason: &str) -> Self {
+        Self {
+            format_version: 1,
+            status: PngGeoreferenceStatus::NotGeoreferenced,
+            reason: Some(reason.to_string()),
+            crs: None,
+            bbox: None,
+            resolution: None,
+            geo_transform: None,
+        }
+    }
+}
+
+pub fn png_spatial_sidecar_path(product_path: &Path) -> PathBuf {
+    let file_name = product_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.spatial_ref.json"))
+        .unwrap_or_else(|| "product.png.spatial_ref.json".to_string());
+    product_path.with_file_name(file_name)
+}
+
+pub async fn write_png_spatial_sidecar(
+    product_path: &Path,
+    spatial_ref: Option<&RasterSpatialRef>,
+) -> AgroResult<PathBuf> {
+    let sidecar = PngSpatialSidecar::from_spatial_ref(spatial_ref);
+    let sidecar_path = png_spatial_sidecar_path(product_path);
+    tokio::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar)?).await?;
+    Ok(sidecar_path)
+}
+
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum BandIngestError {
     #[error("failed to read metadata {path}: {message}")]
@@ -579,6 +666,12 @@ mod tests {
         })
     }
 
+    fn asserted_spatial_ref(width: u32, height: u32) -> RasterSpatialRef {
+        let spatial_ref: RasterSpatialRef =
+            serde_json::from_value(valid_spatial_ref(width, height)).unwrap();
+        assert_raster_spatial_ref(Some(&spatial_ref), width, height).unwrap()
+    }
+
     fn write_metadata(
         input_dir: &Path,
         width: u32,
@@ -617,6 +710,43 @@ mod tests {
         )
         .unwrap();
         metadata_path
+    }
+
+    #[tokio::test]
+    async fn png_spatial_sidecar_matches_asserted_spatial_ref() {
+        let root = temp_test_dir("png_spatial_sidecar");
+        let product_path = root.join("ndvi.png");
+        let spatial_ref = asserted_spatial_ref(2, 1);
+
+        let sidecar_path = write_png_spatial_sidecar(&product_path, Some(&spatial_ref))
+            .await
+            .unwrap();
+
+        let sidecar: PngSpatialSidecar =
+            serde_json::from_str(&fs::read_to_string(sidecar_path).unwrap()).unwrap();
+        assert_eq!(sidecar.status, PngGeoreferenceStatus::Georeferenced);
+        assert_eq!(sidecar.crs.as_deref(), Some("EPSG:4326"));
+        assert_eq!(sidecar.bbox, spatial_ref.bbox);
+        assert_eq!(sidecar.resolution, spatial_ref.resolution);
+        assert_eq!(sidecar.geo_transform, spatial_ref.geo_transform);
+    }
+
+    #[tokio::test]
+    async fn png_spatial_sidecar_marks_plain_when_georeference_missing() {
+        let root = temp_test_dir("png_plain_sidecar");
+        let product_path = root.join("ndvi.png");
+
+        let sidecar_path = write_png_spatial_sidecar(&product_path, None)
+            .await
+            .unwrap();
+
+        let sidecar: PngSpatialSidecar =
+            serde_json::from_str(&fs::read_to_string(sidecar_path).unwrap()).unwrap();
+        assert_eq!(sidecar.status, PngGeoreferenceStatus::NotGeoreferenced);
+        assert_eq!(sidecar.crs, None);
+        assert_eq!(sidecar.bbox, None);
+        assert_eq!(sidecar.resolution, None);
+        assert_eq!(sidecar.reason.as_deref(), Some("missing spatial_ref"));
     }
 
     #[tokio::test]

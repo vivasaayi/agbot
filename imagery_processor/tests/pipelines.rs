@@ -3,8 +3,9 @@
 use image::{GrayImage, ImageBuffer, Luma};
 use imagery_processor::{
     io::{
-        geotiff_spatial_sidecar_path, write_geotiff_spatial_sidecar, BandIngestEvidence,
-        CalibrationStatus, GeoTiffSpatialSidecar,
+        geotiff_spatial_sidecar_path, png_spatial_sidecar_path, write_geotiff_spatial_sidecar,
+        BandIngestEvidence, CalibrationStatus, GeoTiffSpatialSidecar, PngGeoreferenceStatus,
+        PngSpatialSidecar,
     },
     pipeline::{indices::run_indices, masks::run_masks, thermal::run_thermal},
     BandOverrideSpec, IndexBandRole, IndexKind, IndicesArgs, MasksArgs, OutputFormat, SensorPreset,
@@ -522,6 +523,42 @@ async fn indices_persist_asserted_spatial_ref() {
             .len(),
         6
     );
+}
+
+#[tokio::test]
+async fn indices_png_writes_matching_spatial_sidecar() {
+    let root = temp_test_dir("indices_png_sidecar");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    write_gray_image(&red_path, 2, 1, &[10, 20]);
+    write_gray_image(&nir_path, 2, 1, &[30, 40]);
+    write_metadata(
+        &input_dir,
+        2,
+        1,
+        &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+    );
+
+    let args = base_indices_args(input_dir, output_dir.clone());
+
+    run_indices(&args).await.unwrap();
+
+    let meta = read_result_meta(&output_dir);
+    let output_path = PathBuf::from(meta["output_path"].as_str().unwrap());
+    let sidecar_path = png_spatial_sidecar_path(&output_path);
+    let sidecar: PngSpatialSidecar =
+        serde_json::from_str(&fs::read_to_string(sidecar_path).unwrap()).unwrap();
+    let expected = valid_asserted_spatial_ref(2, 1);
+
+    assert_eq!(sidecar.status, PngGeoreferenceStatus::Georeferenced);
+    assert_eq!(sidecar.crs.as_deref(), Some("EPSG:4326"));
+    assert_eq!(sidecar.bbox, expected.bbox);
+    assert_eq!(sidecar.resolution, expected.resolution);
+    assert_eq!(sidecar.geo_transform, expected.geo_transform);
 }
 
 #[tokio::test]
