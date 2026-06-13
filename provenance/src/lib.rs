@@ -143,6 +143,23 @@ pub struct LineageGap {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReproducibilityManifest {
+    pub product_id: String,
+    pub input_digests: Vec<String>,
+    pub method: String,
+    pub method_version: String,
+    pub parameters: ProvenanceParameters,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReproducibilityManifestValidation {
+    pub product_id: String,
+    pub input_count: usize,
+    pub missing_digests: Vec<String>,
+    pub valid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditAction {
     pub action_ref: String,
     pub action_kind: String,
@@ -205,6 +222,11 @@ pub struct EvidenceStore {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReproducibilityManifestStore {
+    manifests: BTreeMap<String, ReproducibilityManifest>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AuditLedger {
     entries: Vec<AuditEntry>,
 }
@@ -233,8 +255,16 @@ pub enum ProvenanceError {
     EmptyEvidenceKind,
     #[error("evidence digest cannot be empty")]
     EmptyEvidenceDigest,
+    #[error("method_version cannot be empty for {product_id}")]
+    EmptyMethodVersion { product_id: String },
+    #[error("manifest input digest cannot be empty for {product_id}")]
+    EmptyManifestInputDigest { product_id: String },
     #[error("lineage already exists for artifact {artifact_id}")]
     DuplicateArtifactId { artifact_id: String },
+    #[error("reproducibility manifest already exists for product {product_id}")]
+    DuplicateManifestProductId { product_id: String },
+    #[error("unknown reproducibility manifest for product {product_id}")]
+    UnknownManifestProductId { product_id: String },
     #[error("unknown input artifact {input_artifact_id} for {artifact_id}")]
     UnknownInputArtifact {
         artifact_id: String,
@@ -242,6 +272,13 @@ pub enum ProvenanceError {
     },
     #[error("unknown evidence digest {digest}")]
     UnknownEvidenceDigest { digest: String },
+    #[error("manifest for product {product_id} references missing input digest {digest}")]
+    MissingManifestInputDigest { product_id: String, digest: String },
+    #[error("reproducibility manifest requires product artifact {artifact_id}, got {kind:?}")]
+    ManifestRequiresProduct {
+        artifact_id: String,
+        kind: ArtifactKind,
+    },
     #[error("evidence digest mismatch expected {expected_digest} actual {actual_digest}")]
     EvidenceDigestMismatch {
         expected_digest: String,
@@ -403,6 +440,68 @@ impl EvidenceStore {
     }
 }
 
+impl ReproducibilityManifestStore {
+    pub fn record_manifest(
+        &mut self,
+        manifest: ReproducibilityManifest,
+    ) -> Result<ReproducibilityManifest, ProvenanceError> {
+        let manifest = normalize_reproducibility_manifest(manifest)?;
+        if self.manifests.contains_key(&manifest.product_id) {
+            return Err(ProvenanceError::DuplicateManifestProductId {
+                product_id: manifest.product_id,
+            });
+        }
+
+        self.manifests
+            .insert(manifest.product_id.clone(), manifest.clone());
+        Ok(manifest)
+    }
+
+    pub fn fetch_manifest(&self, product_id: &str) -> Option<ReproducibilityManifest> {
+        let product_id = normalize_optional_text(product_id)?;
+        self.manifests.get(&product_id).cloned()
+    }
+
+    pub fn validate_manifest_inputs(
+        &self,
+        product_id: &str,
+        evidence_store: &EvidenceStore,
+    ) -> Result<ReproducibilityManifestValidation, ProvenanceError> {
+        let product_id =
+            normalize_required_text(product_id.to_string(), ProvenanceError::EmptyArtifactId)?;
+        let manifest = self.manifests.get(&product_id).ok_or_else(|| {
+            ProvenanceError::UnknownManifestProductId {
+                product_id: product_id.clone(),
+            }
+        })?;
+
+        let mut missing_digests = Vec::new();
+        for digest in &manifest.input_digests {
+            if evidence_store.fetch_evidence(digest).is_none() {
+                missing_digests.push(digest.clone());
+            }
+        }
+
+        if let Some(digest) = missing_digests.first() {
+            return Err(ProvenanceError::MissingManifestInputDigest {
+                product_id,
+                digest: digest.clone(),
+            });
+        }
+
+        Ok(ReproducibilityManifestValidation {
+            product_id,
+            input_count: manifest.input_digests.len(),
+            missing_digests,
+            valid: true,
+        })
+    }
+
+    pub fn manifest_count(&self) -> usize {
+        self.manifests.len()
+    }
+}
+
 impl AuditLedger {
     pub fn append_action(
         &mut self,
@@ -559,6 +658,28 @@ pub fn verify_audit_chain(entries: &[AuditEntry]) -> AuditChainVerification {
     }
 }
 
+pub fn build_reproducibility_manifest(
+    product: &LineageRecord,
+    input_digests: Vec<String>,
+    method_version: String,
+) -> Result<ReproducibilityManifest, ProvenanceError> {
+    let product = normalize_lineage_record(product.clone())?;
+    if product.kind != ArtifactKind::Product {
+        return Err(ProvenanceError::ManifestRequiresProduct {
+            artifact_id: product.artifact_id,
+            kind: product.kind,
+        });
+    }
+
+    normalize_reproducibility_manifest(ReproducibilityManifest {
+        product_id: product.artifact_id,
+        input_digests,
+        method: product.method,
+        method_version,
+        parameters: product.parameters,
+    })
+}
+
 fn audit_chain_breach(index: usize, reason: AuditChainBreachReason) -> AuditChainVerification {
     AuditChainVerification {
         verified: false,
@@ -635,6 +756,38 @@ fn normalize_evidence_object(
     object.evidence_kind =
         normalize_required_text(object.evidence_kind, ProvenanceError::EmptyEvidenceKind)?;
     Ok(object)
+}
+
+fn normalize_reproducibility_manifest(
+    mut manifest: ReproducibilityManifest,
+) -> Result<ReproducibilityManifest, ProvenanceError> {
+    manifest.product_id =
+        normalize_required_text(manifest.product_id, ProvenanceError::EmptyArtifactId)?;
+    manifest.input_digests = manifest
+        .input_digests
+        .into_iter()
+        .map(|digest| {
+            normalize_required_text(
+                digest,
+                ProvenanceError::EmptyManifestInputDigest {
+                    product_id: manifest.product_id.clone(),
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    manifest.method = normalize_required_text(
+        manifest.method,
+        ProvenanceError::EmptyMethod {
+            artifact_id: manifest.product_id.clone(),
+        },
+    )?;
+    manifest.method_version = normalize_required_text(
+        manifest.method_version,
+        ProvenanceError::EmptyMethodVersion {
+            product_id: manifest.product_id.clone(),
+        },
+    )?;
+    Ok(manifest)
 }
 
 fn canonical_evidence_bytes(object: &EvidenceObject) -> Result<Vec<u8>, ProvenanceError> {
@@ -733,9 +886,10 @@ fn normalize_optional_text_owned(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        verify_audit_chain, ActionContext, ActorIdentity, ActorKind, ArtifactKind, AuditAction,
-        AuditChainBreachReason, AuditLedger, AuditOutcome, AuditRefusalReason, EvidenceObject,
-        EvidenceStore, LineageLedger, LineageRecord, ProvenanceError, ProvenanceParameters,
+        build_reproducibility_manifest, verify_audit_chain, ActionContext, ActorIdentity,
+        ActorKind, ArtifactKind, AuditAction, AuditChainBreachReason, AuditLedger, AuditOutcome,
+        AuditRefusalReason, EvidenceObject, EvidenceStore, LineageLedger, LineageRecord,
+        ProvenanceError, ProvenanceParameters, ReproducibilityManifestStore,
     };
 
     #[test]
@@ -1052,6 +1206,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reproducibility_manifest_lists_input_digests_method_version_and_parameters() {
+        let mut evidence_store = EvidenceStore::default();
+        let scene_evidence = evidence_store
+            .store_evidence(scene_evidence())
+            .expect("scene evidence should store");
+        let calibration_evidence = evidence_store
+            .store_evidence(calibration_evidence())
+            .expect("calibration evidence should store");
+        let product = product_lineage();
+
+        let manifest = build_reproducibility_manifest(
+            &product,
+            vec![
+                scene_evidence.digest.clone(),
+                calibration_evidence.digest.clone(),
+            ],
+            "05.ndvi_product.v2".to_string(),
+        )
+        .expect("manifest should build for product lineage");
+
+        assert_eq!(manifest.product_id, "product:ndvi:alpha-2026-06-12");
+        assert_eq!(
+            manifest.input_digests,
+            vec![scene_evidence.digest, calibration_evidence.digest]
+        );
+        assert_eq!(manifest.method, "05.ndvi_product");
+        assert_eq!(manifest.method_version, "05.ndvi_product.v2");
+        assert_eq!(
+            manifest.parameters,
+            ProvenanceParameters::from_json(serde_json::json!({
+                "red_band": "B04",
+                "nir_band": "B08"
+            }))
+        );
+
+        let mut manifest_store = ReproducibilityManifestStore::default();
+        let stored = manifest_store
+            .record_manifest(manifest.clone())
+            .expect("manifest should persist");
+        assert_eq!(stored, manifest);
+        assert_eq!(
+            manifest_store.fetch_manifest("product:ndvi:alpha-2026-06-12"),
+            Some(manifest.clone())
+        );
+
+        let validation = manifest_store
+            .validate_manifest_inputs("product:ndvi:alpha-2026-06-12", &evidence_store)
+            .expect("all input digests should validate");
+        assert!(validation.valid);
+        assert_eq!(validation.input_count, 2);
+        assert!(validation.missing_digests.is_empty());
+    }
+
+    #[test]
+    fn reproducibility_manifest_validation_fails_on_missing_input_digest() {
+        let mut evidence_store = EvidenceStore::default();
+        let present = evidence_store
+            .store_evidence(scene_evidence())
+            .expect("scene evidence should store");
+        let missing = "sha256:missing-input-digest".to_string();
+        let manifest = build_reproducibility_manifest(
+            &product_lineage(),
+            vec![present.digest, missing.clone()],
+            "05.ndvi_product.v2".to_string(),
+        )
+        .expect("manifest should build");
+        let mut manifest_store = ReproducibilityManifestStore::default();
+        manifest_store
+            .record_manifest(manifest)
+            .expect("manifest should persist");
+
+        let error = manifest_store
+            .validate_manifest_inputs("product:ndvi:alpha-2026-06-12", &evidence_store)
+            .expect_err("missing input digest should block validation");
+
+        assert_eq!(
+            error,
+            ProvenanceError::MissingManifestInputDigest {
+                product_id: "product:ndvi:alpha-2026-06-12".to_string(),
+                digest: missing
+            }
+        );
+    }
+
+    #[test]
+    fn reproducibility_manifest_requires_product_lineage() {
+        let error = build_reproducibility_manifest(
+            &scene_lineage(),
+            vec!["sha256:scene-input".to_string()],
+            "04.capture_session_scene.v1".to_string(),
+        )
+        .expect_err("scene lineage should not get a product manifest");
+
+        assert_eq!(
+            error,
+            ProvenanceError::ManifestRequiresProduct {
+                artifact_id: "scene:alpha-2026-06-12".to_string(),
+                kind: ArtifactKind::Scene,
+            }
+        );
+    }
+
     fn seed_product(ledger: &mut LineageLedger) {
         ledger
             .record_lineage(scene_lineage())
@@ -1179,6 +1436,27 @@ mod tests {
                     "pixels_flagged": 1842,
                     "pixels_total": 12000
                 }
+            }),
+        }
+    }
+
+    fn scene_evidence() -> EvidenceObject {
+        EvidenceObject {
+            evidence_kind: "scene_input".to_string(),
+            payload: serde_json::json!({
+                "scene_ref": "scene:alpha-2026-06-12",
+                "bands": ["B04", "B08"],
+                "crs": "EPSG:32610"
+            }),
+        }
+    }
+
+    fn calibration_evidence() -> EvidenceObject {
+        EvidenceObject {
+            evidence_kind: "calibration_input".to_string(),
+            payload: serde_json::json!({
+                "calibration_ref": "calibration:multispectral-rig-2:2026-06",
+                "panel_reflectance": 0.72
             }),
         }
     }
