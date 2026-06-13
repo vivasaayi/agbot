@@ -5,6 +5,7 @@
 #include "agbot_flight_sim/LidarSimulator.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/MissionPreview.hpp"
+#include "agbot_flight_sim/MultispectralCamera.hpp"
 #include "agbot_flight_sim/SensorModel.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
 #include "agbot_flight_sim/SimulationOps.hpp"
@@ -675,6 +676,120 @@ agbot::flight_sim::RunConfig unit_run_config() {
     return config;
 }
 
+agbot::flight_sim::ElevationComposite available_terrain_for_center(const GeoCoordinate& center) {
+    const TileCoordinate tile_coordinate = agbot::flight_sim::tile_for_geo(center, 14);
+    std::vector<std::uint8_t> pixels(2 * 2 * 4, 0);
+    write_terrarium_pixel(pixels, 0, 10.0f);
+    write_terrarium_pixel(pixels, 1, 12.0f);
+    write_terrarium_pixel(pixels, 2, 14.0f);
+    write_terrarium_pixel(pixels, 3, 16.0f);
+    const auto tile = agbot::flight_sim::elevation_tile_from_terrarium_rgba(
+        tile_coordinate,
+        2,
+        2,
+        pixels);
+    assert(tile.has_value());
+    return agbot::flight_sim::composite_elevation_with_state(
+        {*tile},
+        tile_coordinate.bounds(),
+        8,
+        {tile_coordinate});
+}
+
+const agbot::flight_sim::MultispectralBandImage& band_by_name(
+    const agbot::flight_sim::MultispectralCapture& capture,
+    const std::string& name) {
+    const auto iter = std::find_if(capture.bands.begin(), capture.bands.end(), [&](const auto& band) {
+        return band.name == name;
+    });
+    assert(iter != capture.bands.end());
+    return *iter;
+}
+
+void test_multispectral_capture_emits_georeferenced_bands_round_trip() {
+    const GeoCoordinate home = agbot::flight_sim::tile_for_geo({37.7749, -122.4194, 0.0}, 14).bounds().center();
+    agbot::flight_sim::Mission mission;
+    mission.name = "Multispectral Mission";
+    mission.home_geo = home;
+    mission.home = {};
+    mission.waypoints.push_back({"capture", {0.0, 45.0, 0.0}, home});
+    const auto terrain = available_terrain_for_center(home);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {0.0, 45.0, 0.0};
+    agbot::flight_sim::MultispectralCameraConfig config;
+    config.width = 8;
+    config.height = 6;
+
+    const auto capture = agbot::flight_sim::capture_multispectral_bands(
+        state,
+        mission,
+        terrain,
+        config);
+
+    assert(capture.ok());
+    assert(capture.spatial_ref.georeferenced);
+    assert(capture.spatial_ref.crs == "EPSG:4326");
+    assert(capture.bands.size() == 4);
+    assert(capture.spatial_ref.extent.min_latitude < home.latitude);
+    assert(capture.spatial_ref.extent.max_latitude > home.latitude);
+    assert(capture.spatial_ref.extent.min_longitude < home.longitude);
+    assert(capture.spatial_ref.extent.max_longitude > home.longitude);
+
+    const auto coordinate = capture.spatial_ref.coordinate_for_pixel(3.0, 2.0);
+    assert(coordinate.has_value());
+    const auto pixel = capture.spatial_ref.pixel_for_coordinate(*coordinate);
+    assert(pixel.has_value());
+    assert(std::abs((*pixel)[0] - 3.0) < 1e-9);
+    assert(std::abs((*pixel)[1] - 2.0) < 1e-9);
+
+    const auto center_pixel = capture.spatial_ref.pixel_for_coordinate(home);
+    assert(center_pixel.has_value());
+    assert((*center_pixel)[0] >= 0.0);
+    assert((*center_pixel)[0] < static_cast<double>(config.width));
+    assert((*center_pixel)[1] >= 0.0);
+    assert((*center_pixel)[1] < static_cast<double>(config.height));
+
+    const auto& red = band_by_name(capture, "Red");
+    const auto& green = band_by_name(capture, "Green");
+    const auto& blue = band_by_name(capture, "Blue");
+    const auto& nir = band_by_name(capture, "NIR");
+    assert(red.width == config.width);
+    assert(red.height == config.height);
+    assert(nir.sample(4, 3) > red.sample(4, 3));
+    assert(green.sample(4, 3) > blue.sample(4, 3));
+    assert(capture.to_json().find("\"crs\":\"EPSG:4326\"") != std::string::npos);
+    assert(capture.to_json().find("\"bbox\":{\"min_lon\":") != std::string::npos);
+    assert(capture.to_json().find("\"geo_transform\":[") != std::string::npos);
+    assert(capture.to_json().find("\"resolution\":{\"x\":") != std::string::npos);
+}
+
+void test_multispectral_capture_reports_no_coverage_outside_terrain() {
+    const GeoCoordinate home = agbot::flight_sim::tile_for_geo({37.7749, -122.4194, 0.0}, 14).bounds().center();
+    agbot::flight_sim::Mission mission;
+    mission.name = "Multispectral No Coverage";
+    mission.home_geo = home;
+    mission.home = {};
+    mission.waypoints.push_back({"capture", {0.0, 45.0, 0.0}, home});
+    const auto terrain = available_terrain_for_center(home);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {20'000.0, 45.0, 20'000.0};
+
+    const auto capture = agbot::flight_sim::capture_multispectral_bands(
+        state,
+        mission,
+        terrain,
+        {});
+
+    assert(!capture.ok());
+    assert(capture.status == "no_coverage");
+    assert(capture.bands.empty());
+    assert(!capture.spatial_ref.georeferenced);
+    assert(capture.to_json().find("\"status\":\"no_coverage\"") != std::string::npos);
+    assert(capture.to_json().find("outside terrain tile coverage") != std::string::npos);
+}
+
 // Story 02-25: the same mission + seed + timestep produces byte-identical
 // output, and the manifest hashes match (TELEM byte-identity).
 void test_deterministic_runner_is_byte_identical() {
@@ -1198,6 +1313,8 @@ int main() {
     test_lidar_raycast_seeded_cloud_json_is_reproducible();
     test_lidar_raycast_empty_scene_returns_empty_capture_scan();
     test_lidar_flat_fallback_terrain_covers_offset_mission_footprint();
+    test_multispectral_capture_emits_georeferenced_bands_round_trip();
+    test_multispectral_capture_reports_no_coverage_outside_terrain();
     test_deterministic_runner_is_byte_identical();
     test_deterministic_runner_seed_drives_prng();
     test_deterministic_runner_emits_capture_shaped_lidar_jsonl();
