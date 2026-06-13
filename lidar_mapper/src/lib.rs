@@ -100,6 +100,15 @@ pub struct LidarOccupancyGridEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarObstacleHeatmapEvidence {
+    pub occupancy: LidarOccupancyGridEvidence,
+    pub max_obstacle_count: usize,
+    pub spatial_ref: RasterSpatialRef,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LidarPointCloudProvenance {
     pub scan_ids: Vec<Uuid>,
     pub captured_at: Vec<DateTime<Utc>>,
@@ -369,7 +378,7 @@ impl LidarMapper {
         self.save_point_cloud(&all_scans, output_dir).await?;
 
         // Generate obstacle heatmap
-        self.save_obstacle_heatmap(&grid.cells, output_dir).await?;
+        self.save_obstacle_heatmap(&grid, output_dir).await?;
 
         info!("LiDAR mapping completed");
         Ok(())
@@ -1357,36 +1366,30 @@ impl LidarMapper {
 
     async fn save_obstacle_heatmap(
         &self,
-        grid: &HashMap<(i32, i32), GridCell>,
+        grid: &LidarOccupancyGrid,
         output_dir: &PathBuf,
     ) -> AgroResult<()> {
-        // Find grid bounds
-        let min_x = grid.keys().map(|(x, _)| *x).min().unwrap_or(0);
-        let max_x = grid.keys().map(|(x, _)| *x).max().unwrap_or(0);
-        let min_y = grid.keys().map(|(_, y)| *y).min().unwrap_or(0);
-        let max_y = grid.keys().map(|(_, y)| *y).max().unwrap_or(0);
-
-        let width = (max_x - min_x + 1) as u32;
-        let height = (max_y - min_y + 1) as u32;
-
-        let mut img = image::ImageBuffer::new(width, height);
-        let flip_y = self.config.processing.lidar_image_flip_y;
-
-        // Find max obstacle count for normalization
-        let max_count = grid
+        let width = grid.width.max(1);
+        let height = grid.height.max(1);
+        let max_obstacle_count = grid
+            .cells
             .values()
             .map(|cell| cell.obstacle_count)
             .max()
-            .unwrap_or(1);
+            .unwrap_or(0);
+        let low_color = Self::obstacle_heatmap_color(0, max_obstacle_count);
+        let mut img = image::ImageBuffer::from_pixel(width, height, image::Rgb(low_color));
 
-        for ((grid_x, grid_y), cell) in grid {
-            let pixel_x = (*grid_x - min_x) as u32;
-            let py = (*grid_y - min_y) as u32;
-            let pixel_y = if flip_y { height - 1 - py } else { py };
+        for ((grid_x, grid_y), cell) in &grid.cells {
+            let pixel_x = (*grid_x - grid.min_grid_x) as u32;
+            let py = (*grid_y - grid.min_grid_y) as u32;
+            let pixel_y = if grid.evidence.flip_y {
+                height - 1 - py
+            } else {
+                py
+            };
 
-            // Create heat map based on obstacle density
-            let intensity = (cell.obstacle_count as f32 / max_count as f32 * 255.0) as u8;
-            let color = [intensity, 0u8, 255u8 - intensity]; // Blue to red gradient
+            let color = Self::obstacle_heatmap_color(cell.obstacle_count, max_obstacle_count);
 
             if pixel_x < width && pixel_y < height {
                 img.put_pixel(pixel_x, pixel_y, image::Rgb(color));
@@ -1399,6 +1402,45 @@ impl LidarMapper {
         })?;
 
         info!("Saved obstacle heatmap to: {:?}", output_path);
+        self.save_obstacle_heatmap_evidence(
+            &Self::obstacle_heatmap_evidence(grid, max_obstacle_count),
+            output_dir,
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn obstacle_heatmap_color(obstacle_count: usize, max_obstacle_count: usize) -> [u8; 3] {
+        if max_obstacle_count == 0 {
+            return [0, 0, 255];
+        }
+
+        let intensity = (obstacle_count as f32 / max_obstacle_count as f32 * 255.0).round() as u8;
+        [intensity, 0, 255u8.saturating_sub(intensity)]
+    }
+
+    fn obstacle_heatmap_evidence(
+        grid: &LidarOccupancyGrid,
+        max_obstacle_count: usize,
+    ) -> LidarObstacleHeatmapEvidence {
+        LidarObstacleHeatmapEvidence {
+            occupancy: grid.evidence,
+            max_obstacle_count,
+            spatial_ref: grid.spatial_ref.clone(),
+            width: grid.width,
+            height: grid.height,
+        }
+    }
+
+    async fn save_obstacle_heatmap_evidence(
+        &self,
+        evidence: &LidarObstacleHeatmapEvidence,
+        output_dir: &PathBuf,
+    ) -> AgroResult<()> {
+        let output_path = output_dir.join("obstacle_heatmap_evidence.json");
+        let content = serde_json::to_vec_pretty(evidence)?;
+        tokio::fs::write(&output_path, content).await?;
+        info!("Saved obstacle heatmap evidence to: {:?}", output_path);
         Ok(())
     }
 }
@@ -1489,6 +1531,24 @@ mod tests {
             .skip(1)
             .filter(|line| !line.trim().is_empty())
             .collect()
+    }
+
+    fn heatmap_test_grid(
+        mapper: &LidarMapper,
+        cells: Vec<((i32, i32), GridCell)>,
+        width: u32,
+        height: u32,
+    ) -> LidarOccupancyGrid {
+        LidarOccupancyGrid {
+            cells: cells.into_iter().collect(),
+            spatial_ref: LidarMapper::occupancy_grid_spatial_ref(0, 0, width, height, 1.0).unwrap(),
+            resolution: RasterResolution { x: 1.0, y: 1.0 },
+            evidence: mapper.occupancy_grid_evidence().unwrap(),
+            width,
+            height,
+            min_grid_x: 0,
+            min_grid_y: 0,
+        }
     }
 
     fn normal_estimate(point_index: usize, z: f64) -> LidarNormalEstimate {
@@ -1768,6 +1828,82 @@ mod tests {
         assert!(provenance.captured_at.is_empty());
         assert_eq!(provenance.point_count, 0);
         assert!(provenance.frame_crs_note.contains(OCCUPANCY_GRID_LOCAL_CRS));
+    }
+
+    #[tokio::test]
+    async fn save_obstacle_heatmap_maps_density_and_records_thresholds() {
+        let mapper = test_mapper_with_occupancy_controls(1.0, 2.5, 42, 0.75, false);
+        let output_dir = temp_dir("heatmap_export");
+        let grid = heatmap_test_grid(
+            &mapper,
+            vec![
+                (
+                    (0, 0),
+                    GridCell {
+                        occupied: false,
+                        obstacle_count: 0,
+                        total_observations: 4,
+                    },
+                ),
+                (
+                    (1, 0),
+                    GridCell {
+                        occupied: true,
+                        obstacle_count: 4,
+                        total_observations: 4,
+                    },
+                ),
+            ],
+            2,
+            1,
+        );
+
+        mapper
+            .save_obstacle_heatmap(&grid, &output_dir)
+            .await
+            .unwrap();
+
+        let image = image::open(output_dir.join("obstacle_heatmap.png"))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(image.dimensions(), (2, 1));
+        assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255]);
+        assert_eq!(image.get_pixel(1, 0).0, [255, 0, 0]);
+
+        let evidence: LidarObstacleHeatmapEvidence = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("obstacle_heatmap_evidence.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.occupancy, grid.evidence);
+        assert_eq!(evidence.max_obstacle_count, 4);
+        assert_eq!(evidence.width, 2);
+        assert_eq!(evidence.height, 1);
+        assert_eq!(evidence.spatial_ref.bbox, grid.spatial_ref.bbox);
+    }
+
+    #[tokio::test]
+    async fn save_obstacle_heatmap_empty_grid_is_uniform_low() {
+        let mapper = test_mapper_with_occupancy_controls(1.0, 5.0, 0, 0.5, false);
+        let output_dir = temp_dir("heatmap_empty_export");
+        let grid = heatmap_test_grid(&mapper, vec![], 1, 1);
+
+        mapper
+            .save_obstacle_heatmap(&grid, &output_dir)
+            .await
+            .unwrap();
+
+        let image = image::open(output_dir.join("obstacle_heatmap.png"))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(image.dimensions(), (1, 1));
+        assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255]);
+
+        let evidence: LidarObstacleHeatmapEvidence = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("obstacle_heatmap_evidence.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.max_obstacle_count, 0);
+        assert_eq!(evidence.occupancy, grid.evidence);
     }
 
     #[test]
