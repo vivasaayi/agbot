@@ -3,6 +3,7 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use nalgebra::{Matrix3, SymmetricEigen, Vector3};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use shared::{
     config::AgroConfig,
     schemas::{
@@ -137,6 +138,57 @@ pub struct LidarObstacleHeatmapEvidence {
     pub spatial_ref: RasterSpatialRef,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LidarProductOutputHash {
+    pub algorithm: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LidarObservationCounts {
+    pub occupied_cells: usize,
+    pub free_observed_cells: usize,
+    pub obstacle_observations: usize,
+    pub total_observations: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarProductReproducibilityEvidence {
+    pub product_kind: String,
+    pub scan_ids: Vec<Uuid>,
+    pub cleaning_params: Option<LidarOutlierRemovalParams>,
+    pub thresholds: LidarOccupancyGridEvidence,
+    pub observation_counts: LidarObservationCounts,
+    pub spatial_ref: RasterSpatialRef,
+    pub width: u32,
+    pub height: u32,
+    pub output_hash: LidarProductOutputHash,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CanonicalLidarOccupancyProduct {
+    product_kind: String,
+    scan_ids: Vec<Uuid>,
+    cleaning_params: Option<LidarOutlierRemovalParams>,
+    thresholds: LidarOccupancyGridEvidence,
+    observation_counts: LidarObservationCounts,
+    spatial_ref: RasterSpatialRef,
+    width: u32,
+    height: u32,
+    min_grid_x: i32,
+    min_grid_y: i32,
+    cells: Vec<CanonicalLidarOccupancyCell>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CanonicalLidarOccupancyCell {
+    grid_x: i32,
+    grid_y: i32,
+    occupied: bool,
+    obstacle_count: usize,
+    total_observations: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -483,12 +535,18 @@ impl LidarMapper {
         let cleaned = self.clean_scans(&ingest.scans)?;
         self.save_outlier_removal_evidence(&cleaned.evidence, output_dir)
             .await?;
+        let cleaning_params = cleaned.evidence.params;
         let all_scans = cleaned.scans;
 
         // Create occupancy grid
         let grid = self.build_occupancy_grid(&all_scans)?;
         self.save_occupancy_spatial_ref(&grid, output_dir).await?;
         self.save_occupancy_grid_evidence(&grid.evidence, output_dir)
+            .await?;
+        let scan_ids = all_scans.iter().map(|scan| scan.scan_id).collect();
+        let product_evidence =
+            self.occupancy_grid_reproducibility_evidence(&grid, scan_ids, Some(cleaning_params))?;
+        self.save_lidar_product_reproducibility_evidence(&product_evidence, output_dir)
             .await?;
         let coverage_evidence =
             self.coverage_density_evidence(&grid, DEFAULT_LIDAR_COVERAGE_FLOOR)?;
@@ -1532,6 +1590,90 @@ impl LidarMapper {
         })
     }
 
+    pub fn occupancy_grid_reproducibility_evidence(
+        &self,
+        grid: &LidarOccupancyGrid,
+        scan_ids: Vec<Uuid>,
+        cleaning_params: Option<LidarOutlierRemovalParams>,
+    ) -> AgroResult<LidarProductReproducibilityEvidence> {
+        let observation_counts = Self::occupancy_observation_counts(grid);
+        let canonical = CanonicalLidarOccupancyProduct {
+            product_kind: "occupancy_grid".to_string(),
+            scan_ids: scan_ids.clone(),
+            cleaning_params,
+            thresholds: grid.evidence,
+            observation_counts: observation_counts.clone(),
+            spatial_ref: grid.spatial_ref.clone(),
+            width: grid.width,
+            height: grid.height,
+            min_grid_x: grid.min_grid_x,
+            min_grid_y: grid.min_grid_y,
+            cells: Self::canonical_occupancy_cells(grid),
+        };
+        let output_hash = Self::sha256_json(&canonical)?;
+
+        Ok(LidarProductReproducibilityEvidence {
+            product_kind: "occupancy_grid".to_string(),
+            scan_ids,
+            cleaning_params,
+            thresholds: grid.evidence,
+            observation_counts,
+            spatial_ref: grid.spatial_ref.clone(),
+            width: grid.width,
+            height: grid.height,
+            output_hash,
+        })
+    }
+
+    fn occupancy_observation_counts(grid: &LidarOccupancyGrid) -> LidarObservationCounts {
+        let occupied_cells = grid.cells.values().filter(|cell| cell.occupied).count();
+        let observed_cells = grid
+            .cells
+            .values()
+            .filter(|cell| cell.total_observations > 0)
+            .count();
+        LidarObservationCounts {
+            occupied_cells,
+            free_observed_cells: observed_cells.saturating_sub(occupied_cells),
+            obstacle_observations: grid.cells.values().map(|cell| cell.obstacle_count).sum(),
+            total_observations: grid
+                .cells
+                .values()
+                .map(|cell| cell.total_observations)
+                .sum(),
+        }
+    }
+
+    fn canonical_occupancy_cells(grid: &LidarOccupancyGrid) -> Vec<CanonicalLidarOccupancyCell> {
+        let mut cells = grid
+            .cells
+            .iter()
+            .map(|((grid_x, grid_y), cell)| CanonicalLidarOccupancyCell {
+                grid_x: *grid_x,
+                grid_y: *grid_y,
+                occupied: cell.occupied,
+                obstacle_count: cell.obstacle_count,
+                total_observations: cell.total_observations,
+            })
+            .collect::<Vec<_>>();
+        cells.sort_by(|left, right| {
+            left.grid_y
+                .cmp(&right.grid_y)
+                .then_with(|| left.grid_x.cmp(&right.grid_x))
+        });
+        cells
+    }
+
+    fn sha256_json<T: Serialize>(value: &T) -> AgroResult<LidarProductOutputHash> {
+        let bytes = serde_json::to_vec(value)?;
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        Ok(LidarProductOutputHash {
+            algorithm: "sha256".to_string(),
+            value: format!("{:x}", hasher.finalize()),
+        })
+    }
+
     fn grid_coordinate(value_m: f64, resolution_m: f32) -> i32 {
         let scaled = value_m / resolution_m as f64;
         let nearest = scaled.round();
@@ -1628,6 +1770,21 @@ impl LidarMapper {
         let content = serde_json::to_vec_pretty(evidence)?;
         tokio::fs::write(&output_path, content).await?;
         info!("Saved LiDAR occupancy grid evidence to: {:?}", output_path);
+        Ok(())
+    }
+
+    async fn save_lidar_product_reproducibility_evidence(
+        &self,
+        evidence: &LidarProductReproducibilityEvidence,
+        output_dir: &PathBuf,
+    ) -> AgroResult<()> {
+        let output_path = output_dir.join("lidar_occupancy_grid_reproducibility.json");
+        let content = serde_json::to_vec_pretty(evidence)?;
+        tokio::fs::write(&output_path, content).await?;
+        info!(
+            "Saved LiDAR product reproducibility evidence to: {:?}",
+            output_path
+        );
         Ok(())
     }
 
@@ -2222,6 +2379,90 @@ mod tests {
         let persisted: LidarOccupancyGridEvidence =
             serde_json::from_str(&fs::read_to_string(persisted_path).unwrap()).unwrap();
         assert_eq!(persisted, evidence);
+    }
+
+    #[test]
+    fn occupancy_grid_reproducibility_cites_sources_thresholds_counts_and_hash() {
+        let mapper = test_mapper_with_occupancy_controls(1.0, 2.5, 42, 0.75, false);
+        let scan_id = Uuid::new_v4();
+        let cleaning_params = LidarOutlierRemovalParams {
+            k_neighbors: 4,
+            stddev_multiplier: 1.5,
+        };
+        let grid = heatmap_test_grid(
+            &mapper,
+            vec![
+                (
+                    (0, 0),
+                    GridCell {
+                        occupied: true,
+                        obstacle_count: 3,
+                        total_observations: 4,
+                    },
+                ),
+                (
+                    (1, 0),
+                    GridCell {
+                        occupied: false,
+                        obstacle_count: 1,
+                        total_observations: 4,
+                    },
+                ),
+            ],
+            2,
+            1,
+        );
+
+        let evidence = mapper
+            .occupancy_grid_reproducibility_evidence(&grid, vec![scan_id], Some(cleaning_params))
+            .unwrap();
+
+        assert_eq!(evidence.product_kind, "occupancy_grid");
+        assert_eq!(evidence.scan_ids, vec![scan_id]);
+        assert_eq!(evidence.cleaning_params, Some(cleaning_params));
+        assert_eq!(evidence.thresholds, grid.evidence);
+        assert_eq!(evidence.observation_counts.occupied_cells, 1);
+        assert_eq!(evidence.observation_counts.total_observations, 8);
+        assert_eq!(evidence.observation_counts.obstacle_observations, 4);
+        assert_eq!(evidence.spatial_ref, grid.spatial_ref);
+        assert_eq!(evidence.output_hash.algorithm, "sha256");
+        assert_eq!(evidence.output_hash.value.len(), 64);
+    }
+
+    #[test]
+    fn occupancy_grid_reproducibility_hash_is_order_stable() {
+        let mapper = test_mapper();
+        let cells = vec![
+            (
+                (0, 0),
+                GridCell {
+                    occupied: true,
+                    obstacle_count: 2,
+                    total_observations: 3,
+                },
+            ),
+            (
+                (1, 0),
+                GridCell {
+                    occupied: false,
+                    obstacle_count: 0,
+                    total_observations: 2,
+                },
+            ),
+        ];
+        let reversed_cells = cells.iter().cloned().rev().collect::<Vec<_>>();
+        let scan_id = Uuid::new_v4();
+        let first = heatmap_test_grid(&mapper, cells, 2, 1);
+        let second = heatmap_test_grid(&mapper, reversed_cells, 2, 1);
+
+        let first_evidence = mapper
+            .occupancy_grid_reproducibility_evidence(&first, vec![scan_id], None)
+            .unwrap();
+        let second_evidence = mapper
+            .occupancy_grid_reproducibility_evidence(&second, vec![scan_id], None)
+            .unwrap();
+
+        assert_eq!(first_evidence.output_hash, second_evidence.output_hash);
     }
 
     #[test]
