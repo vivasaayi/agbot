@@ -22,6 +22,31 @@ pub struct SimulatedCaptureFrame {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulatedCapturePath {
+    pub session_id: Uuid,
+    pub flight_id: Uuid,
+    pub drone_id: Uuid,
+    pub simulation_mission_id: Uuid,
+    pub steps: Vec<SimulatedCapturePathStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SimulatedCapturePathStep {
+    Fix {
+        observed_at: DateTime<Utc>,
+        position: GpsCoords,
+        observations: Vec<SimulatedSensorObservation>,
+    },
+    Gap {
+        started_at: DateTime<Utc>,
+        ended_at: DateTime<Utc>,
+        sensor_id: String,
+        data_type: DataType,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SimulatedSensorObservation {
     Telemetry {
         sensor_id: String,

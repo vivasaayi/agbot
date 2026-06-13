@@ -25,7 +25,8 @@ pub use rplidar::{
 pub use simulated_capture::{
     flight_sim_cpp_lidar_observation_from_json, flight_sim_cpp_multispectral_observation_from_json,
     simulated_capture_frame_to_batch, SimulatedCaptureBatch, SimulatedCaptureError,
-    SimulatedCaptureFrame, SimulatedSensorObservation,
+    SimulatedCaptureFrame, SimulatedCapturePath, SimulatedCapturePathStep,
+    SimulatedSensorObservation,
 };
 pub use storage::{StorageConfig, StorageEngine};
 
@@ -950,6 +951,59 @@ impl DataCollectorService {
         Ok(batch)
     }
 
+    pub async fn collect_simulated_capture_path(
+        &mut self,
+        path: SimulatedCapturePath,
+    ) -> Result<SimulatedCaptureBatch> {
+        let mut aggregate = SimulatedCaptureBatch {
+            records: Vec::new(),
+            failures: Vec::new(),
+        };
+
+        for step in path.steps {
+            match step {
+                SimulatedCapturePathStep::Fix {
+                    observed_at,
+                    position,
+                    observations,
+                } => {
+                    let frame = SimulatedCaptureFrame {
+                        session_id: path.session_id,
+                        flight_id: path.flight_id,
+                        drone_id: path.drone_id,
+                        simulation_mission_id: path.simulation_mission_id,
+                        observed_at,
+                        position,
+                        observations,
+                    };
+                    let batch = self.collect_simulated_capture_frame(frame).await?;
+                    aggregate.records.extend(batch.records);
+                    aggregate.failures.extend(batch.failures);
+                }
+                SimulatedCapturePathStep::Gap {
+                    started_at,
+                    ended_at,
+                    sensor_id,
+                    data_type,
+                    message,
+                } => {
+                    let failure = CollectionFailureRequest {
+                        occurred_at: Some(started_at),
+                        sensor_id,
+                        data_type,
+                        kind: CollectionFailureKind::SensorDropout,
+                        message: format!("{message}; gap_end={}", ended_at.to_rfc3339()),
+                    };
+                    self.record_collection_failure(&path.session_id, failure.clone())
+                        .await?;
+                    aggregate.failures.push(failure);
+                }
+            }
+        }
+
+        Ok(aggregate)
+    }
+
     pub async fn get_session(&self, session_id: &Uuid) -> Result<Option<FlightSession>> {
         if let Some(session) = self.active_sessions.get(session_id) {
             Ok(Some(session.clone()))
@@ -1138,6 +1192,7 @@ pub struct StorageStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use tempfile::tempdir;
 
     fn capture_request() -> CaptureSessionRequest {
@@ -1155,6 +1210,14 @@ mod tests {
             latitude: 40.0,
             longitude: -105.0,
             altitude: 30.0,
+        }
+    }
+
+    fn gps_coords_at(latitude: f64, longitude: f64, altitude: f64) -> GpsCoords {
+        GpsCoords {
+            latitude,
+            longitude,
+            altitude,
         }
     }
 
@@ -1270,6 +1333,17 @@ mod tests {
                     message: "simulated sensor dropout".to_string(),
                 },
             ],
+        }
+    }
+
+    fn telemetry_observation(sensor_id: &str) -> SimulatedSensorObservation {
+        SimulatedSensorObservation::Telemetry {
+            sensor_id: sensor_id.to_string(),
+            calibration_ref: "sim-telemetry-v1".to_string(),
+            velocity: (1.0, 0.0, 0.0),
+            orientation: (0.0, 0.0, 0.0),
+            battery_level: 0.88,
+            signal_strength: 0.99,
         }
     }
 
@@ -1450,6 +1524,128 @@ mod tests {
                 .copied(),
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn simulated_flight_path_georeferences_records_to_path_points() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let request = capture_request().with_mission_id(Uuid::new_v4());
+        let session_id = start_linked_capture_session(&mut service, request).await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let first_time = Utc.timestamp_opt(1_800_100_000, 0).unwrap();
+        let second_time = Utc.timestamp_opt(1_800_100_030, 0).unwrap();
+        let first_position = gps_coords_at(37.0, -122.0, 101.0);
+        let second_position = gps_coords_at(37.0002, -122.0004, 103.5);
+
+        let batch = service
+            .collect_simulated_capture_path(SimulatedCapturePath {
+                session_id: session.id,
+                flight_id: session.flight_id,
+                drone_id: session.drone_id,
+                simulation_mission_id: session.mission_id.unwrap(),
+                steps: vec![
+                    SimulatedCapturePathStep::Fix {
+                        observed_at: first_time,
+                        position: first_position.clone(),
+                        observations: vec![telemetry_observation("sim-telemetry-front")],
+                    },
+                    SimulatedCapturePathStep::Fix {
+                        observed_at: second_time,
+                        position: second_position.clone(),
+                        observations: vec![telemetry_observation("sim-telemetry-front")],
+                    },
+                ],
+            })
+            .await
+            .expect("path capture persists");
+
+        assert_eq!(batch.records.len(), 2);
+        assert!(batch.failures.is_empty());
+        assert_eq!(batch.records[0].timestamp, first_time);
+        assert_eq!(batch.records[0].gps_coords, Some(first_position));
+        assert_eq!(batch.records[1].timestamp, second_time);
+        assert_eq!(batch.records[1].gps_coords, Some(second_position));
+        assert!(batch
+            .records
+            .iter()
+            .all(|record| record.validate_provenance().is_ok()));
+
+        let stored_session = service.get_session(&session_id).await.unwrap().unwrap();
+        assert_eq!(stored_session.summary.record_count, 2);
+        assert_eq!(
+            stored_session.summary.coverage.status,
+            CaptureCoverageStatus::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn simulated_flight_path_gap_becomes_coverage_hole_without_interpolation() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let request = capture_request().with_mission_id(Uuid::new_v4());
+        let session_id = start_linked_capture_session(&mut service, request).await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let first_time = Utc.timestamp_opt(1_800_200_000, 0).unwrap();
+        let gap_start = Utc.timestamp_opt(1_800_200_010, 0).unwrap();
+        let gap_end = Utc.timestamp_opt(1_800_200_020, 0).unwrap();
+        let second_time = Utc.timestamp_opt(1_800_200_030, 0).unwrap();
+
+        let batch = service
+            .collect_simulated_capture_path(SimulatedCapturePath {
+                session_id: session.id,
+                flight_id: session.flight_id,
+                drone_id: session.drone_id,
+                simulation_mission_id: session.mission_id.unwrap(),
+                steps: vec![
+                    SimulatedCapturePathStep::Fix {
+                        observed_at: first_time,
+                        position: gps_coords_at(37.0, -122.0, 101.0),
+                        observations: vec![telemetry_observation("sim-telemetry-front")],
+                    },
+                    SimulatedCapturePathStep::Gap {
+                        started_at: gap_start,
+                        ended_at: gap_end,
+                        sensor_id: "sim-telemetry-front".to_string(),
+                        data_type: DataType::Telemetry,
+                        message: "flight path gap: no telemetry fix".to_string(),
+                    },
+                    SimulatedCapturePathStep::Fix {
+                        observed_at: second_time,
+                        position: gps_coords_at(37.0003, -122.0005, 102.0),
+                        observations: vec![telemetry_observation("sim-telemetry-front")],
+                    },
+                ],
+            })
+            .await
+            .expect("path gap records coverage hole");
+
+        assert_eq!(batch.records.len(), 2);
+        assert_eq!(batch.failures.len(), 1);
+        assert_eq!(batch.failures[0].occurred_at, Some(gap_start));
+        assert_eq!(batch.failures[0].kind, CollectionFailureKind::SensorDropout);
+        assert!(batch.failures[0].message.contains("flight path gap"));
+        assert!(!batch
+            .records
+            .iter()
+            .any(|record| record.timestamp == gap_start));
+        assert!(!batch
+            .records
+            .iter()
+            .any(|record| record.timestamp == gap_end));
+
+        let stored_session = service.get_session(&session_id).await.unwrap().unwrap();
+        assert_eq!(stored_session.summary.record_count, 2);
+        assert_eq!(stored_session.summary.coverage.successful_records, 2);
+        assert_eq!(stored_session.summary.coverage.failed_observations, 1);
+        assert_eq!(stored_session.summary.coverage.expected_observations, 3);
+        assert_eq!(
+            stored_session.summary.coverage.status,
+            CaptureCoverageStatus::Partial
+        );
+        assert!((stored_session.summary.coverage.captured_fraction - (2.0 / 3.0)).abs() < 0.001);
     }
 
     #[tokio::test]
