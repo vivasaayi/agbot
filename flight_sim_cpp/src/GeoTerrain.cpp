@@ -121,6 +121,57 @@ void write_bounds_json(std::ostringstream& output, const GeoBounds& bounds) {
            << "}";
 }
 
+std::optional<GeoBounds> intersect_bounds(const GeoBounds& left, const GeoBounds& right) {
+    GeoBounds intersection {
+        std::max(left.min_latitude, right.min_latitude),
+        std::max(left.min_longitude, right.min_longitude),
+        std::min(left.max_latitude, right.max_latitude),
+        std::min(left.max_longitude, right.max_longitude),
+    };
+
+    if (intersection.max_latitude <= intersection.min_latitude ||
+        intersection.max_longitude <= intersection.min_longitude) {
+        return std::nullopt;
+    }
+    return intersection;
+}
+
+MapTextureTileStatus map_texture_status_for_tile(
+    const TileCoordinate& coordinate,
+    MapTextureTileState state,
+    const std::string& reason,
+    int texture_width,
+    int texture_height,
+    const TerrainProfile& profile) {
+    MapTextureTileStatus status;
+    status.coordinate = coordinate;
+    status.state = state;
+    status.reason = reason;
+    status.bounds = coordinate.bounds();
+    status.texture_width = texture_width;
+    status.texture_height = texture_height;
+
+    if (profile.asserted) {
+        const GeoCoordinate origin = profile.bounds.center();
+        const Vec3 local_north_west =
+            local_from_geo({status.bounds.max_latitude, status.bounds.min_longitude, 0.0}, origin);
+        const Vec3 local_south_east =
+            local_from_geo({status.bounds.min_latitude, status.bounds.max_longitude, 0.0}, origin);
+        status.local_min_x_m = std::min(local_north_west.x, local_south_east.x);
+        status.local_max_x_m = std::max(local_north_west.x, local_south_east.x);
+        status.local_min_z_m = std::min(local_north_west.z, local_south_east.z);
+        status.local_max_z_m = std::max(local_north_west.z, local_south_east.z);
+
+        if (const auto overlap = intersect_bounds(status.bounds, profile.bounds)) {
+            status.overlap_width_m = overlap->width_m();
+            status.overlap_height_m = overlap->height_m();
+            status.aligned = status.overlap_width_m > 0.0 && status.overlap_height_m > 0.0;
+        }
+    }
+
+    return status;
+}
+
 } // namespace
 
 GeoBounds GeoBounds::from_center(const GeoCoordinate& center, double radius_m) {
@@ -198,6 +249,47 @@ bool ElevationComposite::has_state(TerrainTileState state) const {
     });
 }
 
+bool MapTextureComposite::has_state(MapTextureTileState state) const {
+    return std::any_of(tile_states.begin(), tile_states.end(), [state](const MapTextureTileStatus& status) {
+        return status.state == state;
+    });
+}
+
+MapTextureAlignmentAssertion MapTextureComposite::assert_alignment(double geo_tolerance_m) const {
+    MapTextureAlignmentAssertion assertion;
+    assertion.tolerance_m = std::max(0.0, geo_tolerance_m);
+    assertion.total_tiles = tile_states.size();
+
+    if (!profile.asserted) {
+        assertion.reason = "texture_profile_unasserted";
+        return assertion;
+    }
+
+    if (tile_states.empty()) {
+        assertion.reason = "no_texture_tiles";
+        return assertion;
+    }
+
+    for (const MapTextureTileStatus& status : tile_states) {
+        if (status.state == MapTextureTileState::TileUnavailable) {
+            ++assertion.unavailable_tiles;
+        }
+        if (status.aligned) {
+            ++assertion.aligned_tiles;
+        }
+    }
+
+    assertion.ok = assertion.aligned_tiles == assertion.total_tiles;
+    if (!assertion.ok) {
+        assertion.reason = "texture_tile_misaligned";
+    } else if (assertion.unavailable_tiles > 0) {
+        assertion.reason = "texture_tiles_aligned_with_marked_fallbacks";
+    } else {
+        assertion.reason = "texture_tiles_aligned";
+    }
+    return assertion;
+}
+
 bool TerrainProfile::contains(const GeoCoordinate& coordinate) const {
     return asserted && bounds_contain(bounds, coordinate);
 }
@@ -264,6 +356,16 @@ const char* to_string(TerrainTileState state) {
             return "synthetic";
         case TerrainTileState::FlatFallback:
             return "flat_fallback";
+    }
+    return "unknown";
+}
+
+const char* to_string(MapTextureTileState state) {
+    switch (state) {
+        case MapTextureTileState::Available:
+            return "available";
+        case MapTextureTileState::TileUnavailable:
+            return "tile_unavailable";
     }
     return "unknown";
 }
@@ -412,6 +514,24 @@ std::optional<ElevationTile> elevation_tile_from_terrarium_rgba(
     return tile;
 }
 
+std::optional<MapTextureTile> map_texture_tile_from_rgba(
+    TileCoordinate coordinate,
+    int width,
+    int height,
+    const std::vector<std::uint8_t>& rgba_pixels) {
+    if (width <= 0 || height <= 0 || rgba_pixels.size() != static_cast<std::size_t>(width * height * 4)) {
+        return std::nullopt;
+    }
+
+    return MapTextureTile {
+        coordinate,
+        MapTextureTileState::Available,
+        "osm_rgba_decoded",
+        width,
+        height,
+    };
+}
+
 std::vector<float> composite_elevation(
     const std::vector<ElevationTile>& tiles,
     const GeoBounds& bounds,
@@ -482,6 +602,42 @@ ElevationComposite composite_elevation_with_state(
                 TerrainTileState::FlatFallback,
                 "missing elevation tile; using flat fallback heightmap",
             });
+        }
+    }
+
+    return composite;
+}
+
+MapTextureComposite composite_map_textures_with_state(
+    const std::vector<MapTextureTile>& tiles,
+    const GeoBounds& bounds,
+    int resolution,
+    const std::vector<TileCoordinate>& expected_tiles) {
+    MapTextureComposite composite;
+    composite.profile = terrain_profile_for_bounds(bounds, resolution);
+
+    for (const MapTextureTile& tile : tiles) {
+        composite.tile_states.push_back(map_texture_status_for_tile(
+            tile.coordinate,
+            tile.state,
+            tile.state_reason.empty() ? std::string("map texture tile available") : tile.state_reason,
+            tile.width,
+            tile.height,
+            composite.profile));
+    }
+
+    for (const TileCoordinate& expected : expected_tiles) {
+        const auto found = std::find_if(tiles.begin(), tiles.end(), [expected](const MapTextureTile& tile) {
+            return same_tile(tile.coordinate, expected);
+        });
+        if (found == tiles.end()) {
+            composite.tile_states.push_back(map_texture_status_for_tile(
+                expected,
+                MapTextureTileState::TileUnavailable,
+                "tile unavailable; using marked fallback texture",
+                0,
+                0,
+                composite.profile));
         }
     }
 
@@ -584,6 +740,46 @@ std::string terrain_tiles_json(const ElevationComposite& composite) {
         output << ",\"resolution\":" << composite.profile.resolution
                << ",\"resolution_x_m\":" << composite.profile.resolution_x_m
                << ",\"resolution_y_m\":" << composite.profile.resolution_y_m
+               << "}";
+    }
+    output << "]";
+    return output.str();
+}
+
+std::string map_texture_tiles_json(const MapTextureComposite& composite) {
+    if (composite.tile_states.empty() || !composite.profile.asserted) {
+        return "[]";
+    }
+
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(3) << "[";
+    for (std::size_t index = 0; index < composite.tile_states.size(); ++index) {
+        if (index > 0) {
+            output << ",";
+        }
+        const MapTextureTileStatus& status = composite.tile_states[index];
+        output << "{"
+               << "\"tile\":\"map/tile/z" << status.coordinate.z
+               << "/x" << status.coordinate.x
+               << "/y" << status.coordinate.y << "\""
+               << ",\"z\":" << status.coordinate.z
+               << ",\"x\":" << status.coordinate.x
+               << ",\"y\":" << status.coordinate.y
+               << ",\"state\":\"" << to_string(status.state) << "\""
+               << ",\"reason\":\"" << escape_json(status.reason) << "\""
+               << ",\"crs\":\"" << escape_json(composite.profile.crs) << "\"";
+        output << ",";
+        write_bounds_json(output, status.bounds);
+        output << ",\"resolution\":" << composite.profile.resolution
+               << ",\"texture_width\":" << status.texture_width
+               << ",\"texture_height\":" << status.texture_height
+               << ",\"overlap_width_m\":" << status.overlap_width_m
+               << ",\"overlap_height_m\":" << status.overlap_height_m
+               << ",\"local_min_x_m\":" << status.local_min_x_m
+               << ",\"local_max_x_m\":" << status.local_max_x_m
+               << ",\"local_min_z_m\":" << status.local_min_z_m
+               << ",\"local_max_z_m\":" << status.local_max_z_m
+               << ",\"aligned\":" << (status.aligned ? "true" : "false")
                << "}";
     }
     output << "]";

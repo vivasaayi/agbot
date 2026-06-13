@@ -565,6 +565,81 @@ void test_missing_terrain_tile_is_sampled_and_manifested_as_flat_fallback() {
     assert(failed_assertion.reason == "elevation_mismatch");
 }
 
+void test_map_texture_tiles_align_to_terrain_profile() {
+    const GeoCoordinate center {37.7749, -122.4194, 0.0};
+    const TileCoordinate tile_coordinate = agbot::flight_sim::tile_for_geo(center, 14);
+    const GeoBounds bounds = tile_coordinate.bounds();
+    const std::vector<std::uint8_t> rgba_pixels(2 * 2 * 4, 128);
+
+    const auto texture =
+        agbot::flight_sim::map_texture_tile_from_rgba(tile_coordinate, 2, 2, rgba_pixels);
+    assert(texture.has_value());
+    assert(!agbot::flight_sim::map_texture_tile_from_rgba(tile_coordinate, 2, 2, {1, 2, 3}).has_value());
+
+    const auto composite = agbot::flight_sim::composite_map_textures_with_state(
+        {*texture},
+        bounds,
+        4,
+        {tile_coordinate});
+
+    assert(composite.profile.asserted);
+    assert(composite.tile_states.size() == 1);
+    assert(composite.tile_states[0].state == agbot::flight_sim::MapTextureTileState::Available);
+    assert(composite.tile_states[0].aligned);
+    assert(composite.tile_states[0].texture_width == 2);
+    assert(composite.tile_states[0].texture_height == 2);
+    assert(composite.tile_states[0].overlap_width_m > 0.0);
+    assert(composite.tile_states[0].overlap_height_m > 0.0);
+    assert(composite.tile_states[0].local_min_x_m < composite.tile_states[0].local_max_x_m);
+    assert(composite.tile_states[0].local_min_z_m < composite.tile_states[0].local_max_z_m);
+
+    const auto assertion = composite.assert_alignment(0.01);
+    assert(assertion.ok);
+    assert(assertion.reason == "texture_tiles_aligned");
+    assert(assertion.aligned_tiles == 1);
+    assert(assertion.unavailable_tiles == 0);
+
+    const std::string manifest = agbot::flight_sim::map_texture_tiles_json(composite);
+    assert(manifest.find("\"tile\":\"map/tile/z") != std::string::npos);
+    assert(manifest.find("\"state\":\"available\"") != std::string::npos);
+    assert(manifest.find("\"crs\":\"EPSG:4326\"") != std::string::npos);
+    assert(manifest.find("\"texture_width\":2") != std::string::npos);
+    assert(manifest.find("\"texture_height\":2") != std::string::npos);
+    assert(manifest.find("\"local_min_x_m\":") != std::string::npos);
+    assert(manifest.find("\"aligned\":true") != std::string::npos);
+}
+
+void test_missing_map_texture_tile_is_marked_unavailable_fallback() {
+    const GeoCoordinate center {37.7749, -122.4194, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 500.0);
+    const TileCoordinate expected_tile = agbot::flight_sim::tile_for_geo(center, 14);
+    const auto composite = agbot::flight_sim::composite_map_textures_with_state(
+        {},
+        bounds,
+        4,
+        {expected_tile});
+
+    assert(composite.has_state(agbot::flight_sim::MapTextureTileState::TileUnavailable));
+    assert(composite.tile_states.size() == 1);
+    assert(composite.tile_states[0].state == agbot::flight_sim::MapTextureTileState::TileUnavailable);
+    assert(composite.tile_states[0].reason.find("tile unavailable") != std::string::npos);
+    assert(composite.tile_states[0].texture_width == 0);
+    assert(composite.tile_states[0].texture_height == 0);
+    assert(composite.tile_states[0].aligned);
+
+    const auto assertion = composite.assert_alignment(0.01);
+    assert(assertion.ok);
+    assert(assertion.reason == "texture_tiles_aligned_with_marked_fallbacks");
+    assert(assertion.aligned_tiles == 1);
+    assert(assertion.unavailable_tiles == 1);
+
+    const std::string manifest = agbot::flight_sim::map_texture_tiles_json(composite);
+    assert(manifest.find("\"state\":\"tile_unavailable\"") != std::string::npos);
+    assert(manifest.find("tile unavailable") != std::string::npos);
+    assert(manifest.find("\"texture_width\":0") != std::string::npos);
+    assert(manifest.find("\"aligned\":true") != std::string::npos);
+}
+
 void test_builds_terrain_mesh_from_heightmap() {
     const std::vector<float> heightmap {
         10.0f, 10.0f, 10.0f,
@@ -1308,6 +1383,8 @@ int main() {
     test_composites_empty_elevation_as_flat_zero();
     test_terrain_profile_asserts_crs_extent_resolution_and_samples_elevation();
     test_missing_terrain_tile_is_sampled_and_manifested_as_flat_fallback();
+    test_map_texture_tiles_align_to_terrain_profile();
+    test_missing_map_texture_tile_is_marked_unavailable_fallback();
     test_builds_terrain_mesh_from_heightmap();
     test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance();
     test_lidar_raycast_seeded_cloud_json_is_reproducible();

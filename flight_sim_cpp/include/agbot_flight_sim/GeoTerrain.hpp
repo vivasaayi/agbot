@@ -55,6 +55,52 @@ struct TerrainProfile {
     [[nodiscard]] bool contains(const GeoCoordinate& coordinate) const;
 };
 
+enum class MapTextureTileState {
+    Available,
+    TileUnavailable,
+};
+
+struct MapTextureTile {
+    TileCoordinate coordinate;
+    MapTextureTileState state = MapTextureTileState::Available;
+    std::string state_reason;
+    int width = 0;
+    int height = 0;
+};
+
+struct MapTextureTileStatus {
+    TileCoordinate coordinate;
+    MapTextureTileState state = MapTextureTileState::Available;
+    std::string reason;
+    GeoBounds bounds;
+    int texture_width = 0;
+    int texture_height = 0;
+    double overlap_width_m = 0.0;
+    double overlap_height_m = 0.0;
+    double local_min_x_m = 0.0;
+    double local_max_x_m = 0.0;
+    double local_min_z_m = 0.0;
+    double local_max_z_m = 0.0;
+    bool aligned = false;
+};
+
+struct MapTextureAlignmentAssertion {
+    bool ok = false;
+    std::string reason;
+    std::size_t aligned_tiles = 0;
+    std::size_t unavailable_tiles = 0;
+    std::size_t total_tiles = 0;
+    double tolerance_m = 0.0;
+};
+
+struct MapTextureComposite {
+    std::vector<MapTextureTileStatus> tile_states;
+    TerrainProfile profile;
+
+    [[nodiscard]] bool has_state(MapTextureTileState state) const;
+    [[nodiscard]] MapTextureAlignmentAssertion assert_alignment(double geo_tolerance_m) const;
+};
+
 struct ElevationTile {
     TileCoordinate coordinate;
     TerrainTileState state = TerrainTileState::Available;
@@ -134,6 +180,12 @@ struct TerrainMesh {
     int height,
     const std::vector<std::uint8_t>& rgba_pixels);
 
+[[nodiscard]] std::optional<MapTextureTile> map_texture_tile_from_rgba(
+    TileCoordinate coordinate,
+    int width,
+    int height,
+    const std::vector<std::uint8_t>& rgba_pixels);
+
 [[nodiscard]] std::vector<float> composite_elevation(
     const std::vector<ElevationTile>& tiles,
     const GeoBounds& bounds,
@@ -141,6 +193,12 @@ struct TerrainMesh {
 
 [[nodiscard]] ElevationComposite composite_elevation_with_state(
     const std::vector<ElevationTile>& tiles,
+    const GeoBounds& bounds,
+    int resolution,
+    const std::vector<TileCoordinate>& expected_tiles);
+
+[[nodiscard]] MapTextureComposite composite_map_textures_with_state(
+    const std::vector<MapTextureTile>& tiles,
     const GeoBounds& bounds,
     int resolution,
     const std::vector<TileCoordinate>& expected_tiles);
@@ -153,9 +211,11 @@ struct TerrainMesh {
     double vertical_scale = 1.0);
 
 [[nodiscard]] std::string terrain_tiles_json(const ElevationComposite& composite);
+[[nodiscard]] std::string map_texture_tiles_json(const MapTextureComposite& composite);
 [[nodiscard]] std::string terrain_tiles_json_for_mission_fallback(
     const Mission& mission,
     int resolution);
 [[nodiscard]] const char* to_string(TerrainTileState state);
+[[nodiscard]] const char* to_string(MapTextureTileState state);
 
 } // namespace agbot::flight_sim
