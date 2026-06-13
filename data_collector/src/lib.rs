@@ -829,6 +829,31 @@ pub struct SessionSummary {
     pub collection_failures: Vec<CollectionFailure>,
     #[serde(default)]
     pub capture_health: CaptureHealth,
+    #[serde(default)]
+    pub aggregate_evidence: SessionAggregateEvidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionAggregateStatus {
+    FromTelemetryTrack,
+    NoTelemetryTrack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionAggregateEvidence {
+    pub status: SessionAggregateStatus,
+    pub telemetry_record_ids: Vec<Uuid>,
+    pub sample_count: usize,
+}
+
+impl Default for SessionAggregateEvidence {
+    fn default() -> Self {
+        Self {
+            status: SessionAggregateStatus::NoTelemetryTrack,
+            telemetry_record_ids: Vec::new(),
+            sample_count: 0,
+        }
+    }
 }
 
 /// Main data collector service
@@ -1412,42 +1437,227 @@ impl DataCollectorService {
         }
 
         // Calculate flight metrics from telemetry data
-        let telemetry_records = self.get_telemetry_for_session(&session.id).await?;
+        let telemetry_records = self.get_telemetry_for_session(session).await?;
         if !telemetry_records.is_empty() {
             summary.flight_duration_seconds = self.calculate_flight_duration(&telemetry_records);
             summary.distance_covered_m = self.calculate_distance_covered(&telemetry_records);
             summary.area_covered_m2 = self.calculate_area_covered(&telemetry_records);
             summary.battery_consumed_percent =
                 self.calculate_battery_consumption(&telemetry_records);
+            summary.aggregate_evidence = SessionAggregateEvidence {
+                status: SessionAggregateStatus::FromTelemetryTrack,
+                telemetry_record_ids: telemetry_record_ids(&telemetry_records),
+                sample_count: telemetry_records.len(),
+            };
+        } else {
+            summary.aggregate_evidence = SessionAggregateEvidence::default();
         }
 
         Ok(summary)
     }
 
-    async fn get_telemetry_for_session(&self, _session_id: &Uuid) -> Result<Vec<FlightDataRecord>> {
-        // Implementation would query telemetry records for the session
-        Ok(Vec::new())
+    async fn get_telemetry_for_session(
+        &self,
+        session: &FlightSession,
+    ) -> Result<Vec<FlightDataRecord>> {
+        let mut records = Vec::new();
+        for record_id in &session.data_records {
+            if let Some(record) = self.storage.load_data(record_id).await? {
+                if record.data_type == DataType::Telemetry
+                    && matches!(record.payload, DataPayload::Telemetry { .. })
+                {
+                    records.push(record);
+                }
+            }
+        }
+        records.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(records)
     }
 
-    fn calculate_flight_duration(&self, _records: &[FlightDataRecord]) -> f32 {
-        // Calculate based on first and last telemetry timestamps
-        0.0
+    fn calculate_flight_duration(&self, records: &[FlightDataRecord]) -> f32 {
+        let Some(first) = records.first() else {
+            return 0.0;
+        };
+        let Some(last) = records.last() else {
+            return 0.0;
+        };
+        last.timestamp
+            .signed_duration_since(first.timestamp)
+            .num_milliseconds()
+            .max(0) as f32
+            / 1000.0
     }
 
-    fn calculate_distance_covered(&self, _records: &[FlightDataRecord]) -> f32 {
-        // Sum distances between consecutive GPS positions
-        0.0
+    fn calculate_distance_covered(&self, records: &[FlightDataRecord]) -> f32 {
+        telemetry_samples(records)
+            .windows(2)
+            .map(|pair| distance_between_samples(pair[0], pair[1]))
+            .sum::<f64>() as f32
     }
 
-    fn calculate_area_covered(&self, _records: &[FlightDataRecord]) -> f32 {
-        // Calculate area of convex hull of flight path
-        0.0
+    fn calculate_area_covered(&self, records: &[FlightDataRecord]) -> f32 {
+        let samples = telemetry_samples(records);
+        if samples.len() < 3 {
+            return 0.0;
+        }
+        let points = local_track_points(&samples);
+        polygon_area_m2(&convex_hull(points)) as f32
     }
 
-    fn calculate_battery_consumption(&self, _records: &[FlightDataRecord]) -> f32 {
-        // Calculate based on first and last battery readings
-        0.0
+    fn calculate_battery_consumption(&self, records: &[FlightDataRecord]) -> f32 {
+        let samples = telemetry_samples(records);
+        let Some(first) = samples.first() else {
+            return 0.0;
+        };
+        let Some(last) = samples.last() else {
+            return 0.0;
+        };
+        ((first.battery_level - last.battery_level).max(0.0) * 100.0) as f32
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TelemetryAggregateSample {
+    latitude: f64,
+    longitude: f64,
+    altitude_m: f64,
+    battery_level: f64,
+}
+
+fn telemetry_record_ids(records: &[FlightDataRecord]) -> Vec<Uuid> {
+    records.iter().map(|record| record.id).collect()
+}
+
+fn telemetry_samples(records: &[FlightDataRecord]) -> Vec<TelemetryAggregateSample> {
+    records.iter().filter_map(telemetry_sample).collect()
+}
+
+fn telemetry_sample(record: &FlightDataRecord) -> Option<TelemetryAggregateSample> {
+    match record.payload {
+        DataPayload::Telemetry {
+            position,
+            battery_level,
+            ..
+        } => Some(TelemetryAggregateSample {
+            latitude: position.0,
+            longitude: position.1,
+            altitude_m: f64::from(position.2),
+            battery_level: f64::from(battery_level),
+        }),
+        _ => None,
+    }
+}
+
+fn distance_between_samples(
+    left: TelemetryAggregateSample,
+    right: TelemetryAggregateSample,
+) -> f64 {
+    let horizontal = haversine_distance_m(
+        left.latitude,
+        left.longitude,
+        right.latitude,
+        right.longitude,
+    );
+    let altitude_delta = right.altitude_m - left.altitude_m;
+    horizontal.hypot(altitude_delta)
+}
+
+fn haversine_distance_m(
+    left_latitude: f64,
+    left_longitude: f64,
+    right_latitude: f64,
+    right_longitude: f64,
+) -> f64 {
+    let radius_m = 6_371_000.0;
+    let left_lat = left_latitude.to_radians();
+    let right_lat = right_latitude.to_radians();
+    let delta_lat = (right_latitude - left_latitude).to_radians();
+    let delta_lon = (right_longitude - left_longitude).to_radians();
+    let a = (delta_lat / 2.0).sin().powi(2)
+        + left_lat.cos() * right_lat.cos() * (delta_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    radius_m * c
+}
+
+fn local_track_points(samples: &[TelemetryAggregateSample]) -> Vec<(f64, f64)> {
+    let Some(origin) = samples.first() else {
+        return Vec::new();
+    };
+    let meters_per_degree_lat = 111_320.0;
+    let meters_per_degree_lon = meters_per_degree_lat * origin.latitude.to_radians().cos();
+    samples
+        .iter()
+        .map(|sample| {
+            (
+                (sample.longitude - origin.longitude) * meters_per_degree_lon,
+                (sample.latitude - origin.latitude) * meters_per_degree_lat,
+            )
+        })
+        .collect()
+}
+
+fn convex_hull(mut points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    if points.len() <= 2 {
+        return points;
+    }
+    points.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    points.dedup_by(|left, right| {
+        (left.0 - right.0).abs() <= f64::EPSILON && (left.1 - right.1).abs() <= f64::EPSILON
+    });
+
+    let mut lower = Vec::new();
+    for point in &points {
+        while lower.len() >= 2
+            && cross(lower[lower.len() - 2], lower[lower.len() - 1], *point) <= 0.0
+        {
+            lower.pop();
+        }
+        lower.push(*point);
+    }
+
+    let mut upper = Vec::new();
+    for point in points.iter().rev() {
+        while upper.len() >= 2
+            && cross(upper[upper.len() - 2], upper[upper.len() - 1], *point) <= 0.0
+        {
+            upper.pop();
+        }
+        upper.push(*point);
+    }
+
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+fn cross(origin: (f64, f64), left: (f64, f64), right: (f64, f64)) -> f64 {
+    (left.0 - origin.0) * (right.1 - origin.1) - (left.1 - origin.1) * (right.0 - origin.0)
+}
+
+fn polygon_area_m2(points: &[(f64, f64)]) -> f64 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let twice_area = points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .map(|(left, right)| left.0 * right.1 - right.0 * left.1)
+        .sum::<f64>();
+    (twice_area / 2.0).abs()
 }
 
 impl Default for SessionSummary {
@@ -1464,6 +1674,7 @@ impl Default for SessionSummary {
             coverage: CaptureCoverage::default(),
             collection_failures: Vec::new(),
             capture_health: CaptureHealth::default(),
+            aggregate_evidence: SessionAggregateEvidence::default(),
         }
     }
 }
@@ -1533,6 +1744,36 @@ mod tests {
                 signal_strength: 0.95,
             },
             provenance(session),
+            256,
+        )
+        .unwrap()
+    }
+
+    fn telemetry_record_at(
+        session: &FlightSession,
+        timestamp: DateTime<Utc>,
+        latitude: f64,
+        longitude: f64,
+        battery_level: f32,
+    ) -> FlightDataRecord {
+        FlightDataRecord::new(
+            session.flight_id,
+            session.drone_id,
+            DataType::Telemetry,
+            DataPayload::Telemetry {
+                position: (latitude, longitude, 30.0),
+                velocity: (1.0, 0.0, 0.0),
+                orientation: (0.0, 0.0, 0.0),
+                battery_level,
+                signal_strength: 0.95,
+            },
+            FlightDataProvenance::complete(
+                session.id,
+                "telemetry-track-01".to_string(),
+                gps_coords_at(latitude, longitude, 30.0),
+                timestamp,
+                "telemetry-calibration-v1".to_string(),
+            ),
             256,
         )
         .unwrap()
@@ -1778,6 +2019,75 @@ mod tests {
         assert_eq!(stored_record.sensor_id, "sensor-rgb-01");
         assert_eq!(stored_record.gps_coords, Some(gps_coords()));
         assert_eq!(stored_record.calibration_ref, "calibration-2026-06");
+    }
+
+    #[tokio::test]
+    async fn session_summary_aggregates_are_derived_from_telemetry_track() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let base_time = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let records = vec![
+            telemetry_record_at(&session, base_time, 40.0, -105.0, 0.90),
+            telemetry_record_at(
+                &session,
+                base_time + chrono::Duration::seconds(10),
+                40.0,
+                -104.999,
+                0.82,
+            ),
+            telemetry_record_at(
+                &session,
+                base_time + chrono::Duration::seconds(20),
+                40.001,
+                -104.999,
+                0.75,
+            ),
+        ];
+        let expected_record_ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+        for record in records {
+            service.collect_data(&session_id, record).await.unwrap();
+        }
+
+        let ended = service.end_session(&session_id).await.unwrap();
+
+        assert_eq!(ended.summary.flight_duration_seconds, 20.0);
+        assert!(ended.summary.distance_covered_m > 190.0);
+        assert!(ended.summary.area_covered_m2 > 4_000.0);
+        assert!((ended.summary.battery_consumed_percent - 15.0).abs() < 0.001);
+        assert_eq!(
+            ended.summary.aggregate_evidence.status,
+            SessionAggregateStatus::FromTelemetryTrack
+        );
+        assert_eq!(ended.summary.aggregate_evidence.sample_count, 3);
+        assert_eq!(
+            ended.summary.aggregate_evidence.telemetry_record_ids,
+            expected_record_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn session_summary_without_telemetry_records_explicit_no_track() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
+
+        let ended = service.end_session(&session_id).await.unwrap();
+
+        assert_eq!(ended.summary.flight_duration_seconds, 0.0);
+        assert_eq!(ended.summary.distance_covered_m, 0.0);
+        assert_eq!(ended.summary.area_covered_m2, 0.0);
+        assert_eq!(ended.summary.battery_consumed_percent, 0.0);
+        assert_eq!(
+            ended.summary.aggregate_evidence.status,
+            SessionAggregateStatus::NoTelemetryTrack
+        );
+        assert!(ended
+            .summary
+            .aggregate_evidence
+            .telemetry_record_ids
+            .is_empty());
     }
 
     #[tokio::test]
