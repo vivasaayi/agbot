@@ -585,6 +585,19 @@ pub mod pipeline {
 
 pub mod io;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IndexStatisticsOutcome {
+    Computed,
+    NoClearPixels,
+    NoValidPixels,
+}
+
+impl Default for IndexStatisticsOutcome {
+    fn default() -> Self {
+        Self::Computed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexResultMeta {
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -595,7 +608,17 @@ pub struct IndexResultMeta {
     pub max: f32,
     pub mean: f32,
     #[serde(default)]
+    pub total_pixel_count: usize,
+    #[serde(default)]
+    pub clear_pixel_count: usize,
+    #[serde(default)]
     pub valid_pixel_count: usize,
+    #[serde(default)]
+    pub clear_pixel_coverage: f32,
+    #[serde(default)]
+    pub valid_pixel_coverage: f32,
+    #[serde(default)]
+    pub statistics_outcome: IndexStatisticsOutcome,
     #[serde(default)]
     pub invalid_pixel_reasons: BTreeMap<String, usize>,
     pub radiometric_calibration: crate::io::RadiometricCalibrationEvidence,

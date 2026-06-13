@@ -396,8 +396,52 @@ async fn ndvi_stats_use_valid_masked_pixels_only() {
     assert!((mean - 0.5).abs() < 1e-6);
     assert!((min - 0.5).abs() < 1e-6);
     assert!((max - 0.5).abs() < 1e-6);
+    assert_eq!(meta["statistics_outcome"].as_str().unwrap(), "Computed");
+    assert_eq!(meta["total_pixel_count"].as_u64().unwrap(), 2);
+    assert_eq!(meta["clear_pixel_count"].as_u64().unwrap(), 1);
     assert_eq!(valid_pixel_count, 1);
+    assert!((meta["clear_pixel_coverage"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+    assert!((meta["valid_pixel_coverage"].as_f64().unwrap() - 0.5).abs() < 1e-6);
     assert_eq!(masked_count, 1);
+}
+
+#[tokio::test]
+async fn ndvi_fully_masked_scene_records_no_clear_pixels() {
+    let root = temp_test_dir("ndvi_no_clear_pixels");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    let mask_path = input_dir.join("mask.png");
+    write_gray_image(&red_path, 2, 1, &[10, 10]);
+    write_gray_image(&nir_path, 2, 1, &[30, 30]);
+    write_gray_image(&mask_path, 2, 1, &[0, 0]);
+    write_metadata(
+        &input_dir,
+        2,
+        1,
+        &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.mask = Some(mask_path);
+
+    run_indices(&args).await.unwrap();
+
+    let meta = read_result_meta(&output_dir);
+    assert_eq!(
+        meta["statistics_outcome"].as_str().unwrap(),
+        "NoClearPixels"
+    );
+    assert_eq!(meta["total_pixel_count"].as_u64().unwrap(), 2);
+    assert_eq!(meta["clear_pixel_count"].as_u64().unwrap(), 0);
+    assert_eq!(meta["valid_pixel_count"].as_u64().unwrap(), 0);
+    assert_eq!(meta["clear_pixel_coverage"].as_f64().unwrap(), 0.0);
+    assert_eq!(meta["valid_pixel_coverage"].as_f64().unwrap(), 0.0);
+    assert!(meta["mean"].is_null());
+    assert_eq!(meta["invalid_pixel_reasons"]["masked"].as_u64().unwrap(), 2);
 }
 
 #[tokio::test]

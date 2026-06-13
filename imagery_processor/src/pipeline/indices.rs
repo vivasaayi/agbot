@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use tracing::{error, info};
 
 use crate::{
-    IndexBandRole, IndexBandValues, IndexPixelValue, IndexResultMeta, IndicesArgs, OutputFormat,
+    IndexBandRole, IndexBandValues, IndexPixelValue, IndexResultMeta, IndexStatisticsOutcome,
+    IndicesArgs, OutputFormat,
 };
 
 const NODATA_F32: f32 = -9999.0;
@@ -112,6 +113,115 @@ fn calibrated_band_value(
 struct LoadedIndexBand {
     values: Vec<f32>,
     valid: Vec<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MaskedIndexStatistics {
+    min: f32,
+    max: f32,
+    mean: f32,
+    total_pixel_count: usize,
+    clear_pixel_count: usize,
+    valid_pixel_count: usize,
+    clear_pixel_coverage: f32,
+    valid_pixel_coverage: f32,
+    outcome: IndexStatisticsOutcome,
+    invalid_pixel_reasons: BTreeMap<String, usize>,
+}
+
+fn summarize_masked_index_values(
+    index_values: &[IndexPixelValue],
+    nodata_valid: &[bool],
+    clear_mask: &[bool],
+) -> AgroResult<MaskedIndexStatistics> {
+    if index_values.len() != nodata_valid.len() || index_values.len() != clear_mask.len() {
+        return Err(processing_error(format!(
+            "masked index statistics length mismatch: values={}, nodata={}, mask={}",
+            index_values.len(),
+            nodata_valid.len(),
+            clear_mask.len()
+        )));
+    }
+
+    let total_pixel_count = index_values.len();
+    let mut clear_pixel_count = 0usize;
+    let mut valid_pixel_count = 0usize;
+    let mut stats_min = f32::INFINITY;
+    let mut stats_max = f32::NEG_INFINITY;
+    let mut stats_sum = 0.0f64;
+    let mut invalid_pixel_reasons = BTreeMap::new();
+
+    for ((pixel_value, nodata_is_valid), is_clear) in
+        index_values.iter().zip(nodata_valid).zip(clear_mask)
+    {
+        if !*is_clear {
+            record_invalid_pixel(&mut invalid_pixel_reasons, "masked");
+            continue;
+        }
+        clear_pixel_count += 1;
+
+        if !*nodata_is_valid {
+            record_invalid_pixel(&mut invalid_pixel_reasons, "nodata");
+            continue;
+        }
+
+        match pixel_value {
+            IndexPixelValue::Valid(value) if value.is_finite() => {
+                stats_min = stats_min.min(*value);
+                stats_max = stats_max.max(*value);
+                stats_sum += *value as f64;
+                valid_pixel_count += 1;
+            }
+            IndexPixelValue::Valid(_) => {
+                record_invalid_pixel(&mut invalid_pixel_reasons, "non_finite");
+            }
+            IndexPixelValue::Invalid { reason } => {
+                record_invalid_pixel(&mut invalid_pixel_reasons, reason);
+            }
+        }
+    }
+
+    let (min, max, mean) = if valid_pixel_count > 0 {
+        (
+            stats_min,
+            stats_max,
+            (stats_sum / valid_pixel_count as f64) as f32,
+        )
+    } else {
+        (f32::NAN, f32::NAN, f32::NAN)
+    };
+
+    let denominator = total_pixel_count as f32;
+    let clear_pixel_coverage = if total_pixel_count == 0 {
+        0.0
+    } else {
+        clear_pixel_count as f32 / denominator
+    };
+    let valid_pixel_coverage = if total_pixel_count == 0 {
+        0.0
+    } else {
+        valid_pixel_count as f32 / denominator
+    };
+    let outcome = if clear_pixel_count == 0 {
+        IndexStatisticsOutcome::NoClearPixels
+    } else if valid_pixel_count == 0 {
+        IndexStatisticsOutcome::NoValidPixels
+    } else {
+        IndexStatisticsOutcome::Computed
+    };
+
+    Ok(MaskedIndexStatistics {
+        min,
+        max,
+        mean,
+        total_pixel_count,
+        clear_pixel_count,
+        valid_pixel_count,
+        clear_pixel_coverage,
+        valid_pixel_coverage,
+        outcome,
+        invalid_pixel_reasons,
+    })
 }
 
 fn default_band_name(args: &IndicesArgs, role: IndexBandRole) -> String {
@@ -263,12 +373,10 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
 
     let mut out = image::ImageBuffer::new(width, height);
     let mut out_f32: Option<Vec<f32>> = Some(vec![NODATA_F32; (width * height) as usize]);
-
-    let mut stats_min = f32::INFINITY;
-    let mut stats_max = f32::NEG_INFINITY;
-    let mut stats_sum = 0.0f64;
-    let mut stats_count = 0usize;
-    let mut invalid_pixel_reasons = BTreeMap::new();
+    let total_pixels = (width * height) as usize;
+    let mut index_values = Vec::with_capacity(total_pixels);
+    let mut nodata_valid = Vec::with_capacity(total_pixels);
+    let mut clear_mask = Vec::with_capacity(total_pixels);
 
     // Optional mask: non-zero means valid pixel
     let mask_img = if let Some(mask_path) = &args.mask {
@@ -306,29 +414,27 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
             values.insert(*role, band.values[index]);
         }
 
-        let mut write_val = NODATA_F32;
-        if !valid_mask_at(&mask_img, x, y) {
-            record_invalid_pixel(&mut invalid_pixel_reasons, "masked");
-        } else if !valid_data {
-            record_invalid_pixel(&mut invalid_pixel_reasons, "nodata");
-        } else {
-            match args
-                .index
+        let is_clear = valid_mask_at(&mask_img, x, y);
+        clear_mask.push(is_clear);
+        nodata_valid.push(valid_data);
+
+        let pixel_value = if valid_data {
+            args.index
                 .compute_value(&values)
                 .map_err(|err| processing_error(err.to_string()))?
-            {
-                IndexPixelValue::Valid(value) => {
-                    write_val = value;
-                    stats_min = stats_min.min(value);
-                    stats_max = stats_max.max(value);
-                    stats_sum += value as f64;
-                    stats_count += 1;
-                }
-                IndexPixelValue::Invalid { reason } => {
-                    record_invalid_pixel(&mut invalid_pixel_reasons, reason);
-                }
-            }
-        }
+        } else {
+            IndexPixelValue::Invalid { reason: "nodata" }
+        };
+        index_values.push(pixel_value);
+
+        let write_val = if is_clear && valid_data {
+            pixel_value
+                .value()
+                .filter(|value| value.is_finite())
+                .unwrap_or(NODATA_F32)
+        } else {
+            NODATA_F32
+        };
 
         if let Some(ref mut f32buf) = out_f32 {
             f32buf[index] = write_val;
@@ -343,15 +449,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         *pix = image::Luma([vis]);
     }
 
-    let (min, max, mean) = if stats_count > 0 {
-        (
-            stats_min,
-            stats_max,
-            (stats_sum / stats_count as f64) as f32,
-        )
-    } else {
-        (f32::NAN, f32::NAN, f32::NAN)
-    };
+    let stats = summarize_masked_index_values(&index_values, &nodata_valid, &clear_mask)?;
 
     let out_path = match args.out_format {
         OutputFormat::Png => {
@@ -433,11 +531,16 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         source_images: vec![image.image_id],
         output_path: out_path.to_string_lossy().to_string(),
         index: format!("{:?}", args.index).to_lowercase(),
-        min,
-        max,
-        mean,
-        valid_pixel_count: stats_count,
-        invalid_pixel_reasons,
+        min: stats.min,
+        max: stats.max,
+        mean: stats.mean,
+        total_pixel_count: stats.total_pixel_count,
+        clear_pixel_count: stats.clear_pixel_count,
+        valid_pixel_count: stats.valid_pixel_count,
+        clear_pixel_coverage: stats.clear_pixel_coverage,
+        valid_pixel_coverage: stats.valid_pixel_coverage,
+        statistics_outcome: stats.outcome,
+        invalid_pixel_reasons: stats.invalid_pixel_reasons,
         radiometric_calibration: evidence.radiometric_calibration.clone(),
         spatial_ref: evidence.spatial_ref.clone(),
     };
@@ -452,4 +555,65 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
     tokio::fs::write(meta_path, serde_json::to_string_pretty(&meta)?).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IndexStatisticsOutcome;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "actual {actual} did not match expected {expected}"
+        );
+    }
+
+    #[test]
+    fn masked_index_statistics_exclude_cloud_and_nodata_pixels() {
+        let stats = summarize_masked_index_values(
+            &[
+                IndexPixelValue::Valid(0.2),
+                IndexPixelValue::Valid(0.9),
+                IndexPixelValue::Valid(0.4),
+                IndexPixelValue::Valid(0.8),
+            ],
+            &[true, true, false, true],
+            &[true, false, true, false],
+        )
+        .expect("statistics compute");
+
+        assert_eq!(stats.outcome, IndexStatisticsOutcome::Computed);
+        assert_eq!(stats.total_pixel_count, 4);
+        assert_eq!(stats.clear_pixel_count, 2);
+        assert_eq!(stats.valid_pixel_count, 1);
+        assert_close(stats.clear_pixel_coverage, 0.5);
+        assert_close(stats.valid_pixel_coverage, 0.25);
+        assert_close(stats.min, 0.2);
+        assert_close(stats.max, 0.2);
+        assert_close(stats.mean, 0.2);
+        assert_eq!(stats.invalid_pixel_reasons.get("masked"), Some(&2));
+        assert_eq!(stats.invalid_pixel_reasons.get("nodata"), Some(&1));
+    }
+
+    #[test]
+    fn fully_clouded_index_statistics_report_no_clear_pixels() {
+        let stats = summarize_masked_index_values(
+            &[IndexPixelValue::Valid(0.2), IndexPixelValue::Valid(0.4)],
+            &[true, true],
+            &[false, false],
+        )
+        .expect("statistics compute");
+
+        assert_eq!(stats.outcome, IndexStatisticsOutcome::NoClearPixels);
+        assert_eq!(stats.total_pixel_count, 2);
+        assert_eq!(stats.clear_pixel_count, 0);
+        assert_eq!(stats.valid_pixel_count, 0);
+        assert_eq!(stats.clear_pixel_coverage, 0.0);
+        assert_eq!(stats.valid_pixel_coverage, 0.0);
+        assert!(stats.min.is_nan());
+        assert!(stats.max.is_nan());
+        assert!(stats.mean.is_nan());
+        assert_eq!(stats.invalid_pixel_reasons.get("masked"), Some(&2));
+    }
 }
