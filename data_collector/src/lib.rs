@@ -482,12 +482,24 @@ impl FlightSession {
             .last_record_at
             .map_or(record.timestamp, |current| current.max(record.timestamp));
         self.summary.freshness.last_record_at = Some(last_record_at);
+        self.summary.capture_health.record_success();
         self.refresh_capture_quality(now);
     }
 
     fn record_collection_failure(&mut self, failure: CollectionFailure, now: DateTime<Utc>) {
         self.summary.collection_failures.push(failure);
         self.refresh_capture_quality(now);
+    }
+
+    fn record_capture_reader_error(
+        &mut self,
+        error: &CaptureReaderError,
+        retry_backoff_ms: Option<u64>,
+        exhausted: bool,
+    ) {
+        self.summary
+            .capture_health
+            .record_reader_error(error, retry_backoff_ms, exhausted);
     }
 
     fn refresh_capture_quality(&mut self, now: DateTime<Utc>) {
@@ -609,6 +621,156 @@ impl Default for CaptureCoverage {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CaptureHealthStatus {
+    Unknown,
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaptureHealth {
+    pub successful_reads: u32,
+    pub transient_errors: u32,
+    pub persistent_errors: u32,
+    pub retry_attempts: u32,
+    pub operator_alerts: u32,
+    pub success_rate: f32,
+    pub last_error: Option<String>,
+    pub last_backoff_ms: Option<u64>,
+    pub status: CaptureHealthStatus,
+}
+
+impl CaptureHealth {
+    fn record_success(&mut self) {
+        self.successful_reads += 1;
+        self.recalculate();
+    }
+
+    fn record_reader_error(
+        &mut self,
+        error: &CaptureReaderError,
+        retry_backoff_ms: Option<u64>,
+        exhausted: bool,
+    ) {
+        self.transient_errors += 1;
+        self.last_error = Some(error.message.clone());
+
+        if let Some(backoff_ms) = retry_backoff_ms {
+            self.retry_attempts += 1;
+            self.last_backoff_ms = Some(backoff_ms);
+        }
+
+        if exhausted {
+            self.persistent_errors += 1;
+            self.operator_alerts += 1;
+        }
+
+        self.recalculate();
+    }
+
+    fn recalculate(&mut self) {
+        let total_observations =
+            self.successful_reads + self.transient_errors + self.persistent_errors;
+        self.success_rate = if total_observations == 0 {
+            0.0
+        } else {
+            self.successful_reads as f32 / total_observations as f32
+        };
+
+        self.status = if self.persistent_errors > 0 {
+            CaptureHealthStatus::Failed
+        } else if self.transient_errors > 0 {
+            CaptureHealthStatus::Degraded
+        } else if self.successful_reads > 0 {
+            CaptureHealthStatus::Healthy
+        } else {
+            CaptureHealthStatus::Unknown
+        };
+    }
+}
+
+impl Default for CaptureHealth {
+    fn default() -> Self {
+        Self {
+            successful_reads: 0,
+            transient_errors: 0,
+            persistent_errors: 0,
+            retry_attempts: 0,
+            operator_alerts: 0,
+            success_rate: 0.0,
+            last_error: None,
+            last_backoff_ms: None,
+            status: CaptureHealthStatus::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryBackoffPolicy {
+    pub max_retries: u32,
+    pub initial_backoff_ms: u64,
+    pub multiplier: u64,
+}
+
+impl RetryBackoffPolicy {
+    pub fn new(max_retries: u32, initial_backoff_ms: u64, multiplier: u64) -> Self {
+        Self {
+            max_retries,
+            initial_backoff_ms,
+            multiplier: multiplier.max(1),
+        }
+    }
+
+    fn backoff_ms_for_retry(&self, retry_index: u32) -> u64 {
+        let mut backoff_ms = self.initial_backoff_ms;
+        for _ in 0..retry_index {
+            backoff_ms = backoff_ms.saturating_mul(self.multiplier);
+        }
+        backoff_ms
+    }
+}
+
+impl Default for RetryBackoffPolicy {
+    fn default() -> Self {
+        Self::new(3, 100, 2)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureReaderError {
+    pub sensor_id: String,
+    pub data_type: DataType,
+    pub occurred_at: DateTime<Utc>,
+    pub message: String,
+}
+
+impl CaptureReaderError {
+    pub fn transient(
+        sensor_id: impl Into<String>,
+        data_type: DataType,
+        occurred_at: DateTime<Utc>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            sensor_id: sensor_id.into(),
+            data_type,
+            occurred_at,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaptureRetryReport {
+    pub attempts: u32,
+    pub backoff_schedule_ms: Vec<u64>,
+    pub recovered: bool,
+    pub failure: Option<CollectionFailure>,
+    pub health: CaptureHealth,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CollectionFailureKind {
     SensorDropout,
@@ -665,6 +827,8 @@ pub struct SessionSummary {
     pub coverage: CaptureCoverage,
     #[serde(default)]
     pub collection_failures: Vec<CollectionFailure>,
+    #[serde(default)]
+    pub capture_health: CaptureHealth,
 }
 
 /// Main data collector service
@@ -867,6 +1031,129 @@ impl DataCollectorService {
         self.storage.store_session(&session_snapshot).await?;
 
         Ok(failure)
+    }
+
+    pub async fn collect_reader_capture_with_retry(
+        &mut self,
+        session_id: &Uuid,
+        policy: RetryBackoffPolicy,
+        attempts: impl IntoIterator<Item = std::result::Result<FlightDataRecord, CaptureReaderError>>,
+    ) -> Result<CaptureRetryReport> {
+        let mut attempt_count = 0u32;
+        let mut backoff_schedule_ms = Vec::new();
+        let mut saw_error = false;
+
+        for attempt in attempts {
+            attempt_count += 1;
+            match attempt {
+                Ok(record) => {
+                    self.collect_data(session_id, record).await?;
+                    return Ok(CaptureRetryReport {
+                        attempts: attempt_count,
+                        backoff_schedule_ms,
+                        recovered: saw_error,
+                        failure: None,
+                        health: self.capture_health_snapshot(session_id).await?,
+                    });
+                }
+                Err(error) => {
+                    saw_error = true;
+                    let retry_index = backoff_schedule_ms.len() as u32;
+                    let can_retry = retry_index < policy.max_retries;
+                    let retry_backoff_ms =
+                        can_retry.then(|| policy.backoff_ms_for_retry(retry_index));
+
+                    self.record_capture_reader_error(
+                        session_id,
+                        &error,
+                        retry_backoff_ms,
+                        !can_retry,
+                    )
+                    .await?;
+
+                    if let Some(backoff_ms) = retry_backoff_ms {
+                        backoff_schedule_ms.push(backoff_ms);
+                    } else {
+                        let failure = self
+                            .record_collection_failure(
+                                session_id,
+                                CollectionFailureRequest {
+                                    occurred_at: Some(error.occurred_at),
+                                    sensor_id: error.sensor_id,
+                                    data_type: error.data_type,
+                                    kind: CollectionFailureKind::ReaderError,
+                                    message: format!(
+                                        "retry bound exhausted after {attempt_count} attempts: {}",
+                                        error.message
+                                    ),
+                                },
+                            )
+                            .await?;
+
+                        return Ok(CaptureRetryReport {
+                            attempts: attempt_count,
+                            backoff_schedule_ms,
+                            recovered: false,
+                            failure: Some(failure),
+                            health: self.capture_health_snapshot(session_id).await?,
+                        });
+                    }
+                }
+            }
+        }
+
+        if saw_error {
+            anyhow::bail!("capture reader attempts ended before retry recovery or exhaustion");
+        }
+
+        anyhow::bail!("capture retry requires at least one reader attempt");
+    }
+
+    async fn record_capture_reader_error(
+        &mut self,
+        session_id: &Uuid,
+        error: &CaptureReaderError,
+        retry_backoff_ms: Option<u64>,
+        exhausted: bool,
+    ) -> Result<CaptureHealth> {
+        let session_snapshot = {
+            let session = self.active_sessions.get_mut(session_id).ok_or(
+                SessionLifecycleError::SessionNotFound {
+                    session_id: *session_id,
+                },
+            )?;
+
+            match session.status {
+                SessionStatus::Started => session.transition_status(SessionStatus::Collecting)?,
+                SessionStatus::Collecting => {}
+                SessionStatus::Ended | SessionStatus::Failed => {
+                    return Err(SessionLifecycleError::InvalidStatusTransition {
+                        session_id: *session_id,
+                        from: session.status,
+                        to: SessionStatus::Collecting,
+                    }
+                    .into());
+                }
+            }
+
+            session.record_capture_reader_error(error, retry_backoff_ms, exhausted);
+            session.clone()
+        };
+
+        self.storage.store_session(&session_snapshot).await?;
+        Ok(session_snapshot.summary.capture_health)
+    }
+
+    async fn capture_health_snapshot(&self, session_id: &Uuid) -> Result<CaptureHealth> {
+        self.get_session(session_id)
+            .await?
+            .map(|session| session.summary.capture_health)
+            .ok_or_else(|| {
+                SessionLifecycleError::SessionNotFound {
+                    session_id: *session_id,
+                }
+                .into()
+            })
     }
 
     pub async fn collect_data(&mut self, session_id: &Uuid, data: FlightDataRecord) -> Result<()> {
@@ -1103,6 +1390,7 @@ impl DataCollectorService {
             freshness: session.summary.freshness.clone(),
             coverage: session.summary.coverage.clone(),
             collection_failures: session.summary.collection_failures.clone(),
+            capture_health: session.summary.capture_health.clone(),
             ..SessionSummary::default()
         };
         let mut loaded_record_count = 0u32;
@@ -1175,6 +1463,7 @@ impl Default for SessionSummary {
             freshness: CaptureFreshness::default(),
             coverage: CaptureCoverage::default(),
             collection_failures: Vec::new(),
+            capture_health: CaptureHealth::default(),
         }
     }
 }
@@ -1743,6 +2032,139 @@ mod tests {
             stored_session.summary.coverage.status,
             CaptureCoverageStatus::Partial
         );
+    }
+
+    #[tokio::test]
+    async fn transient_reader_error_retries_with_backoff_and_persists_health() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let record = telemetry_record(&session);
+        let policy = RetryBackoffPolicy::new(2, 50, 2);
+        let error_time = Utc.timestamp_opt(1_800_300_000, 0).unwrap();
+
+        let report = service
+            .collect_reader_capture_with_retry(
+                &session_id,
+                policy,
+                vec![
+                    Err(CaptureReaderError::transient(
+                        "sensor-rgb-01",
+                        DataType::Telemetry,
+                        error_time,
+                        "serial timeout",
+                    )),
+                    Ok(record),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.attempts, 2);
+        assert_eq!(report.backoff_schedule_ms, vec![50]);
+        assert!(report.recovered);
+        assert!(report.failure.is_none());
+        assert_eq!(report.health.successful_reads, 1);
+        assert_eq!(report.health.transient_errors, 1);
+        assert_eq!(report.health.retry_attempts, 1);
+        assert_eq!(report.health.persistent_errors, 0);
+        assert_eq!(report.health.operator_alerts, 0);
+        assert_eq!(report.health.status, CaptureHealthStatus::Degraded);
+        assert!((report.health.success_rate - 0.5).abs() < f32::EPSILON);
+
+        let stored_session = service.get_session(&session_id).await.unwrap().unwrap();
+        assert_eq!(stored_session.summary.record_count, 1);
+        assert_eq!(stored_session.summary.capture_health, report.health);
+        assert!(stored_session.summary.collection_failures.is_empty());
+
+        let stored_path = temp_dir
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("session.json");
+        let stored_json = tokio::fs::read(&stored_path).await.unwrap();
+        let stored_session: FlightSession = serde_json::from_slice(&stored_json).unwrap();
+        assert_eq!(
+            stored_session.summary.capture_health.status,
+            CaptureHealthStatus::Degraded
+        );
+        assert_eq!(stored_session.summary.capture_health.transient_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_reader_errors_exhaust_retry_bound_and_record_failure() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
+        let policy = RetryBackoffPolicy::new(2, 25, 2);
+        let first_error = Utc.timestamp_opt(1_800_400_000, 0).unwrap();
+        let second_error = Utc.timestamp_opt(1_800_400_001, 0).unwrap();
+        let third_error = Utc.timestamp_opt(1_800_400_002, 0).unwrap();
+
+        let report = service
+            .collect_reader_capture_with_retry(
+                &session_id,
+                policy,
+                vec![
+                    Err(CaptureReaderError::transient(
+                        "rplidar-a3-front",
+                        DataType::LidarScan,
+                        first_error,
+                        "serial timeout 1",
+                    )),
+                    Err(CaptureReaderError::transient(
+                        "rplidar-a3-front",
+                        DataType::LidarScan,
+                        second_error,
+                        "serial timeout 2",
+                    )),
+                    Err(CaptureReaderError::transient(
+                        "rplidar-a3-front",
+                        DataType::LidarScan,
+                        third_error,
+                        "serial timeout 3",
+                    )),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let failure = report.failure.as_ref().expect("retry exhaustion escalates");
+        assert_eq!(report.attempts, 3);
+        assert_eq!(report.backoff_schedule_ms, vec![25, 50]);
+        assert!(!report.recovered);
+        assert_eq!(failure.kind, CollectionFailureKind::ReaderError);
+        assert_eq!(failure.sensor_id, "rplidar-a3-front");
+        assert_eq!(failure.data_type, DataType::LidarScan);
+        assert!(failure.message.contains("retry bound exhausted"));
+        assert!(failure.message.contains("serial timeout 3"));
+        assert_eq!(report.health.successful_reads, 0);
+        assert_eq!(report.health.transient_errors, 3);
+        assert_eq!(report.health.retry_attempts, 2);
+        assert_eq!(report.health.persistent_errors, 1);
+        assert_eq!(report.health.operator_alerts, 1);
+        assert_eq!(report.health.status, CaptureHealthStatus::Failed);
+        assert!((report.health.success_rate - 0.0).abs() < f32::EPSILON);
+
+        let stored_session = service.get_session(&session_id).await.unwrap().unwrap();
+        assert_eq!(stored_session.summary.record_count, 0);
+        assert_eq!(
+            stored_session.summary.collection_failures,
+            vec![failure.clone()]
+        );
+        assert_eq!(
+            stored_session.summary.coverage.status,
+            CaptureCoverageStatus::Partial
+        );
+        assert_eq!(stored_session.summary.coverage.failed_observations, 1);
+        assert_eq!(
+            stored_session.summary.capture_health.status,
+            CaptureHealthStatus::Failed
+        );
+        assert_eq!(stored_session.summary.capture_health.operator_alerts, 1);
     }
 
     #[tokio::test]
