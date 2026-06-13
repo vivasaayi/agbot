@@ -2,23 +2,22 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 48f13a34d44b86f14241521ba1e900e50979d279 (`batch-12-04`)
-- **Latest checkpoint commit**: bc120fab8d50700bf508f8ba1134b0e1374d2c7a (`batch-10-08` metadata; `batch-12-04` checkpoint pending)
+- **Last implementation commit**: 12ee64ac48db20fa449ed49bd65c9f52f3650f2b (`batch-13-01`)
+- **Latest checkpoint commit**: 9ac2000c762a0a4103fb8542dd4cf34955889d18 (`batch-12-04` metadata; `batch-13-01` checkpoint pending)
 - **Current batch**: none
-- **Completed feature rows**: 237 committed; 1 skipped; 1 blocked; 259 pending rows remain in the full-roadmap inventory
+- **Completed feature rows**: 238 committed; 1 skipped; 1 blocked; 258 pending rows remain in the full-roadmap inventory
 - **Blocker**: STORY `07-11` is blocked on the documented storage-authority confirmation question.
 
 ## Latest verification
 
-- `bash scripts/verify-arm-ci.sh` — pass
-- `bash -n scripts/package-arm-artifacts.sh` — pass
-- `bash -n scripts/smoke-arm-artifacts.sh` — pass
-- `just --list` — pass
-- synthetic `scripts/package-arm-artifacts.sh aarch64-unknown-linux-gnu` release-tree smoke — pass
-- `bash scripts/verify-container-build.sh` — pass
+- `cargo test -p shared grower_portal` — initial TDD compile failure, then pass
+- `cargo test -p shared` — pass with 72 tests and 0 doc tests
+- `cargo fmt --check` — pass after `cargo fmt`
+- `cargo fmt` — pass
 - `git diff --check` — pass
 - `git diff --cached --check` — pass
-- `cross --version` — failed locally because `cross` is not installed; actual aarch64/armv7 cross builds and QEMU smoke checks are delegated to the configured CI matrix
+- `cargo check -p shared` — pass
+- `cargo check` — pass with existing warnings in `mission_planner`, `post_processor`, `data_collector`, and `multi_drone_control`
 
 ## Next action
 
