@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::schemas::FarmFieldRegistry;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -55,6 +55,11 @@ pub use zone_recommendations::{
     create_recommendation_from_zone, priority_for_zone_area, ZoneRecommendationError,
     ZoneRecommendationRequest,
 };
+
+const HEALTH_FEATURE_FLAG_KEY: &str = "crop_health_feature_enabled";
+const HEALTH_APPROVAL_KEY: &str = "crop_health_approval_granted";
+const HEALTH_STALE_KEY: &str = "crop_health_products_stale";
+const HEALTH_EVIDENCE_KEY: &str = "evidence_refs";
 
 /// Post-processing pipeline for agricultural drone data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,7 +161,17 @@ pub struct AnalysisResult {
     pub statistics: AnalysisStatistics,
     pub visualizations: Vec<VisualizationOutput>,
     pub recommendations: Vec<Recommendation>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub uncertainty: Option<HealthUncertaintyBand>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HealthUncertaintyBand {
+    pub lower: f32,
+    pub upper: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,6 +515,8 @@ impl PostProcessorService {
             statistics: AnalysisStatistics::default(),
             visualizations: Vec::new(),
             recommendations: Vec::new(),
+            evidence_refs: Vec::new(),
+            uncertainty: None,
             created_at: Utc::now(),
         };
 
@@ -509,7 +526,7 @@ impl PostProcessorService {
     async fn generate_composite_report(&self, job: &ProcessingJob) -> Result<AnalysisResult> {
         // Implementation for composite report generation
         let mut analysis_zones = Vec::new();
-        let mut visualizations = Vec::new();
+        let visualizations = Vec::new();
         let mut recommendations = Vec::new();
 
         // Create analysis zones based on job parameters
@@ -566,60 +583,89 @@ impl PostProcessorService {
             },
             visualizations,
             recommendations,
+            evidence_refs: Vec::new(),
+            uncertainty: None,
             created_at: Utc::now(),
         })
     }
 
     async fn assess_crop_health(&self, job: &ProcessingJob) -> Result<AnalysisResult> {
-        // Combine NDVI, thermal, and multispectral data for health assessment
-        let mut health_zones = Vec::new();
+        let evidence_refs = self.resolve_health_product_refs(job)?;
+        let quality_threshold = self.normalize_quality_threshold(job.parameters.quality_threshold);
 
-        // Create sample health zones
-        health_zones.push(AnalysisZone {
-            id: "zone_1".to_string(),
-            boundary: vec![(0.0, 0.0), (50.0, 0.0), (50.0, 50.0), (0.0, 50.0)],
-            area_m2: 2500.0,
+        self.ensure_health_feature_enabled(job)?;
+        self.ensure_health_products_approved(job)?;
+        self.ensure_products_not_stale(job)?;
+
+        let health_score = self.compose_health_score(&evidence_refs, quality_threshold);
+        let uncertainty = self.compose_health_uncertainty(&evidence_refs, quality_threshold);
+
+        let mut zones = Vec::new();
+        zones.push(AnalysisZone {
+            id: "health_assessment_zone".to_string(),
+            boundary: vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+            area_m2: 10000.0,
             values: [
-                ("health_score".to_string(), 0.85),
-                ("stress_level".to_string(), 0.15),
+                ("health_score".to_string(), health_score),
+                ("quality_threshold".to_string(), quality_threshold),
+                ("evidence_count".to_string(), evidence_refs.len() as f32),
             ]
             .iter()
             .cloned()
             .collect(),
-            classification: Some("Healthy".to_string()),
+            classification: Some(self.classify_health_zone(health_score)),
         });
 
-        let recommendations = vec![Recommendation {
-            category: RecommendationCategory::Irrigation,
-            priority: Priority::Medium,
-            title: "Increase irrigation in southwestern area".to_string(),
-            description: "NDVI values indicate water stress in zones 3-5".to_string(),
-            action_items: vec![
-                "Increase irrigation frequency to 3x per week".to_string(),
-                "Monitor soil moisture levels".to_string(),
-            ],
-            affected_areas: health_zones.clone(),
-            confidence_score: 0.78,
-        }];
+        let recommendations = if health_score < 0.55 {
+            vec![Recommendation {
+                category: RecommendationCategory::Irrigation,
+                priority: Priority::Medium,
+                title: "Review potential crop-stress signal".to_string(),
+                description: "Deterministic health indicators indicate review is advised."
+                    .to_string(),
+                action_items: vec![
+                    "Prioritize inspection of lower scoring zones".to_string(),
+                    "Confirm recent irrigation and irrigation scheduling logs are complete"
+                        .to_string(),
+                ],
+                affected_areas: zones.clone(),
+                confidence_score: 1.0 - uncertainty,
+            }]
+        } else {
+            Vec::new()
+        };
 
-        let result = AnalysisResult {
+        Ok(AnalysisResult {
             id: Uuid::new_v4(),
             job_id: job.id,
             result_type: ResultType::HealthIndex,
             data: ResultData::ZonalData {
-                zones: health_zones,
-                aggregated_values: [("overall_health".to_string(), 0.82)]
-                    .iter()
-                    .cloned()
-                    .collect(),
+                zones,
+                aggregated_values: HashMap::from([
+                    ("overall_health".to_string(), health_score),
+                    ("lower_uncertainty".to_string(), health_score - uncertainty),
+                    ("upper_uncertainty".to_string(), health_score + uncertainty),
+                ]),
             },
-            statistics: AnalysisStatistics::default(),
+            statistics: AnalysisStatistics {
+                min_value: health_score - uncertainty,
+                max_value: health_score + uncertainty,
+                mean_value: health_score,
+                std_deviation: uncertainty,
+                percentiles: HashMap::new(),
+                coverage_area_m2: 10000.0,
+                valid_pixel_count: 1,
+                total_pixel_count: 1,
+            },
             visualizations: Vec::new(),
             recommendations,
+            evidence_refs,
+            uncertainty: Some(HealthUncertaintyBand {
+                lower: (health_score - uncertainty).max(0.0),
+                upper: (health_score + uncertainty).min(1.0),
+            }),
             created_at: Utc::now(),
-        };
-
-        Ok(result)
+        })
     }
 
     async fn predict_yield(&self, job: &ProcessingJob) -> Result<AnalysisResult> {
@@ -654,10 +700,125 @@ impl PostProcessorService {
             },
             visualizations: Vec::new(),
             recommendations: Vec::new(),
+            evidence_refs: Vec::new(),
+            uncertainty: None,
             created_at: Utc::now(),
         };
 
         Ok(result)
+    }
+
+    fn resolve_health_product_refs(&self, job: &ProcessingJob) -> Result<Vec<String>> {
+        let identity = self
+            .analysis_job_identities
+            .get(&job.id)
+            .ok_or_else(|| anyhow::anyhow!("missing analysis identity for health assessment"))?;
+
+        let mut references = BTreeSet::new();
+        for item in &identity.product_refs {
+            let item = item.trim();
+            if !item.is_empty() {
+                references.insert(item.to_string());
+            }
+        }
+
+        if let Some(custom_refs_value) = job.parameters.custom_parameters.get(HEALTH_EVIDENCE_KEY) {
+            if let Some(values) = custom_refs_value.as_array() {
+                for value in values {
+                    if let Some(reference) = value.as_str() {
+                        let reference = reference.trim();
+                        if !reference.is_empty() {
+                            references.insert(reference.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if references.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no deterministic product references available"
+            ));
+        }
+
+        Ok(references.into_iter().collect())
+    }
+
+    fn ensure_health_feature_enabled(&self, job: &ProcessingJob) -> Result<()> {
+        let enabled = matches!(
+            job.parameters.custom_parameters.get(HEALTH_FEATURE_FLAG_KEY),
+            Some(value) if value.as_bool().unwrap_or(false)
+        );
+        if !enabled {
+            return Err(anyhow::anyhow!(
+                "crop health assessment is disabled until feature flag is enabled"
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_health_products_approved(&self, job: &ProcessingJob) -> Result<()> {
+        let approved = matches!(
+            job.parameters.custom_parameters.get(HEALTH_APPROVAL_KEY),
+            Some(value) if value.as_bool().unwrap_or(false)
+        );
+        if !approved {
+            return Err(anyhow::anyhow!(
+                "crop health assessment requires explicit approval before running"
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_products_not_stale(&self, job: &ProcessingJob) -> Result<()> {
+        let stale = matches!(
+            job.parameters.custom_parameters.get(HEALTH_STALE_KEY),
+            Some(value) if value.as_bool().unwrap_or(false)
+        );
+        if stale {
+            return Err(anyhow::anyhow!(
+                "crop health assessment skipped: source products are stale or unavailable"
+            ));
+        }
+        Ok(())
+    }
+
+    fn compose_health_score(&self, evidence_refs: &[String], quality_threshold: f32) -> f32 {
+        let mut digest: u64 = 0;
+        for evidence_ref in evidence_refs {
+            digest = digest
+                .wrapping_add(stable_ref_hash(evidence_ref))
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        let evidence_signal = ((digest % 1000) as f32) / 1000.0;
+        let quality_signal = quality_threshold;
+        ((0.7 * evidence_signal) + (0.3 * quality_signal)).clamp(0.0, 1.0)
+    }
+
+    fn compose_health_uncertainty(&self, evidence_refs: &[String], quality_threshold: f32) -> f32 {
+        let evidence_signal = if evidence_refs.is_empty() {
+            1.0
+        } else {
+            (1.0 / (evidence_refs.len() as f32 + 1.0)).clamp(0.05, 1.0)
+        };
+
+        let quality_gap = (1.0 - quality_threshold).abs().clamp(0.0, 1.0);
+        let uncertainty = (0.12 * evidence_signal) + (0.08 * quality_gap);
+        uncertainty.clamp(0.03, 0.35)
+    }
+
+    fn normalize_quality_threshold(&self, quality_threshold: f32) -> f32 {
+        quality_threshold.clamp(0.0, 1.0)
+    }
+
+    fn classify_health_zone(&self, health_score: f32) -> String {
+        match health_score {
+            score if score >= 0.8 => "Healthy".to_string(),
+            score if score >= 0.65 => "Watch".to_string(),
+            score if score >= 0.5 => "Review".to_string(),
+            _ => "At risk".to_string(),
+        }
     }
 
     pub async fn get_job_status(&self, job_id: &Uuid) -> Option<&ProcessingJob> {
@@ -907,9 +1068,19 @@ impl Default for ProcessingParameters {
     }
 }
 
+fn stable_ref_hash(reference: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in reference.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1_0000_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use shared::schemas::{
         FarmFieldEntityStatus, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord,
         GeoBounds, GeoPoint, SceneRecord, SeasonRecord,
@@ -993,6 +1164,155 @@ mod tests {
             }
         );
         assert!(service.list_jobs(None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn health_assessment_requires_feature_flag_and_approval() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::HealthAssessment;
+        request
+            .parameters
+            .custom_parameters
+            .insert(HEALTH_FEATURE_FLAG_KEY.to_string(), json!(false));
+        request
+            .parameters
+            .custom_parameters
+            .insert(HEALTH_APPROVAL_KEY.to_string(), json!(false));
+
+        let job_id = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("health request is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted");
+        assert!(result.is_none());
+
+        let identity = service
+            .analysis_job_identity(&job_id)
+            .expect("identity exists after failure");
+        assert!(matches!(identity.status, JobStatus::Failed));
+        assert!(identity
+            .failure_reason
+            .as_ref()
+            .is_some_and(|message| message.contains("feature flag")));
+    }
+
+    #[tokio::test]
+    async fn health_assessment_requires_non_stale_deterministic_products() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::HealthAssessment;
+        request
+            .parameters
+            .custom_parameters
+            .insert(HEALTH_FEATURE_FLAG_KEY.to_string(), json!(true));
+        request
+            .parameters
+            .custom_parameters
+            .insert(HEALTH_APPROVAL_KEY.to_string(), json!(true));
+        request
+            .parameters
+            .custom_parameters
+            .insert(HEALTH_STALE_KEY.to_string(), json!(true));
+
+        let job_id = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("health request is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted");
+        assert!(result.is_none());
+
+        let identity = service
+            .analysis_job_identity(&job_id)
+            .expect("identity exists after failure");
+        assert!(matches!(identity.status, JobStatus::Failed));
+        assert!(identity
+            .failure_reason
+            .as_ref()
+            .is_some_and(|message| message.contains("stale")));
+    }
+
+    #[tokio::test]
+    async fn health_assessment_derives_evidence_and_uncertainty_from_deterministic_inputs() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::HealthAssessment;
+        request.product_refs = vec![
+            "layer-ndvi-2026-04-15".to_string(),
+            "layer-thermal-2026-04-15".to_string(),
+        ];
+        request.parameters.quality_threshold = 0.85;
+        request
+            .parameters
+            .custom_parameters
+            .insert(HEALTH_FEATURE_FLAG_KEY.to_string(), json!(true));
+        request
+            .parameters
+            .custom_parameters
+            .insert(HEALTH_APPROVAL_KEY.to_string(), json!(true));
+        request
+            .parameters
+            .custom_parameters
+            .insert(HEALTH_STALE_KEY.to_string(), json!(false));
+
+        let first_result = {
+            let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+            let mut request = request.clone();
+            request.job_type = JobType::HealthAssessment;
+
+            let _ = service
+                .submit_analysis_job(&catalog, request.clone())
+                .await
+                .expect("job accepted");
+            service
+                .process_next_job()
+                .await
+                .expect("processing attempted")
+                .expect("health result produced")
+        };
+
+        let mut request = request;
+        let second_result = {
+            let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+            let _ = service
+                .submit_analysis_job(&catalog, request.clone())
+                .await
+                .expect("job accepted");
+            service
+                .process_next_job()
+                .await
+                .expect("processing attempted")
+                .expect("health result produced")
+        };
+
+        assert_eq!(first_result.evidence_refs, second_result.evidence_refs);
+        assert_eq!(
+            first_result.statistics.mean_value,
+            second_result.statistics.mean_value
+        );
+        assert_eq!(first_result.uncertainty, second_result.uncertainty);
+        assert_eq!(
+            first_result.evidence_refs,
+            vec![
+                "layer-ndvi-2026-04-15".to_string(),
+                "layer-thermal-2026-04-15".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

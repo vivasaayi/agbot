@@ -557,6 +557,8 @@ impl NdviAnalysisProcessor {
             },
             visualizations: vec![],
             recommendations: vec![],
+            evidence_refs: vec![],
+            uncertainty: None,
             created_at: Utc::now(),
         })
     }
