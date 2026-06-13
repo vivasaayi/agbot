@@ -102,8 +102,10 @@ use shared::schemas::{
     WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
-    build_geolocated_soil_reading, build_soil_device_record, GatewayIngestError,
-    GatewayReadingRecord, GeoPosition, GeolocatedSoilReading, RegisterSoilDeviceRequest,
+    build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
+    transition_soil_config_push_status, GatewayIngestError, GatewayReadingRecord, GeoPosition,
+    GeolocatedSoilReading, RegisterSoilDeviceRequest, SoilDeviceConfigPushRecord,
+    SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate,
     SoilDeviceRecord, SoilDeviceStatus, SoilIotError, SoilSensorType,
 };
 use sqlx::Row;
@@ -2507,6 +2509,90 @@ pub async fn list_soil_iot_devices(
         .map(|row| decode_soil_iot_device(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
+}
+
+pub async fn record_soil_iot_config_push(
+    Path(device_id): Path<String>,
+    State(state): State<AppState>,
+    Json(mut request): Json<SoilDeviceConfigPushRequest>,
+) -> AppResult<Json<SoilDeviceConfigPushRecord>> {
+    let device_id = normalize_optional_text(Some(device_id))
+        .ok_or_else(|| AppError::BadRequest("device_id cannot be empty".to_string()))?;
+    if let Some(body_device_id) = normalize_optional_text(Some(request.device_id.clone())) {
+        if body_device_id != device_id {
+            return Err(AppError::BadRequest(format!(
+                "request device_id {} does not match path device_id {}",
+                body_device_id, device_id
+            )));
+        }
+    }
+    load_soil_iot_device(&state, &device_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("device {device_id} is not registered")))?;
+
+    request.device_id = device_id;
+    let record = build_soil_config_push_record(request, Uuid::new_v4().to_string())
+        .map_err(soil_iot_error)?;
+    insert_soil_iot_config_push(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_soil_iot_config_pushes(
+    Path(device_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SoilDeviceConfigPushRecord>>> {
+    let device_id = normalize_optional_text(Some(device_id))
+        .ok_or_else(|| AppError::BadRequest("device_id cannot be empty".to_string()))?;
+    load_soil_iot_device(&state, &device_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("device {device_id} is not registered")))?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT push_id, device_id, config_version, pushed_at, push_status, failure_reason, updated_at
+        FROM soil_iot_config_pushes
+        WHERE device_id = ?1
+        ORDER BY pushed_at ASC, push_id ASC
+        "#,
+    )
+    .bind(&device_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_soil_iot_config_push(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn update_soil_iot_config_push_status(
+    Path((device_id, push_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(mut request): Json<SoilDeviceConfigPushStatusUpdate>,
+) -> AppResult<Json<SoilDeviceConfigPushRecord>> {
+    let device_id = normalize_optional_text(Some(device_id))
+        .ok_or_else(|| AppError::BadRequest("device_id cannot be empty".to_string()))?;
+    let push_id = normalize_optional_text(Some(push_id))
+        .ok_or_else(|| AppError::BadRequest("push_id cannot be empty".to_string()))?;
+    let record = load_soil_iot_config_push(&state, &push_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("config push {push_id} is not registered")))?;
+    if record.device_id != device_id {
+        return Err(AppError::BadRequest(format!(
+            "config push {} belongs to device {}",
+            push_id, record.device_id
+        )));
+    }
+
+    if normalize_optional_text(Some(request.updated_at.clone())).is_none() {
+        request.updated_at = current_record_timestamp();
+    }
+    let updated = transition_soil_config_push_status(&record, request).map_err(soil_iot_error)?;
+    update_soil_iot_config_push(&state, &updated).await?;
+
+    Ok(Json(updated))
 }
 
 pub async fn ingest_soil_iot_reading(
@@ -6724,6 +6810,12 @@ fn parse_soil_device_status(value: String) -> AppResult<SoilDeviceStatus> {
     value.parse::<SoilDeviceStatus>().map_err(soil_iot_error)
 }
 
+fn parse_soil_config_push_status(value: String) -> AppResult<SoilDeviceConfigPushStatus> {
+    value
+        .parse::<SoilDeviceConfigPushStatus>()
+        .map_err(soil_iot_error)
+}
+
 fn orthomosaic_ingest_error(error: FrameSetIngestError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -8053,6 +8145,20 @@ fn decode_soil_iot_device(row: &sqlx::sqlite::SqliteRow) -> AppResult<SoilDevice
     })
 }
 
+fn decode_soil_iot_config_push(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SoilDeviceConfigPushRecord> {
+    Ok(SoilDeviceConfigPushRecord {
+        push_id: row.get("push_id"),
+        device_id: row.get("device_id"),
+        config_version: row.get("config_version"),
+        pushed_at: row.get("pushed_at"),
+        push_status: parse_soil_config_push_status(row.get::<String, _>("push_status"))?,
+        failure_reason: row.get("failure_reason"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 fn decode_fleet_component_event(
     row: &sqlx::sqlite::SqliteRow,
 ) -> AppResult<FleetComponentEventRecord> {
@@ -8890,6 +8996,54 @@ async fn insert_soil_iot_device(state: &AppState, record: &SoilDeviceRecord) -> 
     Ok(())
 }
 
+async fn insert_soil_iot_config_push(
+    state: &AppState,
+    record: &SoilDeviceConfigPushRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO soil_iot_config_pushes (
+            push_id, device_id, config_version, pushed_at, push_status, failure_reason, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&record.push_id)
+    .bind(&record.device_id)
+    .bind(&record.config_version)
+    .bind(&record.pushed_at)
+    .bind(record.push_status.as_str())
+    .bind(&record.failure_reason)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn update_soil_iot_config_push(
+    state: &AppState,
+    record: &SoilDeviceConfigPushRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE soil_iot_config_pushes
+        SET push_status = ?2, failure_reason = ?3, updated_at = ?4
+        WHERE push_id = ?1
+        "#,
+    )
+    .bind(&record.push_id)
+    .bind(record.push_status.as_str())
+    .bind(&record.failure_reason)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn insert_soil_moisture_reading(
     state: &AppState,
     record: &SoilMoistureReadingRecord,
@@ -9486,6 +9640,25 @@ async fn load_soil_iot_device(
     .map_err(Error::from)?;
 
     row.map(|row| decode_soil_iot_device(&row)).transpose()
+}
+
+async fn load_soil_iot_config_push(
+    state: &AppState,
+    push_id: &str,
+) -> AppResult<Option<SoilDeviceConfigPushRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT push_id, device_id, config_version, pushed_at, push_status, failure_reason, updated_at
+        FROM soil_iot_config_pushes
+        WHERE push_id = ?1
+        "#,
+    )
+    .bind(push_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_soil_iot_config_push(&row)).transpose()
 }
 
 async fn append_fleet_component_event(

@@ -113,6 +113,71 @@ pub struct SoilDeviceRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoilDeviceConfigPushStatus {
+    Pending,
+    Applied,
+    Failed,
+}
+
+impl SoilDeviceConfigPushStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SoilDeviceConfigPushStatus::Pending => "pending",
+            SoilDeviceConfigPushStatus::Applied => "applied",
+            SoilDeviceConfigPushStatus::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for SoilDeviceConfigPushStatus {
+    type Err = SoilIotError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "applied" => Ok(Self::Applied),
+            "failed" => Ok(Self::Failed),
+            _ => Err(SoilIotError::UnsupportedConfigPushStatus {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SoilDeviceConfigPushRequest {
+    #[serde(default)]
+    pub push_id: Option<String>,
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(default)]
+    pub config_version: String,
+    #[serde(default)]
+    pub pushed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SoilDeviceConfigPushStatusUpdate {
+    pub push_status: SoilDeviceConfigPushStatus,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilDeviceConfigPushRecord {
+    pub push_id: String,
+    pub device_id: String,
+    pub config_version: String,
+    pub pushed_at: String,
+    pub push_status: SoilDeviceConfigPushStatus,
+    pub failure_reason: Option<String>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ReadingDeviceCheckRequest {
     #[serde(default)]
@@ -593,6 +658,18 @@ pub enum SoilIotError {
     EmptyCalibrationProfileRef,
     #[error("created_at cannot be empty")]
     EmptyCreatedAt,
+    #[error("config push_id cannot be empty")]
+    EmptyConfigPushId,
+    #[error("config_version cannot be empty")]
+    EmptyConfigVersion,
+    #[error("config pushed_at cannot be empty")]
+    EmptyConfigPushedAt,
+    #[error("config push updated_at cannot be empty")]
+    EmptyConfigPushUpdatedAt,
+    #[error("config push failure_reason cannot be empty for failed pushes")]
+    EmptyConfigPushFailureReason,
+    #[error("config push failure_reason is only allowed for failed pushes")]
+    UnexpectedConfigPushFailureReason,
     #[error("soil IoT position CRS cannot be empty")]
     EmptyCrs,
     #[error("unsupported soil IoT position CRS {value}; expected EPSG:4326")]
@@ -603,8 +680,16 @@ pub enum SoilIotError {
     UnsupportedSensorType { value: String },
     #[error("unsupported soil device status {value}")]
     UnsupportedStatus { value: String },
+    #[error("unsupported config push status {value}")]
+    UnsupportedConfigPushStatus { value: String },
     #[error("retired device {device_id} cannot leave retired status")]
     RetiredDeviceCannotTransition { device_id: String },
+    #[error("config push {push_id} cannot transition from {from:?} to {to:?}")]
+    InvalidConfigPushTransition {
+        push_id: String,
+        from: SoilDeviceConfigPushStatus,
+        to: SoilDeviceConfigPushStatus,
+    },
     #[error("calibration method_version cannot be empty")]
     EmptyCalibrationMethodVersion,
     #[error("soil reading raw value must be finite")]
@@ -689,6 +774,74 @@ pub fn transition_soil_device_status(
     let mut updated = record.clone();
     updated.status = status;
     updated.updated_at = normalize_required_text(updated_at, SoilIotError::EmptyCreatedAt)?;
+    Ok(updated)
+}
+
+pub fn build_soil_config_push_record(
+    request: SoilDeviceConfigPushRequest,
+    generated_push_id: String,
+) -> Result<SoilDeviceConfigPushRecord, SoilIotError> {
+    let push_id = match normalize_optional_text(request.push_id) {
+        Some(push_id) => push_id,
+        None => normalize_required_text(generated_push_id, SoilIotError::EmptyConfigPushId)?,
+    };
+    let pushed_at = normalize_required_text(request.pushed_at, SoilIotError::EmptyConfigPushedAt)?;
+
+    Ok(SoilDeviceConfigPushRecord {
+        push_id,
+        device_id: normalize_required_text(request.device_id, SoilIotError::EmptyDeviceId)?,
+        config_version: normalize_required_text(
+            request.config_version,
+            SoilIotError::EmptyConfigVersion,
+        )?,
+        pushed_at: pushed_at.clone(),
+        push_status: SoilDeviceConfigPushStatus::Pending,
+        failure_reason: None,
+        updated_at: pushed_at,
+    })
+}
+
+pub fn transition_soil_config_push_status(
+    record: &SoilDeviceConfigPushRecord,
+    update: SoilDeviceConfigPushStatusUpdate,
+) -> Result<SoilDeviceConfigPushRecord, SoilIotError> {
+    let updated_at =
+        normalize_required_text(update.updated_at, SoilIotError::EmptyConfigPushUpdatedAt)?;
+    let failure_reason = normalize_optional_text(update.failure_reason);
+
+    match update.push_status {
+        SoilDeviceConfigPushStatus::Failed => {
+            if failure_reason.is_none() {
+                return Err(SoilIotError::EmptyConfigPushFailureReason);
+            }
+        }
+        SoilDeviceConfigPushStatus::Pending | SoilDeviceConfigPushStatus::Applied => {
+            if failure_reason.is_some() {
+                return Err(SoilIotError::UnexpectedConfigPushFailureReason);
+            }
+        }
+    }
+
+    if record.push_status != SoilDeviceConfigPushStatus::Pending {
+        return Err(SoilIotError::InvalidConfigPushTransition {
+            push_id: record.push_id.clone(),
+            from: record.push_status,
+            to: update.push_status,
+        });
+    }
+
+    if update.push_status == SoilDeviceConfigPushStatus::Pending {
+        return Err(SoilIotError::InvalidConfigPushTransition {
+            push_id: record.push_id.clone(),
+            from: record.push_status,
+            to: update.push_status,
+        });
+    }
+
+    let mut updated = record.clone();
+    updated.push_status = update.push_status;
+    updated.failure_reason = failure_reason;
+    updated.updated_at = updated_at;
     Ok(updated)
 }
 
@@ -1485,9 +1638,10 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_geolocated_soil_reading, build_soil_device_record, decode_gateway_payload,
-        detect_stuck_sensor_window, emit_sensor_health_alert_events, evaluate_irrigation_trigger,
-        evaluate_sensor_health_snapshot, ingest_gateway_readings, reading_rejection_for_device,
+        build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
+        decode_gateway_payload, detect_stuck_sensor_window, emit_sensor_health_alert_events,
+        evaluate_irrigation_trigger, evaluate_sensor_health_snapshot, ingest_gateway_readings,
+        reading_rejection_for_device, transition_soil_config_push_status,
         transition_soil_device_status, validate_and_calibrate_reading, CalibrationProfile,
         GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
         GatewayReadingRecord, GeoPosition, IrrigationTriggerConfig,
@@ -1495,6 +1649,7 @@ mod tests {
         ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
         SensorHealthEventKind, SensorHealthLinkStatus, SensorHealthMonitorState,
         SensorHealthReasonCode, SensorHealthSnapshot, SensorHealthThresholds, SimulatedGateway,
+        SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate,
         SoilDeviceStatus, SoilIotError, SoilSensorType, StuckSensorRail, StuckSensorWindowConfig,
         ZoneSoilMoistureProduct,
     };
@@ -1560,6 +1715,114 @@ mod tests {
                 device_id: "soil-probe-001".to_string()
             }
         );
+    }
+
+    #[test]
+    fn config_push_records_pending_history_then_applied_ack() {
+        let record = build_soil_config_push_record(
+            SoilDeviceConfigPushRequest {
+                push_id: Some(" push-001 ".to_string()),
+                device_id: " soil-probe-001 ".to_string(),
+                config_version: " firmware:soil:v3 ".to_string(),
+                pushed_at: " 2026-06-12T10:00:00Z ".to_string(),
+            },
+            "generated-push".to_string(),
+        )
+        .expect("config push should build");
+
+        assert_eq!(record.push_id, "push-001");
+        assert_eq!(record.device_id, "soil-probe-001");
+        assert_eq!(record.config_version, "firmware:soil:v3");
+        assert_eq!(record.pushed_at, "2026-06-12T10:00:00Z");
+        assert_eq!(record.push_status, SoilDeviceConfigPushStatus::Pending);
+        assert_eq!(record.failure_reason, None);
+
+        let applied = transition_soil_config_push_status(
+            &record,
+            SoilDeviceConfigPushStatusUpdate {
+                push_status: SoilDeviceConfigPushStatus::Applied,
+                failure_reason: None,
+                updated_at: "2026-06-12T10:00:05Z".to_string(),
+            },
+        )
+        .expect("pending push can be acknowledged as applied");
+
+        assert_eq!(applied.push_status, SoilDeviceConfigPushStatus::Applied);
+        assert_eq!(applied.config_version, "firmware:soil:v3");
+        assert_eq!(applied.failure_reason, None);
+        assert_eq!(applied.updated_at, "2026-06-12T10:00:05Z");
+    }
+
+    #[test]
+    fn config_push_timeout_marks_failed_with_reason_and_terminal_status() {
+        let record = build_soil_config_push_record(
+            SoilDeviceConfigPushRequest {
+                push_id: Some("push-timeout".to_string()),
+                device_id: "soil-probe-001".to_string(),
+                config_version: "firmware:soil:v4".to_string(),
+                pushed_at: "2026-06-12T10:00:00Z".to_string(),
+            },
+            "generated-push".to_string(),
+        )
+        .expect("config push should build");
+
+        let failed = transition_soil_config_push_status(
+            &record,
+            SoilDeviceConfigPushStatusUpdate {
+                push_status: SoilDeviceConfigPushStatus::Failed,
+                failure_reason: Some(" ack_timeout ".to_string()),
+                updated_at: "2026-06-12T10:15:00Z".to_string(),
+            },
+        )
+        .expect("pending push can fail after ack window");
+
+        assert_eq!(failed.push_status, SoilDeviceConfigPushStatus::Failed);
+        assert_eq!(failed.failure_reason.as_deref(), Some("ack_timeout"));
+
+        let error = transition_soil_config_push_status(
+            &failed,
+            SoilDeviceConfigPushStatusUpdate {
+                push_status: SoilDeviceConfigPushStatus::Applied,
+                failure_reason: None,
+                updated_at: "2026-06-12T10:16:00Z".to_string(),
+            },
+        )
+        .expect_err("failed pushes are terminal history");
+
+        assert_eq!(
+            error,
+            SoilIotError::InvalidConfigPushTransition {
+                push_id: "push-timeout".to_string(),
+                from: SoilDeviceConfigPushStatus::Failed,
+                to: SoilDeviceConfigPushStatus::Applied,
+            }
+        );
+    }
+
+    #[test]
+    fn config_push_failed_status_requires_reason() {
+        let record = build_soil_config_push_record(
+            SoilDeviceConfigPushRequest {
+                push_id: Some("push-timeout".to_string()),
+                device_id: "soil-probe-001".to_string(),
+                config_version: "firmware:soil:v4".to_string(),
+                pushed_at: "2026-06-12T10:00:00Z".to_string(),
+            },
+            "generated-push".to_string(),
+        )
+        .expect("config push should build");
+
+        let error = transition_soil_config_push_status(
+            &record,
+            SoilDeviceConfigPushStatusUpdate {
+                push_status: SoilDeviceConfigPushStatus::Failed,
+                failure_reason: Some(" ".to_string()),
+                updated_at: "2026-06-12T10:15:00Z".to_string(),
+            },
+        )
+        .expect_err("failed pushes require a durable reason");
+
+        assert_eq!(error, SoilIotError::EmptyConfigPushFailureReason);
     }
 
     #[test]

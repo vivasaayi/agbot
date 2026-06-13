@@ -4041,6 +4041,197 @@ async fn soil_iot_device_registry_registers_and_lists_geolocated_devices() -> Re
 }
 
 #[tokio::test]
+async fn soil_iot_config_push_history_records_and_lists_status_versions() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    register_soil_iot_test_device(&ctx, "soil-probe-config").await?;
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/soil-iot/devices/soil-probe-config/config-pushes")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "push_id": "config-push-001",
+                        "device_id": "soil-probe-config",
+                        "config_version": "soil-fw:v3",
+                        "pushed_at": "2026-06-12T11:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let body = to_bytes(create_response.into_body(), 64 * 1024).await?;
+    let created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created.get("push_status").and_then(|value| value.as_str()),
+        Some("pending")
+    );
+    assert_eq!(
+        created
+            .get("config_version")
+            .and_then(|value| value.as_str()),
+        Some("soil-fw:v3")
+    );
+
+    let update_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/soil-iot/devices/soil-probe-config/config-pushes/config-push-001/status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "push_status": "applied",
+                        "updated_at": "2026-06-12T11:00:05Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(update_response.status(), StatusCode::OK);
+    let body = to_bytes(update_response.into_body(), 64 * 1024).await?;
+    let updated: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        updated.get("push_status").and_then(|value| value.as_str()),
+        Some("applied")
+    );
+    assert_eq!(
+        updated
+            .get("failure_reason")
+            .and_then(|value| value.as_str()),
+        None
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/soil-iot/devices/soil-probe-config/config-pushes")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].get("push_id").and_then(|value| value.as_str()),
+        Some("config-push-001")
+    );
+    assert_eq!(
+        listed[0]
+            .get("push_status")
+            .and_then(|value| value.as_str()),
+        Some("applied")
+    );
+    assert_eq!(
+        listed[0]
+            .get("config_version")
+            .and_then(|value| value.as_str()),
+        Some("soil-fw:v3")
+    );
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM soil_iot_config_pushes WHERE device_id = 'soil-probe-config'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn soil_iot_config_push_without_ack_is_marked_failed_with_reason() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    register_soil_iot_test_device(&ctx, "soil-probe-timeout").await?;
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/soil-iot/devices/soil-probe-timeout/config-pushes")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "push_id": "config-push-timeout",
+                        "config_version": "soil-fw:v4",
+                        "pushed_at": "2026-06-12T12:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let timeout_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(
+                    "/api/soil-iot/devices/soil-probe-timeout/config-pushes/config-push-timeout/status",
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "push_status": "failed",
+                        "failure_reason": "ack_timeout",
+                        "updated_at": "2026-06-12T12:15:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(timeout_response.status(), StatusCode::OK);
+    let body = to_bytes(timeout_response.into_body(), 64 * 1024).await?;
+    let failed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        failed.get("push_status").and_then(|value| value.as_str()),
+        Some("failed")
+    );
+    assert_eq!(
+        failed
+            .get("failure_reason")
+            .and_then(|value| value.as_str()),
+        Some("ack_timeout")
+    );
+
+    let persisted_reason: String = sqlx::query_scalar(
+        "SELECT failure_reason FROM soil_iot_config_pushes WHERE push_id = 'config-push-timeout'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(persisted_reason, "ack_timeout");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn soil_iot_readings_inherit_geolocation_and_persist_via_timeseries() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

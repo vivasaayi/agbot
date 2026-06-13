@@ -762,6 +762,22 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS soil_iot_config_pushes (
+            push_id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            config_version TEXT NOT NULL,
+            pushed_at TEXT NOT NULL,
+            push_status TEXT NOT NULL,
+            failure_reason TEXT,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS water_moisture_readings (
             reading_id TEXT PRIMARY KEY,
             field_id TEXT NOT NULL,
@@ -1253,6 +1269,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_tractor_command_audits_tractor_id
         ON tractor_command_audits(tractor_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_soil_iot_config_pushes_device
+        ON soil_iot_config_pushes(device_id, pushed_at);
         "#,
     )
     .execute(pool)

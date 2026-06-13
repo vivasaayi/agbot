@@ -200,6 +200,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_soil_iot_devices).post(routes::register_soil_iot_device),
         )
         .route(
+            "/api/soil-iot/devices/:device_id/config-pushes",
+            get(routes::list_soil_iot_config_pushes).post(routes::record_soil_iot_config_push),
+        )
+        .route(
+            "/api/soil-iot/devices/:device_id/config-pushes/:push_id/status",
+            put(routes::update_soil_iot_config_push_status),
+        )
+        .route(
             "/api/soil-iot/readings",
             post(routes::ingest_soil_iot_reading),
         )
