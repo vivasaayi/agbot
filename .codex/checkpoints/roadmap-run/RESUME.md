@@ -2,19 +2,18 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: da4eb6504e9104ac01e8050880042ec0f7915d44 (`batch-14-01`)
-- **Latest checkpoint commit**: 28d3a474efd4e8e1f3193ffa80fe53abf099fa58 (`batch-13-01` metadata; `batch-14-01` checkpoint pending)
+- **Last implementation commit**: 16e7798df5b93f71d1f708b52bc7882e99bc95dc (`batch-15-01`)
+- **Latest checkpoint commit**: 1b0dc4da3877c97c5e9babc3b7cfaf60eb02df75 (`batch-14-01` metadata; `batch-15-01` checkpoint pending)
 - **Current batch**: none
-- **Completed feature rows**: 239 committed; 1 skipped; 1 blocked; 257 pending rows remain in the full-roadmap inventory
+- **Completed feature rows**: 240 committed; 1 skipped; 1 blocked; 256 pending rows remain in the full-roadmap inventory
 - **Blocker**: STORY `07-11` is blocked on the documented storage-authority confirmation question.
 
 ## Latest verification
 
-- `cargo test -p shared tractor` — initial fixture failure, then pass
-- `cargo test -p geo_hub tractor --test products_api` — initial missing-route failure, then pass
-- `cargo test -p shared` — pass with 74 tests and 0 doc tests
-- `cargo test -p geo_hub` — pass with 29 lib tests, 77 API tests, and 0 doc tests
-- `cargo check -p geo_hub` — pass
+- `cargo test -p shared weather` — pass
+- `cargo test -p geo_hub weather_forecast --test products_api` — pass
+- `cargo test -p shared` — pass with 77 tests and 0 doc tests
+- `cargo test -p geo_hub` — pass with 29 lib tests, 79 API tests, and 0 doc tests
 - `cargo check` — pass with existing warnings in `mission_planner`, `post_processor`, `data_collector`, and `multi_drone_control`
 - `cargo fmt --check` — pass
 - `git diff --check` — pass
