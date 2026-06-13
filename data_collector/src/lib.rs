@@ -951,6 +951,134 @@ impl Default for SessionAggregateEvidence {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureSessionListFilter {
+    pub field_id: Option<Uuid>,
+    pub flight_id: Option<Uuid>,
+    pub started_after: Option<DateTime<Utc>>,
+    pub started_before: Option<DateTime<Utc>>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for CaptureSessionListFilter {
+    fn default() -> Self {
+        Self {
+            field_id: None,
+            flight_id: None,
+            started_after: None,
+            started_before: None,
+            offset: 0,
+            limit: 50,
+        }
+    }
+}
+
+impl CaptureSessionListFilter {
+    fn normalized_limit(&self) -> usize {
+        if self.limit == 0 {
+            50
+        } else {
+            self.limit.min(500)
+        }
+    }
+
+    fn matches(&self, session: &FlightSession) -> bool {
+        if let Some(field_id) = self.field_id {
+            if session.field_id != field_id {
+                return false;
+            }
+        }
+
+        if let Some(flight_id) = self.flight_id {
+            if session.flight_id != flight_id {
+                return false;
+            }
+        }
+
+        if let Some(started_after) = self.started_after {
+            if session.start_time < started_after {
+                return false;
+            }
+        }
+
+        if let Some(started_before) = self.started_before {
+            if session.start_time > started_before {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaptureSessionListPage {
+    pub items: Vec<CaptureSessionListItem>,
+    pub total_count: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaptureSessionListItem {
+    pub session_id: Uuid,
+    pub flight_id: Uuid,
+    pub field_id: Uuid,
+    pub scene_id: Uuid,
+    pub drone_id: Uuid,
+    pub status: SessionStatus,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub record_count: u32,
+    pub failure_count: u32,
+    pub freshness: CaptureFreshness,
+    pub coverage: CaptureCoverage,
+    pub aggregate_evidence: SessionAggregateEvidence,
+    pub capture_health: CaptureHealth,
+    pub qa: CaptureQaSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureQaSummary {
+    pub passed: bool,
+    pub masked_records: u32,
+    pub reasons: Vec<String>,
+}
+
+impl CaptureQaSummary {
+    fn from_summary(summary: &SessionSummary) -> Self {
+        let mut reasons = summary
+            .collection_failures
+            .iter()
+            .filter(|failure| failure.kind == CollectionFailureKind::QualityMasked)
+            .map(|failure| failure.message.clone())
+            .collect::<Vec<_>>();
+        reasons.sort();
+        reasons.dedup();
+
+        let masked_records = summary
+            .collection_failures
+            .iter()
+            .filter(|failure| failure.kind == CollectionFailureKind::QualityMasked)
+            .count() as u32;
+
+        Self {
+            passed: masked_records == 0,
+            masked_records,
+            reasons,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureSessionInspection {
+    pub session: CaptureSessionListItem,
+    pub summary: SessionSummary,
+    pub failures: Vec<CollectionFailure>,
+}
+
 /// Main data collector service
 pub struct DataCollectorService {
     storage: StorageEngine,
@@ -1457,6 +1585,74 @@ impl DataCollectorService {
         Ok(sessions)
     }
 
+    pub async fn list_capture_sessions(
+        &self,
+        filter: CaptureSessionListFilter,
+    ) -> Result<CaptureSessionListPage> {
+        let mut sessions = self.sessions_for_inspection().await?;
+        sessions.retain(|session| filter.matches(session));
+
+        let total_count = sessions.len();
+        let offset = filter.offset.min(total_count);
+        let limit = filter.normalized_limit();
+        let items = sessions
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|session| capture_session_list_item(&session))
+            .collect::<Vec<_>>();
+        let has_more = offset + items.len() < total_count;
+
+        Ok(CaptureSessionListPage {
+            items,
+            total_count,
+            offset,
+            limit,
+            has_more,
+        })
+    }
+
+    pub async fn inspect_capture_session(
+        &self,
+        session_id: &Uuid,
+    ) -> Result<CaptureSessionInspection> {
+        let session =
+            self.get_session(session_id)
+                .await?
+                .ok_or(SessionLifecycleError::SessionNotFound {
+                    session_id: *session_id,
+                })?;
+
+        Ok(CaptureSessionInspection {
+            session: capture_session_list_item(&session),
+            summary: session.summary.clone(),
+            failures: session.summary.collection_failures.clone(),
+        })
+    }
+
+    async fn sessions_for_inspection(&self) -> Result<Vec<FlightSession>> {
+        let mut sessions_by_id = self
+            .storage
+            .list_sessions(None, None)
+            .await?
+            .into_iter()
+            .map(|session| (session.id, session))
+            .collect::<HashMap<_, _>>();
+
+        for session in self.active_sessions.values() {
+            sessions_by_id.insert(session.id, session.clone());
+        }
+
+        let mut sessions = sessions_by_id.into_values().collect::<Vec<_>>();
+        sessions.sort_by(|left, right| {
+            right
+                .start_time
+                .cmp(&left.start_time)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(sessions)
+    }
+
     pub async fn search_data(&self, query: SearchQuery) -> Result<Vec<FlightDataRecord>> {
         let persisted_records = self.storage.load_all_data().await?;
         if persisted_records.is_empty() {
@@ -1630,6 +1826,26 @@ impl DataCollectorService {
             return 0.0;
         };
         ((first.battery_level - last.battery_level).max(0.0) * 100.0) as f32
+    }
+}
+
+fn capture_session_list_item(session: &FlightSession) -> CaptureSessionListItem {
+    CaptureSessionListItem {
+        session_id: session.id,
+        flight_id: session.flight_id,
+        field_id: session.field_id,
+        scene_id: session.scene_id,
+        drone_id: session.drone_id,
+        status: session.status,
+        started_at: session.start_time,
+        ended_at: session.end_time,
+        record_count: session.summary.record_count,
+        failure_count: session.summary.collection_failures.len() as u32,
+        freshness: session.summary.freshness.clone(),
+        coverage: session.summary.coverage.clone(),
+        aggregate_evidence: session.summary.aggregate_evidence.clone(),
+        capture_health: session.summary.capture_health.clone(),
+        qa: CaptureQaSummary::from_summary(&session.summary),
     }
 }
 
@@ -2719,6 +2935,124 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, record_id);
+    }
+
+    #[tokio::test]
+    async fn test_capture_session_listing_paginates_filters_and_surfaces_quality() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let request = capture_request();
+        let window_start = Utc::now() - chrono::Duration::minutes(1);
+
+        let first_session_id = start_linked_capture_session(&mut service, request.clone()).await;
+        let first_session = service
+            .get_session(&first_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        service
+            .collect_data(&first_session_id, telemetry_record(&first_session))
+            .await
+            .unwrap();
+        service.end_session(&first_session_id).await.unwrap();
+
+        let second_session_id = start_linked_capture_session(&mut service, request.clone()).await;
+        let second_session = service
+            .get_session(&second_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_started_at = Utc::now();
+        service
+            .collect_data(
+                &second_session_id,
+                telemetry_record_at(&second_session, second_started_at, 40.0, -105.0, 0.9),
+            )
+            .await
+            .unwrap();
+        service
+            .collect_data(
+                &second_session_id,
+                telemetry_record_at(
+                    &second_session,
+                    second_started_at + chrono::Duration::seconds(10),
+                    40.001,
+                    -104.999,
+                    0.88,
+                ),
+            )
+            .await
+            .unwrap();
+        service.end_session(&second_session_id).await.unwrap();
+
+        let page = service
+            .list_capture_sessions(CaptureSessionListFilter {
+                field_id: Some(request.field_id),
+                flight_id: Some(request.flight_id),
+                started_after: Some(window_start),
+                started_before: Some(Utc::now() + chrono::Duration::minutes(1)),
+                offset: 0,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(page.total_count, 2);
+        assert_eq!(page.items.len(), 1);
+        assert!(page.has_more);
+        assert_eq!(page.items[0].session_id, second_session_id);
+        assert_eq!(page.items[0].field_id, request.field_id);
+        assert_eq!(page.items[0].flight_id, request.flight_id);
+        assert_eq!(page.items[0].freshness.status, FreshnessStatus::Fresh);
+        assert_eq!(
+            page.items[0].coverage.status,
+            CaptureCoverageStatus::Complete
+        );
+        assert_eq!(
+            page.items[0].aggregate_evidence.status,
+            SessionAggregateStatus::FromTelemetryTrack
+        );
+        assert_eq!(page.items[0].qa.masked_records, 0);
+        assert!(page.items[0].qa.passed);
+    }
+
+    #[tokio::test]
+    async fn test_capture_session_inspection_surfaces_failed_capture_evidence() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = start_linked_capture_session(&mut service, capture_request()).await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+
+        service
+            .collect_data(&session_id, telemetry_record(&session))
+            .await
+            .unwrap();
+        let failure = service
+            .record_collection_failure(
+                &session_id,
+                CollectionFailureRequest {
+                    occurred_at: Some(Utc::now()),
+                    sensor_id: "lidar-a3".to_string(),
+                    data_type: DataType::LidarScan,
+                    kind: CollectionFailureKind::SensorDropout,
+                    message: "serial frame dropped mid-flight".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        service.fail_session(&session_id).await.unwrap();
+
+        let inspection = service.inspect_capture_session(&session_id).await.unwrap();
+
+        assert_eq!(inspection.session.session_id, session_id);
+        assert_eq!(inspection.session.status, SessionStatus::Failed);
+        assert_eq!(
+            inspection.session.coverage.status,
+            CaptureCoverageStatus::Partial
+        );
+        assert_eq!(inspection.session.coverage.failed_observations, 1);
+        assert_eq!(inspection.failures, vec![failure]);
+        assert_eq!(inspection.summary.collection_failures, inspection.failures);
     }
 
     #[tokio::test]
