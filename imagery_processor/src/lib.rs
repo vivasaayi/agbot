@@ -26,6 +26,8 @@ pub enum Commands {
     Classify(ClassifyArgs),
     /// Generate QA-based masks (cloud/shadow/snow/water/clear) from QA bands
     Masks(MasksArgs),
+    /// Export a completed product as GeoTIFF plus stats CSV
+    Export(ExportArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -170,6 +172,16 @@ pub struct MasksArgs {
     /// Output format for masks
     #[arg(long, value_enum, default_value_t = OutputFormat::Png)]
     pub out_format: OutputFormat,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct ExportArgs {
+    /// Product result metadata JSON produced by indices or thermal
+    #[arg(long)]
+    pub product_metadata: PathBuf,
+    /// Output directory for exported GeoTIFF, sidecar, and stats CSV
+    #[arg(long)]
+    pub output_dir: PathBuf,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, ValueEnum, Debug)]
@@ -577,10 +589,18 @@ impl Processor {
     pub async fn run_masks(&self, args: &MasksArgs) -> AgroResult<()> {
         crate::pipeline::masks::run_masks(args).await
     }
+
+    pub async fn run_export(
+        &self,
+        args: &ExportArgs,
+    ) -> AgroResult<crate::pipeline::export::ProductExportReport> {
+        crate::pipeline::export::run_export(args).await
+    }
 }
 
 pub mod pipeline {
     pub mod classify;
+    pub mod export;
     pub mod indices;
     pub mod masks;
     pub mod thermal;

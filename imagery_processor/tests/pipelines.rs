@@ -8,10 +8,11 @@ use imagery_processor::{
         CalibrationStatus, GeoTiffSpatialSidecar, PngGeoreferenceStatus, PngSpatialSidecar,
     },
     pipeline::{
-        classify::run_classify, indices::run_indices, masks::run_masks, thermal::run_thermal,
+        classify::run_classify, export::run_export, indices::run_indices, masks::run_masks,
+        thermal::run_thermal,
     },
-    BandOverrideSpec, ClassifyArgs, IndexBandRole, IndexKind, IndicesArgs, MasksArgs, OutputFormat,
-    SensorPreset, TemperatureUnit, ThermalArgs, ThermalProduct,
+    BandOverrideSpec, ClassifyArgs, ExportArgs, IndexBandRole, IndexKind, IndicesArgs, MasksArgs,
+    OutputFormat, SensorPreset, TemperatureUnit, ThermalArgs, ThermalProduct,
 };
 use serde_json::Value;
 use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef};
@@ -681,6 +682,97 @@ async fn indices_png_writes_matching_spatial_sidecar() {
     assert_eq!(sidecar.bbox, expected.bbox);
     assert_eq!(sidecar.resolution, expected.resolution);
     assert_eq!(sidecar.geo_transform, expected.geo_transform);
+}
+
+#[tokio::test]
+async fn export_geotiff_product_writes_schema_stats_csv_and_sidecar() {
+    let root = temp_test_dir("export_geotiff_product");
+    let source_path = root.join("source_ndvi.tif");
+    let metadata_path = root.join("source_ndvi_result.json");
+    let output_dir = root.join("export");
+    fs::write(&source_path, b"geotiff-bytes").unwrap();
+    let spatial_ref = valid_asserted_spatial_ref(2, 1);
+    write_geotiff_spatial_sidecar(&source_path, &spatial_ref)
+        .await
+        .unwrap();
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "output_path": source_path,
+            "index": "ndvi",
+            "min": 0.1,
+            "max": 0.9,
+            "mean": 0.5,
+            "valid_pixel_coverage": 0.75,
+            "unit": "index",
+            "spatial_ref": spatial_ref,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let report = run_export(&ExportArgs {
+        product_metadata: metadata_path,
+        output_dir: output_dir.clone(),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(fs::read(&report.geotiff_path).unwrap(), b"geotiff-bytes");
+    let sidecar: GeoTiffSpatialSidecar =
+        serde_json::from_str(&fs::read_to_string(&report.spatial_sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar.crs, "EPSG:4326");
+    assert_eq!(sidecar.bbox, spatial_ref.bbox.unwrap());
+    assert_eq!(sidecar.resolution, spatial_ref.resolution.unwrap());
+    let csv = fs::read_to_string(&report.stats_csv_path).unwrap();
+    assert_eq!(
+        csv,
+        "product,min,max,mean,coverage,units\nndvi,0.1,0.9,0.5,0.75,index\n"
+    );
+}
+
+#[tokio::test]
+async fn export_empty_product_writes_valid_zero_coverage_csv() {
+    let root = temp_test_dir("export_empty_product");
+    let source_path = root.join("empty_ndvi.tif");
+    let metadata_path = root.join("empty_ndvi_result.json");
+    let output_dir = root.join("export");
+    fs::write(&source_path, b"empty-geotiff-bytes").unwrap();
+    let spatial_ref = valid_asserted_spatial_ref(1, 1);
+    write_geotiff_spatial_sidecar(&source_path, &spatial_ref)
+        .await
+        .unwrap();
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "output_path": source_path,
+            "index": "ndvi",
+            "min": serde_json::Value::Null,
+            "max": serde_json::Value::Null,
+            "mean": serde_json::Value::Null,
+            "valid_pixel_coverage": 0.0,
+            "unit": "index",
+            "spatial_ref": spatial_ref,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let report = run_export(&ExportArgs {
+        product_metadata: metadata_path,
+        output_dir,
+    })
+    .await
+    .unwrap();
+
+    let csv = fs::read_to_string(&report.stats_csv_path).unwrap();
+    assert_eq!(
+        csv,
+        "product,min,max,mean,coverage,units\nndvi,,,,0,index\n"
+    );
+    assert_eq!(report.stats.coverage, 0.0);
+    assert_eq!(report.stats.min, None);
+    assert_eq!(report.stats.mean, None);
 }
 
 #[tokio::test]
