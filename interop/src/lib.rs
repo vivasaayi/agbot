@@ -215,6 +215,92 @@ pub struct PrescriptionTaskDataReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JohnDeerePrescriptionPushRequest {
+    pub remote_field_id: String,
+    pub prescription: PrescriptionShapefileRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JohnDeereRetryPolicy {
+    pub max_attempts: usize,
+    #[serde(default)]
+    pub backoff_millis: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JohnDeereUploadPayload {
+    pub remote_field_id: String,
+    pub prescription_id: String,
+    pub crs: String,
+    pub unit_designator: String,
+    pub zone_count: usize,
+    pub rates: Vec<f64>,
+    pub taskdata_xml: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemotePrescriptionReceipt {
+    pub remote_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JohnDeereEndpointError {
+    pub message: String,
+}
+
+impl JohnDeereEndpointError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub trait JohnDeereConnectorEndpoint {
+    fn push_prescription(
+        &mut self,
+        payload: JohnDeereUploadPayload,
+    ) -> Result<RemotePrescriptionReceipt, JohnDeereEndpointError>;
+
+    fn pull_boundaries(&mut self) -> Result<Vec<JohnDeereBoundary>, JohnDeereEndpointError>;
+
+    fn wait_backoff(&mut self, _millis: u64) {}
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JohnDeerePrescriptionPushReport {
+    pub remote_id: String,
+    pub attempts: usize,
+    pub backoff_millis: Vec<u64>,
+    pub zone_count: usize,
+    pub unit_designator: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JohnDeereBoundary {
+    pub remote_field_id: String,
+    pub name: String,
+    pub crs: String,
+    pub boundary: Vec<InteropCoordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JohnDeereMappedBoundary {
+    pub remote_field_id: String,
+    pub name: String,
+    pub source_crs: String,
+    pub target_crs: String,
+    pub extent: InteropExtent,
+    pub feature_count: usize,
+    pub boundary: Vec<InteropCoordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JohnDeereBoundaryPullReport {
+    pub boundaries: Vec<JohnDeereMappedBoundary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct NormalizedPrescription {
     prescription_id: String,
     field_id: String,
@@ -291,6 +377,27 @@ pub enum PrescriptionRejectionReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum JohnDeereConnectorError {
+    EmptyRemoteFieldId,
+    EmptyRemoteId,
+    EndpointFailed {
+        attempts: usize,
+        message: String,
+    },
+    UnsupportedPrescriptionCrs {
+        crs: String,
+    },
+    UnsupportedBoundaryCrs {
+        remote_field_id: String,
+        crs: String,
+    },
+    InvalidBoundaryGeometry {
+        remote_field_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InteropRejectionReason {
     ParseError,
     MissingCrs,
@@ -315,6 +422,9 @@ pub enum InteropRejectionReason {
     },
     InvalidPrescription {
         reason: PrescriptionRejectionReason,
+    },
+    JohnDeereConnector {
+        reason: JohnDeereConnectorError,
     },
 }
 
@@ -783,6 +893,87 @@ pub fn validate_taskdata_xml(bytes: &[u8]) -> Result<TaskDataValidation, Interop
     })
 }
 
+pub fn push_john_deere_prescription(
+    endpoint: &mut impl JohnDeereConnectorEndpoint,
+    request: JohnDeerePrescriptionPushRequest,
+    retry_policy: JohnDeereRetryPolicy,
+) -> Result<JohnDeerePrescriptionPushReport, InteropError> {
+    let remote_field_id = normalize_prescription_text(&request.remote_field_id)
+        .ok_or_else(|| john_deere_rejected(JohnDeereConnectorError::EmptyRemoteFieldId))?;
+    let prescription = normalize_prescription_request(request.prescription)?;
+    validate_john_deere_prescription_crs(&prescription.field_crs)?;
+    let unit_designator = taskdata_unit_designator(&prescription)?;
+    let taskdata_xml = write_taskdata_xml(&prescription, &unit_designator).into_bytes();
+    validate_taskdata_xml(&taskdata_xml)?;
+    let rates = prescription
+        .zones
+        .iter()
+        .map(|zone| zone.rate)
+        .collect::<Vec<_>>();
+    let payload = JohnDeereUploadPayload {
+        remote_field_id,
+        prescription_id: prescription.prescription_id,
+        crs: prescription.field_crs,
+        unit_designator: unit_designator.clone(),
+        zone_count: prescription.zones.len(),
+        rates,
+        taskdata_xml,
+    };
+    let max_attempts = retry_policy.max_attempts.max(1);
+    let mut backoff_millis = Vec::new();
+    let mut last_error = None::<JohnDeereEndpointError>;
+
+    for attempt in 1..=max_attempts {
+        match endpoint.push_prescription(payload.clone()) {
+            Ok(receipt) => {
+                let remote_id = normalize_prescription_text(&receipt.remote_id)
+                    .ok_or_else(|| john_deere_rejected(JohnDeereConnectorError::EmptyRemoteId))?;
+                return Ok(JohnDeerePrescriptionPushReport {
+                    remote_id,
+                    attempts: attempt,
+                    backoff_millis,
+                    zone_count: payload.zone_count,
+                    unit_designator,
+                });
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < max_attempts {
+                    let backoff = backoff_for_attempt(&retry_policy, attempt);
+                    endpoint.wait_backoff(backoff);
+                    backoff_millis.push(backoff);
+                }
+            }
+        }
+    }
+
+    let message = last_error
+        .map(|error| error.message)
+        .unwrap_or_else(|| "endpoint failed".to_string());
+    Err(john_deere_rejected(
+        JohnDeereConnectorError::EndpointFailed {
+            attempts: max_attempts,
+            message,
+        },
+    ))
+}
+
+pub fn pull_john_deere_boundaries(
+    endpoint: &mut impl JohnDeereConnectorEndpoint,
+) -> Result<JohnDeereBoundaryPullReport, InteropError> {
+    let boundaries = endpoint.pull_boundaries().map_err(|error| {
+        john_deere_rejected(JohnDeereConnectorError::EndpointFailed {
+            attempts: 1,
+            message: error.message,
+        })
+    })?;
+    let mut mapped = Vec::with_capacity(boundaries.len());
+    for boundary in boundaries {
+        mapped.push(map_john_deere_boundary(boundary)?);
+    }
+    Ok(JohnDeereBoundaryPullReport { boundaries: mapped })
+}
+
 fn export_geojson(imported: &InteropImportResult) -> Result<Vec<u8>, InteropError> {
     let features = imported
         .features
@@ -979,6 +1170,77 @@ fn normalize_prescription_request(
         field_crs,
         field_extent,
         zones,
+    })
+}
+
+fn backoff_for_attempt(policy: &JohnDeereRetryPolicy, attempt: usize) -> u64 {
+    policy
+        .backoff_millis
+        .get(attempt.saturating_sub(1))
+        .copied()
+        .or_else(|| policy.backoff_millis.last().copied())
+        .unwrap_or(0)
+}
+
+fn validate_john_deere_prescription_crs(crs: &str) -> Result<(), InteropError> {
+    if matches!(crs, WGS84 | WEB_MERCATOR) {
+        return Ok(());
+    }
+    Err(john_deere_rejected(
+        JohnDeereConnectorError::UnsupportedPrescriptionCrs {
+            crs: crs.to_string(),
+        },
+    ))
+}
+
+fn map_john_deere_boundary(
+    boundary: JohnDeereBoundary,
+) -> Result<JohnDeereMappedBoundary, InteropError> {
+    let remote_field_id = normalize_prescription_text(&boundary.remote_field_id)
+        .ok_or_else(|| john_deere_rejected(JohnDeereConnectorError::EmptyRemoteFieldId))?;
+    let source_crs = normalize_crs(&boundary.crs).ok_or_else(|| {
+        john_deere_rejected(JohnDeereConnectorError::UnsupportedBoundaryCrs {
+            remote_field_id: remote_field_id.clone(),
+            crs: boundary.crs.clone(),
+        })
+    })?;
+    if source_crs.to_ascii_uppercase().contains("OBLIQUE")
+        || !matches!(source_crs.as_str(), WGS84 | WEB_MERCATOR)
+    {
+        return Err(john_deere_rejected(
+            JohnDeereConnectorError::UnsupportedBoundaryCrs {
+                remote_field_id,
+                crs: boundary.crs,
+            },
+        ));
+    }
+    let ring = normalize_prescription_ring(&boundary.boundary).ok_or_else(|| {
+        john_deere_rejected(JohnDeereConnectorError::InvalidBoundaryGeometry {
+            remote_field_id: remote_field_id.clone(),
+        })
+    })?;
+    if polygon_area(&ring) <= GEOMETRY_EPSILON || ring_self_intersects_coordinates(&ring) {
+        return Err(john_deere_rejected(
+            JohnDeereConnectorError::InvalidBoundaryGeometry {
+                remote_field_id: remote_field_id.clone(),
+            },
+        ));
+    }
+    let extent = extent_from_coordinates(&ring).ok_or_else(|| {
+        john_deere_rejected(JohnDeereConnectorError::InvalidBoundaryGeometry {
+            remote_field_id: remote_field_id.clone(),
+        })
+    })?;
+
+    Ok(JohnDeereMappedBoundary {
+        remote_field_id,
+        name: normalize_prescription_text(&boundary.name)
+            .unwrap_or_else(|| "<unnamed>".to_string()),
+        source_crs: source_crs.clone(),
+        target_crs: source_crs,
+        extent,
+        feature_count: 1,
+        boundary: ring,
     })
 }
 
@@ -1889,6 +2151,13 @@ fn prescription_rejected(filename: &str, reason: PrescriptionRejectionReason) ->
     )
 }
 
+fn john_deere_rejected(reason: JohnDeereConnectorError) -> InteropError {
+    rejected(
+        "john-deere-operations-center",
+        InteropRejectionReason::JohnDeereConnector { reason },
+    )
+}
+
 fn parse_geojson_and_reproject(
     filename: &str,
     bytes: &[u8],
@@ -2185,12 +2454,15 @@ impl ExtentBuilder {
 mod tests {
     use super::{
         export_prescription_shapefile, export_prescription_taskdata, export_raster_geotiff,
-        import_field_boundary, reopen_raster_geotiff, round_trip_vector_layer,
-        validate_and_reproject_import, validate_geopackage_layers, validate_taskdata_xml,
-        CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason, ImportFormat,
-        ImportPayload, InteropCoordinate, InteropError, InteropExtent, InteropRejectionReason,
+        import_field_boundary, pull_john_deere_boundaries, push_john_deere_prescription,
+        reopen_raster_geotiff, round_trip_vector_layer, validate_and_reproject_import,
+        validate_geopackage_layers, validate_taskdata_xml, CrsTransform,
+        FieldBoundaryImportRequest, FieldBoundaryRejectionReason, ImportFormat, ImportPayload,
+        InteropCoordinate, InteropError, InteropExtent, InteropRejectionReason, JohnDeereBoundary,
+        JohnDeereConnectorEndpoint, JohnDeereConnectorError, JohnDeereEndpointError,
+        JohnDeerePrescriptionPushRequest, JohnDeereRetryPolicy, JohnDeereUploadPayload,
         PrescriptionField, PrescriptionRejectionReason, PrescriptionShapefileRequest,
-        PrescriptionZone, RasterProduct, ReprojectedGeometry,
+        PrescriptionZone, RasterProduct, RemotePrescriptionReceipt, ReprojectedGeometry,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -2763,6 +3035,228 @@ mod tests {
         );
     }
 
+    #[test]
+    fn john_deere_connector_pushes_prescription_after_retry_with_mapping() {
+        let mut endpoint = FakeJohnDeereEndpoint::new()
+            .with_push_error("503 transient")
+            .with_push_success("jd-rx-001");
+
+        let report = push_john_deere_prescription(
+            &mut endpoint,
+            JohnDeerePrescriptionPushRequest {
+                remote_field_id: "jd-field-alpha".to_string(),
+                prescription: john_deere_prescription_request(),
+            },
+            JohnDeereRetryPolicy {
+                max_attempts: 3,
+                backoff_millis: vec![100, 250],
+            },
+        )
+        .expect("connector should retry and upload");
+
+        assert_eq!(report.remote_id, "jd-rx-001");
+        assert_eq!(report.attempts, 2);
+        assert_eq!(report.backoff_millis, vec![100]);
+        assert_eq!(endpoint.backoffs, vec![100]);
+        assert_eq!(endpoint.uploads.len(), 2);
+        let payload = endpoint.uploads.last().expect("payload should be sent");
+        assert_eq!(payload.remote_field_id, "jd-field-alpha");
+        assert_eq!(payload.prescription_id, "rx-alpha-2026");
+        assert_eq!(payload.crs, "EPSG:4326");
+        assert_eq!(payload.unit_designator, "kg/ha");
+        assert_eq!(payload.zone_count, 2);
+        assert_eq!(payload.rates, vec![32.5, 12.25]);
+        assert!(String::from_utf8(payload.taskdata_xml.clone())
+            .expect("TaskData XML")
+            .contains("<ISO11783_TaskData"));
+    }
+
+    #[test]
+    fn john_deere_connector_surfaces_endpoint_failure_after_retries() {
+        let mut endpoint = FakeJohnDeereEndpoint::new()
+            .with_push_error("503 transient")
+            .with_push_error("500 still down");
+
+        let error = push_john_deere_prescription(
+            &mut endpoint,
+            JohnDeerePrescriptionPushRequest {
+                remote_field_id: "jd-field-alpha".to_string(),
+                prescription: john_deere_prescription_request(),
+            },
+            JohnDeereRetryPolicy {
+                max_attempts: 2,
+                backoff_millis: vec![50],
+            },
+        )
+        .expect_err("exhausted endpoint errors should surface");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "john-deere-operations-center".to_string(),
+                reason: InteropRejectionReason::JohnDeereConnector {
+                    reason: JohnDeereConnectorError::EndpointFailed {
+                        attempts: 2,
+                        message: "500 still down".to_string(),
+                    }
+                }
+            }
+        );
+        assert_eq!(endpoint.uploads.len(), 2);
+        assert_eq!(endpoint.backoffs, vec![50]);
+    }
+
+    #[test]
+    fn john_deere_connector_refuses_prescription_push_with_unsupported_crs() {
+        let mut request = prescription_request();
+        request.field.crs = "EPSG:32614".to_string();
+        request.zones[0].crs = "EPSG:32614".to_string();
+        request.zones[1].crs = "EPSG:32614".to_string();
+        let mut endpoint = FakeJohnDeereEndpoint::new().with_push_success("jd-rx-001");
+
+        let error = push_john_deere_prescription(
+            &mut endpoint,
+            JohnDeerePrescriptionPushRequest {
+                remote_field_id: "jd-field-alpha".to_string(),
+                prescription: request,
+            },
+            JohnDeereRetryPolicy {
+                max_attempts: 1,
+                backoff_millis: Vec::new(),
+            },
+        )
+        .expect_err("unsupported JD push CRS should refuse before upload");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "john-deere-operations-center".to_string(),
+                reason: InteropRejectionReason::JohnDeereConnector {
+                    reason: JohnDeereConnectorError::UnsupportedPrescriptionCrs {
+                        crs: "EPSG:32614".to_string(),
+                    }
+                }
+            }
+        );
+        assert!(endpoint.uploads.is_empty());
+    }
+
+    #[test]
+    fn john_deere_connector_pulls_boundaries_with_valid_crs_mapping() {
+        let mut endpoint = FakeJohnDeereEndpoint::new().with_boundary(JohnDeereBoundary {
+            remote_field_id: "jd-field-alpha".to_string(),
+            name: "North Block".to_string(),
+            crs: "EPSG:4326".to_string(),
+            boundary: vec![
+                InteropCoordinate {
+                    x: -121.0,
+                    y: 39.01,
+                },
+                InteropCoordinate {
+                    x: -120.99,
+                    y: 39.01,
+                },
+                InteropCoordinate {
+                    x: -120.99,
+                    y: 39.0,
+                },
+                InteropCoordinate { x: -121.0, y: 39.0 },
+                InteropCoordinate {
+                    x: -121.0,
+                    y: 39.01,
+                },
+            ],
+        });
+
+        let report =
+            pull_john_deere_boundaries(&mut endpoint).expect("valid JD boundary should map");
+
+        assert_eq!(report.boundaries.len(), 1);
+        assert_eq!(report.boundaries[0].remote_field_id, "jd-field-alpha");
+        assert_eq!(report.boundaries[0].target_crs, "EPSG:4326");
+        assert_eq!(report.boundaries[0].feature_count, 1);
+        assert!(report.boundaries[0].extent.min_x < report.boundaries[0].extent.max_x);
+    }
+
+    #[test]
+    fn john_deere_connector_refuses_boundary_with_unsupported_crs() {
+        let mut endpoint = FakeJohnDeereEndpoint::new().with_boundary(JohnDeereBoundary {
+            remote_field_id: "jd-field-oblique".to_string(),
+            name: "Bad CRS".to_string(),
+            crs: "OBLIQUE:LOCAL".to_string(),
+            boundary: rectangle(0.0, 0.0, 1.0, 1.0),
+        });
+
+        let error = pull_john_deere_boundaries(&mut endpoint)
+            .expect_err("unsupported CRS should refuse pulled boundary");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "john-deere-operations-center".to_string(),
+                reason: InteropRejectionReason::JohnDeereConnector {
+                    reason: JohnDeereConnectorError::UnsupportedBoundaryCrs {
+                        remote_field_id: "jd-field-oblique".to_string(),
+                        crs: "OBLIQUE:LOCAL".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeJohnDeereEndpoint {
+        push_results: Vec<Result<RemotePrescriptionReceipt, JohnDeereEndpointError>>,
+        boundaries: Vec<JohnDeereBoundary>,
+        uploads: Vec<JohnDeereUploadPayload>,
+        backoffs: Vec<u64>,
+    }
+
+    impl FakeJohnDeereEndpoint {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_push_error(mut self, message: &str) -> Self {
+            self.push_results
+                .push(Err(JohnDeereEndpointError::new(message)));
+            self
+        }
+
+        fn with_push_success(mut self, remote_id: &str) -> Self {
+            self.push_results.push(Ok(RemotePrescriptionReceipt {
+                remote_id: remote_id.to_string(),
+            }));
+            self
+        }
+
+        fn with_boundary(mut self, boundary: JohnDeereBoundary) -> Self {
+            self.boundaries.push(boundary);
+            self
+        }
+    }
+
+    impl JohnDeereConnectorEndpoint for FakeJohnDeereEndpoint {
+        fn push_prescription(
+            &mut self,
+            payload: JohnDeereUploadPayload,
+        ) -> Result<RemotePrescriptionReceipt, JohnDeereEndpointError> {
+            self.uploads.push(payload);
+            if self.push_results.is_empty() {
+                return Err(JohnDeereEndpointError::new("no fake response configured"));
+            }
+            self.push_results.remove(0)
+        }
+
+        fn pull_boundaries(&mut self) -> Result<Vec<JohnDeereBoundary>, JohnDeereEndpointError> {
+            Ok(self.boundaries.clone())
+        }
+
+        fn wait_backoff(&mut self, millis: u64) {
+            self.backoffs.push(millis);
+        }
+    }
+
     fn prescription_request() -> PrescriptionShapefileRequest {
         PrescriptionShapefileRequest {
             prescription_id: "rx-alpha-2026".to_string(),
@@ -2783,6 +3277,33 @@ mod tests {
                     zone_id: "zone-east".to_string(),
                     polygon: rectangle(500_010.0, 4_499_980.0, 500_020.0, 4_500_000.0),
                     crs: "EPSG:32614".to_string(),
+                    rate: 12.25,
+                    unit: "kg_ha".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn john_deere_prescription_request() -> PrescriptionShapefileRequest {
+        PrescriptionShapefileRequest {
+            prescription_id: "rx-alpha-2026".to_string(),
+            field: PrescriptionField {
+                field_id: "field-alpha".to_string(),
+                crs: "EPSG:4326".to_string(),
+                boundary: rectangle(-121.0, 39.0, -120.98, 39.02),
+            },
+            zones: vec![
+                PrescriptionZone {
+                    zone_id: "zone-west".to_string(),
+                    polygon: rectangle(-121.0, 39.0, -120.99, 39.02),
+                    crs: "EPSG:4326".to_string(),
+                    rate: 32.5,
+                    unit: "kg_ha".to_string(),
+                },
+                PrescriptionZone {
+                    zone_id: "zone-east".to_string(),
+                    polygon: rectangle(-120.99, 39.0, -120.98, 39.02),
+                    crs: "EPSG:4326".to_string(),
                     rate: 12.25,
                     unit: "kg_ha".to_string(),
                 },
