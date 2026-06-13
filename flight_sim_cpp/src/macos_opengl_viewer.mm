@@ -3,6 +3,7 @@
 
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
+#include "agbot_flight_sim/HudTelemetry.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/MissionPreview.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
@@ -29,6 +30,8 @@ using agbot::flight_sim::GeoCoordinate;
 using agbot::flight_sim::GeoBounds;
 using agbot::flight_sim::ControlMode;
 using agbot::flight_sim::ElevationTile;
+using agbot::flight_sim::HudTelemetry;
+using agbot::flight_sim::HudUiState;
 using agbot::flight_sim::ManualControlInput;
 using agbot::flight_sim::Mission;
 using agbot::flight_sim::MissionLoader;
@@ -45,6 +48,7 @@ using agbot::flight_sim::build_terrain_mesh;
 using agbot::flight_sim::composite_elevation_with_state;
 using agbot::flight_sim::elevation_tile_from_terrarium_rgba;
 using agbot::flight_sim::geo_from_local;
+using agbot::flight_sim::hud_telemetry_from_state;
 using agbot::flight_sim::local_from_geo;
 using agbot::flight_sim::build_mission_preview_overlay;
 using agbot::flight_sim::radius_m_for_area_km2;
@@ -1232,19 +1236,23 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
 
     const DroneState& state = [self displayState];
-    const double speed = state.velocity.length();
+    const ControlMode display_control_mode = replay_mode_ ? ControlMode::Replay : simulation_->control_mode();
+    const HudTelemetry hud = hud_telemetry_from_state(state, display_control_mode);
     const std::size_t waypoint_count = simulation_->mission().waypoints.size();
     const std::size_t waypoint_index = std::min(state.target_waypoint_index + 1, waypoint_count);
     const MissionPreviewOverlay preview = build_mission_preview_overlay(simulation_->mission());
 
     std::ostringstream telemetry;
     telemetry << std::fixed << std::setprecision(1)
-              << "Mode      " << (replay_mode_ ? "replay" : to_string(simulation_->control_mode())) << "\n"
-              << "Flight    " << to_string(state.mode) << "\n"
-              << "Armed     " << (state.armed ? "yes" : "no") << "\n"
-              << "Speed     " << speed << " m/s\n"
-              << "Altitude  " << state.position.y << " m\n"
-              << "Battery   " << std::setprecision(0) << state.battery_percent << "%\n"
+              << "Mode      " << to_string(hud.control_mode) << "\n"
+              << "Flight    " << to_string(hud.flight_mode) << "\n"
+              << "HUD       " << to_string(hud.ui_state) << "\n"
+              << "Armed     " << (hud.armed ? "yes" : "no") << "\n"
+              << "Compass   " << std::setprecision(0) << hud.compass_heading_deg << " deg\n"
+              << std::setprecision(1)
+              << "Speed     " << hud.speed_mps << " m/s\n"
+              << "Altitude  " << hud.altitude_m << " m\n"
+              << "Battery   " << std::setprecision(0) << hud.battery_percent << "%\n"
               << std::setprecision(1)
               << "Time      " << state.mission_time_s << " s\n"
               << "Camera    "
@@ -2578,6 +2586,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     const double width = bounds.size.width;
     const double height = bounds.size.height;
     const DroneState& state = [self displayState];
+    const ControlMode display_control_mode = replay_mode_ ? ControlMode::Replay : simulation_->control_mode();
+    const HudTelemetry hud = hud_telemetry_from_state(state, display_control_mode);
 
     glMatrixMode(GL_PROJECTION);
     glPushMatrix();
@@ -2594,8 +2604,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     set_color(0.22, 0.24, 0.28, 1.0);
     draw_rect(34.0, height - 45.0, 180.0, 10.0);
 
-    const double battery_width = 180.0 * std::clamp(state.battery_percent / 100.0, 0.0, 1.0);
-    if (state.battery_percent < 25.0) {
+    const double battery_width = 180.0 * std::clamp(hud.battery_percent / 100.0, 0.0, 1.0);
+    if (hud.ui_state == HudUiState::Emergency || hud.battery_critical) {
         set_color(1.0, 0.25, 0.18, 1.0);
     } else {
         set_color(0.2, 0.86, 0.42, 1.0);

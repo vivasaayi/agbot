@@ -12,6 +12,7 @@ add_library(agbot_flight_sim_core
     src/DroneSimulation.cpp
     src/FaultInjection.cpp
     src/GeoTerrain.cpp
+    src/HudTelemetry.cpp
     src/LidarSimulator.cpp
     src/MissionLoader.cpp
     src/MissionPreview.cpp

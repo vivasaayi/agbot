@@ -2,6 +2,7 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/FaultInjection.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
+#include "agbot_flight_sim/HudTelemetry.hpp"
 #include "agbot_flight_sim/LidarSimulator.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/MissionPreview.hpp"
@@ -39,6 +40,8 @@ using agbot::flight_sim::SimulationEventType;
 using agbot::flight_sim::TileCoordinate;
 using agbot::flight_sim::TelemetryRecorder;
 using agbot::flight_sim::TelemetryReplay;
+using agbot::flight_sim::HudUiState;
+using agbot::flight_sim::hud_telemetry_from_state;
 
 namespace {
 
@@ -387,6 +390,46 @@ void test_twin_backend_unavailable_fails_closed_without_telemetry() {
     assert(ack.error->code == "twin_unavailable");
     assert(!ack.telemetry.has_value());
     assert(!backend.simulation().state().armed);
+}
+
+void test_hud_telemetry_maps_display_values_from_state() {
+    agbot::flight_sim::DroneState state;
+    state.position = {12.0, 42.5, -5.0};
+    state.velocity = {3.0, 4.0, 12.0};
+    state.yaw_rad = -M_PI / 2.0;
+    state.battery_percent = 76.4;
+    state.mode = DroneMode::Flying;
+    state.armed = true;
+
+    const auto hud = hud_telemetry_from_state(state, ControlMode::Manual);
+
+    assert(std::abs(hud.compass_heading_deg - 270.0) < 1e-9);
+    assert(std::abs(hud.speed_mps - 13.0) < 1e-9);
+    assert(std::abs(hud.altitude_m - 42.5) < 1e-9);
+    assert(std::abs(hud.battery_percent - 76.4) < 1e-9);
+    assert(hud.flight_mode == DroneMode::Flying);
+    assert(hud.control_mode == ControlMode::Manual);
+    assert(hud.armed);
+    assert(!hud.battery_critical);
+    assert(hud.ui_state == HudUiState::Normal);
+}
+
+void test_hud_telemetry_reflects_battery_critical_and_failsafe_state() {
+    agbot::flight_sim::DroneState critical_battery;
+    critical_battery.battery_percent = 12.0;
+    critical_battery.mode = DroneMode::Flying;
+
+    const auto critical_hud = hud_telemetry_from_state(critical_battery, ControlMode::Autopilot);
+    assert(critical_hud.battery_critical);
+    assert(critical_hud.ui_state == HudUiState::Emergency);
+
+    agbot::flight_sim::DroneState failsafe;
+    failsafe.battery_percent = 86.0;
+    failsafe.mode = DroneMode::Failsafe;
+
+    const auto failsafe_hud = hud_telemetry_from_state(failsafe, ControlMode::Autopilot);
+    assert(!failsafe_hud.battery_critical);
+    assert(failsafe_hud.ui_state == HudUiState::Emergency);
 }
 
 void test_failsafe_low_battery() {
@@ -1374,6 +1417,8 @@ int main() {
     test_mission_round_trip();
     test_twin_backend_executes_shared_command_and_returns_telemetry();
     test_twin_backend_unavailable_fails_closed_without_telemetry();
+    test_hud_telemetry_maps_display_values_from_state();
+    test_hud_telemetry_reflects_battery_critical_and_failsafe_state();
     test_failsafe_low_battery();
     test_safety_parity_harness_covers_required_rules();
     test_drone_simulation_enforces_altitude_safety_rule();
