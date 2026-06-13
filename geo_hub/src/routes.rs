@@ -70,10 +70,18 @@ use orthomosaic::{
     ReconstructionJobRecord, ReconstructionJobRequest, ReconstructionStatus, TiledOutputHandoff,
     TiledOutputHandoffError, TiledOutputHandoffRequest,
 };
+use plugin_sdk::{
+    PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginLifecycleAuditRecord,
+    PluginLifecycleError, PluginLifecycleStatus, PluginLifecycleTransitionRequest,
+    PluginRegistrationError, PluginRegistrationRecord, RawPluginManifest, SandboxExecutionOutcome,
+    SandboxExecutionStatus, SandboxTerminationReason,
+};
 use provenance::{
-    ActorIdentity, AuditAction, AuditEntry, AuditRefusalReason, LineageRecord, ProvenanceParameters,
+    ActorIdentity, ActorKind, AuditAction, AuditEntry, AuditLedger, AuditRefusalReason,
+    LineageRecord, ProvenanceParameters,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
     append_content_version, assert_raster_spatial_ref, bind_fleet_node_identity,
     bounds_from_points, build_collaboration_channel, build_collaboration_message,
@@ -610,6 +618,41 @@ pub struct ProvenanceAuditPage {
     pub page_size: usize,
     pub total: usize,
     pub entries: Vec<AuditEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginListQuery {
+    pub kind: Option<ExtensionPointKind>,
+    pub status: Option<PluginLifecycleStatus>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginRegistrationPage {
+    pub page: usize,
+    pub page_size: usize,
+    pub total: usize,
+    pub plugins: Vec<PluginRegistrationRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginStatusUpdateRequest {
+    pub status: PluginLifecycleStatus,
+    pub actor_id: String,
+    pub actor_kind: Option<ActorKind>,
+    pub occurred_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginExecutionRequest {
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    pub estimated_runtime_ms: u64,
+    pub estimated_memory_mb: u64,
+    pub result: Option<String>,
+    pub limits: Option<PluginExecutionLimits>,
+    pub attempted_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3425,6 +3468,150 @@ pub async fn get_provenance_audit_entry(
         .transpose()?
         .map(Json)
         .ok_or(AppError::NotFound)
+}
+
+pub async fn register_plugin(
+    State(state): State<AppState>,
+    Json(manifest): Json<RawPluginManifest>,
+) -> AppResult<Json<PluginRegistrationRecord>> {
+    let mut host = PluginHost::default();
+    let record = host
+        .register_plugin(manifest)
+        .map_err(plugin_registration_error)?;
+    insert_plugin_registration(&state, &record, current_record_timestamp()).await?;
+    Ok(Json(record))
+}
+
+pub async fn list_plugins(
+    Query(query): Query<PluginListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<PluginRegistrationPage>> {
+    let kind = query.kind.map(|kind| kind.as_str().to_string());
+    let status = query.status.map(|status| status.as_str().to_string());
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * page_size;
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM plugin_registrations
+        WHERE (?1 IS NULL OR kind = ?1)
+          AND (?2 IS NULL OR status = ?2)
+        "#,
+    )
+    .bind(&kind)
+    .bind(&status)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT plugin_id, name, version, kind, host_api_version, capabilities_json, entrypoint,
+               status
+        FROM plugin_registrations
+        WHERE (?1 IS NULL OR kind = ?1)
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY updated_at DESC, plugin_id ASC
+        LIMIT ?3 OFFSET ?4
+        "#,
+    )
+    .bind(kind)
+    .bind(status)
+    .bind(page_size as i64)
+    .bind(offset as i64)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let plugins = rows
+        .into_iter()
+        .map(|row| decode_plugin_registration(&row))
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(Json(PluginRegistrationPage {
+        page,
+        page_size,
+        total: total as usize,
+        plugins,
+    }))
+}
+
+pub async fn update_plugin_status(
+    Path(plugin_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PluginStatusUpdateRequest>,
+) -> AppResult<Json<PluginRegistrationRecord>> {
+    let plugin_id = normalize_optional_text(Some(plugin_id))
+        .ok_or_else(|| AppError::BadRequest("plugin_id is required".to_string()))?;
+    let current = load_plugin_registration(&state, &plugin_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let occurred_at =
+        normalize_optional_text(request.occurred_at).unwrap_or_else(current_record_timestamp);
+    let actor_kind = request.actor_kind.unwrap_or(ActorKind::PlatformAdmin);
+    let mut host =
+        PluginHost::with_registration_records(vec![current]).map_err(plugin_registration_error)?;
+    let (updated, audit) = host
+        .transition_plugin_status(
+            &plugin_id,
+            PluginLifecycleTransitionRequest {
+                status: request.status,
+                actor_id: request.actor_id,
+                occurred_at,
+            },
+            format!("plugin-lifecycle-audit-{}", Uuid::new_v4()),
+        )
+        .map_err(plugin_lifecycle_error)?;
+
+    update_plugin_registration_status(&state, &updated, &audit.occurred_at).await?;
+    insert_plugin_lifecycle_audit(&state, &audit).await?;
+    append_plugin_lifecycle_provenance_audit(&state, &audit, actor_kind).await?;
+
+    Ok(Json(updated))
+}
+
+pub async fn execute_plugin(
+    Path(plugin_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PluginExecutionRequest>,
+) -> AppResult<Json<SandboxExecutionOutcome>> {
+    let plugin_id = normalize_optional_text(Some(plugin_id))
+        .ok_or_else(|| AppError::BadRequest("plugin_id is required".to_string()))?;
+    let current = load_plugin_registration(&state, &plugin_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let mut host =
+        PluginHost::with_registration_records(vec![current]).map_err(plugin_registration_error)?;
+    let limits = request.limits.unwrap_or(PluginExecutionLimits {
+        max_runtime_ms: 1_000,
+        max_memory_mb: 512,
+    });
+    let attempted_at =
+        normalize_optional_text(request.attempted_at).unwrap_or_else(current_record_timestamp);
+    let outcome = host.execute_sandboxed(
+        PluginExecutionPlan {
+            plugin_id: plugin_id.clone(),
+            required_capabilities: request.required_capabilities,
+            estimated_runtime_ms: request.estimated_runtime_ms,
+            estimated_memory_mb: request.estimated_memory_mb,
+            result: request
+                .result
+                .unwrap_or_else(|| "plugin execution complete".to_string()),
+        },
+        limits,
+        &attempted_at,
+    );
+    if outcome.status == SandboxExecutionStatus::Terminated
+        && outcome.termination_reason == Some(SandboxTerminationReason::PluginNotEnabled)
+    {
+        return Err(AppError::Forbidden(format!(
+            "plugin {plugin_id} is not enabled"
+        )));
+    }
+
+    Ok(Json(outcome))
 }
 
 pub async fn create_alert_rule(
@@ -7323,6 +7510,14 @@ fn alerting_error(error: AlertingError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn plugin_registration_error(error: PluginRegistrationError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn plugin_lifecycle_error(error: PluginLifecycleError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn airspace_zone_error(error: AirspaceZoneError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -8500,12 +8695,47 @@ fn decode_audit_entry(row: &sqlx::sqlite::SqliteRow) -> AppResult<AuditEntry> {
     })
 }
 
+fn decode_plugin_registration(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<PluginRegistrationRecord> {
+    let capabilities = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("capabilities_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode plugin capabilities_json"))
+    })?;
+
+    Ok(PluginRegistrationRecord {
+        plugin_id: row.get("plugin_id"),
+        name: row.get("name"),
+        version: row.get("version"),
+        kind: decode_db_enum::<ExtensionPointKind>(row.get("kind"))?,
+        host_api_version: row.get("host_api_version"),
+        capabilities,
+        entrypoint: row.get("entrypoint"),
+        status: decode_db_enum::<PluginLifecycleStatus>(row.get("status"))?,
+    })
+}
+
 fn decode_db_enum<T>(value: String) -> AppResult<T>
 where
     T: DeserializeOwned,
 {
     serde_json::from_value(serde_json::Value::String(value))
         .map_err(|err| AppError::Anyhow(Error::new(err).context("failed to decode enum value")))
+}
+
+fn encode_db_enum<T>(value: T) -> AppResult<String>
+where
+    T: Serialize,
+{
+    match serde_json::to_value(value).map_err(|err| AppError::Anyhow(err.into()))? {
+        serde_json::Value::String(value) => Ok(value),
+        other => Err(AppError::Anyhow(
+            Error::msg(format!("enum serialized as non-string value {other}"))
+                .context("failed to encode enum value"),
+        )),
+    }
 }
 
 fn soil_reading_time_series_metadata(reading: &GeolocatedSoilReading) -> AppResult<String> {
@@ -9481,6 +9711,159 @@ async fn insert_fired_alert_record(state: &AppState, record: &FiredAlertRecord) 
     Ok(())
 }
 
+async fn insert_plugin_registration(
+    state: &AppState,
+    record: &PluginRegistrationRecord,
+    timestamp: String,
+) -> AppResult<()> {
+    let capabilities_json =
+        serde_json::to_string(&record.capabilities).map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO plugin_registrations (
+            plugin_id, name, version, kind, host_api_version, capabilities_json, entrypoint,
+            status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+        "#,
+    )
+    .bind(&record.plugin_id)
+    .bind(&record.name)
+    .bind(&record.version)
+    .bind(record.kind.as_str())
+    .bind(&record.host_api_version)
+    .bind(capabilities_json)
+    .bind(&record.entrypoint)
+    .bind(record.status.as_str())
+    .bind(timestamp)
+    .execute(&state.pool)
+    .await
+    .map_err(|err| {
+        if err.to_string().contains("UNIQUE constraint failed") {
+            AppError::BadRequest(format!("plugin {} is already registered", record.plugin_id))
+        } else {
+            AppError::Anyhow(err.into())
+        }
+    })?;
+
+    Ok(())
+}
+
+async fn update_plugin_registration_status(
+    state: &AppState,
+    record: &PluginRegistrationRecord,
+    updated_at: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE plugin_registrations
+        SET status = ?2, updated_at = ?3
+        WHERE plugin_id = ?1
+        "#,
+    )
+    .bind(&record.plugin_id)
+    .bind(record.status.as_str())
+    .bind(updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_plugin_lifecycle_audit(
+    state: &AppState,
+    audit: &PluginLifecycleAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO plugin_lifecycle_audits (
+            audit_id, plugin_id, previous_status, new_status, actor_id, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.plugin_id)
+    .bind(audit.previous_status.as_str())
+    .bind(audit.new_status.as_str())
+    .bind(&audit.actor_id)
+    .bind(&audit.occurred_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn append_plugin_lifecycle_provenance_audit(
+    state: &AppState,
+    audit: &PluginLifecycleAuditRecord,
+    actor_kind: ActorKind,
+) -> AppResult<()> {
+    let existing_entries = load_provenance_audit_entries_for_append(state).await?;
+    let mut ledger = AuditLedger::from_entries(existing_entries)
+        .map_err(|err| AppError::Anyhow(Error::new(err)))?;
+    let entry = ledger
+        .append_action(
+            ActorIdentity {
+                actor_id: audit.actor_id.clone(),
+                actor_kind,
+            },
+            AuditAction {
+                action_ref: audit.audit_id.clone(),
+                action_kind: "plugin_lifecycle_transition".to_string(),
+                artifact_ref: Some(format!("plugin:{}", audit.plugin_id)),
+                payload: ProvenanceParameters::from_json(serde_json::json!({
+                    "plugin_id": audit.plugin_id,
+                    "previous_status": audit.previous_status,
+                    "new_status": audit.new_status,
+                })),
+                occurred_at: audit.occurred_at.clone(),
+            },
+        )
+        .map_err(|err| AppError::Anyhow(Error::new(err)))?;
+    insert_provenance_audit_entry(state, &entry).await
+}
+
+async fn insert_provenance_audit_entry(state: &AppState, entry: &AuditEntry) -> AppResult<()> {
+    let payload_json = serde_json::to_string(entry.action.payload.as_json())
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let actor_kind = encode_db_enum(entry.actor.actor_kind)?;
+    let outcome = encode_db_enum(entry.outcome)?;
+    let refusal_reason = entry.refusal_reason.map(encode_db_enum).transpose()?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO provenance_audit_entries (
+            entry_hash, seq, prev_hash, payload_hash, actor_id, actor_kind, ts, action_ref,
+            action_kind, artifact_ref, payload_json, occurred_at, outcome, refusal_reason
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+    )
+    .bind(&entry.entry_hash)
+    .bind(entry.seq as i64)
+    .bind(&entry.prev_hash)
+    .bind(&entry.payload_hash)
+    .bind(&entry.actor.actor_id)
+    .bind(actor_kind)
+    .bind(&entry.ts)
+    .bind(&entry.action.action_ref)
+    .bind(&entry.action.action_kind)
+    .bind(&entry.action.artifact_ref)
+    .bind(payload_json)
+    .bind(&entry.action.occurred_at)
+    .bind(outcome)
+    .bind(refusal_reason)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn insert_alert_rule_record(state: &AppState, record: &AlertRuleRecord) -> AppResult<()> {
     let channels_json =
         serde_json::to_string(&record.channels).map_err(|err| AppError::Anyhow(err.into()))?;
@@ -10251,6 +10634,44 @@ async fn load_latest_alert_rule(
     .map_err(Error::from)?;
 
     row.map(|row| decode_alert_rule_record(&row)).transpose()
+}
+
+async fn load_plugin_registration(
+    state: &AppState,
+    plugin_id: &str,
+) -> AppResult<Option<PluginRegistrationRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT plugin_id, name, version, kind, host_api_version, capabilities_json, entrypoint,
+               status
+        FROM plugin_registrations
+        WHERE plugin_id = ?1
+        "#,
+    )
+    .bind(plugin_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_plugin_registration(&row)).transpose()
+}
+
+async fn load_provenance_audit_entries_for_append(state: &AppState) -> AppResult<Vec<AuditEntry>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT entry_hash, seq, prev_hash, payload_hash, actor_id, actor_kind, ts, action_ref,
+               action_kind, artifact_ref, payload_json, occurred_at, outcome, refusal_reason
+        FROM provenance_audit_entries
+        ORDER BY seq ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_audit_entry(&row))
+        .collect()
 }
 
 async fn validate_collaboration_field_ref(

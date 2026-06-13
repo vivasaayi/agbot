@@ -1201,6 +1201,40 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS plugin_registrations (
+            plugin_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            host_api_version TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL,
+            entrypoint TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS plugin_lifecycle_audits (
+            audit_id TEXT PRIMARY KEY,
+            plugin_id TEXT NOT NULL,
+            previous_status TEXT NOT NULL,
+            new_status TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS compliance_records (
             record_id TEXT NOT NULL,
             version INTEGER NOT NULL,
@@ -1774,6 +1808,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_provenance_audit_actor_date
         ON provenance_audit_entries(actor_id, ts);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_plugin_registrations_kind_status
+        ON plugin_registrations(kind, status);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_plugin_lifecycle_audits_plugin
+        ON plugin_lifecycle_audits(plugin_id, occurred_at);
         "#,
     )
     .execute(pool)

@@ -43,6 +43,64 @@ pub struct PluginRegistrationRecord {
     pub host_api_version: String,
     pub capabilities: Vec<String>,
     pub entrypoint: String,
+    pub status: PluginLifecycleStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginLifecycleStatus {
+    Registered,
+    Enabled,
+    Disabled,
+}
+
+impl PluginLifecycleStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl FromStr for PluginLifecycleStatus {
+    type Err = PluginLifecycleStatusParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "registered" => Ok(Self::Registered),
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(PluginLifecycleStatusParseError {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("unknown plugin lifecycle status: {value}")]
+pub struct PluginLifecycleStatusParseError {
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLifecycleTransitionRequest {
+    pub status: PluginLifecycleStatus,
+    pub actor_id: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLifecycleAuditRecord {
+    pub audit_id: String,
+    pub plugin_id: String,
+    pub previous_status: PluginLifecycleStatus,
+    pub new_status: PluginLifecycleStatus,
+    pub actor_id: String,
+    pub occurred_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +178,7 @@ pub enum SandboxTerminationReason {
     TimeLimitExceeded,
     MemoryLimitExceeded,
     UnknownPlugin,
+    PluginNotEnabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +238,24 @@ pub enum PluginRegistrationError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PluginLifecycleError {
+    #[error("unknown plugin: {plugin_id}")]
+    UnknownPlugin { plugin_id: String },
+    #[error("actor_id cannot be empty")]
+    EmptyActorId,
+    #[error("occurred_at cannot be empty")]
+    EmptyOccurredAt,
+    #[error("audit_id cannot be empty")]
+    EmptyAuditId,
+    #[error("plugin {plugin_id} cannot transition from {from_status:?} to {to_status:?}")]
+    InvalidTransition {
+        plugin_id: String,
+        from_status: PluginLifecycleStatus,
+        to_status: PluginLifecycleStatus,
+    },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PluginHost {
     registrations: BTreeMap<String, PluginRegistrationRecord>,
@@ -210,6 +287,25 @@ impl PluginHost {
         })
     }
 
+    pub fn with_registration_records(
+        records: Vec<PluginRegistrationRecord>,
+    ) -> Result<Self, PluginRegistrationError> {
+        let mut registrations = BTreeMap::new();
+        for record in records {
+            if registrations.contains_key(&record.plugin_id) {
+                return Err(PluginRegistrationError::DuplicatePluginId {
+                    plugin_id: record.plugin_id,
+                });
+            }
+            registrations.insert(record.plugin_id.clone(), record);
+        }
+
+        Ok(Self {
+            registrations,
+            ..Self::default()
+        })
+    }
+
     pub fn list_extension_points(&self) -> Vec<ExtensionPointContract> {
         extension_point_taxonomy()
     }
@@ -234,6 +330,7 @@ impl PluginHost {
             host_api_version: manifest.host_api_version,
             capabilities: manifest.capabilities,
             entrypoint: manifest.entrypoint,
+            status: PluginLifecycleStatus::Registered,
         };
         self.registrations
             .insert(record.plugin_id.clone(), record.clone());
@@ -242,6 +339,46 @@ impl PluginHost {
 
     pub fn list_plugins(&self) -> Vec<PluginRegistrationRecord> {
         self.registrations.values().cloned().collect()
+    }
+
+    pub fn transition_plugin_status(
+        &mut self,
+        plugin_id: &str,
+        request: PluginLifecycleTransitionRequest,
+        audit_id: String,
+    ) -> Result<(PluginRegistrationRecord, PluginLifecycleAuditRecord), PluginLifecycleError> {
+        let plugin_id = normalize_optional_text(plugin_id.to_string()).unwrap_or_default();
+        let actor_id =
+            normalize_optional_text(request.actor_id).ok_or(PluginLifecycleError::EmptyActorId)?;
+        let occurred_at = normalize_optional_text(request.occurred_at)
+            .ok_or(PluginLifecycleError::EmptyOccurredAt)?;
+        let audit_id =
+            normalize_optional_text(audit_id).ok_or(PluginLifecycleError::EmptyAuditId)?;
+        let registration = self.registrations.get_mut(&plugin_id).ok_or_else(|| {
+            PluginLifecycleError::UnknownPlugin {
+                plugin_id: plugin_id.clone(),
+            }
+        })?;
+        let previous_status = registration.status;
+        if !is_allowed_lifecycle_transition(previous_status, request.status) {
+            return Err(PluginLifecycleError::InvalidTransition {
+                plugin_id,
+                from_status: previous_status,
+                to_status: request.status,
+            });
+        }
+
+        registration.status = request.status;
+        let updated = registration.clone();
+        let audit = PluginLifecycleAuditRecord {
+            audit_id,
+            plugin_id: updated.plugin_id.clone(),
+            previous_status,
+            new_status: request.status,
+            actor_id,
+            occurred_at,
+        };
+        Ok((updated, audit))
     }
 
     pub fn check_capability(
@@ -288,11 +425,22 @@ impl PluginHost {
         attempted_at: &str,
     ) -> SandboxExecutionOutcome {
         let plugin_id = normalize_optional_text(plan.plugin_id).unwrap_or_default();
-        if !self.registrations.contains_key(&plugin_id) {
+        let Some(registration) = self.registrations.get(&plugin_id) else {
             return SandboxExecutionOutcome {
                 plugin_id,
                 status: SandboxExecutionStatus::Terminated,
                 termination_reason: Some(SandboxTerminationReason::UnknownPlugin),
+                result: None,
+                estimated_runtime_ms: plan.estimated_runtime_ms,
+                estimated_memory_mb: plan.estimated_memory_mb,
+                capability_audit: Vec::new(),
+            };
+        };
+        if registration.status != PluginLifecycleStatus::Enabled {
+            return SandboxExecutionOutcome {
+                plugin_id,
+                status: SandboxExecutionStatus::Terminated,
+                termination_reason: Some(SandboxTerminationReason::PluginNotEnabled),
                 result: None,
                 estimated_runtime_ms: plan.estimated_runtime_ms,
                 estimated_memory_mb: plan.estimated_memory_mb,
@@ -490,6 +638,25 @@ fn capability_violation_reason(
     }
 }
 
+fn is_allowed_lifecycle_transition(
+    from_status: PluginLifecycleStatus,
+    to_status: PluginLifecycleStatus,
+) -> bool {
+    matches!(
+        (from_status, to_status),
+        (
+            PluginLifecycleStatus::Registered,
+            PluginLifecycleStatus::Enabled
+        ) | (
+            PluginLifecycleStatus::Enabled,
+            PluginLifecycleStatus::Disabled
+        ) | (
+            PluginLifecycleStatus::Disabled,
+            PluginLifecycleStatus::Enabled
+        )
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ParsedHostApiVersion {
     major: u32,
@@ -562,8 +729,9 @@ fn normalize_optional_text(value: String) -> Option<String> {
 mod tests {
     use super::{
         CapabilityDecision, CapabilityViolationReason, ManifestField, ManifestRejectionReason,
-        PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginRegistrationError,
-        RawPluginManifest, SandboxExecutionStatus, SandboxTerminationReason,
+        PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginLifecycleStatus,
+        PluginLifecycleTransitionRequest, PluginRegistrationError, RawPluginManifest,
+        SandboxExecutionStatus, SandboxTerminationReason,
     };
     use shared::plugin_extensions::ExtensionPointKind;
 
@@ -591,11 +759,59 @@ mod tests {
         assert_eq!(record.plugin_id, "plugin.custom_ndvi");
         assert_eq!(record.kind, ExtensionPointKind::Index);
         assert_eq!(record.version, "1.2.3");
+        assert_eq!(record.status, PluginLifecycleStatus::Registered);
         assert_eq!(
             record.capabilities,
             vec!["read:scene".to_string(), "write:product".to_string()]
         );
         assert_eq!(host.list_plugins(), vec![record]);
+    }
+
+    #[test]
+    fn lifecycle_enable_disable_transitions_are_audited() {
+        let mut host = PluginHost::default();
+        host.register_plugin(read_scene_manifest())
+            .expect("plugin should register");
+
+        let (enabled, enable_audit) = host
+            .transition_plugin_status(
+                "plugin.scene_reader",
+                lifecycle_request(
+                    PluginLifecycleStatus::Enabled,
+                    "platform-admin-1",
+                    "2026-06-12T12:05:00Z",
+                ),
+                "plugin-audit-000001".to_string(),
+            )
+            .expect("registered plugin should enable");
+
+        assert_eq!(enabled.status, PluginLifecycleStatus::Enabled);
+        assert_eq!(
+            enable_audit.previous_status,
+            PluginLifecycleStatus::Registered
+        );
+        assert_eq!(enable_audit.new_status, PluginLifecycleStatus::Enabled);
+        assert_eq!(enable_audit.actor_id, "platform-admin-1");
+        assert_eq!(enable_audit.occurred_at, "2026-06-12T12:05:00Z");
+
+        let (disabled, disable_audit) = host
+            .transition_plugin_status(
+                "plugin.scene_reader",
+                lifecycle_request(
+                    PluginLifecycleStatus::Disabled,
+                    "platform-admin-1",
+                    "2026-06-12T12:06:00Z",
+                ),
+                "plugin-audit-000002".to_string(),
+            )
+            .expect("enabled plugin should disable");
+
+        assert_eq!(disabled.status, PluginLifecycleStatus::Disabled);
+        assert_eq!(
+            disable_audit.previous_status,
+            PluginLifecycleStatus::Enabled
+        );
+        assert_eq!(disable_audit.new_status, PluginLifecycleStatus::Disabled);
     }
 
     #[test]
@@ -733,6 +949,7 @@ mod tests {
         let mut host = PluginHost::default();
         host.register_plugin(read_scene_manifest())
             .expect("plugin should register");
+        enable_scene_reader(&mut host);
 
         let outcome = host.execute_sandboxed(
             sandbox_plan("plugin.scene_reader", vec!["read:scene"], 25, 64),
@@ -754,6 +971,7 @@ mod tests {
         let mut host = PluginHost::default();
         host.register_plugin(read_scene_manifest())
             .expect("plugin should register");
+        enable_scene_reader(&mut host);
 
         let outcome = host.execute_sandboxed(
             sandbox_plan("plugin.scene_reader", vec!["read:scene"], 250, 64),
@@ -775,6 +993,7 @@ mod tests {
         let mut host = PluginHost::default();
         host.register_plugin(read_scene_manifest())
             .expect("plugin should register");
+        enable_scene_reader(&mut host);
 
         let outcome = host.execute_sandboxed(
             sandbox_plan("plugin.scene_reader", vec!["write:field"], 25, 64),
@@ -791,6 +1010,38 @@ mod tests {
             outcome.capability_audit[0].reason,
             Some(CapabilityViolationReason::UndeclaredCapability)
         );
+        assert_eq!(outcome.result, None);
+    }
+
+    #[test]
+    fn sandbox_refuses_disabled_plugin_before_capability_checks() {
+        let mut host = PluginHost::default();
+        host.register_plugin(read_scene_manifest())
+            .expect("plugin should register");
+        enable_scene_reader(&mut host);
+        host.transition_plugin_status(
+            "plugin.scene_reader",
+            lifecycle_request(
+                PluginLifecycleStatus::Disabled,
+                "platform-admin-1",
+                "2026-06-12T12:20:00Z",
+            ),
+            "plugin-audit-000010".to_string(),
+        )
+        .expect("enabled plugin should disable");
+
+        let outcome = host.execute_sandboxed(
+            sandbox_plan("plugin.scene_reader", vec!["read:scene"], 25, 64),
+            sandbox_limits(),
+            "2026-06-12T12:21:00Z",
+        );
+
+        assert_eq!(outcome.status, SandboxExecutionStatus::Terminated);
+        assert_eq!(
+            outcome.termination_reason,
+            Some(SandboxTerminationReason::PluginNotEnabled)
+        );
+        assert!(outcome.capability_audit.is_empty());
         assert_eq!(outcome.result, None);
     }
 
@@ -860,6 +1111,31 @@ mod tests {
         PluginExecutionLimits {
             max_runtime_ms: 100,
             max_memory_mb: 128,
+        }
+    }
+
+    fn enable_scene_reader(host: &mut PluginHost) {
+        host.transition_plugin_status(
+            "plugin.scene_reader",
+            lifecycle_request(
+                PluginLifecycleStatus::Enabled,
+                "platform-admin-1",
+                "2026-06-12T12:04:00Z",
+            ),
+            "plugin-audit-enable-scene-reader".to_string(),
+        )
+        .expect("plugin should enable");
+    }
+
+    fn lifecycle_request(
+        status: PluginLifecycleStatus,
+        actor_id: &str,
+        occurred_at: &str,
+    ) -> PluginLifecycleTransitionRequest {
+        PluginLifecycleTransitionRequest {
+            status,
+            actor_id: actor_id.to_string(),
+            occurred_at: occurred_at.to_string(),
         }
     }
 

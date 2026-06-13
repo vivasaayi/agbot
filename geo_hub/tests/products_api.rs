@@ -4194,6 +4194,277 @@ async fn alert_rule_create_rejects_invalid_predicate_without_persisting() -> Res
 }
 
 #[tokio::test]
+async fn plugin_lifecycle_lists_filters_refuses_disabled_execution_and_audits() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let register_index = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/plugins")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "plugin_id": "plugin.custom_ndvi",
+                        "name": "Custom NDVI",
+                        "version": "1.2.3",
+                        "kind": "index",
+                        "host_api_version": "2026.1",
+                        "capabilities": ["read:scene", "write:product"],
+                        "entrypoint": "custom_ndvi::run"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(register_index.status(), StatusCode::OK);
+    let body = to_bytes(register_index.into_body(), 64 * 1024).await?;
+    let registered: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        registered.get("status").and_then(|value| value.as_str()),
+        Some("registered")
+    );
+
+    let register_map_layer = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/plugins")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "plugin_id": "plugin.field_heatmap",
+                        "name": "Field Heatmap",
+                        "version": "0.3.0",
+                        "kind": "map_layer",
+                        "host_api_version": "2026.1",
+                        "capabilities": ["read:scene"],
+                        "entrypoint": "field_heatmap::layer"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(register_map_layer.status(), StatusCode::OK);
+
+    let filtered_list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/plugins?kind=index&status=registered&page=1&page_size=1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(filtered_list.status(), StatusCode::OK);
+    let body = to_bytes(filtered_list.into_body(), 64 * 1024).await?;
+    let page: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(page.get("total").and_then(|value| value.as_u64()), Some(1));
+    assert_eq!(
+        page.get("plugins")
+            .and_then(|value| value.as_array())
+            .and_then(|plugins| plugins.first())
+            .and_then(|plugin| plugin.get("plugin_id"))
+            .and_then(|value| value.as_str()),
+        Some("plugin.custom_ndvi")
+    );
+
+    let enable_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/plugins/plugin.custom_ndvi/status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "status": "enabled",
+                        "actor_id": "pa-admin-1",
+                        "actor_kind": "platform_admin",
+                        "occurred_at": "2026-06-12T13:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(enable_response.status(), StatusCode::OK);
+    let body = to_bytes(enable_response.into_body(), 64 * 1024).await?;
+    let enabled: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        enabled.get("status").and_then(|value| value.as_str()),
+        Some("enabled")
+    );
+
+    let execution_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/plugins/plugin.custom_ndvi/execute")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "required_capabilities": ["read:scene"],
+                        "estimated_runtime_ms": 25,
+                        "estimated_memory_mb": 64,
+                        "result": "ndvi complete",
+                        "attempted_at": "2026-06-12T13:01:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(execution_response.status(), StatusCode::OK);
+    let body = to_bytes(execution_response.into_body(), 64 * 1024).await?;
+    let execution: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        execution.get("status").and_then(|value| value.as_str()),
+        Some("completed")
+    );
+
+    let disable_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/plugins/plugin.custom_ndvi/status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "status": "disabled",
+                        "actor_id": "pa-admin-1",
+                        "actor_kind": "platform_admin",
+                        "occurred_at": "2026-06-12T13:05:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(disable_response.status(), StatusCode::OK);
+    let body = to_bytes(disable_response.into_body(), 64 * 1024).await?;
+    let disabled: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        disabled.get("status").and_then(|value| value.as_str()),
+        Some("disabled")
+    );
+
+    let disabled_execution = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/plugins/plugin.custom_ndvi/execute")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "required_capabilities": ["read:scene"],
+                        "estimated_runtime_ms": 25,
+                        "estimated_memory_mb": 64,
+                        "result": "should not run",
+                        "attempted_at": "2026-06-12T13:06:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(disabled_execution.status(), StatusCode::FORBIDDEN);
+
+    let disabled_list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/plugins?status=disabled&page=1&page_size=10")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(disabled_list.status(), StatusCode::OK);
+    let body = to_bytes(disabled_list.into_body(), 64 * 1024).await?;
+    let disabled_page: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        disabled_page.get("total").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+
+    let lifecycle_audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM plugin_lifecycle_audits WHERE plugin_id = 'plugin.custom_ndvi'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(lifecycle_audit_count, 2);
+
+    let disabled_audit_actor: String = sqlx::query_scalar(
+        "SELECT actor_id FROM plugin_lifecycle_audits WHERE plugin_id = 'plugin.custom_ndvi' AND new_status = 'disabled'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(disabled_audit_actor, "pa-admin-1");
+
+    let provenance_audit = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/api/provenance/audit?artifact_id=plugin:plugin.custom_ndvi&actor_id=pa-admin-1&page=1&page_size=10",
+                )
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(provenance_audit.status(), StatusCode::OK);
+    let body = to_bytes(provenance_audit.into_body(), 64 * 1024).await?;
+    let provenance_page: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        provenance_page
+            .get("total")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert!(provenance_page
+        .get("entries")
+        .and_then(|value| value.as_array())
+        .expect("entries should be present")
+        .iter()
+        .all(|entry| entry
+            .get("action")
+            .and_then(|action| action.get("action_kind"))
+            .and_then(|value| value.as_str())
+            == Some("plugin_lifecycle_transition")));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn provenance_ledger_lists_filters_and_retrieves_after_restart() -> Result<()> {
     let tmp = TempDir::new()?;
     let data_root = tmp.path().join("data");

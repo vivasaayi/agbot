@@ -588,6 +588,17 @@ impl ReproducibilityManifestStore {
 }
 
 impl AuditLedger {
+    pub fn from_entries(entries: Vec<AuditEntry>) -> Result<Self, ProvenanceError> {
+        let verification = verify_audit_chain(&entries);
+        if !verification.verified {
+            return Err(ProvenanceError::InvalidEvidencePackAuditChain {
+                breach_index: verification.breach_index,
+                reason: verification.reason,
+            });
+        }
+        Ok(Self { entries })
+    }
+
     pub fn append_action(
         &mut self,
         actor: ActorIdentity,

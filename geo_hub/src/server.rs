@@ -292,6 +292,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_provenance_audit_entry),
         )
         .route(
+            "/api/plugins",
+            get(routes::list_plugins).post(routes::register_plugin),
+        )
+        .route(
+            "/api/plugins/:plugin_id/status",
+            put(routes::update_plugin_status),
+        )
+        .route(
+            "/api/plugins/:plugin_id/execute",
+            post(routes::execute_plugin),
+        )
+        .route(
             "/api/alerting/fired-alerts",
             get(routes::list_fired_alerts).post(routes::store_fired_alert),
         )

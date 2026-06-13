@@ -31,6 +31,7 @@ fleet_health = { path = "../fleet_health" }
 soil_iot = { path = "../soil_iot" }
 timeseries = { path = "../timeseries" }
 provenance = { path = "../provenance" }
+plugin_sdk = { path = "../plugin_sdk" }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
 image = { workspace = true }
