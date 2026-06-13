@@ -10,6 +10,7 @@ pub mod export;
 pub mod indexing;
 pub mod multispectral;
 pub mod rplidar;
+pub mod simulated_capture;
 pub mod storage;
 
 pub use export::{DataExporter, ExportFormat};
@@ -20,6 +21,11 @@ pub use multispectral::{
 };
 pub use rplidar::{
     lidar_scan_to_record, parse_rplidar_a3_measurements, LidarRecordError, RplidarParseError,
+};
+pub use simulated_capture::{
+    flight_sim_cpp_lidar_observation_from_json, flight_sim_cpp_multispectral_observation_from_json,
+    simulated_capture_frame_to_batch, SimulatedCaptureBatch, SimulatedCaptureError,
+    SimulatedCaptureFrame, SimulatedSensorObservation,
 };
 pub use storage::{StorageConfig, StorageEngine};
 
@@ -806,6 +812,24 @@ impl DataCollectorService {
         Ok(())
     }
 
+    pub async fn collect_simulated_capture_frame(
+        &mut self,
+        frame: SimulatedCaptureFrame,
+    ) -> Result<SimulatedCaptureBatch> {
+        let session_id = frame.session_id;
+        let batch = simulated_capture_frame_to_batch(frame)?;
+
+        for record in batch.records.iter().cloned() {
+            self.collect_data(&session_id, record).await?;
+        }
+
+        for failure in batch.failures.iter().cloned() {
+            self.record_collection_failure(&session_id, failure).await?;
+        }
+
+        Ok(batch)
+    }
+
     pub async fn get_session(&self, session_id: &Uuid) -> Result<Option<FlightSession>> {
         if let Some(session) = self.active_sessions.get(session_id) {
             Ok(Some(session.clone()))
@@ -1102,6 +1126,33 @@ mod tests {
         ]
     }
 
+    fn simulated_capture_frame(session: &FlightSession) -> SimulatedCaptureFrame {
+        SimulatedCaptureFrame {
+            session_id: session.id,
+            flight_id: session.flight_id,
+            drone_id: session.drone_id,
+            simulation_mission_id: session.mission_id.unwrap_or(session.flight_id),
+            observed_at: Utc::now(),
+            position: gps_coords(),
+            observations: vec![
+                SimulatedSensorObservation::Telemetry {
+                    sensor_id: "sim-telemetry".to_string(),
+                    calibration_ref: "sim-telemetry-v1".to_string(),
+                    velocity: (1.0, 0.0, 0.0),
+                    orientation: (0.0, 0.0, 0.0),
+                    battery_level: 0.88,
+                    signal_strength: 0.99,
+                },
+                SimulatedSensorObservation::Failure {
+                    sensor_id: "sim-multispectral".to_string(),
+                    data_type: DataType::MultispectralImage,
+                    kind: CollectionFailureKind::SensorDropout,
+                    message: "simulated sensor dropout".to_string(),
+                },
+            ],
+        }
+    }
+
     #[tokio::test]
     async fn test_service_creation() {
         let temp_dir = tempdir().unwrap();
@@ -1191,6 +1242,41 @@ mod tests {
         assert_eq!(stored_record.sensor_id, "sensor-rgb-01");
         assert_eq!(stored_record.gps_coords, Some(gps_coords()));
         assert_eq!(stored_record.calibration_ref, "calibration-2026-06");
+    }
+
+    #[tokio::test]
+    async fn simulated_capture_frame_persists_records_and_failures() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let request = capture_request().with_mission_id(Uuid::new_v4());
+        let session_id = service.start_capture_session(request).await.unwrap();
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+
+        let batch = service
+            .collect_simulated_capture_frame(simulated_capture_frame(&session))
+            .await
+            .expect("simulated frame persists");
+
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.failures.len(), 1);
+
+        let stored_session = service.get_session(&session_id).await.unwrap().unwrap();
+        assert_eq!(stored_session.status, SessionStatus::Collecting);
+        assert_eq!(stored_session.summary.record_count, 1);
+        assert_eq!(stored_session.summary.collection_failures.len(), 1);
+        assert_eq!(
+            stored_session.summary.coverage.status,
+            CaptureCoverageStatus::Partial
+        );
+        assert_eq!(
+            stored_session
+                .summary
+                .data_types
+                .get(&DataType::Telemetry)
+                .copied(),
+            Some(1)
+        );
     }
 
     #[tokio::test]
