@@ -4,12 +4,14 @@ use image::{GrayImage, ImageBuffer, Luma};
 use imagery_processor::{
     io::{
         geotiff_spatial_sidecar_path, png_spatial_sidecar_path, write_geotiff_spatial_sidecar,
-        BandIngestEvidence, CalibrationStatus, GeoTiffSpatialSidecar, PngGeoreferenceStatus,
-        PngSpatialSidecar,
+        write_png_spatial_sidecar, BandIngestEvidence, CalibrationStatus, GeoTiffSpatialSidecar,
+        PngGeoreferenceStatus, PngSpatialSidecar,
     },
-    pipeline::{indices::run_indices, masks::run_masks, thermal::run_thermal},
-    BandOverrideSpec, IndexBandRole, IndexKind, IndicesArgs, MasksArgs, OutputFormat, SensorPreset,
-    TemperatureUnit, ThermalArgs, ThermalProduct,
+    pipeline::{
+        classify::run_classify, indices::run_indices, masks::run_masks, thermal::run_thermal,
+    },
+    BandOverrideSpec, ClassifyArgs, IndexBandRole, IndexKind, IndicesArgs, MasksArgs, OutputFormat,
+    SensorPreset, TemperatureUnit, ThermalArgs, ThermalProduct,
 };
 use serde_json::Value;
 use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef};
@@ -185,6 +187,16 @@ fn base_thermal_args(input_dir: PathBuf, output_dir: PathBuf) -> ThermalArgs {
         nir: None,
         out_format: OutputFormat::Png,
         mask: None,
+    }
+}
+
+fn base_classify_args(input_image: PathBuf, output_path: PathBuf) -> ClassifyArgs {
+    ClassifyArgs {
+        input_image,
+        output_path,
+        threshold: None,
+        kmeans: None,
+        seed: 0,
     }
 }
 
@@ -669,6 +681,113 @@ async fn indices_png_writes_matching_spatial_sidecar() {
     assert_eq!(sidecar.bbox, expected.bbox);
     assert_eq!(sidecar.resolution, expected.resolution);
     assert_eq!(sidecar.geo_transform, expected.geo_transform);
+}
+
+#[tokio::test]
+async fn classify_threshold_records_boundaries_counts_and_spatial_sidecar() {
+    let root = temp_test_dir("classify_threshold_evidence");
+    let input_path = root.join("ndvi.png");
+    let output_path = root.join("classified.png");
+    write_gray_image(&input_path, 3, 1, &[0, 128, 255]);
+    write_png_spatial_sidecar(&input_path, Some(&valid_asserted_spatial_ref(3, 1)))
+        .await
+        .unwrap();
+
+    let mut args = base_classify_args(input_path, output_path.clone());
+    args.threshold = Some(0.0);
+
+    run_classify(&args).await.unwrap();
+
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(output_path.with_extension("json")).unwrap())
+            .unwrap();
+    assert_eq!(meta["method"].as_str().unwrap(), "threshold");
+    assert_eq!(meta["total_pixel_count"].as_u64().unwrap(), 3);
+    assert_eq!(
+        meta["class_boundaries"][0]["label"].as_str().unwrap(),
+        "below_threshold"
+    );
+    assert_eq!(
+        meta["class_boundaries"][1]["label"].as_str().unwrap(),
+        "above_or_equal_threshold"
+    );
+    assert_eq!(meta["class_counts"][0]["pixel_count"].as_u64().unwrap(), 1);
+    assert_eq!(meta["class_counts"][1]["pixel_count"].as_u64().unwrap(), 2);
+
+    let sidecar: PngSpatialSidecar =
+        serde_json::from_str(&fs::read_to_string(png_spatial_sidecar_path(&output_path)).unwrap())
+            .unwrap();
+    assert_eq!(sidecar.status, PngGeoreferenceStatus::Georeferenced);
+    assert_eq!(sidecar.crs.as_deref(), Some("EPSG:4326"));
+}
+
+#[tokio::test]
+async fn classify_kmeans_is_deterministic_with_seed() {
+    let root = temp_test_dir("classify_kmeans_seed");
+    let input_path = root.join("ndvi.png");
+    let first_output = root.join("classified_a.png");
+    let second_output = root.join("classified_b.png");
+    write_gray_image(&input_path, 4, 1, &[0, 0, 128, 255]);
+
+    let mut first_args = base_classify_args(input_path.clone(), first_output.clone());
+    first_args.kmeans = Some(3);
+    first_args.seed = 42;
+    let mut second_args = base_classify_args(input_path, second_output.clone());
+    second_args.kmeans = Some(3);
+    second_args.seed = 42;
+
+    run_classify(&first_args).await.unwrap();
+    run_classify(&second_args).await.unwrap();
+
+    assert_eq!(
+        fs::read(&first_output).unwrap(),
+        fs::read(&second_output).unwrap()
+    );
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(first_output.with_extension("json")).unwrap())
+            .unwrap();
+    assert_eq!(meta["method"].as_str().unwrap(), "kmeans");
+    assert_eq!(meta["seed"].as_u64().unwrap(), 42);
+    assert_eq!(meta["class_centers"].as_array().unwrap().len(), 3);
+    assert_eq!(meta["class_counts"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        meta["class_counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["pixel_count"].as_u64().unwrap())
+            .sum::<u64>(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn classify_kmeans_single_value_raster_reports_one_effective_class() {
+    let root = temp_test_dir("classify_kmeans_single_value");
+    let input_path = root.join("ndvi.png");
+    let output_path = root.join("classified.png");
+    write_gray_image(&input_path, 4, 1, &[128, 128, 128, 128]);
+
+    let mut args = base_classify_args(input_path, output_path.clone());
+    args.kmeans = Some(3);
+    args.seed = 7;
+
+    run_classify(&args).await.unwrap();
+
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(output_path.with_extension("json")).unwrap())
+            .unwrap();
+    assert_eq!(meta["method"].as_str().unwrap(), "kmeans");
+    assert_eq!(meta["effective_class_count"].as_u64().unwrap(), 1);
+    assert_eq!(
+        meta["class_counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["pixel_count"].as_u64().unwrap() > 0)
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

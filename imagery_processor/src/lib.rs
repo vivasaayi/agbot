@@ -148,6 +148,9 @@ pub struct ClassifyArgs {
     /// Use k-means with k clusters instead of threshold
     #[arg(long)]
     pub kmeans: Option<usize>,
+    /// Seed for deterministic k-means initialization
+    #[arg(long, default_value_t = 0)]
+    pub seed: u64,
 }
 
 #[derive(ClapArgs, Debug)]
