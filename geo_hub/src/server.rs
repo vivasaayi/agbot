@@ -284,6 +284,22 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_fired_alert),
         )
         .route(
+            "/api/alerting/rules",
+            get(routes::list_alert_rules).post(routes::create_alert_rule),
+        )
+        .route(
+            "/api/alerting/rules/:rule_id",
+            get(routes::get_alert_rule_versions).put(routes::update_alert_rule),
+        )
+        .route(
+            "/api/alerting/rules/:rule_id/status",
+            put(routes::update_alert_rule_status),
+        )
+        .route(
+            "/api/alerting/rules/:rule_id/subscriptions",
+            get(routes::list_alert_rule_subscriptions).post(routes::create_alert_rule_subscription),
+        )
+        .route(
             "/api/fields/export/geojson",
             get(routes::export_fields_geojson),
         )

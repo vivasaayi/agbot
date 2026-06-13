@@ -3965,6 +3965,235 @@ async fn fired_alert_history_is_filterable_paginable_and_not_fabricated() -> Res
 }
 
 #[tokio::test]
+async fn alert_rules_create_version_disable_and_subscribe_with_audit() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerting/rules")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "rule_id": "rule-sensor-stale",
+                        "event_type": "sensor_stale",
+                        "subject_ref": "field:field-alert-001",
+                        "severity": "critical",
+                        "channels": ["in_app"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let body = to_bytes(create_response.into_body(), 64 * 1024).await?;
+    let created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created.get("version").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        created.get("status").and_then(|value| value.as_str()),
+        Some("active")
+    );
+
+    let subscription_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerting/rules/rule-sensor-stale/subscriptions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "subscription_id": "subscription-ops-stale",
+                        "recipient_id": "ops-user-001",
+                        "recipient_role": "operator",
+                        "channels": ["in_app", "email"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(subscription_response.status(), StatusCode::OK);
+
+    let edit_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/alerting/rules/rule-sensor-stale")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "event_type": "sensor_stale",
+                        "severity": "warning",
+                        "channels": ["email"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(edit_response.status(), StatusCode::OK);
+    let body = to_bytes(edit_response.into_body(), 64 * 1024).await?;
+    let edited: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        edited.get("version").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        edited.get("severity").and_then(|value| value.as_str()),
+        Some("warning")
+    );
+
+    let disable_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/alerting/rules/rule-sensor-stale/status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "status": "disabled",
+                        "actor_id": "ops-admin",
+                        "occurred_at": "2026-06-12T10:30:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(disable_response.status(), StatusCode::OK);
+    let body = to_bytes(disable_response.into_body(), 64 * 1024).await?;
+    let disabled: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        disabled.get("version").and_then(|value| value.as_u64()),
+        Some(3)
+    );
+    assert_eq!(
+        disabled.get("status").and_then(|value| value.as_str()),
+        Some("disabled")
+    );
+
+    let versions_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/alerting/rules/rule-sensor-stale")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(versions_response.status(), StatusCode::OK);
+    let body = to_bytes(versions_response.into_body(), 64 * 1024).await?;
+    let versions: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(versions.len(), 3);
+
+    let active_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/alerting/rules?status=active")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(active_response.status(), StatusCode::OK);
+    let body = to_bytes(active_response.into_body(), 64 * 1024).await?;
+    let active_rules: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert!(active_rules.is_empty());
+
+    let subscriptions_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/alerting/rules/rule-sensor-stale/subscriptions")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(subscriptions_response.status(), StatusCode::OK);
+    let body = to_bytes(subscriptions_response.into_body(), 64 * 1024).await?;
+    let subscriptions: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(
+        subscriptions[0]
+            .get("recipient_role")
+            .and_then(|value| value.as_str()),
+        Some("operator")
+    );
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alert_rule_audits WHERE rule_id = 'rule-sensor-stale'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alert_rule_create_rejects_invalid_predicate_without_persisting() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerting/rules")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "rule_id": "rule-invalid",
+                        "event_type": " ",
+                        "severity": "warning",
+                        "channels": ["in_app"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alert_rules")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(stored_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn soil_iot_device_registry_registers_and_lists_geolocated_devices() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

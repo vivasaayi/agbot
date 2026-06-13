@@ -72,6 +72,118 @@ pub struct AlertRule {
     pub channels: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertRuleStatus {
+    Active,
+    Disabled,
+}
+
+impl AlertRuleStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlertRuleStatus::Active => "active",
+            AlertRuleStatus::Disabled => "disabled",
+        }
+    }
+}
+
+impl FromStr for AlertRuleStatus {
+    type Err = AlertingError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "active" => Ok(Self::Active),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(AlertingError::InvalidRuleStatus(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AlertRuleCreateRequest {
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub subject_ref: Option<String>,
+    pub severity: AlertSeverityHint,
+    #[serde(default)]
+    pub channels: Vec<String>,
+    #[serde(default)]
+    pub status: Option<AlertRuleStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AlertRuleUpdateRequest {
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub subject_ref: Option<String>,
+    pub severity: AlertSeverityHint,
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AlertRuleStatusUpdateRequest {
+    pub status: AlertRuleStatus,
+    #[serde(default)]
+    pub actor_id: String,
+    #[serde(default)]
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertRuleRecord {
+    pub rule_id: String,
+    pub version: u32,
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_ref: Option<String>,
+    pub severity: AlertSeverityHint,
+    pub channels: Vec<String>,
+    pub status: AlertRuleStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertRuleAuditRecord {
+    pub audit_id: String,
+    pub rule_id: String,
+    pub version: u32,
+    pub previous_status: AlertRuleStatus,
+    pub new_status: AlertRuleStatus,
+    pub actor_id: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AlertRuleSubscriptionCreateRequest {
+    #[serde(default)]
+    pub subscription_id: Option<String>,
+    #[serde(default)]
+    pub rule_id: String,
+    #[serde(default)]
+    pub recipient_id: String,
+    #[serde(default)]
+    pub recipient_role: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertRuleSubscriptionRecord {
+    pub subscription_id: String,
+    pub rule_id: String,
+    pub recipient_id: String,
+    pub recipient_role: String,
+    pub channels: Vec<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FiredAlertRecord {
     pub alert_id: String,
@@ -388,6 +500,18 @@ pub enum AlertingError {
     EmptyAlertId,
     #[error("matched_rule_id cannot be empty")]
     EmptyMatchedRuleId,
+    #[error("rule_id cannot be empty")]
+    EmptyRuleId,
+    #[error("subscription rule_id {actual} does not match rule {expected}")]
+    RuleIdMismatch { expected: String, actual: String },
+    #[error("rule version must be greater than zero")]
+    InvalidRuleVersion,
+    #[error("rule status change audit_id cannot be empty")]
+    EmptyRuleAuditId,
+    #[error("rule status change actor_id cannot be empty")]
+    EmptyRuleActorId,
+    #[error("subscription_id cannot be empty")]
+    EmptySubscriptionId,
     #[error("source_event_ref cannot be empty")]
     EmptySourceEventRef,
     #[error("channels cannot contain empty values")]
@@ -448,6 +572,8 @@ pub enum AlertingError {
     InvalidRetryPolicy,
     #[error("invalid alert severity {0}")]
     InvalidSeverity(String),
+    #[error("invalid alert rule status {0}")]
+    InvalidRuleStatus(String),
 }
 
 pub trait SourceAdapter {
@@ -628,6 +754,142 @@ pub fn evaluate_alert_rules(
         fired_alerts,
         non_match_count,
     }
+}
+
+pub fn build_alert_rule_record(
+    request: AlertRuleCreateRequest,
+    generated_rule_id: String,
+    created_at: String,
+) -> Result<AlertRuleRecord, AlertingError> {
+    let rule_id = normalize_optional_text(request.rule_id)
+        .or_else(|| normalize_optional_text(Some(generated_rule_id)))
+        .ok_or(AlertingError::EmptyRuleId)?;
+    let created_at = normalize_required_text(created_at, AlertingError::EmptyOccurredAt)?;
+
+    Ok(AlertRuleRecord {
+        rule_id,
+        version: 1,
+        event_type: normalize_required_text(request.event_type, AlertingError::EmptyEventType)?,
+        subject_ref: normalize_optional_text(request.subject_ref),
+        severity: request.severity,
+        channels: normalize_channels(request.channels)?,
+        status: request.status.unwrap_or(AlertRuleStatus::Active),
+        created_at: created_at.clone(),
+        updated_at: created_at,
+    })
+}
+
+pub fn version_alert_rule_record(
+    current: &AlertRuleRecord,
+    request: AlertRuleUpdateRequest,
+    updated_at: String,
+) -> Result<AlertRuleRecord, AlertingError> {
+    validate_alert_rule_record(current)?;
+    let updated_at = normalize_required_text(updated_at, AlertingError::EmptyOccurredAt)?;
+
+    Ok(AlertRuleRecord {
+        rule_id: current.rule_id.clone(),
+        version: current
+            .version
+            .checked_add(1)
+            .ok_or(AlertingError::InvalidRuleVersion)?,
+        event_type: normalize_required_text(request.event_type, AlertingError::EmptyEventType)?,
+        subject_ref: normalize_optional_text(request.subject_ref),
+        severity: request.severity,
+        channels: normalize_channels(request.channels)?,
+        status: current.status,
+        created_at: current.created_at.clone(),
+        updated_at,
+    })
+}
+
+pub fn transition_alert_rule_status(
+    current: &AlertRuleRecord,
+    request: AlertRuleStatusUpdateRequest,
+    generated_audit_id: String,
+) -> Result<(AlertRuleRecord, AlertRuleAuditRecord), AlertingError> {
+    validate_alert_rule_record(current)?;
+    let audit_id = normalize_required_text(generated_audit_id, AlertingError::EmptyRuleAuditId)?;
+    let actor_id = normalize_required_text(request.actor_id, AlertingError::EmptyRuleActorId)?;
+    let occurred_at = normalize_required_text(request.occurred_at, AlertingError::EmptyOccurredAt)?;
+    let next_version = current
+        .version
+        .checked_add(1)
+        .ok_or(AlertingError::InvalidRuleVersion)?;
+
+    let mut next = current.clone();
+    next.version = next_version;
+    next.status = request.status;
+    next.updated_at = occurred_at.clone();
+
+    Ok((
+        next,
+        AlertRuleAuditRecord {
+            audit_id,
+            rule_id: current.rule_id.clone(),
+            version: next_version,
+            previous_status: current.status,
+            new_status: request.status,
+            actor_id,
+            occurred_at,
+        },
+    ))
+}
+
+pub fn build_alert_rule_subscription(
+    request: AlertRuleSubscriptionCreateRequest,
+    rule: &AlertRuleRecord,
+    generated_subscription_id: String,
+    created_at: String,
+) -> Result<AlertRuleSubscriptionRecord, AlertingError> {
+    validate_alert_rule_record(rule)?;
+    let subscription_id = normalize_optional_text(request.subscription_id)
+        .or_else(|| normalize_optional_text(Some(generated_subscription_id)))
+        .ok_or(AlertingError::EmptySubscriptionId)?;
+    let request_rule_id = normalize_required_text(request.rule_id, AlertingError::EmptyRuleId)?;
+    if request_rule_id != rule.rule_id {
+        return Err(AlertingError::RuleIdMismatch {
+            expected: rule.rule_id.clone(),
+            actual: request_rule_id,
+        });
+    }
+    let channels = normalize_channels(request.channels)?;
+    if channels.is_empty() {
+        return Err(AlertingError::EmptyChannel);
+    }
+
+    Ok(AlertRuleSubscriptionRecord {
+        subscription_id,
+        rule_id: rule.rule_id.clone(),
+        recipient_id: normalize_required_text(
+            request.recipient_id,
+            AlertingError::EmptyRecipientId,
+        )?,
+        recipient_role: normalize_required_text(
+            request.recipient_role,
+            AlertingError::EmptyRecipientRole,
+        )?,
+        channels,
+        created_at: normalize_required_text(created_at, AlertingError::EmptyOccurredAt)?,
+    })
+}
+
+pub fn evaluate_managed_alert_rules(
+    candidate: &AlertCandidateRecord,
+    rules: &[AlertRuleRecord],
+) -> RuleEvaluationOutcome {
+    let active_rules = rules
+        .iter()
+        .filter(|rule| rule.status == AlertRuleStatus::Active)
+        .map(|rule| AlertRule {
+            rule_id: rule.rule_id.clone(),
+            event_type: rule.event_type.clone(),
+            subject_ref: rule.subject_ref.clone(),
+            severity: rule.severity,
+            channels: rule.channels.clone(),
+        })
+        .collect::<Vec<_>>();
+    evaluate_alert_rules(candidate, &active_rules)
 }
 
 fn rule_matches_candidate(rule: &AlertRule, candidate: &AlertCandidateRecord) -> bool {
@@ -1515,6 +1777,28 @@ fn aggregation_summary_text(summary: &AlertDedupSummary) -> String {
     )
 }
 
+fn validate_alert_rule_record(rule: &AlertRuleRecord) -> Result<(), AlertingError> {
+    normalize_required_text(rule.rule_id.clone(), AlertingError::EmptyRuleId)?;
+    if rule.version == 0 {
+        return Err(AlertingError::InvalidRuleVersion);
+    }
+    normalize_required_text(rule.event_type.clone(), AlertingError::EmptyEventType)?;
+    if let Some(subject_ref) = &rule.subject_ref {
+        normalize_required_text(subject_ref.clone(), AlertingError::EmptySubjectRef)?;
+    }
+    normalize_channels(rule.channels.clone())?;
+    normalize_required_text(rule.created_at.clone(), AlertingError::EmptyOccurredAt)?;
+    normalize_required_text(rule.updated_at.clone(), AlertingError::EmptyOccurredAt)?;
+    Ok(())
+}
+
+fn normalize_channels(channels: Vec<String>) -> Result<Vec<String>, AlertingError> {
+    channels
+        .into_iter()
+        .map(|value| normalize_required_text(value, AlertingError::EmptyChannel))
+        .collect()
+}
+
 fn normalize_required_text(value: String, error: AlertingError) -> Result<String, AlertingError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1522,6 +1806,17 @@ fn normalize_required_text(value: String, error: AlertingError) -> Result<String
     } else {
         Ok(trimmed.to_string())
     }
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
@@ -1535,11 +1830,15 @@ fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acknowledge_alert, auto_resolve_alert, classify_alert_severity, compute_alert_dedup_key,
-        deduplicate_alert_stream, deliver_alert, evaluate_alert_rules, filter_alert_history,
-        open_alert_lifecycle, resolve_alert, route_alert_to_recipients, run_tracked_delivery,
-        AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone, AlertHistoryQuery,
-        AlertLifecycleRecord, AlertLifecycleState, AlertRecipient, AlertRoutingRule, AlertRule,
+        acknowledge_alert, auto_resolve_alert, build_alert_rule_record,
+        build_alert_rule_subscription, classify_alert_severity, compute_alert_dedup_key,
+        deduplicate_alert_stream, deliver_alert, evaluate_alert_rules,
+        evaluate_managed_alert_rules, filter_alert_history, open_alert_lifecycle, resolve_alert,
+        route_alert_to_recipients, run_tracked_delivery, transition_alert_rule_status,
+        version_alert_rule_record, AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone,
+        AlertHistoryQuery, AlertLifecycleRecord, AlertLifecycleState, AlertRecipient,
+        AlertRoutingRule, AlertRule, AlertRuleCreateRequest, AlertRuleStatus,
+        AlertRuleStatusUpdateRequest, AlertRuleSubscriptionCreateRequest, AlertRuleUpdateRequest,
         AlertSeverityEvidence, AlertSeverityHint, AlertingError, DeliveryRetryPolicy,
         DeliveryState, DeliveryStatus, InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
     };
@@ -1639,6 +1938,122 @@ mod tests {
 
         assert!(outcome.fired_alerts.is_empty());
         assert_eq!(outcome.non_match_count, 1);
+    }
+
+    #[test]
+    fn rule_management_creates_versions_and_disables_firing_with_audit() {
+        let rule = build_alert_rule_record(
+            AlertRuleCreateRequest {
+                rule_id: Some(" rule-sensor-stale ".to_string()),
+                event_type: " sensor_stale ".to_string(),
+                subject_ref: Some(" sensor:soil-probe-001 ".to_string()),
+                severity: AlertSeverityHint::Critical,
+                channels: vec![" in_app ".to_string()],
+                status: None,
+            },
+            "generated-rule".to_string(),
+            "2026-06-12T10:00:00Z".to_string(),
+        )
+        .expect("valid rule should build");
+        assert_eq!(rule.rule_id, "rule-sensor-stale");
+        assert_eq!(rule.version, 1);
+        assert_eq!(rule.status, AlertRuleStatus::Active);
+        assert_eq!(rule.subject_ref.as_deref(), Some("sensor:soil-probe-001"));
+
+        let edited = version_alert_rule_record(
+            &rule,
+            AlertRuleUpdateRequest {
+                event_type: "sensor_stale".to_string(),
+                subject_ref: None,
+                severity: AlertSeverityHint::Warning,
+                channels: vec!["email".to_string()],
+            },
+            "2026-06-12T10:05:00Z".to_string(),
+        )
+        .expect("rule edit should create next version");
+        assert_eq!(edited.version, 2);
+        assert_eq!(edited.status, AlertRuleStatus::Active);
+        assert_eq!(edited.severity, AlertSeverityHint::Warning);
+
+        let (disabled, audit) = transition_alert_rule_status(
+            &edited,
+            AlertRuleStatusUpdateRequest {
+                status: AlertRuleStatus::Disabled,
+                actor_id: "ops-admin".to_string(),
+                occurred_at: "2026-06-12T10:10:00Z".to_string(),
+            },
+            "audit-rule-disable".to_string(),
+        )
+        .expect("status change should version and audit");
+
+        assert_eq!(disabled.version, 3);
+        assert_eq!(disabled.status, AlertRuleStatus::Disabled);
+        assert_eq!(audit.previous_status, AlertRuleStatus::Active);
+        assert_eq!(audit.new_status, AlertRuleStatus::Disabled);
+        assert_eq!(audit.actor_id, "ops-admin");
+
+        let mut backbone = AlertEventBackbone::default();
+        let candidate = backbone
+            .emit(sensor_health_event())
+            .expect("event should be accepted");
+        let outcome = evaluate_managed_alert_rules(&candidate, &[disabled]);
+        assert!(outcome.fired_alerts.is_empty());
+    }
+
+    #[test]
+    fn malformed_rule_is_rejected_before_it_can_fire() {
+        let error = build_alert_rule_record(
+            AlertRuleCreateRequest {
+                rule_id: Some("rule-invalid".to_string()),
+                event_type: " ".to_string(),
+                subject_ref: None,
+                severity: AlertSeverityHint::Warning,
+                channels: vec!["in_app".to_string()],
+                status: None,
+            },
+            "generated-rule".to_string(),
+            "2026-06-12T10:00:00Z".to_string(),
+        )
+        .expect_err("empty event_type is an invalid predicate");
+
+        assert_eq!(error, AlertingError::EmptyEventType);
+    }
+
+    #[test]
+    fn subscription_binds_recipient_role_and_channels_to_rule() {
+        let rule = build_alert_rule_record(
+            AlertRuleCreateRequest {
+                rule_id: Some("rule-sensor-stale".to_string()),
+                event_type: "sensor_stale".to_string(),
+                subject_ref: None,
+                severity: AlertSeverityHint::Critical,
+                channels: vec!["in_app".to_string()],
+                status: None,
+            },
+            "generated-rule".to_string(),
+            "2026-06-12T10:00:00Z".to_string(),
+        )
+        .expect("valid rule should build");
+
+        let subscription = build_alert_rule_subscription(
+            AlertRuleSubscriptionCreateRequest {
+                subscription_id: Some(" subscription-001 ".to_string()),
+                rule_id: " rule-sensor-stale ".to_string(),
+                recipient_id: " ops-user-001 ".to_string(),
+                recipient_role: " operator ".to_string(),
+                channels: vec![" in_app ".to_string(), " email ".to_string()],
+            },
+            &rule,
+            "generated-subscription".to_string(),
+            "2026-06-12T10:01:00Z".to_string(),
+        )
+        .expect("subscription should build");
+
+        assert_eq!(subscription.subscription_id, "subscription-001");
+        assert_eq!(subscription.rule_id, "rule-sensor-stale");
+        assert_eq!(subscription.recipient_id, "ops-user-001");
+        assert_eq!(subscription.recipient_role, "operator");
+        assert_eq!(subscription.channels, vec!["in_app", "email"]);
     }
 
     #[test]

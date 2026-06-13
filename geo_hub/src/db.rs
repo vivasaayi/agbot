@@ -1110,6 +1110,56 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS alert_rules (
+            rule_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            subject_ref TEXT,
+            severity TEXT NOT NULL,
+            channels_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(rule_id, version)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS alert_rule_subscriptions (
+            subscription_id TEXT PRIMARY KEY,
+            rule_id TEXT NOT NULL,
+            recipient_id TEXT NOT NULL,
+            recipient_role TEXT NOT NULL,
+            channels_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS alert_rule_audits (
+            audit_id TEXT PRIMARY KEY,
+            rule_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            previous_status TEXT NOT NULL,
+            new_status TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS compliance_records (
             record_id TEXT NOT NULL,
             version INTEGER NOT NULL,
@@ -1629,6 +1679,33 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_alert_fired_alerts_severity_time
         ON alert_fired_alerts(severity, fired_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_alert_rules_status_event
+        ON alert_rules(status, event_type);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_alert_rule_subscriptions_rule
+        ON alert_rule_subscriptions(rule_id, created_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_alert_rule_audits_rule
+        ON alert_rule_audits(rule_id, occurred_at);
         "#,
     )
     .execute(pool)
