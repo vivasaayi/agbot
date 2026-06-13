@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::schemas::FarmFieldRegistry;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub mod findings_export;
@@ -148,6 +149,31 @@ pub struct AnalysisResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetainedAnalysisResult {
+    pub result: AnalysisResult,
+    pub identity: AnalysisJobIdentity,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AnalysisResultListQuery {
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub scene_id: Option<String>,
+    pub created_from: Option<DateTime<Utc>>,
+    pub created_to: Option<DateTime<Utc>>,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalysisResultListPage {
+    pub items: Vec<RetainedAnalysisResult>,
+    pub total_count: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResultType {
     NdviMap,
     ElevationModel,
@@ -259,6 +285,7 @@ pub struct PostProcessorService {
     job_queue: Vec<ProcessingJob>,
     completed_jobs: HashMap<Uuid, ProcessingJob>,
     results_cache: HashMap<Uuid, AnalysisResult>,
+    result_records: HashMap<Uuid, RetainedAnalysisResult>,
     analysis_job_identities: HashMap<Uuid, AnalysisJobIdentity>,
     working_directory: PathBuf,
     ndvi_analyzer: NdviAnalysisProcessor,
@@ -269,11 +296,22 @@ pub struct PostProcessorService {
 
 impl PostProcessorService {
     pub fn new(working_directory: PathBuf) -> Result<Self> {
+        let result_records = Self::load_retained_analysis_results(&working_directory)?;
+        let results_cache = result_records
+            .iter()
+            .map(|(result_id, record)| (*result_id, record.result.clone()))
+            .collect();
+        let analysis_job_identities = result_records
+            .values()
+            .map(|record| (record.identity.job_id, record.identity.clone()))
+            .collect();
+
         Ok(Self {
             job_queue: Vec::new(),
             completed_jobs: HashMap::new(),
-            results_cache: HashMap::new(),
-            analysis_job_identities: HashMap::new(),
+            results_cache,
+            result_records,
+            analysis_job_identities,
             working_directory,
             ndvi_analyzer: NdviAnalysisProcessor::new(NdviAnalysisConfig::default()),
             lidar_analyzer: LidarAnalysisProcessor::new(LidarAnalysisConfig::default()),
@@ -401,6 +439,9 @@ impl PostProcessorService {
             };
 
             self.sync_analysis_job_identity(&job);
+            if let Some(result) = result.as_ref() {
+                self.retain_analysis_result(result).await?;
+            }
             self.completed_jobs.insert(job.id, job);
             Ok(result)
         } else {
@@ -622,6 +663,42 @@ impl PostProcessorService {
         self.results_cache.get(result_id)
     }
 
+    pub async fn list_analysis_results(
+        &self,
+        query: AnalysisResultListQuery,
+    ) -> AnalysisResultListPage {
+        let page = query.page.max(1);
+        let page_size = if query.page_size == 0 {
+            50
+        } else {
+            query.page_size.min(250)
+        };
+        let mut items: Vec<RetainedAnalysisResult> = self
+            .result_records
+            .values()
+            .filter(|record| analysis_result_matches_query(record, &query))
+            .cloned()
+            .collect();
+        items.sort_by(|left, right| {
+            right
+                .result
+                .created_at
+                .cmp(&left.result.created_at)
+                .then_with(|| right.result.id.cmp(&left.result.id))
+        });
+
+        let total_count = items.len();
+        let start = (page - 1).saturating_mul(page_size);
+        let paged_items = items.into_iter().skip(start).take(page_size).collect();
+
+        AnalysisResultListPage {
+            items: paged_items,
+            total_count,
+            page,
+            page_size,
+        }
+    }
+
     pub fn analysis_job_identity(&self, job_id: &Uuid) -> Option<&AnalysisJobIdentity> {
         self.analysis_job_identities.get(job_id)
     }
@@ -673,6 +750,49 @@ impl PostProcessorService {
         }
     }
 
+    async fn retain_analysis_result(&mut self, result: &AnalysisResult) -> Result<()> {
+        let Some(identity) = self.analysis_job_identities.get(&result.job_id).cloned() else {
+            return Ok(());
+        };
+        let record = RetainedAnalysisResult {
+            result: result.clone(),
+            identity,
+        };
+        let output_dir = Self::analysis_results_dir_for(&self.working_directory);
+        tokio::fs::create_dir_all(&output_dir).await?;
+        let output_path = output_dir.join(format!("{}.json", result.id));
+        let content = serde_json::to_vec_pretty(&record)?;
+        tokio::fs::write(output_path, content).await?;
+        self.result_records.insert(result.id, record);
+        Ok(())
+    }
+
+    fn load_retained_analysis_results(
+        working_directory: &Path,
+    ) -> Result<HashMap<Uuid, RetainedAnalysisResult>> {
+        let results_dir = Self::analysis_results_dir_for(working_directory);
+        if !results_dir.exists() {
+            return Ok(HashMap::new());
+        }
+
+        let mut records = HashMap::new();
+        for entry in fs::read_dir(results_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let content = fs::read(&path)?;
+            let record: RetainedAnalysisResult = serde_json::from_slice(&content)?;
+            records.insert(record.result.id, record);
+        }
+        Ok(records)
+    }
+
+    fn analysis_results_dir_for(working_directory: &Path) -> PathBuf {
+        working_directory.join("analysis_results")
+    }
+
     pub async fn cleanup_old_results(&mut self, older_than_days: u32) -> Result<u32> {
         let cutoff_date = Utc::now() - chrono::Duration::days(older_than_days as i64);
         let mut removed_count = 0;
@@ -687,9 +807,21 @@ impl PostProcessorService {
             }
         });
 
-        // Remove old results
-        self.results_cache
-            .retain(|_, result| result.created_at > cutoff_date);
+        // Remove old results and their retained listing records.
+        let old_result_ids: Vec<Uuid> = self
+            .results_cache
+            .iter()
+            .filter_map(|(result_id, result)| {
+                (result.created_at <= cutoff_date).then_some(*result_id)
+            })
+            .collect();
+        for result_id in old_result_ids {
+            self.results_cache.remove(&result_id);
+            self.result_records.remove(&result_id);
+            let result_path = Self::analysis_results_dir_for(&self.working_directory)
+                .join(format!("{result_id}.json"));
+            let _ = tokio::fs::remove_file(result_path).await;
+        }
 
         tracing::info!("Cleaned up {} old processing jobs", removed_count);
         Ok(removed_count)
@@ -709,6 +841,46 @@ impl Default for AnalysisStatistics {
             total_pixel_count: 0,
         }
     }
+}
+
+fn analysis_result_matches_query(
+    record: &RetainedAnalysisResult,
+    query: &AnalysisResultListQuery,
+) -> bool {
+    if query
+        .field_id
+        .as_deref()
+        .is_some_and(|field_id| record.identity.field_id != field_id)
+    {
+        return false;
+    }
+    if query
+        .season_id
+        .as_deref()
+        .is_some_and(|season_id| record.identity.season_id != season_id)
+    {
+        return false;
+    }
+    if query
+        .scene_id
+        .as_deref()
+        .is_some_and(|scene_id| record.identity.scene_id != scene_id)
+    {
+        return false;
+    }
+    if query
+        .created_from
+        .is_some_and(|created_from| record.result.created_at < created_from)
+    {
+        return false;
+    }
+    if query
+        .created_to
+        .is_some_and(|created_to| record.result.created_at > created_to)
+    {
+        return false;
+    }
+    true
 }
 
 impl Default for ProcessingParameters {
@@ -855,6 +1027,98 @@ mod tests {
         assert_eq!(result.job_id, job_id);
         let identity = service.analysis_job_identity(&job_id).unwrap();
         assert!(matches!(identity.status, JobStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn completed_results_are_listed_with_filters_and_pagination() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let catalog = analysis_catalog();
+        let started_at = Utc::now() - chrono::Duration::seconds(1);
+
+        for _ in 0..2 {
+            let mut request = analysis_job_request(temp_dir.path());
+            request.job_type = JobType::MultiSpectralAnalysis;
+            service
+                .submit_analysis_job(&catalog, request)
+                .await
+                .expect("scene-linked job is accepted");
+            service
+                .process_next_job()
+                .await
+                .expect("processing succeeds")
+                .expect("result is produced");
+        }
+
+        let page = service
+            .list_analysis_results(AnalysisResultListQuery {
+                field_id: Some("field-a".to_string()),
+                season_id: Some("season-2026".to_string()),
+                created_from: Some(started_at),
+                created_to: Some(Utc::now() + chrono::Duration::seconds(1)),
+                page: 1,
+                page_size: 1,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(page.total_count, 2);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].identity.field_id, "field-a");
+        assert_eq!(page.items[0].identity.season_id, "season-2026");
+        assert!(matches!(
+            page.items[0].identity.status,
+            JobStatus::Completed
+        ));
+
+        let empty = service
+            .list_analysis_results(AnalysisResultListQuery {
+                field_id: Some("field-b".to_string()),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(empty.total_count, 0);
+        assert!(empty.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_result_is_retrievable_after_restart() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let (result_id, job_id) = {
+            let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+            let mut request = analysis_job_request(temp_dir.path());
+            request.job_type = JobType::MultiSpectralAnalysis;
+            let job_id = service
+                .submit_analysis_job(&catalog, request)
+                .await
+                .expect("scene-linked job is accepted");
+            let result = service
+                .process_next_job()
+                .await
+                .expect("processing succeeds")
+                .expect("result is produced");
+            (result.id, job_id)
+        };
+
+        let restarted = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let result = restarted
+            .get_result(&result_id)
+            .await
+            .expect("retained result loads after restart");
+        assert_eq!(result.job_id, job_id);
+
+        let page = restarted
+            .list_analysis_results(AnalysisResultListQuery {
+                field_id: Some("field-a".to_string()),
+                season_id: Some("season-2026".to_string()),
+                page: 1,
+                page_size: 10,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(page.total_count, 1);
+        assert_eq!(page.items[0].result.id, result_id);
     }
 
     fn analysis_job_request(output_directory: &std::path::Path) -> AnalysisJobRequest {
