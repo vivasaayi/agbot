@@ -361,6 +361,42 @@ async fn creating_field_and_linking_scene_exposes_field_scoped_gis_data() -> Res
         .and_then(|v| v.as_str())
         .is_some_and(|value| !value.trim().is_empty()));
 
+    let audit_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{scene_id}/audit"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(audit_response.status(), StatusCode::OK);
+    let audit_body = to_bytes(audit_response.into_body(), 64 * 1024).await?;
+    let audit_json: serde_json::Value = serde_json::from_slice(&audit_body)?;
+    assert_eq!(
+        audit_json.get("scene_id").and_then(|value| value.as_str()),
+        Some(scene_id)
+    );
+    assert_eq!(
+        audit_json
+            .pointer("/link_audits/0/mutation")
+            .and_then(|value| value.as_str()),
+        Some("link_scene_to_field")
+    );
+    assert_eq!(
+        audit_json
+            .pointer("/link_audits/0/new_field_id")
+            .and_then(|value| value.as_str()),
+        Some("north-80")
+    );
+    assert!(audit_json
+        .pointer("/link_audits/0/audit_id")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.starts_with("scene-link-audit-")));
+
     let scenes_response = ctx
         .app
         .clone()
@@ -9432,6 +9468,7 @@ async fn layer_metadata_endpoint_returns_asserted_spatial_ref() -> Result<()> {
     insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref).await?;
     link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
     insert_layer_product(&ctx, scene_id, "ndvi").await?;
+    insert_ingest_source(&ctx, scene_id, "landsat:/layer-detail-source").await?;
 
     let response = ctx
         .app
@@ -9460,6 +9497,20 @@ async fn layer_metadata_endpoint_returns_asserted_spatial_ref() -> Result<()> {
     assert_eq!(
         layer_json.get("url_path").and_then(|value| value.as_str()),
         Some("/api/scenes/layer-detail-scene/products/ndvi")
+    );
+    assert_eq!(
+        layer_json.get("dataset").and_then(|value| value.as_str()),
+        Some("landsat8")
+    );
+    assert_eq!(
+        layer_json.get("source").and_then(|value| value.as_str()),
+        Some("landsat:/layer-detail-source")
+    );
+    assert_eq!(
+        layer_json
+            .pointer("/freshness/ingested_at")
+            .and_then(|value| value.as_str()),
+        Some("2026-05-01T00:00:00Z")
     );
 
     Ok(())

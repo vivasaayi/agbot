@@ -218,6 +218,7 @@ pub struct LayerMetadata {
     pub field_id: Option<String>,
     pub season_id: Option<String>,
     pub product_kind: String,
+    pub dataset: String,
     pub width_px: Option<u32>,
     pub height_px: Option<u32>,
     pub gsd_m_per_px: Option<f64>,
@@ -238,6 +239,25 @@ pub struct LayerFreshness {
     pub acquired_at: String,
     pub ingested_at: Option<String>,
     pub coverage_fraction: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SceneAuditTrail {
+    pub scene_id: String,
+    pub ingest_attempts: Vec<ingest::SceneIngestAttemptRecord>,
+    pub link_audits: Vec<SceneLinkAuditRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SceneLinkAuditRecord {
+    pub audit_id: String,
+    pub scene_id: String,
+    pub mutation: String,
+    pub previous_field_id: Option<String>,
+    pub previous_season_id: Option<String>,
+    pub new_field_id: String,
+    pub new_season_id: String,
+    pub occurred_at: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -6015,6 +6035,8 @@ pub async fn link_scene_to_field(
         ));
     }
 
+    let previous_field_id = scene_row.get::<Option<String>, _>("field_id");
+    let previous_season_id = scene_row.get::<Option<String>, _>("season_id");
     let linked_at = current_record_timestamp();
     let updated = sqlx::query(
         "UPDATE scenes SET field_id = ?1, season_id = ?2, linked_at = ?3 WHERE scene_id = ?4",
@@ -6029,6 +6051,16 @@ pub async fn link_scene_to_field(
     if updated.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
+    insert_scene_link_audit(
+        &state,
+        &scene_id,
+        previous_field_id.as_deref(),
+        previous_season_id.as_deref(),
+        &field_id,
+        &season_id,
+        &linked_at,
+    )
+    .await?;
 
     get_scene(Path(scene_id), State(state)).await
 }
@@ -6163,6 +6195,93 @@ pub async fn get_layer_metadata(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(layer))
+}
+
+pub async fn get_scene_audit(
+    Path(scene_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SceneAuditTrail>> {
+    let scene_exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM scenes WHERE scene_id = ?1")
+        .bind(&scene_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(Error::from)?;
+    let ingest_attempts = ingest::load_ingest_attempts(&state.pool, &scene_id).await?;
+    let link_audits = load_scene_link_audits(&state, &scene_id).await?;
+
+    if scene_exists.is_none() && ingest_attempts.is_empty() && link_audits.is_empty() {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(SceneAuditTrail {
+        scene_id,
+        ingest_attempts,
+        link_audits,
+    }))
+}
+
+async fn load_scene_link_audits(
+    state: &AppState,
+    scene_id: &str,
+) -> AppResult<Vec<SceneLinkAuditRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT audit_id, scene_id, mutation, previous_field_id, previous_season_id,
+               new_field_id, new_season_id, occurred_at
+        FROM scene_link_audits
+        WHERE scene_id = ?1
+        ORDER BY occurred_at ASC, audit_id ASC
+        "#,
+    )
+    .bind(scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| SceneLinkAuditRecord {
+            audit_id: row.get("audit_id"),
+            scene_id: row.get("scene_id"),
+            mutation: row.get("mutation"),
+            previous_field_id: row.get("previous_field_id"),
+            previous_season_id: row.get("previous_season_id"),
+            new_field_id: row.get("new_field_id"),
+            new_season_id: row.get("new_season_id"),
+            occurred_at: row.get("occurred_at"),
+        })
+        .collect())
+}
+
+async fn insert_scene_link_audit(
+    state: &AppState,
+    scene_id: &str,
+    previous_field_id: Option<&str>,
+    previous_season_id: Option<&str>,
+    new_field_id: &str,
+    new_season_id: &str,
+    occurred_at: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO scene_link_audits (
+            audit_id, scene_id, mutation, previous_field_id, previous_season_id,
+            new_field_id, new_season_id, occurred_at
+        )
+        VALUES (?1, ?2, 'link_scene_to_field', ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(format!("scene-link-audit-{}", Uuid::new_v4()))
+    .bind(scene_id)
+    .bind(previous_field_id)
+    .bind(previous_season_id)
+    .bind(new_field_id)
+    .bind(new_season_id)
+    .bind(occurred_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
 }
 
 pub async fn export_layer_geotiff(
@@ -6506,7 +6625,7 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
             s.season_id,
             i.ingested_at,
             i.coverage_fraction,
-            i.source_path,
+            i.source_path AS ingest_source_path,
             sr.spatial_ref_json AS scene_spatial_ref_json
         FROM products p
         JOIN scenes s ON s.scene_id = p.scene_id
@@ -6551,7 +6670,7 @@ async fn load_layer_row(
             s.season_id,
             i.ingested_at,
             i.coverage_fraction,
-            i.source_path,
+            i.source_path AS ingest_source_path,
             sr.spatial_ref_json AS scene_spatial_ref_json
         FROM products p
         JOIN scenes s ON s.scene_id = p.scene_id
@@ -6632,6 +6751,7 @@ async fn layer_from_row(
 
     let scene_id: String = row.get("scene_id");
     let product_kind: String = row.get("kind");
+    let dataset: String = row.get("sensor");
     let metadata_json: String = row.get("metadata_json");
     let image = serde_json::from_str::<MultispectralImage>(&metadata_json).map_err(|err| {
         AppError::Anyhow(
@@ -6678,7 +6798,7 @@ async fn layer_from_row(
     };
 
     let source = row
-        .get::<Option<String>, _>("source_path")
+        .get::<Option<String>, _>("ingest_source_path")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| row.get("sensor"));
     let url_path = format!("/api/scenes/{scene_id}/products/{product_kind}");
@@ -6699,6 +6819,7 @@ async fn layer_from_row(
         field_id,
         season_id,
         product_kind,
+        dataset,
         width_px,
         height_px,
         gsd_m_per_px,

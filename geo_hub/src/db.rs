@@ -201,6 +201,23 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS scene_link_audits (
+            audit_id TEXT PRIMARY KEY,
+            scene_id TEXT NOT NULL,
+            mutation TEXT NOT NULL,
+            previous_field_id TEXT,
+            previous_season_id TEXT,
+            new_field_id TEXT NOT NULL,
+            new_season_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS scene_spatial_refs (
             scene_id TEXT PRIMARY KEY,
             spatial_ref_json TEXT NOT NULL,

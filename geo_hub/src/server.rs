@@ -361,6 +361,7 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::export_layer_geotiff),
         )
         .route("/api/scenes/:scene_id", get(routes::get_scene))
+        .route("/api/scenes/:scene_id/audit", get(routes::get_scene_audit))
         .route(
             "/api/scenes/:scene_id/annotations",
             get(routes::list_scene_annotations).post(routes::create_scene_annotation),

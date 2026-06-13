@@ -94,6 +94,7 @@ pub struct SceneIngestRecord {
     pub ingested_at: Option<String>,
     pub acquisition_date: Option<String>,
     pub coverage_fraction: Option<f64>,
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +223,7 @@ pub async fn ingest_landsat_with_policy(
     let scene_dir = scenes_root.join(&args.scene_id);
     let source_path = args.source_dir.to_string_lossy().to_string();
     let max_attempts = retry_policy.max_attempts();
+    let first_attempt_number = next_ingest_attempt_number(pool, &args.scene_id).await?;
 
     record_ingest_status(
         pool,
@@ -246,7 +248,8 @@ pub async fn ingest_landsat_with_policy(
     )
     .await?;
 
-    for attempt_number in 1..=max_attempts {
+    for attempt_index in 0..max_attempts {
+        let attempt_number = first_attempt_number + attempt_index;
         record_ingest_attempt_started(pool, &args.scene_id, attempt_number).await?;
 
         match ingest_landsat_inner(&args, pool, &scene_dir, &source_path).await {
@@ -263,7 +266,7 @@ pub async fn ingest_landsat_with_policy(
             }
             Err(err) => {
                 let reason_code = err.reason_code;
-                let retryable = is_retryable_ingest_error(&err) && attempt_number < max_attempts;
+                let retryable = is_retryable_ingest_error(&err) && attempt_index + 1 < max_attempts;
                 let message = err.to_string();
                 record_ingest_attempt_finished(
                     pool,
@@ -296,7 +299,7 @@ pub async fn ingest_landsat_with_policy(
                         &source_path,
                     )
                     .await?;
-                    let backoff = retry_policy.backoff_for_attempt(attempt_number);
+                    let backoff = retry_policy.backoff_for_attempt(attempt_index + 1);
                     if !backoff.is_zero() {
                         tokio::time::sleep(backoff).await;
                     }
@@ -326,6 +329,17 @@ pub async fn ingest_landsat_with_policy(
 
 fn is_retryable_ingest_error(err: &IngestStepError) -> bool {
     err.reason_code == "download_error"
+}
+
+async fn next_ingest_attempt_number(pool: &DbPool, scene_id: &str) -> Result<usize> {
+    let next = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM scene_ingest_attempts WHERE scene_id = ?1",
+    )
+    .bind(scene_id)
+    .fetch_one(pool)
+    .await?
+    .unwrap_or(1);
+    Ok(next.max(1) as usize)
 }
 
 async fn record_ingest_attempt_started(
@@ -629,7 +643,7 @@ pub async fn load_ingest_record(
 ) -> Result<Option<SceneIngestRecord>> {
     let row = sqlx::query(
         r#"
-        SELECT scene_id, status, status_reason, ingested_at, acquisition_date, coverage_fraction
+        SELECT scene_id, status, status_reason, ingested_at, acquisition_date, coverage_fraction, source_path
         FROM scene_ingests
         WHERE scene_id = ?1
         "#,
@@ -647,6 +661,7 @@ pub async fn load_ingest_record(
             ingested_at: row.get("ingested_at"),
             acquisition_date: row.get("acquisition_date"),
             coverage_fraction: row.get("coverage_fraction"),
+            source_path: row.get("source_path"),
         })
     })
     .transpose()
@@ -776,6 +791,7 @@ async fn record_ingest_status(
         ingested_at: ingested_at.map(ToOwned::to_owned),
         acquisition_date: acquisition_date.map(ToOwned::to_owned),
         coverage_fraction,
+        source_path: Some(source_path.to_string()),
     })
 }
 
@@ -990,6 +1006,61 @@ mod tests {
             .await?
             .expect("ingest record should persist");
         assert_eq!(persisted, record);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_landsat_duplicate_source_is_idempotent_and_audited() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir)?;
+        write_scene_fixture(&source_dir, &[("B4", "B4.png"), ("B5", "B5.png")])?;
+
+        let config = test_config(&tmp);
+        config.ensure_data_dirs()?;
+        let pool = db::connect_pool(&config).await?;
+
+        for _ in 0..2 {
+            ingest_landsat(
+                IngestLandsatArgs {
+                    scene_id: "scene-idempotent".to_string(),
+                    source_dir: source_dir.clone(),
+                },
+                &config,
+                &pool,
+            )
+            .await?;
+        }
+
+        let scene_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scenes WHERE scene_id = ?1")
+                .bind("scene-idempotent")
+                .fetch_one(&pool)
+                .await?;
+        let ingest_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scene_ingests WHERE scene_id = ?1")
+                .bind("scene-idempotent")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(scene_count, 1);
+        assert_eq!(ingest_count, 1);
+
+        let attempts = load_ingest_attempts(&pool, "scene-idempotent").await?;
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].attempt_number, 1);
+        assert_eq!(attempts[1].attempt_number, 2);
+        assert!(attempts
+            .iter()
+            .all(|attempt| attempt.status == SceneIngestAttemptStatus::Succeeded));
+
+        let record = load_ingest_record(&pool, "scene-idempotent")
+            .await?
+            .expect("ingest record should persist");
+        assert_eq!(
+            record.source_path.as_deref(),
+            Some(source_dir.to_string_lossy().as_ref())
+        );
 
         Ok(())
     }
