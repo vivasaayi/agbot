@@ -1,4 +1,5 @@
 use crate::survey_template::{validate_plan_bounds, PlanBoundsConfig, PlanBoundsIssueCode};
+use crate::weather_integration::WeatherData;
 use crate::{Mission, MissionStateTransitionError};
 use geo::{Contains, Intersects, LineString, Point, Polygon};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,12 @@ pub struct NoFlyZone {
     pub boundary: Polygon<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AirspaceConstraint {
+    pub id: String,
+    pub boundary: Polygon<f64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SafetyViolationCode {
     InvalidGeofence,
@@ -22,6 +29,9 @@ pub enum SafetyViolationCode {
     CurrentPositionOutsideGeofence,
     AltitudeCeilingExceeded,
     NoFlyZoneIntersection,
+    WindSpeedExceeded,
+    PrecipitationExceeded,
+    AirspaceIntersection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +45,12 @@ pub struct SafetyViolation {
     pub severity: SafetyViolationSeverity,
     pub waypoint_index: Option<usize>,
     pub zone_id: Option<String>,
+    #[serde(default)]
+    pub measured_value: Option<f32>,
+    #[serde(default)]
+    pub threshold_value: Option<f32>,
+    #[serde(default)]
+    pub unit: Option<String>,
     pub message: String,
 }
 
@@ -82,6 +98,24 @@ pub fn evaluate_dispatch_safety(
     no_fly_zones: &[NoFlyZone],
     config: DispatchSafetyConfig,
 ) -> DispatchSafetyReport {
+    evaluate_dispatch_safety_with_constraints(
+        mission,
+        current_position,
+        no_fly_zones,
+        None,
+        &[],
+        config,
+    )
+}
+
+pub fn evaluate_dispatch_safety_with_constraints(
+    mission: &Mission,
+    current_position: Option<Point<f64>>,
+    no_fly_zones: &[NoFlyZone],
+    weather: Option<&WeatherData>,
+    airspace_constraints: &[AirspaceConstraint],
+    config: DispatchSafetyConfig,
+) -> DispatchSafetyReport {
     let mut violations = Vec::new();
 
     if let Err(error) = validate_plan_bounds(
@@ -107,6 +141,9 @@ pub fn evaluate_dispatch_safety(
             severity: SafetyViolationSeverity::Blocker,
             waypoint_index: issue.waypoint_index,
             zone_id: None,
+            measured_value: None,
+            threshold_value: None,
+            unit: None,
             message: issue.message,
         }));
     }
@@ -118,7 +155,44 @@ pub fn evaluate_dispatch_safety(
                 severity: SafetyViolationSeverity::Blocker,
                 waypoint_index: None,
                 zone_id: None,
+                measured_value: None,
+                threshold_value: None,
+                unit: None,
                 message: "current aircraft position lies outside the mission geofence".to_string(),
+            });
+        }
+    }
+
+    if let Some(weather) = weather {
+        if weather.wind_speed_ms > mission.weather_constraints.max_wind_speed_ms {
+            violations.push(SafetyViolation {
+                code: SafetyViolationCode::WindSpeedExceeded,
+                severity: SafetyViolationSeverity::Blocker,
+                waypoint_index: None,
+                zone_id: None,
+                measured_value: Some(weather.wind_speed_ms),
+                threshold_value: Some(mission.weather_constraints.max_wind_speed_ms),
+                unit: Some("m/s".to_string()),
+                message: format!(
+                    "wind speed {:.1} m/s exceeds dispatch limit {:.1} m/s",
+                    weather.wind_speed_ms, mission.weather_constraints.max_wind_speed_ms
+                ),
+            });
+        }
+
+        if weather.precipitation_mm > mission.weather_constraints.max_precipitation_mm {
+            violations.push(SafetyViolation {
+                code: SafetyViolationCode::PrecipitationExceeded,
+                severity: SafetyViolationSeverity::Blocker,
+                waypoint_index: None,
+                zone_id: None,
+                measured_value: Some(weather.precipitation_mm),
+                threshold_value: Some(mission.weather_constraints.max_precipitation_mm),
+                unit: Some("mm".to_string()),
+                message: format!(
+                    "precipitation {:.1} mm exceeds dispatch limit {:.1} mm",
+                    weather.precipitation_mm, mission.weather_constraints.max_precipitation_mm
+                ),
             });
         }
     }
@@ -135,7 +209,34 @@ pub fn evaluate_dispatch_safety(
                     severity: SafetyViolationSeverity::Blocker,
                     waypoint_index: Some(leg_index + 1),
                     zone_id: Some(zone.id.clone()),
+                    measured_value: None,
+                    threshold_value: None,
+                    unit: None,
                     message: format!("mission leg intersects no-fly zone {}", zone.id),
+                });
+            }
+        }
+    }
+
+    for constraint in airspace_constraints {
+        for (leg_index, pair) in mission.waypoints.windows(2).enumerate() {
+            let leg = LineString::from(vec![
+                (pair[0].position.x(), pair[0].position.y()),
+                (pair[1].position.x(), pair[1].position.y()),
+            ]);
+            if constraint.boundary.intersects(&leg) {
+                violations.push(SafetyViolation {
+                    code: SafetyViolationCode::AirspaceIntersection,
+                    severity: SafetyViolationSeverity::Blocker,
+                    waypoint_index: Some(leg_index + 1),
+                    zone_id: Some(constraint.id.clone()),
+                    measured_value: None,
+                    threshold_value: None,
+                    unit: None,
+                    message: format!(
+                        "mission leg intersects airspace constraint {}",
+                        constraint.id
+                    ),
                 });
             }
         }
@@ -151,7 +252,7 @@ fn point_is_inside_or_on_boundary(boundary: &Polygon<f64>, point: &Point<f64>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Mission, Waypoint, WaypointType};
+    use crate::{Mission, Waypoint, WaypointType, WeatherData};
     use geo::{point, polygon};
 
     fn sample_mission() -> Mission {
@@ -183,6 +284,19 @@ mod tests {
             WaypointType::Landing,
         ));
         mission
+    }
+
+    fn sample_weather() -> WeatherData {
+        WeatherData {
+            temperature_celsius: 20.0,
+            humidity_percent: 50.0,
+            wind_speed_ms: 5.0,
+            wind_direction_degrees: 180.0,
+            precipitation_mm: 0.0,
+            visibility_m: 10000.0,
+            pressure_hpa: 1015.0,
+            cloud_cover_percent: 30.0,
+        }
     }
 
     #[test]
@@ -252,6 +366,105 @@ mod tests {
             SafetyViolationCode::NoFlyZoneIntersection
         );
         assert_eq!(report.violations[0].zone_id.as_deref(), Some("nfz-1"));
+        assert_eq!(
+            report.violations[0].severity,
+            SafetyViolationSeverity::Blocker
+        );
+    }
+
+    #[test]
+    fn dispatch_safety_allows_weather_under_thresholds() {
+        let mission = sample_mission();
+
+        let report = evaluate_dispatch_safety_with_constraints(
+            &mission,
+            Some(point!(x: 20.0, y: 20.0)),
+            &[],
+            Some(&sample_weather()),
+            &[],
+            DispatchSafetyConfig {
+                altitude_ceiling_m: 120.0,
+            },
+        );
+
+        assert!(report.is_clear());
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn dispatch_safety_blocks_wind_and_precipitation_thresholds() {
+        let mission = sample_mission();
+        let mut weather = sample_weather();
+        weather.wind_speed_ms = 18.5;
+        weather.precipitation_mm = 3.25;
+
+        let report = evaluate_dispatch_safety_with_constraints(
+            &mission,
+            Some(point!(x: 20.0, y: 20.0)),
+            &[],
+            Some(&weather),
+            &[],
+            DispatchSafetyConfig {
+                altitude_ceiling_m: 120.0,
+            },
+        );
+
+        assert!(!report.is_clear());
+        assert_eq!(report.violations.len(), 2);
+        assert_eq!(
+            report.violations[0].code,
+            SafetyViolationCode::WindSpeedExceeded
+        );
+        assert_eq!(report.violations[0].measured_value, Some(18.5));
+        assert_eq!(report.violations[0].threshold_value, Some(15.0));
+        assert_eq!(report.violations[0].unit.as_deref(), Some("m/s"));
+        assert!(report.violations[0].message.contains("18.5"));
+        assert!(report.violations[0].message.contains("15.0"));
+        assert_eq!(
+            report.violations[1].code,
+            SafetyViolationCode::PrecipitationExceeded
+        );
+        assert_eq!(report.violations[1].measured_value, Some(3.25));
+        assert_eq!(report.violations[1].threshold_value, Some(2.0));
+        assert_eq!(report.violations[1].unit.as_deref(), Some("mm"));
+    }
+
+    #[test]
+    fn dispatch_safety_blocks_airspace_intersection() {
+        let mission = sample_mission();
+        let restricted_airspace = AirspaceConstraint {
+            id: "temporary-flight-restriction".to_string(),
+            boundary: polygon![
+                (x: 45.0, y: 45.0),
+                (x: 55.0, y: 45.0),
+                (x: 55.0, y: 55.0),
+                (x: 45.0, y: 55.0),
+                (x: 45.0, y: 45.0),
+            ],
+        };
+
+        let report = evaluate_dispatch_safety_with_constraints(
+            &mission,
+            Some(point!(x: 20.0, y: 20.0)),
+            &[],
+            Some(&sample_weather()),
+            &[restricted_airspace],
+            DispatchSafetyConfig {
+                altitude_ceiling_m: 120.0,
+            },
+        );
+
+        assert!(!report.is_clear());
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(
+            report.violations[0].code,
+            SafetyViolationCode::AirspaceIntersection
+        );
+        assert_eq!(
+            report.violations[0].zone_id.as_deref(),
+            Some("temporary-flight-restriction")
+        );
+        assert_eq!(report.violations[0].waypoint_index, Some(1));
         assert_eq!(
             report.violations[0].severity,
             SafetyViolationSeverity::Blocker

@@ -2,9 +2,9 @@ use crate::mavlink_integration::{
     MAVLinkCommandAckError, MAVLinkCommandAckRecord, MAVLinkCommandAckTracker,
 };
 use crate::{
-    evaluate_abort_recovery, evaluate_dispatch_safety, AbortRecoveryConfig, AbortRecoveryContext,
-    AbortRecoveryPlan, DispatchSafetyConfig, DispatchSafetyReport, Mission, MissionStatus,
-    NoFlyZone, TelemetryLinkState,
+    evaluate_abort_recovery, evaluate_dispatch_safety_with_constraints, AbortRecoveryConfig,
+    AbortRecoveryContext, AbortRecoveryPlan, AirspaceConstraint, DispatchSafetyConfig,
+    DispatchSafetyReport, Mission, MissionStatus, NoFlyZone, TelemetryLinkState, WeatherData,
 };
 use chrono::{DateTime, Duration, Utc};
 use geo::Point;
@@ -20,6 +20,8 @@ pub struct GuardedDispatchContext {
     pub dispatch_safety: DispatchSafetyConfig,
     pub battery_percentage: u8,
     pub minimum_battery_percentage: u8,
+    pub weather: Option<WeatherData>,
+    pub airspace_constraints: Vec<AirspaceConstraint>,
     pub link_state: TelemetryLinkState,
     pub sent_at: DateTime<Utc>,
     pub simulated_ack_latency: Duration,
@@ -154,10 +156,12 @@ pub fn dispatch_guarded_simulation_command(
         });
     }
 
-    let dispatch_safety = evaluate_dispatch_safety(
+    let dispatch_safety = evaluate_dispatch_safety_with_constraints(
         mission,
         context.current_position,
         &context.no_fly_zones,
+        context.weather.as_ref(),
+        &context.airspace_constraints,
         context.dispatch_safety,
     );
     if !dispatch_safety.is_clear() {
@@ -239,7 +243,7 @@ mod tests {
     };
     use crate::{
         AbortRecoveryConfig, AbortRecoveryContext, AbortTrigger, DispatchSafetyConfig, Mission,
-        MissionStatus, TelemetryLinkState, Waypoint, WaypointType,
+        MissionStatus, TelemetryLinkState, Waypoint, WaypointType, WeatherData,
     };
     use chrono::{Duration, TimeZone, Utc};
     use geo::{point, polygon};
@@ -288,6 +292,8 @@ mod tests {
             },
             battery_percentage: 80,
             minimum_battery_percentage: 30,
+            weather: None,
+            airspace_constraints: Vec::new(),
             link_state: TelemetryLinkState::Fresh,
             sent_at,
             simulated_ack_latency: Duration::milliseconds(120),
@@ -376,5 +382,51 @@ mod tests {
         }
         assert!(tracker.record(correlation_id).is_none());
         assert_eq!(mission.status, MissionStatus::InFlight);
+    }
+
+    #[test]
+    fn guarded_dispatch_blocks_over_wind_constraint_before_sending_command() {
+        let mission = armed_mission();
+        let correlation_id = Uuid::new_v4();
+        let mut context = dispatch_context(&mission);
+        let weather = WeatherData {
+            temperature_celsius: 20.0,
+            humidity_percent: 50.0,
+            wind_speed_ms: 21.0,
+            wind_direction_degrees: 180.0,
+            precipitation_mm: 0.0,
+            visibility_m: 10000.0,
+            pressure_hpa: 1015.0,
+            cloud_cover_percent: 30.0,
+        };
+        context.weather = Some(weather);
+        let mut tracker = MAVLinkCommandAckTracker::new(MAVLinkAckConfig::default());
+
+        let error = dispatch_guarded_simulation_command(
+            &mission,
+            GuardedDispatchCommand {
+                correlation_id,
+                mavlink_command: MAV_CMD_NAV_TAKEOFF,
+                label: "takeoff".to_string(),
+            },
+            context,
+            &mut tracker,
+        )
+        .expect_err("over-wind constraint should block dispatch before command send");
+
+        match error {
+            GuardedDispatchError::SafetyHalt { report, abort_plan } => {
+                assert_eq!(
+                    report.violations[0].code,
+                    crate::SafetyViolationCode::WindSpeedExceeded
+                );
+                assert_eq!(report.violations[0].measured_value, Some(21.0));
+                assert_eq!(report.violations[0].threshold_value, Some(15.0));
+                assert!(abort_plan.is_some());
+            }
+            other => panic!("expected weather/airspace block, got {other:?}"),
+        }
+        assert!(tracker.record(correlation_id).is_none());
+        assert_eq!(mission.status, MissionStatus::Armed);
     }
 }

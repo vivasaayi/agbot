@@ -1,7 +1,7 @@
 use crate::{
-    evaluate_dispatch_safety, DispatchSafetyConfig, DispatchSafetyReport, Mission,
-    MissionBudgetReport, MissionStateTransitionError, NoFlyZone, TelemetryFreshness,
-    TelemetryLinkState,
+    evaluate_dispatch_safety_with_constraints, AirspaceConstraint, DispatchSafetyConfig,
+    DispatchSafetyReport, Mission, MissionBudgetReport, MissionStateTransitionError, NoFlyZone,
+    TelemetryFreshness, TelemetryLinkState, WeatherData,
 };
 use geo::Point;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,10 @@ pub struct PreflightChecklistContext {
     pub battery_percentage: u8,
     #[serde(default)]
     pub mission_budget_report: Option<MissionBudgetReport>,
+    #[serde(default)]
+    pub weather: Option<WeatherData>,
+    #[serde(default)]
+    pub airspace_constraints: Vec<AirspaceConstraint>,
     pub gps: GpsFixStatus,
     pub link_freshness: TelemetryFreshness,
     pub failsafe_configured: bool,
@@ -194,10 +198,12 @@ pub fn evaluate_preflight_checklist(
     mission: &Mission,
     context: &PreflightChecklistContext,
 ) -> PreflightChecklistReport {
-    let dispatch_safety = evaluate_dispatch_safety(
+    let dispatch_safety = evaluate_dispatch_safety_with_constraints(
         mission,
         context.current_position,
         &context.no_fly_zones,
+        context.weather.as_ref(),
+        &context.airspace_constraints,
         context.config.dispatch_safety,
     );
 
@@ -412,6 +418,8 @@ mod tests {
             },
             battery_percentage: 82,
             mission_budget_report: None,
+            weather: None,
+            airspace_constraints: Vec::new(),
             gps: GpsFixStatus {
                 fix_type: GpsFixType::ThreeD,
                 hdop: 0.8,
@@ -529,6 +537,45 @@ mod tests {
                 assert_eq!(
                     battery_check.required_value.as_deref(),
                     Some("margin >= 0.0% and within time budget")
+                );
+            }
+            crate::PreflightArmError::State(error) => {
+                panic!("expected checklist error, got state error: {error}");
+            }
+        }
+        assert_eq!(mission.status, MissionStatus::Validated);
+    }
+
+    #[test]
+    fn preflight_checklist_surfaces_weather_constraint_as_dispatch_safety() {
+        let mut mission = sample_mission();
+        mission.validate().expect("fixture validates");
+        let mut context = checklist_context(mission.id);
+        context.weather = Some(WeatherData {
+            temperature_celsius: 20.0,
+            humidity_percent: 50.0,
+            wind_speed_ms: 19.0,
+            wind_direction_degrees: 180.0,
+            precipitation_mm: 0.0,
+            visibility_m: 10000.0,
+            pressure_hpa: 1015.0,
+            cloud_cover_percent: 30.0,
+        });
+
+        let error = mission
+            .arm_with_preflight_checklist(&context)
+            .expect_err("over-wind dispatch safety should block arming");
+
+        match error {
+            crate::PreflightArmError::Checklist(report) => {
+                assert_single_failure(&report, PreflightCheckName::DispatchSafety);
+                assert_eq!(
+                    report.dispatch_safety.violations[0].code,
+                    crate::SafetyViolationCode::WindSpeedExceeded
+                );
+                assert_eq!(
+                    report.dispatch_safety.violations[0].measured_value,
+                    Some(19.0)
                 );
             }
             crate::PreflightArmError::State(error) => {

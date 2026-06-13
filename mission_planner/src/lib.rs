@@ -34,8 +34,9 @@ pub use automated_failsafe::{
 };
 pub use database::{DatabaseService, MissionStats};
 pub use dispatch_safety::{
-    evaluate_dispatch_safety, DispatchSafetyConfig, DispatchSafetyError, DispatchSafetyReport,
-    NoFlyZone, SafetyViolation, SafetyViolationCode, SafetyViolationSeverity,
+    evaluate_dispatch_safety, evaluate_dispatch_safety_with_constraints, AirspaceConstraint,
+    DispatchSafetyConfig, DispatchSafetyError, DispatchSafetyReport, NoFlyZone, SafetyViolation,
+    SafetyViolationCode, SafetyViolationSeverity,
 };
 pub use flight_path::{FlightPath, PathSegment, SurveyPattern};
 pub use guarded_dispatch::{
@@ -67,6 +68,7 @@ pub use waypoint::{
     validate_waypoint_sanity, Action, Waypoint, WaypointType, WaypointValidationCode,
     WaypointValidationConfig, WaypointValidationError, WaypointValidationIssue,
 };
+pub use weather_integration::{AlertSeverity, FlightConditionResult, WeatherAlert, WeatherData};
 
 /// Core mission planning structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
