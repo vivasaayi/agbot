@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const EVIDENCE_DIGEST_ALGORITHM: &str = "sha256";
+const EVIDENCE_PACK_SCHEMA_VERSION: &str = "provenance.evidence_pack.v1";
 const SYSTEM_AUDIT_ACTOR_ID: &str = "system:provenance-ledger";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +185,38 @@ pub struct ReproducibilityVerification {
     pub reason: Option<ReproducibilityMismatchReason>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidencePackRequest {
+    pub target_artifact_id: String,
+    #[serde(default)]
+    pub evidence_digests: Vec<String>,
+    #[serde(default)]
+    pub citation_digests: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidencePack {
+    pub schema_version: String,
+    pub target_artifact_id: String,
+    pub lineage: BackwardProvenanceTrace,
+    pub evidence_objects: Vec<StoredEvidence>,
+    pub audit_entries: Vec<AuditEntry>,
+    pub manifests: Vec<ReproducibilityManifest>,
+    pub citation_digests: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidencePackValidation {
+    pub valid: bool,
+    pub schema_version: String,
+    pub target_artifact_id: String,
+    pub lineage_record_count: usize,
+    pub evidence_count: usize,
+    pub audit_entry_count: usize,
+    pub manifest_count: usize,
+    pub citation_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditAction {
     pub action_ref: String,
@@ -280,6 +313,10 @@ pub enum ProvenanceError {
     EmptyEvidenceKind,
     #[error("evidence digest cannot be empty")]
     EmptyEvidenceDigest,
+    #[error("duplicate evidence digest {digest} in evidence pack")]
+    DuplicateEvidenceDigest { digest: String },
+    #[error("unsupported evidence digest algorithm {algorithm}")]
+    UnsupportedEvidenceAlgorithm { algorithm: String },
     #[error("method_version cannot be empty for {product_id}")]
     EmptyMethodVersion { product_id: String },
     #[error("manifest input digest cannot be empty for {product_id}")]
@@ -303,6 +340,25 @@ pub enum ProvenanceError {
     MissingManifestInputDigest { product_id: String, digest: String },
     #[error("rerun input digest {digest} is not listed in manifest for {product_id}")]
     UnexpectedManifestInputDigest { product_id: String, digest: String },
+    #[error("evidence pack for {target_artifact_id} has unresolved citation digest {digest}")]
+    UnresolvedEvidencePackCitation {
+        target_artifact_id: String,
+        digest: String,
+    },
+    #[error(
+        "evidence pack schema_version must be provenance.evidence_pack.v1, got {schema_version}"
+    )]
+    InvalidEvidencePackSchemaVersion { schema_version: String },
+    #[error("evidence pack for {target_artifact_id} has lineage gap {missing_artifact_id}")]
+    EvidencePackLineageGap {
+        target_artifact_id: String,
+        missing_artifact_id: String,
+    },
+    #[error("evidence pack audit chain invalid at {breach_index:?}: {reason:?}")]
+    InvalidEvidencePackAuditChain {
+        breach_index: Option<usize>,
+        reason: Option<AuditChainBreachReason>,
+    },
     #[error("reproducibility manifest requires product artifact {artifact_id}, got {kind:?}")]
     ManifestRequiresProduct {
         artifact_id: String,
@@ -754,6 +810,171 @@ pub fn verify_reproducible_output(
     })
 }
 
+pub fn build_evidence_pack(
+    lineage_ledger: &LineageLedger,
+    evidence_store: &EvidenceStore,
+    audit_ledger: &AuditLedger,
+    manifest_store: &ReproducibilityManifestStore,
+    request: EvidencePackRequest,
+) -> Result<EvidencePack, ProvenanceError> {
+    let request = normalize_evidence_pack_request(request)?;
+    let lineage = lineage_ledger.trace_backward(&request.target_artifact_id)?;
+    if let Some(gap) = lineage.gaps.first() {
+        return Err(ProvenanceError::EvidencePackLineageGap {
+            target_artifact_id: request.target_artifact_id,
+            missing_artifact_id: gap.missing_artifact_id.clone(),
+        });
+    }
+    if !lineage
+        .records
+        .iter()
+        .any(|record| record.artifact_id == request.target_artifact_id)
+    {
+        return Err(ProvenanceError::EvidencePackLineageGap {
+            target_artifact_id: request.target_artifact_id.clone(),
+            missing_artifact_id: request.target_artifact_id,
+        });
+    }
+    let mut manifests = Vec::new();
+    let mut evidence_digests = request
+        .evidence_digests
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for record in &lineage.records {
+        if let Some(manifest) = manifest_store.fetch_manifest(&record.artifact_id) {
+            evidence_digests.extend(manifest.input_digests.iter().cloned());
+            manifests.push(manifest);
+        }
+    }
+
+    let mut evidence_objects = Vec::with_capacity(evidence_digests.len());
+    for digest in evidence_digests {
+        let evidence = evidence_store.fetch_evidence(&digest).ok_or_else(|| {
+            ProvenanceError::UnknownEvidenceDigest {
+                digest: digest.clone(),
+            }
+        })?;
+        evidence_objects.push(evidence);
+    }
+    evidence_objects.sort_by(|left, right| left.digest.cmp(&right.digest));
+    manifests.sort_by(|left, right| left.product_id.cmp(&right.product_id));
+
+    let evidence_digest_set = evidence_objects
+        .iter()
+        .map(|evidence| evidence.digest.clone())
+        .collect::<BTreeSet<_>>();
+    for digest in &request.citation_digests {
+        if !evidence_digest_set.contains(digest) {
+            return Err(ProvenanceError::UnresolvedEvidencePackCitation {
+                target_artifact_id: request.target_artifact_id.clone(),
+                digest: digest.clone(),
+            });
+        }
+    }
+
+    let pack = EvidencePack {
+        schema_version: EVIDENCE_PACK_SCHEMA_VERSION.to_string(),
+        target_artifact_id: request.target_artifact_id,
+        lineage,
+        evidence_objects,
+        audit_entries: audit_ledger.entries().to_vec(),
+        manifests,
+        citation_digests: request.citation_digests,
+    };
+    verify_evidence_pack_schema(&pack)?;
+    Ok(pack)
+}
+
+pub fn verify_evidence_pack_schema(
+    pack: &EvidencePack,
+) -> Result<EvidencePackValidation, ProvenanceError> {
+    let schema_version = normalize_required_text(
+        pack.schema_version.clone(),
+        ProvenanceError::EvidenceSerializationFailed {
+            details: "evidence pack schema_version cannot be empty".to_string(),
+        },
+    )?;
+    if schema_version != EVIDENCE_PACK_SCHEMA_VERSION {
+        return Err(ProvenanceError::InvalidEvidencePackSchemaVersion { schema_version });
+    }
+    let target_artifact_id = normalize_required_text(
+        pack.target_artifact_id.clone(),
+        ProvenanceError::EmptyArtifactId,
+    )?;
+    if pack.lineage.target_artifact_id != target_artifact_id {
+        return Err(ProvenanceError::UnknownInputArtifact {
+            artifact_id: target_artifact_id,
+            input_artifact_id: pack.lineage.target_artifact_id.clone(),
+        });
+    }
+    if let Some(gap) = pack.lineage.gaps.first() {
+        return Err(ProvenanceError::EvidencePackLineageGap {
+            target_artifact_id: target_artifact_id.clone(),
+            missing_artifact_id: gap.missing_artifact_id.clone(),
+        });
+    }
+    if !pack
+        .lineage
+        .records
+        .iter()
+        .any(|record| record.artifact_id == target_artifact_id)
+    {
+        return Err(ProvenanceError::EvidencePackLineageGap {
+            target_artifact_id: target_artifact_id.clone(),
+            missing_artifact_id: target_artifact_id.clone(),
+        });
+    }
+
+    let mut evidence_digests = BTreeSet::new();
+    for evidence in &pack.evidence_objects {
+        let digest = verify_stored_evidence(evidence)?;
+        if !evidence_digests.insert(digest.clone()) {
+            return Err(ProvenanceError::DuplicateEvidenceDigest { digest });
+        }
+    }
+
+    let audit_verification = verify_audit_chain(&pack.audit_entries);
+    if !audit_verification.verified {
+        return Err(ProvenanceError::InvalidEvidencePackAuditChain {
+            breach_index: audit_verification.breach_index,
+            reason: audit_verification.reason,
+        });
+    }
+
+    for manifest in &pack.manifests {
+        let manifest = normalize_reproducibility_manifest(manifest.clone())?;
+        for digest in &manifest.input_digests {
+            if !evidence_digests.contains(digest) {
+                return Err(ProvenanceError::MissingManifestInputDigest {
+                    product_id: manifest.product_id,
+                    digest: digest.clone(),
+                });
+            }
+        }
+    }
+    for digest in &pack.citation_digests {
+        let digest = normalize_required_text(digest.clone(), ProvenanceError::EmptyEvidenceDigest)?;
+        if !evidence_digests.contains(&digest) {
+            return Err(ProvenanceError::UnresolvedEvidencePackCitation {
+                target_artifact_id: pack.target_artifact_id.clone(),
+                digest,
+            });
+        }
+    }
+
+    Ok(EvidencePackValidation {
+        valid: true,
+        schema_version,
+        target_artifact_id: pack.target_artifact_id.clone(),
+        lineage_record_count: pack.lineage.records.len(),
+        evidence_count: pack.evidence_objects.len(),
+        audit_entry_count: pack.audit_entries.len(),
+        manifest_count: pack.manifests.len(),
+        citation_count: pack.citation_digests.len(),
+    })
+}
+
 fn audit_chain_breach(index: usize, reason: AuditChainBreachReason) -> AuditChainVerification {
     AuditChainVerification {
         verified: false,
@@ -832,6 +1053,42 @@ fn normalize_evidence_object(
     Ok(object)
 }
 
+fn verify_stored_evidence(evidence: &StoredEvidence) -> Result<String, ProvenanceError> {
+    let digest = normalize_required_text(
+        evidence.digest.clone(),
+        ProvenanceError::EmptyEvidenceDigest,
+    )?;
+    let algorithm = normalize_required_text(
+        evidence.algorithm.clone(),
+        ProvenanceError::UnsupportedEvidenceAlgorithm {
+            algorithm: evidence.algorithm.clone(),
+        },
+    )?;
+    if algorithm != EVIDENCE_DIGEST_ALGORITHM {
+        return Err(ProvenanceError::UnsupportedEvidenceAlgorithm { algorithm });
+    }
+
+    let object = normalize_evidence_object(evidence.object.clone())?;
+    let expected_canonical_bytes = canonical_evidence_bytes(&object)?;
+    let object_digest = evidence_digest_for_bytes(&expected_canonical_bytes);
+    if object_digest != digest || expected_canonical_bytes != evidence.canonical_bytes {
+        return Err(ProvenanceError::EvidenceDigestMismatch {
+            expected_digest: digest,
+            actual_digest: object_digest,
+        });
+    }
+
+    let byte_digest = evidence_digest_for_bytes(&evidence.canonical_bytes);
+    if byte_digest != digest {
+        return Err(ProvenanceError::EvidenceDigestMismatch {
+            expected_digest: digest,
+            actual_digest: byte_digest,
+        });
+    }
+
+    Ok(digest)
+}
+
 fn normalize_reproducibility_manifest(
     mut manifest: ReproducibilityManifest,
 ) -> Result<ReproducibilityManifest, ProvenanceError> {
@@ -862,6 +1119,24 @@ fn normalize_reproducibility_manifest(
         },
     )?;
     Ok(manifest)
+}
+
+fn normalize_evidence_pack_request(
+    mut request: EvidencePackRequest,
+) -> Result<EvidencePackRequest, ProvenanceError> {
+    request.target_artifact_id =
+        normalize_required_text(request.target_artifact_id, ProvenanceError::EmptyArtifactId)?;
+    request.evidence_digests = request
+        .evidence_digests
+        .into_iter()
+        .map(|digest| normalize_required_text(digest, ProvenanceError::EmptyEvidenceDigest))
+        .collect::<Result<Vec<_>, _>>()?;
+    request.citation_digests = request
+        .citation_digests
+        .into_iter()
+        .map(|digest| normalize_required_text(digest, ProvenanceError::EmptyEvidenceDigest))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(request)
 }
 
 fn validate_reproducibility_inputs(
@@ -1005,12 +1280,12 @@ fn normalize_optional_text_owned(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_reproducibility_manifest, output_hash_for_bytes, verify_audit_chain,
-        verify_reproducible_output, ActionContext, ActorIdentity, ActorKind, ArtifactKind,
-        AuditAction, AuditChainBreachReason, AuditLedger, AuditOutcome, AuditRefusalReason,
-        EvidenceObject, EvidenceStore, LineageLedger, LineageRecord, ProvenanceError,
-        ProvenanceParameters, ReproducibilityInputBytes, ReproducibilityManifestStore,
-        ReproducibilityMismatchReason,
+        build_evidence_pack, build_reproducibility_manifest, output_hash_for_bytes,
+        verify_audit_chain, verify_evidence_pack_schema, verify_reproducible_output, ActionContext,
+        ActorIdentity, ActorKind, ArtifactKind, AuditAction, AuditChainBreachReason, AuditLedger,
+        AuditOutcome, AuditRefusalReason, EvidenceObject, EvidencePackRequest, EvidenceStore,
+        LineageLedger, LineageRecord, ProvenanceError, ProvenanceParameters,
+        ReproducibilityInputBytes, ReproducibilityManifestStore, ReproducibilityMismatchReason,
     };
 
     #[test]
@@ -1573,6 +1848,200 @@ mod tests {
         );
     }
 
+    #[test]
+    fn evidence_pack_exports_lineage_evidence_audit_and_manifest_with_resolved_citations() {
+        let mut ledger = LineageLedger::default();
+        seed_capture_graph(&mut ledger);
+        let mut evidence_store = EvidenceStore::default();
+        let finding_evidence = evidence_store
+            .store_evidence(sample_evidence())
+            .expect("finding evidence should store");
+        let scene_input = evidence_store
+            .store_evidence(scene_evidence())
+            .expect("scene input evidence should store");
+        let calibration_input = evidence_store
+            .store_evidence(calibration_evidence())
+            .expect("calibration input evidence should store");
+        let mut manifest_store = ReproducibilityManifestStore::default();
+        manifest_store
+            .record_manifest(
+                build_reproducibility_manifest(
+                    &product_lineage(),
+                    vec![scene_input.digest.clone(), calibration_input.digest.clone()],
+                    "05.ndvi_product.v2".to_string(),
+                )
+                .expect("manifest should build"),
+            )
+            .expect("manifest should persist");
+        let mut audit = AuditLedger::default();
+        audit
+            .append_action(
+                sample_actor(),
+                audit_action_for_artifact(
+                    "action:product:ndvi:derive",
+                    "product:ndvi:alpha-2026-06-12",
+                ),
+            )
+            .expect("product audit should append");
+        audit
+            .append_action(
+                sample_actor(),
+                audit_action_for_artifact(
+                    "action:finding:stress:create",
+                    "finding:09:stress-ne-zone",
+                ),
+            )
+            .expect("finding audit should append");
+
+        let pack = build_evidence_pack(
+            &ledger,
+            &evidence_store,
+            &audit,
+            &manifest_store,
+            EvidencePackRequest {
+                target_artifact_id: "finding:09:stress-ne-zone".to_string(),
+                evidence_digests: vec![finding_evidence.digest.clone()],
+                citation_digests: vec![finding_evidence.digest.clone(), scene_input.digest.clone()],
+            },
+        )
+        .expect("evidence pack should build");
+
+        assert_eq!(pack.schema_version, "provenance.evidence_pack.v1");
+        assert_eq!(pack.target_artifact_id, "finding:09:stress-ne-zone");
+        assert_eq!(pack.lineage.records.len(), 4);
+        assert_eq!(pack.evidence_objects.len(), 3);
+        assert_eq!(pack.audit_entries.len(), 2);
+        assert_eq!(pack.manifests.len(), 1);
+        assert_eq!(
+            pack.citation_digests,
+            vec![finding_evidence.digest, scene_input.digest]
+        );
+        let validation = verify_evidence_pack_schema(&pack).expect("pack schema should validate");
+        assert!(validation.valid);
+        assert_eq!(validation.evidence_count, 3);
+        assert_eq!(validation.citation_count, 2);
+    }
+
+    #[test]
+    fn evidence_pack_refuses_unresolved_copilot_citation() {
+        let mut ledger = LineageLedger::default();
+        seed_capture_graph(&mut ledger);
+        let evidence_store = EvidenceStore::default();
+        let audit = AuditLedger::default();
+        let manifest_store = ReproducibilityManifestStore::default();
+
+        let error = build_evidence_pack(
+            &ledger,
+            &evidence_store,
+            &audit,
+            &manifest_store,
+            EvidencePackRequest {
+                target_artifact_id: "finding:09:stress-ne-zone".to_string(),
+                evidence_digests: Vec::new(),
+                citation_digests: vec!["sha256:missing-citation".to_string()],
+            },
+        )
+        .expect_err("dangling copilot citation should refuse pack");
+
+        assert_eq!(
+            error,
+            ProvenanceError::UnresolvedEvidencePackCitation {
+                target_artifact_id: "finding:09:stress-ne-zone".to_string(),
+                digest: "sha256:missing-citation".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn evidence_pack_refuses_missing_target_lineage_gap() {
+        let ledger = LineageLedger::default();
+        let evidence_store = EvidenceStore::default();
+        let audit = AuditLedger::default();
+        let manifest_store = ReproducibilityManifestStore::default();
+
+        let error = build_evidence_pack(
+            &ledger,
+            &evidence_store,
+            &audit,
+            &manifest_store,
+            EvidencePackRequest {
+                target_artifact_id: "finding:missing".to_string(),
+                evidence_digests: Vec::new(),
+                citation_digests: Vec::new(),
+            },
+        )
+        .expect_err("pack should refuse missing target lineage");
+
+        assert_eq!(
+            error,
+            ProvenanceError::EvidencePackLineageGap {
+                target_artifact_id: "finding:missing".to_string(),
+                missing_artifact_id: "finding:missing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn evidence_pack_schema_rejects_bad_schema_tampered_evidence_and_bad_audit_chain() {
+        let mut ledger = LineageLedger::default();
+        seed_capture_graph(&mut ledger);
+        let mut evidence_store = EvidenceStore::default();
+        let finding_evidence = evidence_store
+            .store_evidence(sample_evidence())
+            .expect("finding evidence should store");
+        let mut audit = AuditLedger::default();
+        audit
+            .append_action(
+                sample_actor(),
+                audit_action_for_artifact(
+                    "action:finding:stress:create",
+                    "finding:09:stress-ne-zone",
+                ),
+            )
+            .expect("audit should append");
+        let manifest_store = ReproducibilityManifestStore::default();
+        let pack = build_evidence_pack(
+            &ledger,
+            &evidence_store,
+            &audit,
+            &manifest_store,
+            EvidencePackRequest {
+                target_artifact_id: "finding:09:stress-ne-zone".to_string(),
+                evidence_digests: vec![finding_evidence.digest],
+                citation_digests: Vec::new(),
+            },
+        )
+        .expect("base pack should build");
+
+        let mut bad_schema = pack.clone();
+        bad_schema.schema_version = "bogus".to_string();
+        assert_eq!(
+            verify_evidence_pack_schema(&bad_schema).expect_err("schema version should be exact"),
+            ProvenanceError::InvalidEvidencePackSchemaVersion {
+                schema_version: "bogus".to_string(),
+            }
+        );
+
+        let mut tampered_evidence = pack.clone();
+        tampered_evidence.evidence_objects[0].object.payload = serde_json::json!({
+            "tampered": true
+        });
+        assert!(matches!(
+            verify_evidence_pack_schema(&tampered_evidence),
+            Err(ProvenanceError::EvidenceDigestMismatch { .. })
+        ));
+
+        let mut bad_audit = pack;
+        bad_audit.audit_entries[0].seq = 99;
+        assert_eq!(
+            verify_evidence_pack_schema(&bad_audit).expect_err("audit chain should validate"),
+            ProvenanceError::InvalidEvidencePackAuditChain {
+                breach_index: Some(0),
+                reason: Some(AuditChainBreachReason::SequenceMismatch),
+            }
+        );
+    }
+
     fn seed_product(ledger: &mut LineageLedger) {
         ledger
             .record_lineage(scene_lineage())
@@ -1686,6 +2155,19 @@ mod tests {
                 "approved": true
             })),
             occurred_at: "2026-06-12T13:05:00Z".to_string(),
+        }
+    }
+
+    fn audit_action_for_artifact(action_ref: &str, artifact_ref: &str) -> AuditAction {
+        AuditAction {
+            action_ref: action_ref.to_string(),
+            action_kind: "artifact_mutation".to_string(),
+            artifact_ref: Some(artifact_ref.to_string()),
+            payload: ProvenanceParameters::from_json(serde_json::json!({
+                "artifact_ref": artifact_ref,
+                "changed": true
+            })),
+            occurred_at: "2026-06-12T13:10:00Z".to_string(),
         }
     }
 
