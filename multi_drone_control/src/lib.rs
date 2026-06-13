@@ -20,7 +20,10 @@ pub use coordinated_approval::{
     ApprovalGateConfig, ApprovalGateError, CoordinatedExecutionDecision,
     CoordinatedExecutionDryRun, CoordinatedExecutionStatus, OperatorApproval,
 };
-pub use coordination::{CoordinationEngine, CoordinationStatus};
+pub use coordination::{
+    CoordinationEngine, CoordinationStatus, DroneTelemetryFreshness, DroneTelemetrySnapshot,
+    SwarmTelemetryReport, SwarmTelemetryStatus,
+};
 pub use mission_assignment::{DroneAssignment, MissionAssignmentEngine};
 pub use swarm::{DroneSwarm, SwarmController, SwarmStatus};
 pub use swarm_command::{
