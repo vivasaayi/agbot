@@ -14,6 +14,7 @@ pub mod plugin_extensions;
 pub mod resource_budget;
 pub mod schemas;
 pub mod secrets;
+pub mod twin_contract_v1;
 pub mod types;
 
 pub use control_plane::*;
@@ -25,6 +26,7 @@ pub use logging::{
 pub use observability::*;
 pub use resource_budget::*;
 pub use secrets::*;
+pub use twin_contract_v1::*;
 pub use types::*;
 
 /// Common result type used across the workspace

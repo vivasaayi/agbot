@@ -1,0 +1,103 @@
+{
+  "schema": {
+    "name": "TwinContractV1",
+    "version": "1.0.0",
+    "types": [
+      {
+        "name": "FlightCommandV1",
+        "required_fields": [
+          "contract_version",
+          "command_id",
+          "command_type",
+          "issued_at_unix_ms",
+          "payload",
+          "ack_timeout_ms"
+        ]
+      },
+      {
+        "name": "TelemetryV1",
+        "required_fields": [
+          "contract_version",
+          "command_id",
+          "time_s",
+          "mode",
+          "position",
+          "velocity",
+          "attitude",
+          "battery_percent",
+          "target_waypoint_index",
+          "armed"
+        ]
+      },
+      {
+        "name": "TwinCommandAckV1",
+        "required_fields": [
+          "contract_version",
+          "command_id",
+          "accepted",
+          "error",
+          "telemetry"
+        ]
+      }
+    ],
+    "capabilities": [
+      "shared_command_telemetry_contract",
+      "twin_backend_api"
+    ]
+  },
+  "sample_command": {
+    "contract_version": "1.0.0",
+    "command_id": "cmd-step-1",
+    "command_type": "step",
+    "issued_at_unix_ms": 1800000000250,
+    "payload": {
+      "source": "shared_fixture"
+    },
+    "ack_timeout_ms": 1000,
+    "step_duration_s": 0.25,
+    "manual_input": {
+      "throttle": 0.0,
+      "yaw": 0.0,
+      "pitch": 0.0,
+      "roll": 0.0,
+      "takeoff": false,
+      "land": false,
+      "arm": false
+    },
+    "wind_mps": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    }
+  },
+  "sample_ack": {
+    "contract_version": "1.0.0",
+    "command_id": "cmd-step-1",
+    "accepted": true,
+    "error": null,
+    "telemetry": {
+      "contract_version": "1.0.0",
+      "command_id": "cmd-step-1",
+      "time_s": 0.25,
+      "mode": "takeoff",
+      "position": {
+        "x": 0.0,
+        "y": 1.0,
+        "z": 0.0
+      },
+      "velocity": {
+        "x": 0.0,
+        "y": 2.0,
+        "z": 0.0
+      },
+      "attitude": {
+        "x": 0.0,
+        "y": 0.1,
+        "z": 0.0
+      },
+      "battery_percent": 99.9,
+      "target_waypoint_index": 0,
+      "armed": true
+    }
+  }
+}

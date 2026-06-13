@@ -23,6 +23,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using agbot::flight_sim::DroneMode;
@@ -137,6 +138,14 @@ void write_terrarium_pixel(std::vector<std::uint8_t>& pixels, int index, float e
     pixels[offset + 1] = g;
     pixels[offset + 2] = b;
     pixels[offset + 3] = 255;
+}
+
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    assert(stream && "fixture file is missing");
+    std::ostringstream buffer;
+    buffer << stream.rdbuf();
+    return buffer.str();
 }
 
 void test_loads_mission() {
@@ -347,6 +356,15 @@ void test_twin_backend_executes_shared_command_and_returns_telemetry() {
     assert(step_ack.telemetry.has_value());
     assert(step_ack.telemetry->time_s > 0.0);
     assert(step_ack.telemetry->target_waypoint_index == backend.simulation().state().target_waypoint_index);
+    const std::string telemetry_json = step_ack.telemetry->to_json();
+    assert(telemetry_json.find("\"contract_version\":\"1.0.0\"") != std::string::npos);
+    assert(telemetry_json.find("\"command_id\":\"cmd-step-1\"") != std::string::npos);
+    assert(telemetry_json.find("\"position\":{") != std::string::npos);
+    assert(telemetry_json.find("\"velocity\":{") != std::string::npos);
+    assert(telemetry_json.find("\"attitude\":{") != std::string::npos);
+    assert(telemetry_json.find("\"battery_percent\":") != std::string::npos);
+    assert(telemetry_json.find("\"target_waypoint_index\":") != std::string::npos);
+    assert(telemetry_json.find("\"armed\":true") != std::string::npos);
     assert(step_ack.to_json().find("\"command_id\":\"cmd-step-1\"") != std::string::npos);
     assert(step_ack.to_json().find("\"telemetry\":{") != std::string::npos);
 }
@@ -852,7 +870,22 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.has_type("TwinErrorV1"));
     assert(schema.has_type("TwinCommandAckV1"));
     assert(schema.has_type("TwinCapabilitiesV1"));
+    assert(schema.type_has_field("FlightCommandV1", "contract_version"));
+    assert(schema.type_has_field("FlightCommandV1", "command_id"));
+    assert(schema.type_has_field("FlightCommandV1", "command_type"));
+    assert(schema.type_has_field("FlightCommandV1", "issued_at_unix_ms"));
+    assert(schema.type_has_field("FlightCommandV1", "payload"));
+    assert(schema.type_has_field("FlightCommandV1", "ack_timeout_ms"));
+    assert(schema.type_has_field("TelemetryV1", "contract_version"));
+    assert(schema.type_has_field("TelemetryV1", "command_id"));
+    assert(schema.type_has_field("TelemetryV1", "time_s"));
+    assert(schema.type_has_field("TelemetryV1", "mode"));
+    assert(schema.type_has_field("TelemetryV1", "position"));
+    assert(schema.type_has_field("TelemetryV1", "velocity"));
+    assert(schema.type_has_field("TelemetryV1", "attitude"));
     assert(schema.type_has_field("TelemetryV1", "battery_percent"));
+    assert(schema.type_has_field("TelemetryV1", "target_waypoint_index"));
+    assert(schema.type_has_field("TelemetryV1", "armed"));
     assert(schema.type_has_field("TwinCommandAckV1", "telemetry"));
     assert(schema.type_has_field("SimulationTraceV1", "contract_version"));
     assert(schema.type_has_field("ScenarioManifestV1", "contract_schema_hash"));
@@ -871,7 +904,48 @@ void test_twin_contract_v1_schema_covers_required_types() {
     assert(schema.has_capability("sensor_noise_calibration"));
     assert(schema.has_capability("lidar_raycast"));
     assert(schema.has_capability("twin_backend_api"));
+    assert(schema.has_capability("shared_command_telemetry_contract"));
     assert(schema.to_json().find("\"schema_hash\":\"" + schema.schema_hash + "\"") != std::string::npos);
+    assert(!schema.type_has_field("TelemetryV1", "missing_field"));
+}
+
+void test_twin_contract_matches_shared_command_telemetry_fixture() {
+    const std::filesystem::path fixture_path =
+        std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR).parent_path()
+        / "shared" / "fixtures" / "twin_contract_v1_command_telemetry.json";
+    const std::string fixture = read_text_file(fixture_path);
+    const auto& schema = agbot::flight_sim::twin_contract_v1_schema();
+
+    assert(fixture.find("\"version\": \"1.0.0\"") != std::string::npos);
+    assert(fixture.find("\"command_type\": \"step\"") != std::string::npos);
+    assert(std::string(agbot::flight_sim::to_string(agbot::flight_sim::TwinCommandType::Step)) == "step");
+    assert(fixture.find("\"shared_command_telemetry_contract\"") != std::string::npos);
+    assert(schema.has_capability("shared_command_telemetry_contract"));
+
+    const std::vector<std::pair<std::string, std::string>> required_fields {
+        {"FlightCommandV1", "contract_version"},
+        {"FlightCommandV1", "command_id"},
+        {"FlightCommandV1", "command_type"},
+        {"FlightCommandV1", "issued_at_unix_ms"},
+        {"FlightCommandV1", "payload"},
+        {"FlightCommandV1", "ack_timeout_ms"},
+        {"TelemetryV1", "contract_version"},
+        {"TelemetryV1", "command_id"},
+        {"TelemetryV1", "time_s"},
+        {"TelemetryV1", "mode"},
+        {"TelemetryV1", "position"},
+        {"TelemetryV1", "velocity"},
+        {"TelemetryV1", "attitude"},
+        {"TelemetryV1", "battery_percent"},
+        {"TelemetryV1", "target_waypoint_index"},
+        {"TelemetryV1", "armed"},
+    };
+
+    for (const auto& [type_name, field_name] : required_fields) {
+        assert(fixture.find("\"name\": \"" + type_name + "\"") != std::string::npos);
+        assert(fixture.find("\"" + field_name + "\"") != std::string::npos);
+        assert(schema.type_has_field(type_name, field_name));
+    }
 }
 
 void test_twin_contract_version_compatibility() {
@@ -908,11 +982,7 @@ void test_deterministic_runner_matches_golden() {
     const std::filesystem::path golden_path =
         std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "tests" / "golden" / "unit_mission.jsonl";
 
-    std::ifstream golden_stream(golden_path, std::ios::binary);
-    assert(golden_stream && "golden fixture tests/golden/unit_mission.jsonl is missing");
-    std::ostringstream buffer;
-    buffer << golden_stream.rdbuf();
-    const std::string golden = buffer.str();
+    const std::string golden = read_text_file(golden_path);
 
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
@@ -1138,6 +1208,7 @@ int main() {
     test_zero_noise_sensor_profile_is_exact();
     test_seeded_sensor_noise_is_reproducible_and_inspectable();
     test_twin_contract_v1_schema_covers_required_types();
+    test_twin_contract_matches_shared_command_telemetry_fixture();
     test_twin_contract_version_compatibility();
     test_trace_diff_reports_divergent_field();
     test_deterministic_runner_matches_golden();

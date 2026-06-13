@@ -124,6 +124,8 @@ TwinContractSchemaV1 build_schema() {
         {
             "TelemetryV1",
             {
+                "contract_version",
+                "command_id",
                 "time_s",
                 "mode",
                 "position",
@@ -131,6 +133,7 @@ TwinContractSchemaV1 build_schema() {
                 "attitude",
                 "battery_percent",
                 "target_waypoint_index",
+                "armed",
             },
         },
         {
@@ -238,6 +241,7 @@ TwinContractSchemaV1 build_schema() {
         "sensor_noise_calibration",
         "lidar_raycast",
         "twin_backend_api",
+        "shared_command_telemetry_contract",
     };
     schema.schema_hash = sha256_hex(schema_json_without_hash(schema));
     return schema;
