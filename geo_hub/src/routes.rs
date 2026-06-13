@@ -63,21 +63,23 @@ use orthomosaic::{
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-    build_soil_moisture_reading, build_tractor_record, normalize_weather_provider_forecast,
-    parse_soil_moisture_qa_flag, parse_soil_moisture_rejection_reason,
-    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
-    validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
-    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
-    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-    GpsCoords, ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef,
-    RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
-    ReportVisibility, SoilMoistureReadingError, SoilMoistureReadingRecord,
-    SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
-    TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
-    TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
-    TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
-    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
+    build_soil_moisture_reading, build_tractor_record, compute_drought_index,
+    normalize_weather_provider_forecast, parse_drought_index_type, parse_soil_moisture_qa_flag,
+    parse_soil_moisture_rejection_reason, soil_moisture_rejection_reason_for_error,
+    soil_moisture_rejection_record, validate_field_boundary, weather_fetch_failure_record,
+    AnnotationGeometry, AnnotationRecord, DroughtIndexComputeRequest, DroughtIndexError,
+    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MultispectralImage, RasterResolution, RasterSpatialRef, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
+    SoilMoistureReadingError, SoilMoistureReadingRecord, SoilMoistureReadingRequest,
+    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, TractorCommandAuditDecision,
+    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
+    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
+    TractorRegistrationRequest, TractorRegistryError, WeatherFetchFailureRecord,
+    WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
     WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
     GEO_EXTENT_ASSERTION_TOLERANCE,
 };
@@ -457,6 +459,14 @@ pub struct SoilMoistureReadingListQuery {
 pub struct SoilMoistureRejectionListQuery {
     pub field_id: Option<String>,
     pub reason: Option<SoilMoistureRejectionReason>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DroughtIndexListQuery {
+    pub field_or_region_ref: Option<String>,
+    pub index_type: Option<DroughtIndexType>,
     pub start: Option<String>,
     pub end: Option<String>,
 }
@@ -2570,6 +2580,60 @@ async fn reject_soil_moisture_reading(
     .map_err(soil_moisture_error)?;
     insert_soil_moisture_rejection(state, &rejection).await?;
     Ok((StatusCode::BAD_REQUEST, Json(rejection)).into_response())
+}
+
+pub async fn compute_drought_index_route(
+    State(state): State<AppState>,
+    Json(request): Json<DroughtIndexComputeRequest>,
+) -> AppResult<Json<DroughtIndexRecord>> {
+    validate_drought_scope_ref(&state, &request.field_or_region_ref).await?;
+    let record = compute_drought_index(
+        request,
+        format!("drought-index-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(drought_index_error)?;
+
+    insert_drought_index_record(&state, &record, current_record_timestamp()).await?;
+    insert_drought_index_time_series_point(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_drought_indices(
+    Query(query): Query<DroughtIndexListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<DroughtIndexRecord>>> {
+    let field_or_region_ref = normalize_optional_text(query.field_or_region_ref);
+    let index_type = query
+        .index_type
+        .map(|index_type| index_type.as_str().to_string());
+    let start = normalize_optional_text(query.start);
+    let end = normalize_optional_text(query.end);
+    let rows = sqlx::query(
+        r#"
+        SELECT index_id, field_or_region_ref, index_type, value, period_start, period_end,
+               accumulation_days, input_refs_json, method, computed_at
+        FROM drought_indices
+        WHERE (?1 IS NULL OR field_or_region_ref = ?1)
+          AND (?2 IS NULL OR index_type = ?2)
+          AND (?3 IS NULL OR period_end >= ?3)
+          AND (?4 IS NULL OR period_start <= ?4)
+        ORDER BY period_end ASC, index_id ASC
+        "#,
+    )
+    .bind(field_or_region_ref)
+    .bind(index_type)
+    .bind(start)
+    .bind(end)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_drought_index_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
 }
 
 pub async fn list_time_series_points(
@@ -6007,6 +6071,10 @@ fn soil_moisture_error(error: SoilMoistureReadingError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn drought_index_error(error: DroughtIndexError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
     value.parse::<SoilSensorType>().map_err(soil_iot_error)
 }
@@ -7194,6 +7262,33 @@ fn decode_soil_moisture_rejection(
     })
 }
 
+fn decode_drought_index_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<DroughtIndexRecord> {
+    let input_refs = serde_json::from_str::<Vec<String>>(&row.get::<String, _>("input_refs_json"))
+        .map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode drought input_refs_json"))
+        })?;
+    let accumulation_days = row
+        .try_get::<Option<i64>, _>("accumulation_days")
+        .map_err(Error::from)?
+        .map(|days| days as u32);
+
+    Ok(DroughtIndexRecord {
+        index_id: row.get("index_id"),
+        field_or_region_ref: row.get("field_or_region_ref"),
+        index_type: parse_drought_index_type(&row.get::<String, _>("index_type"))
+            .map_err(drought_index_error)?,
+        value: row.get("value"),
+        period: DroughtIndexPeriod {
+            start: row.get("period_start"),
+            end: row.get("period_end"),
+            accumulation_days,
+        },
+        input_refs,
+        method: row.get("method"),
+        computed_at: row.get("computed_at"),
+    })
+}
+
 fn decode_soil_iot_device(row: &sqlx::sqlite::SqliteRow) -> AppResult<SoilDeviceRecord> {
     Ok(SoilDeviceRecord {
         device_id: row.get("device_id"),
@@ -7472,6 +7567,29 @@ async fn load_field(state: &AppState, field_id: &str) -> AppResult<Option<FieldR
     .map_err(Error::from)?;
 
     row.map(|row| decode_field_record(&row)).transpose()
+}
+
+async fn validate_drought_scope_ref(state: &AppState, field_or_region_ref: &str) -> AppResult<()> {
+    let scope_ref = normalize_optional_text(Some(field_or_region_ref.to_string()))
+        .ok_or_else(|| AppError::BadRequest("field_or_region_ref is required".to_string()))?;
+    if let Some(field_id) = scope_ref.strip_prefix("field:") {
+        let field_id = normalize_optional_text(Some(field_id.to_string()))
+            .ok_or_else(|| AppError::BadRequest("field scope requires a field id".to_string()))?;
+        load_field(state, &field_id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest(format!("field {field_id} does not exist")))?;
+        return Ok(());
+    }
+    if let Some(region_ref) = scope_ref.strip_prefix("region:") {
+        normalize_optional_text(Some(region_ref.to_string())).ok_or_else(|| {
+            AppError::BadRequest("region scope requires a non-empty region ref".to_string())
+        })?;
+        return Ok(());
+    }
+
+    Err(AppError::BadRequest(
+        "field_or_region_ref must start with field: or region:".to_string(),
+    ))
 }
 
 async fn load_farm(state: &AppState, farm_id: &str) -> AppResult<Option<FarmRecord>> {
@@ -8104,6 +8222,69 @@ async fn insert_soil_moisture_time_series_point(
         },
         source_ref: record.reading_id.clone(),
         created_at: record.ingested_at.clone(),
+    };
+
+    insert_time_series_point_record(state, &point, Some(metadata)).await
+}
+
+async fn insert_drought_index_record(
+    state: &AppState,
+    record: &DroughtIndexRecord,
+    created_at: String,
+) -> AppResult<()> {
+    let input_refs_json =
+        serde_json::to_string(&record.input_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT OR REPLACE INTO drought_indices (
+            index_id, field_or_region_ref, index_type, value, period_start, period_end,
+            accumulation_days, input_refs_json, method, computed_at, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&record.index_id)
+    .bind(&record.field_or_region_ref)
+    .bind(record.index_type.as_str())
+    .bind(record.value)
+    .bind(&record.period.start)
+    .bind(&record.period.end)
+    .bind(record.period.accumulation_days.map(i64::from))
+    .bind(input_refs_json)
+    .bind(&record.method)
+    .bind(&record.computed_at)
+    .bind(created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_drought_index_time_series_point(
+    state: &AppState,
+    record: &DroughtIndexRecord,
+) -> AppResult<()> {
+    let metadata = serde_json::json!({
+        "index_id": record.index_id,
+        "field_or_region_ref": record.field_or_region_ref,
+        "index_type": record.index_type.as_str(),
+        "period": record.period,
+        "input_refs": record.input_refs,
+        "method": record.method,
+        "computed_at": record.computed_at
+    })
+    .to_string();
+    let point = SeriesPoint {
+        entity_ref: record.field_or_region_ref.clone(),
+        metric: format!("drought_{}", record.index_type.as_str()),
+        unit: "z_score".to_string(),
+        t: record.period.end.clone(),
+        value: SeriesValue::Scalar {
+            value: record.value,
+        },
+        source_ref: record.index_id.clone(),
+        created_at: record.computed_at.clone(),
     };
 
     insert_time_series_point_record(state, &point, Some(metadata)).await

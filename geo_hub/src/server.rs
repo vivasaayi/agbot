@@ -187,6 +187,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_soil_moisture_rejections),
         )
         .route(
+            "/api/drought-management/indices",
+            get(routes::list_drought_indices),
+        )
+        .route(
+            "/api/drought-management/indices/compute",
+            post(routes::compute_drought_index_route),
+        )
+        .route(
             "/api/time-series/points",
             get(routes::list_time_series_points),
         )

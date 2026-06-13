@@ -2372,6 +2372,152 @@ async fn water_management_moisture_reading_rejects_unlinked_reading_with_audit()
 }
 
 #[tokio::test]
+async fn drought_index_compute_persists_field_linked_traceable_index() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_drought_management_field(&ctx).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/drought-management/indices/compute")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "index_id": "drought-spi-001",
+                        "field_or_region_ref": "field:field-drought",
+                        "index_type": "spi",
+                        "period": {
+                            "start": "2026-04-01",
+                            "end": "2026-06-30",
+                            "accumulation_days": 90
+                        },
+                        "observed_value": 42.0,
+                        "baseline_mean": 60.0,
+                        "baseline_std_dev": 12.0,
+                        "input_refs": [
+                            "weather:field-drought:precip:2026-Q2",
+                            "water:field-drought:balance:2026-Q2"
+                        ],
+                        "computed_at": "2026-06-13T10:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let index: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        index.get("index_id").and_then(|value| value.as_str()),
+        Some("drought-spi-001")
+    );
+    assert_eq!(
+        index
+            .get("field_or_region_ref")
+            .and_then(|value| value.as_str()),
+        Some("field:field-drought")
+    );
+    assert_eq!(
+        index.get("index_type").and_then(|value| value.as_str()),
+        Some("spi")
+    );
+    assert_eq!(
+        index.get("value").and_then(|value| value.as_f64()),
+        Some(-1.5)
+    );
+    assert_eq!(
+        index
+            .pointer("/input_refs/0")
+            .and_then(|value| value.as_str()),
+        Some("water:field-drought:balance:2026-Q2")
+    );
+    assert_eq!(
+        index.get("method").and_then(|value| value.as_str()),
+        Some("standardized_anomaly_v1")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/drought-management/indices?field_or_region_ref=field:field-drought")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].get("index_id").and_then(|value| value.as_str()),
+        Some("drought-spi-001")
+    );
+
+    let index_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM drought_indices")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(index_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn drought_index_compute_rejects_untraceable_index_without_persisting() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_drought_management_field(&ctx).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/drought-management/indices/compute")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "index_id": "drought-spi-untraceable",
+                        "field_or_region_ref": "field:field-drought",
+                        "index_type": "spi",
+                        "period": {
+                            "start": "2026-04-01",
+                            "end": "2026-06-30",
+                            "accumulation_days": 90
+                        },
+                        "observed_value": 42.0,
+                        "baseline_mean": 60.0,
+                        "baseline_std_dev": 12.0,
+                        "input_refs": [],
+                        "computed_at": "2026-06-13T10:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let index_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM drought_indices")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(index_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -7998,6 +8144,62 @@ async fn seed_water_management_field(ctx: &TestContext) -> Result<()> {
                         "farm_id": "farm-water",
                         "field_id": "field-water",
                         "name": "Water Field",
+                        "boundary": {
+                            "crs": "EPSG:4326",
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 },
+                                { "longitude": -96.7, "latitude": 41.1 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(field_response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_drought_management_field(ctx: &TestContext) -> Result<()> {
+    let farm_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/farms")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-drought",
+                        "owner": "org-alpha",
+                        "name": "Drought Farm"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(farm_response.status(), StatusCode::OK);
+
+    let field_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "farm_id": "farm-drought",
+                        "field_id": "field-drought",
+                        "name": "Drought Field",
                         "boundary": {
                             "crs": "EPSG:4326",
                             "coordinates": [

@@ -796,6 +796,26 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS drought_indices (
+            index_id TEXT PRIMARY KEY,
+            field_or_region_ref TEXT NOT NULL,
+            index_type TEXT NOT NULL,
+            value REAL NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            accumulation_days INTEGER,
+            input_refs_json TEXT NOT NULL,
+            method TEXT NOT NULL,
+            computed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,
@@ -1216,6 +1236,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_water_moisture_rejections_field
         ON water_moisture_reading_rejections(field_id, rejected_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_drought_indices_scope_type_period
+        ON drought_indices(field_or_region_ref, index_type, period_start, period_end);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_drought_indices_computed_at
+        ON drought_indices(computed_at);
         "#,
     )
     .execute(pool)

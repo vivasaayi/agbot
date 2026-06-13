@@ -1374,6 +1374,178 @@ fn normalize_soil_moisture_text(value: String) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+pub const DROUGHT_INDEX_METHOD_STANDARDIZED_ANOMALY_V1: &str = "standardized_anomaly_v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtIndexType {
+    Spi,
+    Spei,
+}
+
+impl DroughtIndexType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DroughtIndexType::Spi => "spi",
+            DroughtIndexType::Spei => "spei",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroughtIndexPeriod {
+    pub start: String,
+    pub end: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accumulation_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtIndexComputeRequest {
+    #[serde(default)]
+    pub index_id: Option<String>,
+    pub field_or_region_ref: String,
+    pub index_type: DroughtIndexType,
+    pub period: DroughtIndexPeriod,
+    pub observed_value: f64,
+    pub baseline_mean: f64,
+    pub baseline_std_dev: f64,
+    #[serde(default)]
+    pub input_refs: Vec<String>,
+    #[serde(default)]
+    pub computed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtIndexRecord {
+    pub index_id: String,
+    pub field_or_region_ref: String,
+    pub index_type: DroughtIndexType,
+    pub value: f64,
+    pub period: DroughtIndexPeriod,
+    pub input_refs: Vec<String>,
+    pub method: String,
+    pub computed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DroughtIndexError {
+    #[error("drought index_id cannot be empty")]
+    EmptyIndexId,
+    #[error("drought index requires field_or_region_ref")]
+    EmptyFieldOrRegionRef,
+    #[error("drought index period start cannot be empty")]
+    EmptyPeriodStart,
+    #[error("drought index period end cannot be empty")]
+    EmptyPeriodEnd,
+    #[error("drought index period range is invalid: {start}..{end}")]
+    InvalidPeriodRange { start: String, end: String },
+    #[error("drought index accumulation_days must be positive")]
+    InvalidAccumulationDays,
+    #[error("drought index observed_value must be finite")]
+    InvalidObservedValue,
+    #[error("drought index baseline_mean must be finite")]
+    InvalidBaselineMean,
+    #[error("drought index baseline_std_dev must be finite and positive")]
+    InvalidBaselineStdDev,
+    #[error("drought index requires at least one input reference")]
+    EmptyInputRefs,
+    #[error("drought index computed_at cannot be empty")]
+    EmptyComputedAt,
+    #[error("unsupported drought index type {value}")]
+    UnsupportedIndexType { value: String },
+}
+
+pub fn compute_drought_index(
+    request: DroughtIndexComputeRequest,
+    generated_index_id: String,
+    computed_at: String,
+) -> Result<DroughtIndexRecord, DroughtIndexError> {
+    let index_id = normalize_drought_optional_text(request.index_id)
+        .or_else(|| normalize_drought_text(generated_index_id))
+        .ok_or(DroughtIndexError::EmptyIndexId)?;
+    let field_or_region_ref = normalize_drought_text(request.field_or_region_ref)
+        .ok_or(DroughtIndexError::EmptyFieldOrRegionRef)?;
+    let period = normalize_drought_period(request.period)?;
+    let input_refs = normalize_drought_input_refs(request.input_refs)?;
+    if !request.observed_value.is_finite() {
+        return Err(DroughtIndexError::InvalidObservedValue);
+    }
+    if !request.baseline_mean.is_finite() {
+        return Err(DroughtIndexError::InvalidBaselineMean);
+    }
+    if !(request.baseline_std_dev.is_finite() && request.baseline_std_dev > 0.0) {
+        return Err(DroughtIndexError::InvalidBaselineStdDev);
+    }
+    let computed_at = normalize_drought_optional_text(request.computed_at)
+        .or_else(|| normalize_drought_text(computed_at))
+        .ok_or(DroughtIndexError::EmptyComputedAt)?;
+    let value = (request.observed_value - request.baseline_mean) / request.baseline_std_dev;
+
+    Ok(DroughtIndexRecord {
+        index_id,
+        field_or_region_ref,
+        index_type: request.index_type,
+        value,
+        period,
+        input_refs,
+        method: DROUGHT_INDEX_METHOD_STANDARDIZED_ANOMALY_V1.to_string(),
+        computed_at,
+    })
+}
+
+pub fn parse_drought_index_type(value: &str) -> Result<DroughtIndexType, DroughtIndexError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "spi" => Ok(DroughtIndexType::Spi),
+        "spei" => Ok(DroughtIndexType::Spei),
+        _ => Err(DroughtIndexError::UnsupportedIndexType {
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn normalize_drought_period(
+    period: DroughtIndexPeriod,
+) -> Result<DroughtIndexPeriod, DroughtIndexError> {
+    let start = normalize_drought_text(period.start).ok_or(DroughtIndexError::EmptyPeriodStart)?;
+    let end = normalize_drought_text(period.end).ok_or(DroughtIndexError::EmptyPeriodEnd)?;
+    if start > end {
+        return Err(DroughtIndexError::InvalidPeriodRange { start, end });
+    }
+    if period.accumulation_days == Some(0) {
+        return Err(DroughtIndexError::InvalidAccumulationDays);
+    }
+
+    Ok(DroughtIndexPeriod {
+        start,
+        end,
+        accumulation_days: period.accumulation_days,
+    })
+}
+
+fn normalize_drought_input_refs(input_refs: Vec<String>) -> Result<Vec<String>, DroughtIndexError> {
+    let input_refs = input_refs
+        .into_iter()
+        .filter_map(normalize_drought_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if input_refs.is_empty() {
+        Err(DroughtIndexError::EmptyInputRefs)
+    } else {
+        Ok(input_refs)
+    }
+}
+
+fn normalize_drought_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(normalize_drought_text)
+}
+
+fn normalize_drought_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetNodeComponentHealth {
@@ -3931,11 +4103,12 @@ mod tests {
     use super::{
         apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
         bind_fleet_node_identity, bounds_from_points, build_soil_moisture_reading,
-        normalize_weather_provider_forecast, sign_fleet_config_bundle,
+        compute_drought_index, normalize_weather_provider_forecast, sign_fleet_config_bundle,
         soil_moisture_rejection_record, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record,
         AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
         AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord, CropPlanRecord,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
         FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
         FieldBoundary, FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus,
         FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
@@ -4538,6 +4711,102 @@ mod tests {
                 value: "140".to_string()
             }
         );
+    }
+
+    #[test]
+    fn drought_index_compute_persists_standardized_value_and_input_refs() {
+        let record = compute_drought_index(
+            DroughtIndexComputeRequest {
+                index_id: Some(" drought-spi-001 ".to_string()),
+                field_or_region_ref: " field:field-north ".to_string(),
+                index_type: DroughtIndexType::Spi,
+                period: DroughtIndexPeriod {
+                    start: "2026-04-01".to_string(),
+                    end: "2026-06-30".to_string(),
+                    accumulation_days: Some(90),
+                },
+                observed_value: 45.0,
+                baseline_mean: 60.0,
+                baseline_std_dev: 10.0,
+                input_refs: vec![
+                    " weather:field-north:precip:q2 ".to_string(),
+                    "water:field-north:balance:q2".to_string(),
+                    "weather:field-north:precip:q2".to_string(),
+                ],
+                computed_at: Some(" 2026-06-13T10:00:00Z ".to_string()),
+            },
+            "generated-drought-index".to_string(),
+            "2026-06-13T10:01:00Z".to_string(),
+        )
+        .expect("drought index should compute");
+
+        assert_eq!(record.index_id, "drought-spi-001");
+        assert_eq!(record.field_or_region_ref, "field:field-north");
+        assert_eq!(record.index_type, DroughtIndexType::Spi);
+        assert_eq!(record.value, -1.5);
+        assert_eq!(record.period.start, "2026-04-01");
+        assert_eq!(record.period.end, "2026-06-30");
+        assert_eq!(
+            record.input_refs,
+            vec![
+                "water:field-north:balance:q2".to_string(),
+                "weather:field-north:precip:q2".to_string()
+            ]
+        );
+        assert_eq!(record.method, "standardized_anomaly_v1");
+        assert_eq!(record.computed_at, "2026-06-13T10:00:00Z");
+    }
+
+    #[test]
+    fn drought_index_compute_rejects_missing_input_refs() {
+        let error = compute_drought_index(
+            DroughtIndexComputeRequest {
+                index_id: Some("drought-spi-001".to_string()),
+                field_or_region_ref: "field:field-north".to_string(),
+                index_type: DroughtIndexType::Spi,
+                period: DroughtIndexPeriod {
+                    start: "2026-04-01".to_string(),
+                    end: "2026-06-30".to_string(),
+                    accumulation_days: Some(90),
+                },
+                observed_value: 45.0,
+                baseline_mean: 60.0,
+                baseline_std_dev: 10.0,
+                input_refs: vec![" ".to_string()],
+                computed_at: Some("2026-06-13T10:00:00Z".to_string()),
+            },
+            "generated-drought-index".to_string(),
+            "2026-06-13T10:01:00Z".to_string(),
+        )
+        .expect_err("untraceable index should reject");
+
+        assert_eq!(error, DroughtIndexError::EmptyInputRefs);
+    }
+
+    #[test]
+    fn drought_index_compute_rejects_zero_baseline_std_dev() {
+        let error = compute_drought_index(
+            DroughtIndexComputeRequest {
+                index_id: None,
+                field_or_region_ref: "field:field-north".to_string(),
+                index_type: DroughtIndexType::Spei,
+                period: DroughtIndexPeriod {
+                    start: "2026-04-01".to_string(),
+                    end: "2026-06-30".to_string(),
+                    accumulation_days: Some(90),
+                },
+                observed_value: 12.0,
+                baseline_mean: 20.0,
+                baseline_std_dev: 0.0,
+                input_refs: vec!["weather:field-north:water-balance:q2".to_string()],
+                computed_at: None,
+            },
+            "generated-drought-index".to_string(),
+            "2026-06-13T10:01:00Z".to_string(),
+        )
+        .expect_err("zero baseline spread cannot produce standardized index");
+
+        assert_eq!(error, DroughtIndexError::InvalidBaselineStdDev);
     }
 
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
