@@ -45,6 +45,8 @@ pub struct SwarmCommandOutcome {
 pub enum SwarmCommandError {
     #[error("unsupported swarm command for audited dry-run")]
     UnsupportedCommand,
+    #[error("invalid formation geometry: {reason}")]
+    InvalidFormationGeometry { reason: String },
     #[error("drone {drone_id} not found in any registered swarm")]
     DroneNotFound { drone_id: Uuid },
     #[error("emergency landing requires at least one configured emergency site")]
@@ -244,78 +246,18 @@ fn formation_positions(
     formation: &Formation,
     drone_count: usize,
 ) -> Result<Vec<(f64, f64, f32)>, SwarmCommandError> {
-    match formation {
-        Formation::Custom { positions } => {
-            if positions.len() != drone_count {
-                return Err(SwarmCommandError::FormationPositionCount {
-                    expected: drone_count,
-                    actual: positions.len(),
-                });
-            }
-            Ok(positions
-                .iter()
-                .map(|(x, y, z)| (f64::from(*x), f64::from(*y), *z))
-                .collect())
-        }
-        Formation::Line {
-            spacing_m,
-            heading_deg,
-        } => {
-            let heading = f64::from(*heading_deg).to_radians();
-            Ok((0..drone_count)
-                .map(|index| {
-                    let offset = f64::from(*spacing_m) * index as f64;
-                    (offset * heading.sin(), offset * heading.cos(), 0.0)
-                })
-                .collect())
-        }
-        Formation::Grid {
-            rows: _,
-            cols,
-            spacing_m,
-        } => {
-            let cols = (*cols).max(1) as usize;
-            Ok((0..drone_count)
-                .map(|index| {
-                    let row = index / cols;
-                    let col = index % cols;
-                    (
-                        f64::from(*spacing_m) * col as f64,
-                        f64::from(*spacing_m) * row as f64,
-                        0.0,
-                    )
-                })
-                .collect())
-        }
-        Formation::Circle { radius_m, center } => Ok((0..drone_count)
-            .map(|index| {
-                let angle = (index as f64 / drone_count.max(1) as f64) * std::f64::consts::TAU;
-                (
-                    center.0 + f64::from(*radius_m) * angle.cos(),
-                    center.1 + f64::from(*radius_m) * angle.sin(),
-                    0.0,
-                )
-            })
-            .collect()),
-        Formation::VFormation {
-            spacing_m,
-            angle_deg,
-        } => Ok((0..drone_count)
-            .map(|index| {
-                if index == 0 {
-                    return (0.0, 0.0, 0.0);
+    let slots =
+        crate::swarm::generate_formation_slots(formation, drone_count, 0.0).map_err(|error| {
+            match error {
+                crate::swarm::FormationGeometryError::CustomSlotCount { expected, actual } => {
+                    SwarmCommandError::FormationPositionCount { expected, actual }
                 }
-                let side = if index % 2 == 0 { -1.0 } else { 1.0 };
-                let rank = ((index + 1) / 2) as f64;
-                let angle = f64::from(*angle_deg).to_radians();
-                (
-                    side * rank * f64::from(*spacing_m) * angle.sin(),
-                    rank * f64::from(*spacing_m) * angle.cos(),
-                    0.0,
-                )
-            })
-            .collect()),
-    }
+                other => SwarmCommandError::InvalidFormationGeometry {
+                    reason: other.to_string(),
+                },
+            }
+        })?;
+    Ok(slots.into_iter().map(|slot| slot.offset_m).collect())
 }
 
 fn formation_separation_violations(
