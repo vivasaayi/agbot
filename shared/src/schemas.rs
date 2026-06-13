@@ -1151,6 +1151,10 @@ impl FarmFieldRegistry {
             .cloned()
     }
 
+    pub fn field_by_id(&self, field_id: &str) -> Option<FieldRecord> {
+        self.fields.get(field_id).cloned()
+    }
+
     pub fn insert_season(&mut self, season: SeasonRecord) -> Result<SeasonRecord, FarmFieldError> {
         let season = normalize_season_record(season)?;
         self.fields

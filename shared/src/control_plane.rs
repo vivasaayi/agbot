@@ -1,3 +1,4 @@
+use crate::schemas::{FarmFieldRegistry, FieldRecord};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -86,6 +87,27 @@ pub struct TenantScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalSessionScope {
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub role: MembershipRole,
+    pub farm_ids: Vec<String>,
+    pub field_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalAccessEvidence {
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub role: MembershipRole,
+    pub action: ControlPlaneAction,
+    pub field_id: String,
+    pub target_org_id: Option<String>,
+    pub decision: AuthorizationDecision,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantBoundaryAuditEvent {
     pub actor_user_id: Uuid,
     pub actor_org_id: Uuid,
@@ -145,6 +167,24 @@ pub enum TenantIsolationError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GrowerPortalAccessError {
+    #[error("grower not found: {grower_id}")]
+    GrowerNotFound { grower_id: Uuid },
+    #[error("grower is suspended: {grower_id}")]
+    GrowerSuspended { grower_id: Uuid },
+    #[error("grower membership not found: {grower_id}")]
+    MembershipNotFound { grower_id: Uuid },
+    #[error("grower role is not permitted: {role:?}")]
+    RoleDenied { role: MembershipRole },
+    #[error("field not found: {field_id}")]
+    FieldNotFound { field_id: String },
+    #[error("grower portal access forbidden")]
+    Forbidden {
+        evidence: GrowerPortalAccessEvidence,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuditTrailError {
     #[error("audit record is append-only: {audit_id}")]
     AppendOnlyRecord { audit_id: Uuid },
@@ -201,6 +241,18 @@ impl TenantIsolationError {
     }
 }
 
+impl GrowerPortalAccessError {
+    pub fn status_code(&self) -> u16 {
+        match self {
+            Self::GrowerNotFound { .. } | Self::FieldNotFound { .. } => 404,
+            Self::GrowerSuspended { .. }
+            | Self::MembershipNotFound { .. }
+            | Self::RoleDenied { .. }
+            | Self::Forbidden { .. } => 403,
+        }
+    }
+}
+
 impl From<TenantBoundaryAuditEvent> for AuditRecordRequest {
     fn from(event: TenantBoundaryAuditEvent) -> Self {
         Self {
@@ -213,6 +265,49 @@ impl From<TenantBoundaryAuditEvent> for AuditRecordRequest {
             reason_code: event.reason_code,
         }
     }
+}
+
+pub fn resolve_grower_portal_session_scope(
+    control_plane: &ControlPlaneRegistry,
+    farm_fields: &FarmFieldRegistry,
+    grower_id: Uuid,
+) -> Result<GrowerPortalSessionScope, GrowerPortalAccessError> {
+    let user = control_plane
+        .get_user(grower_id)
+        .ok_or(GrowerPortalAccessError::GrowerNotFound { grower_id })?;
+    if user.status != UserStatus::Active {
+        return Err(GrowerPortalAccessError::GrowerSuspended { grower_id });
+    }
+    let membership = control_plane
+        .membership_for_user(grower_id)
+        .filter(|membership| membership.org_id == user.org_id)
+        .ok_or(GrowerPortalAccessError::MembershipNotFound { grower_id })?;
+    let authorization = authorize(membership.role, ControlPlaneAction::ReadEntity);
+    if authorization.decision != AuthorizationDecision::Allowed {
+        return Err(GrowerPortalAccessError::RoleDenied {
+            role: membership.role,
+        });
+    }
+
+    let org_key = user.org_id.to_string();
+    let farm_ids = farm_fields
+        .farms_for_org(&org_key)
+        .into_iter()
+        .map(|farm| farm.farm_id)
+        .collect();
+    let field_ids = farm_fields
+        .fields_for_org(&org_key)
+        .into_iter()
+        .map(|field| field.field_id)
+        .collect();
+
+    Ok(GrowerPortalSessionScope {
+        grower_id,
+        org_id: user.org_id,
+        role: membership.role,
+        farm_ids,
+        field_ids,
+    })
 }
 
 impl TenantScoped for OrganizationRecord {
@@ -410,6 +505,81 @@ impl ControlPlaneRegistry {
         memberships
     }
 
+    pub fn membership_for_user(&self, user_id: Uuid) -> Option<MembershipRecord> {
+        self.memberships
+            .values()
+            .filter(|membership| membership.user_id == user_id)
+            .min_by(|left, right| {
+                left.joined_at
+                    .cmp(&right.joined_at)
+                    .then(left.membership_id.cmp(&right.membership_id))
+            })
+            .cloned()
+    }
+
+    pub fn read_grower_portal_field(
+        &mut self,
+        scope: &GrowerPortalSessionScope,
+        farm_fields: &FarmFieldRegistry,
+        field_id: &str,
+    ) -> Result<FieldRecord, GrowerPortalAccessError> {
+        let field_id = field_id.trim();
+        if field_id.is_empty() {
+            return Err(GrowerPortalAccessError::FieldNotFound {
+                field_id: String::new(),
+            });
+        }
+
+        let field = farm_fields.field_by_id(field_id).ok_or_else(|| {
+            GrowerPortalAccessError::FieldNotFound {
+                field_id: field_id.to_string(),
+            }
+        })?;
+        let target_org_id = field.org_id.clone();
+        let in_scope = target_org_id == scope.org_id.to_string()
+            && scope.field_ids.iter().any(|allowed| allowed == field_id);
+
+        if in_scope {
+            self.append_audit_record(AuditRecordRequest {
+                actor_user_id: scope.grower_id,
+                org_id: scope.org_id,
+                action: ControlPlaneAction::ReadEntity,
+                target_ref: None,
+                target_org_id: Some(scope.org_id),
+                decision: AuthorizationDecision::Allowed,
+                reason_code: "allowed".to_string(),
+            });
+            return Ok(field);
+        }
+
+        let reason_code = if target_org_id == scope.org_id.to_string() {
+            "field_out_of_scope"
+        } else {
+            "cross_tenant_field_read"
+        };
+        let evidence = GrowerPortalAccessEvidence {
+            grower_id: scope.grower_id,
+            org_id: scope.org_id,
+            role: scope.role,
+            action: ControlPlaneAction::ReadEntity,
+            field_id: field_id.to_string(),
+            target_org_id: Some(target_org_id.clone()),
+            decision: AuthorizationDecision::Denied,
+            reason_code: reason_code.to_string(),
+        };
+        self.append_audit_record(AuditRecordRequest {
+            actor_user_id: scope.grower_id,
+            org_id: scope.org_id,
+            action: ControlPlaneAction::ReadEntity,
+            target_ref: None,
+            target_org_id: target_org_id.parse::<Uuid>().ok(),
+            decision: AuthorizationDecision::Denied,
+            reason_code: reason_code.to_string(),
+        });
+
+        Err(GrowerPortalAccessError::Forbidden { evidence })
+    }
+
     pub fn append_audit_record(&mut self, request: AuditRecordRequest) -> AuditRecord {
         self.append_audit_record_at(request, Utc::now())
     }
@@ -586,6 +756,10 @@ fn normalize_email(email: &str) -> Result<String, ControlPlaneError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schemas::{
+        FarmFieldEntityStatus, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord,
+        GeoBounds, GeoPoint,
+    };
     use chrono::TimeZone;
 
     #[test]
@@ -693,6 +867,89 @@ mod tests {
         let scope = TenantScope::from_principal(&principal, Some(request_org_id));
 
         assert_eq!(scope.org_id, principal_org_id);
+    }
+
+    #[test]
+    fn grower_portal_session_scope_resolves_owned_farms_and_fields() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_a = control
+            .create_organization("Org A".to_string())
+            .expect("org A creates");
+        let org_b = control
+            .create_organization("Org B".to_string())
+            .expect("org B creates");
+        let grower = control
+            .create_user_with_role(
+                org_a.org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let mut farm_fields = FarmFieldRegistry::default();
+        insert_test_farm_field_scope(&mut farm_fields, org_a.org_id, "farm-a", "field-a");
+        insert_test_farm_field_scope(&mut farm_fields, org_b.org_id, "farm-b", "field-b");
+
+        let scope =
+            resolve_grower_portal_session_scope(&control, &farm_fields, grower.user.user_id)
+                .expect("grower scope resolves");
+
+        assert_eq!(scope.grower_id, grower.user.user_id);
+        assert_eq!(scope.org_id, org_a.org_id);
+        assert_eq!(scope.role, MembershipRole::Viewer);
+        assert_eq!(scope.farm_ids, vec!["farm-a".to_string()]);
+        assert_eq!(scope.field_ids, vec!["field-a".to_string()]);
+    }
+
+    #[test]
+    fn grower_portal_field_read_denies_cross_tenant_and_audits() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_a = control
+            .create_organization("Org A".to_string())
+            .expect("org A creates");
+        let org_b = control
+            .create_organization("Org B".to_string())
+            .expect("org B creates");
+        let grower = control
+            .create_user_with_role(
+                org_a.org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let mut farm_fields = FarmFieldRegistry::default();
+        insert_test_farm_field_scope(&mut farm_fields, org_a.org_id, "farm-a", "field-a");
+        insert_test_farm_field_scope(&mut farm_fields, org_b.org_id, "farm-b", "field-b");
+        let scope =
+            resolve_grower_portal_session_scope(&control, &farm_fields, grower.user.user_id)
+                .expect("grower scope resolves");
+
+        let allowed = control
+            .read_grower_portal_field(&scope, &farm_fields, "field-a")
+            .expect("owned field reads");
+        assert_eq!(allowed.field_id, "field-a");
+
+        let error = control
+            .read_grower_portal_field(&scope, &farm_fields, "field-b")
+            .expect_err("cross-tenant field read is denied");
+
+        assert_eq!(error.status_code(), 403);
+        let GrowerPortalAccessError::Forbidden { evidence } = error else {
+            panic!("cross-tenant read returns forbidden evidence");
+        };
+        assert_eq!(evidence.grower_id, grower.user.user_id);
+        assert_eq!(evidence.org_id, org_a.org_id);
+        assert_eq!(evidence.field_id, "field-b");
+        assert_eq!(evidence.target_org_id, Some(org_b.org_id.to_string()));
+        assert_eq!(evidence.decision, AuthorizationDecision::Denied);
+        assert_eq!(evidence.reason_code, "cross_tenant_field_read");
+
+        let records = control.audit_records_for_org(org_a.org_id, None, None);
+        let decisions = records
+            .iter()
+            .map(|record| (record.decision, record.reason_code.as_str()))
+            .collect::<Vec<_>>();
+        assert!(decisions.contains(&(AuthorizationDecision::Allowed, "allowed")));
+        assert!(decisions.contains(&(AuthorizationDecision::Denied, "cross_tenant_field_read")));
     }
 
     #[test]
@@ -915,5 +1172,80 @@ mod tests {
 
         assert!(decisions.contains(&(AuthorizationDecision::Allowed, "allowed")));
         assert!(decisions.contains(&(AuthorizationDecision::Denied, "cross_tenant_read")));
+    }
+
+    fn insert_test_farm_field_scope(
+        registry: &mut FarmFieldRegistry,
+        org_id: Uuid,
+        farm_id: &str,
+        field_id: &str,
+    ) {
+        registry
+            .insert_farm(FarmRecord {
+                farm_id: farm_id.to_string(),
+                org_id: org_id.to_string(),
+                owner: org_id.to_string(),
+                name: farm_id.to_string(),
+                notes: None,
+                status: FarmFieldEntityStatus::Active,
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect("farm persists");
+        registry
+            .insert_field(FieldRecord {
+                farm_id: Some(farm_id.to_string()),
+                field_id: field_id.to_string(),
+                org_id: org_id.to_string(),
+                owner: org_id.to_string(),
+                name: field_id.to_string(),
+                area_ha: None,
+                crop: None,
+                season: None,
+                notes: None,
+                boundary: test_boundary(),
+                extent: test_extent(),
+                status: FarmFieldEntityStatus::Active,
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
+            })
+            .expect("field persists");
+    }
+
+    fn test_boundary() -> FieldBoundary {
+        FieldBoundary {
+            crs: Some("EPSG:4326".to_string()),
+            coordinates: vec![
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.2,
+                },
+                GeoPoint {
+                    longitude: -96.2,
+                    latitude: 41.2,
+                },
+                GeoPoint {
+                    longitude: -96.2,
+                    latitude: 41.4,
+                },
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.4,
+                },
+                GeoPoint {
+                    longitude: -96.5,
+                    latitude: 41.2,
+                },
+            ],
+        }
+    }
+
+    fn test_extent() -> GeoBounds {
+        GeoBounds {
+            min_lon: -96.5,
+            min_lat: 41.2,
+            max_lon: -96.2,
+            max_lat: 41.4,
+        }
     }
 }
