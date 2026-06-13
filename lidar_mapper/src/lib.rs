@@ -384,6 +384,46 @@ pub struct LidarElevationProducts {
     pub evidence: LidarElevationEvidence,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LidarTerrainMeshStatus {
+    Surface,
+    NoSurface,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LidarMeshVertex {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LidarMeshFace {
+    pub vertices: [usize; 3],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarTerrainMeshEvidence {
+    pub source_kind: String,
+    pub width: u32,
+    pub height: u32,
+    pub valid_cell_count: usize,
+    pub vertex_count: usize,
+    pub face_count: usize,
+    pub spatial_ref: RasterSpatialRef,
+    pub no_surface_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarTerrainMesh {
+    pub status: LidarTerrainMeshStatus,
+    pub vertices: Vec<LidarMeshVertex>,
+    pub faces: Vec<LidarMeshFace>,
+    pub spatial_ref: RasterSpatialRef,
+    pub evidence: LidarTerrainMeshEvidence,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IndexedLidarPoint {
     scan_index: usize,
@@ -1207,6 +1247,118 @@ impl LidarMapper {
                 params,
             },
         })
+    }
+
+    pub fn build_terrain_mesh_from_dsm(
+        &self,
+        dsm: &LidarElevationRaster,
+    ) -> AgroResult<LidarTerrainMesh> {
+        let expected_values = (dsm.width * dsm.height) as usize;
+        if dsm.values.len() != expected_values {
+            return Err(shared::error::AgroError::Processing(format!(
+                "LiDAR terrain mesh expected {} DSM values for {}x{}, got {}",
+                expected_values,
+                dsm.width,
+                dsm.height,
+                dsm.values.len()
+            )));
+        }
+        let spatial_ref = assert_raster_spatial_ref(Some(&dsm.spatial_ref), dsm.width, dsm.height)
+            .map_err(|err| {
+                shared::error::AgroError::Processing(format!(
+                    "LiDAR terrain mesh spatial reference assertion failed: {err}"
+                ))
+            })?;
+        let geo_transform = spatial_ref.geo_transform.ok_or_else(|| {
+            shared::error::AgroError::Processing(
+                "LiDAR terrain mesh spatial_ref missing geo_transform".into(),
+            )
+        })?;
+
+        let mut vertices = Vec::new();
+        let mut vertex_by_cell = vec![None; expected_values];
+        for y in 0..dsm.height {
+            for x in 0..dsm.width {
+                let cell_index = (y * dsm.width + x) as usize;
+                let z = dsm.values[cell_index];
+                if !Self::is_valid_elevation_cell(z, dsm.nodata) {
+                    continue;
+                }
+                let vertex_index = vertices.len();
+                vertex_by_cell[cell_index] = Some(vertex_index);
+                vertices.push(LidarMeshVertex {
+                    x: geo_transform[0] + x as f64 * geo_transform[1] + y as f64 * geo_transform[2],
+                    y: geo_transform[3] + x as f64 * geo_transform[4] + y as f64 * geo_transform[5],
+                    z: z as f64,
+                });
+            }
+        }
+
+        if vertices.is_empty() {
+            return Ok(LidarTerrainMesh {
+                status: LidarTerrainMeshStatus::NoSurface,
+                vertices,
+                faces: Vec::new(),
+                spatial_ref: spatial_ref.clone(),
+                evidence: LidarTerrainMeshEvidence {
+                    source_kind: dsm.kind.clone(),
+                    width: dsm.width,
+                    height: dsm.height,
+                    valid_cell_count: 0,
+                    vertex_count: 0,
+                    face_count: 0,
+                    spatial_ref,
+                    no_surface_reason: Some("all cells nodata".to_string()),
+                },
+            });
+        }
+
+        let mut faces = Vec::new();
+        if dsm.width >= 2 && dsm.height >= 2 {
+            for y in 0..(dsm.height - 1) {
+                for x in 0..(dsm.width - 1) {
+                    let top_left = vertex_by_cell[(y * dsm.width + x) as usize];
+                    let top_right = vertex_by_cell[(y * dsm.width + x + 1) as usize];
+                    let bottom_left = vertex_by_cell[((y + 1) * dsm.width + x) as usize];
+                    let bottom_right = vertex_by_cell[((y + 1) * dsm.width + x + 1) as usize];
+                    if let (
+                        Some(top_left),
+                        Some(top_right),
+                        Some(bottom_left),
+                        Some(bottom_right),
+                    ) = (top_left, top_right, bottom_left, bottom_right)
+                    {
+                        faces.push(LidarMeshFace {
+                            vertices: [top_left, top_right, bottom_left],
+                        });
+                        faces.push(LidarMeshFace {
+                            vertices: [top_right, bottom_right, bottom_left],
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(LidarTerrainMesh {
+            status: LidarTerrainMeshStatus::Surface,
+            evidence: LidarTerrainMeshEvidence {
+                source_kind: dsm.kind.clone(),
+                width: dsm.width,
+                height: dsm.height,
+                valid_cell_count: vertices.len(),
+                vertex_count: vertices.len(),
+                face_count: faces.len(),
+                spatial_ref: spatial_ref.clone(),
+                no_surface_reason: None,
+            },
+            spatial_ref,
+            vertices,
+            faces,
+        })
+    }
+
+    fn is_valid_elevation_cell(value: f32, nodata: f32) -> bool {
+        value.is_finite() && (value - nodata).abs() > f32::EPSILON
     }
 
     fn validate_elevation_params(params: LidarElevationRasterParams) -> AgroResult<()> {
@@ -2740,5 +2892,74 @@ mod tests {
         assert_eq!(products.dsm.value_at(1, 0), Some(2.5));
         assert_eq!(products.dtm.value_at(1, 0), Some(params.nodata));
         assert_ne!(products.dtm.value_at(1, 0), Some(0.0));
+    }
+
+    #[test]
+    fn build_terrain_mesh_from_dsm_records_vertices_faces_and_frame() {
+        let mapper = test_mapper();
+        let spatial_ref = LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 2, 1.0).unwrap();
+        let dsm = LidarElevationRaster {
+            kind: "dsm".to_string(),
+            width: 2,
+            height: 2,
+            nodata: -9999.0,
+            values: vec![1.0, 2.0, 3.0, 4.0],
+            spatial_ref: spatial_ref.clone(),
+        };
+
+        let mesh = mapper.build_terrain_mesh_from_dsm(&dsm).unwrap();
+
+        assert_eq!(mesh.status, LidarTerrainMeshStatus::Surface);
+        assert_eq!(mesh.vertices.len(), 4);
+        assert_eq!(mesh.faces.len(), 2);
+        assert_eq!(
+            mesh.vertices[0],
+            LidarMeshVertex {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0
+            }
+        );
+        assert_eq!(
+            mesh.vertices[3],
+            LidarMeshVertex {
+                x: 1.0,
+                y: 1.0,
+                z: 4.0
+            }
+        );
+        assert_eq!(mesh.faces[0].vertices, [0, 1, 2]);
+        assert_eq!(mesh.faces[1].vertices, [1, 3, 2]);
+        assert_eq!(mesh.spatial_ref, spatial_ref);
+        assert_eq!(mesh.evidence.vertex_count, 4);
+        assert_eq!(mesh.evidence.face_count, 2);
+        assert_eq!(mesh.evidence.valid_cell_count, 4);
+        assert_eq!(mesh.evidence.source_kind, "dsm");
+    }
+
+    #[test]
+    fn build_terrain_mesh_from_all_nodata_dsm_returns_empty_no_surface() {
+        let mapper = test_mapper();
+        let spatial_ref = LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 2, 1.0).unwrap();
+        let dsm = LidarElevationRaster {
+            kind: "dsm".to_string(),
+            width: 2,
+            height: 2,
+            nodata: -9999.0,
+            values: vec![-9999.0; 4],
+            spatial_ref: spatial_ref.clone(),
+        };
+
+        let mesh = mapper.build_terrain_mesh_from_dsm(&dsm).unwrap();
+
+        assert_eq!(mesh.status, LidarTerrainMeshStatus::NoSurface);
+        assert!(mesh.vertices.is_empty());
+        assert!(mesh.faces.is_empty());
+        assert_eq!(mesh.spatial_ref, spatial_ref);
+        assert_eq!(mesh.evidence.valid_cell_count, 0);
+        assert_eq!(
+            mesh.evidence.no_surface_reason.as_deref(),
+            Some("all cells nodata")
+        );
     }
 }
