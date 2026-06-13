@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use shared::{config::AgroConfig, AgroResult};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -59,6 +60,9 @@ pub struct IndicesArgs {
     /// Override band mapping: name for SWIR2 band (e.g., SWIR2, B12/B7)
     #[arg(long)]
     pub swir2: Option<String>,
+    /// Generic band override in role=name form, e.g. --band nir=AltNIR
+    #[arg(long = "band", value_name = "ROLE=NAME")]
+    pub band_overrides: Vec<BandOverrideSpec>,
     /// Output format: png (default) or geotiff (requires --feature gdal-io)
     #[arg(long, value_enum, default_value_t = OutputFormat::Png)]
     pub out_format: OutputFormat,
@@ -215,6 +219,60 @@ impl IndexBandRole {
             IndexBandRole::Swir1 => "SWIR1",
             IndexBandRole::Swir2 => "SWIR2",
         }
+    }
+
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "blue" | "b" => Some(IndexBandRole::Blue),
+            "green" | "g" => Some(IndexBandRole::Green),
+            "red" | "r" => Some(IndexBandRole::Red),
+            "nir" => Some(IndexBandRole::Nir),
+            "red_edge" | "red-edge" | "rededge" | "re" => Some(IndexBandRole::RedEdge),
+            "swir1" | "swir_1" | "swir-1" => Some(IndexBandRole::Swir1),
+            "swir2" | "swir_2" | "swir-2" => Some(IndexBandRole::Swir2),
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for IndexBandRole {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_key(value).ok_or_else(|| format!("unknown band role '{value}'"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandOverrideSpec {
+    pub role: IndexBandRole,
+    pub band_name: String,
+}
+
+impl BandOverrideSpec {
+    pub fn new(role: IndexBandRole, band_name: impl Into<String>) -> Self {
+        Self {
+            role,
+            band_name: band_name.into(),
+        }
+    }
+}
+
+impl FromStr for BandOverrideSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (role, band_name) = value
+            .split_once('=')
+            .or_else(|| value.split_once(':'))
+            .ok_or_else(|| "band override must be role=name".to_string())?;
+        let role = role.parse::<IndexBandRole>()?;
+        let band_name = band_name.trim();
+        if band_name.is_empty() {
+            return Err("band override name cannot be empty".to_string());
+        }
+
+        Ok(Self::new(role, band_name))
     }
 }
 
@@ -449,6 +507,32 @@ pub enum SensorPreset {
 }
 
 impl SensorPreset {
+    pub fn default_band_for_role(self, role: IndexBandRole) -> Option<&'static str> {
+        match (self, role) {
+            (SensorPreset::Sentinel2, IndexBandRole::Blue) => Some("B02"),
+            (SensorPreset::Sentinel2, IndexBandRole::Green) => Some("B03"),
+            (SensorPreset::Sentinel2, IndexBandRole::Red) => Some("B04"),
+            (SensorPreset::Sentinel2, IndexBandRole::Nir) => Some("B08"),
+            (SensorPreset::Sentinel2, IndexBandRole::RedEdge) => Some("B05"),
+            (SensorPreset::Sentinel2, IndexBandRole::Swir1) => Some("B11"),
+            (SensorPreset::Sentinel2, IndexBandRole::Swir2) => Some("B12"),
+            (SensorPreset::Landsat8, IndexBandRole::Blue) => Some("B2"),
+            (SensorPreset::Landsat8, IndexBandRole::Green) => Some("B3"),
+            (SensorPreset::Landsat8, IndexBandRole::Red) => Some("B4"),
+            (SensorPreset::Landsat8, IndexBandRole::Nir) => Some("B5"),
+            (SensorPreset::Landsat8, IndexBandRole::RedEdge) => Some("B6"),
+            (SensorPreset::Landsat8, IndexBandRole::Swir1) => Some("B6"),
+            (SensorPreset::Landsat8, IndexBandRole::Swir2) => Some("B7"),
+            (SensorPreset::DjiMultispectral, IndexBandRole::Blue) => Some("Blue"),
+            (SensorPreset::DjiMultispectral, IndexBandRole::Green) => Some("Green"),
+            (SensorPreset::DjiMultispectral, IndexBandRole::Red) => Some("Red"),
+            (SensorPreset::DjiMultispectral, IndexBandRole::Nir) => Some("NIR"),
+            (SensorPreset::DjiMultispectral, IndexBandRole::RedEdge) => Some("RE"),
+            (SensorPreset::DjiMultispectral, IndexBandRole::Swir1) => None,
+            (SensorPreset::DjiMultispectral, IndexBandRole::Swir2) => None,
+        }
+    }
+
     pub fn default_bands(
         self,
     ) -> (
@@ -456,11 +540,11 @@ impl SensorPreset {
         Option<&'static str>,
         Option<&'static str>,
     ) {
-        match self {
-            SensorPreset::Sentinel2 => (Some("B04"), Some("B08"), Some("B05")), // Red, NIR, RE
-            SensorPreset::Landsat8 => (Some("B4"), Some("B5"), Some("B6")),     // Red, NIR, RE-ish
-            SensorPreset::DjiMultispectral => (Some("Red"), Some("NIR"), Some("RE")),
-        }
+        (
+            self.default_band_for_role(IndexBandRole::Red),
+            self.default_band_for_role(IndexBandRole::Nir),
+            self.default_band_for_role(IndexBandRole::RedEdge),
+        )
     }
 }
 
@@ -605,5 +689,40 @@ mod index_catalog_tests {
                 band: IndexBandRole::Blue
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod sensor_preset_tests {
+    use super::*;
+
+    #[test]
+    fn sensor_presets_supply_default_band_names_by_role() {
+        assert_eq!(
+            SensorPreset::Sentinel2.default_band_for_role(IndexBandRole::Blue),
+            Some("B02")
+        );
+        assert_eq!(
+            SensorPreset::Sentinel2.default_band_for_role(IndexBandRole::Swir2),
+            Some("B12")
+        );
+        assert_eq!(
+            SensorPreset::Landsat8.default_band_for_role(IndexBandRole::Swir1),
+            Some("B6")
+        );
+        assert_eq!(
+            SensorPreset::DjiMultispectral.default_band_for_role(IndexBandRole::RedEdge),
+            Some("RE")
+        );
+    }
+
+    #[test]
+    fn generic_band_override_parses_role_and_band_name() {
+        let override_spec: BandOverrideSpec = "nir=AltNIR".parse().unwrap();
+
+        assert_eq!(override_spec.role, IndexBandRole::Nir);
+        assert_eq!(override_spec.band_name, "AltNIR");
+        assert!("swir3=Missing".parse::<BandOverrideSpec>().is_err());
+        assert!("nir=".parse::<BandOverrideSpec>().is_err());
     }
 }

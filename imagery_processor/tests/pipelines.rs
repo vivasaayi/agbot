@@ -7,8 +7,8 @@ use imagery_processor::{
         CalibrationStatus, GeoTiffSpatialSidecar,
     },
     pipeline::{indices::run_indices, masks::run_masks, thermal::run_thermal},
-    IndexKind, IndicesArgs, MasksArgs, OutputFormat, SensorPreset, TemperatureUnit, ThermalArgs,
-    ThermalProduct,
+    BandOverrideSpec, IndexBandRole, IndexKind, IndicesArgs, MasksArgs, OutputFormat, SensorPreset,
+    TemperatureUnit, ThermalArgs, ThermalProduct,
 };
 use serde_json::Value;
 use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef};
@@ -146,6 +146,7 @@ fn base_indices_args(input_dir: PathBuf, output_dir: PathBuf) -> IndicesArgs {
         blue: None,
         swir1: None,
         swir2: None,
+        band_overrides: Vec::new(),
         out_format: OutputFormat::Png,
         sensor: None,
         mask: None,
@@ -709,6 +710,106 @@ async fn missing_calibration_coefficients_are_marked_uncalibrated_dn() {
         meta["radiometric_calibration"]["status"].as_str().unwrap(),
         "UncalibratedDn"
     );
+}
+
+#[tokio::test]
+async fn dji_preset_resolves_ndre_default_bands() {
+    let root = temp_test_dir("dji_ndre_defaults");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    let red_edge_path = input_dir.join("re.png");
+    write_gray_image(&red_path, 1, 1, &[20]);
+    write_gray_image(&nir_path, 1, 1, &[60]);
+    write_gray_image(&red_edge_path, 1, 1, &[30]);
+    write_metadata(
+        &input_dir,
+        1,
+        1,
+        &[
+            ("Red", red_path.as_path()),
+            ("NIR", nir_path.as_path()),
+            ("RE", red_edge_path.as_path()),
+        ],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.sensor = Some(SensorPreset::DjiMultispectral);
+    args.index = IndexKind::Ndre;
+
+    run_indices(&args).await.unwrap();
+
+    let evidence = read_band_ingest_evidence(&output_dir);
+    assert_eq!(evidence.resolved_bands.get("red_edge").unwrap(), "RE");
+    assert_eq!(evidence.resolved_bands.get("nir").unwrap(), "NIR");
+
+    let meta = read_result_meta(&output_dir);
+    assert!((meta["mean"].as_f64().unwrap() - (30.0 / 90.0)).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn generic_band_override_takes_precedence_and_is_recorded() {
+    let root = temp_test_dir("generic_band_override");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let default_nir_path = input_dir.join("nir.png");
+    let override_nir_path = input_dir.join("alt_nir.png");
+    write_gray_image(&red_path, 1, 1, &[20]);
+    write_gray_image(&default_nir_path, 1, 1, &[40]);
+    write_gray_image(&override_nir_path, 1, 1, &[80]);
+    write_metadata(
+        &input_dir,
+        1,
+        1,
+        &[
+            ("Red", red_path.as_path()),
+            ("NIR", default_nir_path.as_path()),
+            ("AltNIR", override_nir_path.as_path()),
+        ],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.band_overrides = vec![BandOverrideSpec::new(IndexBandRole::Nir, "AltNIR")];
+
+    run_indices(&args).await.unwrap();
+
+    let evidence = read_band_ingest_evidence(&output_dir);
+    assert_eq!(evidence.resolved_bands.get("nir").unwrap(), "AltNIR");
+
+    let meta = read_result_meta(&output_dir);
+    assert!((meta["mean"].as_f64().unwrap() - (60.0 / 100.0)).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn generic_band_override_to_unknown_band_is_rejected() {
+    let root = temp_test_dir("generic_band_override_missing");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let red_path = input_dir.join("red.png");
+    let nir_path = input_dir.join("nir.png");
+    write_gray_image(&red_path, 1, 1, &[20]);
+    write_gray_image(&nir_path, 1, 1, &[80]);
+    write_metadata(
+        &input_dir,
+        1,
+        1,
+        &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir);
+    args.band_overrides = vec![BandOverrideSpec::new(IndexBandRole::Nir, "MissingNIR")];
+
+    let error = run_indices(&args).await.unwrap_err().to_string();
+
+    assert!(error.contains("required band 'MissingNIR'"));
 }
 
 #[tokio::test]

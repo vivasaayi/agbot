@@ -115,31 +115,55 @@ struct LoadedIndexBand {
 }
 
 fn default_band_name(args: &IndicesArgs, role: IndexBandRole) -> String {
-    let (def_red, def_nir, def_re) = args
+    if let Some(override_spec) = args
+        .band_overrides
+        .iter()
+        .rev()
+        .find(|override_spec| override_spec.role == role)
+    {
+        return override_spec.band_name.clone();
+    }
+
+    let preset_default = args
         .sensor
-        .map(|preset| preset.default_bands())
-        .unwrap_or((None, None, None));
+        .and_then(|preset| preset.default_band_for_role(role));
 
     match role {
-        IndexBandRole::Blue => args.blue.clone().unwrap_or_else(|| "Blue".to_string()),
-        IndexBandRole::Green => args.green.clone().unwrap_or_else(|| "Green".to_string()),
+        IndexBandRole::Blue => args
+            .blue
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "Blue".to_string()),
+        IndexBandRole::Green => args
+            .green
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "Green".to_string()),
         IndexBandRole::Red => args
             .red
             .clone()
-            .or(def_red.map(str::to_string))
+            .or(preset_default.map(str::to_string))
             .unwrap_or_else(|| "Red".to_string()),
         IndexBandRole::Nir => args
             .nir
             .clone()
-            .or(def_nir.map(str::to_string))
+            .or(preset_default.map(str::to_string))
             .unwrap_or_else(|| "NIR".to_string()),
         IndexBandRole::RedEdge => args
             .red_edge
             .clone()
-            .or(def_re.map(str::to_string))
+            .or(preset_default.map(str::to_string))
             .unwrap_or_else(|| "RE".to_string()),
-        IndexBandRole::Swir1 => args.swir1.clone().unwrap_or_else(|| "SWIR1".to_string()),
-        IndexBandRole::Swir2 => args.swir2.clone().unwrap_or_else(|| "SWIR2".to_string()),
+        IndexBandRole::Swir1 => args
+            .swir1
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "SWIR1".to_string()),
+        IndexBandRole::Swir2 => args
+            .swir2
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "SWIR2".to_string()),
     }
 }
 

@@ -590,6 +590,7 @@ pub async fn ensure_product(pool: &DbPool, scene_id: &str, kind: &str) -> Result
         blue: Some("B2".to_string()),
         swir1: Some("B6".to_string()),
         swir2: Some("B7".to_string()),
+        band_overrides: Vec::new(),
         out_format: OutputFormat::Png,
         sensor,
         mask: None,
