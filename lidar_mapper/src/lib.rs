@@ -438,6 +438,41 @@ pub struct LidarElevationProducts {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum LidarElevationExportStatus {
+    Populated,
+    Empty,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarElevationExportSchema {
+    pub product_kind: String,
+    pub status: LidarElevationExportStatus,
+    pub width: u32,
+    pub height: u32,
+    pub valid_cell_count: usize,
+    pub nodata_cell_count: usize,
+    pub nodata: f32,
+    pub min: Option<f32>,
+    pub max: Option<f32>,
+    pub mean: Option<f32>,
+    pub spatial_ref: RasterSpatialRef,
+    pub geotiff_path: PathBuf,
+    pub spatial_sidecar_path: PathBuf,
+    pub pcd_path: PathBuf,
+    pub scan_ids: Vec<Uuid>,
+    pub point_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarElevationExportReport {
+    pub geotiff_path: PathBuf,
+    pub spatial_sidecar_path: PathBuf,
+    pub pcd_path: PathBuf,
+    pub schema_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum LidarTerrainMeshStatus {
     Surface,
     NoSurface,
@@ -474,6 +509,15 @@ pub struct LidarTerrainMesh {
     pub faces: Vec<LidarMeshFace>,
     pub spatial_ref: RasterSpatialRef,
     pub evidence: LidarTerrainMeshEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LidarElevationRasterStats {
+    valid_cell_count: usize,
+    nodata_cell_count: usize,
+    min: Option<f32>,
+    max: Option<f32>,
+    mean: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1415,8 +1459,194 @@ impl LidarMapper {
         })
     }
 
+    pub async fn export_elevation_product(
+        &self,
+        raster: &LidarElevationRaster,
+        scans: &[LidarScan],
+        output_dir: &PathBuf,
+    ) -> AgroResult<LidarElevationExportReport> {
+        tokio::fs::create_dir_all(output_dir).await?;
+        let spatial_ref = Self::validate_elevation_raster_export(raster)?;
+        let stats = Self::elevation_raster_stats(raster);
+
+        let product_stem = Self::elevation_product_stem(&raster.kind);
+        let geotiff_path = output_dir.join(format!("{product_stem}.tif"));
+        Self::write_elevation_geotiff(raster, stats, &geotiff_path)?;
+
+        let spatial_sidecar_path = Self::geotiff_spatial_sidecar_path(&geotiff_path);
+        tokio::fs::write(
+            &spatial_sidecar_path,
+            serde_json::to_vec_pretty(&spatial_ref)?,
+        )
+        .await?;
+
+        self.save_point_cloud(scans, output_dir).await?;
+        let pcd_path = output_dir.join("point_cloud.pcd");
+        let schema_path = output_dir.join(format!("{product_stem}_schema.json"));
+        let schema = LidarElevationExportSchema {
+            product_kind: raster.kind.clone(),
+            status: if stats.valid_cell_count == 0 {
+                LidarElevationExportStatus::Empty
+            } else {
+                LidarElevationExportStatus::Populated
+            },
+            width: raster.width,
+            height: raster.height,
+            valid_cell_count: stats.valid_cell_count,
+            nodata_cell_count: stats.nodata_cell_count,
+            nodata: raster.nodata,
+            min: stats.min,
+            max: stats.max,
+            mean: stats.mean,
+            spatial_ref,
+            geotiff_path: geotiff_path.clone(),
+            spatial_sidecar_path: spatial_sidecar_path.clone(),
+            pcd_path: pcd_path.clone(),
+            scan_ids: scans.iter().map(|scan| scan.scan_id).collect(),
+            point_count: scans.iter().map(|scan| scan.points.len()).sum(),
+        };
+        tokio::fs::write(&schema_path, serde_json::to_vec_pretty(&schema)?).await?;
+
+        Ok(LidarElevationExportReport {
+            geotiff_path,
+            spatial_sidecar_path,
+            pcd_path,
+            schema_path,
+        })
+    }
+
     fn is_valid_elevation_cell(value: f32, nodata: f32) -> bool {
         value.is_finite() && (value - nodata).abs() > f32::EPSILON
+    }
+
+    fn validate_elevation_raster_export(
+        raster: &LidarElevationRaster,
+    ) -> AgroResult<RasterSpatialRef> {
+        let expected_values = (raster.width * raster.height) as usize;
+        if raster.values.len() != expected_values {
+            return Err(shared::error::AgroError::Processing(format!(
+                "LiDAR elevation export expected {} values for {}x{}, got {}",
+                expected_values,
+                raster.width,
+                raster.height,
+                raster.values.len()
+            )));
+        }
+        if !raster.nodata.is_finite() {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR elevation export requires a finite nodata value".into(),
+            ));
+        }
+        assert_raster_spatial_ref(Some(&raster.spatial_ref), raster.width, raster.height).map_err(
+            |err| {
+                shared::error::AgroError::Processing(format!(
+                    "LiDAR elevation export spatial reference assertion failed: {err}"
+                ))
+            },
+        )
+    }
+
+    fn elevation_raster_stats(raster: &LidarElevationRaster) -> LidarElevationRasterStats {
+        let mut valid_cell_count = 0;
+        let mut nodata_cell_count = 0;
+        let mut min = None;
+        let mut max = None;
+        let mut sum = 0.0f64;
+
+        for value in &raster.values {
+            if Self::is_valid_elevation_cell(*value, raster.nodata) {
+                valid_cell_count += 1;
+                min = Some(
+                    min.map(|current: f32| current.min(*value))
+                        .unwrap_or(*value),
+                );
+                max = Some(
+                    max.map(|current: f32| current.max(*value))
+                        .unwrap_or(*value),
+                );
+                sum += *value as f64;
+            } else {
+                nodata_cell_count += 1;
+            }
+        }
+
+        LidarElevationRasterStats {
+            valid_cell_count,
+            nodata_cell_count,
+            min,
+            max,
+            mean: if valid_cell_count == 0 {
+                None
+            } else {
+                Some((sum / valid_cell_count as f64) as f32)
+            },
+        }
+    }
+
+    fn write_elevation_geotiff(
+        raster: &LidarElevationRaster,
+        stats: LidarElevationRasterStats,
+        geotiff_path: &Path,
+    ) -> AgroResult<()> {
+        let mut image = image::GrayImage::new(raster.width, raster.height);
+        let range = stats.min.zip(stats.max).and_then(|(min, max)| {
+            let range = max - min;
+            if range.is_finite() && range > f32::EPSILON {
+                Some((min, range))
+            } else {
+                None
+            }
+        });
+
+        for y in 0..raster.height {
+            for x in 0..raster.width {
+                let value = raster.values[(y * raster.width + x) as usize];
+                let pixel = if !Self::is_valid_elevation_cell(value, raster.nodata) {
+                    0
+                } else if let Some((min, range)) = range {
+                    (((value - min) / range).clamp(0.0, 1.0) * 254.0).round() as u8 + 1
+                } else {
+                    u8::MAX
+                };
+                image.put_pixel(x, y, image::Luma([pixel]));
+            }
+        }
+
+        image.save(geotiff_path).map_err(|err| {
+            shared::error::AgroError::Processing(format!(
+                "failed to save LiDAR elevation GeoTIFF {}: {err}",
+                geotiff_path.display()
+            ))
+        })
+    }
+
+    fn elevation_product_stem(kind: &str) -> String {
+        let stem = kind
+            .trim()
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let stem = stem.trim_matches('_');
+        if stem.is_empty() {
+            "elevation_product".to_string()
+        } else {
+            format!("{stem}_elevation")
+        }
+    }
+
+    fn geotiff_spatial_sidecar_path(product_path: &Path) -> PathBuf {
+        let file_name = product_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{name}.spatial_ref.json"))
+            .unwrap_or_else(|| "elevation_product.tif.spatial_ref.json".to_string());
+        product_path.with_file_name(file_name)
     }
 
     fn validate_elevation_params(params: LidarElevationRasterParams) -> AgroResult<()> {
@@ -3202,5 +3432,77 @@ mod tests {
             mesh.evidence.no_surface_reason.as_deref(),
             Some("all cells nodata")
         );
+    }
+
+    #[tokio::test]
+    async fn export_elevation_product_writes_geotiff_sidecar_pcd_and_schema() {
+        let mapper = test_mapper();
+        let output_dir = temp_dir("elevation_export");
+        let spatial_ref = LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 1, 1.0).unwrap();
+        let dsm = LidarElevationRaster {
+            kind: "dsm".to_string(),
+            width: 2,
+            height: 1,
+            nodata: -9999.0,
+            values: vec![1.0, 3.0],
+            spatial_ref: spatial_ref.clone(),
+        };
+        let scan_id = Uuid::new_v4();
+        let captured_at = Utc::now();
+        let scans = vec![LidarScan {
+            timestamp: captured_at,
+            scan_id,
+            points: vec![point(0.0, 1000.0)],
+        }];
+
+        let report = mapper
+            .export_elevation_product(&dsm, &scans, &output_dir)
+            .await
+            .unwrap();
+
+        assert!(report.geotiff_path.exists());
+        assert!(report.pcd_path.exists());
+        let sidecar: RasterSpatialRef =
+            serde_json::from_str(&fs::read_to_string(&report.spatial_sidecar_path).unwrap())
+                .unwrap();
+        assert_eq!(sidecar, spatial_ref);
+        let pcd = fs::read_to_string(&report.pcd_path).unwrap();
+        assert!(pcd.contains("POINTS 1"));
+        let schema: LidarElevationExportSchema =
+            serde_json::from_str(&fs::read_to_string(&report.schema_path).unwrap()).unwrap();
+        assert_eq!(schema.product_kind, "dsm");
+        assert_eq!(schema.status, LidarElevationExportStatus::Populated);
+        assert_eq!(schema.valid_cell_count, 2);
+        assert_eq!(schema.nodata_cell_count, 0);
+        assert_eq!(schema.scan_ids, vec![scan_id]);
+        assert_eq!(schema.spatial_ref, spatial_ref);
+    }
+
+    #[tokio::test]
+    async fn export_empty_elevation_product_writes_valid_empty_schema_and_pcd() {
+        let mapper = test_mapper();
+        let output_dir = temp_dir("elevation_empty_export");
+        let spatial_ref = LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 1, 1.0).unwrap();
+        let dsm = LidarElevationRaster {
+            kind: "dsm".to_string(),
+            width: 2,
+            height: 1,
+            nodata: -9999.0,
+            values: vec![-9999.0, -9999.0],
+            spatial_ref: spatial_ref.clone(),
+        };
+
+        let report = mapper
+            .export_elevation_product(&dsm, &[], &output_dir)
+            .await
+            .unwrap();
+
+        let schema: LidarElevationExportSchema =
+            serde_json::from_str(&fs::read_to_string(&report.schema_path).unwrap()).unwrap();
+        assert_eq!(schema.status, LidarElevationExportStatus::Empty);
+        assert_eq!(schema.valid_cell_count, 0);
+        assert_eq!(schema.nodata_cell_count, 2);
+        let pcd = fs::read_to_string(&report.pcd_path).unwrap();
+        assert!(pcd.contains("POINTS 0"));
     }
 }
