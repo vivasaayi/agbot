@@ -41,6 +41,8 @@ pub struct MultiDroneController {
     pub name: String,
     pub swarms: HashMap<Uuid, DroneSwarm>,
     pub global_constraints: GlobalConstraints,
+    #[serde(default)]
+    pub swarm_constraints: HashMap<Uuid, GlobalConstraints>,
     pub communication_range_m: f32,
     pub created_at: DateTime<Utc>,
 }
@@ -75,7 +77,7 @@ pub enum SwarmRegistryError {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlobalConstraints {
     pub max_altitude_m: f32,
     pub geofence_boundaries: Vec<(f64, f64)>,
@@ -84,7 +86,7 @@ pub struct GlobalConstraints {
     pub emergency_landing_sites: Vec<(f64, f64)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NoFlyZone {
     pub id: Uuid,
     pub name: String,
@@ -92,6 +94,32 @@ pub struct NoFlyZone {
     pub altitude_restriction: Option<(f32, f32)>,
     pub reason: String,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum GlobalConstraintValidationError {
+    #[error("global constraints require a finite positive max altitude")]
+    InvalidMaxAltitude,
+    #[error("global constraints require a geofence polygon with at least three points")]
+    EmptyGeofence,
+    #[error("global constraints contain an invalid geofence coordinate")]
+    InvalidGeofenceCoordinate,
+    #[error("global constraints require max_concurrent_drones greater than zero")]
+    InvalidMaxConcurrentDrones,
+    #[error("global constraints require at least one emergency landing site")]
+    MissingEmergencyLandingSite,
+    #[error("global constraints contain invalid emergency landing site {index}")]
+    InvalidEmergencyLandingSite { index: usize },
+    #[error("no-fly zone {zone_id} is invalid: {reason}")]
+    InvalidNoFlyZone { zone_id: Uuid, reason: String },
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum SwarmConstraintPersistenceError {
+    #[error("swarm not found for constraints: {swarm_id}")]
+    SwarmNotFound { swarm_id: Uuid },
+    #[error(transparent)]
+    InvalidConstraints(#[from] GlobalConstraintValidationError),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +289,7 @@ impl MultiDroneController {
             name,
             swarms: HashMap::new(),
             global_constraints: GlobalConstraints::default(),
+            swarm_constraints: HashMap::new(),
             communication_range_m: 1000.0,
             created_at: Utc::now(),
         }
@@ -386,8 +415,46 @@ impl MultiDroneController {
         drone_ids
     }
 
-    pub fn update_constraints(&mut self, constraints: GlobalConstraints) {
+    pub fn update_constraints(
+        &mut self,
+        constraints: GlobalConstraints,
+    ) -> std::result::Result<(), GlobalConstraintValidationError> {
+        constraints.validate()?;
         self.global_constraints = constraints;
+        Ok(())
+    }
+
+    pub fn set_global_constraints(
+        &mut self,
+        constraints: GlobalConstraints,
+    ) -> std::result::Result<(), GlobalConstraintValidationError> {
+        self.update_constraints(constraints)
+    }
+
+    pub fn save_swarm_constraints(
+        &mut self,
+        swarm_id: Uuid,
+        constraints: GlobalConstraints,
+    ) -> std::result::Result<&GlobalConstraints, SwarmConstraintPersistenceError> {
+        if !self.swarms.contains_key(&swarm_id) {
+            return Err(SwarmConstraintPersistenceError::SwarmNotFound { swarm_id });
+        }
+        constraints.validate()?;
+        self.swarm_constraints.insert(swarm_id, constraints);
+        Ok(self
+            .swarm_constraints
+            .get(&swarm_id)
+            .expect("saved constraints must be retrievable"))
+    }
+
+    pub fn get_swarm_constraints(&self, swarm_id: Uuid) -> Option<&GlobalConstraints> {
+        self.swarm_constraints.get(&swarm_id)
+    }
+
+    pub fn effective_constraints_for_swarm(&self, swarm_id: Uuid) -> &GlobalConstraints {
+        self.swarm_constraints
+            .get(&swarm_id)
+            .unwrap_or(&self.global_constraints)
     }
 
     pub fn validate_swarm_action_targets(
@@ -397,10 +464,30 @@ impl MultiDroneController {
         checked_at: DateTime<Utc>,
     ) -> std::result::Result<SwarmActionConstraintReport, SwarmActionSafetyError> {
         let action_ref = action_ref.into().trim().to_string();
+        self.validate_swarm_action_targets_with_constraints(
+            action_ref,
+            targets,
+            checked_at,
+            &self.global_constraints,
+        )
+    }
+
+    fn validate_swarm_action_targets_with_constraints(
+        &self,
+        action_ref: String,
+        targets: &[SwarmActionTarget],
+        checked_at: DateTime<Utc>,
+        constraints: &GlobalConstraints,
+    ) -> std::result::Result<SwarmActionConstraintReport, SwarmActionSafetyError> {
         let mut violations = Vec::new();
 
         for target in targets {
-            violations.extend(self.target_constraint_violations(&action_ref, target, checked_at));
+            violations.extend(self.target_constraint_violations(
+                &action_ref,
+                target,
+                checked_at,
+                constraints,
+            ));
         }
 
         let report = SwarmActionConstraintReport {
@@ -438,7 +525,12 @@ impl MultiDroneController {
         let target_positions = action.target_positions();
 
         if target_positions.is_empty() {
-            return self.validate_swarm_action_targets(action_ref, &[], checked_at);
+            return self.validate_swarm_action_targets_with_constraints(
+                action_ref,
+                &[],
+                checked_at,
+                self.effective_constraints_for_swarm(swarm_id),
+            );
         }
 
         let drone_ids = swarm.drone_ids();
@@ -458,7 +550,12 @@ impl MultiDroneController {
             })
             .collect::<Vec<_>>();
 
-        self.validate_swarm_action_targets(action_ref, &targets, checked_at)
+        self.validate_swarm_action_targets_with_constraints(
+            action_ref,
+            &targets,
+            checked_at,
+            self.effective_constraints_for_swarm(swarm_id),
+        )
     }
 
     fn target_constraint_violations(
@@ -466,9 +563,9 @@ impl MultiDroneController {
         action_ref: &str,
         target: &SwarmActionTarget,
         checked_at: DateTime<Utc>,
+        constraints: &GlobalConstraints,
     ) -> Vec<SafetyViolation> {
         let mut violations = Vec::new();
-        let constraints = &self.global_constraints;
 
         if target.target_position.2 > constraints.max_altitude_m {
             violations.push(SafetyViolation {
@@ -626,6 +723,72 @@ impl Default for GlobalConstraints {
     }
 }
 
+impl GlobalConstraints {
+    pub fn validate(&self) -> std::result::Result<(), GlobalConstraintValidationError> {
+        if !self.max_altitude_m.is_finite() || self.max_altitude_m <= 0.0 {
+            return Err(GlobalConstraintValidationError::InvalidMaxAltitude);
+        }
+
+        if self.geofence_boundaries.len() < 3 {
+            return Err(GlobalConstraintValidationError::EmptyGeofence);
+        }
+
+        if self
+            .geofence_boundaries
+            .iter()
+            .any(|(x, y)| !x.is_finite() || !y.is_finite())
+        {
+            return Err(GlobalConstraintValidationError::InvalidGeofenceCoordinate);
+        }
+
+        if self.max_concurrent_drones == 0 {
+            return Err(GlobalConstraintValidationError::InvalidMaxConcurrentDrones);
+        }
+
+        if self.emergency_landing_sites.is_empty() {
+            return Err(GlobalConstraintValidationError::MissingEmergencyLandingSite);
+        }
+
+        for (index, (x, y)) in self.emergency_landing_sites.iter().enumerate() {
+            if !x.is_finite() || !y.is_finite() {
+                return Err(GlobalConstraintValidationError::InvalidEmergencyLandingSite { index });
+            }
+        }
+
+        for zone in &self.no_fly_zones {
+            if zone.boundary.len() < 3 {
+                return Err(GlobalConstraintValidationError::InvalidNoFlyZone {
+                    zone_id: zone.id,
+                    reason: "boundary requires at least three points".to_string(),
+                });
+            }
+            if zone
+                .boundary
+                .iter()
+                .any(|(x, y)| !x.is_finite() || !y.is_finite())
+            {
+                return Err(GlobalConstraintValidationError::InvalidNoFlyZone {
+                    zone_id: zone.id,
+                    reason: "boundary contains non-finite coordinate".to_string(),
+                });
+            }
+            if let Some((min_altitude, max_altitude)) = zone.altitude_restriction {
+                if !min_altitude.is_finite()
+                    || !max_altitude.is_finite()
+                    || min_altitude > max_altitude
+                {
+                    return Err(GlobalConstraintValidationError::InvalidNoFlyZone {
+                        zone_id: zone.id,
+                        reason: "altitude restriction is invalid".to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl MultiDroneControlService {
     pub fn new(controller_name: String) -> Self {
         let controller = MultiDroneController::new(controller_name);
@@ -744,7 +907,7 @@ impl MultiDroneControlService {
             }
             ControlCommand::UpdateConstraints { constraints } => {
                 let mut controller = self.controller.write().await;
-                controller.update_constraints(constraints);
+                controller.update_constraints(constraints)?;
             }
         }
 
@@ -1172,6 +1335,93 @@ mod tests {
         let removed = controller.remove_swarm(&swarm_id).unwrap();
         assert_eq!(removed.id, swarm_id);
         assert!(controller.list_swarm_registry().is_empty());
+    }
+
+    #[test]
+    fn complete_swarm_constraints_persist_and_round_trip() {
+        let mut controller = MultiDroneController::new("Constraint Controller".to_string());
+        let swarm = DroneSwarm::new_owned(
+            "Constrained".to_string(),
+            vec![Uuid::new_v4()],
+            swarm::FormationType::Grid,
+            "ops-team".to_string(),
+        );
+        let swarm_id = swarm.id;
+        controller.register_swarm(swarm).unwrap();
+        let constraints = constrained_controller().global_constraints;
+
+        let saved = controller
+            .save_swarm_constraints(swarm_id, constraints.clone())
+            .expect("complete constraints save");
+
+        assert_eq!(saved, &constraints);
+        assert_eq!(
+            controller.get_swarm_constraints(swarm_id),
+            Some(&constraints)
+        );
+
+        let serialized = serde_json::to_string(&controller).expect("controller serializes");
+        let restored: MultiDroneController =
+            serde_json::from_str(&serialized).expect("controller deserializes");
+        assert_eq!(restored.get_swarm_constraints(swarm_id), Some(&constraints));
+    }
+
+    #[test]
+    fn swarm_constraints_reject_missing_emergency_landing_site() {
+        let mut controller = MultiDroneController::new("Constraint Controller".to_string());
+        let swarm = DroneSwarm::new_owned(
+            "Constrained".to_string(),
+            vec![Uuid::new_v4()],
+            swarm::FormationType::Line,
+            "ops-team".to_string(),
+        );
+        let swarm_id = swarm.id;
+        controller.register_swarm(swarm).unwrap();
+        let mut constraints = constrained_controller().global_constraints;
+        constraints.emergency_landing_sites.clear();
+
+        let err = controller
+            .save_swarm_constraints(swarm_id, constraints)
+            .expect_err("missing emergency landing site must reject save");
+
+        assert!(matches!(
+            err,
+            SwarmConstraintPersistenceError::InvalidConstraints(
+                GlobalConstraintValidationError::MissingEmergencyLandingSite
+            )
+        ));
+        assert!(controller.get_swarm_constraints(swarm_id).is_none());
+    }
+
+    #[test]
+    fn coordinated_action_uses_saved_swarm_constraints() {
+        let mut controller = MultiDroneController::new("Constraint Controller".to_string());
+        let swarm = DroneSwarm::new_owned(
+            "Constrained".to_string(),
+            vec![Uuid::new_v4()],
+            swarm::FormationType::Line,
+            "ops-team".to_string(),
+        );
+        let swarm_id = swarm.id;
+        controller.register_swarm(swarm).unwrap();
+        controller
+            .save_swarm_constraints(swarm_id, constrained_controller().global_constraints)
+            .expect("swarm constraints save");
+        let action = CoordinatedAction::DataCollection {
+            collection_points: vec![(5.0, 5.0, 50.0)],
+        };
+
+        let err = controller
+            .validate_coordinated_action(swarm_id, &action, fixed_time())
+            .expect_err("swarm-specific no-fly zone must reject target");
+        let report = err.report();
+
+        assert_eq!(report.target_count, 1);
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(
+            report.violations[0].violation_type,
+            ViolationType::NoFlyZoneViolation
+        );
     }
 
     #[test]
