@@ -2,6 +2,7 @@
 pub mod gdal_util;
 
 use crate::{IndicesArgs, SensorPreset};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::{
     error::AgroError,
@@ -15,6 +16,8 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+
+const DEFAULT_VALID_PIXEL_FLOOR: f32 = 0.95;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BandOverrides {
@@ -50,6 +53,48 @@ pub struct BandIngestEvidence {
     pub spatial_ref: RasterSpatialRef,
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub ingest_quality: ImageIngestQualityEvidence,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IngestCoverageStatus {
+    Pass,
+    LowCoverage,
+}
+
+impl Default for IngestCoverageStatus {
+    fn default() -> Self {
+        Self::Pass
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageIngestQualityEvidence {
+    pub capture_time: DateTime<Utc>,
+    pub ingested_at: DateTime<Utc>,
+    pub capture_age_seconds: i64,
+    pub total_pixel_count: usize,
+    pub valid_pixel_count: usize,
+    pub valid_pixel_fraction: f32,
+    pub coverage_floor: f32,
+    pub coverage_status: IngestCoverageStatus,
+}
+
+impl Default for ImageIngestQualityEvidence {
+    fn default() -> Self {
+        let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        Self {
+            capture_time: epoch,
+            ingested_at: epoch,
+            capture_age_seconds: 0,
+            total_pixel_count: 0,
+            valid_pixel_count: 0,
+            valid_pixel_fraction: 0.0,
+            coverage_floor: DEFAULT_VALID_PIXEL_FLOOR,
+            coverage_status: IngestCoverageStatus::Pass,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -286,6 +331,8 @@ pub fn resolve_band_ingest_evidence_for_resolved_bands(
     .map_err(|err| BandIngestError::SpatialRefInvalid {
         message: err.to_string(),
     })?;
+    let ingest_quality =
+        build_ingest_quality_evidence(image, DEFAULT_VALID_PIXEL_FLOOR, Utc::now())?;
 
     Ok(BandIngestEvidence {
         image_id: image.image_id,
@@ -297,7 +344,96 @@ pub fn resolve_band_ingest_evidence_for_resolved_bands(
         spatial_ref,
         width: image.metadata.width,
         height: image.metadata.height,
+        ingest_quality,
     })
+}
+
+fn build_ingest_quality_evidence(
+    image: &MultispectralImage,
+    coverage_floor: f32,
+    ingested_at: DateTime<Utc>,
+) -> Result<ImageIngestQualityEvidence, BandIngestError> {
+    let (valid_pixel_count, total_pixel_count) = count_valid_image_pixels(image)?;
+    let valid_pixel_fraction = if total_pixel_count == 0 {
+        0.0
+    } else {
+        valid_pixel_count as f32 / total_pixel_count as f32
+    };
+    let coverage_floor = normalize_coverage_floor(coverage_floor);
+    let coverage_status = if valid_pixel_fraction >= coverage_floor {
+        IngestCoverageStatus::Pass
+    } else {
+        IngestCoverageStatus::LowCoverage
+    };
+    let capture_age_seconds = ingested_at
+        .signed_duration_since(image.metadata.timestamp)
+        .num_seconds()
+        .max(0);
+
+    Ok(ImageIngestQualityEvidence {
+        capture_time: image.metadata.timestamp,
+        ingested_at,
+        capture_age_seconds,
+        total_pixel_count,
+        valid_pixel_count,
+        valid_pixel_fraction,
+        coverage_floor,
+        coverage_status,
+    })
+}
+
+fn normalize_coverage_floor(coverage_floor: f32) -> f32 {
+    if coverage_floor.is_finite() {
+        coverage_floor.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_VALID_PIXEL_FLOOR
+    }
+}
+
+fn count_valid_image_pixels(image: &MultispectralImage) -> Result<(usize, usize), BandIngestError> {
+    let total_pixel_count = (image.metadata.width * image.metadata.height) as usize;
+    let mut valid_pixels = vec![false; total_pixel_count];
+    let mut band_names = if image.metadata.bands.is_empty() {
+        image.file_paths.keys().cloned().collect::<Vec<_>>()
+    } else {
+        image.metadata.bands.clone()
+    };
+    band_names.sort();
+
+    for band_name in band_names {
+        let band_path = image.file_paths.get(&band_name).ok_or_else(|| {
+            BandIngestError::MissingRequiredBand {
+                band_name: band_name.to_string(),
+            }
+        })?;
+        let band_path = PathBuf::from(band_path);
+        let band = image::open(&band_path).map_err(|err| BandIngestError::RasterInspect {
+            band_name: band_name.clone(),
+            path: band_path.clone(),
+            message: err.to_string(),
+        })?;
+        let actual_width = band.width();
+        let actual_height = band.height();
+        if actual_width != image.metadata.width || actual_height != image.metadata.height {
+            return Err(BandIngestError::DimensionMismatch {
+                band_name: band_name.clone(),
+                expected_width: image.metadata.width,
+                expected_height: image.metadata.height,
+                actual_width,
+                actual_height,
+            });
+        }
+
+        let gray = band.to_luma16();
+        for (index, pixel) in gray.pixels().enumerate() {
+            if pixel[0] != 0 {
+                valid_pixels[index] = true;
+            }
+        }
+    }
+
+    let valid_pixel_count = valid_pixels.iter().filter(|is_valid| **is_valid).count();
+    Ok((valid_pixel_count, total_pixel_count))
 }
 
 fn radiometric_calibration_evidence(
@@ -395,6 +531,7 @@ fn sensor_name(sensor: SensorPreset) -> &'static str {
 mod tests {
     use super::*;
     use crate::SensorPreset;
+    use chrono::TimeZone;
     use image::{GrayImage, Luma};
     use serde_json::Value;
     use std::{
@@ -409,9 +546,16 @@ mod tests {
     }
 
     fn write_gray_image(path: &Path, width: u32, height: u32, value: u8) {
+        write_gray_image_values(path, width, height, &vec![value; (width * height) as usize]);
+    }
+
+    fn write_gray_image_values(path: &Path, width: u32, height: u32, values: &[u8]) {
+        assert_eq!(values.len(), (width * height) as usize);
         let mut image = GrayImage::new(width, height);
-        for pixel in image.pixels_mut() {
-            *pixel = Luma([value]);
+        for (index, value) in values.iter().enumerate() {
+            let x = (index as u32) % width;
+            let y = (index as u32) / width;
+            image.put_pixel(x, y, Luma([*value]));
         }
         image.save(path).unwrap();
     }
@@ -511,6 +655,11 @@ mod tests {
         assert_eq!(ingest.evidence.sensor.as_deref(), Some("sentinel2"));
         assert_eq!(ingest.evidence.width, 2);
         assert_eq!(ingest.evidence.height, 1);
+        assert_eq!(ingest.evidence.ingest_quality.valid_pixel_fraction, 1.0);
+        assert_eq!(
+            ingest.evidence.ingest_quality.coverage_status,
+            IngestCoverageStatus::Pass
+        );
         assert_eq!(ingest.evidence.band_index_to_name.get(&0).unwrap(), "B04");
         assert_eq!(ingest.evidence.band_index_to_name.get(&1).unwrap(), "B08");
         assert_eq!(ingest.evidence.band_index_to_name.get(&2).unwrap(), "B05");
@@ -592,6 +741,65 @@ mod tests {
         assert_eq!(blue_grid.height, 1);
         assert_eq!(blue_grid.dtype, "L8");
         assert_eq!(blue_grid.nodata, None);
+    }
+
+    #[tokio::test]
+    async fn ingest_quality_records_fresh_full_coverage_image() {
+        let root = temp_test_dir("ingest_quality_full");
+        let input_dir = root.join("input");
+        fs::create_dir_all(&input_dir).unwrap();
+
+        let red_path = input_dir.join("red.png");
+        let nir_path = input_dir.join("nir.png");
+        write_gray_image(&red_path, 2, 1, 10);
+        write_gray_image(&nir_path, 2, 1, 30);
+        let metadata_path = write_metadata(
+            &input_dir,
+            2,
+            1,
+            &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+        );
+        let image = load_multispectral_metadata(&metadata_path).await.unwrap();
+        let ingested_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap();
+
+        let quality = build_ingest_quality_evidence(&image, 0.95, ingested_at).unwrap();
+
+        assert_eq!(quality.capture_time, image.metadata.timestamp);
+        assert_eq!(quality.ingested_at, ingested_at);
+        assert_eq!(quality.capture_age_seconds, 300);
+        assert_eq!(quality.total_pixel_count, 2);
+        assert_eq!(quality.valid_pixel_count, 2);
+        assert_eq!(quality.valid_pixel_fraction, 1.0);
+        assert_eq!(quality.coverage_floor, 0.95);
+        assert_eq!(quality.coverage_status, IngestCoverageStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn ingest_quality_flags_coverage_below_floor() {
+        let root = temp_test_dir("ingest_quality_low_coverage");
+        let input_dir = root.join("input");
+        fs::create_dir_all(&input_dir).unwrap();
+
+        let red_path = input_dir.join("red.png");
+        let nir_path = input_dir.join("nir.png");
+        write_gray_image_values(&red_path, 4, 1, &[10, 0, 0, 0]);
+        write_gray_image_values(&nir_path, 4, 1, &[30, 0, 0, 0]);
+        let metadata_path = write_metadata(
+            &input_dir,
+            4,
+            1,
+            &[("Red", red_path.as_path()), ("NIR", nir_path.as_path())],
+        );
+        let image = load_multispectral_metadata(&metadata_path).await.unwrap();
+        let ingested_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 10, 0).unwrap();
+
+        let quality = build_ingest_quality_evidence(&image, 0.5, ingested_at).unwrap();
+
+        assert_eq!(quality.total_pixel_count, 4);
+        assert_eq!(quality.valid_pixel_count, 1);
+        assert_eq!(quality.valid_pixel_fraction, 0.25);
+        assert_eq!(quality.coverage_floor, 0.5);
+        assert_eq!(quality.coverage_status, IngestCoverageStatus::LowCoverage);
     }
 
     #[tokio::test]
