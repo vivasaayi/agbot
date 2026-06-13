@@ -1,9 +1,14 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use shared::RuntimeMode;
 use std::collections::HashMap;
+use std::env;
+use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use std::time::Duration;
+use tokio::sync::{mpsc, watch, RwLock};
+use tokio::time::sleep;
 use uuid::Uuid;
 
 pub mod collision_avoidance;
@@ -42,6 +47,32 @@ pub use synchronized_survey::{
     SurveyLane, SurveyProgressReport, SurveySeparationSample, SynchronizedSurveyConfig,
     SynchronizedSurveyError, SynchronizedSurveyPlan,
 };
+
+const AUTONOMOUS_SURVEY_ENV_VAR: &str = "AUTONOMOUS_SURVEY_ENABLED";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutonomousSurveyConfig {
+    pub enabled: bool,
+    pub runtime_mode: RuntimeMode,
+}
+
+impl AutonomousSurveyConfig {
+    pub fn from_env() -> Self {
+        let enabled = env::var(AUTONOMOUS_SURVEY_ENV_VAR)
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let runtime_mode = env::var("RUNTIME_MODE")
+            .ok()
+            .as_deref()
+            .and_then(|value| RuntimeMode::from_str(value).ok())
+            .unwrap_or(RuntimeMode::Simulation);
+
+        Self {
+            enabled,
+            runtime_mode,
+        }
+    }
+}
 
 /// Multi-drone control system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +186,10 @@ pub enum ControlCommand {
     ExecuteCoordinatedAction {
         swarm_id: Uuid,
         action: CoordinatedAction,
+        operator_approval: Option<OperatorApproval>,
+    },
+    AbortCoordinatedAction {
+        swarm_id: Uuid,
     },
     EmergencyLand {
         drone_ids: Vec<Uuid>,
@@ -280,6 +315,7 @@ impl SwarmActionSafetyError {
 }
 
 /// Main control service
+#[derive(Clone)]
 pub struct MultiDroneControlService {
     controller: Arc<RwLock<MultiDroneController>>,
     drone_statuses: Arc<RwLock<HashMap<Uuid, DroneStatus>>>,
@@ -287,8 +323,17 @@ pub struct MultiDroneControlService {
     mission_assigner: Arc<RwLock<MissionAssignmentEngine>>,
     collision_avoidance: Arc<RwLock<CollisionAvoidanceSystem>>,
     safety_audit_log: Arc<RwLock<SafetyViolationAuditLog>>,
+    autonomy_config: AutonomousSurveyConfig,
+    active_autonomous_surveys: Arc<RwLock<HashMap<Uuid, watch::Sender<bool>>>>,
     command_sender: mpsc::UnboundedSender<ControlCommand>,
     command_receiver: Arc<RwLock<mpsc::UnboundedReceiver<ControlCommand>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AutonomousSurveyOutcome {
+    Completed,
+    AbortRequested,
+    SafetyViolation,
 }
 
 impl MultiDroneController {
@@ -800,6 +845,13 @@ impl GlobalConstraints {
 
 impl MultiDroneControlService {
     pub fn new(controller_name: String) -> Self {
+        Self::new_with_config(controller_name, AutonomousSurveyConfig::from_env())
+    }
+
+    pub fn new_with_config(
+        controller_name: String,
+        autonomy_config: AutonomousSurveyConfig,
+    ) -> Self {
         let controller = MultiDroneController::new(controller_name);
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
@@ -812,6 +864,8 @@ impl MultiDroneControlService {
             ))),
             collision_avoidance: Arc::new(RwLock::new(CollisionAvoidanceSystem::new())),
             safety_audit_log: Arc::new(RwLock::new(SafetyViolationAuditLog::default())),
+            autonomy_config,
+            active_autonomous_surveys: Arc::new(RwLock::new(HashMap::new())),
             command_sender,
             command_receiver: Arc::new(RwLock::new(command_receiver)),
         }
@@ -883,24 +937,37 @@ impl MultiDroneControlService {
                 let mut controller = self.controller.write().await;
                 controller.register_swarm(swarm)?;
             }
-            ControlCommand::ExecuteCoordinatedAction { swarm_id, action } => {
-                let action_str = format!("{:?}", action);
-                let validation_result = {
-                    let controller = self.controller.read().await;
-                    controller.validate_coordinated_action(swarm_id, &action, Utc::now())
-                };
-                if let Err(err) = validation_result {
-                    if let Some(report) = err.rejected_report() {
-                        self.audit_safety_violations(&report.violations, Utc::now())
-                            .await;
-                    }
-                    return Err(anyhow::anyhow!(err.to_string()));
+            ControlCommand::ExecuteCoordinatedAction {
+                swarm_id,
+                action,
+                operator_approval,
+            } => match action {
+                CoordinatedAction::SynchronizedSurvey { .. } => {
+                    self.start_autonomous_survey(swarm_id, action, operator_approval)
+                        .await?
                 }
-                self.coordination_engine
-                    .write()
-                    .await
-                    .execute_action(swarm_id, action_str)
-                    .await?;
+                _ => {
+                    let action_str = format!("{:?}", action);
+                    let validation_result = {
+                        let controller = self.controller.read().await;
+                        controller.validate_coordinated_action(swarm_id, &action, Utc::now())
+                    };
+                    if let Err(err) = validation_result {
+                        if let Some(report) = err.rejected_report() {
+                            self.audit_safety_violations(&report.violations, Utc::now())
+                                .await;
+                        }
+                        return Err(anyhow::anyhow!(err.to_string()));
+                    }
+                    self.coordination_engine
+                        .write()
+                        .await
+                        .execute_action(swarm_id, action_str)
+                        .await?;
+                }
+            },
+            ControlCommand::AbortCoordinatedAction { swarm_id } => {
+                self.abort_autonomous_survey(swarm_id).await?;
             }
             ControlCommand::EmergencyLand { drone_ids } => {
                 for drone_id in drone_ids {
@@ -932,6 +999,262 @@ impl MultiDroneControlService {
         for violation in violations {
             audit_log.append(violation.clone(), recorded_at);
         }
+    }
+
+    async fn start_autonomous_survey(
+        &self,
+        swarm_id: Uuid,
+        action: CoordinatedAction,
+        operator_approval: Option<OperatorApproval>,
+    ) -> Result<()> {
+        if !self.autonomy_config.enabled {
+            return Err(anyhow::anyhow!(
+                "autonomous coordinated execution is disabled by configuration"
+            ));
+        }
+
+        if self.autonomy_config.runtime_mode != RuntimeMode::Simulation {
+            return Err(anyhow::anyhow!(
+                "autonomous coordinated execution is simulation-only and requires runtime mode SIMULATION"
+            ));
+        }
+
+        if let CoordinatedAction::SynchronizedSurvey {
+            area,
+            overlap_percent,
+        } = &action
+        {
+            let checked_at = Utc::now();
+            let approval_config = ApprovalGateConfig {
+                min_predicted_separation_m: self.autonomy_config_min_separation_m(),
+                planned_altitude_m: self.autonomy_config_planned_altitude_m(),
+            };
+            let dry_run = {
+                let controller = self.controller.read().await;
+                dry_run_coordinated_execution(
+                    &controller,
+                    swarm_id,
+                    action.clone(),
+                    approval_config,
+                    checked_at,
+                )
+            }?;
+
+            let decision = authorize_coordinated_execution(&dry_run, operator_approval, checked_at);
+            if !decision.permitted {
+                let blocked_reason = decision
+                    .audit
+                    .first()
+                    .map(|entry| entry.message.clone())
+                    .unwrap_or_else(|| "coordinated execution blocked by operator".to_string());
+                return Err(anyhow::anyhow!(blocked_reason));
+            }
+
+            let survey_config = SynchronizedSurveyConfig {
+                planned_altitude_m: approval_config.planned_altitude_m,
+                min_separation_m: approval_config.min_predicted_separation_m,
+                overlap_percent: *overlap_percent,
+            };
+            let plan = {
+                let controller = self.controller.read().await;
+                controller.plan_synchronized_survey(
+                    swarm_id,
+                    area.clone(),
+                    survey_config.clone(),
+                    checked_at,
+                )?
+            };
+
+            if plan.status != SurveyExecutionStatus::Planned {
+                return Err(anyhow::anyhow!(
+                    "autonomous coordinated survey plan is not executable in planned state"
+                ));
+            }
+
+            if plan
+                .separation_violations
+                .iter()
+                .any(|violation| violation.severity == Severity::Critical)
+            {
+                return Err(anyhow::anyhow!(
+                    "autonomous coordinated survey plan contains critical separation violations"
+                ));
+            }
+
+            {
+                let active = self.active_autonomous_surveys.write().await;
+                if active.contains_key(&swarm_id) {
+                    return Err(anyhow::anyhow!(
+                        "an autonomous survey is already running for this swarm"
+                    ));
+                }
+            }
+
+            let (abort_tx, abort_rx) = watch::channel(false);
+            {
+                let mut active = self.active_autonomous_surveys.write().await;
+                active.insert(swarm_id, abort_tx);
+            }
+
+            let service = self.clone();
+            let step_plan = plan;
+            let step_survey_config = survey_config;
+            tokio::spawn(async move {
+                let outcome = service
+                    .run_autonomous_survey_session(
+                        swarm_id,
+                        step_plan,
+                        step_survey_config,
+                        abort_rx,
+                    )
+                    .await;
+                let mut active = service.active_autonomous_surveys.write().await;
+                active.remove(&swarm_id);
+                if let Err(error) = outcome {
+                    tracing::warn!(
+                        "autonomous survey for swarm {swarm_id} finished with error: {error}"
+                    );
+                }
+            });
+
+            Ok(())
+        } else {
+            unreachable!("only synchronized survey actions are routed to autonomous execution")
+        }
+    }
+
+    async fn abort_autonomous_survey(&self, swarm_id: Uuid) -> Result<()> {
+        let abort_tx = {
+            let sessions = self.active_autonomous_surveys.read().await;
+            sessions.get(&swarm_id).cloned().ok_or_else(|| {
+                anyhow::anyhow!("no running autonomous survey for requested swarm")
+            })?
+        };
+        abort_tx.send(true).map_err(|error| {
+            anyhow::anyhow!("failed to request abort for autonomous survey: {error}")
+        })?;
+        self.fail_safe_land_for_swarm(swarm_id).await
+    }
+
+    async fn run_autonomous_survey_session(
+        &self,
+        swarm_id: Uuid,
+        plan: SynchronizedSurveyPlan,
+        config: SynchronizedSurveyConfig,
+        mut abort_rx: watch::Receiver<bool>,
+    ) -> Result<AutonomousSurveyOutcome> {
+        const SURVEY_STEPS: usize = 12;
+        let mut step = 0usize;
+
+        while step <= SURVEY_STEPS {
+            tokio::select! {
+                _ = abort_rx.changed() => {
+                    if *abort_rx.borrow() {
+                        self.fail_safe_land_for_swarm(swarm_id).await?;
+                        return Ok(AutonomousSurveyOutcome::AbortRequested);
+                    }
+                },
+                _ = sleep(Duration::from_millis(20)) => {}
+            }
+
+            let progress = evaluate_synchronized_survey_progress(
+                &plan,
+                &[SurveySeparationSample {
+                    elapsed_s: step as f64,
+                    positions: plan
+                        .lanes
+                        .iter()
+                        .map(|lane| {
+                            let span = step as f64 / SURVEY_STEPS as f64;
+                            let position = self.interpolate_position(
+                                lane.start_xy,
+                                lane.end_xy,
+                                span,
+                                lane.planned_altitude_m,
+                            );
+                            (lane.drone_id, position)
+                        })
+                        .collect(),
+                }],
+                config.clone(),
+                Utc::now(),
+            );
+
+            if !progress.separation_violations.is_empty() {
+                self.fail_safe_land_for_swarm(swarm_id).await?;
+                return Ok(AutonomousSurveyOutcome::SafetyViolation);
+            }
+
+            let violations = self.check_safety_violations().await?;
+            if !violations.is_empty() {
+                self.fail_safe_land_for_swarm(swarm_id).await?;
+                return Ok(AutonomousSurveyOutcome::SafetyViolation);
+            }
+
+            step += 1;
+        }
+
+        self.complete_autonomous_survey(swarm_id).await
+    }
+
+    async fn complete_autonomous_survey(&self, _swarm_id: Uuid) -> Result<AutonomousSurveyOutcome> {
+        Ok(AutonomousSurveyOutcome::Completed)
+    }
+
+    async fn fail_safe_land_for_swarm(&self, swarm_id: Uuid) -> Result<()> {
+        let drone_ids = {
+            let controller = self.controller.read().await;
+            controller
+                .get_swarm(&swarm_id)
+                .ok_or_else(|| anyhow::anyhow!("swarm {swarm_id} not found"))?
+                .drone_ids()
+        };
+
+        let command = ControlCommand::EmergencyLand { drone_ids };
+        let controller = self.controller.read().await;
+        let outcome = execute_audited_swarm_command(
+            &controller,
+            &command,
+            SwarmCommandConfig::default(),
+            Utc::now(),
+        )?;
+
+        if outcome.status != SwarmCommandStatus::Executed {
+            return Err(anyhow::anyhow!(format!(
+                "fail-safe for swarm {swarm_id} could not be executed"
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn autonomy_config_min_separation_m(&self) -> f64 {
+        25.0
+    }
+
+    fn autonomy_config_planned_altitude_m(&self) -> f32 {
+        30.0
+    }
+
+    fn interpolate_position(
+        &self,
+        start_xy: (f64, f64),
+        end_xy: (f64, f64),
+        span: f64,
+        altitude_m: f32,
+    ) -> (f64, f64, f32) {
+        let normalized = span.clamp(0.0, 1.0);
+        let x = start_xy.0 + (end_xy.0 - start_xy.0) * normalized;
+        let y = start_xy.1 + (end_xy.1 - start_xy.1) * normalized;
+        (x, y, altitude_m)
+    }
+
+    #[cfg(test)]
+    async fn is_autonomous_survey_active(&self, swarm_id: Uuid) -> bool {
+        self.active_autonomous_surveys
+            .read()
+            .await
+            .contains_key(&swarm_id)
     }
 
     pub async fn list_safety_violation_audit_records(&self) -> Vec<SafetyViolationAuditRecord> {
@@ -1694,12 +2017,236 @@ mod tests {
                 action: CoordinatedAction::DataCollection {
                     collection_points: vec![(5.0, 5.0, 50.0)],
                 },
+                operator_approval: None,
             })
             .await
             .unwrap();
         let err = service.process_commands().await.unwrap_err();
 
         assert!(err.to_string().contains("rejected with 1 safety violation"));
+    }
+
+    #[tokio::test]
+    async fn autonomous_survey_rejects_when_autonomy_disabled() {
+        let service = MultiDroneControlService::new_with_config(
+            "Test Service".to_string(),
+            AutonomousSurveyConfig {
+                enabled: false,
+                runtime_mode: RuntimeMode::Simulation,
+            },
+        );
+        let drone_id = Uuid::new_v4();
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: vec![drone_id],
+                formation: Formation::Line {
+                    spacing_m: 25.0,
+                    heading_deg: 0.0,
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        let swarm_id = {
+            let controller = service.controller.read().await;
+            controller.list_swarm_registry()[0].swarm_id
+        };
+
+        service
+            .send_command(ControlCommand::ExecuteCoordinatedAction {
+                swarm_id,
+                action: CoordinatedAction::SynchronizedSurvey {
+                    area: vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+                    overlap_percent: 15.0,
+                },
+                operator_approval: Some(OperatorApproval {
+                    approved: true,
+                    approved_by: "ops".to_string(),
+                    approved_at: Utc::now(),
+                }),
+            })
+            .await
+            .unwrap();
+        let err = service.process_commands().await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("autonomous coordinated execution is disabled"));
+    }
+
+    #[tokio::test]
+    async fn autonomous_survey_rejects_when_runtime_not_simulation() {
+        let service = MultiDroneControlService::new_with_config(
+            "Test Service".to_string(),
+            AutonomousSurveyConfig {
+                enabled: true,
+                runtime_mode: RuntimeMode::Flight,
+            },
+        );
+        let drone_id = Uuid::new_v4();
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: vec![drone_id],
+                formation: Formation::Line {
+                    spacing_m: 25.0,
+                    heading_deg: 0.0,
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        let swarm_id = {
+            let controller = service.controller.read().await;
+            controller.list_swarm_registry()[0].swarm_id
+        };
+
+        service
+            .send_command(ControlCommand::ExecuteCoordinatedAction {
+                swarm_id,
+                action: CoordinatedAction::SynchronizedSurvey {
+                    area: vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+                    overlap_percent: 15.0,
+                },
+                operator_approval: Some(OperatorApproval {
+                    approved: true,
+                    approved_by: "ops".to_string(),
+                    approved_at: Utc::now(),
+                }),
+            })
+            .await
+            .unwrap();
+        let err = service.process_commands().await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("autonomous coordinated execution is simulation-only"));
+    }
+
+    #[tokio::test]
+    async fn autonomous_survey_can_be_aborted_mid_mission() {
+        let service = MultiDroneControlService::new_with_config(
+            "Test Service".to_string(),
+            AutonomousSurveyConfig {
+                enabled: true,
+                runtime_mode: RuntimeMode::Simulation,
+            },
+        );
+        let drone_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: drone_ids.clone(),
+                formation: Formation::Line {
+                    spacing_m: 25.0,
+                    heading_deg: 0.0,
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        let swarm_id = {
+            let controller = service.controller.read().await;
+            controller.list_swarm_registry()[0].swarm_id
+        };
+
+        service
+            .send_command(ControlCommand::ExecuteCoordinatedAction {
+                swarm_id,
+                action: CoordinatedAction::SynchronizedSurvey {
+                    area: vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+                    overlap_percent: 15.0,
+                },
+                operator_approval: Some(OperatorApproval {
+                    approved: true,
+                    approved_by: "ops".to_string(),
+                    approved_at: Utc::now(),
+                }),
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(service.is_autonomous_survey_active(swarm_id).await);
+
+        service
+            .send_command(ControlCommand::AbortCoordinatedAction { swarm_id })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!service.is_autonomous_survey_active(swarm_id).await);
+    }
+
+    #[tokio::test]
+    async fn autonomous_survey_stops_on_red_safety_violation() {
+        let service = MultiDroneControlService::new_with_config(
+            "Test Service".to_string(),
+            AutonomousSurveyConfig {
+                enabled: true,
+                runtime_mode: RuntimeMode::Simulation,
+            },
+        );
+        let drone_id = Uuid::new_v4();
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: vec![drone_id],
+                formation: Formation::Line {
+                    spacing_m: 25.0,
+                    heading_deg: 0.0,
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        {
+            let mut controller = service.controller.write().await;
+            controller.global_constraints.max_altitude_m = 80.0;
+        }
+
+        let swarm_id = {
+            let controller = service.controller.read().await;
+            controller.list_swarm_registry()[0].swarm_id
+        };
+        service
+            .send_command(ControlCommand::ExecuteCoordinatedAction {
+                swarm_id,
+                action: CoordinatedAction::SynchronizedSurvey {
+                    area: vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+                    overlap_percent: 15.0,
+                },
+                operator_approval: Some(OperatorApproval {
+                    approved: true,
+                    approved_by: "ops".to_string(),
+                    approved_at: Utc::now(),
+                }),
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        service
+            .update_drone_status(DroneStatus {
+                id: drone_id,
+                position: (0.0, 0.0, 120.0),
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.9,
+                status: "in_mission".to_string(),
+                assigned_mission: None,
+                last_update: Utc::now(),
+            })
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert!(!service.is_autonomous_survey_active(swarm_id).await);
     }
 
     fn constrained_controller() -> MultiDroneController {
