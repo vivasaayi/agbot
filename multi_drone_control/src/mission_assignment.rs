@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use shared::{GeoCoordinate, Mission};
+use shared::Mission;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -87,6 +87,26 @@ pub enum AssignmentAlgorithm {
     Auction,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AssignmentFailureReason {
+    RequirementsNotMet,
+    InsufficientCapacity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnassignableMission {
+    pub mission_id: Uuid,
+    pub reason: AssignmentFailureReason,
+    pub required_drones: usize,
+    pub assignable_drones: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssignmentBatchReport {
+    pub assigned_count: usize,
+    pub unassignable_missions: Vec<UnassignableMission>,
+}
+
 impl MissionAssignmentEngine {
     pub fn new(algorithm: AssignmentAlgorithm) -> Self {
         Self {
@@ -118,12 +138,20 @@ impl MissionAssignmentEngine {
     }
 
     pub async fn process_pending_missions(&mut self) -> Result<usize> {
+        Ok(self
+            .process_pending_missions_with_report()
+            .await?
+            .assigned_count)
+    }
+
+    pub async fn process_pending_missions_with_report(&mut self) -> Result<AssignmentBatchReport> {
         let mut assigned_count = 0;
-        let pending_ids: Vec<Uuid> = self.pending_missions.keys().copied().collect();
+        let mut unassignable_missions = Vec::new();
+        let pending_ids = self.sorted_pending_mission_ids();
 
         for mission_id in pending_ids {
-            if let Some(request) = self.pending_missions.get(&mission_id) {
-                if let Some(assignments) = self.find_best_assignment(request).await? {
+            if let Some(request) = self.pending_missions.get(&mission_id).cloned() {
+                if let Some(assignments) = self.find_best_assignment(&request).await? {
                     // Remove from pending and add to assigned
                     self.pending_missions.remove(&mission_id);
 
@@ -138,11 +166,16 @@ impl MissionAssignmentEngine {
                         mission_id,
                         assigned_count
                     );
+                } else {
+                    unassignable_missions.push(self.unassignable_mission(&request));
                 }
             }
         }
 
-        Ok(assigned_count)
+        Ok(AssignmentBatchReport {
+            assigned_count,
+            unassignable_missions,
+        })
     }
 
     async fn find_best_assignment(
@@ -163,10 +196,8 @@ impl MissionAssignmentEngine {
         request: &MissionRequest,
     ) -> Result<Option<Vec<DroneAssignment>>> {
         let available_drones: Vec<&DroneCapabilities> = self
-            .drone_capabilities
-            .values()
-            .filter(|d| d.availability_status == AvailabilityStatus::Available)
-            .filter(|d| self.drone_matches_requirements(d, request))
+            .candidate_drones_for(request)
+            .into_iter()
             .take(request.max_drones)
             .collect();
 
@@ -177,20 +208,7 @@ impl MissionAssignmentEngine {
         let assignments = available_drones
             .into_iter()
             .enumerate()
-            .map(|(i, drone)| DroneAssignment {
-                drone_id: drone.id,
-                mission_id: request.id,
-                assigned_at: Utc::now(),
-                estimated_completion: Utc::now()
-                    + chrono::Duration::from_std(request.estimated_duration).unwrap(),
-                status: AssignmentStatus::Assigned,
-                role: if i == 0 {
-                    DroneRole::Primary
-                } else {
-                    DroneRole::Secondary
-                },
-                workload_score: self.calculate_workload_score(drone.id),
-            })
+            .map(|(i, drone)| self.build_assignment(request, drone, i))
             .collect();
 
         Ok(Some(assignments))
@@ -201,14 +219,16 @@ impl MissionAssignmentEngine {
         request: &MissionRequest,
     ) -> Result<Option<Vec<DroneAssignment>>> {
         let mut scored_drones: Vec<(f32, &DroneCapabilities)> = self
-            .drone_capabilities
-            .values()
-            .filter(|d| d.availability_status == AvailabilityStatus::Available)
-            .filter(|d| self.drone_matches_requirements(d, request))
+            .candidate_drones_for(request)
+            .into_iter()
             .map(|d| (self.calculate_fitness_score(d, request), d))
             .collect();
 
-        scored_drones.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        scored_drones.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
 
         let selected_drones: Vec<&DroneCapabilities> = scored_drones
             .into_iter()
@@ -223,20 +243,7 @@ impl MissionAssignmentEngine {
         let assignments = selected_drones
             .into_iter()
             .enumerate()
-            .map(|(i, drone)| DroneAssignment {
-                drone_id: drone.id,
-                mission_id: request.id,
-                assigned_at: Utc::now(),
-                estimated_completion: Utc::now()
-                    + chrono::Duration::from_std(request.estimated_duration).unwrap(),
-                status: AssignmentStatus::Assigned,
-                role: if i == 0 {
-                    DroneRole::Primary
-                } else {
-                    DroneRole::Secondary
-                },
-                workload_score: self.calculate_workload_score(drone.id),
-            })
+            .map(|(i, drone)| self.build_assignment(request, drone, i))
             .collect();
 
         Ok(Some(assignments))
@@ -244,18 +251,51 @@ impl MissionAssignmentEngine {
 
     async fn assign_load_balanced(
         &self,
-        _request: &MissionRequest,
+        request: &MissionRequest,
     ) -> Result<Option<Vec<DroneAssignment>>> {
-        // TODO: Implement load balancing algorithm
-        Ok(None)
+        let mut scored_drones: Vec<(f32, f32, &DroneCapabilities)> = self
+            .candidate_drones_for(request)
+            .into_iter()
+            .map(|drone| {
+                (
+                    self.calculate_workload_score(drone.id),
+                    self.calculate_fitness_score(drone, request),
+                    drone,
+                )
+            })
+            .collect();
+
+        scored_drones.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.2.id.cmp(&b.2.id))
+        });
+
+        let selected_drones = scored_drones
+            .into_iter()
+            .take(request.max_drones)
+            .map(|(_, _, drone)| drone)
+            .collect::<Vec<_>>();
+
+        if selected_drones.len() < request.min_drones {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            selected_drones
+                .into_iter()
+                .enumerate()
+                .map(|(i, drone)| self.build_assignment(request, drone, i))
+                .collect(),
+        ))
     }
 
     async fn assign_priority_based(
         &self,
-        _request: &MissionRequest,
+        request: &MissionRequest,
     ) -> Result<Option<Vec<DroneAssignment>>> {
-        // TODO: Implement priority-based assignment
-        Ok(None)
+        self.assign_best_fit(request).await
     }
 
     async fn assign_auction_based(
@@ -295,6 +335,91 @@ impl MissionAssignmentEngine {
         }
 
         true
+    }
+
+    fn sorted_pending_mission_ids(&self) -> Vec<Uuid> {
+        let mut pending = self.pending_missions.values().collect::<Vec<_>>();
+        pending.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        pending.into_iter().map(|request| request.id).collect()
+    }
+
+    fn candidate_drones_for(&self, request: &MissionRequest) -> Vec<&DroneCapabilities> {
+        let mut drones = self
+            .drone_capabilities
+            .values()
+            .filter(|drone| self.drone_is_assignable(drone, request))
+            .collect::<Vec<_>>();
+        drones.sort_by_key(|drone| drone.id);
+        drones
+    }
+
+    fn drone_is_assignable(&self, drone: &DroneCapabilities, request: &MissionRequest) -> bool {
+        drone.availability_status == AvailabilityStatus::Available
+            && !self.has_active_assignment(drone.id)
+            && self.drone_matches_requirements(drone, request)
+    }
+
+    fn has_active_assignment(&self, drone_id: Uuid) -> bool {
+        self.assigned_missions
+            .get(&drone_id)
+            .is_some_and(|assignment| {
+                matches!(
+                    assignment.status,
+                    AssignmentStatus::Assigned | AssignmentStatus::InProgress
+                )
+            })
+    }
+
+    fn unassignable_mission(&self, request: &MissionRequest) -> UnassignableMission {
+        let capable_drones = self
+            .drone_capabilities
+            .values()
+            .filter(|drone| {
+                drone.availability_status == AvailabilityStatus::Available
+                    && self.drone_matches_requirements(drone, request)
+            })
+            .count();
+        let assignable_drones = self.candidate_drones_for(request).len();
+        let reason = if capable_drones < request.min_drones {
+            AssignmentFailureReason::RequirementsNotMet
+        } else {
+            AssignmentFailureReason::InsufficientCapacity
+        };
+
+        UnassignableMission {
+            mission_id: request.id,
+            reason,
+            required_drones: request.min_drones,
+            assignable_drones,
+        }
+    }
+
+    fn build_assignment(
+        &self,
+        request: &MissionRequest,
+        drone: &DroneCapabilities,
+        role_index: usize,
+    ) -> DroneAssignment {
+        let assigned_at = Utc::now();
+        DroneAssignment {
+            drone_id: drone.id,
+            mission_id: request.id,
+            assigned_at,
+            estimated_completion: assigned_at
+                + chrono::Duration::from_std(request.estimated_duration).unwrap(),
+            status: AssignmentStatus::Assigned,
+            role: if role_index == 0 {
+                DroneRole::Primary
+            } else {
+                DroneRole::Secondary
+            },
+            workload_score: self.calculate_workload_score(drone.id),
+        }
     }
 
     fn calculate_fitness_score(&self, drone: &DroneCapabilities, request: &MissionRequest) -> f32 {
@@ -437,6 +562,52 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn test_drone(id: Uuid, sensor: &str) -> DroneCapabilities {
+        DroneCapabilities {
+            id,
+            flight_time_minutes: 60,
+            max_speed: 15.0,
+            payload_capacity: 2.0,
+            sensor_types: vec![sensor.to_string(), "GPS".to_string()],
+            special_capabilities: vec!["autonomous_flight".to_string()],
+            current_battery: 0.9,
+            maintenance_schedule: None,
+            availability_status: AvailabilityStatus::Available,
+        }
+    }
+
+    fn test_mission_request(id: Uuid, required_capability: &str, priority: u8) -> MissionRequest {
+        MissionRequest {
+            id,
+            mission: Mission {
+                id: Uuid::new_v4(),
+                name: format!("Mission {id}"),
+                waypoints: vec![],
+                flight_parameters: shared::FlightParameters {
+                    max_speed_ms: 15.0,
+                    cruise_altitude_m: 100.0,
+                    takeoff_altitude_m: 50.0,
+                    return_to_home_altitude_m: 120.0,
+                },
+                safety_constraints: shared::SafetyConstraints {
+                    max_wind_speed_ms: 10.0,
+                    min_battery_level: 0.2,
+                    geofence_boundaries: vec![],
+                    no_fly_zones: vec![],
+                },
+                created_at: Utc::now(),
+            },
+            priority,
+            required_capabilities: vec![required_capability.to_string()],
+            preferred_drone: None,
+            deadline: None,
+            estimated_duration: Duration::from_secs(1800),
+            max_drones: 1,
+            min_drones: 1,
+            created_at: Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn test_mission_assignment() {
         let mut engine = MissionAssignmentEngine::new(AssignmentAlgorithm::FirstAvailable);
@@ -491,5 +662,89 @@ mod tests {
 
         let stats = engine.get_assignment_statistics().await;
         assert_eq!(stats.total_assigned_missions, 1);
+    }
+
+    #[tokio::test]
+    async fn load_balanced_assignment_distributes_missions_deterministically() {
+        let mut engine = MissionAssignmentEngine::new(AssignmentAlgorithm::LoadBalanced);
+        let first_drone = Uuid::from_u128(301);
+        let second_drone = Uuid::from_u128(302);
+        engine
+            .register_drone(test_drone(first_drone, "RGB"))
+            .await
+            .unwrap();
+        engine
+            .register_drone(test_drone(second_drone, "RGB"))
+            .await
+            .unwrap();
+
+        let first_mission = Uuid::from_u128(401);
+        let second_mission = Uuid::from_u128(402);
+        engine
+            .submit_mission(test_mission_request(first_mission, "RGB", 5))
+            .await
+            .unwrap();
+        engine
+            .submit_mission(test_mission_request(second_mission, "RGB", 5))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.assigned_missions.len(), 2);
+        assert_eq!(
+            engine
+                .assigned_missions
+                .get(&first_drone)
+                .expect("first drone assignment")
+                .mission_id,
+            first_mission
+        );
+        assert_eq!(
+            engine
+                .assigned_missions
+                .get(&second_drone)
+                .expect("second drone assignment")
+                .mission_id,
+            second_mission
+        );
+        assert_eq!(
+            engine
+                .assigned_missions
+                .get(&second_drone)
+                .expect("second drone assignment")
+                .workload_score,
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn load_balanced_assignment_reports_over_capacity_missions() {
+        let mut engine = MissionAssignmentEngine::new(AssignmentAlgorithm::LoadBalanced);
+        let drone_id = Uuid::from_u128(501);
+        engine
+            .register_drone(test_drone(drone_id, "RGB"))
+            .await
+            .unwrap();
+
+        let first_mission = Uuid::from_u128(601);
+        let second_mission = Uuid::from_u128(602);
+        engine
+            .submit_mission(test_mission_request(first_mission, "RGB", 5))
+            .await
+            .unwrap();
+        engine
+            .submit_mission(test_mission_request(second_mission, "RGB", 5))
+            .await
+            .unwrap();
+
+        let report = engine.process_pending_missions_with_report().await.unwrap();
+
+        assert_eq!(report.assigned_count, 0);
+        assert_eq!(report.unassignable_missions.len(), 1);
+        assert_eq!(report.unassignable_missions[0].mission_id, second_mission);
+        assert_eq!(
+            report.unassignable_missions[0].reason,
+            AssignmentFailureReason::InsufficientCapacity
+        );
+        assert_eq!(engine.pending_missions.len(), 1);
     }
 }

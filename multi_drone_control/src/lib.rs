@@ -26,7 +26,10 @@ pub use coordination::{
     FormationOptimizationConfig, FormationOptimizationReport, LinkQualityReport,
     SwarmTelemetryReport, SwarmTelemetryStatus,
 };
-pub use mission_assignment::{DroneAssignment, MissionAssignmentEngine};
+pub use mission_assignment::{
+    AssignmentBatchReport, AssignmentFailureReason, DroneAssignment, MissionAssignmentEngine,
+    UnassignableMission,
+};
 pub use swarm::{DroneSwarm, SwarmController, SwarmStatus};
 pub use swarm_command::{
     dry_run_swarm_command, execute_audited_swarm_command, SwarmCommandAuditEvent,
