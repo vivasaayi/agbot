@@ -1160,6 +1160,47 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS provenance_lineage_records (
+            artifact_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            inputs_json TEXT NOT NULL,
+            method TEXT NOT NULL,
+            parameters_json TEXT NOT NULL,
+            operator TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_kind TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS provenance_audit_entries (
+            entry_hash TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            prev_hash TEXT,
+            payload_hash TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_kind TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            action_ref TEXT NOT NULL,
+            action_kind TEXT NOT NULL,
+            artifact_ref TEXT,
+            payload_json TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            refusal_reason TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS compliance_records (
             record_id TEXT NOT NULL,
             version INTEGER NOT NULL,
@@ -1706,6 +1747,33 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_alert_rule_audits_rule
         ON alert_rule_audits(rule_id, occurred_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_provenance_lineage_actor_date
+        ON provenance_lineage_records(actor_id, created_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_provenance_audit_artifact_date
+        ON provenance_audit_entries(artifact_ref, ts);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_provenance_audit_actor_date
+        ON provenance_audit_entries(actor_id, ts);
         "#,
     )
     .execute(pool)

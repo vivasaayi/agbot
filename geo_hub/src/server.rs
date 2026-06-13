@@ -276,6 +276,22 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_time_series_points),
         )
         .route(
+            "/api/provenance/lineage",
+            get(routes::list_provenance_lineage_records),
+        )
+        .route(
+            "/api/provenance/lineage/:artifact_id",
+            get(routes::get_provenance_lineage_record),
+        )
+        .route(
+            "/api/provenance/audit",
+            get(routes::list_provenance_audit_entries),
+        )
+        .route(
+            "/api/provenance/audit/:entry_hash",
+            get(routes::get_provenance_audit_entry),
+        )
+        .route(
             "/api/alerting/fired-alerts",
             get(routes::list_fired_alerts).post(routes::store_fired_alert),
         )

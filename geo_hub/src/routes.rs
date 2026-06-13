@@ -70,7 +70,10 @@ use orthomosaic::{
     ReconstructionJobRecord, ReconstructionJobRequest, ReconstructionStatus, TiledOutputHandoff,
     TiledOutputHandoffError, TiledOutputHandoffRequest,
 };
-use serde::{Deserialize, Serialize};
+use provenance::{
+    ActorIdentity, AuditAction, AuditEntry, AuditRefusalReason, LineageRecord, ProvenanceParameters,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::schemas::{
     append_content_version, assert_raster_spatial_ref, bind_fleet_node_identity,
     bounds_from_points, build_collaboration_channel, build_collaboration_message,
@@ -571,6 +574,42 @@ pub struct AlertRuleListQuery {
     pub status: Option<AlertRuleStatus>,
     pub event_type: Option<String>,
     pub include_versions: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvenanceLineageListQuery {
+    pub artifact_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvenanceLineagePage {
+    pub page: usize,
+    pub page_size: usize,
+    pub total: usize,
+    pub records: Vec<LineageRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvenanceAuditListQuery {
+    pub artifact_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvenanceAuditPage {
+    pub page: usize,
+    pub page_size: usize,
+    pub total: usize,
+    pub entries: Vec<AuditEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3204,6 +3243,188 @@ pub async fn list_time_series_points(
         .map(|row| decode_time_series_point_response(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
+}
+
+pub async fn list_provenance_lineage_records(
+    Query(query): Query<ProvenanceLineageListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ProvenanceLineagePage>> {
+    let artifact_id = normalize_optional_text(query.artifact_id);
+    let actor_id = normalize_optional_text(query.actor_id);
+    let start = normalize_optional_text(query.start);
+    let end = normalize_optional_text(query.end);
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * page_size;
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM provenance_lineage_records
+        WHERE (?1 IS NULL OR artifact_id = ?1)
+          AND (?2 IS NULL OR actor_id = ?2)
+          AND (?3 IS NULL OR created_at >= ?3)
+          AND (?4 IS NULL OR created_at <= ?4)
+        "#,
+    )
+    .bind(&artifact_id)
+    .bind(&actor_id)
+    .bind(&start)
+    .bind(&end)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT artifact_id, kind, inputs_json, method, parameters_json, operator, actor_id,
+               actor_kind, created_at
+        FROM provenance_lineage_records
+        WHERE (?1 IS NULL OR artifact_id = ?1)
+          AND (?2 IS NULL OR actor_id = ?2)
+          AND (?3 IS NULL OR created_at >= ?3)
+          AND (?4 IS NULL OR created_at <= ?4)
+        ORDER BY created_at DESC, artifact_id ASC
+        LIMIT ?5 OFFSET ?6
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(actor_id)
+    .bind(start)
+    .bind(end)
+    .bind(page_size as i64)
+    .bind(offset as i64)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let records = rows
+        .into_iter()
+        .map(|row| decode_lineage_record(&row))
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(Json(ProvenanceLineagePage {
+        page,
+        page_size,
+        total: total as usize,
+        records,
+    }))
+}
+
+pub async fn get_provenance_lineage_record(
+    Path(artifact_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<LineageRecord>> {
+    let artifact_id = normalize_optional_text(Some(artifact_id))
+        .ok_or_else(|| AppError::BadRequest("artifact_id is required".to_string()))?;
+    let row = sqlx::query(
+        r#"
+        SELECT artifact_id, kind, inputs_json, method, parameters_json, operator, actor_id,
+               actor_kind, created_at
+        FROM provenance_lineage_records
+        WHERE artifact_id = ?1
+        "#,
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_lineage_record(&row))
+        .transpose()?
+        .map(Json)
+        .ok_or(AppError::NotFound)
+}
+
+pub async fn list_provenance_audit_entries(
+    Query(query): Query<ProvenanceAuditListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ProvenanceAuditPage>> {
+    let artifact_id = normalize_optional_text(query.artifact_id);
+    let actor_id = normalize_optional_text(query.actor_id);
+    let start = normalize_optional_text(query.start);
+    let end = normalize_optional_text(query.end);
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let offset = (page - 1) * page_size;
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM provenance_audit_entries
+        WHERE (?1 IS NULL OR artifact_ref = ?1)
+          AND (?2 IS NULL OR actor_id = ?2)
+          AND (?3 IS NULL OR ts >= ?3)
+          AND (?4 IS NULL OR ts <= ?4)
+        "#,
+    )
+    .bind(&artifact_id)
+    .bind(&actor_id)
+    .bind(&start)
+    .bind(&end)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT entry_hash, seq, prev_hash, payload_hash, actor_id, actor_kind, ts, action_ref,
+               action_kind, artifact_ref, payload_json, occurred_at, outcome, refusal_reason
+        FROM provenance_audit_entries
+        WHERE (?1 IS NULL OR artifact_ref = ?1)
+          AND (?2 IS NULL OR actor_id = ?2)
+          AND (?3 IS NULL OR ts >= ?3)
+          AND (?4 IS NULL OR ts <= ?4)
+        ORDER BY ts DESC, seq DESC
+        LIMIT ?5 OFFSET ?6
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(actor_id)
+    .bind(start)
+    .bind(end)
+    .bind(page_size as i64)
+    .bind(offset as i64)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let entries = rows
+        .into_iter()
+        .map(|row| decode_audit_entry(&row))
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(Json(ProvenanceAuditPage {
+        page,
+        page_size,
+        total: total as usize,
+        entries,
+    }))
+}
+
+pub async fn get_provenance_audit_entry(
+    Path(entry_hash): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<AuditEntry>> {
+    let entry_hash = normalize_optional_text(Some(entry_hash))
+        .ok_or_else(|| AppError::BadRequest("entry_hash is required".to_string()))?;
+    let row = sqlx::query(
+        r#"
+        SELECT entry_hash, seq, prev_hash, payload_hash, actor_id, actor_kind, ts, action_ref,
+               action_kind, artifact_ref, payload_json, occurred_at, outcome, refusal_reason
+        FROM provenance_audit_entries
+        WHERE entry_hash = ?1
+        "#,
+    )
+    .bind(entry_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_audit_entry(&row))
+        .transpose()?
+        .map(Json)
+        .ok_or(AppError::NotFound)
 }
 
 pub async fn create_alert_rule(
@@ -8213,6 +8434,78 @@ fn decode_alert_rule_subscription(
         channels,
         created_at: row.get("created_at"),
     })
+}
+
+fn decode_lineage_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<LineageRecord> {
+    let inputs = serde_json::from_str::<Vec<String>>(&row.get::<String, _>("inputs_json"))
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode provenance lineage inputs_json"),
+            )
+        })?;
+    let parameters =
+        serde_json::from_str::<serde_json::Value>(&row.get::<String, _>("parameters_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode provenance lineage parameters_json"),
+                )
+            })?;
+
+    Ok(LineageRecord {
+        artifact_id: row.get("artifact_id"),
+        kind: decode_db_enum(row.get::<String, _>("kind"))?,
+        inputs,
+        method: row.get("method"),
+        parameters: ProvenanceParameters::from_json(parameters),
+        operator: row.get("operator"),
+        actor: ActorIdentity {
+            actor_id: row.get("actor_id"),
+            actor_kind: decode_db_enum(row.get::<String, _>("actor_kind"))?,
+        },
+        created_at: row.get("created_at"),
+    })
+}
+
+fn decode_audit_entry(row: &sqlx::sqlite::SqliteRow) -> AppResult<AuditEntry> {
+    let payload = serde_json::from_str::<serde_json::Value>(&row.get::<String, _>("payload_json"))
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode provenance audit payload_json"),
+            )
+        })?;
+    let seq: i64 = row.get("seq");
+    let refusal_reason: Option<String> = row.get("refusal_reason");
+
+    Ok(AuditEntry {
+        seq: u64::try_from(seq).map_err(|err| AppError::Anyhow(err.into()))?,
+        prev_hash: row.get("prev_hash"),
+        payload_hash: row.get("payload_hash"),
+        entry_hash: row.get("entry_hash"),
+        actor: ActorIdentity {
+            actor_id: row.get("actor_id"),
+            actor_kind: decode_db_enum(row.get::<String, _>("actor_kind"))?,
+        },
+        ts: row.get("ts"),
+        action: AuditAction {
+            action_ref: row.get("action_ref"),
+            action_kind: row.get("action_kind"),
+            artifact_ref: row.get("artifact_ref"),
+            payload: ProvenanceParameters::from_json(payload),
+            occurred_at: row.get("occurred_at"),
+        },
+        outcome: decode_db_enum(row.get::<String, _>("outcome"))?,
+        refusal_reason: refusal_reason
+            .map(decode_db_enum::<AuditRefusalReason>)
+            .transpose()?,
+    })
+}
+
+fn decode_db_enum<T>(value: String) -> AppResult<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(serde_json::Value::String(value))
+        .map_err(|err| AppError::Anyhow(Error::new(err).context("failed to decode enum value")))
 }
 
 fn soil_reading_time_series_metadata(reading: &GeolocatedSoilReading) -> AppResult<String> {

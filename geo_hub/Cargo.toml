@@ -30,6 +30,7 @@ compliance = { path = "../compliance" }
 fleet_health = { path = "../fleet_health" }
 soil_iot = { path = "../soil_iot" }
 timeseries = { path = "../timeseries" }
+provenance = { path = "../provenance" }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
 image = { workspace = true }

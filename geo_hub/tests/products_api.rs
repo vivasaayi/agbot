@@ -4194,6 +4194,132 @@ async fn alert_rule_create_rejects_invalid_predicate_without_persisting() -> Res
 }
 
 #[tokio::test]
+async fn provenance_ledger_lists_filters_and_retrieves_after_restart() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let data_root = tmp.path().join("data");
+    let db_path = tmp.path().join("geo_hub_test.db");
+    let ctx = test_app_with_paths(data_root.clone(), db_path.clone()).await?;
+    seed_provenance_ledger_fixture(&ctx).await?;
+    drop(ctx);
+
+    let restarted = test_app_with_paths(data_root, db_path).await?;
+
+    let lineage_page = restarted
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/api/provenance/lineage?actor_id=operator:dsp-7&start=2026-06-12T09:00:00Z&end=2026-06-12T11:00:00Z&page=1&page_size=1",
+                )
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(lineage_page.status(), StatusCode::OK);
+    let body = to_bytes(lineage_page.into_body(), 64 * 1024).await?;
+    let lineage_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        lineage_json.get("total").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        lineage_json
+            .get("page_size")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        lineage_json
+            .pointer("/records/0/artifact_id")
+            .and_then(|value| value.as_str()),
+        Some("finding:09:stress-ne-zone")
+    );
+
+    let lineage_record = restarted
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/provenance/lineage/finding:09:stress-ne-zone")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(lineage_record.status(), StatusCode::OK);
+    let body = to_bytes(lineage_record.into_body(), 64 * 1024).await?;
+    let lineage_record_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        lineage_record_json
+            .pointer("/inputs/0")
+            .and_then(|value| value.as_str()),
+        Some("product:ndvi:alpha-2026-06-12")
+    );
+    assert_eq!(
+        lineage_record_json
+            .pointer("/parameters/threshold")
+            .and_then(|value| value.as_f64()),
+        Some(0.42)
+    );
+
+    let audit_page = restarted
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/api/provenance/audit?artifact_id=finding:09:stress-ne-zone&actor_id=operator:dsp-7&start=2026-06-12T09:00:00Z&end=2026-06-12T11:00:00Z&page=1&page_size=10",
+                )
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(audit_page.status(), StatusCode::OK);
+    let body = to_bytes(audit_page.into_body(), 64 * 1024).await?;
+    let audit_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        audit_json.get("total").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        audit_json
+            .pointer("/entries/0/action/action_ref")
+            .and_then(|value| value.as_str()),
+        Some("action:record-finding")
+    );
+
+    let audit_entry = restarted
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/provenance/audit/audit-entry-hash-0002")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(audit_entry.status(), StatusCode::OK);
+    let body = to_bytes(audit_entry.into_body(), 64 * 1024).await?;
+    let audit_entry_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        audit_entry_json
+            .pointer("/action/artifact_ref")
+            .and_then(|value| value.as_str()),
+        Some("finding:09:stress-ne-zone")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn soil_iot_device_registry_registers_and_lists_geolocated_devices() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -9901,6 +10027,133 @@ async fn register_soil_iot_test_device(ctx: &TestContext, device_id: &str) -> Re
         .await
         .expect("router should handle request");
     assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_provenance_ledger_fixture(ctx: &TestContext) -> Result<()> {
+    insert_provenance_lineage_fixture(
+        ctx,
+        "product:ndvi:alpha-2026-06-12",
+        "product",
+        json!([]),
+        json!({
+            "scene_id": "scene-alpha",
+            "index": "ndvi"
+        }),
+        "2026-06-12T10:00:00Z",
+    )
+    .await?;
+    insert_provenance_lineage_fixture(
+        ctx,
+        "finding:09:stress-ne-zone",
+        "finding",
+        json!(["product:ndvi:alpha-2026-06-12"]),
+        json!({
+            "index": "ndvi",
+            "threshold": 0.42,
+            "zone": "NE"
+        }),
+        "2026-06-12T10:05:00Z",
+    )
+    .await?;
+
+    insert_provenance_audit_fixture(
+        ctx,
+        1,
+        "audit-entry-hash-0001",
+        None,
+        "action:publish-product",
+        "product_publish",
+        Some("product:ndvi:alpha-2026-06-12"),
+        json!({"publish_status": "published"}),
+        "2026-06-12T10:01:00Z",
+    )
+    .await?;
+    insert_provenance_audit_fixture(
+        ctx,
+        2,
+        "audit-entry-hash-0002",
+        Some("audit-entry-hash-0001"),
+        "action:record-finding",
+        "finding_record",
+        Some("finding:09:stress-ne-zone"),
+        json!({"finding": "stress-ne-zone"}),
+        "2026-06-12T10:06:00Z",
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_provenance_lineage_fixture(
+    ctx: &TestContext,
+    artifact_id: &str,
+    kind: &str,
+    inputs: serde_json::Value,
+    parameters: serde_json::Value,
+    created_at: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO provenance_lineage_records (
+            artifact_id, kind, inputs_json, method, parameters_json, operator, actor_id,
+            actor_kind, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(kind)
+    .bind(inputs.to_string())
+    .bind("09.crop_stress_finding")
+    .bind(parameters.to_string())
+    .bind("operator:dsp-7")
+    .bind("operator:dsp-7")
+    .bind("drone_service_provider")
+    .bind(created_at)
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_provenance_audit_fixture(
+    ctx: &TestContext,
+    seq: i64,
+    entry_hash: &str,
+    prev_hash: Option<&str>,
+    action_ref: &str,
+    action_kind: &str,
+    artifact_ref: Option<&str>,
+    payload: serde_json::Value,
+    ts: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO provenance_audit_entries (
+            entry_hash, seq, prev_hash, payload_hash, actor_id, actor_kind, ts, action_ref,
+            action_kind, artifact_ref, payload_json, occurred_at, outcome, refusal_reason
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+    )
+    .bind(entry_hash)
+    .bind(seq)
+    .bind(prev_hash)
+    .bind(format!("payload-hash-{seq:04}"))
+    .bind("operator:dsp-7")
+    .bind("drone_service_provider")
+    .bind(ts)
+    .bind(action_ref)
+    .bind(action_kind)
+    .bind(artifact_ref)
+    .bind(payload.to_string())
+    .bind(ts)
+    .bind("accepted")
+    .bind(Option::<String>::None)
+    .execute(&ctx.pool)
+    .await?;
+
     Ok(())
 }
 
