@@ -1046,6 +1046,32 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS copilot_conversations (
+            conversation_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS copilot_turns (
+            turn_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS alert_fired_alerts (
             alert_id TEXT PRIMARY KEY,
             matched_rule_id TEXT NOT NULL,
@@ -1542,6 +1568,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_crop_detection_correction_labels_source
         ON crop_detection_correction_labels(source_detection_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_copilot_conversations_field
+        ON copilot_conversations(field_id, created_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_copilot_turns_conversation
+        ON copilot_turns(conversation_id, created_at);
         "#,
     )
     .execute(pool)

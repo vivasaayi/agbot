@@ -5218,6 +5218,205 @@ async fn crop_intelligence_inference_run_rejects_unpublished_mosaic_without_writ
 }
 
 #[tokio::test]
+async fn copilot_conversation_create_turn_and_list_are_field_scoped() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-copilot", "field-copilot", "season-2026").await?;
+
+    let start = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/copilot/conversations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "conversation_id": "conversation-001",
+                        "field_id": "field-copilot"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(start.status(), StatusCode::OK);
+    let body = to_bytes(start.into_body(), 64 * 1024).await?;
+    let conversation: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        conversation
+            .get("conversation_id")
+            .and_then(|value| value.as_str()),
+        Some("conversation-001")
+    );
+    assert_eq!(
+        conversation
+            .get("field_id")
+            .and_then(|value| value.as_str()),
+        Some("field-copilot")
+    );
+
+    let turn = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/copilot/conversations/conversation-001/turns")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "turn_id": "turn-001",
+                        "field_id": "field-copilot",
+                        "role": "user"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(turn.status(), StatusCode::OK);
+    let body = to_bytes(turn.into_body(), 64 * 1024).await?;
+    let turn: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        turn.get("turn_id").and_then(|value| value.as_str()),
+        Some("turn-001")
+    );
+    assert_eq!(
+        turn.get("role").and_then(|value| value.as_str()),
+        Some("user")
+    );
+
+    let list_conversations = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/copilot/conversations?field_id=field-copilot")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_conversations.status(), StatusCode::OK);
+    let body = to_bytes(list_conversations.into_body(), 64 * 1024).await?;
+    let conversations: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(conversations.len(), 1);
+
+    let list_turns = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/copilot/conversations/conversation-001/turns")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_turns.status(), StatusCode::OK);
+    let body = to_bytes(list_turns.into_body(), 64 * 1024).await?;
+    let turns: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(turns.len(), 1);
+    assert_eq!(
+        turns[0].get("field_id").and_then(|value| value.as_str()),
+        Some("field-copilot")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_conversation_rejects_missing_field_scope_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-copilot", "field-copilot", "season-2026").await?;
+
+    let missing_field = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/copilot/conversations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "conversation_id": "conversation-missing",
+                        "field_id": "field-missing"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(missing_field.status(), StatusCode::BAD_REQUEST);
+
+    let start = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/copilot/conversations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "conversation_id": "conversation-002",
+                        "field_id": "field-copilot"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(start.status(), StatusCode::OK);
+
+    let wrong_field_turn = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/copilot/conversations/conversation-002/turns")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "turn_id": "turn-wrong-field",
+                        "field_id": "field-missing",
+                        "role": "assistant"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(wrong_field_turn.status(), StatusCode::BAD_REQUEST);
+
+    let missing_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM copilot_conversations WHERE conversation_id = 'conversation-missing'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(missing_count, 0);
+    let wrong_turn_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM copilot_turns WHERE turn_id = 'turn-wrong-field'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(wrong_turn_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn crop_intelligence_verifies_and_corrects_detections_with_label_feedback() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

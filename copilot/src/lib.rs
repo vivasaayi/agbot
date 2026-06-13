@@ -68,6 +68,91 @@ pub enum CopilotIndexError {
     EmptyFieldId,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CopilotConversationStartRequest {
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    pub field_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopilotConversationRecord {
+    pub conversation_id: String,
+    pub field_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopilotTurnRole {
+    User,
+    Assistant,
+    System,
+}
+
+impl CopilotTurnRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CopilotTurnRole::User => "user",
+            CopilotTurnRole::Assistant => "assistant",
+            CopilotTurnRole::System => "system",
+        }
+    }
+}
+
+impl std::str::FromStr for CopilotTurnRole {
+    type Err = CopilotConversationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "user" => Ok(CopilotTurnRole::User),
+            "assistant" => Ok(CopilotTurnRole::Assistant),
+            "system" => Ok(CopilotTurnRole::System),
+            _ => Err(CopilotConversationError::UnsupportedRole {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CopilotTurnCreateRequest {
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    pub field_id: String,
+    pub role: CopilotTurnRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopilotTurnRecord {
+    pub conversation_id: String,
+    pub field_id: String,
+    pub turn_id: String,
+    pub role: CopilotTurnRole,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotConversationError {
+    #[error("conversation_id cannot be empty")]
+    EmptyConversationId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("turn_id cannot be empty")]
+    EmptyTurnId,
+    #[error("timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error(
+        "turn field {turn_field_id} does not match conversation field {conversation_field_id}"
+    )]
+    FieldScopeMismatch {
+        conversation_field_id: String,
+        turn_field_id: String,
+    },
+    #[error("turn role {value} is invalid")]
+    UnsupportedRole { value: String },
+}
+
 pub trait LedgerEvidenceResolver {
     fn resolves_ledger_ref(&self, ledger_ref: &str) -> bool;
 }
@@ -634,6 +719,57 @@ pub fn approve_recommendation_draft(
     })
 }
 
+pub fn start_copilot_conversation(
+    request: CopilotConversationStartRequest,
+    generated_conversation_id: String,
+    created_at: String,
+) -> Result<CopilotConversationRecord, CopilotConversationError> {
+    let conversation_id = normalize_optional_conversation_text(request.conversation_id)
+        .or_else(|| normalize_conversation_text(generated_conversation_id))
+        .ok_or(CopilotConversationError::EmptyConversationId)?;
+    let field_id = normalize_conversation_text(request.field_id)
+        .ok_or(CopilotConversationError::EmptyFieldId)?;
+    let created_at =
+        normalize_conversation_text(created_at).ok_or(CopilotConversationError::EmptyTimestamp)?;
+
+    Ok(CopilotConversationRecord {
+        conversation_id,
+        field_id,
+        created_at,
+    })
+}
+
+pub fn create_copilot_turn(
+    conversation: &CopilotConversationRecord,
+    request: CopilotTurnCreateRequest,
+    generated_turn_id: String,
+    created_at: String,
+) -> Result<CopilotTurnRecord, CopilotConversationError> {
+    let turn_id = normalize_optional_conversation_text(request.turn_id)
+        .or_else(|| normalize_conversation_text(generated_turn_id))
+        .ok_or(CopilotConversationError::EmptyTurnId)?;
+    let turn_field_id = normalize_conversation_text(request.field_id)
+        .ok_or(CopilotConversationError::EmptyFieldId)?;
+    let conversation_field_id = normalize_conversation_text(conversation.field_id.clone())
+        .ok_or(CopilotConversationError::EmptyFieldId)?;
+    if turn_field_id != conversation_field_id {
+        return Err(CopilotConversationError::FieldScopeMismatch {
+            conversation_field_id,
+            turn_field_id,
+        });
+    }
+    let created_at =
+        normalize_conversation_text(created_at).ok_or(CopilotConversationError::EmptyTimestamp)?;
+
+    Ok(CopilotTurnRecord {
+        conversation_id: conversation.conversation_id.clone(),
+        field_id: turn_field_id,
+        turn_id,
+        role: request.role,
+        created_at,
+    })
+}
+
 pub fn post_check_grounded_answer(
     answer: CopilotAnswer,
     claims: Vec<CopilotAnswerClaim>,
@@ -966,6 +1102,14 @@ fn normalize_draft_text(
     normalize_text(value).ok_or(error)
 }
 
+fn normalize_conversation_text(value: String) -> Option<String> {
+    normalize_text(value)
+}
+
+fn normalize_optional_conversation_text(value: Option<String>) -> Option<String> {
+    value.and_then(normalize_conversation_text)
+}
+
 fn normalize_draft_citations(
     values: Vec<String>,
 ) -> Result<Vec<String>, CopilotRecommendationDraftError> {
@@ -1029,15 +1173,17 @@ mod tests {
 
     use super::{
         annotate_answer_uncertainty, answer_grounded_question, approve_recommendation_draft,
-        build_evidence_retrieval_index, draft_recommendation_from_answer,
-        post_check_grounded_answer, CopilotAnswer, CopilotAnswerClaim, CopilotAnswerRequest,
-        CopilotConfidenceLevel, CopilotGroundingError, CopilotIndexError, CopilotModel,
+        build_evidence_retrieval_index, create_copilot_turn, draft_recommendation_from_answer,
+        post_check_grounded_answer, start_copilot_conversation, CopilotAnswer, CopilotAnswerClaim,
+        CopilotAnswerRequest, CopilotConfidenceLevel, CopilotConversationError,
+        CopilotConversationStartRequest, CopilotGroundingError, CopilotIndexError, CopilotModel,
         CopilotModelError, CopilotRecommendationApproval, CopilotRecommendationDraftError,
         CopilotRecommendationDraftRequest, CopilotRecommendationDraftStatus, CopilotRefusalReason,
-        DeterministicAnswerFixture, DeterministicCopilotModel, EvidenceCandidate,
-        EvidenceFreshnessRecord, EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind,
-        EvidenceRejectionReason, GroundedCopilotAnswer, GroundedCopilotQuestionRequest,
-        LedgerEvidenceResolver, UnavailableCopilotModel, UncertaintyReasonCode,
+        CopilotTurnCreateRequest, CopilotTurnRole, DeterministicAnswerFixture,
+        DeterministicCopilotModel, EvidenceCandidate, EvidenceFreshnessRecord,
+        EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind, EvidenceRejectionReason,
+        GroundedCopilotAnswer, GroundedCopilotQuestionRequest, LedgerEvidenceResolver,
+        UnavailableCopilotModel, UncertaintyReasonCode,
     };
     use shared::schemas::{RecommendationLifecycleRegistry, RecommendationPriority};
 
@@ -1165,6 +1311,73 @@ mod tests {
             .expect_err("empty field scope should be rejected");
 
         assert_eq!(error, CopilotIndexError::EmptyFieldId);
+    }
+
+    #[test]
+    fn conversation_and_turn_identity_are_field_scoped() {
+        let conversation = start_copilot_conversation(
+            CopilotConversationStartRequest {
+                conversation_id: Some(" conversation-001 ".to_string()),
+                field_id: " field-001 ".to_string(),
+            },
+            "generated-conversation".to_string(),
+            " 2026-06-13T16:00:00Z ".to_string(),
+        )
+        .expect("conversation should normalize");
+
+        assert_eq!(conversation.conversation_id, "conversation-001");
+        assert_eq!(conversation.field_id, "field-001");
+        assert_eq!(conversation.created_at, "2026-06-13T16:00:00Z");
+
+        let turn = create_copilot_turn(
+            &conversation,
+            CopilotTurnCreateRequest {
+                turn_id: Some(" turn-001 ".to_string()),
+                field_id: " field-001 ".to_string(),
+                role: CopilotTurnRole::User,
+            },
+            "generated-turn".to_string(),
+            "2026-06-13T16:01:00Z".to_string(),
+        )
+        .expect("turn should inherit field scope");
+
+        assert_eq!(turn.conversation_id, "conversation-001");
+        assert_eq!(turn.field_id, "field-001");
+        assert_eq!(turn.turn_id, "turn-001");
+        assert_eq!(turn.role, CopilotTurnRole::User);
+    }
+
+    #[test]
+    fn copilot_turn_rejects_cross_field_scope() {
+        let conversation = start_copilot_conversation(
+            CopilotConversationStartRequest {
+                conversation_id: Some("conversation-001".to_string()),
+                field_id: "field-001".to_string(),
+            },
+            "generated-conversation".to_string(),
+            "2026-06-13T16:00:00Z".to_string(),
+        )
+        .expect("conversation should normalize");
+
+        let error = create_copilot_turn(
+            &conversation,
+            CopilotTurnCreateRequest {
+                turn_id: Some("turn-foreign".to_string()),
+                field_id: "field-foreign".to_string(),
+                role: CopilotTurnRole::Assistant,
+            },
+            "generated-turn".to_string(),
+            "2026-06-13T16:01:00Z".to_string(),
+        )
+        .expect_err("turn must stay scoped to the conversation field");
+
+        assert_eq!(
+            error,
+            CopilotConversationError::FieldScopeMismatch {
+                conversation_field_id: "field-001".to_string(),
+                turn_field_id: "field-foreign".to_string()
+            }
+        );
     }
 
     #[test]

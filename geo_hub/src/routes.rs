@@ -27,6 +27,11 @@ use compliance::{
     ComplianceRecord, ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
     CreateComplianceRecordRequest,
 };
+use copilot::{
+    create_copilot_turn, start_copilot_conversation, CopilotConversationError,
+    CopilotConversationRecord, CopilotConversationStartRequest, CopilotTurnCreateRequest,
+    CopilotTurnRecord, CopilotTurnRole,
+};
 use crop_intelligence::{
     apply_detection_verification, assemble_detection_finding, build_inference_run_record,
     build_model_version_record, transition_inference_run_status,
@@ -583,6 +588,11 @@ pub struct UpdateReconstructionStatusRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CropModelListQuery {
     pub task: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CopilotConversationListQuery {
+    pub field_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3516,6 +3526,94 @@ pub async fn apply_orthomosaic_publish_gate(
     .map_err(Error::from)?;
 
     Ok(Json(decision))
+}
+
+pub async fn start_copilot_conversation_handler(
+    State(state): State<AppState>,
+    Json(request): Json<CopilotConversationStartRequest>,
+) -> AppResult<Json<CopilotConversationRecord>> {
+    let conversation = start_copilot_conversation(
+        request,
+        format!("copilot-conversation-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(copilot_conversation_error)?;
+    assert_copilot_field_exists(&state, &conversation.field_id).await?;
+    insert_copilot_conversation(&state, &conversation).await?;
+
+    Ok(Json(conversation))
+}
+
+pub async fn list_copilot_conversations(
+    Query(query): Query<CopilotConversationListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CopilotConversationRecord>>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    assert_copilot_field_exists(&state, &field_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT conversation_id, field_id, created_at
+        FROM copilot_conversations
+        WHERE field_id = ?1
+        ORDER BY created_at ASC, conversation_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_copilot_conversation(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn create_copilot_turn_handler(
+    Path(conversation_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CopilotTurnCreateRequest>,
+) -> AppResult<Json<CopilotTurnRecord>> {
+    let conversation = load_copilot_conversation(&state, &conversation_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let turn = create_copilot_turn(
+        &conversation,
+        request,
+        format!("copilot-turn-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(copilot_conversation_error)?;
+    insert_copilot_turn(&state, &turn).await?;
+
+    Ok(Json(turn))
+}
+
+pub async fn list_copilot_turns(
+    Path(conversation_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CopilotTurnRecord>>> {
+    load_copilot_conversation(&state, &conversation_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let rows = sqlx::query(
+        r#"
+        SELECT conversation_id, field_id, turn_id, role, created_at
+        FROM copilot_turns
+        WHERE conversation_id = ?1
+        ORDER BY created_at ASC, rowid ASC
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_copilot_turn(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
 }
 
 pub async fn register_crop_model(
@@ -6642,6 +6740,10 @@ fn mosaic_publish_gate_error(error: MosaicPublishGateError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn copilot_conversation_error(error: CopilotConversationError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_reconstruction_status(value: String) -> AppResult<ReconstructionStatus> {
     value.parse::<ReconstructionStatus>().map_err(|err| {
         AppError::Anyhow(Error::new(err).context("failed to decode reconstruction status"))
@@ -6672,6 +6774,12 @@ fn parse_crop_model_task(value: String) -> AppResult<CropModelTask> {
     value
         .parse::<CropModelTask>()
         .map_err(crop_model_registry_error)
+}
+
+fn parse_copilot_turn_role(value: String) -> AppResult<CopilotTurnRole> {
+    value
+        .parse::<CopilotTurnRole>()
+        .map_err(copilot_conversation_error)
 }
 
 fn parse_detection_verification_state(value: String) -> AppResult<DetectionVerificationState> {
@@ -9580,6 +9688,94 @@ async fn load_orthomosaic_reconstruction(
 
     row.map(|row| decode_orthomosaic_reconstruction_record(&row))
         .transpose()
+}
+
+async fn assert_copilot_field_exists(state: &AppState, field_id: &str) -> AppResult<()> {
+    if load_field(state, field_id).await?.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "copilot field scope {field_id} does not exist"
+        )))
+    }
+}
+
+async fn insert_copilot_conversation(
+    state: &AppState,
+    conversation: &CopilotConversationRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO copilot_conversations (conversation_id, field_id, created_at)
+        VALUES (?1, ?2, ?3)
+        "#,
+    )
+    .bind(&conversation.conversation_id)
+    .bind(&conversation.field_id)
+    .bind(&conversation.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_copilot_conversation(
+    state: &AppState,
+    conversation_id: &str,
+) -> AppResult<Option<CopilotConversationRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT conversation_id, field_id, created_at
+        FROM copilot_conversations
+        WHERE conversation_id = ?1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_copilot_conversation(&row)).transpose()
+}
+
+fn decode_copilot_conversation(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CopilotConversationRecord> {
+    Ok(CopilotConversationRecord {
+        conversation_id: row.get("conversation_id"),
+        field_id: row.get("field_id"),
+        created_at: row.get("created_at"),
+    })
+}
+
+async fn insert_copilot_turn(state: &AppState, turn: &CopilotTurnRecord) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO copilot_turns (turn_id, conversation_id, field_id, role, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(&turn.turn_id)
+    .bind(&turn.conversation_id)
+    .bind(&turn.field_id)
+    .bind(turn.role.as_str())
+    .bind(&turn.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+fn decode_copilot_turn(row: &sqlx::sqlite::SqliteRow) -> AppResult<CopilotTurnRecord> {
+    Ok(CopilotTurnRecord {
+        conversation_id: row.get("conversation_id"),
+        field_id: row.get("field_id"),
+        turn_id: row.get("turn_id"),
+        role: parse_copilot_turn_role(row.get("role"))?,
+        created_at: row.get("created_at"),
+    })
 }
 
 async fn crop_inference_mosaic_is_published(

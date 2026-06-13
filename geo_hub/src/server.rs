@@ -98,6 +98,15 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::apply_orthomosaic_publish_gate),
         )
         .route(
+            "/api/copilot/conversations",
+            get(routes::list_copilot_conversations)
+                .post(routes::start_copilot_conversation_handler),
+        )
+        .route(
+            "/api/copilot/conversations/:conversation_id/turns",
+            get(routes::list_copilot_turns).post(routes::create_copilot_turn_handler),
+        )
+        .route(
             "/api/crop-intelligence/models",
             get(routes::list_crop_models).post(routes::register_crop_model),
         )
