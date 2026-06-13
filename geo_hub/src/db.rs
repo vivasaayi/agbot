@@ -849,6 +849,36 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS cms_contents (
+            content_id TEXT PRIMARY KEY,
+            content_type TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_content_versions (
+            version_id TEXT PRIMARY KEY,
+            content_id TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,
@@ -1323,6 +1353,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_sustainability_records_audit
         ON sustainability_records(audit_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_cms_contents_org_status
+        ON cms_contents(org_id, status, content_type);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_cms_content_versions_content
+        ON cms_content_versions(content_id, created_at);
         "#,
     )
     .execute(pool)

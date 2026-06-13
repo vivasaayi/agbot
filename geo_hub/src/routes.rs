@@ -62,14 +62,17 @@ use orthomosaic::{
 };
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-    build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
-    build_tractor_record, compute_drought_index, normalize_weather_provider_forecast,
-    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_party_type,
-    parse_soil_moisture_qa_flag, parse_soil_moisture_rejection_reason,
-    parse_sustainability_metric_type, soil_moisture_rejection_reason_for_error,
-    soil_moisture_rejection_record, transition_marketplace_account_status, validate_field_boundary,
-    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord, DroughtIndexComputeRequest,
+    append_content_version, assert_raster_spatial_ref, bind_fleet_node_identity,
+    bounds_from_points, build_marketplace_account_record, build_soil_moisture_reading,
+    build_sustainability_record, build_tractor_record, compute_drought_index,
+    create_versioned_content, normalize_weather_provider_forecast, parse_content_status,
+    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
+    parse_marketplace_party_type, parse_soil_moisture_qa_flag,
+    parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
+    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
+    transition_marketplace_account_status, validate_field_boundary, weather_fetch_failure_record,
+    AnnotationGeometry, AnnotationRecord, ContentCreateRequest, ContentEditRequest, ContentError,
+    ContentRecord, ContentStatus, ContentType, ContentVersionRecord, DroughtIndexComputeRequest,
     DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
     FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
     FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
@@ -84,9 +87,9 @@ use shared::schemas::{
     TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
     TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
     TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
-    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
-    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
-    GEO_EXTENT_ASSERTION_TOLERANCE,
+    VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
+    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
+    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_device_record, GatewayIngestError,
@@ -504,6 +507,18 @@ pub struct SustainabilityRecordListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SustainabilityRecordScopeQuery {
     pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentItemListQuery {
+    pub org_id: Option<String>,
+    pub content_type: Option<ContentType>,
+    pub status: Option<ContentStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentItemScopeQuery {
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2839,6 +2854,103 @@ pub async fn get_sustainability_record(
     }
 
     Ok(Json(record))
+}
+
+pub async fn create_content_item(
+    State(state): State<AppState>,
+    Json(request): Json<ContentCreateRequest>,
+) -> AppResult<Json<VersionedContentRecord>> {
+    let (content, version) = create_versioned_content(
+        request,
+        format!("content-{}", Uuid::new_v4()),
+        format!("content-version-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    insert_content_item_with_version(&state, &content, &version).await?;
+
+    Ok(Json(VersionedContentRecord {
+        content,
+        versions: vec![version],
+    }))
+}
+
+pub async fn append_content_item_version(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<ContentEditRequest>,
+) -> AppResult<Json<VersionedContentRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let (updated, version) = append_content_version(
+        &content,
+        request.body,
+        format!("content-version-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    append_content_version_record(&state, &updated, &version).await?;
+
+    load_versioned_content(&state, &updated.content_id, &org_id)
+        .await?
+        .ok_or(AppError::NotFound)
+        .map(Json)
+}
+
+pub async fn get_content_item(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<VersionedContentRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+
+    load_versioned_content(&state, &content_id, &org_id)
+        .await?
+        .ok_or(AppError::NotFound)
+        .map(Json)
+}
+
+pub async fn list_content_items(
+    Query(query): Query<ContentItemListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ContentRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest("org_id query parameter is required for content items".to_string())
+    })?;
+    let content_type = query
+        .content_type
+        .map(|content_type| content_type.as_str().to_string());
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT content_id, content_type, author_id, org_id, status, current_version,
+               created_at, updated_at
+        FROM cms_contents
+        WHERE org_id = ?1
+          AND (?2 IS NULL OR content_type = ?2)
+          AND (?3 IS NULL OR status = ?3)
+        ORDER BY created_at ASC, content_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(content_type)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_content_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
 }
 
 pub async fn list_time_series_points(
@@ -6288,6 +6400,10 @@ fn sustainability_record_error(error: SustainabilityRecordError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn content_error(error: ContentError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
     value.parse::<SoilSensorType>().map_err(soil_iot_error)
 }
@@ -7537,6 +7653,29 @@ fn decode_sustainability_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Sust
     })
 }
 
+fn decode_content_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ContentRecord> {
+    Ok(ContentRecord {
+        content_id: row.get("content_id"),
+        content_type: parse_content_type(&row.get::<String, _>("content_type"))
+            .map_err(content_error)?,
+        author_id: row.get("author_id"),
+        org_id: row.get("org_id"),
+        status: parse_content_status(&row.get::<String, _>("status")).map_err(content_error)?,
+        current_version: row.get("current_version"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_content_version_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<ContentVersionRecord> {
+    Ok(ContentVersionRecord {
+        version_id: row.get("version_id"),
+        content_id: row.get("content_id"),
+        body: row.get("body"),
+        created_at: row.get("created_at"),
+    })
+}
+
 fn decode_soil_iot_device(row: &sqlx::sqlite::SqliteRow) -> AppResult<SoilDeviceRecord> {
     Ok(SoilDeviceRecord {
         device_id: row.get("device_id"),
@@ -8688,6 +8827,142 @@ async fn load_sustainability_record_linkage(
         field_id: row.get("field_id"),
         season_id: row.get("season"),
     }))
+}
+
+async fn insert_content_item_with_version(
+    state: &AppState,
+    content: &ContentRecord,
+    version: &ContentVersionRecord,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        INSERT INTO cms_contents (
+            content_id, content_type, author_id, org_id, status, current_version,
+            created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&content.content_id)
+    .bind(content.content_type.as_str())
+    .bind(&content.author_id)
+    .bind(&content.org_id)
+    .bind(content.status.as_str())
+    .bind(&content.current_version)
+    .bind(&content.created_at)
+    .bind(&content.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    insert_content_version_in_tx(&mut tx, version).await?;
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn append_content_version_record(
+    state: &AppState,
+    content: &ContentRecord,
+    version: &ContentVersionRecord,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    insert_content_version_in_tx(&mut tx, version).await?;
+    sqlx::query(
+        r#"
+        UPDATE cms_contents
+        SET current_version = ?2, updated_at = ?3
+        WHERE content_id = ?1
+        "#,
+    )
+    .bind(&content.content_id)
+    .bind(&content.current_version)
+    .bind(&content.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_content_version_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    version: &ContentVersionRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_content_versions (version_id, content_id, body, created_at)
+        VALUES (?1, ?2, ?3, ?4)
+        "#,
+    )
+    .bind(&version.version_id)
+    .bind(&version.content_id)
+    .bind(&version.body)
+    .bind(&version.created_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_content_record(
+    state: &AppState,
+    content_id: &str,
+) -> AppResult<Option<ContentRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT content_id, content_type, author_id, org_id, status, current_version,
+               created_at, updated_at
+        FROM cms_contents
+        WHERE content_id = ?1
+        "#,
+    )
+    .bind(content_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_content_record(&row)).transpose()
+}
+
+async fn load_versioned_content(
+    state: &AppState,
+    content_id: &str,
+    org_id: &str,
+) -> AppResult<Option<VersionedContentRecord>> {
+    let Some(content) = load_content_record(state, content_id).await? else {
+        return Ok(None);
+    };
+    if content.org_id != org_id {
+        return Ok(None);
+    }
+    let versions = load_content_versions(state, content_id).await?;
+
+    Ok(Some(VersionedContentRecord { content, versions }))
+}
+
+async fn load_content_versions(
+    state: &AppState,
+    content_id: &str,
+) -> AppResult<Vec<ContentVersionRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT version_id, content_id, body, created_at
+        FROM cms_content_versions
+        WHERE content_id = ?1
+        ORDER BY rowid ASC
+        "#,
+    )
+    .bind(content_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_content_version_record(&row))
+        .collect()
 }
 
 async fn load_soil_iot_device(

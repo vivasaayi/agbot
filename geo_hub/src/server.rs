@@ -215,6 +215,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_sustainability_record),
         )
         .route(
+            "/api/content/items",
+            get(routes::list_content_items).post(routes::create_content_item),
+        )
+        .route(
+            "/api/content/items/:content_id",
+            get(routes::get_content_item),
+        )
+        .route(
+            "/api/content/items/:content_id/versions",
+            post(routes::append_content_item_version),
+        )
+        .route(
             "/api/time-series/points",
             get(routes::list_time_series_points),
         )

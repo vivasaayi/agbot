@@ -1928,6 +1928,206 @@ fn normalize_sustainability_text(value: String) -> Option<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ContentType {
+    Article,
+    Guide,
+    Post,
+}
+
+impl ContentType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentType::Article => "article",
+            ContentType::Guide => "guide",
+            ContentType::Post => "post",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentStatus {
+    Draft,
+    InReview,
+    Published,
+    Rejected,
+    Unpublished,
+}
+
+impl Default for ContentStatus {
+    fn default() -> Self {
+        ContentStatus::Draft
+    }
+}
+
+impl ContentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentStatus::Draft => "draft",
+            ContentStatus::InReview => "in_review",
+            ContentStatus::Published => "published",
+            ContentStatus::Rejected => "rejected",
+            ContentStatus::Unpublished => "unpublished",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentCreateRequest {
+    #[serde(default)]
+    pub content_id: Option<String>,
+    pub content_type: ContentType,
+    pub author_id: String,
+    pub org_id: String,
+    pub body: String,
+    #[serde(default)]
+    pub status: Option<ContentStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentEditRequest {
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentRecord {
+    pub content_id: String,
+    pub content_type: ContentType,
+    pub author_id: String,
+    pub org_id: String,
+    pub status: ContentStatus,
+    pub current_version: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentVersionRecord {
+    pub version_id: String,
+    pub content_id: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedContentRecord {
+    pub content: ContentRecord,
+    pub versions: Vec<ContentVersionRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ContentError {
+    #[error("content_id cannot be empty")]
+    EmptyContentId,
+    #[error("content author_id cannot be empty")]
+    EmptyAuthorId,
+    #[error("content org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("content version_id cannot be empty")]
+    EmptyVersionId,
+    #[error("content body cannot be empty")]
+    EmptyBody,
+    #[error("content created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("unsupported content type {value}")]
+    UnsupportedContentType { value: String },
+    #[error("unsupported content status {value}")]
+    UnsupportedContentStatus { value: String },
+}
+
+pub fn create_versioned_content(
+    request: ContentCreateRequest,
+    generated_content_id: String,
+    generated_version_id: String,
+    created_at: String,
+) -> Result<(ContentRecord, ContentVersionRecord), ContentError> {
+    let content_id = normalize_content_optional_text(request.content_id)
+        .or_else(|| normalize_content_text(generated_content_id))
+        .ok_or(ContentError::EmptyContentId)?;
+    let author_id = normalize_content_text(request.author_id).ok_or(ContentError::EmptyAuthorId)?;
+    let org_id = normalize_content_text(request.org_id).ok_or(ContentError::EmptyOrgId)?;
+    let version_id =
+        normalize_content_text(generated_version_id).ok_or(ContentError::EmptyVersionId)?;
+    let body = normalize_content_text(request.body).ok_or(ContentError::EmptyBody)?;
+    let created_at = normalize_content_text(created_at).ok_or(ContentError::EmptyCreatedAt)?;
+    let version = ContentVersionRecord {
+        version_id: version_id.clone(),
+        content_id: content_id.clone(),
+        body,
+        created_at: created_at.clone(),
+    };
+    let content = ContentRecord {
+        content_id,
+        content_type: request.content_type,
+        author_id,
+        org_id,
+        status: request.status.unwrap_or_default(),
+        current_version: version_id,
+        created_at: created_at.clone(),
+        updated_at: created_at,
+    };
+
+    Ok((content, version))
+}
+
+pub fn append_content_version(
+    content: &ContentRecord,
+    body: String,
+    generated_version_id: String,
+    created_at: String,
+) -> Result<(ContentRecord, ContentVersionRecord), ContentError> {
+    let version_id =
+        normalize_content_text(generated_version_id).ok_or(ContentError::EmptyVersionId)?;
+    let body = normalize_content_text(body).ok_or(ContentError::EmptyBody)?;
+    let created_at = normalize_content_text(created_at).ok_or(ContentError::EmptyCreatedAt)?;
+    let mut updated = content.clone();
+    updated.current_version = version_id.clone();
+    updated.updated_at = created_at.clone();
+    let version = ContentVersionRecord {
+        version_id,
+        content_id: content.content_id.clone(),
+        body,
+        created_at,
+    };
+
+    Ok((updated, version))
+}
+
+pub fn parse_content_type(value: &str) -> Result<ContentType, ContentError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "article" => Ok(ContentType::Article),
+        "guide" => Ok(ContentType::Guide),
+        "post" => Ok(ContentType::Post),
+        _ => Err(ContentError::UnsupportedContentType {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_content_status(value: &str) -> Result<ContentStatus, ContentError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "draft" => Ok(ContentStatus::Draft),
+        "in_review" => Ok(ContentStatus::InReview),
+        "published" => Ok(ContentStatus::Published),
+        "rejected" => Ok(ContentStatus::Rejected),
+        "unpublished" => Ok(ContentStatus::Unpublished),
+        _ => Err(ContentError::UnsupportedContentStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn normalize_content_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(normalize_content_text)
+}
+
+fn normalize_content_text(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FleetNodeComponentHealth {
     Ok,
     Warn,
@@ -4481,36 +4681,37 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
-        bind_fleet_node_identity, bounds_from_points, build_marketplace_account_record,
-        build_soil_moisture_reading, build_sustainability_record, compute_drought_index,
-        normalize_weather_provider_forecast, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, transition_marketplace_account_status,
-        validate_field_boundary, verify_and_apply_fleet_config_bundle,
-        weather_fetch_failure_record, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod,
-        DroughtIndexType, FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery,
-        FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
-        MarketplacePartyType, MultispectralImage, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, ReportDeliverableRegistry, ReportFormat,
-        ReportPersistenceError, ReportRecord, ReportVisibility, SceneLayerMetadataError,
-        SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError,
-        SoilMoistureReadingRequest, SoilMoistureRejectionReason, SustainabilityMetricType,
-        SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
-        TractorCommandAuditDecision, TractorCommandRejectionReason, TractorImplementRef,
-        TractorLifecycleStatus, TractorMotionCommandRequest, TractorRegistrationRequest,
-        TractorRegistry, WeatherIngestError, WeatherProviderForecastPoint,
-        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
-        WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
+        append_content_version, apply_fleet_node_heartbeat, assert_flight_operation_allowed,
+        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
+        build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
+        compute_drought_index, create_versioned_content, normalize_weather_provider_forecast,
+        sign_fleet_config_bundle, soil_moisture_rejection_record,
+        transition_marketplace_account_status, validate_field_boundary,
+        verify_and_apply_fleet_config_bundle, weather_fetch_failure_record,
+        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
+        AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeEnrollmentError,
+        FleetNodeEnrollmentRequest, FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind,
+        FleetNodeOperationError, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds,
+        GeoPoint, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+        MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, RasterResolution,
+        RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
+        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
+        RecommendationStatus, RecommendationStatusChangeType, ReportDeliverableRegistry,
+        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
+        SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
+        SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+        SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
+        TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
+        TractorRegistrationRequest, TractorRegistry, WeatherIngestError,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -5087,6 +5288,68 @@ mod tests {
                 linked_season_id: "season-2026".to_string()
             }
         );
+    }
+
+    #[test]
+    fn versioned_content_create_and_edit_advances_current_version() {
+        let (content, first_version) = create_versioned_content(
+            ContentCreateRequest {
+                content_id: Some(" article-001 ".to_string()),
+                content_type: ContentType::Article,
+                author_id: " author-001 ".to_string(),
+                org_id: " org-alpha ".to_string(),
+                body: " First draft ".to_string(),
+                status: None,
+            },
+            "generated-content".to_string(),
+            "version-001".to_string(),
+            "2026-06-13T13:00:00Z".to_string(),
+        )
+        .expect("content should create with first version");
+
+        assert_eq!(content.content_id, "article-001");
+        assert_eq!(content.content_type, ContentType::Article);
+        assert_eq!(content.author_id, "author-001");
+        assert_eq!(content.org_id, "org-alpha");
+        assert_eq!(content.status, ContentStatus::Draft);
+        assert_eq!(content.current_version, "version-001");
+        assert_eq!(first_version.content_id, content.content_id);
+        assert_eq!(first_version.body, "First draft");
+
+        let (updated, second_version) = append_content_version(
+            &content,
+            " Updated body ".to_string(),
+            "version-002".to_string(),
+            "2026-06-13T14:00:00Z".to_string(),
+        )
+        .expect("edit should append version");
+
+        assert_eq!(updated.content_id, content.content_id);
+        assert_eq!(updated.current_version, "version-002");
+        assert_eq!(updated.created_at, content.created_at);
+        assert_eq!(updated.updated_at, "2026-06-13T14:00:00Z");
+        assert_eq!(second_version.content_id, content.content_id);
+        assert_eq!(second_version.body, "Updated body");
+    }
+
+    #[test]
+    fn versioned_content_rejects_empty_body_without_record() {
+        let error = create_versioned_content(
+            ContentCreateRequest {
+                content_id: Some("article-empty".to_string()),
+                content_type: ContentType::Article,
+                author_id: "author-001".to_string(),
+                org_id: "org-alpha".to_string(),
+                body: "   ".to_string(),
+                status: None,
+            },
+            "generated-content".to_string(),
+            "version-001".to_string(),
+            "2026-06-13T13:00:00Z".to_string(),
+        )
+        .expect_err("empty body should reject");
+
+        assert_eq!(error, ContentError::EmptyBody);
     }
 
     #[test]

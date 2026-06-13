@@ -2880,6 +2880,193 @@ async fn sustainability_record_create_rejects_unknown_field_or_season_without_wr
 }
 
 #[tokio::test]
+async fn content_items_create_edit_get_list_and_deny_cross_org_read() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "content_id": "article-001",
+                        "content_type": "article",
+                        "author_id": "author-001",
+                        "org_id": "org-alpha",
+                        "body": "First draft"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = to_bytes(create.into_body(), 64 * 1024).await?;
+    let created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created
+            .pointer("/content/content_id")
+            .and_then(|value| value.as_str()),
+        Some("article-001")
+    );
+    assert_eq!(
+        created
+            .pointer("/content/current_version")
+            .and_then(|value| value.as_str()),
+        created
+            .pointer("/versions/0/version_id")
+            .and_then(|value| value.as_str())
+    );
+    assert_eq!(
+        created
+            .pointer("/versions")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let edit = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-001/versions?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "body": "Second draft with agronomy notes"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(edit.status(), StatusCode::OK);
+    let body = to_bytes(edit.into_body(), 64 * 1024).await?;
+    let edited: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        edited
+            .pointer("/versions")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        edited
+            .pointer("/content/current_version")
+            .and_then(|value| value.as_str()),
+        edited
+            .pointer("/versions/1/version_id")
+            .and_then(|value| value.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-001?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = to_bytes(get.into_body(), 64 * 1024).await?;
+    let fetched: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        fetched
+            .pointer("/versions")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(items.len(), 1);
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-001?org_id=org-beta")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_item_create_rejects_empty_body_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "content_id": "article-empty",
+                        "content_type": "article",
+                        "author_id": "author-001",
+                        "org_id": "org-alpha",
+                        "body": "   "
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::BAD_REQUEST);
+
+    let content_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cms_contents")
+        .fetch_one(&ctx.pool)
+        .await?;
+    let version_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cms_content_versions")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(content_count, 0);
+    assert_eq!(version_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
