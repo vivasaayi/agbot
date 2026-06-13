@@ -2,19 +2,22 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: ee89fba3d299d54a6e4922c59cbe669a1140fb7a (`batch-02-06`)
-- **Latest checkpoint commit**: 04d2eed3cce1fa14c3d179a83059e99e1d0d184c (`batch-02-04` metadata; `batch-02-06` checkpoint pending)
+- **Last implementation commit**: 134f68babaf553849e3804f6ed29f32339b071a9 (`batch-02-07`)
+- **Latest checkpoint commit**: 6f5b845b135764cbd83232f265cdf6a050635912 (`batch-02-06` metadata; `batch-02-07` checkpoint pending)
 - **Current batch**: none
-- **Completed feature rows**: 222 committed; 1 blocked; 275 pending rows remain in the full-roadmap inventory
+- **Completed feature rows**: 223 committed; 1 blocked; 274 pending rows remain in the full-roadmap inventory
 - **Blocker**: STORY `07-11` is blocked on the documented storage-authority confirmation question.
 
 ## Latest verification
 
-- `just flight-sim-build` — pass
-- `just flight-sim-test` — pass with `agbot_flight_sim_tests` 1/1
-- `cargo test -p imagery_processor spatial_ref` — pass with 4 spatial-ref pipeline tests
+- `cargo fmt` — pass
+- `cargo test -p data_collector simulated_capture` — pass with 6 simulated capture tests
+- `cargo test -p data_collector` — pass with 38 unit tests and 0 doc tests; existing `auto_export` warning observed
+- `cargo check -p data_collector` — pass with existing `auto_export` warning
+- `cargo check` — pass with existing warnings in `mission_planner`, `post_processor`, `multi_drone_control`, and `data_collector`
+- `cargo fmt --check` — pass
 - `git diff --check` — pass
-- Independent verifier: `Aristotle` read-only survey confirmed terrain/georef primitives and recommended the implemented shared `RasterSpatialRef` JSON shape
+- Independent verifier: `Carson` read-only survey confirmed `data_collector` is the correct ingestion surface and recommended the implemented `flight_sim_cpp` JSON parser coverage
 
 ## Next action
 
