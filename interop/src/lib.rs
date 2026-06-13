@@ -10,6 +10,15 @@ const WGS84: &str = "EPSG:4326";
 const WEB_MERCATOR: &str = "EPSG:3857";
 const WEB_MERCATOR_RADIUS_METERS: f64 = 6_378_137.0;
 const GEOTIFF_METADATA_MAGIC: &[u8] = b"AGBOT-GEOTIFF-METADATA-V1\n";
+const SHAPEFILE_HEADER_BYTES: usize = 100;
+const ESRI_FILE_CODE: i32 = 9994;
+const SHAPEFILE_VERSION: i32 = 1000;
+const SHAPE_TYPE_POLYGON: i32 = 5;
+const PRESCRIPTION_RATE_ATTRIBUTE: &str = "RATE";
+const PRESCRIPTION_UNIT_ATTRIBUTE: &str = "UNIT";
+const PRESCRIPTION_RATE_FIELD_WIDTH: u8 = 18;
+const PRESCRIPTION_RATE_DECIMALS: u8 = 6;
+const GEOMETRY_EPSILON: f64 = 1e-9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,6 +149,59 @@ pub struct FieldBoundaryImportReport {
     pub feature_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrescriptionField {
+    pub field_id: String,
+    pub crs: String,
+    pub boundary: Vec<InteropCoordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrescriptionZone {
+    pub zone_id: String,
+    pub polygon: Vec<InteropCoordinate>,
+    pub crs: String,
+    pub rate: f64,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrescriptionShapefileRequest {
+    pub prescription_id: String,
+    pub field: PrescriptionField,
+    pub zones: Vec<PrescriptionZone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrescriptionShapefileFiles {
+    pub shp: Vec<u8>,
+    pub shx: Vec<u8>,
+    pub dbf: Vec<u8>,
+    pub prj: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrescriptionShapefileReport {
+    pub prescription_id: String,
+    pub field_id: String,
+    pub field_crs: String,
+    pub extent: InteropExtent,
+    pub zone_count: usize,
+    pub rate_attribute: String,
+    pub unit_attribute: String,
+    pub files: PrescriptionShapefileFiles,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct NormalizedPrescriptionZone {
+    zone_id: String,
+    polygon: Vec<InteropCoordinate>,
+    extent: InteropExtent,
+    area: f64,
+    rate: f64,
+    unit: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldBoundaryRejectionReason {
@@ -149,6 +211,39 @@ pub enum FieldBoundaryRejectionReason {
     RingNotClosed,
     SelfIntersection,
     EmptyArea,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescriptionRejectionReason {
+    EmptyPrescriptionId,
+    EmptyFieldId,
+    EmptyCrs,
+    EmptyZoneSet,
+    EmptyZoneId,
+    EmptyUnit {
+        zone_id: String,
+    },
+    InvalidRate {
+        zone_id: String,
+    },
+    InvalidFieldGeometry,
+    InvalidZoneGeometry {
+        zone_id: String,
+    },
+    CrsMismatch {
+        zone_id: String,
+        expected_crs: String,
+        actual_crs: String,
+    },
+    ZoneOutsideField {
+        zone_id: String,
+    },
+    OverlappingZones {
+        left_zone_id: String,
+        right_zone_id: String,
+    },
+    ZoneCoverageGap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +269,9 @@ pub enum InteropRejectionReason {
     InvalidRasterCells,
     InvalidFieldBoundary {
         reason: FieldBoundaryRejectionReason,
+    },
+    InvalidPrescription {
+        reason: PrescriptionRejectionReason,
     },
 }
 
@@ -432,6 +530,65 @@ pub fn import_field_boundary(
     })
 }
 
+pub fn export_prescription_shapefile(
+    request: PrescriptionShapefileRequest,
+) -> Result<PrescriptionShapefileReport, InteropError> {
+    let filename = normalized_filename(request.prescription_id.clone());
+    let prescription_id =
+        normalize_prescription_text(&request.prescription_id).ok_or_else(|| {
+            prescription_rejected(&filename, PrescriptionRejectionReason::EmptyPrescriptionId)
+        })?;
+    let field_id = normalize_prescription_text(&request.field.field_id).ok_or_else(|| {
+        prescription_rejected(&filename, PrescriptionRejectionReason::EmptyFieldId)
+    })?;
+    let field_crs = normalize_crs(&request.field.crs)
+        .ok_or_else(|| prescription_rejected(&filename, PrescriptionRejectionReason::EmptyCrs))?;
+    let field_boundary = normalize_prescription_ring(&request.field.boundary).ok_or_else(|| {
+        prescription_rejected(&filename, PrescriptionRejectionReason::InvalidFieldGeometry)
+    })?;
+    let field_extent = extent_from_coordinates(&field_boundary).ok_or_else(|| {
+        prescription_rejected(&filename, PrescriptionRejectionReason::InvalidFieldGeometry)
+    })?;
+    let field_area = polygon_area(&field_boundary);
+    if field_area <= GEOMETRY_EPSILON || ring_self_intersects_coordinates(&field_boundary) {
+        return Err(prescription_rejected(
+            &filename,
+            PrescriptionRejectionReason::InvalidFieldGeometry,
+        ));
+    }
+    if request.zones.is_empty() {
+        return Err(prescription_rejected(
+            &filename,
+            PrescriptionRejectionReason::EmptyZoneSet,
+        ));
+    }
+
+    let mut zones = Vec::with_capacity(request.zones.len());
+    for zone in request.zones {
+        zones.push(normalize_prescription_zone(
+            &filename,
+            zone,
+            &field_crs,
+            &field_boundary,
+            field_extent,
+        )?);
+    }
+    assert_prescription_zones_do_not_overlap(&filename, &zones)?;
+    assert_prescription_zones_tile_field(&filename, field_area, &zones)?;
+
+    let files = write_prescription_shapefile_bundle(&field_crs, field_extent, &zones);
+    Ok(PrescriptionShapefileReport {
+        prescription_id,
+        field_id,
+        field_crs,
+        extent: field_extent,
+        zone_count: zones.len(),
+        rate_attribute: PRESCRIPTION_RATE_ATTRIBUTE.to_string(),
+        unit_attribute: PRESCRIPTION_UNIT_ATTRIBUTE.to_string(),
+        files,
+    })
+}
+
 fn export_geojson(imported: &InteropImportResult) -> Result<Vec<u8>, InteropError> {
     let features = imported
         .features
@@ -574,6 +731,648 @@ impl From<FieldBoundaryValidationError> for FieldBoundaryRejectionReason {
             FieldBoundaryValidationError::EmptyArea => Self::EmptyArea,
         }
     }
+}
+
+fn normalize_prescription_zone(
+    filename: &str,
+    zone: PrescriptionZone,
+    field_crs: &str,
+    field_boundary: &[InteropCoordinate],
+    field_extent: InteropExtent,
+) -> Result<NormalizedPrescriptionZone, InteropError> {
+    let zone_id = normalize_prescription_text(&zone.zone_id)
+        .ok_or_else(|| prescription_rejected(filename, PrescriptionRejectionReason::EmptyZoneId))?;
+    let zone_crs = normalize_crs(&zone.crs)
+        .ok_or_else(|| prescription_rejected(filename, PrescriptionRejectionReason::EmptyCrs))?;
+    if zone_crs != field_crs {
+        return Err(prescription_rejected(
+            filename,
+            PrescriptionRejectionReason::CrsMismatch {
+                zone_id,
+                expected_crs: field_crs.to_string(),
+                actual_crs: zone_crs,
+            },
+        ));
+    }
+    let unit = normalize_prescription_text(&zone.unit).ok_or_else(|| {
+        prescription_rejected(
+            filename,
+            PrescriptionRejectionReason::EmptyUnit {
+                zone_id: zone_id.clone(),
+            },
+        )
+    })?;
+    if !zone.rate.is_finite() || zone.rate < 0.0 {
+        return Err(prescription_rejected(
+            filename,
+            PrescriptionRejectionReason::InvalidRate {
+                zone_id: zone_id.clone(),
+            },
+        ));
+    }
+    let polygon = normalize_prescription_ring(&zone.polygon).ok_or_else(|| {
+        prescription_rejected(
+            filename,
+            PrescriptionRejectionReason::InvalidZoneGeometry {
+                zone_id: zone_id.clone(),
+            },
+        )
+    })?;
+    let extent = extent_from_coordinates(&polygon).ok_or_else(|| {
+        prescription_rejected(
+            filename,
+            PrescriptionRejectionReason::InvalidZoneGeometry {
+                zone_id: zone_id.clone(),
+            },
+        )
+    })?;
+    let area = polygon_area(&polygon);
+    if area <= GEOMETRY_EPSILON || ring_self_intersects_coordinates(&polygon) {
+        return Err(prescription_rejected(
+            filename,
+            PrescriptionRejectionReason::InvalidZoneGeometry {
+                zone_id: zone_id.clone(),
+            },
+        ));
+    }
+    if !rate_fits_dbf(zone.rate) {
+        return Err(prescription_rejected(
+            filename,
+            PrescriptionRejectionReason::InvalidRate {
+                zone_id: zone_id.clone(),
+            },
+        ));
+    }
+    if !extent_within(extent, field_extent)
+        || !polygon_inside_or_on_polygon(&polygon, field_boundary)
+    {
+        return Err(prescription_rejected(
+            filename,
+            PrescriptionRejectionReason::ZoneOutsideField {
+                zone_id: zone_id.clone(),
+            },
+        ));
+    }
+
+    Ok(NormalizedPrescriptionZone {
+        zone_id,
+        polygon,
+        extent,
+        area,
+        rate: zone.rate,
+        unit,
+    })
+}
+
+fn assert_prescription_zones_do_not_overlap(
+    filename: &str,
+    zones: &[NormalizedPrescriptionZone],
+) -> Result<(), InteropError> {
+    for left_index in 0..zones.len() {
+        for right_index in (left_index + 1)..zones.len() {
+            let left = &zones[left_index];
+            let right = &zones[right_index];
+            if extents_have_positive_overlap(left.extent, right.extent)
+                && (polygons_overlap(&left.polygon, &right.polygon)
+                    || extent_overlap_center_inside_both(left, right))
+            {
+                return Err(prescription_rejected(
+                    filename,
+                    PrescriptionRejectionReason::OverlappingZones {
+                        left_zone_id: left.zone_id.clone(),
+                        right_zone_id: right.zone_id.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assert_prescription_zones_tile_field(
+    filename: &str,
+    field_area: f64,
+    zones: &[NormalizedPrescriptionZone],
+) -> Result<(), InteropError> {
+    let zone_area = zones.iter().map(|zone| zone.area).sum::<f64>();
+    let tolerance = GEOMETRY_EPSILON.max(field_area.abs() * 1e-9);
+    if (zone_area - field_area).abs() > tolerance {
+        return Err(prescription_rejected(
+            filename,
+            PrescriptionRejectionReason::ZoneCoverageGap,
+        ));
+    }
+    Ok(())
+}
+
+fn write_prescription_shapefile_bundle(
+    crs: &str,
+    extent: InteropExtent,
+    zones: &[NormalizedPrescriptionZone],
+) -> PrescriptionShapefileFiles {
+    let record_contents = zones
+        .iter()
+        .map(|zone| polygon_shapefile_record_content(&zone.polygon, zone.extent))
+        .collect::<Vec<_>>();
+    PrescriptionShapefileFiles {
+        shp: write_shp_bytes(extent, &record_contents),
+        shx: write_shx_bytes(extent, &record_contents),
+        dbf: write_prescription_dbf(zones),
+        prj: projection_wkt(crs).into_bytes(),
+    }
+}
+
+fn write_shp_bytes(extent: InteropExtent, record_contents: &[Vec<u8>]) -> Vec<u8> {
+    let file_len_bytes = SHAPEFILE_HEADER_BYTES
+        + record_contents
+            .iter()
+            .map(|content| 8 + content.len())
+            .sum::<usize>();
+    let mut bytes = shapefile_header(extent, file_len_bytes);
+    for (index, content) in record_contents.iter().enumerate() {
+        bytes.extend_from_slice(&((index as i32) + 1).to_be_bytes());
+        bytes.extend_from_slice(&((content.len() / 2) as i32).to_be_bytes());
+        bytes.extend_from_slice(content);
+    }
+    bytes
+}
+
+fn write_shx_bytes(extent: InteropExtent, record_contents: &[Vec<u8>]) -> Vec<u8> {
+    let file_len_bytes = SHAPEFILE_HEADER_BYTES + record_contents.len() * 8;
+    let mut bytes = shapefile_header(extent, file_len_bytes);
+    let mut record_offset_words = (SHAPEFILE_HEADER_BYTES / 2) as i32;
+    for content in record_contents {
+        let content_len_words = (content.len() / 2) as i32;
+        bytes.extend_from_slice(&record_offset_words.to_be_bytes());
+        bytes.extend_from_slice(&content_len_words.to_be_bytes());
+        record_offset_words += 4 + content_len_words;
+    }
+    bytes
+}
+
+fn shapefile_header(extent: InteropExtent, file_len_bytes: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; SHAPEFILE_HEADER_BYTES];
+    bytes[0..4].copy_from_slice(&ESRI_FILE_CODE.to_be_bytes());
+    bytes[24..28].copy_from_slice(&((file_len_bytes / 2) as i32).to_be_bytes());
+    bytes[28..32].copy_from_slice(&SHAPEFILE_VERSION.to_le_bytes());
+    bytes[32..36].copy_from_slice(&SHAPE_TYPE_POLYGON.to_le_bytes());
+    bytes[36..44].copy_from_slice(&extent.min_x.to_le_bytes());
+    bytes[44..52].copy_from_slice(&extent.min_y.to_le_bytes());
+    bytes[52..60].copy_from_slice(&extent.max_x.to_le_bytes());
+    bytes[60..68].copy_from_slice(&extent.max_y.to_le_bytes());
+    bytes
+}
+
+fn polygon_shapefile_record_content(
+    polygon: &[InteropCoordinate],
+    extent: InteropExtent,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(44 + polygon.len() * 16);
+    bytes.extend_from_slice(&SHAPE_TYPE_POLYGON.to_le_bytes());
+    bytes.extend_from_slice(&extent.min_x.to_le_bytes());
+    bytes.extend_from_slice(&extent.min_y.to_le_bytes());
+    bytes.extend_from_slice(&extent.max_x.to_le_bytes());
+    bytes.extend_from_slice(&extent.max_y.to_le_bytes());
+    bytes.extend_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&(polygon.len() as i32).to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    for coordinate in polygon {
+        bytes.extend_from_slice(&coordinate.x.to_le_bytes());
+        bytes.extend_from_slice(&coordinate.y.to_le_bytes());
+    }
+    bytes
+}
+
+fn write_prescription_dbf(zones: &[NormalizedPrescriptionZone]) -> Vec<u8> {
+    let fields = [
+        DbfField::character("ZONE_ID", 32),
+        DbfField::numeric(
+            PRESCRIPTION_RATE_ATTRIBUTE,
+            PRESCRIPTION_RATE_FIELD_WIDTH,
+            PRESCRIPTION_RATE_DECIMALS,
+        ),
+        DbfField::character(PRESCRIPTION_UNIT_ATTRIBUTE, 16),
+    ];
+    let header_len = 32 + fields.len() * 32 + 1;
+    let record_len = 1 + fields
+        .iter()
+        .map(|field| field.length as usize)
+        .sum::<usize>();
+    let mut bytes = vec![0u8; 32];
+    bytes[0] = 0x03;
+    bytes[1] = 126;
+    bytes[2] = 6;
+    bytes[3] = 13;
+    bytes[4..8].copy_from_slice(&(zones.len() as u32).to_le_bytes());
+    bytes[8..10].copy_from_slice(&(header_len as u16).to_le_bytes());
+    bytes[10..12].copy_from_slice(&(record_len as u16).to_le_bytes());
+    for field in &fields {
+        bytes.extend_from_slice(&field.descriptor());
+    }
+    bytes.push(0x0D);
+
+    for zone in zones {
+        bytes.push(b' ');
+        bytes.extend_from_slice(&dbf_character_value(&zone.zone_id, fields[0].length));
+        bytes.extend_from_slice(&dbf_numeric_value(
+            zone.rate,
+            fields[1].length,
+            fields[1].decimal_count,
+        ));
+        bytes.extend_from_slice(&dbf_character_value(&zone.unit, fields[2].length));
+    }
+    bytes.push(0x1A);
+    bytes
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DbfField {
+    name: &'static str,
+    field_type: u8,
+    length: u8,
+    decimal_count: u8,
+}
+
+impl DbfField {
+    fn character(name: &'static str, length: u8) -> Self {
+        Self {
+            name,
+            field_type: b'C',
+            length,
+            decimal_count: 0,
+        }
+    }
+
+    fn numeric(name: &'static str, length: u8, decimal_count: u8) -> Self {
+        Self {
+            name,
+            field_type: b'N',
+            length,
+            decimal_count,
+        }
+    }
+
+    fn descriptor(self) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        let name = self.name.as_bytes();
+        let name_len = name.len().min(11);
+        bytes[0..name_len].copy_from_slice(&name[0..name_len]);
+        bytes[11] = self.field_type;
+        bytes[16] = self.length;
+        bytes[17] = self.decimal_count;
+        bytes
+    }
+}
+
+fn dbf_character_value(value: &str, width: u8) -> Vec<u8> {
+    let width = width as usize;
+    let mut bytes = vec![b' '; width];
+    let value = value.as_bytes();
+    let len = value.len().min(width);
+    bytes[0..len].copy_from_slice(&value[0..len]);
+    bytes
+}
+
+fn dbf_numeric_value(value: f64, width: u8, decimals: u8) -> Vec<u8> {
+    let width = width as usize;
+    let decimals = decimals as usize;
+    let rendered = format!(
+        "{value:>width$.decimals$}",
+        width = width,
+        decimals = decimals
+    );
+    if rendered.len() > width {
+        return vec![b'*'; width];
+    }
+    let mut bytes = vec![b' '; width];
+    let start = width - rendered.len();
+    bytes[start..].copy_from_slice(rendered.as_bytes());
+    bytes
+}
+
+fn rate_fits_dbf(rate: f64) -> bool {
+    format!(
+        "{rate:.decimals$}",
+        decimals = PRESCRIPTION_RATE_DECIMALS as usize
+    )
+    .len()
+        <= PRESCRIPTION_RATE_FIELD_WIDTH as usize
+}
+
+fn projection_wkt(crs: &str) -> String {
+    match crs {
+        WGS84 => "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433],AUTHORITY[\"EPSG\",\"4326\"]]".to_string(),
+        WEB_MERCATOR => "PROJCS[\"WGS 84 / Pseudo-Mercator\",GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Mercator_1SP\"],PARAMETER[\"central_meridian\",0],PARAMETER[\"scale_factor\",1],PARAMETER[\"false_easting\",0],PARAMETER[\"false_northing\",0],UNIT[\"metre\",1],AUTHORITY[\"EPSG\",\"3857\"]]".to_string(),
+        _ => epsg_utm_wkt(crs).unwrap_or_else(|| {
+            let code = crs.strip_prefix("EPSG:").unwrap_or(crs);
+            format!("PROJCS[\"{crs}\",AUTHORITY[\"EPSG\",\"{code}\"]]")
+        }),
+    }
+}
+
+fn epsg_utm_wkt(crs: &str) -> Option<String> {
+    let code = crs.strip_prefix("EPSG:")?.parse::<i32>().ok()?;
+    let (hemisphere, zone, false_northing) = if (32601..=32660).contains(&code) {
+        ("N", code - 32600, 0)
+    } else if (32701..=32760).contains(&code) {
+        ("S", code - 32700, 10_000_000)
+    } else {
+        return None;
+    };
+    let central_meridian = zone * 6 - 183;
+    Some(format!(
+        "PROJCS[\"WGS 84 / UTM zone {zone}{hemisphere}\",GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",{central_meridian}],PARAMETER[\"scale_factor\",0.9996],PARAMETER[\"false_easting\",500000],PARAMETER[\"false_northing\",{false_northing}],UNIT[\"metre\",1],AUTHORITY[\"EPSG\",\"{code}\"]]"
+    ))
+}
+
+fn normalize_prescription_text(value: &str) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn normalize_prescription_ring(points: &[InteropCoordinate]) -> Option<Vec<InteropCoordinate>> {
+    if points.len() < 4
+        || points
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    {
+        return None;
+    }
+    if !same_coordinate(
+        *points.first().expect("points length checked"),
+        *points.last().expect("points length checked"),
+    ) {
+        return None;
+    }
+    Some(clockwise_ring(points))
+}
+
+fn extent_from_coordinates(points: &[InteropCoordinate]) -> Option<InteropExtent> {
+    let mut builder = ExtentBuilder::default();
+    for point in points {
+        builder.observe(*point);
+    }
+    builder.finish()
+}
+
+fn extent_within(inner: InteropExtent, outer: InteropExtent) -> bool {
+    inner.min_x >= outer.min_x - GEOMETRY_EPSILON
+        && inner.min_y >= outer.min_y - GEOMETRY_EPSILON
+        && inner.max_x <= outer.max_x + GEOMETRY_EPSILON
+        && inner.max_y <= outer.max_y + GEOMETRY_EPSILON
+}
+
+fn extents_have_positive_overlap(left: InteropExtent, right: InteropExtent) -> bool {
+    left.min_x < right.max_x - GEOMETRY_EPSILON
+        && left.max_x > right.min_x + GEOMETRY_EPSILON
+        && left.min_y < right.max_y - GEOMETRY_EPSILON
+        && left.max_y > right.min_y + GEOMETRY_EPSILON
+}
+
+fn extent_overlap_center_inside_both(
+    left: &NormalizedPrescriptionZone,
+    right: &NormalizedPrescriptionZone,
+) -> bool {
+    let overlap = InteropCoordinate {
+        x: (left.extent.min_x.max(right.extent.min_x) + left.extent.max_x.min(right.extent.max_x))
+            * 0.5,
+        y: (left.extent.min_y.max(right.extent.min_y) + left.extent.max_y.min(right.extent.max_y))
+            * 0.5,
+    };
+    point_strictly_inside_polygon(overlap, &left.polygon)
+        && point_strictly_inside_polygon(overlap, &right.polygon)
+}
+
+fn polygon_area(points: &[InteropCoordinate]) -> f64 {
+    signed_polygon_area(points).abs()
+}
+
+fn signed_polygon_area(points: &[InteropCoordinate]) -> f64 {
+    points
+        .windows(2)
+        .map(|window| window[0].x * window[1].y - window[1].x * window[0].y)
+        .sum::<f64>()
+        * 0.5
+}
+
+fn clockwise_ring(points: &[InteropCoordinate]) -> Vec<InteropCoordinate> {
+    let mut ring = points
+        .iter()
+        .take(points.len().saturating_sub(1))
+        .copied()
+        .collect::<Vec<_>>();
+    if signed_polygon_area(points) > 0.0 {
+        ring.reverse();
+    }
+    if let Some(first) = ring.first().copied() {
+        ring.push(first);
+    }
+    ring
+}
+
+fn polygons_overlap(left: &[InteropCoordinate], right: &[InteropCoordinate]) -> bool {
+    left.iter()
+        .take(left.len().saturating_sub(1))
+        .any(|point| point_strictly_inside_polygon(*point, right))
+        || right
+            .iter()
+            .take(right.len().saturating_sub(1))
+            .any(|point| point_strictly_inside_polygon(*point, left))
+        || point_strictly_inside_polygon(polygon_centroid(left), right)
+        || point_strictly_inside_polygon(polygon_centroid(right), left)
+        || rings_have_proper_intersection(left, right)
+}
+
+fn polygon_inside_or_on_polygon(inner: &[InteropCoordinate], outer: &[InteropCoordinate]) -> bool {
+    inner
+        .iter()
+        .all(|coordinate| point_in_or_on_polygon(*coordinate, outer))
+        && inner
+            .windows(2)
+            .all(|segment| segment_inside_or_on_polygon(segment[0], segment[1], outer))
+}
+
+fn segment_inside_or_on_polygon(
+    start: InteropCoordinate,
+    end: InteropCoordinate,
+    polygon: &[InteropCoordinate],
+) -> bool {
+    let midpoint = InteropCoordinate {
+        x: (start.x + end.x) * 0.5,
+        y: (start.y + end.y) * 0.5,
+    };
+    point_in_or_on_polygon(midpoint, polygon)
+        && !polygon
+            .windows(2)
+            .any(|segment| segments_properly_intersect(start, end, segment[0], segment[1]))
+}
+
+fn point_in_or_on_polygon(point: InteropCoordinate, polygon: &[InteropCoordinate]) -> bool {
+    point_on_polygon_boundary(point, polygon) || point_strictly_inside_polygon(point, polygon)
+}
+
+fn point_strictly_inside_polygon(point: InteropCoordinate, polygon: &[InteropCoordinate]) -> bool {
+    if point_on_polygon_boundary(point, polygon) {
+        return false;
+    }
+    let mut inside = false;
+    for segment in polygon.windows(2) {
+        let a = segment[0];
+        let b = segment[1];
+        let crosses = (a.y > point.y) != (b.y > point.y);
+        if crosses {
+            let intersection_x = (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x;
+            if point.x < intersection_x {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn point_on_polygon_boundary(point: InteropCoordinate, polygon: &[InteropCoordinate]) -> bool {
+    polygon
+        .windows(2)
+        .any(|segment| point_on_segment_coordinates(segment[0], point, segment[1]))
+}
+
+fn polygon_centroid(points: &[InteropCoordinate]) -> InteropCoordinate {
+    let unique = points.len().saturating_sub(1).max(1);
+    let (sum_x, sum_y) = points
+        .iter()
+        .take(unique)
+        .fold((0.0, 0.0), |(sum_x, sum_y), point| {
+            (sum_x + point.x, sum_y + point.y)
+        });
+    InteropCoordinate {
+        x: sum_x / unique as f64,
+        y: sum_y / unique as f64,
+    }
+}
+
+fn ring_self_intersects_coordinates(points: &[InteropCoordinate]) -> bool {
+    let segment_count = points.len().saturating_sub(1);
+    for left in 0..segment_count {
+        for right in (left + 1)..segment_count {
+            if segments_share_ring_vertex(left, right, segment_count) {
+                continue;
+            }
+            if segments_intersect_coordinates(
+                points[left],
+                points[left + 1],
+                points[right],
+                points[right + 1],
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn rings_have_proper_intersection(left: &[InteropCoordinate], right: &[InteropCoordinate]) -> bool {
+    for left_segment in left.windows(2) {
+        for right_segment in right.windows(2) {
+            if segments_properly_intersect(
+                left_segment[0],
+                left_segment[1],
+                right_segment[0],
+                right_segment[1],
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn segments_intersect_coordinates(
+    a: InteropCoordinate,
+    b: InteropCoordinate,
+    c: InteropCoordinate,
+    d: InteropCoordinate,
+) -> bool {
+    let o1 = orientation_coordinates(a, b, c);
+    let o2 = orientation_coordinates(a, b, d);
+    let o3 = orientation_coordinates(c, d, a);
+    let o4 = orientation_coordinates(c, d, b);
+
+    if orientation_sign(o1) != orientation_sign(o2) && orientation_sign(o3) != orientation_sign(o4)
+    {
+        return true;
+    }
+
+    (orientation_is_colinear(o1) && point_on_segment_coordinates(a, c, b))
+        || (orientation_is_colinear(o2) && point_on_segment_coordinates(a, d, b))
+        || (orientation_is_colinear(o3) && point_on_segment_coordinates(c, a, d))
+        || (orientation_is_colinear(o4) && point_on_segment_coordinates(c, b, d))
+}
+
+fn segments_properly_intersect(
+    a: InteropCoordinate,
+    b: InteropCoordinate,
+    c: InteropCoordinate,
+    d: InteropCoordinate,
+) -> bool {
+    let o1 = orientation_coordinates(a, b, c);
+    let o2 = orientation_coordinates(a, b, d);
+    let o3 = orientation_coordinates(c, d, a);
+    let o4 = orientation_coordinates(c, d, b);
+    orientation_sign(o1) != 0
+        && orientation_sign(o2) != 0
+        && orientation_sign(o3) != 0
+        && orientation_sign(o4) != 0
+        && orientation_sign(o1) != orientation_sign(o2)
+        && orientation_sign(o3) != orientation_sign(o4)
+}
+
+fn orientation_coordinates(
+    a: InteropCoordinate,
+    b: InteropCoordinate,
+    c: InteropCoordinate,
+) -> f64 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+fn orientation_sign(value: f64) -> i8 {
+    if orientation_is_colinear(value) {
+        0
+    } else if value > 0.0 {
+        1
+    } else {
+        -1
+    }
+}
+
+fn orientation_is_colinear(value: f64) -> bool {
+    value.abs() <= GEOMETRY_EPSILON
+}
+
+fn segments_share_ring_vertex(left: usize, right: usize, segment_count: usize) -> bool {
+    left == right || left + 1 == right || (left == 0 && right + 1 == segment_count)
+}
+
+fn point_on_segment_coordinates(
+    start: InteropCoordinate,
+    point: InteropCoordinate,
+    end: InteropCoordinate,
+) -> bool {
+    orientation_is_colinear(orientation_coordinates(start, end, point))
+        && point.x >= start.x.min(end.x) - GEOMETRY_EPSILON
+        && point.x <= start.x.max(end.x) + GEOMETRY_EPSILON
+        && point.y >= start.y.min(end.y) - GEOMETRY_EPSILON
+        && point.y <= start.y.max(end.y) + GEOMETRY_EPSILON
+}
+
+fn same_coordinate(left: InteropCoordinate, right: InteropCoordinate) -> bool {
+    (left.x - right.x).abs() <= GEOMETRY_EPSILON && (left.y - right.y).abs() <= GEOMETRY_EPSILON
+}
+
+fn prescription_rejected(filename: &str, reason: PrescriptionRejectionReason) -> InteropError {
+    rejected(
+        filename,
+        InteropRejectionReason::InvalidPrescription { reason },
+    )
 }
 
 fn parse_geojson_and_reproject(
@@ -871,10 +1670,12 @@ impl ExtentBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_raster_geotiff, import_field_boundary, reopen_raster_geotiff,
-        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
-        CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason, ImportFormat,
-        ImportPayload, InteropError, InteropRejectionReason, RasterProduct, ReprojectedGeometry,
+        export_prescription_shapefile, export_raster_geotiff, import_field_boundary,
+        reopen_raster_geotiff, round_trip_vector_layer, validate_and_reproject_import,
+        validate_geopackage_layers, CrsTransform, FieldBoundaryImportRequest,
+        FieldBoundaryRejectionReason, ImportFormat, ImportPayload, InteropCoordinate, InteropError,
+        InteropExtent, InteropRejectionReason, PrescriptionField, PrescriptionRejectionReason,
+        PrescriptionShapefileRequest, PrescriptionZone, RasterProduct, ReprojectedGeometry,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -1116,6 +1917,284 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn prescription_shapefile_exports_zone_rates_in_field_crs() {
+        let report = export_prescription_shapefile(prescription_request())
+            .expect("aligned prescription zones should export");
+
+        assert_eq!(report.prescription_id, "rx-alpha-2026");
+        assert_eq!(report.field_id, "field-alpha");
+        assert_eq!(report.field_crs, "EPSG:32614");
+        assert_eq!(report.zone_count, 2);
+        assert_eq!(report.rate_attribute, "RATE");
+        assert_eq!(report.unit_attribute, "UNIT");
+        assert_eq!(
+            report.extent,
+            InteropExtent {
+                min_x: 500_000.0,
+                min_y: 4_499_980.0,
+                max_x: 500_020.0,
+                max_y: 4_500_000.0,
+            }
+        );
+        assert_eq!(&report.files.shp[0..4], &9994i32.to_be_bytes());
+        assert_eq!(&report.files.shx[0..4], &9994i32.to_be_bytes());
+        assert_shapefile_bundle_consistent(&report.files, 2);
+        let first_polygon = first_shp_polygon(&report.files.shp);
+        assert!(signed_area_for_test(&first_polygon) < 0.0);
+        assert_eq!(dbf_record_count(&report.files.dbf), 2);
+        let dbf_text = String::from_utf8_lossy(&report.files.dbf);
+        assert!(dbf_text.contains("zone-west"));
+        assert!(dbf_text.contains("zone-east"));
+        assert!(dbf_text.contains("32.500000"));
+        assert!(dbf_text.contains("12.250000"));
+        assert!(dbf_text.contains("kg_ha"));
+        let prj_text = String::from_utf8(report.files.prj).expect("prj should be utf8");
+        assert!(prj_text.contains("32614"));
+    }
+
+    #[test]
+    fn prescription_shapefile_refuses_overlapping_zones() {
+        let mut request = prescription_request();
+        request.zones[0].polygon = rectangle(500_000.0, 4_499_980.0, 500_014.0, 4_500_000.0);
+        request.zones[1].polygon = rectangle(500_010.0, 4_499_980.0, 500_020.0, 4_500_000.0);
+
+        let error =
+            export_prescription_shapefile(request).expect_err("overlap should refuse export");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "rx-alpha-2026".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::OverlappingZones {
+                        left_zone_id: "zone-west".to_string(),
+                        right_zone_id: "zone-east".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn prescription_shapefile_refuses_coverage_gap() {
+        let mut request = prescription_request();
+        request.zones.pop();
+
+        let error = export_prescription_shapefile(request)
+            .expect_err("zones that do not tile the field should refuse export");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "rx-alpha-2026".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::ZoneCoverageGap
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn prescription_shapefile_refuses_zone_edge_that_leaves_concave_field() {
+        let request = PrescriptionShapefileRequest {
+            prescription_id: "rx-concave".to_string(),
+            field: PrescriptionField {
+                field_id: "field-concave".to_string(),
+                crs: "EPSG:32614".to_string(),
+                boundary: vec![
+                    InteropCoordinate { x: 0.0, y: 4.0 },
+                    InteropCoordinate { x: 2.0, y: 4.0 },
+                    InteropCoordinate { x: 2.0, y: 2.0 },
+                    InteropCoordinate { x: 4.0, y: 2.0 },
+                    InteropCoordinate { x: 4.0, y: 0.0 },
+                    InteropCoordinate { x: 0.0, y: 0.0 },
+                    InteropCoordinate { x: 0.0, y: 4.0 },
+                ],
+            },
+            zones: vec![PrescriptionZone {
+                zone_id: "zone-diagonal".to_string(),
+                polygon: vec![
+                    InteropCoordinate { x: 0.0, y: 4.0 },
+                    InteropCoordinate { x: 4.0, y: 2.0 },
+                    InteropCoordinate { x: 4.0, y: 0.0 },
+                    InteropCoordinate { x: 0.0, y: 0.0 },
+                    InteropCoordinate { x: 0.0, y: 4.0 },
+                ],
+                crs: "EPSG:32614".to_string(),
+                rate: 20.0,
+                unit: "kg_ha".to_string(),
+            }],
+        };
+
+        let error = export_prescription_shapefile(request)
+            .expect_err("edge crossing outside concave field should refuse export");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "rx-concave".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::ZoneOutsideField {
+                        zone_id: "zone-diagonal".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn prescription_shapefile_refuses_rate_that_cannot_fit_dbf_field() {
+        let mut request = prescription_request();
+        request.zones[0].rate = 1_000_000_000_000.0;
+
+        let error =
+            export_prescription_shapefile(request).expect_err("oversized rate should be refused");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "rx-alpha-2026".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::InvalidRate {
+                        zone_id: "zone-west".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn prescription_shapefile_refuses_zone_crs_mismatch() {
+        let mut request = prescription_request();
+        request.zones[1].crs = "EPSG:4326".to_string();
+
+        let error =
+            export_prescription_shapefile(request).expect_err("CRS mismatch should refuse export");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "rx-alpha-2026".to_string(),
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::CrsMismatch {
+                        zone_id: "zone-east".to_string(),
+                        expected_crs: "EPSG:32614".to_string(),
+                        actual_crs: "EPSG:4326".to_string(),
+                    }
+                }
+            }
+        );
+    }
+
+    fn prescription_request() -> PrescriptionShapefileRequest {
+        PrescriptionShapefileRequest {
+            prescription_id: "rx-alpha-2026".to_string(),
+            field: PrescriptionField {
+                field_id: "field-alpha".to_string(),
+                crs: "EPSG:32614".to_string(),
+                boundary: rectangle(500_000.0, 4_499_980.0, 500_020.0, 4_500_000.0),
+            },
+            zones: vec![
+                PrescriptionZone {
+                    zone_id: "zone-west".to_string(),
+                    polygon: rectangle(500_000.0, 4_499_980.0, 500_010.0, 4_500_000.0),
+                    crs: "EPSG:32614".to_string(),
+                    rate: 32.5,
+                    unit: "kg_ha".to_string(),
+                },
+                PrescriptionZone {
+                    zone_id: "zone-east".to_string(),
+                    polygon: rectangle(500_010.0, 4_499_980.0, 500_020.0, 4_500_000.0),
+                    crs: "EPSG:32614".to_string(),
+                    rate: 12.25,
+                    unit: "kg_ha".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn rectangle(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<InteropCoordinate> {
+        vec![
+            InteropCoordinate { x: min_x, y: max_y },
+            InteropCoordinate { x: max_x, y: max_y },
+            InteropCoordinate { x: max_x, y: min_y },
+            InteropCoordinate { x: min_x, y: min_y },
+            InteropCoordinate { x: min_x, y: max_y },
+        ]
+    }
+
+    fn dbf_record_count(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes[4..8].try_into().expect("dbf count bytes"))
+    }
+
+    fn assert_shapefile_bundle_consistent(files: &super::PrescriptionShapefileFiles, records: u32) {
+        assert_eq!(be_i32(&files.shp, 24) as usize * 2, files.shp.len());
+        assert_eq!(be_i32(&files.shx, 24) as usize * 2, files.shx.len());
+        assert_eq!(le_i32(&files.shp, 32), 5);
+        assert_eq!(le_i32(&files.shx, 32), 5);
+        assert_eq!(files.shx.len(), 100 + records as usize * 8);
+        assert_eq!(dbf_record_count(&files.dbf), records);
+        let dbf_header_len = le_u16(&files.dbf, 8) as usize;
+        let dbf_record_len = le_u16(&files.dbf, 10) as usize;
+        assert_eq!(
+            files.dbf.len(),
+            dbf_header_len + dbf_record_len * records as usize + 1
+        );
+
+        let mut shp_offset_words = 50i32;
+        for index in 0..records as usize {
+            let shx_offset = 100 + index * 8;
+            let record_offset = (shp_offset_words as usize) * 2;
+            let content_length_words = be_i32(&files.shx, shx_offset + 4);
+            assert_eq!(be_i32(&files.shx, shx_offset), shp_offset_words);
+            assert_eq!(be_i32(&files.shp, record_offset), (index + 1) as i32);
+            assert_eq!(be_i32(&files.shp, record_offset + 4), content_length_words);
+            assert_eq!(le_i32(&files.shp, record_offset + 8), 5);
+            shp_offset_words += 4 + content_length_words;
+        }
+        assert_eq!(shp_offset_words as usize * 2, files.shp.len());
+    }
+
+    fn first_shp_polygon(bytes: &[u8]) -> Vec<InteropCoordinate> {
+        let record = 108;
+        let point_count = le_i32(bytes, record + 40) as usize;
+        let points_offset = record + 48;
+        (0..point_count)
+            .map(|index| {
+                let offset = points_offset + index * 16;
+                InteropCoordinate {
+                    x: le_f64(bytes, offset),
+                    y: le_f64(bytes, offset + 8),
+                }
+            })
+            .collect()
+    }
+
+    fn signed_area_for_test(points: &[InteropCoordinate]) -> f64 {
+        points
+            .windows(2)
+            .map(|window| window[0].x * window[1].y - window[1].x * window[0].y)
+            .sum::<f64>()
+            * 0.5
+    }
+
+    fn be_i32(bytes: &[u8], offset: usize) -> i32 {
+        i32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("be i32"))
+    }
+
+    fn le_i32(bytes: &[u8], offset: usize) -> i32 {
+        i32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("le i32"))
+    }
+
+    fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("le u16"))
+    }
+
+    fn le_f64(bytes: &[u8], offset: usize) -> f64 {
+        f64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("le f64"))
     }
 
     fn valid_geojson(crs: &str) -> String {
