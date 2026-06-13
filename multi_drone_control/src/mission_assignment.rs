@@ -137,6 +137,32 @@ impl MissionAssignmentEngine {
         Ok(mission_id)
     }
 
+    pub async fn simulate_mission_assignment(
+        &mut self,
+        request: MissionRequest,
+    ) -> Result<(AssignmentBatchReport, Vec<Uuid>)> {
+        let mission_id = request.id;
+        self.pending_missions.insert(request.id, request);
+
+        let report = self.process_pending_missions_with_report().await?;
+
+        let mut assigned_drone_ids = self
+            .assigned_missions
+            .values()
+            .filter(|assignment| assignment.mission_id == mission_id)
+            .map(|assignment| assignment.drone_id)
+            .collect::<Vec<_>>();
+        assigned_drone_ids.sort();
+
+        for drone_id in &assigned_drone_ids {
+            self.assigned_missions.remove(drone_id);
+        }
+
+        self.pending_missions.remove(&mission_id);
+
+        Ok((report, assigned_drone_ids))
+    }
+
     pub async fn process_pending_missions(&mut self) -> Result<usize> {
         Ok(self
             .process_pending_missions_with_report()

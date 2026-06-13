@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use shared::{FlightParameters, Mission, SafetyConstraints};
 use shared::{GeoCoordinate, RuntimeMode};
 use std::collections::HashMap;
 use std::env;
@@ -34,9 +35,50 @@ pub use coordination::{
 };
 use coordination::{DroneOperationStatus, DroneState};
 pub use mission_assignment::{
-    AssignmentBatchReport, AssignmentFailureReason, DroneAssignment, MissionAssignmentEngine,
+    AssignmentAlgorithm, AssignmentBatchReport, AssignmentFailureReason, AvailabilityStatus,
+    DroneAssignment, DroneCapabilities, MissionAssignmentEngine, MissionRequest,
     UnassignableMission,
 };
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum RetaskProposalStatus {
+    AwaitingOperatorApproval,
+    Approved,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RetaskProposalAuditEvent {
+    pub proposal_id: String,
+    pub swarm_id: Uuid,
+    pub at: DateTime<Utc>,
+    pub status: RetaskProposalStatus,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SwarmRetaskProposal {
+    pub proposal_id: String,
+    pub swarm_id: Uuid,
+    pub dropped_drone_id: Uuid,
+    pub area: Vec<(f64, f64)>,
+    pub overlap_percent: f32,
+    pub remaining_drone_ids: Vec<Uuid>,
+    pub requested_at: DateTime<Utc>,
+    pub assignment_count: usize,
+    pub assignment_unassignable: Vec<UnassignableMission>,
+    pub coverage_plan: CoverageOptimizationPlan,
+    pub status: RetaskProposalStatus,
+    pub approval: Option<OperatorApproval>,
+    pub audit: Vec<RetaskProposalAuditEvent>,
+}
+
+#[derive(Clone)]
+struct AutonomousSurveySession {
+    abort_tx: watch::Sender<bool>,
+    area: Vec<(f64, f64)>,
+    overlap_percent: f32,
+    started_at: DateTime<Utc>,
+}
 pub use swarm::{DroneSwarm, SwarmController, SwarmStatus};
 pub use swarm_command::{
     dry_run_swarm_command, execute_audited_swarm_command, SwarmCommandAuditEvent,
@@ -202,6 +244,10 @@ pub enum ControlCommand {
     UpdateConstraints {
         constraints: GlobalConstraints,
     },
+    ConfirmRetaskProposal {
+        swarm_id: Uuid,
+        operator_approval: OperatorApproval,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,7 +372,8 @@ pub struct MultiDroneControlService {
     collision_avoidance: Arc<RwLock<CollisionAvoidanceSystem>>,
     safety_audit_log: Arc<RwLock<SafetyViolationAuditLog>>,
     autonomy_config: AutonomousSurveyConfig,
-    active_autonomous_surveys: Arc<RwLock<HashMap<Uuid, watch::Sender<bool>>>>,
+    active_autonomous_surveys: Arc<RwLock<HashMap<Uuid, AutonomousSurveySession>>>,
+    retask_proposals: Arc<RwLock<HashMap<Uuid, SwarmRetaskProposal>>>,
     command_sender: mpsc::UnboundedSender<ControlCommand>,
     command_receiver: Arc<RwLock<mpsc::UnboundedReceiver<ControlCommand>>>,
 }
@@ -868,6 +915,7 @@ impl MultiDroneControlService {
             safety_audit_log: Arc::new(RwLock::new(SafetyViolationAuditLog::default())),
             autonomy_config,
             active_autonomous_surveys: Arc::new(RwLock::new(HashMap::new())),
+            retask_proposals: Arc::new(RwLock::new(HashMap::new())),
             command_sender,
             command_receiver: Arc::new(RwLock::new(command_receiver)),
         }
@@ -882,6 +930,7 @@ impl MultiDroneControlService {
 
     pub async fn update_drone_status(&self, status: DroneStatus) {
         let mut status = status;
+        let communication_loss_events: Vec<Uuid>;
 
         let executed_rules = {
             let drone_state = Self::drone_state_from_status(&status);
@@ -920,6 +969,12 @@ impl MultiDroneControlService {
             }
         };
 
+        communication_loss_events = executed_rules
+            .iter()
+            .filter(|execution| execution.condition == "communication_loss")
+            .map(|execution| execution.drone_id)
+            .collect();
+
         let emergency_sites = {
             let controller = self.controller.read().await;
             controller
@@ -937,6 +992,19 @@ impl MultiDroneControlService {
                     &execution,
                     &emergency_sites,
                 );
+            }
+        }
+
+        for dropped_drone_id in communication_loss_events {
+            if let Some(swarm_id) = self.find_active_survey_for_drone(dropped_drone_id).await {
+                if let Err(error) = self
+                    .evaluate_retask_plan_on_dropout(swarm_id, dropped_drone_id)
+                    .await
+                {
+                    tracing::warn!(
+                        "retask proposal generation failed for swarm {swarm_id} and drone {dropped_drone_id}: {error}"
+                    );
+                }
             }
         }
     }
@@ -1057,6 +1125,271 @@ impl MultiDroneControlService {
         Ok(())
     }
 
+    async fn find_active_survey_for_drone(&self, drone_id: Uuid) -> Option<Uuid> {
+        let active = self.active_autonomous_surveys.read().await;
+        let controller = self.controller.read().await;
+
+        active.keys().find_map(|swarm_id| {
+            controller
+                .get_swarm(swarm_id)
+                .is_some_and(|swarm| swarm.drone_ids().contains(&drone_id))
+                .then_some(*swarm_id)
+        })
+    }
+
+    fn build_retask_drone_capability(&self, drone_id: Uuid) -> DroneCapabilities {
+        DroneCapabilities {
+            id: drone_id,
+            flight_time_minutes: 120,
+            max_speed: 20.0,
+            payload_capacity: 2.5,
+            sensor_types: vec!["autonomous_flight".to_string(), "RGB".to_string()],
+            special_capabilities: vec!["autonomous_flight".to_string()],
+            current_battery: 1.0,
+            maintenance_schedule: None,
+            availability_status: AvailabilityStatus::Available,
+        }
+    }
+
+    fn build_retask_coverage_config(&self, overlap_percent: f32) -> CoverageOptimizationConfig {
+        CoverageOptimizationConfig {
+            planned_altitude_m: self.autonomy_config_planned_altitude_m(),
+            min_separation_m: self.autonomy_config_min_separation_m(),
+            overlap_percent,
+            sensor_swath_width_m: 40.0,
+            survey_speed_mps: 10.0,
+        }
+    }
+
+    fn build_retask_mission_request(&self, mission_drone_count: usize) -> MissionRequest {
+        let now = Utc::now();
+        MissionRequest {
+            id: Uuid::new_v4(),
+            mission: Mission {
+                id: Uuid::new_v4(),
+                name: format!("Adaptive Retask ({mission_drone_count} drones)"),
+                waypoints: Vec::new(),
+                flight_parameters: FlightParameters {
+                    max_speed_ms: 20.0,
+                    cruise_altitude_m: self.autonomy_config_planned_altitude_m(),
+                    takeoff_altitude_m: 20.0,
+                    return_to_home_altitude_m: 40.0,
+                },
+                safety_constraints: SafetyConstraints {
+                    max_wind_speed_ms: 10.0,
+                    min_battery_level: 0.2,
+                    geofence_boundaries: Vec::new(),
+                    no_fly_zones: Vec::new(),
+                },
+                created_at: now,
+            },
+            priority: 10,
+            required_capabilities: vec!["autonomous_flight".to_string()],
+            preferred_drone: None,
+            deadline: None,
+            estimated_duration: std::time::Duration::from_secs(1_800),
+            max_drones: mission_drone_count,
+            min_drones: mission_drone_count,
+            created_at: now,
+        }
+    }
+
+    fn append_retask_proposal_audit(
+        proposal: &mut SwarmRetaskProposal,
+        status: RetaskProposalStatus,
+        message: impl Into<String>,
+    ) {
+        proposal.audit.push(RetaskProposalAuditEvent {
+            proposal_id: proposal.proposal_id.clone(),
+            swarm_id: proposal.swarm_id,
+            at: Utc::now(),
+            status,
+            message: message.into(),
+        });
+    }
+
+    async fn evaluate_retask_plan_on_dropout(
+        &self,
+        swarm_id: Uuid,
+        dropped_drone_id: Uuid,
+    ) -> Result<()> {
+        {
+            let proposals = self.retask_proposals.read().await;
+            if proposals.get(&swarm_id).is_some_and(|proposal| {
+                proposal.status == RetaskProposalStatus::AwaitingOperatorApproval
+            }) {
+                return Ok(());
+            }
+        }
+
+        let controller = self.controller.read().await;
+        let swarm = controller
+            .get_swarm(&swarm_id)
+            .ok_or_else(|| anyhow::anyhow!("swarm {swarm_id} not found for retask planning"))?;
+        let session = self
+            .active_autonomous_surveys
+            .read()
+            .await
+            .get(&swarm_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no active autonomous session for swarm {swarm_id}"))?;
+        let mut remaining_drone_ids = swarm.drone_ids();
+        remaining_drone_ids.retain(|drone_id| *drone_id != dropped_drone_id);
+        if remaining_drone_ids.is_empty() {
+            let _ = self.abort_autonomous_survey(swarm_id).await?;
+            return Ok(());
+        }
+        let area = session.area.clone();
+        let overlap_percent = session.overlap_percent;
+        let started_at = session.started_at;
+        drop(controller);
+
+        let mut assignment_engine = MissionAssignmentEngine::new(AssignmentAlgorithm::LoadBalanced);
+        for drone_id in &remaining_drone_ids {
+            assignment_engine
+                .register_drone(self.build_retask_drone_capability(*drone_id))
+                .await?;
+        }
+        let request = self.build_retask_mission_request(remaining_drone_ids.len());
+        let (assignment_report, assigned_drone_ids) = assignment_engine
+            .simulate_mission_assignment(request)
+            .await?;
+
+        if assigned_drone_ids.len() < remaining_drone_ids.len() {
+            tracing::warn!(
+                "Retask assignment under-capacity for swarm {swarm_id} on dropout {dropped_drone_id}: assigned {}/{}",
+                assigned_drone_ids.len(),
+                remaining_drone_ids.len()
+            );
+            self.abort_autonomous_survey(swarm_id).await?;
+            return Ok(());
+        }
+
+        if !assignment_report.unassignable_missions.is_empty() {
+            tracing::warn!(
+                "Retask assignment unassignable missions for swarm {swarm_id}: {}",
+                assignment_report.unassignable_missions.len()
+            );
+            self.abort_autonomous_survey(swarm_id).await?;
+            return Ok(());
+        }
+
+        let coverage_plan = {
+            let controller = self.controller.read().await;
+            match controller.plan_coverage_optimization(
+                swarm_id,
+                area.clone(),
+                self.build_retask_coverage_config(overlap_percent),
+                started_at,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    tracing::warn!(
+                        "Retask coverage plan generation failed for swarm {swarm_id} on dropout {dropped_drone_id}: {error}"
+                    );
+                    self.abort_autonomous_survey(swarm_id).await?;
+                    return Ok(());
+                }
+            }
+        };
+
+        if !coverage_plan.separation_violations.is_empty()
+            || coverage_plan.status != SurveyExecutionStatus::Planned
+        {
+            tracing::warn!(
+                "Retask coverage plan rejected for swarm {swarm_id} on dropout {dropped_drone_id}"
+            );
+            self.abort_autonomous_survey(swarm_id).await?;
+            return Ok(());
+        }
+
+        let proposal_id = Uuid::new_v4().to_string();
+        let mut proposal = SwarmRetaskProposal {
+            proposal_id: proposal_id.clone(),
+            swarm_id,
+            dropped_drone_id,
+            area,
+            overlap_percent,
+            remaining_drone_ids: assigned_drone_ids,
+            requested_at: Utc::now(),
+            assignment_count: assignment_report.assigned_count,
+            assignment_unassignable: assignment_report.unassignable_missions,
+            coverage_plan,
+            status: RetaskProposalStatus::AwaitingOperatorApproval,
+            approval: None,
+            audit: Vec::new(),
+        };
+        let remaining_count = proposal.remaining_drone_ids.len();
+        Self::append_retask_proposal_audit(
+            &mut proposal,
+            RetaskProposalStatus::AwaitingOperatorApproval,
+            format!(
+                "Re-task proposal generated for remaining {} drone(s) after dropout {}",
+                remaining_count, dropped_drone_id
+            ),
+        );
+
+        let mut proposals = self.retask_proposals.write().await;
+        proposals.insert(swarm_id, proposal);
+        Ok(())
+    }
+
+    async fn confirm_retask_proposal(
+        &self,
+        swarm_id: Uuid,
+        operator_approval: OperatorApproval,
+    ) -> Result<()> {
+        if !operator_approval.approved {
+            return Err(anyhow::anyhow!("operator did not approve retask proposal"));
+        }
+
+        let proposal = {
+            let mut proposals = self.retask_proposals.write().await;
+            proposals
+                .remove(&swarm_id)
+                .ok_or_else(|| anyhow::anyhow!("no pending retask proposal for swarm {swarm_id}"))?
+        };
+
+        if proposal.status != RetaskProposalStatus::AwaitingOperatorApproval {
+            return Err(anyhow::anyhow!(
+                "retask proposal for swarm {swarm_id} is not awaiting approval"
+            ));
+        }
+
+        let mut confirmed = proposal;
+        confirmed.status = RetaskProposalStatus::Approved;
+        confirmed.approval = Some(operator_approval.clone());
+        Self::append_retask_proposal_audit(
+            &mut confirmed,
+            RetaskProposalStatus::Approved,
+            "Operator approved retask proposal".to_string(),
+        );
+
+        {
+            let mut proposals = self.retask_proposals.write().await;
+            proposals.insert(swarm_id, confirmed.clone());
+        }
+
+        if self
+            .active_autonomous_surveys
+            .read()
+            .await
+            .contains_key(&swarm_id)
+        {
+            let _ = self.abort_autonomous_survey(swarm_id).await;
+        }
+
+        self.start_autonomous_survey(
+            swarm_id,
+            CoordinatedAction::SynchronizedSurvey {
+                area: confirmed.area.clone(),
+                overlap_percent: confirmed.overlap_percent,
+            },
+            Some(operator_approval),
+        )
+        .await
+    }
+
     async fn handle_command(&self, command: ControlCommand) -> Result<()> {
         match command {
             ControlCommand::AssignMission {
@@ -1122,6 +1455,13 @@ impl MultiDroneControlService {
             },
             ControlCommand::AbortCoordinatedAction { swarm_id } => {
                 self.abort_autonomous_survey(swarm_id).await?;
+            }
+            ControlCommand::ConfirmRetaskProposal {
+                swarm_id,
+                operator_approval,
+            } => {
+                self.confirm_retask_proposal(swarm_id, operator_approval)
+                    .await?;
             }
             ControlCommand::EmergencyLand { drone_ids } => {
                 for drone_id in drone_ids {
@@ -1247,7 +1587,15 @@ impl MultiDroneControlService {
             let (abort_tx, abort_rx) = watch::channel(false);
             {
                 let mut active = self.active_autonomous_surveys.write().await;
-                active.insert(swarm_id, abort_tx);
+                active.insert(
+                    swarm_id,
+                    AutonomousSurveySession {
+                        abort_tx,
+                        area: area.clone(),
+                        overlap_percent: *overlap_percent,
+                        started_at: checked_at,
+                    },
+                );
             }
 
             let service = self.clone();
@@ -1279,10 +1627,13 @@ impl MultiDroneControlService {
 
     async fn abort_autonomous_survey(&self, swarm_id: Uuid) -> Result<()> {
         let abort_tx = {
-            let sessions = self.active_autonomous_surveys.read().await;
-            sessions.get(&swarm_id).cloned().ok_or_else(|| {
-                anyhow::anyhow!("no running autonomous survey for requested swarm")
-            })?
+            let mut sessions = self.active_autonomous_surveys.write().await;
+            sessions
+                .remove(&swarm_id)
+                .map(|session| session.abort_tx)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no running autonomous survey for requested swarm")
+                })?
         };
         abort_tx.send(true).map_err(|error| {
             anyhow::anyhow!("failed to request abort for autonomous survey: {error}")
@@ -1409,6 +1760,11 @@ impl MultiDroneControlService {
             .read()
             .await
             .contains_key(&swarm_id)
+    }
+
+    #[cfg(test)]
+    async fn get_retask_proposal(&self, swarm_id: Uuid) -> Option<SwarmRetaskProposal> {
+        self.retask_proposals.read().await.get(&swarm_id).cloned()
     }
 
     pub async fn list_safety_violation_audit_records(&self) -> Vec<SafetyViolationAuditRecord> {
@@ -2524,6 +2880,243 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(160)).await;
         assert!(!service.is_autonomous_survey_active(swarm_id).await);
+    }
+
+    #[tokio::test]
+    async fn adaptive_retasking_generates_proposal_and_waits_for_operator_confirmation() {
+        let service = MultiDroneControlService::new_with_config(
+            "Test Service".to_string(),
+            AutonomousSurveyConfig {
+                enabled: true,
+                runtime_mode: RuntimeMode::Simulation,
+            },
+        );
+        let drone_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let dropped_drone_id = drone_ids[0];
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: drone_ids.clone(),
+                formation: Formation::Line {
+                    spacing_m: 25.0,
+                    heading_deg: 0.0,
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        let swarm_id = {
+            let controller = service.controller.read().await;
+            controller.list_swarm_registry()[0].swarm_id
+        };
+
+        service
+            .send_command(ControlCommand::ExecuteCoordinatedAction {
+                swarm_id,
+                action: CoordinatedAction::SynchronizedSurvey {
+                    area: vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+                    overlap_percent: 15.0,
+                },
+                operator_approval: Some(OperatorApproval {
+                    approved: true,
+                    approved_by: "ops".to_string(),
+                    approved_at: Utc::now(),
+                }),
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(service.is_autonomous_survey_active(swarm_id).await);
+
+        service
+            .update_drone_status(DroneStatus {
+                id: dropped_drone_id,
+                position: (0.0, 0.0, 50.0),
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.9,
+                status: "executing_mission".to_string(),
+                assigned_mission: None,
+                last_update: Utc::now() - chrono::Duration::seconds(120),
+            })
+            .await;
+
+        let proposal = service
+            .get_retask_proposal(swarm_id)
+            .await
+            .expect("dropout should generate retask proposal");
+        assert_eq!(
+            proposal.status,
+            RetaskProposalStatus::AwaitingOperatorApproval
+        );
+        assert_eq!(proposal.remaining_drone_ids.len(), 1);
+        assert_eq!(proposal.remaining_drone_ids[0], drone_ids[1]);
+        assert_eq!(proposal.assignment_count, 1);
+
+        service
+            .send_command(ControlCommand::ConfirmRetaskProposal {
+                swarm_id,
+                operator_approval: OperatorApproval {
+                    approved: true,
+                    approved_by: "ops".to_string(),
+                    approved_at: Utc::now(),
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let approved = service
+            .get_retask_proposal(swarm_id)
+            .await
+            .expect("approved proposal should be persisted");
+        assert_eq!(approved.status, RetaskProposalStatus::Approved);
+        assert_eq!(
+            approved
+                .approval
+                .as_ref()
+                .map(|entry| entry.approved_by.as_str()),
+            Some("ops")
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_retasking_aborts_when_no_remaining_drones() {
+        let service = MultiDroneControlService::new_with_config(
+            "Test Service".to_string(),
+            AutonomousSurveyConfig {
+                enabled: true,
+                runtime_mode: RuntimeMode::Simulation,
+            },
+        );
+        let drone_id = Uuid::new_v4();
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: vec![drone_id],
+                formation: Formation::Line {
+                    spacing_m: 25.0,
+                    heading_deg: 0.0,
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        let swarm_id = {
+            let controller = service.controller.read().await;
+            controller.list_swarm_registry()[0].swarm_id
+        };
+
+        service
+            .send_command(ControlCommand::ExecuteCoordinatedAction {
+                swarm_id,
+                action: CoordinatedAction::SynchronizedSurvey {
+                    area: vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+                    overlap_percent: 15.0,
+                },
+                operator_approval: Some(OperatorApproval {
+                    approved: true,
+                    approved_by: "ops".to_string(),
+                    approved_at: Utc::now(),
+                }),
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(service.is_autonomous_survey_active(swarm_id).await);
+
+        service
+            .update_drone_status(DroneStatus {
+                id: drone_id,
+                position: (0.0, 0.0, 50.0),
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.9,
+                status: "executing_mission".to_string(),
+                assigned_mission: None,
+                last_update: Utc::now() - chrono::Duration::seconds(120),
+            })
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!service.is_autonomous_survey_active(swarm_id).await);
+        assert!(service.get_retask_proposal(swarm_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn adaptive_retasking_aborts_on_unsafe_retask_plan() {
+        let service = MultiDroneControlService::new_with_config(
+            "Test Service".to_string(),
+            AutonomousSurveyConfig {
+                enabled: true,
+                runtime_mode: RuntimeMode::Simulation,
+            },
+        );
+        let drone_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let dropped_drone_id = drone_ids[0];
+
+        service
+            .send_command(ControlCommand::FormSwarm {
+                drone_ids: drone_ids.clone(),
+                formation: Formation::Line {
+                    spacing_m: 25.0,
+                    heading_deg: 0.0,
+                },
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        let swarm_id = {
+            let controller = service.controller.read().await;
+            controller.list_swarm_registry()[0].swarm_id
+        };
+
+        service
+            .send_command(ControlCommand::ExecuteCoordinatedAction {
+                swarm_id,
+                action: CoordinatedAction::SynchronizedSurvey {
+                    area: vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+                    overlap_percent: 15.0,
+                },
+                operator_approval: Some(OperatorApproval {
+                    approved: true,
+                    approved_by: "ops".to_string(),
+                    approved_at: Utc::now(),
+                }),
+            })
+            .await
+            .unwrap();
+        service.process_commands().await.unwrap();
+
+        {
+            let mut controller = service.controller.write().await;
+            controller.global_constraints.max_concurrent_drones = 0;
+        }
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(service.is_autonomous_survey_active(swarm_id).await);
+
+        service
+            .update_drone_status(DroneStatus {
+                id: dropped_drone_id,
+                position: (0.0, 0.0, 50.0),
+                velocity: (0.0, 0.0, 0.0),
+                battery_level: 0.9,
+                status: "executing_mission".to_string(),
+                assigned_mission: None,
+                last_update: Utc::now() - chrono::Duration::seconds(120),
+            })
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!service.is_autonomous_survey_active(swarm_id).await);
+        assert!(service.get_retask_proposal(swarm_id).await.is_none());
     }
 
     fn constrained_controller() -> MultiDroneController {
