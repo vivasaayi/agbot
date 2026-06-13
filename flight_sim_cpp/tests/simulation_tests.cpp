@@ -1,4 +1,5 @@
 #include "agbot_flight_sim/DeterministicRegression.hpp"
+#include "agbot_flight_sim/CoordinationPreview.hpp"
 #include "agbot_flight_sim/DeterministicRunner.hpp"
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/FaultInjection.hpp"
@@ -436,6 +437,89 @@ void test_twin_backend_unavailable_fails_closed_without_telemetry() {
     assert(ack.error->code == "twin_unavailable");
     assert(!ack.telemetry.has_value());
     assert(!backend.simulation().state().armed);
+}
+
+agbot::flight_sim::Mission offset_coordination_mission(
+    std::string name,
+    double start_x,
+    double start_z,
+    double end_x,
+    double end_z) {
+    agbot::flight_sim::Mission mission;
+    mission.name = std::move(name);
+    mission.home = {start_x, 0.0, start_z};
+    mission.cruise_speed_mps = 8.0;
+    mission.acceptance_radius_m = 0.5;
+    mission.waypoints = {
+        {"takeoff", {start_x, 20.0, start_z}, std::nullopt, agbot::flight_sim::WaypointAction::Takeoff},
+        {"survey", {end_x, 20.0, end_z}, std::nullopt, agbot::flight_sim::WaypointAction::FlyThrough},
+        {"land", {end_x, 0.0, end_z}, std::nullopt, agbot::flight_sim::WaypointAction::Land},
+    };
+    return mission;
+}
+
+void test_coordination_preview_is_disabled_until_operator_approved() {
+    std::vector<agbot::flight_sim::CoordinationPreviewDrone> drones {
+        {"drone-a", offset_coordination_mission("north lane", 0.0, 0.0, 80.0, 0.0)},
+        {"drone-b", offset_coordination_mission("south lane", 0.0, 40.0, 80.0, 40.0)},
+    };
+
+    const auto report = agbot::flight_sim::run_coordination_preview(drones);
+
+    assert(!report.permitted);
+    assert(!report.safe_to_execute);
+    assert(report.status == agbot::flight_sim::CoordinationPreviewStatus::WaitingForApproval);
+    assert(report.breach_count == 0);
+    assert(report.telemetry_samples.empty());
+    assert(report.to_json().find("\"status\":\"waiting_for_approval\"") != std::string::npos);
+}
+
+void test_coordination_preview_runs_multiple_twins_and_is_reproducible() {
+    std::vector<agbot::flight_sim::CoordinationPreviewDrone> drones {
+        {"drone-a", offset_coordination_mission("north lane", 0.0, 0.0, 80.0, 0.0)},
+        {"drone-b", offset_coordination_mission("south lane", 0.0, 40.0, 80.0, 40.0)},
+    };
+    agbot::flight_sim::CoordinationPreviewConfig config;
+    config.operator_approved = true;
+    config.min_separation_m = 25.0;
+    config.step_s = 0.5;
+    config.max_duration_s = 60.0;
+    config.wind_mps = {1.0, 0.0, 0.0};
+
+    const auto report = agbot::flight_sim::run_coordination_preview(drones, config);
+    const auto repeat = agbot::flight_sim::run_coordination_preview(drones, config);
+
+    assert(report.permitted);
+    assert(report.safe_to_execute);
+    assert(report.status == agbot::flight_sim::CoordinationPreviewStatus::Passed);
+    assert(report.min_observed_separation_m >= 25.0);
+    assert(report.breach_count == 0);
+    assert(!report.telemetry_samples.empty());
+    assert(report.deterministic_run_id == repeat.deterministic_run_id);
+    assert(report.to_json() == repeat.to_json());
+    assert(report.to_json().find("\"coordination_source\":\"multi_drone_control\"") != std::string::npos);
+}
+
+void test_coordination_preview_surfaces_separation_breach() {
+    std::vector<agbot::flight_sim::CoordinationPreviewDrone> drones {
+        {"drone-a", offset_coordination_mission("center lane a", 0.0, 0.0, 80.0, 0.0)},
+        {"drone-b", offset_coordination_mission("center lane b", 0.0, 5.0, 80.0, 5.0)},
+    };
+    agbot::flight_sim::CoordinationPreviewConfig config;
+    config.operator_approved = true;
+    config.min_separation_m = 25.0;
+    config.step_s = 0.5;
+    config.max_duration_s = 10.0;
+
+    const auto report = agbot::flight_sim::run_coordination_preview(drones, config);
+
+    assert(report.permitted);
+    assert(!report.safe_to_execute);
+    assert(report.status == agbot::flight_sim::CoordinationPreviewStatus::SeparationBreach);
+    assert(report.min_observed_separation_m < 25.0);
+    assert(report.breach_count > 0);
+    assert(report.to_json().find("\"status\":\"separation_breach\"") != std::string::npos);
+    assert(report.to_json().find("\"breach_count\":") != std::string::npos);
 }
 
 void test_hud_telemetry_maps_display_values_from_state() {
@@ -1586,6 +1670,9 @@ int main() {
     test_mission_round_trip();
     test_twin_backend_executes_shared_command_and_returns_telemetry();
     test_twin_backend_unavailable_fails_closed_without_telemetry();
+    test_coordination_preview_is_disabled_until_operator_approved();
+    test_coordination_preview_runs_multiple_twins_and_is_reproducible();
+    test_coordination_preview_surfaces_separation_breach();
     test_hud_telemetry_maps_display_values_from_state();
     test_hud_telemetry_reflects_battery_critical_and_failsafe_state();
     test_failsafe_low_battery();
