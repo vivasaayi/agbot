@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    assert_raster_spatial_ref, GeoBounds, RasterSpatialRef, RasterSpatialRefError,
+    assert_raster_spatial_ref, GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
 };
 use std::collections::BTreeMap;
 
@@ -145,6 +145,58 @@ pub struct InferenceRunRecord {
     pub failure_reason_code: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledInferenceInput {
+    pub tile_id: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledInferenceTile {
+    pub tile_id: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub footprint: GeoBounds,
+    pub resolution: RasterResolution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TiledInferenceSkipReason {
+    InvalidGeoreference,
+    CrsMismatch,
+    EvaluatorFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TiledInferenceTileSkip {
+    pub tile_id: String,
+    pub reason: TiledInferenceSkipReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledInferenceTileOutput<T> {
+    pub tile_id: String,
+    pub spatial_ref: RasterSpatialRef,
+    pub footprint: GeoBounds,
+    pub result: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledInferenceReport<T> {
+    pub field_crs: String,
+    pub field_extent: GeoBounds,
+    pub tiles_total: usize,
+    pub tiles_processed: usize,
+    pub tiles_skipped: usize,
+    pub outputs: Vec<TiledInferenceTileOutput<T>>,
+    pub skipped_tiles: Vec<TiledInferenceTileSkip>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +620,14 @@ pub enum InferenceRunError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TiledInferenceError {
+    #[error("tiled inference requires at least one tile")]
+    EmptyTiles,
+    #[error("tiled inference had no valid georeferenced tiles")]
+    NoValidTiles,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StandCountError {
     #[error("field_id cannot be empty")]
     EmptyFieldId,
@@ -856,6 +916,108 @@ pub fn validate_inference_run_transition(
         | (InferenceRunStatus::Running, InferenceRunStatus::Failed) => Ok(()),
         (from, to) => Err(InferenceRunError::InvalidTransition { from, to }),
     }
+}
+
+pub fn run_tiled_inference_pipeline<T, F>(
+    tiles: Vec<TiledInferenceInput>,
+    mut evaluator: F,
+) -> Result<TiledInferenceReport<T>, TiledInferenceError>
+where
+    F: FnMut(&TiledInferenceTile) -> Result<T, String>,
+{
+    if tiles.is_empty() {
+        return Err(TiledInferenceError::EmptyTiles);
+    }
+
+    let tiles_total = tiles.len();
+    let mut field_crs: Option<String> = None;
+    let mut field_extent: Option<GeoBounds> = None;
+    let mut outputs = Vec::new();
+    let mut skipped_tiles = Vec::new();
+
+    for tile in tiles {
+        let tile_id = normalize_optional_run_text(Some(tile.tile_id.clone()))
+            .unwrap_or_else(|| "unnamed_tile".to_string());
+        let spatial_ref =
+            match assert_raster_spatial_ref(Some(&tile.spatial_ref), tile.width_px, tile.height_px)
+            {
+                Ok(spatial_ref) => spatial_ref,
+                Err(error) => {
+                    skipped_tiles.push(TiledInferenceTileSkip {
+                        tile_id,
+                        reason: TiledInferenceSkipReason::InvalidGeoreference,
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+        let tile_crs = spatial_ref.crs.clone().unwrap_or_default();
+        if let Some(expected_crs) = field_crs.as_ref() {
+            if expected_crs != &tile_crs {
+                skipped_tiles.push(TiledInferenceTileSkip {
+                    tile_id,
+                    reason: TiledInferenceSkipReason::CrsMismatch,
+                    detail: format!("tile CRS {tile_crs} does not match field CRS {expected_crs}"),
+                });
+                continue;
+            }
+        } else {
+            field_crs = Some(tile_crs);
+        }
+
+        let footprint = spatial_ref
+            .bbox
+            .clone()
+            .expect("assert_raster_spatial_ref returns a bbox");
+        let resolution = spatial_ref
+            .resolution
+            .expect("assert_raster_spatial_ref returns a resolution");
+        let prepared_tile = TiledInferenceTile {
+            tile_id: tile_id.clone(),
+            width_px: tile.width_px,
+            height_px: tile.height_px,
+            spatial_ref,
+            footprint: footprint.clone(),
+            resolution,
+        };
+        let result = match evaluator(&prepared_tile) {
+            Ok(result) => result,
+            Err(detail) => {
+                skipped_tiles.push(TiledInferenceTileSkip {
+                    tile_id,
+                    reason: TiledInferenceSkipReason::EvaluatorFailed,
+                    detail,
+                });
+                continue;
+            }
+        };
+
+        field_extent = Some(match field_extent {
+            Some(extent) => merge_bounds(&extent, &footprint),
+            None => footprint.clone(),
+        });
+        outputs.push(TiledInferenceTileOutput {
+            tile_id,
+            spatial_ref: prepared_tile.spatial_ref,
+            footprint,
+            result,
+        });
+    }
+
+    let field_crs = field_crs.ok_or(TiledInferenceError::NoValidTiles)?;
+    let field_extent = field_extent.ok_or(TiledInferenceError::NoValidTiles)?;
+    outputs.sort_by(|left, right| left.tile_id.cmp(&right.tile_id));
+    skipped_tiles.sort_by(|left, right| left.tile_id.cmp(&right.tile_id));
+
+    Ok(TiledInferenceReport {
+        field_crs,
+        field_extent,
+        tiles_total,
+        tiles_processed: outputs.len(),
+        tiles_skipped: skipped_tiles.len(),
+        outputs,
+        skipped_tiles,
+    })
 }
 
 pub fn run_stand_count(
@@ -1696,6 +1858,15 @@ fn bbox_within(inner: &GeoBounds, outer: &GeoBounds) -> bool {
         && inner.max_lat <= outer.max_lat + TOLERANCE
 }
 
+fn merge_bounds(left: &GeoBounds, right: &GeoBounds) -> GeoBounds {
+    GeoBounds {
+        min_lon: left.min_lon.min(right.min_lon),
+        min_lat: left.min_lat.min(right.min_lat),
+        max_lon: left.max_lon.max(right.max_lon),
+        max_lat: left.max_lat.max(right.max_lat),
+    }
+}
+
 fn normalize_weed_text(value: String, error: WeedMappingError) -> Result<String, WeedMappingError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1826,16 +1997,17 @@ mod tests {
     use super::{
         apply_detection_verification, assemble_detection_finding, build_inference_run_record,
         build_model_version_record, run_canopy_cover, run_disease_lesion_detection,
-        run_stand_count, run_weed_mapping, transition_inference_run_status,
-        validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
-        CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
-        CropDetectionVerificationAction, CropDetectionVerificationRequest, CropModelRegistryError,
-        CropModelTask, DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
+        run_stand_count, run_tiled_inference_pipeline, run_weed_mapping,
+        transition_inference_run_status, validate_detection_finding_promotion,
+        validate_model_reference, CanopyCoverConfig, CanopyCoverError, CanopyCoverTile,
+        CropDetectionFindingError, CropDetectionFindingRequest, CropDetectionVerificationAction,
+        CropDetectionVerificationRequest, CropModelRegistryError, CropModelTask,
+        DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
         FindingPromotionRequest, InferenceModelReference, InferenceRunError, InferenceRunStatus,
         InferenceRunSubmissionRequest, ModelVersionRegistrationRequest, PlantCountConfig,
-        PlantCountTile, PlantCountZeroReason, WeedMappingConfig, WeedMappingError,
-        WeedZoneCandidate,
+        PlantCountTile, PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason,
+        WeedMappingConfig, WeedMappingError, WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -2050,6 +2222,123 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn tiled_inference_pipeline_preserves_crs_extent_and_reassembles_outputs() {
+        let report = run_tiled_inference_pipeline(
+            vec![
+                inference_tile(
+                    "tile-west",
+                    2,
+                    2,
+                    GeoBounds {
+                        min_lon: 0.0,
+                        min_lat: 0.0,
+                        max_lon: 20.0,
+                        max_lat: 20.0,
+                    },
+                ),
+                inference_tile(
+                    "tile-east",
+                    2,
+                    2,
+                    GeoBounds {
+                        min_lon: 20.0,
+                        min_lat: 0.0,
+                        max_lon: 40.0,
+                        max_lat: 20.0,
+                    },
+                ),
+            ],
+            |tile| Ok(tile.footprint.max_lon - tile.footprint.min_lon),
+        )
+        .expect("tiled inference should assemble valid tiles");
+
+        assert_eq!(report.field_crs, "EPSG:32614");
+        assert_eq!(
+            report.field_extent,
+            GeoBounds {
+                min_lon: 0.0,
+                min_lat: 0.0,
+                max_lon: 40.0,
+                max_lat: 20.0,
+            }
+        );
+        assert_eq!(report.tiles_total, 2);
+        assert_eq!(report.tiles_processed, 2);
+        assert_eq!(report.tiles_skipped, 0);
+        assert_eq!(
+            report
+                .outputs
+                .iter()
+                .map(|tile| &tile.tile_id)
+                .collect::<Vec<_>>(),
+            vec![&"tile-east".to_string(), &"tile-west".to_string()]
+        );
+        assert!(report
+            .outputs
+            .iter()
+            .all(|tile| tile.spatial_ref.crs.as_deref() == Some("EPSG:32614")));
+        assert_eq!(report.outputs[0].result, 20.0);
+    }
+
+    #[test]
+    fn tiled_inference_pipeline_skips_bad_georeference_without_default_origin() {
+        let mut bad_tile = inference_tile(
+            "tile-bad",
+            2,
+            2,
+            GeoBounds {
+                min_lon: 100.0,
+                min_lat: 100.0,
+                max_lon: 120.0,
+                max_lat: 120.0,
+            },
+        );
+        bad_tile.spatial_ref.georeferenced = false;
+
+        let report = run_tiled_inference_pipeline(
+            vec![
+                bad_tile,
+                inference_tile(
+                    "tile-good",
+                    2,
+                    2,
+                    GeoBounds {
+                        min_lon: 20.0,
+                        min_lat: 0.0,
+                        max_lon: 40.0,
+                        max_lat: 20.0,
+                    },
+                ),
+            ],
+            |tile| Ok(tile.tile_id.clone()),
+        )
+        .expect("valid tile should still run");
+
+        assert_eq!(report.tiles_total, 2);
+        assert_eq!(report.tiles_processed, 1);
+        assert_eq!(report.tiles_skipped, 1);
+        assert_eq!(report.outputs[0].tile_id, "tile-good");
+        assert_eq!(
+            report.field_extent,
+            GeoBounds {
+                min_lon: 20.0,
+                min_lat: 0.0,
+                max_lon: 40.0,
+                max_lat: 20.0,
+            }
+        );
+        assert_eq!(report.skipped_tiles[0].tile_id, "tile-bad");
+        assert_eq!(
+            report.skipped_tiles[0].reason,
+            TiledInferenceSkipReason::InvalidGeoreference
+        );
+        assert!(!report
+            .outputs
+            .iter()
+            .any(|tile| tile.footprint.min_lon == 0.0 && tile.footprint.min_lat == 0.0));
     }
 
     #[test]
@@ -2581,6 +2870,20 @@ mod tests {
         }
     }
 
+    fn inference_tile(
+        tile_id: &str,
+        width_px: u32,
+        height_px: u32,
+        bbox: GeoBounds,
+    ) -> TiledInferenceInput {
+        TiledInferenceInput {
+            tile_id: tile_id.to_string(),
+            width_px,
+            height_px,
+            spatial_ref: spatial_ref_with_bbox(width_px, height_px, bbox),
+        }
+    }
+
     fn canopy_tile(
         tile_id: &str,
         zone_id: Option<&str>,
@@ -2686,17 +2989,37 @@ mod tests {
     fn spatial_ref(width_px: u32, height_px: u32) -> RasterSpatialRef {
         let max_x = width_px as f64 * 10.0;
         let max_y = height_px as f64 * 10.0;
-        RasterSpatialRef {
-            georeferenced: true,
-            crs: Some("EPSG:32614".to_string()),
-            bbox: Some(GeoBounds {
+        spatial_ref_with_bbox(
+            width_px,
+            height_px,
+            GeoBounds {
                 min_lon: 0.0,
                 min_lat: 0.0,
                 max_lon: max_x,
                 max_lat: max_y,
+            },
+        )
+    }
+
+    fn spatial_ref_with_bbox(width_px: u32, height_px: u32, bbox: GeoBounds) -> RasterSpatialRef {
+        let x_resolution = (bbox.max_lon - bbox.min_lon) / width_px as f64;
+        let y_resolution = (bbox.max_lat - bbox.min_lat) / height_px as f64;
+        RasterSpatialRef {
+            georeferenced: true,
+            crs: Some("EPSG:32614".to_string()),
+            geo_transform: Some([
+                bbox.min_lon,
+                x_resolution,
+                0.0,
+                bbox.max_lat,
+                0.0,
+                -y_resolution,
+            ]),
+            bbox: Some(bbox),
+            resolution: Some(RasterResolution {
+                x: x_resolution,
+                y: y_resolution,
             }),
-            geo_transform: Some([0.0, 10.0, 0.0, max_y, 0.0, -10.0]),
-            resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
         }
     }
 }
