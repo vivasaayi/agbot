@@ -132,6 +132,35 @@ pub struct CopilotTurnRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopilotFieldContext {
+    pub conversation_id: String,
+    pub field_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_scene: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_zone: Option<String>,
+    pub last_evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopilotContextResolution {
+    pub context: CopilotFieldContext,
+    pub rejected_evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CopilotContextUpdateRequest {
+    #[serde(default)]
+    pub field_id: Option<String>,
+    #[serde(default)]
+    pub active_scene: Option<String>,
+    #[serde(default)]
+    pub active_zone: Option<String>,
+    #[serde(default)]
+    pub retrieved_evidence: Vec<EvidenceIndexEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CopilotConversationError {
     #[error("conversation_id cannot be empty")]
@@ -151,6 +180,26 @@ pub enum CopilotConversationError {
     },
     #[error("turn role {value} is invalid")]
     UnsupportedRole { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotContextError {
+    #[error("conversation_id cannot be empty")]
+    EmptyConversationId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("context conversation {context_conversation_id} does not match conversation {conversation_id}")]
+    ConversationScopeMismatch {
+        conversation_id: String,
+        context_conversation_id: String,
+    },
+    #[error(
+        "context field {context_field_id} does not match requested field {requested_field_id}"
+    )]
+    FieldScopeMismatch {
+        context_field_id: String,
+        requested_field_id: String,
+    },
 }
 
 pub trait LedgerEvidenceResolver {
@@ -906,6 +955,91 @@ pub fn create_copilot_turn(
     })
 }
 
+pub fn resolve_copilot_field_context(
+    conversation: &CopilotConversationRecord,
+    previous: Option<&CopilotFieldContext>,
+    request: CopilotContextUpdateRequest,
+) -> Result<CopilotContextResolution, CopilotContextError> {
+    let conversation_id = normalize_context_text(
+        conversation.conversation_id.clone(),
+        CopilotContextError::EmptyConversationId,
+    )?;
+    let conversation_field_id = normalize_context_text(
+        conversation.field_id.clone(),
+        CopilotContextError::EmptyFieldId,
+    )?;
+
+    if let Some(previous) = previous {
+        let context_conversation_id = normalize_context_text(
+            previous.conversation_id.clone(),
+            CopilotContextError::EmptyConversationId,
+        )?;
+        if context_conversation_id != conversation_id {
+            return Err(CopilotContextError::ConversationScopeMismatch {
+                conversation_id,
+                context_conversation_id,
+            });
+        }
+        if previous.field_id != conversation_field_id {
+            return Err(CopilotContextError::FieldScopeMismatch {
+                context_field_id: previous.field_id.clone(),
+                requested_field_id: conversation_field_id,
+            });
+        }
+    }
+
+    let requested_field_id = request
+        .field_id
+        .and_then(normalize_text)
+        .unwrap_or_else(|| conversation_field_id.clone());
+    if requested_field_id != conversation_field_id {
+        return Err(CopilotContextError::FieldScopeMismatch {
+            context_field_id: conversation_field_id,
+            requested_field_id,
+        });
+    }
+
+    let previous_scene = previous.and_then(|context| context.active_scene.clone());
+    let previous_zone = previous.and_then(|context| context.active_zone.clone());
+    let active_scene = normalize_optional_text(request.active_scene).or(previous_scene);
+    let active_zone = normalize_optional_text(request.active_zone).or(previous_zone);
+    let mut rejected_evidence_ids = Vec::new();
+    let mut last_evidence_ids = request
+        .retrieved_evidence
+        .into_iter()
+        .filter_map(|entry| {
+            let evidence_id = normalize_text(entry.evidence_id)?;
+            let evidence_field = normalize_text(entry.field_id)?;
+            if evidence_field == conversation_field_id {
+                Some(evidence_id)
+            } else {
+                rejected_evidence_ids.push(evidence_id);
+                None
+            }
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if last_evidence_ids.is_empty() {
+        last_evidence_ids = previous
+            .map(|context| context.last_evidence_ids.clone())
+            .unwrap_or_default();
+    }
+    rejected_evidence_ids.sort();
+    rejected_evidence_ids.dedup();
+
+    Ok(CopilotContextResolution {
+        context: CopilotFieldContext {
+            conversation_id,
+            field_id: conversation_field_id,
+            active_scene,
+            active_zone,
+            last_evidence_ids,
+        },
+        rejected_evidence_ids,
+    })
+}
+
 pub fn post_check_grounded_answer(
     answer: CopilotAnswer,
     claims: Vec<CopilotAnswerClaim>,
@@ -1263,6 +1397,13 @@ fn normalize_conversation_text(value: String) -> Option<String> {
     normalize_text(value)
 }
 
+fn normalize_context_text(
+    value: String,
+    error: CopilotContextError,
+) -> Result<String, CopilotContextError> {
+    normalize_text(value).ok_or(error)
+}
+
 fn normalize_optional_conversation_text(value: Option<String>) -> Option<String> {
     value.and_then(normalize_conversation_text)
 }
@@ -1331,10 +1472,11 @@ mod tests {
     use super::{
         annotate_answer_uncertainty, answer_grounded_question, approve_recommendation_draft,
         build_evidence_retrieval_index, create_copilot_turn, draft_recommendation_from_answer,
-        finalize_audited_turn, post_check_grounded_answer, start_copilot_conversation,
-        CopilotAnswer, CopilotAnswerClaim, CopilotAnswerRequest, CopilotAuditError,
-        CopilotAuditSink, CopilotConfidenceLevel, CopilotConversationError,
-        CopilotConversationStartRequest, CopilotGroundingError, CopilotIndexError, CopilotModel,
+        finalize_audited_turn, post_check_grounded_answer, resolve_copilot_field_context,
+        start_copilot_conversation, CopilotAnswer, CopilotAnswerClaim, CopilotAnswerRequest,
+        CopilotAuditError, CopilotAuditSink, CopilotConfidenceLevel, CopilotContextError,
+        CopilotContextUpdateRequest, CopilotConversationError, CopilotConversationStartRequest,
+        CopilotFieldContext, CopilotGroundingError, CopilotIndexError, CopilotModel,
         CopilotModelError, CopilotRecommendationApproval, CopilotRecommendationDraftError,
         CopilotRecommendationDraftRequest, CopilotRecommendationDraftStatus, CopilotRefusalReason,
         CopilotTurnAuditRecord, CopilotTurnAuditRequest, CopilotTurnCreateRequest, CopilotTurnRole,
@@ -1534,6 +1676,106 @@ mod tests {
             CopilotConversationError::FieldScopeMismatch {
                 conversation_field_id: "field-001".to_string(),
                 turn_field_id: "field-foreign".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn field_context_carries_scene_zone_and_evidence_into_followup() {
+        let conversation = conversation_record("conversation-001", "field-001");
+        let first = resolve_copilot_field_context(
+            &conversation,
+            None,
+            CopilotContextUpdateRequest {
+                field_id: None,
+                active_scene: Some("scene-2026-06-12".to_string()),
+                active_zone: Some("zone-ne".to_string()),
+                retrieved_evidence: vec![retrieved_evidence("evidence-ndvi-001")],
+            },
+        )
+        .expect("initial context should resolve");
+
+        let followup = resolve_copilot_field_context(
+            &conversation,
+            Some(&first.context),
+            CopilotContextUpdateRequest {
+                field_id: None,
+                active_scene: None,
+                active_zone: None,
+                retrieved_evidence: vec![],
+            },
+        )
+        .expect("follow-up should carry context");
+
+        assert_eq!(followup.context.field_id, "field-001");
+        assert_eq!(
+            followup.context.active_scene.as_deref(),
+            Some("scene-2026-06-12")
+        );
+        assert_eq!(followup.context.active_zone.as_deref(), Some("zone-ne"));
+        assert_eq!(
+            followup.context.last_evidence_ids,
+            vec!["evidence-ndvi-001"]
+        );
+        assert!(followup.rejected_evidence_ids.is_empty());
+    }
+
+    #[test]
+    fn field_context_isolates_other_field_evidence() {
+        let conversation = conversation_record("conversation-001", "field-001");
+        let resolution = resolve_copilot_field_context(
+            &conversation,
+            None,
+            CopilotContextUpdateRequest {
+                field_id: None,
+                active_scene: Some("scene-2026-06-12".to_string()),
+                active_zone: None,
+                retrieved_evidence: vec![
+                    retrieved_evidence("evidence-ndvi-001"),
+                    retrieved_evidence_for_field("evidence-other-field", "field-foreign"),
+                ],
+            },
+        )
+        .expect("context should resolve with isolated evidence");
+
+        assert_eq!(
+            resolution.context.last_evidence_ids,
+            vec!["evidence-ndvi-001"]
+        );
+        assert_eq!(
+            resolution.rejected_evidence_ids,
+            vec!["evidence-other-field"]
+        );
+    }
+
+    #[test]
+    fn field_context_rejects_cross_field_followup_scope() {
+        let conversation = conversation_record("conversation-001", "field-001");
+        let previous = CopilotFieldContext {
+            conversation_id: "conversation-001".to_string(),
+            field_id: "field-001".to_string(),
+            active_scene: None,
+            active_zone: None,
+            last_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+        };
+
+        let error = resolve_copilot_field_context(
+            &conversation,
+            Some(&previous),
+            CopilotContextUpdateRequest {
+                field_id: Some("field-foreign".to_string()),
+                active_scene: None,
+                active_zone: None,
+                retrieved_evidence: vec![],
+            },
+        )
+        .expect_err("cross-field follow-up should be rejected");
+
+        assert_eq!(
+            error,
+            CopilotContextError::FieldScopeMismatch {
+                context_field_id: "field-001".to_string(),
+                requested_field_id: "field-foreign".to_string()
             }
         );
     }
@@ -2029,14 +2271,29 @@ mod tests {
     }
 
     fn retrieved_evidence(evidence_id: &str) -> EvidenceIndexEntry {
+        retrieved_evidence_for_field(evidence_id, "field-001")
+    }
+
+    fn retrieved_evidence_for_field(evidence_id: &str, field_id: &str) -> EvidenceIndexEntry {
         EvidenceIndexEntry {
             evidence_id: evidence_id.to_string(),
             kind: EvidenceKind::ImageryProduct,
-            field_id: "field-001".to_string(),
+            field_id: field_id.to_string(),
             scene_ref: Some("scene-2026-06-01".to_string()),
             zone_ref: Some("zone-ne".to_string()),
             ledger_ref: format!("ledger:30:{evidence_id}"),
             summary: "NDVI in the northeast zone dropped below threshold.".to_string(),
+        }
+    }
+
+    fn conversation_record(
+        conversation_id: &str,
+        field_id: &str,
+    ) -> super::CopilotConversationRecord {
+        super::CopilotConversationRecord {
+            conversation_id: conversation_id.to_string(),
+            field_id: field_id.to_string(),
+            created_at: "2026-06-13T16:00:00Z".to_string(),
         }
     }
 
