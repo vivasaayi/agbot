@@ -342,6 +342,32 @@ pub struct HealthDegradationDetectionReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum HealthEvidenceSubjectKind {
+    ComponentVerdict,
+    DegradationEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthEvidenceInputRef {
+    pub ref_kind: String,
+    pub ref_id: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthEvidenceRecord {
+    pub record_id: String,
+    pub subject_kind: HealthEvidenceSubjectKind,
+    pub component_id: String,
+    pub method_version: String,
+    pub reason_code: String,
+    pub recorded_at: String,
+    pub input_refs: Vec<HealthEvidenceInputRef>,
+    pub decision_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ComponentHealthVerdictStatus {
     Ok,
     Watch,
@@ -791,10 +817,18 @@ pub enum FleetHealthError {
     EmptyHealthMethodVersion,
     #[error("health degradation detection config must have at least two points and finite positive slope/delta thresholds")]
     InvalidHealthDegradationConfig,
+    #[error("health evidence record_id cannot be empty")]
+    EmptyHealthEvidenceRecordId,
+    #[error("health evidence input ref_kind cannot be empty")]
+    EmptyHealthEvidenceRefKind,
+    #[error("health evidence input ref_id cannot be empty")]
+    EmptyHealthEvidenceRefId,
     #[error("telemetry value must be finite")]
     InvalidTelemetryValue,
     #[error("telemetry sample timestamp is invalid: {value}")]
     InvalidTelemetryTimestamp { value: String },
+    #[error("health evidence record {record_id} already exists with a different decision hash")]
+    HealthEvidenceOverwriteRefused { record_id: String },
     #[error(
         "health threshold must be finite, non-negative, and ordered watch <= degraded <= critical"
     )]
@@ -1396,6 +1430,156 @@ pub fn evaluate_component_health_verdict(
         freshness,
         evidence,
     })
+}
+
+pub fn build_health_verdict_evidence_record(
+    record_id: String,
+    verdict: &ComponentHealthVerdict,
+    recorded_at: String,
+) -> Result<HealthEvidenceRecord, FleetHealthError> {
+    let record_id =
+        normalize_required_text(record_id, FleetHealthError::EmptyHealthEvidenceRecordId)?;
+    let component_id = normalize_required_text(
+        verdict.component_id.clone(),
+        FleetHealthError::EmptyComponentId,
+    )?;
+    let method_version = normalize_required_text(
+        verdict.method_version.clone(),
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    let recorded_at = normalize_required_text(recorded_at, FleetHealthError::EmptyCreatedAt)?;
+    let mut input_refs = verdict
+        .evidence
+        .iter()
+        .map(|evidence| {
+            health_evidence_input_ref(
+                format!("indicator:{}", evidence.indicator.as_str()),
+                evidence.source_ref.clone(),
+                Some(format!(
+                    "value={:.12}|threshold={:.12}|sample_ts={}|freshness={}",
+                    evidence.value,
+                    evidence.threshold,
+                    evidence.sample_ts,
+                    evidence.freshness.as_str()
+                )),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    input_refs.sort_by(|left, right| {
+        left.ref_kind
+            .cmp(&right.ref_kind)
+            .then_with(|| left.ref_id.cmp(&right.ref_id))
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    let reason_code = health_verdict_reason_code(verdict.reason_code).to_string();
+    let decision_hash = health_evidence_decision_hash(
+        HealthEvidenceSubjectKind::ComponentVerdict,
+        &component_id,
+        &method_version,
+        &reason_code,
+        &input_refs,
+    );
+
+    Ok(HealthEvidenceRecord {
+        record_id,
+        subject_kind: HealthEvidenceSubjectKind::ComponentVerdict,
+        component_id,
+        method_version,
+        reason_code,
+        recorded_at,
+        input_refs,
+        decision_hash,
+    })
+}
+
+pub fn build_degradation_event_evidence_record(
+    record_id: String,
+    report: &HealthDegradationDetectionReport,
+    recorded_at: String,
+) -> Result<HealthEvidenceRecord, FleetHealthError> {
+    let record_id =
+        normalize_required_text(record_id, FleetHealthError::EmptyHealthEvidenceRecordId)?;
+    let component_id = normalize_required_text(
+        report.component_id.clone(),
+        FleetHealthError::EmptyComponentId,
+    )?;
+    let method_version = normalize_required_text(
+        report.method_version.clone(),
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    let recorded_at = normalize_required_text(recorded_at, FleetHealthError::EmptyCreatedAt)?;
+    let reason_code = health_degradation_reason_code(report.reason_code).to_string();
+    let mut input_refs = report
+        .evidence_refs
+        .iter()
+        .map(|source_ref| {
+            health_evidence_input_ref(
+                format!("indicator_window:{}", report.indicator.as_str()),
+                source_ref.clone(),
+                Some(format!(
+                    "window_start={}|window_end={}|slope_per_day={:.12}|delta={:.12}",
+                    report.window_start.as_deref().unwrap_or(""),
+                    report.window_end.as_deref().unwrap_or(""),
+                    report.slope_per_day.unwrap_or(0.0),
+                    report.delta.unwrap_or(0.0)
+                )),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    input_refs.sort_by(|left, right| {
+        left.ref_kind
+            .cmp(&right.ref_kind)
+            .then_with(|| left.ref_id.cmp(&right.ref_id))
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    let decision_hash = health_evidence_decision_hash(
+        HealthEvidenceSubjectKind::DegradationEvent,
+        &component_id,
+        &method_version,
+        &reason_code,
+        &input_refs,
+    );
+
+    Ok(HealthEvidenceRecord {
+        record_id,
+        subject_kind: HealthEvidenceSubjectKind::DegradationEvent,
+        component_id,
+        method_version,
+        reason_code,
+        recorded_at,
+        input_refs,
+        decision_hash,
+    })
+}
+
+pub fn append_health_evidence_record(
+    records: &mut Vec<HealthEvidenceRecord>,
+    record: HealthEvidenceRecord,
+) -> Result<HealthEvidenceRecord, FleetHealthError> {
+    if let Some(existing) = records
+        .iter()
+        .find(|existing| existing.record_id == record.record_id)
+    {
+        refuse_health_evidence_overwrite(existing, &record)?;
+        return Ok(existing.clone());
+    }
+    records.push(record.clone());
+    Ok(record)
+}
+
+pub fn refuse_health_evidence_overwrite(
+    existing: &HealthEvidenceRecord,
+    replacement: &HealthEvidenceRecord,
+) -> Result<(), FleetHealthError> {
+    if existing.record_id == replacement.record_id
+        && existing.decision_hash != replacement.decision_hash
+    {
+        Err(FleetHealthError::HealthEvidenceOverwriteRefused {
+            record_id: existing.record_id.clone(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 pub fn evaluate_fleet_readiness(
@@ -2022,6 +2206,78 @@ fn sorted_unique_evidence_refs(window: &[ParsedHealthIndicatorSample]) -> Vec<St
     refs
 }
 
+fn health_evidence_input_ref(
+    ref_kind: String,
+    ref_id: String,
+    value: Option<String>,
+) -> Result<HealthEvidenceInputRef, FleetHealthError> {
+    Ok(HealthEvidenceInputRef {
+        ref_kind: normalize_required_text(ref_kind, FleetHealthError::EmptyHealthEvidenceRefKind)?,
+        ref_id: normalize_required_text(ref_id, FleetHealthError::EmptyHealthEvidenceRefId)?,
+        value,
+    })
+}
+
+fn health_verdict_reason_code(reason_code: HealthVerdictReasonCode) -> &'static str {
+    match reason_code {
+        HealthVerdictReasonCode::AllIndicatorsWithinThreshold => "all_indicators_within_threshold",
+        HealthVerdictReasonCode::WatchThresholdExceeded => "watch_threshold_exceeded",
+        HealthVerdictReasonCode::DegradedThresholdExceeded => "degraded_threshold_exceeded",
+        HealthVerdictReasonCode::CriticalThresholdExceeded => "critical_threshold_exceeded",
+    }
+}
+
+fn health_degradation_reason_code(reason_code: HealthDegradationReasonCode) -> &'static str {
+    match reason_code {
+        HealthDegradationReasonCode::WithinTrendBand => "within_trend_band",
+        HealthDegradationReasonCode::SustainedAdverseSlope => "sustained_adverse_slope",
+        HealthDegradationReasonCode::DriftExceeded => "drift_exceeded",
+        HealthDegradationReasonCode::InsufficientHistory => "insufficient_history",
+    }
+}
+
+fn health_evidence_decision_hash(
+    subject_kind: HealthEvidenceSubjectKind,
+    component_id: &str,
+    method_version: &str,
+    reason_code: &str,
+    input_refs: &[HealthEvidenceInputRef],
+) -> String {
+    let mut canonical = String::new();
+    canonical.push_str(health_evidence_subject_kind(subject_kind));
+    canonical.push('|');
+    canonical.push_str(component_id);
+    canonical.push('|');
+    canonical.push_str(method_version);
+    canonical.push('|');
+    canonical.push_str(reason_code);
+    for input_ref in input_refs {
+        canonical.push('|');
+        canonical.push_str(&input_ref.ref_kind);
+        canonical.push('=');
+        canonical.push_str(&input_ref.ref_id);
+        canonical.push('=');
+        canonical.push_str(input_ref.value.as_deref().unwrap_or(""));
+    }
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn health_evidence_subject_kind(subject_kind: HealthEvidenceSubjectKind) -> &'static str {
+    match subject_kind {
+        HealthEvidenceSubjectKind::ComponentVerdict => "component_verdict",
+        HealthEvidenceSubjectKind::DegradationEvent => "degradation_event",
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn validate_finite(value: f64) -> Result<(), FleetHealthError> {
     if value.is_finite() {
         Ok(())
@@ -2235,22 +2491,25 @@ fn validate_nonnegative_finite(
 #[cfg(test)]
 mod tests {
     use super::{
-        accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
-        build_component_record, build_fleet_operations_dashboard_feed, component_event,
-        derive_health_indicators, detect_health_indicator_degradation,
-        evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
-        evaluate_ota_rollout, fleet_operations_source_current, fleet_operations_source_unavailable,
-        install_component, BatteryHealthTrendConfig, ComponentHealthVerdict,
+        accrue_component_duty, append_health_evidence_record, apply_rollout_control,
+        build_component_duty_accruals, build_component_record,
+        build_degradation_event_evidence_record, build_fleet_operations_dashboard_feed,
+        build_health_verdict_evidence_record, component_event, derive_health_indicators,
+        detect_health_indicator_degradation, evaluate_battery_health_trend,
+        evaluate_component_health_verdict, evaluate_fleet_readiness, evaluate_ota_rollout,
+        fleet_operations_source_current, fleet_operations_source_unavailable, install_component,
+        refuse_health_evidence_overwrite, BatteryHealthTrendConfig, ComponentHealthVerdict,
         ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
         DutyAccrualRequest, FleetComponentRecord, FleetComponentType, FleetHealthError,
         FleetHealthIndicator, FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
         FleetOperationsRolloutFeedState, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
         FleetReadinessRequest, HealthDegradationDetectionConfig, HealthDegradationDetectionRequest,
-        HealthDegradationDetectionStatus, HealthDegradationReasonCode, HealthIndicatorFreshness,
-        HealthIndicatorThreshold, HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence,
-        HealthVerdictReasonCode, InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport,
-        OtaRolloutDecisionReason, OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest,
-        OtaRolloutStage, RegisterComponentRequest, RolloutControlAction, RolloutControlReason,
+        HealthDegradationDetectionStatus, HealthDegradationReasonCode, HealthEvidenceRecord,
+        HealthEvidenceSubjectKind, HealthIndicatorFreshness, HealthIndicatorThreshold,
+        HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
+        InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
+        OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
+        RegisterComponentRequest, RolloutControlAction, RolloutControlReason,
         RolloutControlRequest, RolloutControlStatus, ServiceHistoryEntry,
         TelemetryHealthIndicatorRequest,
     };
@@ -2765,6 +3024,154 @@ mod tests {
         assert!(report.event.is_none());
         assert!(report.slope_per_day.is_none());
         assert!(report.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn health_verdict_evidence_rerun_produces_identical_hash() {
+        let verdict = evaluate_component_health_verdict(ComponentHealthVerdictRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T12:30:00Z".to_string(),
+            method_version: "fleet-health-thresholds-v1".to_string(),
+            samples: vec![indicator_sample(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                1.2,
+            )],
+            thresholds: vec![threshold(
+                FleetHealthIndicator::MotorVibration,
+                0.6,
+                1.0,
+                1.5,
+            )],
+        })
+        .expect("verdict should evaluate");
+
+        let first = build_health_verdict_evidence_record(
+            "health-evidence:motor-001:thresholds-v1".to_string(),
+            &verdict,
+            "2026-06-22T12:31:00Z".to_string(),
+        )
+        .expect("evidence should build");
+        let second = build_health_verdict_evidence_record(
+            "health-evidence:motor-001:thresholds-v1".to_string(),
+            &verdict,
+            "2026-06-22T12:45:00Z".to_string(),
+        )
+        .expect("rerun evidence should build");
+
+        assert_eq!(first.decision_hash, second.decision_hash);
+        assert_eq!(first.reason_code, "degraded_threshold_exceeded");
+        assert_eq!(
+            first.subject_kind,
+            HealthEvidenceSubjectKind::ComponentVerdict
+        );
+        assert_eq!(first.input_refs.len(), 1);
+    }
+
+    #[test]
+    fn health_evidence_appends_method_version_change_without_overwriting_prior() {
+        let old_verdict = component_verdict(
+            "motor-001",
+            ComponentHealthVerdictStatus::Watch,
+            HealthIndicatorFreshness::Fresh,
+        );
+        let mut new_verdict = component_verdict(
+            "motor-001",
+            ComponentHealthVerdictStatus::Degraded,
+            HealthIndicatorFreshness::Fresh,
+        );
+        new_verdict.method_version = "fleet-health-thresholds-v2".to_string();
+        let first = build_health_verdict_evidence_record(
+            "health-evidence:motor-001:thresholds-v1".to_string(),
+            &old_verdict,
+            "2026-06-22T12:31:00Z".to_string(),
+        )
+        .expect("old evidence should build");
+        let second = build_health_verdict_evidence_record(
+            "health-evidence:motor-001:thresholds-v2".to_string(),
+            &new_verdict,
+            "2026-06-22T13:31:00Z".to_string(),
+        )
+        .expect("new evidence should build");
+
+        let mut records = Vec::new();
+        append_health_evidence_record(&mut records, first.clone())
+            .expect("first append should work");
+        append_health_evidence_record(&mut records, second.clone())
+            .expect("new method append should work");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].method_version, "fleet-health-thresholds-v1");
+        assert_eq!(records[1].method_version, "fleet-health-thresholds-v2");
+        assert_ne!(records[0].decision_hash, records[1].decision_hash);
+    }
+
+    #[test]
+    fn health_evidence_refuses_in_place_overwrite() {
+        let existing = health_evidence_record("health-evidence:motor-001", "hash-a");
+        let replacement = health_evidence_record("health-evidence:motor-001", "hash-b");
+        let error = refuse_health_evidence_overwrite(&existing, &replacement)
+            .expect_err("different hash under same record id should be refused");
+
+        assert_eq!(
+            error,
+            FleetHealthError::HealthEvidenceOverwriteRefused {
+                record_id: "health-evidence:motor-001".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn degradation_event_evidence_retains_series_window_refs() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.35,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-15T00:00:00Z",
+                "telemetry:mission-003",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.65,
+                "2026-06-22T00:00:00Z",
+                "telemetry:mission-004",
+            ),
+        ]))
+        .expect("degradation report should evaluate");
+        let evidence = build_degradation_event_evidence_record(
+            "health-evidence:motor-001:degradation-v1".to_string(),
+            &report,
+            "2026-06-22T12:31:00Z".to_string(),
+        )
+        .expect("degradation evidence should build");
+
+        assert_eq!(
+            evidence.subject_kind,
+            HealthEvidenceSubjectKind::DegradationEvent
+        );
+        assert_eq!(evidence.reason_code, "sustained_adverse_slope");
+        assert_eq!(evidence.input_refs.len(), 4);
+        assert!(evidence.input_refs[0]
+            .value
+            .as_deref()
+            .expect("window value should be present")
+            .contains("window_start=2026-06-01T00:00:00Z"));
     }
 
     #[test]
@@ -3390,6 +3797,19 @@ mod tests {
                 min_adverse_slope_per_day: 0.02,
                 min_adverse_delta: 0.30,
             },
+        }
+    }
+
+    fn health_evidence_record(record_id: &str, decision_hash: &str) -> HealthEvidenceRecord {
+        HealthEvidenceRecord {
+            record_id: record_id.to_string(),
+            subject_kind: HealthEvidenceSubjectKind::ComponentVerdict,
+            component_id: "motor-001".to_string(),
+            method_version: "fleet-health-thresholds-v1".to_string(),
+            reason_code: "degraded_threshold_exceeded".to_string(),
+            recorded_at: "2026-06-22T12:31:00Z".to_string(),
+            input_refs: vec![],
+            decision_hash: decision_hash.to_string(),
         }
     }
 
