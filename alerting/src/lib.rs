@@ -237,6 +237,20 @@ pub struct AlertSeverityClassification {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertMessageTemplate {
+    pub template_id: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderedAlertMessage {
+    pub template_id: String,
+    pub alert_id: String,
+    pub message: String,
+    pub variables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlertDedupKey {
     pub source_domain: String,
     pub subject_ref: String,
@@ -532,6 +546,16 @@ pub enum AlertingError {
     EmptyFiredAt,
     #[error("explanation cannot be empty")]
     EmptyExplanation,
+    #[error("template_id cannot be empty")]
+    EmptyTemplateId,
+    #[error("template body cannot be empty")]
+    EmptyTemplateBody,
+    #[error("template variable cannot be empty")]
+    EmptyTemplateVariable,
+    #[error("template variable {variable} is missing from alert evidence")]
+    MissingTemplateVariable { variable: String },
+    #[error("template variable {variable} is not closed")]
+    UnclosedTemplateVariable { variable: String },
     #[error("severity metric cannot be empty")]
     EmptySeverityMetric,
     #[error("severity method_version cannot be empty")]
@@ -1081,6 +1105,26 @@ pub fn classify_alert_severity(
     })
 }
 
+pub fn render_alert_message_template(
+    template: AlertMessageTemplate,
+    alert: &FiredAlertRecord,
+    evidence: BTreeMap<String, String>,
+) -> Result<RenderedAlertMessage, AlertingError> {
+    let template_id =
+        normalize_required_text(template.template_id, AlertingError::EmptyTemplateId)?;
+    let body = normalize_required_text(template.body, AlertingError::EmptyTemplateBody)?;
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    let values = alert_template_values(&alert, evidence)?;
+    let (message, variables) = render_template_body(&body, &values)?;
+
+    Ok(RenderedAlertMessage {
+        template_id,
+        alert_id: alert.alert_id,
+        message,
+        variables,
+    })
+}
+
 pub fn compute_alert_dedup_key(alert: &FiredAlertRecord) -> Result<AlertDedupKey, AlertingError> {
     let alert = normalize_fired_alert_record(alert.clone())?;
     Ok(AlertDedupKey {
@@ -1448,6 +1492,78 @@ fn normalize_severity_evidence(
         emergency_threshold: evidence.emergency_threshold,
         method_version,
     })
+}
+
+fn alert_template_values(
+    alert: &FiredAlertRecord,
+    evidence: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, AlertingError> {
+    let mut values = BTreeMap::from([
+        ("alert_id".to_string(), alert.alert_id.clone()),
+        ("matched_rule_id".to_string(), alert.matched_rule_id.clone()),
+        (
+            "source_event_ref".to_string(),
+            alert.source_event_ref.clone(),
+        ),
+        ("source_domain".to_string(), alert.source_domain.clone()),
+        ("event_type".to_string(), alert.event_type.clone()),
+        ("subject_ref".to_string(), alert.subject_ref.clone()),
+        ("severity".to_string(), alert.severity.as_str().to_string()),
+        ("channels".to_string(), alert.channels.join(",")),
+        ("fired_at".to_string(), alert.fired_at.clone()),
+        ("explanation".to_string(), alert.explanation.clone()),
+        ("evidence_refs".to_string(), alert.evidence_refs.join(",")),
+    ]);
+    if let Some(field_id) = &alert.field_id {
+        values.insert("field_id".to_string(), field_id.clone());
+    }
+    for (key, value) in evidence {
+        let key = normalize_required_text(key, AlertingError::EmptyTemplateVariable)?;
+        let value = normalize_required_text(
+            value,
+            AlertingError::MissingTemplateVariable {
+                variable: key.clone(),
+            },
+        )?;
+        values.insert(key, value);
+    }
+    Ok(values)
+}
+
+fn render_template_body(
+    body: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<(String, Vec<String>), AlertingError> {
+    let mut rendered = String::with_capacity(body.len());
+    let mut variables = Vec::new();
+    let mut rest = body;
+
+    while let Some(start) = rest.find("{{") {
+        rendered.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            return Err(AlertingError::UnclosedTemplateVariable {
+                variable: after_open.trim().to_string(),
+            });
+        };
+        let variable = after_open[..end].trim();
+        if variable.is_empty() {
+            return Err(AlertingError::EmptyTemplateVariable);
+        }
+        let value = values
+            .get(variable)
+            .ok_or_else(|| AlertingError::MissingTemplateVariable {
+                variable: variable.to_string(),
+            })?;
+        rendered.push_str(value);
+        variables.push(variable.to_string());
+        rest = &after_open[end + 2..];
+    }
+
+    rendered.push_str(rest);
+    variables.sort();
+    variables.dedup();
+    Ok((rendered, variables))
 }
 
 fn normalize_dedup_window(window: AlertDedupWindow) -> Result<AlertDedupWindow, AlertingError> {
@@ -1874,14 +1990,17 @@ fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
         acknowledge_alert, auto_resolve_alert, build_alert_rule_record,
         build_alert_rule_subscription, classify_alert_severity, compute_alert_dedup_key,
         deduplicate_alert_stream, deliver_alert, evaluate_alert_rules,
-        evaluate_managed_alert_rules, filter_alert_history, open_alert_lifecycle, resolve_alert,
-        route_alert_to_recipients, run_tracked_delivery, transition_alert_rule_status,
-        version_alert_rule_record, AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone,
-        AlertHistoryQuery, AlertLifecycleRecord, AlertLifecycleState, AlertRecipient,
+        evaluate_managed_alert_rules, filter_alert_history, open_alert_lifecycle,
+        render_alert_message_template, resolve_alert, route_alert_to_recipients,
+        run_tracked_delivery, transition_alert_rule_status, version_alert_rule_record,
+        AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone, AlertHistoryQuery,
+        AlertLifecycleRecord, AlertLifecycleState, AlertMessageTemplate, AlertRecipient,
         AlertRoutingRule, AlertRule, AlertRuleCreateRequest, AlertRuleStatus,
         AlertRuleStatusUpdateRequest, AlertRuleSubscriptionCreateRequest, AlertRuleUpdateRequest,
         AlertSeverityEvidence, AlertSeverityHint, AlertingError, DeliveryRetryPolicy,
@@ -2019,6 +2138,80 @@ mod tests {
 
         assert!(outcome.fired_alerts.is_empty());
         assert_eq!(outcome.non_match_count, 1);
+    }
+
+    #[test]
+    fn alert_template_renders_from_alert_and_evidence_fields() {
+        let alert = fired_alert(
+            "alert-sensor-stale-001",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:02:00Z",
+        );
+        let mut evidence = BTreeMap::new();
+        evidence.insert("metric".to_string(), "soil_probe_age_minutes".to_string());
+        evidence.insert("observed_value".to_string(), "74".to_string());
+        evidence.insert("threshold".to_string(), "60".to_string());
+
+        let rendered = render_alert_message_template(
+            AlertMessageTemplate {
+                template_id: "sensor-stale-critical-v1".to_string(),
+                body: "{{severity}} {{event_type}} for {{field_id}}: {{metric}}={{observed_value}} over {{threshold}} at {{fired_at}}".to_string(),
+            },
+            &alert,
+            evidence,
+        )
+        .expect("complete evidence should render");
+
+        assert_eq!(rendered.template_id, "sensor-stale-critical-v1");
+        assert_eq!(rendered.alert_id, "alert-sensor-stale-001");
+        assert_eq!(
+            rendered.message,
+            "critical sensor_stale for field-alpha: soil_probe_age_minutes=74 over 60 at 2026-06-12T10:02:00Z"
+        );
+        assert_eq!(
+            rendered.variables,
+            vec![
+                "event_type".to_string(),
+                "field_id".to_string(),
+                "fired_at".to_string(),
+                "metric".to_string(),
+                "observed_value".to_string(),
+                "severity".to_string(),
+                "threshold".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn alert_template_missing_evidence_field_fails_without_partial_message() {
+        let alert = fired_alert(
+            "alert-sensor-stale-001",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:02:00Z",
+        );
+        let mut evidence = BTreeMap::new();
+        evidence.insert("metric".to_string(), "soil_probe_age_minutes".to_string());
+
+        let error = render_alert_message_template(
+            AlertMessageTemplate {
+                template_id: "sensor-stale-critical-v1".to_string(),
+                body: "{{severity}} {{metric}} over {{threshold}}".to_string(),
+            },
+            &alert,
+            evidence,
+        )
+        .expect_err("missing template variable should refuse render");
+
+        assert_eq!(
+            error,
+            AlertingError::MissingTemplateVariable {
+                variable: "threshold".to_string()
+            }
+        );
     }
 
     #[test]
