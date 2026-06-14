@@ -147,6 +147,7 @@ pub struct HealthTelemetryGap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetHealthIndicator {
+    BatteryCycleCount,
     BatteryInternalResistance,
     MotorVibration,
     EscTemperature,
@@ -155,6 +156,7 @@ pub enum FleetHealthIndicator {
 impl FleetHealthIndicator {
     pub fn as_str(self) -> &'static str {
         match self {
+            FleetHealthIndicator::BatteryCycleCount => "battery_cycle_count",
             FleetHealthIndicator::BatteryInternalResistance => {
                 "battery_internal_resistance_milliohm"
             }
@@ -165,6 +167,7 @@ impl FleetHealthIndicator {
 
     pub fn unit(self) -> &'static str {
         match self {
+            FleetHealthIndicator::BatteryCycleCount => "cycles",
             FleetHealthIndicator::BatteryInternalResistance => "milliohm",
             FleetHealthIndicator::MotorVibration => "g",
             FleetHealthIndicator::EscTemperature => "celsius",
@@ -177,6 +180,7 @@ impl std::str::FromStr for FleetHealthIndicator {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "battery_cycle_count" | "battery_cycles" => Ok(Self::BatteryCycleCount),
             "battery_internal_resistance_milliohm" | "battery_internal_resistance" => {
                 Ok(Self::BatteryInternalResistance)
             }
@@ -248,6 +252,24 @@ impl FleetHealthIndicatorSample {
 pub struct FleetHealthIndicatorDerivation {
     pub samples: Vec<FleetHealthIndicatorSample>,
     pub gaps: Vec<HealthTelemetryGap>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BatteryHealthTrendConfig {
+    pub max_cycles: u32,
+    pub resistance_degraded_at_milliohm: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatteryHealthTrendReport {
+    pub component_id: String,
+    pub evaluated_at: String,
+    pub cycle_count: u32,
+    pub max_cycles: u32,
+    pub latest_internal_resistance_milliohm: f64,
+    pub resistance_sample_count: usize,
+    pub status: ComponentHealthVerdictStatus,
+    pub evidence: Vec<HealthVerdictEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,6 +655,8 @@ pub enum FleetHealthError {
     EmptyHealthIndicatorSamples,
     #[error("health threshold set cannot be empty")]
     EmptyHealthThresholds,
+    #[error("battery trend requires at least one internal-resistance sample")]
+    EmptyBatteryResistanceSamples,
     #[error("health threshold method_version cannot be empty")]
     EmptyHealthMethodVersion,
     #[error("telemetry value must be finite")]
@@ -650,6 +674,8 @@ pub enum FleetHealthError {
     },
     #[error("service limit must have a component_id and at least one finite non-negative limit")]
     InvalidServiceLimit { component_id: String },
+    #[error("battery trend requires a battery component")]
+    BatteryTrendRequiresBattery { component_id: String },
     #[error("battery current must be finite and non-zero")]
     InvalidBatteryCurrent,
     #[error("telemetry gap timestamp cannot be empty")]
@@ -888,6 +914,130 @@ pub fn derive_health_indicators(
     }
 
     Ok(FleetHealthIndicatorDerivation { samples, gaps })
+}
+
+pub fn evaluate_battery_health_trend(
+    component: &FleetComponentRecord,
+    samples: Vec<FleetHealthIndicatorSample>,
+    config: BatteryHealthTrendConfig,
+    evaluated_at: String,
+) -> Result<BatteryHealthTrendReport, FleetHealthError> {
+    if component.component_type != FleetComponentType::Battery {
+        return Err(FleetHealthError::BatteryTrendRequiresBattery {
+            component_id: component.component_id.clone(),
+        });
+    }
+    let component_id = normalize_required_text(
+        component.component_id.clone(),
+        FleetHealthError::EmptyComponentId,
+    )?;
+    let evaluated_at = normalize_required_text(evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    if config.max_cycles == 0 {
+        return Err(FleetHealthError::InvalidServiceLimit {
+            component_id: component_id.clone(),
+        });
+    }
+    if !config.resistance_degraded_at_milliohm.is_finite()
+        || config.resistance_degraded_at_milliohm < 0.0
+    {
+        return Err(FleetHealthError::InvalidHealthThreshold {
+            indicator: FleetHealthIndicator::BatteryInternalResistance,
+        });
+    }
+
+    let mut resistance_samples = Vec::new();
+    for sample in samples {
+        let sample_component_id =
+            normalize_required_text(sample.component_id, FleetHealthError::EmptyComponentId)?;
+        if sample_component_id != component_id {
+            return Err(FleetHealthError::IndicatorComponentMismatch {
+                component_id: component_id.clone(),
+                sample_component_id,
+            });
+        }
+        if sample.indicator != FleetHealthIndicator::BatteryInternalResistance {
+            continue;
+        }
+        validate_finite(sample.value)?;
+        resistance_samples.push(FleetHealthIndicatorSample {
+            component_id: sample_component_id,
+            indicator: sample.indicator,
+            value: sample.value,
+            ts: normalize_required_text(sample.ts, FleetHealthError::EmptyTelemetryTimestamp)?,
+            source_ref: normalize_required_text(
+                sample.source_ref,
+                FleetHealthError::EmptySourceRef,
+            )?,
+            created_at: sample.created_at,
+            freshness: sample.freshness,
+        });
+    }
+    if resistance_samples.is_empty() {
+        return Err(FleetHealthError::EmptyBatteryResistanceSamples);
+    }
+    resistance_samples.sort_by(|left, right| left.ts.cmp(&right.ts));
+    let latest_resistance = resistance_samples
+        .last()
+        .expect("non-empty resistance samples checked above");
+
+    let cycle_status = if component.cycles > config.max_cycles {
+        ComponentHealthVerdictStatus::Degraded
+    } else {
+        ComponentHealthVerdictStatus::Ok
+    };
+    let resistance_status = if latest_resistance.value >= config.resistance_degraded_at_milliohm {
+        ComponentHealthVerdictStatus::Degraded
+    } else {
+        ComponentHealthVerdictStatus::Ok
+    };
+    let cycle_reason = if cycle_status == ComponentHealthVerdictStatus::Degraded {
+        HealthVerdictReasonCode::DegradedThresholdExceeded
+    } else {
+        HealthVerdictReasonCode::AllIndicatorsWithinThreshold
+    };
+    let resistance_reason = if resistance_status == ComponentHealthVerdictStatus::Degraded {
+        HealthVerdictReasonCode::DegradedThresholdExceeded
+    } else {
+        HealthVerdictReasonCode::AllIndicatorsWithinThreshold
+    };
+    let evidence = vec![
+        HealthVerdictEvidence {
+            indicator: FleetHealthIndicator::BatteryCycleCount,
+            value: component.cycles as f64,
+            threshold: config.max_cycles as f64,
+            status: cycle_status,
+            reason_code: cycle_reason,
+            sample_ts: component.updated_at.clone(),
+            source_ref: format!("component:{}", component.component_id),
+            freshness: HealthIndicatorFreshness::Fresh,
+        },
+        HealthVerdictEvidence {
+            indicator: FleetHealthIndicator::BatteryInternalResistance,
+            value: latest_resistance.value,
+            threshold: config.resistance_degraded_at_milliohm,
+            status: resistance_status,
+            reason_code: resistance_reason,
+            sample_ts: latest_resistance.ts.clone(),
+            source_ref: latest_resistance.source_ref.clone(),
+            freshness: latest_resistance.freshness,
+        },
+    ];
+    let status = evidence
+        .iter()
+        .max_by(|left, right| compare_verdict_evidence(left, right))
+        .map(|evidence| evidence.status)
+        .unwrap_or(ComponentHealthVerdictStatus::Ok);
+
+    Ok(BatteryHealthTrendReport {
+        component_id,
+        evaluated_at,
+        cycle_count: component.cycles,
+        max_cycles: config.max_cycles,
+        latest_internal_resistance_milliohm: latest_resistance.value,
+        resistance_sample_count: resistance_samples.len(),
+        status,
+        evidence,
+    })
 }
 
 pub fn evaluate_component_health_verdict(
@@ -1623,13 +1773,13 @@ mod tests {
     use super::{
         accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
         build_component_record, component_event, derive_health_indicators,
-        evaluate_component_health_verdict, evaluate_fleet_readiness, evaluate_ota_rollout,
-        install_component, ComponentHealthVerdict, ComponentHealthVerdictRequest,
-        ComponentHealthVerdictStatus, ComponentServiceLimit, DutyAccrualRequest,
-        FleetComponentRecord, FleetComponentType, FleetHealthError, FleetHealthIndicator,
-        FleetReadinessBlockReason, FleetReadinessDecisionStatus, FleetReadinessRequest,
-        HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
-        HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
+        evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
+        evaluate_ota_rollout, install_component, BatteryHealthTrendConfig, ComponentHealthVerdict,
+        ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
+        DutyAccrualRequest, FleetComponentRecord, FleetComponentType, FleetHealthError,
+        FleetHealthIndicator, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
+        FleetReadinessRequest, HealthIndicatorFreshness, HealthIndicatorThreshold,
+        HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
         InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
         OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
         RegisterComponentRequest, RolloutControlAction, RolloutControlReason,
@@ -1905,6 +2055,106 @@ mod tests {
             HealthIndicatorFreshness::Stale
         );
         assert_ne!(derived.samples[0].ts, "2026-06-12T12:01:00Z");
+    }
+
+    #[test]
+    fn battery_cycle_count_and_resistance_trend_tracks_completed_discharge() {
+        let component =
+            component_for_readiness("battery-pack-001", FleetComponentType::Battery, 0.0, 0, 0.0);
+        let accruals = build_component_duty_accruals(
+            DutyAccrualRequest {
+                session_id: "session-001".to_string(),
+                airframe_id: "airframe-1".to_string(),
+                flight_hours: 0.6,
+                cycles: 1,
+                duty_score: 0.4,
+                ended_at: "2026-06-12T12:10:00Z".to_string(),
+            },
+            &[component.component_id.clone()],
+        )
+        .expect("battery discharge cycle should accrue");
+        let updated =
+            accrue_component_duty(&component, &accruals[0], "2026-06-12T12:10:00Z".to_string())
+                .expect("battery cycle total should update");
+        let derived = derive_health_indicators(TelemetryHealthIndicatorRequest {
+            source_ref: "telemetry:session-001".to_string(),
+            created_at: "2026-06-12T12:20:00Z".to_string(),
+            samples: vec![HealthTelemetrySample {
+                component_id: "battery-pack-001".to_string(),
+                component_type: FleetComponentType::Battery,
+                ts: "2026-06-12T12:09:00Z".to_string(),
+                battery_open_circuit_voltage_v: Some(16.8),
+                battery_voltage_v: Some(16.24),
+                battery_current_a: Some(28.0),
+                motor_vibration_g: None,
+                esc_temperature_c: None,
+            }],
+            telemetry_gaps: vec![],
+        })
+        .expect("resistance sample should derive from telemetry");
+
+        let trend = evaluate_battery_health_trend(
+            &updated,
+            derived.samples,
+            BatteryHealthTrendConfig {
+                max_cycles: 200,
+                resistance_degraded_at_milliohm: 60.0,
+            },
+            "2026-06-12T12:30:00Z".to_string(),
+        )
+        .expect("battery trend should evaluate");
+
+        assert_eq!(trend.component_id, "battery-pack-001");
+        assert_eq!(trend.cycle_count, 1);
+        assert_eq!(trend.resistance_sample_count, 1);
+        assert!((trend.latest_internal_resistance_milliohm - 20.0).abs() < 1e-9);
+        assert_eq!(trend.status, ComponentHealthVerdictStatus::Ok);
+        assert_eq!(
+            trend.evidence[0].indicator,
+            FleetHealthIndicator::BatteryCycleCount
+        );
+        assert_eq!(
+            trend.evidence[1].indicator,
+            FleetHealthIndicator::BatteryInternalResistance
+        );
+    }
+
+    #[test]
+    fn battery_trend_flags_degraded_pack_over_cycle_limit_with_evidence() {
+        let component = component_for_readiness(
+            "battery-pack-001",
+            FleetComponentType::Battery,
+            80.0,
+            201,
+            70.0,
+        );
+        let trend = evaluate_battery_health_trend(
+            &component,
+            vec![indicator_sample(
+                "battery-pack-001",
+                FleetHealthIndicator::BatteryInternalResistance,
+                31.0,
+            )],
+            BatteryHealthTrendConfig {
+                max_cycles: 200,
+                resistance_degraded_at_milliohm: 60.0,
+            },
+            "2026-06-12T12:30:00Z".to_string(),
+        )
+        .expect("battery trend should evaluate");
+
+        assert_eq!(trend.status, ComponentHealthVerdictStatus::Degraded);
+        let cycle_evidence = trend
+            .evidence
+            .iter()
+            .find(|item| item.indicator == FleetHealthIndicator::BatteryCycleCount)
+            .expect("cycle evidence should be present");
+        assert_eq!(cycle_evidence.value, 201.0);
+        assert_eq!(cycle_evidence.threshold, 200.0);
+        assert_eq!(
+            cycle_evidence.reason_code,
+            HealthVerdictReasonCode::DegradedThresholdExceeded
+        );
     }
 
     #[test]
