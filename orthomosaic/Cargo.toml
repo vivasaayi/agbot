@@ -9,3 +9,4 @@ serde_json = { workspace = true }
 shared = { path = "../shared" }
 provenance = { path = "../provenance" }
 thiserror = { workspace = true }
+chrono = { workspace = true }

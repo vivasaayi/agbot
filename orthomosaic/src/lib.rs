@@ -144,6 +144,42 @@ pub struct ReconstructionJobRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructionProgressStage {
+    FeatureMatching,
+    CameraRegistration,
+    DenseReconstruction,
+    Orthorectification,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReconstructionProgressEvent {
+    pub recon_id: String,
+    pub stage: ReconstructionProgressStage,
+    pub matched_frames: usize,
+    pub registered_cameras: usize,
+    pub dense_points: usize,
+    pub coverage_fraction: f64,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructionStallReasonCode {
+    NoProgressWithinWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconstructionStallEvent {
+    pub recon_id: String,
+    pub stage: ReconstructionProgressStage,
+    pub last_progress_at: chrono::DateTime<chrono::Utc>,
+    pub detected_at: chrono::DateTime<chrono::Utc>,
+    pub stalled_for_seconds: u64,
+    pub reason_code: ReconstructionStallReasonCode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReconstructionJobError {
     #[error("recon_id cannot be empty")]
@@ -154,6 +190,8 @@ pub enum ReconstructionJobError {
     EmptyTimestamp,
     #[error("failure reason cannot be empty")]
     EmptyFailureReason,
+    #[error("reconstruction progress coverage_fraction must be finite within 0..=1")]
+    InvalidProgressCoverage,
     #[error("unsupported reconstruction status {value}")]
     UnsupportedStatus { value: String },
     #[error("invalid reconstruction status transition {from:?} -> {to:?}")]
@@ -211,6 +249,69 @@ pub fn transition_reconstruction_status(
     record.failure_reason = failure_reason;
     record.updated_at = updated_at;
     Ok(record)
+}
+
+pub fn build_reconstruction_progress_event(
+    recon_id: String,
+    stage: ReconstructionProgressStage,
+    matched_frames: usize,
+    registered_cameras: usize,
+    dense_points: usize,
+    coverage_fraction: f64,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<ReconstructionProgressEvent, ReconstructionJobError> {
+    let recon_id = normalize_required_recon_text(recon_id, ReconstructionJobError::EmptyReconId)?;
+    if !coverage_fraction.is_finite() || !(0.0..=1.0).contains(&coverage_fraction) {
+        return Err(ReconstructionJobError::InvalidProgressCoverage);
+    }
+
+    Ok(ReconstructionProgressEvent {
+        recon_id,
+        stage,
+        matched_frames,
+        registered_cameras,
+        dense_points,
+        coverage_fraction,
+        at,
+    })
+}
+
+pub fn reconstruction_progress_stream(
+    mut events: Vec<ReconstructionProgressEvent>,
+) -> Vec<ReconstructionProgressEvent> {
+    events.sort_by(|left, right| {
+        left.at
+            .cmp(&right.at)
+            .then(left.recon_id.cmp(&right.recon_id))
+            .then((left.stage as u8).cmp(&(right.stage as u8)))
+    });
+    events
+}
+
+pub fn detect_reconstruction_stall(
+    events: &[ReconstructionProgressEvent],
+    detected_at: chrono::DateTime<chrono::Utc>,
+    stall_after: std::time::Duration,
+) -> Option<ReconstructionStallEvent> {
+    let latest = events.iter().max_by(|left, right| {
+        left.at
+            .cmp(&right.at)
+            .then(left.recon_id.cmp(&right.recon_id))
+            .then((left.stage as u8).cmp(&(right.stage as u8)))
+    })?;
+    let stalled_for_seconds = detected_at
+        .signed_duration_since(latest.at)
+        .num_seconds()
+        .max(0) as u64;
+
+    (stalled_for_seconds > stall_after.as_secs()).then(|| ReconstructionStallEvent {
+        recon_id: latest.recon_id.clone(),
+        stage: latest.stage,
+        last_progress_at: latest.at,
+        detected_at,
+        stalled_for_seconds,
+        reason_code: ReconstructionStallReasonCode::NoProgressWithinWindow,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -2499,15 +2600,17 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_frame_set_record, build_reconstruction_job, build_reprojection_error_report,
-        build_tiled_output_handoff, generate_dsm, run_feature_matching, run_frame_set_qa,
+        build_frame_set_record, build_reconstruction_job, build_reconstruction_progress_event,
+        build_reprojection_error_report, build_tiled_output_handoff, detect_reconstruction_stall,
+        generate_dsm, reconstruction_progress_stream, run_feature_matching, run_frame_set_qa,
         run_orthorectified_mosaic, run_sparse_sfm, transition_reconstruction_status, CameraExif,
         CameraImuPose, DensePoint, DensePointCloud, DsmConfig, FeatureMatchingConfig,
         FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
         FrameSetIngestRequest, FrameSetQaConfig, GcpMarkedImagePoint, GcpRegistrationError,
         GcpRegistrationRequest, GcpSurveyedCoordinate, GroundControlPoint, MosaicProvenanceRecord,
         MosaicPublishGateRequest, MosaicPublishStatus, MosaicQualityVerdict, OrthomosaicConfig,
-        OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest, ReconstructionStatus,
+        OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest,
+        ReconstructionProgressStage, ReconstructionStallReasonCode, ReconstructionStatus,
         ReprojectionReportConfig, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
         TiledOutputHandoffError, TiledOutputHandoffRequest, TiledRasterProductRequest,
     };
@@ -2701,6 +2804,84 @@ mod tests {
                 from: ReconstructionStatus::Queued,
                 to: ReconstructionStatus::Completed
             }
+        );
+    }
+
+    #[test]
+    fn reconstruction_progress_stream_orders_stage_counts_with_coverage() {
+        let later = build_reconstruction_progress_event(
+            " recon-001 ".to_string(),
+            ReconstructionProgressStage::CameraRegistration,
+            12,
+            8,
+            0,
+            0.42,
+            dt("2026-06-01T12:10:10Z"),
+        )
+        .expect("later progress event builds");
+        let earlier = build_reconstruction_progress_event(
+            "recon-001".to_string(),
+            ReconstructionProgressStage::FeatureMatching,
+            12,
+            0,
+            0,
+            0.18,
+            dt("2026-06-01T12:10:00Z"),
+        )
+        .expect("earlier progress event builds");
+
+        let stream = reconstruction_progress_stream(vec![later, earlier]);
+
+        assert_eq!(
+            stream[0].stage,
+            ReconstructionProgressStage::FeatureMatching
+        );
+        assert_eq!(stream[0].matched_frames, 12);
+        assert_eq!(stream[0].coverage_fraction, 0.18);
+        assert_eq!(
+            stream[1].stage,
+            ReconstructionProgressStage::CameraRegistration
+        );
+        assert_eq!(stream[1].registered_cameras, 8);
+        assert_eq!(stream[1].coverage_fraction, 0.42);
+    }
+
+    #[test]
+    fn reconstruction_progress_stall_is_flagged_after_window() {
+        let event = build_reconstruction_progress_event(
+            "recon-001".to_string(),
+            ReconstructionProgressStage::DenseReconstruction,
+            12,
+            12,
+            40_000,
+            0.70,
+            dt("2026-06-01T12:10:00Z"),
+        )
+        .expect("progress event builds");
+
+        let healthy = detect_reconstruction_stall(
+            std::slice::from_ref(&event),
+            dt("2026-06-01T12:10:20Z"),
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(healthy, None);
+
+        let stalled = detect_reconstruction_stall(
+            &[event],
+            dt("2026-06-01T12:10:45Z"),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("stalled event should be flagged");
+
+        assert_eq!(stalled.recon_id, "recon-001");
+        assert_eq!(
+            stalled.stage,
+            ReconstructionProgressStage::DenseReconstruction
+        );
+        assert_eq!(stalled.stalled_for_seconds, 45);
+        assert_eq!(
+            stalled.reason_code,
+            ReconstructionStallReasonCode::NoProgressWithinWindow
         );
     }
 
@@ -3466,6 +3647,12 @@ mod tests {
                 software_version: " agbot-orthomosaic 0.1.0 ".to_string(),
             },
         }
+    }
+
+    fn dt(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
     }
 
     fn meters_per_degree_lon(latitude: f64) -> f64 {
