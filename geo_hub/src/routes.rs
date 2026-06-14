@@ -84,27 +84,28 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
     append_content_version, assert_raster_spatial_ref, bind_fleet_node_identity,
-    bounds_from_points, build_collaboration_channel, build_collaboration_message,
-    build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
-    build_tractor_record, compute_drought_index, create_versioned_content,
-    normalize_weather_provider_forecast, parse_content_status, parse_content_type,
-    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_party_type,
-    parse_soil_moisture_qa_flag, parse_soil_moisture_rejection_reason,
-    parse_sustainability_metric_type, soil_moisture_rejection_reason_for_error,
-    soil_moisture_rejection_record, transition_marketplace_account_status, validate_field_boundary,
-    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
-    CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
-    CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
-    ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
-    ContentType, ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError,
-    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
-    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
-    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
-    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage,
-    RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
-    RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
+    bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
+    build_collaboration_message, build_marketplace_account_record, build_soil_moisture_reading,
+    build_sustainability_record, build_tractor_record, compute_drought_index,
+    create_versioned_content, normalize_weather_provider_forecast, parse_content_status,
+    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
+    parse_marketplace_party_type, parse_soil_moisture_qa_flag,
+    parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
+    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
+    transition_marketplace_account_status, validate_field_boundary, weather_fetch_failure_record,
+    AnnotationGeometry, AnnotationRecord, CollaborationChannelCreateRequest,
+    CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
+    CollaborationMessageCreateRequest, CollaborationMessageRecord, ContentCreateRequest,
+    ContentEditRequest, ContentError, ContentRecord, ContentStatus, ContentType,
+    ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod,
+    DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus, FarmFieldListPage,
+    FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord, FieldRecord,
+    FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord,
+    FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
+    MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+    MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, RasterResolution,
+    RasterSpatialRef, RecommendationPriority, RecommendationRecord, RecommendationStatus,
+    ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
     SoilMoistureReadingRecord, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
     SoilMoistureRejectionRecord, SustainabilityMetricType, SustainabilityRecord,
     SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
@@ -136,6 +137,7 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 const TILE_SIZE: u32 = 256;
+const DEFAULT_LAYER_STALE_AFTER_DAYS: i64 = 14;
 const MOBILE_APP_HTML: &str = include_str!("mobile_app.html");
 
 #[derive(Debug, Serialize)]
@@ -218,6 +220,7 @@ pub struct LayerListQuery {
     pub season_id: Option<String>,
     pub product_kind: Option<String>,
     pub date: Option<String>,
+    pub stale_after_days: Option<i64>,
     pub page: Option<usize>,
     pub page_size: Option<usize>,
 }
@@ -260,6 +263,11 @@ pub struct LayerFreshness {
     pub acquired_at: String,
     pub ingested_at: Option<String>,
     pub coverage_fraction: Option<f64>,
+    pub stale_after_days: i64,
+    pub age_days: Option<i64>,
+    pub stale: bool,
+    pub field_coverage_fraction: Option<f64>,
+    pub field_coverage_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6302,6 +6310,7 @@ pub async fn list_layers(
 ) -> AppResult<Json<LayerListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let stale_after_days = normalized_stale_after_days(query.stale_after_days);
     let rows = load_layer_rows(&state).await?;
     let mut layers = Vec::new();
 
@@ -6309,7 +6318,7 @@ pub async fn list_layers(
         if !layer_row_matches_query(&row, &query) {
             continue;
         }
-        if let Some(layer) = layer_from_row(&row, false).await? {
+        if let Some(layer) = layer_from_row(&row, false, stale_after_days).await? {
             layers.push(layer);
         }
     }
@@ -6333,7 +6342,7 @@ pub async fn get_layer_metadata(
     let row = load_layer_row(&state, &scene_id, &kind)
         .await?
         .ok_or(AppError::NotFound)?;
-    let layer = layer_from_row(&row, true)
+    let layer = layer_from_row(&row, true, DEFAULT_LAYER_STALE_AFTER_DAYS)
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(layer))
@@ -6433,7 +6442,7 @@ pub async fn export_layer_geotiff(
     let row = load_layer_row(&state, &scene_id, &kind)
         .await?
         .ok_or(AppError::NotFound)?;
-    let layer = layer_from_row(&row, true)
+    let layer = layer_from_row(&row, true, DEFAULT_LAYER_STALE_AFTER_DAYS)
         .await?
         .ok_or(AppError::NotFound)?;
     let metadata_json: String = row.get("metadata_json");
@@ -6769,11 +6778,13 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
             i.ingested_at,
             i.coverage_fraction,
             i.source_path AS ingest_source_path,
-            sr.spatial_ref_json AS scene_spatial_ref_json
+            sr.spatial_ref_json AS scene_spatial_ref_json,
+            f.boundary_json AS field_boundary_json
         FROM products p
         JOIN scenes s ON s.scene_id = p.scene_id
         LEFT JOIN scene_ingests i ON i.scene_id = s.scene_id
         LEFT JOIN scene_spatial_refs sr ON sr.scene_id = s.scene_id
+        LEFT JOIN fields f ON f.field_id = COALESCE(p.field_id, s.field_id)
         ORDER BY s.acquired_at DESC, p.kind ASC
         "#,
     )
@@ -6815,11 +6826,13 @@ async fn load_layer_row(
             i.ingested_at,
             i.coverage_fraction,
             i.source_path AS ingest_source_path,
-            sr.spatial_ref_json AS scene_spatial_ref_json
+            sr.spatial_ref_json AS scene_spatial_ref_json,
+            f.boundary_json AS field_boundary_json
         FROM products p
         JOIN scenes s ON s.scene_id = p.scene_id
         LEFT JOIN scene_ingests i ON i.scene_id = s.scene_id
         LEFT JOIN scene_spatial_refs sr ON sr.scene_id = s.scene_id
+        LEFT JOIN fields f ON f.field_id = COALESCE(p.field_id, s.field_id)
         WHERE p.scene_id = ?1 AND lower(p.kind) = lower(?2)
         "#,
     )
@@ -6880,6 +6893,7 @@ fn optional_filter_matches(row_value: Option<String>, filter: Option<&String>) -
 async fn layer_from_row(
     row: &sqlx::sqlite::SqliteRow,
     strict: bool,
+    stale_after_days: i64,
 ) -> AppResult<Option<LayerMetadata>> {
     let product_path = PathBuf::from(row.get::<String, _>("path"));
     if !fs::try_exists(&product_path)
@@ -6955,6 +6969,8 @@ async fn layer_from_row(
     let product_id = row
         .get::<Option<String>, _>("product_id")
         .filter(|value| !value.trim().is_empty());
+    let acquired_at = row.get::<String, _>("acquired_at");
+    let (field_coverage_fraction, field_coverage_status) = layer_field_coverage(row, &spatial_ref)?;
 
     Ok(Some(LayerMetadata {
         layer_id: format!("{scene_id}:{product_kind}"),
@@ -6974,15 +6990,97 @@ async fn layer_from_row(
         qa_report_ref: row.get("qa_report_ref"),
         provenance_hash: row.get("provenance_hash"),
         downstream_consumers: decode_downstream_consumers(row.get("downstream_consumers_json"))?,
-        freshness: LayerFreshness {
-            acquired_at: row.get("acquired_at"),
-            ingested_at: row.get("ingested_at"),
-            coverage_fraction: row.get("coverage_fraction"),
-        },
+        freshness: layer_freshness(
+            acquired_at,
+            row.get("ingested_at"),
+            row.get("coverage_fraction"),
+            stale_after_days,
+            field_coverage_fraction,
+            field_coverage_status,
+        ),
         source,
         tile_url_template: format!("{url_path}/tiles/{{z}}/{{x}}/{{y}}.png"),
         url_path,
     }))
+}
+
+fn normalized_stale_after_days(value: Option<i64>) -> i64 {
+    value
+        .unwrap_or(DEFAULT_LAYER_STALE_AFTER_DAYS)
+        .clamp(0, 3650)
+}
+
+fn layer_freshness(
+    acquired_at: String,
+    ingested_at: Option<String>,
+    coverage_fraction: Option<f64>,
+    stale_after_days: i64,
+    field_coverage_fraction: Option<f64>,
+    field_coverage_status: Option<String>,
+) -> LayerFreshness {
+    let age_days = chrono::DateTime::parse_from_rfc3339(&acquired_at)
+        .ok()
+        .map(|acquired| {
+            chrono::Utc::now()
+                .signed_duration_since(acquired.with_timezone(&chrono::Utc))
+                .num_days()
+        });
+    let stale = age_days.is_some_and(|age| age > stale_after_days);
+
+    LayerFreshness {
+        acquired_at,
+        ingested_at,
+        coverage_fraction,
+        stale_after_days,
+        age_days,
+        stale,
+        field_coverage_fraction,
+        field_coverage_status,
+    }
+}
+
+fn layer_field_coverage(
+    row: &sqlx::sqlite::SqliteRow,
+    spatial_ref: &RasterSpatialRef,
+) -> AppResult<(Option<f64>, Option<String>)> {
+    let Some(boundary_json) = row.get::<Option<String>, _>("field_boundary_json") else {
+        return Ok((None, None));
+    };
+    let Some(layer_bounds) = spatial_ref.bbox.as_ref() else {
+        return Ok((None, None));
+    };
+    let boundary = serde_json::from_str::<FieldBoundary>(&boundary_json).map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode field boundary_json"))
+    })?;
+    let validated = match validate_field_boundary(&boundary) {
+        Ok(validated) => validated,
+        Err(_) => return Ok((None, Some("invalid_boundary".to_string()))),
+    };
+
+    let Some(layer_crs) = spatial_ref.crs.as_deref() else {
+        return Ok((None, Some("missing_crs".to_string())));
+    };
+
+    if boundary
+        .crs
+        .as_deref()
+        .map(str::trim)
+        .filter(|crs| !crs.is_empty())
+        != Some(layer_crs)
+    {
+        return Ok((None, Some("crs_mismatch".to_string())));
+    }
+
+    let fraction = bounds_coverage_fraction(&validated.extent, layer_bounds);
+    let status = if fraction == 0.0 {
+        "no_coverage"
+    } else if fraction >= 0.999_999 {
+        "full"
+    } else {
+        "partial"
+    };
+
+    Ok((Some(fraction), Some(status.to_string())))
 }
 
 async fn is_supported_product_file(entry: &DirEntry) -> AppResult<bool> {

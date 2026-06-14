@@ -227,6 +227,30 @@ pub struct FieldSceneCatalogEntry {
     pub layers: Vec<SceneLayerRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSeasonResolution {
+    pub field_id: String,
+    pub requested_date: String,
+    pub active_season: Option<SeasonRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SceneFieldCoverageStatus {
+    Full,
+    Partial,
+    NoCoverage,
+    NoLayers,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneFieldCoverage {
+    pub scene_id: String,
+    pub field_id: String,
+    pub coverage_fraction: f64,
+    pub status: SceneFieldCoverageStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetNodeKind {
@@ -3080,6 +3104,43 @@ impl FarmFieldRegistry {
             .collect()
     }
 
+    pub fn active_season_for_field(
+        &self,
+        org_id: &str,
+        field_id: &str,
+        requested_date: &str,
+    ) -> Result<ActiveSeasonResolution, FarmFieldError> {
+        self.fields
+            .get(field_id)
+            .filter(|field| field.org_id == org_id)
+            .ok_or_else(|| FarmFieldError::FieldNotFound {
+                field_id: field_id.to_string(),
+            })?;
+        let requested = parse_farm_field_date(requested_date)?;
+
+        let mut matches = self
+            .seasons
+            .values()
+            .filter(|season| season.org_id == org_id && season.field_id == field_id)
+            .filter_map(|season| {
+                let start = parse_farm_field_date(&season.start).ok()?;
+                let end = parse_farm_field_date(&season.end).ok()?;
+                (start <= requested && requested <= end).then(|| season.clone())
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            left.start
+                .cmp(&right.start)
+                .then(left.season_id.cmp(&right.season_id))
+        });
+
+        Ok(ActiveSeasonResolution {
+            field_id: field_id.to_string(),
+            requested_date: requested_date.to_string(),
+            active_season: matches.into_iter().next(),
+        })
+    }
+
     pub fn insert_scene(&mut self, scene: SceneRecord) -> Result<SceneRecord, FarmFieldError> {
         let scene = normalize_scene_record(scene)?;
         self.fields
@@ -3161,6 +3222,68 @@ impl FarmFieldRegistry {
                 FieldSceneCatalogEntry { scene, layers }
             })
             .collect()
+    }
+
+    pub fn scene_field_coverage(
+        &self,
+        org_id: &str,
+        field_id: &str,
+        scene_id: &str,
+    ) -> Result<SceneFieldCoverage, FarmFieldError> {
+        let field = self
+            .fields
+            .get(field_id)
+            .filter(|field| field.org_id == org_id)
+            .ok_or_else(|| FarmFieldError::FieldNotFound {
+                field_id: field_id.to_string(),
+            })?;
+        let scene = self
+            .scenes
+            .get(scene_id)
+            .filter(|scene| scene.org_id == org_id && scene.field_id == field_id)
+            .ok_or_else(|| FarmFieldError::SceneNotFound {
+                scene_id: scene_id.to_string(),
+            })?;
+
+        let layer_extents = self
+            .scene_layers
+            .values()
+            .filter(|layer| layer.scene_id == scene.scene_id)
+            .filter_map(|layer| layer.extent.as_ref())
+            .collect::<Vec<_>>();
+        if layer_extents.is_empty() {
+            return Ok(SceneFieldCoverage {
+                scene_id: scene.scene_id.clone(),
+                field_id: field.field_id.clone(),
+                coverage_fraction: 0.0,
+                status: SceneFieldCoverageStatus::NoLayers,
+            });
+        }
+
+        let covered_area = layer_extents
+            .iter()
+            .map(|extent| bounds_intersection_area(&field.extent, extent))
+            .sum::<f64>();
+        let field_area = bounds_area(&field.extent);
+        let coverage_fraction = if field_area > 0.0 {
+            (covered_area / field_area).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let status = if coverage_fraction == 0.0 {
+            SceneFieldCoverageStatus::NoCoverage
+        } else if coverage_fraction >= 0.999_999 {
+            SceneFieldCoverageStatus::Full
+        } else {
+            SceneFieldCoverageStatus::Partial
+        };
+
+        Ok(SceneFieldCoverage {
+            scene_id: scene.scene_id.clone(),
+            field_id: field.field_id.clone(),
+            coverage_fraction,
+            status,
+        })
     }
 }
 
@@ -3324,6 +3447,31 @@ fn parse_farm_field_date(value: &str) -> Result<NaiveDate, FarmFieldError> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| FarmFieldError::InvalidDate {
         value: value.to_string(),
     })
+}
+
+pub fn bounds_coverage_fraction(boundary: &GeoBounds, covered: &GeoBounds) -> f64 {
+    let boundary_area = bounds_area(boundary);
+    if boundary_area <= 0.0 {
+        return 0.0;
+    }
+    (bounds_intersection_area(boundary, covered) / boundary_area).clamp(0.0, 1.0)
+}
+
+fn bounds_area(bounds: &GeoBounds) -> f64 {
+    let width = (bounds.max_lon - bounds.min_lon).max(0.0);
+    let height = (bounds.max_lat - bounds.min_lat).max(0.0);
+    width * height
+}
+
+fn bounds_intersection_area(left: &GeoBounds, right: &GeoBounds) -> f64 {
+    let min_lon = left.min_lon.max(right.min_lon);
+    let max_lon = left.max_lon.min(right.max_lon);
+    let min_lat = left.min_lat.max(right.min_lat);
+    let max_lat = left.max_lat.min(right.max_lat);
+    if max_lon <= min_lon || max_lat <= min_lat {
+        return 0.0;
+    }
+    (max_lon - min_lon) * (max_lat - min_lat)
 }
 
 pub fn validate_field_boundary(
@@ -4859,14 +5007,15 @@ mod tests {
         RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
         RecommendationStatus, RecommendationStatusChangeType, ReportDeliverableRegistry,
         ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
-        SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
-        SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
-        SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
-        TractorRegistrationRequest, TractorRegistry, WeatherIngestError,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
+        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
+        SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
+        SoilMoistureRejectionReason, SustainabilityMetricType, SustainabilityRecordCreateRequest,
+        SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
+        TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
+        TractorMotionCommandRequest, TractorRegistrationRequest, TractorRegistry,
+        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
+        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry,
+        WorkOrderStatus,
     };
 
     #[test]
@@ -6613,6 +6762,44 @@ mod tests {
     }
 
     #[test]
+    fn active_season_resolution_returns_matching_season_or_none() {
+        let mut registry = registry_with_field();
+        registry
+            .insert_season(SeasonRecord {
+                season_id: "season-2025".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2025-03-01".to_string(),
+                end: "2025-10-31".to_string(),
+                label: "2025 Soy".to_string(),
+            })
+            .expect("2025 season persists");
+        registry
+            .insert_season(SeasonRecord {
+                season_id: "season-2026".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2026-03-01".to_string(),
+                end: "2026-10-31".to_string(),
+                label: "2026 Corn".to_string(),
+            })
+            .expect("2026 season persists");
+
+        let active = registry
+            .active_season_for_field("org-a", "field-a", "2026-06-14")
+            .expect("active season resolves");
+        assert_eq!(
+            active.active_season.map(|season| season.season_id),
+            Some("season-2026".to_string())
+        );
+
+        let inactive = registry
+            .active_season_for_field("org-a", "field-a", "2026-12-01")
+            .expect("no active season is explicit");
+        assert_eq!(inactive.active_season, None);
+    }
+
+    #[test]
     fn scene_and_layers_are_listable_by_field_and_season() {
         let mut registry = registry_with_field_and_season();
         registry
@@ -6710,6 +6897,76 @@ mod tests {
                 .layers
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn scene_field_coverage_reports_partial_and_no_coverage() {
+        let mut registry = registry_with_field_and_season();
+        registry
+            .insert_scene(SceneRecord {
+                scene_id: "scene-coverage".to_string(),
+                field_id: "field-a".to_string(),
+                season_id: "season-2026".to_string(),
+                org_id: "org-a".to_string(),
+                captured_at: "2026-04-15T14:30:00Z".to_string(),
+                source: "landsat".to_string(),
+            })
+            .expect("scene persists");
+        registry
+            .insert_scene_layer(SceneLayerRecord {
+                layer_id: "layer-partial".to_string(),
+                scene_id: "scene-coverage".to_string(),
+                product_type: "ndvi".to_string(),
+                crs: "EPSG:4326".to_string(),
+                extent: Some(GeoBounds {
+                    min_lon: -96.5,
+                    min_lat: 41.2,
+                    max_lon: -96.35,
+                    max_lat: 41.4,
+                }),
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+                uri: "s3://agbot/scenes/scene-coverage/ndvi.tif".to_string(),
+            })
+            .expect("layer persists");
+
+        let coverage = registry
+            .scene_field_coverage("org-a", "field-a", "scene-coverage")
+            .expect("coverage computes");
+        assert_eq!(coverage.status, SceneFieldCoverageStatus::Partial);
+        assert!((coverage.coverage_fraction - 0.5).abs() < 1e-9);
+
+        registry
+            .insert_scene(SceneRecord {
+                scene_id: "scene-no-coverage".to_string(),
+                field_id: "field-a".to_string(),
+                season_id: "season-2026".to_string(),
+                org_id: "org-a".to_string(),
+                captured_at: "2026-04-16T14:30:00Z".to_string(),
+                source: "landsat".to_string(),
+            })
+            .expect("scene persists");
+        registry
+            .insert_scene_layer(SceneLayerRecord {
+                layer_id: "layer-outside".to_string(),
+                scene_id: "scene-no-coverage".to_string(),
+                product_type: "ndvi".to_string(),
+                crs: "EPSG:4326".to_string(),
+                extent: Some(GeoBounds {
+                    min_lon: -97.0,
+                    min_lat: 40.0,
+                    max_lon: -96.9,
+                    max_lat: 40.1,
+                }),
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+                uri: "s3://agbot/scenes/scene-no-coverage/ndvi.tif".to_string(),
+            })
+            .expect("layer persists");
+
+        let no_coverage = registry
+            .scene_field_coverage("org-a", "field-a", "scene-no-coverage")
+            .expect("coverage computes");
+        assert_eq!(no_coverage.status, SceneFieldCoverageStatus::NoCoverage);
+        assert_eq!(no_coverage.coverage_fraction, 0.0);
     }
 
     fn test_boundary() -> FieldBoundary {

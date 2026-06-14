@@ -10037,7 +10037,6 @@ async fn scene_detail_returns_persisted_spatial_ref_roundtrip() -> Result<()> {
             "y": 0.05
         }
     });
-
     insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref.clone()).await?;
 
     let response = ctx
@@ -10095,6 +10094,21 @@ async fn list_layers_filters_and_returns_spatial_ref_metadata() -> Result<()> {
             "y": 0.05
         }
     });
+    insert_layer_field(
+        &ctx,
+        "field-alpha",
+        json!({
+            "crs": "EPSG:4326",
+            "coordinates": [
+                { "longitude": -96.7, "latitude": 41.1 },
+                { "longitude": -96.6, "latitude": 41.1 },
+                { "longitude": -96.6, "latitude": 41.2 },
+                { "longitude": -96.7, "latitude": 41.2 },
+                { "longitude": -96.7, "latitude": 41.1 }
+            ]
+        }),
+    )
+    .await?;
 
     let first_scene = "layer-scene-older";
     let first_dir = ctx.data_root.join("scenes").join(first_scene);
@@ -10123,7 +10137,7 @@ async fn list_layers_filters_and_returns_spatial_ref_metadata() -> Result<()> {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/layers?field_id=field-alpha&season_id=2026&product_kind=ndvi&page=1&page_size=1")
+                .uri("/api/layers?field_id=field-alpha&season_id=2026&product_kind=ndvi&page=1&page_size=1&stale_after_days=7")
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -10168,6 +10182,24 @@ async fn list_layers_filters_and_returns_spatial_ref_metadata() -> Result<()> {
     );
     assert_eq!(
         layers_json
+            .pointer("/layers/0/freshness/stale_after_days")
+            .and_then(|value| value.as_i64()),
+        Some(7)
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/freshness/field_coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(1.0)
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/freshness/field_coverage_status")
+            .and_then(|value| value.as_str()),
+        Some("full")
+    );
+    assert_eq!(
+        layers_json
             .pointer("/layers/0/source")
             .and_then(|value| value.as_str()),
         Some("landsat:/newer-source")
@@ -10196,6 +10228,82 @@ async fn list_layers_filters_and_returns_spatial_ref_metadata() -> Result<()> {
             .pointer("/layers/0/scene_id")
             .and_then(|value| value.as_str()),
         Some(first_scene)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_layers_reports_no_field_coverage_for_non_intersecting_extent() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_layer_field(
+        &ctx,
+        "field-alpha",
+        json!({
+            "crs": "EPSG:4326",
+            "coordinates": [
+                { "longitude": -96.7, "latitude": 41.1 },
+                { "longitude": -96.6, "latitude": 41.1 },
+                { "longitude": -96.6, "latitude": 41.2 },
+                { "longitude": -96.7, "latitude": 41.2 },
+                { "longitude": -96.7, "latitude": 41.1 }
+            ]
+        }),
+    )
+    .await?;
+    let scene_id = "layer-scene-outside-field";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(
+        &ctx,
+        scene_id,
+        &scene_dir,
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -97.7,
+                "min_lat": 40.1,
+                "max_lon": -97.6,
+                "max_lat": 40.2
+            },
+            "geo_transform": [-97.7, 0.05, 0.0, 40.2, 0.0, -0.05],
+            "resolution": {
+                "x": 0.05,
+                "y": 0.05
+            }
+        }),
+    )
+    .await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/layers?field_id=field-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let layers_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/freshness/field_coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(0.0)
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/freshness/field_coverage_status")
+            .and_then(|value| value.as_str()),
+        Some("no_coverage")
     );
 
     Ok(())
@@ -12138,6 +12246,32 @@ async fn link_scene_context(
     .bind(scene_id)
     .execute(&ctx.pool)
     .await?;
+    Ok(())
+}
+
+async fn insert_layer_field(
+    ctx: &TestContext,
+    field_id: &str,
+    boundary_json: serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO fields (field_id, owner, name, season, boundary_json, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(field_id) DO UPDATE SET
+            boundary_json = excluded.boundary_json,
+            season = excluded.season
+        "#,
+    )
+    .bind(field_id)
+    .bind("org-alpha")
+    .bind(format!("{field_id} name"))
+    .bind("2026")
+    .bind(boundary_json.to_string())
+    .bind("2026-01-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
     Ok(())
 }
 
