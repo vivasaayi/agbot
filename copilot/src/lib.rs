@@ -324,6 +324,36 @@ pub struct CopilotAuditedTurn {
     pub audit: CopilotTurnAuditRecord,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotCitationExport {
+    pub evidence_id: String,
+    pub kind: EvidenceKind,
+    pub ledger_ref: String,
+    pub field_id: String,
+    pub scene_ref: Option<String>,
+    pub zone_ref: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotAnswerExportRequest {
+    pub question: String,
+    pub turn: GroundedCopilotTurn,
+    pub retrieved_evidence: Vec<EvidenceIndexEntry>,
+    pub exported_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotAnswerExport {
+    pub question: String,
+    pub refused: bool,
+    pub refusal_reason: Option<CopilotRefusalReason>,
+    pub answer: Option<String>,
+    pub confidence: Option<f64>,
+    pub cited_evidence: Vec<CopilotCitationExport>,
+    pub exported_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceFreshnessStatus {
@@ -583,6 +613,20 @@ pub enum CopilotAuditError {
     AuditWriteFailed { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotAnswerExportError {
+    #[error("question cannot be empty")]
+    EmptyQuestion,
+    #[error("export timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("completed answer must cite at least one evidence id before export")]
+    AnswerWithoutCitations,
+    #[error("citation {evidence_id} is missing from retrieved evidence")]
+    CitationNotRetrieved { evidence_id: String },
+    #[error("citation {evidence_id} is missing a resolvable ledger ref")]
+    CitationMissingLedgerRef { evidence_id: String },
+}
+
 pub trait CopilotModel {
     fn answer(&self, request: CopilotAnswerRequest) -> Result<CopilotAnswer, CopilotModelError>;
 }
@@ -838,6 +882,71 @@ pub fn finalize_audited_turn(
     Ok(CopilotAuditedTurn {
         turn: request.turn,
         audit,
+    })
+}
+
+pub fn export_copilot_answer_with_citations(
+    request: CopilotAnswerExportRequest,
+) -> Result<CopilotAnswerExport, CopilotAnswerExportError> {
+    let question =
+        normalize_export_text(request.question, CopilotAnswerExportError::EmptyQuestion)?;
+    let exported_at = normalize_export_text(
+        request.exported_at,
+        CopilotAnswerExportError::EmptyTimestamp,
+    )?;
+    if request.turn.refused {
+        return Ok(CopilotAnswerExport {
+            question,
+            refused: true,
+            refusal_reason: request.turn.refusal.map(|refusal| refusal.reason),
+            answer: None,
+            confidence: None,
+            cited_evidence: Vec::new(),
+            exported_at,
+        });
+    }
+
+    let answer = request
+        .turn
+        .answer
+        .ok_or(CopilotAnswerExportError::AnswerWithoutCitations)?;
+    let cited_ids = normalize_export_citations(answer.cited_evidence_ids)?;
+    let evidence_by_id = request
+        .retrieved_evidence
+        .into_iter()
+        .filter_map(|entry| normalize_text(entry.evidence_id.clone()).map(|id| (id, entry)))
+        .collect::<BTreeMap<_, _>>();
+    let mut cited_evidence = Vec::new();
+    for evidence_id in cited_ids {
+        let entry = evidence_by_id.get(&evidence_id).ok_or_else(|| {
+            CopilotAnswerExportError::CitationNotRetrieved {
+                evidence_id: evidence_id.clone(),
+            }
+        })?;
+        let ledger_ref = normalize_text(entry.ledger_ref.clone()).ok_or_else(|| {
+            CopilotAnswerExportError::CitationMissingLedgerRef {
+                evidence_id: evidence_id.clone(),
+            }
+        })?;
+        cited_evidence.push(CopilotCitationExport {
+            evidence_id,
+            kind: entry.kind,
+            ledger_ref,
+            field_id: entry.field_id.clone(),
+            scene_ref: entry.scene_ref.clone(),
+            zone_ref: entry.zone_ref.clone(),
+            summary: entry.summary.clone(),
+        });
+    }
+
+    Ok(CopilotAnswerExport {
+        question,
+        refused: false,
+        refusal_reason: None,
+        answer: Some(answer.text),
+        confidence: Some(answer.confidence),
+        cited_evidence,
+        exported_at,
     })
 }
 
@@ -1505,6 +1614,29 @@ fn normalize_audit_citations(values: Vec<String>) -> Result<Vec<String>, Copilot
     }
 }
 
+fn normalize_export_text(
+    value: String,
+    error: CopilotAnswerExportError,
+) -> Result<String, CopilotAnswerExportError> {
+    normalize_text(value).ok_or(error)
+}
+
+fn normalize_export_citations(
+    values: Vec<String>,
+) -> Result<Vec<String>, CopilotAnswerExportError> {
+    let cited_evidence_ids = values
+        .into_iter()
+        .filter_map(normalize_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if cited_evidence_ids.is_empty() {
+        Err(CopilotAnswerExportError::AnswerWithoutCitations)
+    } else {
+        Ok(cited_evidence_ids)
+    }
+}
+
 fn normalize_draft_text(
     value: String,
     error: CopilotRecommendationDraftError,
@@ -1591,16 +1723,16 @@ mod tests {
     use super::{
         annotate_answer_uncertainty, answer_grounded_question, approve_recommendation_draft,
         build_evidence_retrieval_index, create_copilot_turn, draft_recommendation_from_answer,
-        explain_zone_finding_change, finalize_audited_turn, post_check_grounded_answer,
-        resolve_copilot_field_context, start_copilot_conversation, CopilotAnswer,
-        CopilotAnswerClaim, CopilotAnswerRequest, CopilotAuditError, CopilotAuditSink,
-        CopilotConfidenceLevel, CopilotContextError, CopilotContextUpdateRequest,
-        CopilotConversationError, CopilotConversationStartRequest, CopilotExplanationError,
-        CopilotExplanationRequest, CopilotFieldContext, CopilotGroundingError, CopilotIndexError,
-        CopilotModel, CopilotModelError, CopilotRecommendationApproval,
-        CopilotRecommendationDraftError, CopilotRecommendationDraftRequest,
-        CopilotRecommendationDraftStatus, CopilotRefusalReason, CopilotTurnAuditRecord,
-        CopilotTurnAuditRequest, CopilotTurnCreateRequest, CopilotTurnRole,
+        explain_zone_finding_change, export_copilot_answer_with_citations, finalize_audited_turn,
+        post_check_grounded_answer, resolve_copilot_field_context, start_copilot_conversation,
+        CopilotAnswer, CopilotAnswerClaim, CopilotAnswerExportError, CopilotAnswerExportRequest,
+        CopilotAnswerRequest, CopilotAuditError, CopilotAuditSink, CopilotConfidenceLevel,
+        CopilotContextError, CopilotContextUpdateRequest, CopilotConversationError,
+        CopilotConversationStartRequest, CopilotExplanationError, CopilotExplanationRequest,
+        CopilotFieldContext, CopilotGroundingError, CopilotIndexError, CopilotModel,
+        CopilotModelError, CopilotRecommendationApproval, CopilotRecommendationDraftError,
+        CopilotRecommendationDraftRequest, CopilotRecommendationDraftStatus, CopilotRefusalReason,
+        CopilotTurnAuditRecord, CopilotTurnAuditRequest, CopilotTurnCreateRequest, CopilotTurnRole,
         DeterministicAnswerFixture, DeterministicCopilotModel, EvidenceCandidate,
         EvidenceFreshnessRecord, EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind,
         EvidenceRejectionReason, GroundedCopilotAnswer, GroundedCopilotQuestionRequest,
@@ -2348,6 +2480,67 @@ mod tests {
     }
 
     #[test]
+    fn answer_export_includes_resolvable_citation_ledger_refs() {
+        let export = export_copilot_answer_with_citations(CopilotAnswerExportRequest {
+            question: "explain the NE zone".to_string(),
+            turn: completed_turn(),
+            retrieved_evidence: vec![retrieved_evidence("evidence-ndvi-001")],
+            exported_at: "2026-06-13T17:00:00Z".to_string(),
+        })
+        .expect("export should validate");
+
+        assert!(!export.refused);
+        assert_eq!(export.answer.as_deref(), Some("The zone needs attention."));
+        assert_eq!(export.confidence, Some(0.82));
+        assert_eq!(export.cited_evidence.len(), 1);
+        assert_eq!(
+            export.cited_evidence[0].ledger_ref,
+            "ledger:30:evidence-ndvi-001"
+        );
+        assert_eq!(export.cited_evidence[0].evidence_id, "evidence-ndvi-001");
+    }
+
+    #[test]
+    fn answer_export_rejects_citation_without_ledger_ref() {
+        let mut evidence = retrieved_evidence("evidence-ndvi-001");
+        evidence.ledger_ref = " ".to_string();
+        let error = export_copilot_answer_with_citations(CopilotAnswerExportRequest {
+            question: "explain the NE zone".to_string(),
+            turn: completed_turn(),
+            retrieved_evidence: vec![evidence],
+            exported_at: "2026-06-13T17:00:00Z".to_string(),
+        })
+        .expect_err("missing ledger ref should fail export validation");
+
+        assert_eq!(
+            error,
+            CopilotAnswerExportError::CitationMissingLedgerRef {
+                evidence_id: "evidence-ndvi-001".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_export_records_reason_without_fabricated_answer() {
+        let export = export_copilot_answer_with_citations(CopilotAnswerExportRequest {
+            question: "what changed in unknown field?".to_string(),
+            turn: no_evidence_turn(),
+            retrieved_evidence: vec![],
+            exported_at: "2026-06-13T17:00:00Z".to_string(),
+        })
+        .expect("refusal export should validate");
+
+        assert!(export.refused);
+        assert_eq!(
+            export.refusal_reason,
+            Some(CopilotRefusalReason::NoEvidence)
+        );
+        assert!(export.answer.is_none());
+        assert!(export.confidence.is_none());
+        assert!(export.cited_evidence.is_empty());
+    }
+
+    #[test]
     fn uncertainty_marker_is_high_for_fully_cited_fresh_answer() {
         let annotated = annotate_answer_uncertainty(
             grounded_answer_with_claims(vec![CopilotAnswerClaim {
@@ -2594,6 +2787,39 @@ mod tests {
             model_provider: "test-double".to_string(),
             model_id: "fixture-rag".to_string(),
             model_version: "2026-06-12".to_string(),
+        }
+    }
+
+    fn completed_turn() -> super::GroundedCopilotTurn {
+        super::GroundedCopilotTurn {
+            refused: false,
+            refusal: None,
+            answer: Some(GroundedCopilotAnswer {
+                text: "The zone needs attention.".to_string(),
+                claims: vec![CopilotAnswerClaim {
+                    text: "The zone needs attention.".to_string(),
+                    cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+                }],
+                cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+                confidence: 0.82,
+                model_provider: "test-double".to_string(),
+                model_id: "fixture-rag".to_string(),
+                model_version: "2026-06-12".to_string(),
+            }),
+        }
+    }
+
+    fn no_evidence_turn() -> super::GroundedCopilotTurn {
+        super::GroundedCopilotTurn {
+            refused: true,
+            refusal: Some(super::CopilotRefusal {
+                refused: true,
+                reason: CopilotRefusalReason::NoEvidence,
+                needed_evidence: vec![
+                    "resolvable indexed evidence relevant to the question".to_string()
+                ],
+            }),
+            answer: None,
         }
     }
 
