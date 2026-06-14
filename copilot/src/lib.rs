@@ -246,6 +246,20 @@ pub struct GroundedCopilotQuestionRequest {
     pub claims: Vec<CopilotAnswerClaim>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotExplanationRequest {
+    pub question: String,
+    pub field_id: String,
+    pub zone_ref: String,
+    pub retrieved_evidence: Vec<EvidenceIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotExplanation {
+    pub answer: GroundedCopilotAnswer,
+    pub no_comparable_history: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CopilotRefusalReason {
@@ -521,6 +535,22 @@ pub enum CopilotGroundingError {
     EmptyModelVersion,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotExplanationError {
+    #[error("question cannot be empty")]
+    EmptyQuestion,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("zone_ref cannot be empty")]
+    EmptyZoneRef,
+    #[error("explanation requires finding evidence")]
+    MissingFindingEvidence,
+    #[error("explanation requires zone evidence")]
+    MissingZoneEvidence,
+    #[error("explanation requires domain 28 change/trend evidence")]
+    MissingChangeEvidence,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CopilotTurnError {
     #[error("question cannot be empty")]
@@ -660,6 +690,88 @@ pub fn answer_grounded_question(
         refused: false,
         refusal: None,
         answer: Some(grounded),
+    })
+}
+
+pub fn explain_zone_finding_change(
+    request: CopilotExplanationRequest,
+) -> Result<CopilotExplanation, CopilotExplanationError> {
+    let question =
+        normalize_text(request.question).ok_or(CopilotExplanationError::EmptyQuestion)?;
+    let field_id = normalize_text(request.field_id).ok_or(CopilotExplanationError::EmptyFieldId)?;
+    let zone_ref = normalize_text(request.zone_ref).ok_or(CopilotExplanationError::EmptyZoneRef)?;
+    let mut scoped = request
+        .retrieved_evidence
+        .into_iter()
+        .filter(|entry| {
+            normalize_text(entry.evidence_id.clone()).is_some()
+                && normalize_text(entry.ledger_ref.clone()).is_some()
+                && normalize_text(entry.field_id.clone()).as_deref() == Some(field_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    scoped.sort_by(|left, right| left.evidence_id.cmp(&right.evidence_id));
+
+    let finding = scoped
+        .iter()
+        .find(|entry| entry.kind == EvidenceKind::Finding)
+        .ok_or(CopilotExplanationError::MissingFindingEvidence)?;
+    let zone = scoped
+        .iter()
+        .find(|entry| {
+            entry.zone_ref.as_deref() == Some(zone_ref.as_str())
+                && entry.evidence_id != finding.evidence_id
+                && entry.kind != EvidenceKind::Trend
+        })
+        .ok_or(CopilotExplanationError::MissingZoneEvidence)?;
+    let change = scoped
+        .iter()
+        .find(|entry| entry.kind == EvidenceKind::Trend)
+        .ok_or(CopilotExplanationError::MissingChangeEvidence)?;
+    let no_comparable_history = is_no_baseline_change(change);
+    let cited_evidence_ids = BTreeSet::from([
+        finding.evidence_id.clone(),
+        zone.evidence_id.clone(),
+        change.evidence_id.clone(),
+    ])
+    .into_iter()
+    .collect::<Vec<_>>();
+
+    let change_text = if no_comparable_history {
+        "Domain 28 reports no comparable baseline/history for this change request; no change magnitude is inferred."
+            .to_string()
+    } else {
+        format!("Domain 28 change context: {}", change.summary)
+    };
+    let text = format!(
+        "{} Finding: {} Zone context: {} {}",
+        question, finding.summary, zone.summary, change_text
+    );
+    let claims = vec![
+        CopilotAnswerClaim {
+            text: format!("Finding evidence: {}", finding.summary),
+            cited_evidence_ids: vec![finding.evidence_id.clone()],
+        },
+        CopilotAnswerClaim {
+            text: format!("Zone evidence: {}", zone.summary),
+            cited_evidence_ids: vec![zone.evidence_id.clone()],
+        },
+        CopilotAnswerClaim {
+            text: change_text,
+            cited_evidence_ids: vec![change.evidence_id.clone()],
+        },
+    ];
+
+    Ok(CopilotExplanation {
+        answer: GroundedCopilotAnswer {
+            text,
+            claims,
+            cited_evidence_ids,
+            confidence: if no_comparable_history { 0.74 } else { 0.86 },
+            model_provider: "deterministic".to_string(),
+            model_id: "copilot-explain-zone-finding-change".to_string(),
+            model_version: "v1".to_string(),
+        },
+        no_comparable_history,
     })
 }
 
@@ -1190,6 +1302,13 @@ fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
     }
 }
 
+fn is_no_baseline_change(entry: &EvidenceIndexEntry) -> bool {
+    let summary = entry.summary.to_ascii_lowercase();
+    summary.contains("no baseline")
+        || summary.contains("no comparable history")
+        || summary.contains("insufficient baseline")
+}
+
 fn meaningful_tokens(value: &str) -> BTreeSet<String> {
     value
         .split(|character: char| !character.is_ascii_alphanumeric())
@@ -1472,14 +1591,16 @@ mod tests {
     use super::{
         annotate_answer_uncertainty, answer_grounded_question, approve_recommendation_draft,
         build_evidence_retrieval_index, create_copilot_turn, draft_recommendation_from_answer,
-        finalize_audited_turn, post_check_grounded_answer, resolve_copilot_field_context,
-        start_copilot_conversation, CopilotAnswer, CopilotAnswerClaim, CopilotAnswerRequest,
-        CopilotAuditError, CopilotAuditSink, CopilotConfidenceLevel, CopilotContextError,
-        CopilotContextUpdateRequest, CopilotConversationError, CopilotConversationStartRequest,
-        CopilotFieldContext, CopilotGroundingError, CopilotIndexError, CopilotModel,
-        CopilotModelError, CopilotRecommendationApproval, CopilotRecommendationDraftError,
-        CopilotRecommendationDraftRequest, CopilotRecommendationDraftStatus, CopilotRefusalReason,
-        CopilotTurnAuditRecord, CopilotTurnAuditRequest, CopilotTurnCreateRequest, CopilotTurnRole,
+        explain_zone_finding_change, finalize_audited_turn, post_check_grounded_answer,
+        resolve_copilot_field_context, start_copilot_conversation, CopilotAnswer,
+        CopilotAnswerClaim, CopilotAnswerRequest, CopilotAuditError, CopilotAuditSink,
+        CopilotConfidenceLevel, CopilotContextError, CopilotContextUpdateRequest,
+        CopilotConversationError, CopilotConversationStartRequest, CopilotExplanationError,
+        CopilotExplanationRequest, CopilotFieldContext, CopilotGroundingError, CopilotIndexError,
+        CopilotModel, CopilotModelError, CopilotRecommendationApproval,
+        CopilotRecommendationDraftError, CopilotRecommendationDraftRequest,
+        CopilotRecommendationDraftStatus, CopilotRefusalReason, CopilotTurnAuditRecord,
+        CopilotTurnAuditRequest, CopilotTurnCreateRequest, CopilotTurnRole,
         DeterministicAnswerFixture, DeterministicCopilotModel, EvidenceCandidate,
         EvidenceFreshnessRecord, EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind,
         EvidenceRejectionReason, GroundedCopilotAnswer, GroundedCopilotQuestionRequest,
@@ -1778,6 +1899,115 @@ mod tests {
                 requested_field_id: "field-foreign".to_string()
             }
         );
+    }
+
+    #[test]
+    fn explain_zone_finding_change_cites_finding_zone_and_28_change() {
+        let explanation = explain_zone_finding_change(CopilotExplanationRequest {
+            question: "explain the NE zone".to_string(),
+            field_id: "field-001".to_string(),
+            zone_ref: "zone-ne".to_string(),
+            retrieved_evidence: vec![
+                evidence_entry(
+                    "finding-09-001",
+                    EvidenceKind::Finding,
+                    Some("zone-ne"),
+                    "09 finding: northeast zone is stressed with low NDVI.",
+                ),
+                evidence_entry(
+                    "zone-10-ne",
+                    EvidenceKind::ImageryProduct,
+                    Some("zone-ne"),
+                    "Zone NE boundary covers the stressed canopy cluster.",
+                ),
+                evidence_entry(
+                    "change-28-001",
+                    EvidenceKind::Trend,
+                    Some("zone-ne"),
+                    "28 ranked change event: NDVI declined 0.18 versus aligned baseline pair.",
+                ),
+            ],
+        })
+        .expect("explanation should build");
+
+        assert!(!explanation.no_comparable_history);
+        assert_eq!(
+            explanation.answer.cited_evidence_ids,
+            vec![
+                "change-28-001".to_string(),
+                "finding-09-001".to_string(),
+                "zone-10-ne".to_string()
+            ]
+        );
+        assert_eq!(explanation.answer.claims.len(), 3);
+        assert!(explanation.answer.text.contains("Domain 28 change context"));
+    }
+
+    #[test]
+    fn explain_change_with_no_baseline_does_not_invent_history() {
+        let explanation = explain_zone_finding_change(CopilotExplanationRequest {
+            question: "what changed since last flight?".to_string(),
+            field_id: "field-001".to_string(),
+            zone_ref: "zone-ne".to_string(),
+            retrieved_evidence: vec![
+                evidence_entry(
+                    "finding-09-001",
+                    EvidenceKind::Finding,
+                    Some("zone-ne"),
+                    "09 finding: northeast zone has low vigor.",
+                ),
+                evidence_entry(
+                    "zone-10-ne",
+                    EvidenceKind::ImageryProduct,
+                    Some("zone-ne"),
+                    "Zone NE boundary covers the stressed canopy cluster.",
+                ),
+                evidence_entry(
+                    "change-28-no-baseline",
+                    EvidenceKind::Trend,
+                    Some("zone-ne"),
+                    "28 reports no baseline for this zone, so no comparable history exists.",
+                ),
+            ],
+        })
+        .expect("no-baseline explanation should build");
+
+        assert!(explanation.no_comparable_history);
+        assert!(explanation
+            .answer
+            .text
+            .contains("no comparable baseline/history"));
+        assert!(!explanation.answer.text.contains("declined 0."));
+        assert_eq!(
+            explanation.answer.claims[2].cited_evidence_ids,
+            vec!["change-28-no-baseline".to_string()]
+        );
+    }
+
+    #[test]
+    fn explain_zone_refuses_without_28_change_evidence() {
+        let error = explain_zone_finding_change(CopilotExplanationRequest {
+            question: "explain the NE zone".to_string(),
+            field_id: "field-001".to_string(),
+            zone_ref: "zone-ne".to_string(),
+            retrieved_evidence: vec![
+                evidence_entry(
+                    "finding-09-001",
+                    EvidenceKind::Finding,
+                    Some("zone-ne"),
+                    "09 finding: northeast zone is stressed.",
+                ),
+                evidence_entry(
+                    "zone-10-ne",
+                    EvidenceKind::ImageryProduct,
+                    Some("zone-ne"),
+                    "Zone NE boundary covers the stressed canopy cluster.",
+                ),
+            ],
+        })
+        .expect_err("28 change evidence is required");
+
+        assert_eq!(error, CopilotExplanationError::MissingChangeEvidence);
     }
 
     #[test]
@@ -2283,6 +2513,23 @@ mod tests {
             zone_ref: Some("zone-ne".to_string()),
             ledger_ref: format!("ledger:30:{evidence_id}"),
             summary: "NDVI in the northeast zone dropped below threshold.".to_string(),
+        }
+    }
+
+    fn evidence_entry(
+        evidence_id: &str,
+        kind: EvidenceKind,
+        zone_ref: Option<&str>,
+        summary: &str,
+    ) -> EvidenceIndexEntry {
+        EvidenceIndexEntry {
+            evidence_id: evidence_id.to_string(),
+            kind,
+            field_id: "field-001".to_string(),
+            scene_ref: Some("scene-2026-06-01".to_string()),
+            zone_ref: zone_ref.map(ToOwned::to_owned),
+            ledger_ref: format!("ledger:30:{evidence_id}"),
+            summary: summary.to_string(),
         }
     }
 
