@@ -22,11 +22,12 @@ pub use link_client::{
     LinkStateSnapshot, ReconnectPolicy, SharedLinkState,
 };
 pub use map_state::{
-    assert_overlay_matches_basemap, project_wgs84_to_web_mercator, BasemapLayer, FlightPathSample,
-    GeofenceBreach, MapOverlayLayer, MapPathPoint, MapRenderError, MapRenderState,
-    MissionMapOverlay, MissionOverlayInput, MissionPolygonInput, MissionPolygonOverlay,
-    MissionPolygonVertex, MissionWaypointInput, MissionWaypointOverlay, OverlayAssertion,
-    ProjectedExtent, ProjectedPoint, DEFAULT_FLIGHT_PATH_LIMIT, WEB_MERCATOR_CRS, WGS84_CRS,
+    assert_overlay_matches_basemap, project_wgs84_to_web_mercator, BasemapLayer, CaptureEventInput,
+    CaptureMapMarker, FlightPathSample, GeofenceBreach, MapOverlayLayer, MapPathPoint,
+    MapRenderError, MapRenderState, MissionMapOverlay, MissionOverlayInput, MissionPolygonInput,
+    MissionPolygonOverlay, MissionPolygonVertex, MissionWaypointInput, MissionWaypointOverlay,
+    OverlayAssertion, ProjectedExtent, ProjectedPoint, DEFAULT_FLIGHT_PATH_LIMIT, WEB_MERCATOR_CRS,
+    WGS84_CRS,
 };
 pub use message_dispatch::{
     shared_message_dispatch_state, CaptureEvent, CaptureEventKind, DispatchError,

@@ -2,18 +2,18 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 98c7bba (`batch-20260614204500`)
-- **Latest checkpoint commit**: 98c7bba (`batch-20260614204500`)
-- **Current batch**: `batch-20260614210000` — STORY `10-18`
-- **Completed feature rows**: 320 committed; 2 tests_passed; 1 skipped; 1 blocked; 174 pending in this run.
+- **Last implementation commit**: be59f1d (`batch-20260614210000`)
+- **Latest checkpoint commit**: be59f1d (`batch-20260614210000`)
+- **Current batch**: `batch-20260614211500` — STORY `11-10`
+- **Completed feature rows**: 321 committed; 2 tests_passed; 1 skipped; 1 blocked; 173 pending in this run.
 - **Blocker**: None
 
 ## Latest verification
 
-- `cargo test -p shared work_order` — pass (5 tests)
+- `cargo test -p ground_station_ui capture` — pass (4 tests)
 - `cargo fmt --all --check` — pass
-- `cargo test -p shared` — pass (99 tests)
+- `cargo test -p ground_station_ui` — pass (35 tests)
 
 ## Next action
 
-- Commit STORY `10-18`, then update checkpoint with the commit SHA and select the next pending feature.
+- Commit STORY `11-10`, then update checkpoint with the commit SHA and select the next pending feature.

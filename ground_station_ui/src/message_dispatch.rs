@@ -1,6 +1,9 @@
-use crate::{FlightPathSample, MapRenderState, MissionOverlayInput, DEFAULT_FLIGHT_PATH_LIMIT};
+use crate::{
+    CaptureEventInput, FlightPathSample, MapRenderState, MissionOverlayInput,
+    DEFAULT_FLIGHT_PATH_LIMIT,
+};
 use serde::Serialize;
-use shared::schemas::{Telemetry, WebSocketMessage};
+use shared::schemas::{GpsCoords, Telemetry, WebSocketMessage};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -92,11 +95,13 @@ pub enum CaptureEventKind {
     NdviProcessed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CaptureEvent {
+    pub capture_event_id: String,
     pub event_type: CaptureEventKind,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub summary: String,
+    pub position: Option<GpsCoords>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -229,30 +234,36 @@ impl MessageDispatchState {
             WebSocketMessage::LidarUpdate { scan } => {
                 self.lidar_scan_point_counts.push(scan.points.len());
                 self.append_capture_event(CaptureEvent {
+                    capture_event_id: format!("lidar:{}", scan.scan_id),
                     event_type: CaptureEventKind::Lidar,
                     timestamp: scan.timestamp,
                     summary: format!("LiDAR scan: {} points", scan.points.len()),
+                    position: None,
                 });
                 MessageRoute::LidarUpdate
             }
             WebSocketMessage::ImageCaptured { image } => {
                 self.captured_image_ids.push(image.image_id);
                 self.append_capture_event(CaptureEvent {
+                    capture_event_id: format!("image:{}", image.image_id),
                     event_type: CaptureEventKind::ImageCaptured,
                     timestamp: image.metadata.timestamp,
                     summary: format!("Image captured: {}", image.image_id),
+                    position: image.metadata.gps_position.clone(),
                 });
                 MessageRoute::ImageCaptured
             }
             WebSocketMessage::NdviProcessed { result } => {
                 self.ndvi_means.push(result.mean_ndvi);
                 self.append_capture_event(CaptureEvent {
+                    capture_event_id: format!("ndvi:{}", result.output_path),
                     event_type: CaptureEventKind::NdviProcessed,
                     timestamp: result.timestamp,
                     summary: format!(
                         "NDVI processed: mean {:.3}, vegetation {:.1}%",
                         result.mean_ndvi, result.vegetation_percentage
                     ),
+                    position: None,
                 });
                 MessageRoute::NdviProcessed
             }
@@ -335,9 +346,21 @@ impl MessageDispatchState {
     }
 
     pub fn map_render_state(&self) -> MapRenderState {
-        MapRenderState::from_flight_path_and_mission(
+        let capture_events = self
+            .capture_events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| CaptureEventInput {
+                capture_event_id: event.capture_event_id.clone(),
+                timeline_entry_id: format!("capture-timeline:{index}"),
+                captured_at: event.timestamp,
+                position: event.position.clone(),
+            })
+            .collect::<Vec<_>>();
+        MapRenderState::from_flight_path_mission_and_captures(
             &self.flight_path,
             self.mission_overlay.as_ref(),
+            &capture_events,
         )
     }
 
@@ -747,6 +770,57 @@ mod tests {
 
         assert!(overlay.geofence.is_none());
         assert!(map_state.geofence_breach.is_none());
+    }
+
+    #[test]
+    fn geolocated_capture_events_project_to_map_markers_with_timeline_links() {
+        let image_id = Uuid::new_v4();
+        let mut state = MessageDispatchState::default();
+        let image = sample_image(image_id);
+
+        state.dispatch_message(&WebSocketMessage::ImageCaptured { image });
+
+        let timeline = state.capture_events(None);
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(
+            timeline[0].position.as_ref().map(|gps| gps.latitude),
+            Some(42.0)
+        );
+        let map_state = state.map_render_state();
+        assert_eq!(map_state.capture_markers.len(), 1);
+        let marker = &map_state.capture_markers[0];
+        assert_eq!(marker.capture_event_id, format!("image:{image_id}"));
+        assert_eq!(marker.timeline_entry_id, "capture-timeline:0");
+        assert_eq!(marker.latitude, 42.0);
+        assert_eq!(marker.longitude, -71.0);
+        assert!(marker.x_px >= 0.0 && marker.x_px <= map_state.basemap.width_px as f64);
+        assert!(marker.y_px >= 0.0 && marker.y_px <= map_state.basemap.height_px as f64);
+        assert!(map_state
+            .overlay_assertions
+            .iter()
+            .any(|assertion| assertion.overlay_id == "capture-markers" && assertion.accepted));
+    }
+
+    #[test]
+    fn capture_events_without_position_stay_timeline_only() {
+        let image_id = Uuid::new_v4();
+        let mut state = MessageDispatchState::default();
+        let mut image = sample_image(image_id);
+        image.metadata.gps_position = None;
+        let lidar = sample_lidar_scan();
+        let lidar_id = lidar.scan_id;
+
+        state.dispatch_message(&WebSocketMessage::ImageCaptured { image });
+        state.dispatch_message(&WebSocketMessage::LidarUpdate { scan: lidar });
+
+        let timeline = state.capture_events(None);
+        assert_eq!(timeline.len(), 2);
+        let map_state = state.map_render_state();
+        assert!(map_state.capture_markers.is_empty());
+        assert_eq!(
+            map_state.unmapped_capture_event_ids,
+            vec![format!("lidar:{lidar_id}"), format!("image:{image_id}")]
+        );
     }
 
     #[test]
