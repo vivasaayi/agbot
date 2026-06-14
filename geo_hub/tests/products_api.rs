@@ -8403,6 +8403,309 @@ async fn recommendation_crud_roundtrip_with_annotation_linkage() -> Result<()> {
 }
 
 #[tokio::test]
+async fn recommendation_creation_rejects_dangling_annotation_reference() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "recommendation-dangling-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+
+    let annotation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/annotations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "annotation_id": "ann-rec-stale-1",
+                        "label": "Stress zone",
+                        "severity": "high",
+                        "geometry": {
+                            "type": "point",
+                            "coordinate": {
+                                "longitude": -96.45,
+                                "latitude": 41.25
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(annotation_response.status(), StatusCode::OK);
+
+    let create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/recommendations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recommendation_id": "rec-stale-1",
+                        "title": "Scout irrigation line",
+                        "note": "Verify nozzle coverage",
+                        "category": "irrigation",
+                        "priority": "high",
+                        "status": "open",
+                        "annotation_ids": ["ann-rec-stale-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let delete_annotation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/annotations/ann-rec-stale-1"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(delete_annotation_response.status(), StatusCode::NO_CONTENT);
+
+    let dangling_create_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{scene_id}/recommendations"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recommendation_id": "rec-stale-2",
+                        "title": "Missing annotation recommendation",
+                        "category": "irrigation",
+                        "priority": "medium",
+                        "status": "open",
+                        "annotation_ids": ["ann-rec-stale-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(dangling_create_response.status(), StatusCode::BAD_REQUEST);
+    let dangling_create_body = to_bytes(dangling_create_response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&dangling_create_body).contains("does not exist on this scene"));
+
+    let dangling_update_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/recommendations/rec-stale-1"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "Close irrigation gap",
+                        "note": "Action assigned to operator",
+                        "category": "irrigation",
+                        "priority": "critical",
+                        "status": "reviewed",
+                        "annotation_ids": ["ann-rec-stale-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(dangling_update_response.status(), StatusCode::BAD_REQUEST);
+    let dangling_update_body = to_bytes(dangling_update_response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&dangling_update_body).contains("does not exist on this scene"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mobile_sample_endpoints_return_products_and_handle_invalid_inputs() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let search_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mobile/scenes/search")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "latitude": 36.7783,
+                        "longitude": -119.4179,
+                        "date": "2026-06-14",
+                        "days": 14,
+                        "source": "sample"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(search_response.status(), StatusCode::OK);
+    let search_body = to_bytes(search_response.into_body(), 64 * 1024).await?;
+    let search_json: serde_json::Value = serde_json::from_slice(&search_body)?;
+    assert_eq!(
+        search_json.pointer("/search_days").and_then(|v| v.as_u64()),
+        Some(14)
+    );
+    assert_eq!(
+        search_json
+            .get("scenes")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len()),
+        Some(0)
+    );
+
+    let analyze_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mobile/analyze")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "latitude": 36.7783,
+                        "longitude": -119.4179,
+                        "date": "2026-06-14",
+                        "days": 14,
+                        "source": "sample",
+                        "products": ["ndvi", "ndmi", "nbr", "mndwi", "evi2"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    let analyze_status = analyze_response.status();
+    let analyze_body = to_bytes(analyze_response.into_body(), 64 * 1024).await?;
+    assert_eq!(
+        analyze_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&analyze_body)
+    );
+    let analyze_json: serde_json::Value = serde_json::from_slice(&analyze_body)?;
+    assert_eq!(
+        analyze_json.get("acquired_at").and_then(|v| v.as_str()),
+        Some("2026-06-14")
+    );
+    assert_eq!(
+        analyze_json
+            .get("real_products_ready")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        analyze_json.get("source").and_then(|v| v.as_str()),
+        Some("backend-generated Landsat-style sample selected by user")
+    );
+    let products = analyze_json
+        .get("products")
+        .and_then(|v| v.as_array())
+        .expect("products should be an array");
+    assert!(products.len() >= 6);
+    assert_eq!(
+        products[0].get("kind").and_then(|v| v.as_str()),
+        Some("rgb")
+    );
+
+    let invalid_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mobile/analyze")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "latitude": 999,
+                        "longitude": -119.4179,
+                        "date": "2026-06-14",
+                        "days": 14,
+                        "source": "sample"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+    let invalid_body = to_bytes(invalid_response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&invalid_body)
+        .contains("latitude or longitude outside valid range"));
+
+    let mismatch_payload = json!({
+        "latitude": 36.7783,
+        "longitude": -119.4179,
+        "date": "2026-06-14",
+        "days": 14,
+        "source": "landsat",
+        "external_scene_id": "selected-scene-id",
+        "selected_scene": {
+            "external_scene_id": "other-scene-id",
+            "dataset": "landsat",
+            "dataset_label": "landsat",
+            "provider": "mock-provider",
+            "collection": "mock-collection",
+            "acquired_at": "2026-06-14T00:00:00Z",
+            "resolution_m": 30.0,
+            "bbox": null,
+            "asset_count": 0
+        }
+    });
+    let mismatch_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mobile/analyze")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(mismatch_payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(mismatch_response.status(), StatusCode::BAD_REQUEST);
+    let mismatch_body = to_bytes(mismatch_response.into_body(), 64 * 1024).await?;
+    assert!(String::from_utf8_lossy(&mismatch_body)
+        .contains("selected scene payload does not match selected scene id"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn annotation_exports_return_csv_and_geojson() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -8853,6 +9156,90 @@ async fn recommendation_exports_return_csv_and_geojson() -> Result<()> {
             .pointer("/features/0/properties/evidence_refs/0")
             .and_then(|value| value.as_str()),
         Some("annotation:ann-export-rec-1")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_recommendation_exports_are_schema_valid() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "empty-recommendation-export-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/exports/recommendations.csv"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(
+        csv_reader.headers()?.iter().collect::<Vec<_>>(),
+        vec![
+            "recommendation_id",
+            "scene_id",
+            "field_id",
+            "org_id",
+            "author_user_id",
+            "title",
+            "category",
+            "action_category",
+            "priority",
+            "status",
+            "evidence_refs",
+            "annotation_ids",
+            "note",
+            "created_at",
+            "updated_at"
+        ]
+    );
+    assert_eq!(csv_reader.records().count(), 0);
+
+    let geojson_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{scene_id}/exports/recommendations.geojson"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson.get("type").and_then(|value| value.as_str()),
+        Some("FeatureCollection")
+    );
+    assert_eq!(
+        geojson
+            .pointer("/crs/properties/name")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert_eq!(
+        geojson
+            .get("features")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0)
     );
 
     Ok(())

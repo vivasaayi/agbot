@@ -564,6 +564,41 @@
 
     $("searchScenes").addEventListener("click", searchScenes);
 
+    async function requestMobileJson(url, payload) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const bodyText = await response.text();
+      let bodyJson = null;
+      if (bodyText) {
+        try {
+          bodyJson = JSON.parse(bodyText);
+        } catch (_error) {
+          bodyJson = null;
+        }
+      }
+
+      if (!response.ok) {
+        const message =
+          (typeof bodyJson === "object" && bodyJson !== null && (bodyJson.error || bodyJson.message)) ||
+          bodyText ||
+          "Request failed.";
+        throw new Error(String(message));
+      }
+
+      if (!bodyText.trim()) {
+        throw new Error("Server returned an empty response.");
+      }
+
+      if (bodyJson === null) {
+        throw new Error("Server response is not valid JSON.");
+      }
+
+      return bodyJson;
+    }
+
     async function searchScenes() {
       const latitude = Number($("lat").value);
       const longitude = Number($("lon").value);
@@ -588,13 +623,13 @@
       renderSceneList([]);
 
       try {
-        const response = await fetch("/api/mobile/scenes/search", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ latitude, longitude, date, days, source })
+        const payload = await requestMobileJson("/api/mobile/scenes/search", {
+          latitude,
+          longitude,
+          date,
+          days,
+          source,
         });
-        if (!response.ok) throw new Error(await response.text());
-        const payload = await response.json();
         state.scenes = payload.scenes || [];
         state.selectedSceneId = state.scenes[0]?.external_scene_id || null;
         renderSceneList(state.scenes);
@@ -660,25 +695,17 @@
       $("placeholder").hidden = false;
 
       try {
-        const response = await fetch("/api/mobile/analyze", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            latitude,
-            longitude,
-            date,
-            days,
-            source,
-            external_scene_id: state.selectedSceneId,
-            selected_scene: selectedScene(),
-            field_geometry: fieldGeometry(),
-            products: ["ndvi", "ndmi", "nbr", "mndwi", "evi2"]
-          })
+        state.response = await requestMobileJson("/api/mobile/analyze", {
+          latitude,
+          longitude,
+          date,
+          days,
+          source,
+          external_scene_id: state.selectedSceneId,
+          selected_scene: selectedScene(),
+          field_geometry: fieldGeometry(),
+          products: ["ndvi", "ndmi", "nbr", "mndwi", "evi2"],
         });
-        if (!response.ok) {
-          throw new Error(await response.text());
-        }
-        state.response = await response.json();
         state.selected = state.response.products[0]?.kind || null;
         if (state.response.external_scene_id) {
           setStatus(`${state.response.dataset_label || "Satellite"} scene ${state.response.external_scene_id} selected.`);

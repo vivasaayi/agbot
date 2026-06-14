@@ -1104,16 +1104,21 @@ pub async fn mobile_analyze(
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?;
 
+    let synthetic_scene_field_id = (source_mode == "sample").then(|| "sample-mobile".to_string());
+    let synthetic_scene_season_id = (source_mode == "sample").then(|| "sample".to_string());
+
     sqlx::query(
         r#"
-        INSERT INTO scenes (scene_id, owner, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO scenes (scene_id, owner, sensor, acquired_at, data_path, metadata_json, cloud_cover, created_at, field_id, season_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         ON CONFLICT(scene_id) DO UPDATE SET owner = excluded.owner,
                                           sensor = excluded.sensor,
                                           acquired_at = excluded.acquired_at,
                                           data_path = excluded.data_path,
                                           metadata_json = excluded.metadata_json,
-                                          cloud_cover = excluded.cloud_cover
+                                          cloud_cover = excluded.cloud_cover,
+                                          field_id = excluded.field_id,
+                                          season_id = excluded.season_id
         "#,
     )
     .bind(&scene_id)
@@ -1139,6 +1144,8 @@ pub async fn mobile_analyze(
             .unwrap_or(8.0f64),
     )
     .bind(current_record_timestamp())
+    .bind(synthetic_scene_field_id)
+    .bind(synthetic_scene_season_id)
     .execute(&state.pool)
     .await
     .map_err(Error::from)?;
