@@ -14,6 +14,7 @@ pub mod index_anomaly;
 pub mod index_trend;
 pub mod index_vegetation_classification;
 pub mod lidar_analysis;
+pub mod lidar_change;
 pub mod ndvi_analysis;
 pub mod product_anomalies;
 pub mod report_generator;
@@ -49,6 +50,10 @@ pub use index_vegetation_classification::{
     INDEX_VEGETATION_CLASSIFICATION_PAYLOAD_KEY,
 };
 pub use lidar_analysis::{LidarAnalysisConfig, LidarAnalysisProcessor};
+pub use lidar_change::{
+    analyze_lidar_change, LidarChangeDecision, LidarChangeError, LidarChangeRequest,
+    LIDAR_CHANGE_FEATURE_FLAG_KEY, LIDAR_CHANGE_PAYLOAD_KEY,
+};
 pub use ndvi_analysis::{NdviAnalysisConfig, NdviAnalysisProcessor};
 pub use product_anomalies::{
     flag_product_anomalies, AnomalyDetectionConfig, AnomalyDetectionError, ProductAnomaly,
@@ -142,6 +147,7 @@ pub enum JobType {
     HealthAssessment,
     YieldPrediction,
     IndexAnomalyDetection,
+    LidarChangeAdvisory,
     IndexTrendAdvisory,
     IndexVegetationTypeClassification,
 }
@@ -521,6 +527,7 @@ impl PostProcessorService {
             JobType::HealthAssessment => self.assess_crop_health(job).await,
             JobType::YieldPrediction => self.predict_yield(job).await,
             JobType::IndexAnomalyDetection => self.analyze_index_anomaly(job).await,
+            JobType::LidarChangeAdvisory => self.analyze_lidar_change(job).await,
             JobType::IndexTrendAdvisory => self.analyze_index_trend(job).await,
             JobType::IndexVegetationTypeClassification => {
                 self.analyze_index_vegetation_type_classification(job).await
@@ -818,6 +825,92 @@ impl PostProcessorService {
             },
             evidence_refs: vec![trend.evidence_input_hash],
             uncertainty: Some(trend.uncertainty),
+            created_at: Utc::now(),
+        })
+    }
+
+    async fn analyze_lidar_change(&self, job: &ProcessingJob) -> Result<AnalysisResult> {
+        self.ensure_lidar_change_feature_enabled(job)?;
+        let request = self.resolve_lidar_change_request(job)?;
+        let result = analyze_lidar_change(request).map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        let (result_data, statistics) = match result.decision {
+            LidarChangeDecision::Available { .. } => {
+                let stats = result
+                    .change_statistics
+                    .expect("available change result must include statistics");
+                (
+                    ResultData::GridData {
+                        width: result.width,
+                        height: result.height,
+                        values: result.obstacle_change_values.unwrap_or_default(),
+                        bounds: (
+                            result.common_extent.min_lon,
+                            result.common_extent.min_lat,
+                            result.common_extent.max_lon,
+                            result.common_extent.max_lat,
+                        ),
+                        units: "obstacle_canopy_change".to_string(),
+                    },
+                    stats.statistics,
+                )
+            }
+            LidarChangeDecision::LowConfidence { .. } | LidarChangeDecision::Unavailable { .. } => {
+                let available =
+                    if matches!(result.decision, LidarChangeDecision::Unavailable { .. }) {
+                        0.0
+                    } else {
+                        0.0
+                    };
+                (
+                    ResultData::ZonalData {
+                        zones: Vec::new(),
+                        aggregated_values: HashMap::from([
+                            ("coverage_fraction".to_string(), result.coverage_fraction),
+                            ("available".to_string(), available),
+                        ]),
+                    },
+                    AnalysisStatistics {
+                        min_value: 0.0,
+                        max_value: 0.0,
+                        mean_value: 0.0,
+                        std_deviation: 0.0,
+                        percentiles: HashMap::new(),
+                        coverage_area_m2: 0.0,
+                        valid_pixel_count: 0,
+                        total_pixel_count: result.width.saturating_mul(result.height),
+                    },
+                )
+            }
+        };
+
+        Ok(AnalysisResult {
+            id: Uuid::new_v4(),
+            job_id: job.id,
+            result_type: ResultType::StressIndicators,
+            data: result_data,
+            statistics,
+            visualizations: Vec::new(),
+            recommendations: if result.decision.label() == "unavailable" {
+                vec![Recommendation {
+                    category: RecommendationCategory::General,
+                    priority: Priority::Medium,
+                    title: "Lidar change advisory unavailable".to_string(),
+                    description: "Change comparison was blocked by advisability constraints."
+                        .to_string(),
+                    action_items: Vec::new(),
+                    affected_areas: Vec::new(),
+                    confidence_score: 0.2,
+                }]
+            } else {
+                Vec::new()
+            },
+            evidence_refs: if result.evidence_input_hash.is_empty() {
+                Vec::new()
+            } else {
+                vec![result.evidence_input_hash]
+            },
+            uncertainty: Some(result.uncertainty),
             created_at: Utc::now(),
         })
     }
@@ -1148,6 +1241,25 @@ impl PostProcessorService {
             .map_err(|error| anyhow::anyhow!("invalid index trend payload: {error}"))
     }
 
+    fn resolve_lidar_change_request(&self, job: &ProcessingJob) -> Result<LidarChangeRequest> {
+        let _identity = self.analysis_job_identities.get(&job.id).ok_or_else(|| {
+            anyhow::anyhow!("missing analysis identity for lidar change advisory")
+        })?;
+
+        let payload = job
+            .parameters
+            .custom_parameters
+            .get(LIDAR_CHANGE_PAYLOAD_KEY)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "lidar change advisory requires '{}' payload",
+                    LIDAR_CHANGE_PAYLOAD_KEY
+                )
+            })?;
+        serde_json::from_value(payload.clone())
+            .map_err(|error| anyhow::anyhow!("invalid lidar change payload: {error}"))
+    }
+
     fn ensure_index_trend_feature_enabled(&self, job: &ProcessingJob) -> Result<()> {
         let enabled = matches!(
             job.parameters.custom_parameters.get(INDEX_TREND_FEATURE_FLAG_KEY),
@@ -1156,6 +1268,21 @@ impl PostProcessorService {
         if !enabled {
             return Err(anyhow::anyhow!(
                 "index trend advisory is disabled until feature flag is enabled"
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_lidar_change_feature_enabled(&self, job: &ProcessingJob) -> Result<()> {
+        let enabled = matches!(
+            job.parameters
+                .custom_parameters
+                .get(LIDAR_CHANGE_FEATURE_FLAG_KEY),
+            Some(value) if value.as_bool().unwrap_or(false)
+        );
+        if !enabled {
+            return Err(anyhow::anyhow!(
+                "lidar change advisory is disabled until feature flag is enabled"
             ));
         }
         Ok(())
@@ -2010,6 +2137,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lidar_change_advisory_requires_feature_flag() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::LidarChangeAdvisory;
+        request.parameters.custom_parameters.insert(
+            LIDAR_CHANGE_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(lidar_change_request()).expect("valid request"),
+        );
+        request
+            .parameters
+            .custom_parameters
+            .insert(LIDAR_CHANGE_FEATURE_FLAG_KEY.to_string(), json!(false));
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let job_id = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("lidar request is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted");
+        assert!(result.is_none());
+
+        let identity = service
+            .analysis_job_identity(&job_id)
+            .expect("identity exists after failure");
+        assert!(matches!(identity.status, JobStatus::Failed));
+        assert!(identity
+            .failure_reason
+            .as_ref()
+            .is_some_and(|message| message.contains("disabled")));
+    }
+
+    #[tokio::test]
+    async fn lidar_change_advisory_produces_change_for_comparable_reliable_snapshots() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::LidarChangeAdvisory;
+        request.parameters.custom_parameters.insert(
+            LIDAR_CHANGE_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(lidar_change_request()).expect("valid request"),
+        );
+        request
+            .parameters
+            .custom_parameters
+            .insert(LIDAR_CHANGE_FEATURE_FLAG_KEY.to_string(), json!(true));
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let _ = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("lidar request is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted")
+            .expect("lidar result produced");
+
+        assert_eq!(result.result_type, ResultType::StressIndicators);
+        assert!(matches!(result.data, ResultData::GridData { .. }));
+        assert!(result.uncertainty.is_some());
+        assert!(result.evidence_refs.first().is_some());
+    }
+
+    #[tokio::test]
+    async fn lidar_change_advisory_marks_low_confidence_when_segmentation_unreliable() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = lidar_change_request();
+        request.snapshots[1].segmentation_reliable = false;
+
+        let mut job_request = analysis_job_request(temp_dir.path());
+        job_request.job_type = JobType::LidarChangeAdvisory;
+        job_request.parameters.custom_parameters.insert(
+            LIDAR_CHANGE_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(request).expect("valid request"),
+        );
+        job_request
+            .parameters
+            .custom_parameters
+            .insert(LIDAR_CHANGE_FEATURE_FLAG_KEY.to_string(), json!(true));
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let _ = service
+            .submit_analysis_job(&catalog, job_request)
+            .await
+            .expect("lidar request is accepted");
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted")
+            .expect("lidar result produced");
+
+        assert!(matches!(result.data, ResultData::ZonalData { .. }));
+        assert!(result.uncertainty.is_some());
+    }
+
+    #[tokio::test]
     async fn index_anomaly_detection_requires_feature_flag() {
         let temp_dir = tempdir().unwrap();
         let catalog = analysis_catalog();
@@ -2438,6 +2668,92 @@ mod tests {
                 trend_snapshot("scene-2026-05-01", "2026-05-01T00:00:00Z"),
                 trend_snapshot("scene-2026-06-01", "2026-06-01T00:00:00Z"),
             ],
+        }
+    }
+
+    fn lidar_change_request() -> LidarChangeRequest {
+        LidarChangeRequest {
+            snapshots: vec![
+                lidar_snapshot(
+                    "scene-2026-05-01",
+                    "2026-05-01T00:00:00Z",
+                    true,
+                    0.0,
+                    1.0,
+                    3.0,
+                    3.5,
+                ),
+                lidar_snapshot(
+                    "scene-2026-06-01",
+                    "2026-06-01T00:00:00Z",
+                    true,
+                    0.0,
+                    0.8,
+                    3.1,
+                    3.7,
+                ),
+            ],
+        }
+    }
+
+    fn lidar_snapshot(
+        scene_id: &str,
+        captured_at: &str,
+        segmentation_reliable: bool,
+        occupancy_prev: f32,
+        occupancy_current: f32,
+        chm_prev: f32,
+        chm_current: f32,
+    ) -> lidar_change::LidarChangeSnapshotPayload {
+        let acquired_at = chrono::DateTime::parse_from_rfc3339(captured_at)
+            .expect("captured time is valid")
+            .with_timezone(&Utc);
+        let occupancy_grid = ProductGrid {
+            width: 2,
+            height: 2,
+            values: vec![occupancy_prev, 1.0, 0.5, occupancy_current],
+            nodata_mask: vec![false, false, true, false],
+            spatial_ref: shared::schemas::RasterSpatialRef {
+                georeferenced: true,
+                crs: Some("EPSG:32614".to_string()),
+                bbox: Some(GeoBounds {
+                    min_lon: 500000.0,
+                    min_lat: 4500000.0,
+                    max_lon: 500020.0,
+                    max_lat: 4500020.0,
+                }),
+                geo_transform: Some([500000.0, 10.0, 0.0, 4500020.0, 0.0, -10.0]),
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+            },
+        };
+        let chm_grid = ProductGrid {
+            width: 2,
+            height: 2,
+            values: vec![chm_prev, 3.6, 2.4, chm_current],
+            nodata_mask: vec![false, false, true, false],
+            spatial_ref: shared::schemas::RasterSpatialRef {
+                georeferenced: true,
+                crs: Some("EPSG:32614".to_string()),
+                bbox: Some(GeoBounds {
+                    min_lon: 500000.0,
+                    min_lat: 4500000.0,
+                    max_lon: 500020.0,
+                    max_lat: 4500020.0,
+                }),
+                geo_transform: Some([500000.0, 10.0, 0.0, 4500020.0, 0.0, -10.0]),
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+            },
+        };
+
+        lidar_change::LidarChangeSnapshotPayload {
+            field_id: "field-a".to_string(),
+            scene_id: scene_id.to_string(),
+            occupancy_product_ref: format!("occupancy-layer-{scene_id}"),
+            chm_product_ref: format!("chm-layer-{scene_id}"),
+            acquired_at,
+            occupancy_grid,
+            chm_grid,
+            segmentation_reliable,
         }
     }
 

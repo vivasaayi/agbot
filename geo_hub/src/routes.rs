@@ -184,6 +184,7 @@ pub struct ProductSummary {
     pub gsd_m_per_px: Option<f64>,
     pub spatial_ref: Option<RasterSpatialRef>,
     pub source_image_ids: Vec<String>,
+    pub source_scan_ids: Vec<String>,
     pub publish_status: Option<String>,
     pub qa_report_ref: Option<String>,
     pub provenance_hash: Option<String>,
@@ -224,6 +225,7 @@ pub struct LayerMetadata {
     pub gsd_m_per_px: Option<f64>,
     pub spatial_ref: RasterSpatialRef,
     pub source_image_ids: Vec<String>,
+    pub source_scan_ids: Vec<String>,
     pub publish_status: Option<String>,
     pub qa_report_ref: Option<String>,
     pub provenance_hash: Option<String>,
@@ -4184,6 +4186,7 @@ pub async fn handoff_orthomosaic_tiles(
             layer.height_px,
             layer.gsd_m_per_px,
             handoff.source_image_ids.clone(),
+            handoff.source_image_ids.clone(),
         )
         .await
         .map_err(|err| {
@@ -6570,7 +6573,7 @@ async fn collect_scene_products(
     let rows = sqlx::query(
         r#"
         SELECT product_id, field_id, season_id, kind, path, width_px, height_px, gsd_m_per_px,
-               spatial_ref_json, source_image_ids_json,
+               spatial_ref_json, source_image_ids_json, source_scan_ids_json,
                publish_status, qa_report_ref, provenance_hash, downstream_consumers_json
         FROM products
         WHERE scene_id = ?1
@@ -6613,6 +6616,7 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
             p.gsd_m_per_px AS product_gsd_m_per_px,
             p.spatial_ref_json AS product_spatial_ref_json,
             p.source_image_ids_json,
+            p.source_scan_ids_json,
             p.publish_status,
             p.qa_report_ref,
             p.provenance_hash,
@@ -6658,6 +6662,7 @@ async fn load_layer_row(
             p.gsd_m_per_px AS product_gsd_m_per_px,
             p.spatial_ref_json AS product_spatial_ref_json,
             p.source_image_ids_json,
+            p.source_scan_ids_json,
             p.publish_status,
             p.qa_report_ref,
             p.provenance_hash,
@@ -6825,6 +6830,7 @@ async fn layer_from_row(
         gsd_m_per_px,
         spatial_ref,
         source_image_ids: decode_source_image_ids(row.get("source_image_ids_json"))?,
+        source_scan_ids: decode_source_scan_ids(row.get("source_scan_ids_json"))?,
         publish_status: row.get("publish_status"),
         qa_report_ref: row.get("qa_report_ref"),
         provenance_hash: row.get("provenance_hash"),
@@ -6936,6 +6942,7 @@ fn build_product_summary(scene_id: &str, kind: &str, path: &FsPath) -> ProductSu
         gsd_m_per_px: None,
         spatial_ref: None,
         source_image_ids: Vec::new(),
+        source_scan_ids: Vec::new(),
         publish_status: None,
         qa_report_ref: None,
         provenance_hash: None,
@@ -6986,6 +6993,7 @@ fn product_summary_from_row(
         gsd_m_per_px: row.get("gsd_m_per_px"),
         spatial_ref,
         source_image_ids: decode_source_image_ids(row.get("source_image_ids_json"))?,
+        source_scan_ids: decode_source_scan_ids(row.get("source_scan_ids_json"))?,
         publish_status: row.get("publish_status"),
         qa_report_ref: row.get("qa_report_ref"),
         provenance_hash: row.get("provenance_hash"),
@@ -7003,6 +7011,15 @@ fn decode_source_image_ids(value: Option<String>) -> AppResult<Vec<String>> {
     };
     serde_json::from_str::<Vec<String>>(&json).map_err(|err| {
         AppError::Anyhow(Error::new(err).context("failed to decode product source_image_ids_json"))
+    })
+}
+
+fn decode_source_scan_ids(value: Option<String>) -> AppResult<Vec<String>> {
+    let Some(json) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<String>>(&json).map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode product source_scan_ids_json"))
     })
 }
 

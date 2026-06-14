@@ -251,6 +251,7 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             gsd_m_per_px REAL,
             spatial_ref_json TEXT,
             source_image_ids_json TEXT,
+            source_scan_ids_json TEXT,
             publish_status TEXT,
             qa_report_ref TEXT,
             provenance_hash TEXT,
@@ -325,6 +326,14 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         "products",
         "source_image_ids_json",
         "ALTER TABLE products ADD COLUMN source_image_ids_json TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "source_scan_ids_json",
+        "ALTER TABLE products ADD COLUMN source_scan_ids_json TEXT",
     )
     .await?;
 

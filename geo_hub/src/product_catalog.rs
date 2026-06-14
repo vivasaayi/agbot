@@ -14,6 +14,7 @@ pub struct ProductPublication {
     pub product_kind: String,
     pub spatial_ref: RasterSpatialRef,
     pub source_image_ids: Vec<String>,
+    pub source_scan_ids: Vec<String>,
     pub width_px: Option<u32>,
     pub height_px: Option<u32>,
     pub gsd_m_per_px: Option<f64>,
@@ -51,14 +52,16 @@ pub async fn publish_product(
         .context("failed to encode product spatial_ref")?;
     let source_image_ids_json = serde_json::to_string(&context.source_image_ids)
         .context("failed to encode product source_image_ids")?;
+    let source_scan_ids_json = serde_json::to_string(&context.source_scan_ids)
+        .context("failed to encode product source_scan_ids")?;
 
     sqlx::query(
         r#"
         INSERT INTO products (
             product_id, scene_id, field_id, season_id, kind, path,
-            spatial_ref_json, source_image_ids_json, created_at
+            spatial_ref_json, source_image_ids_json, source_scan_ids_json, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
         ON CONFLICT(scene_id, kind) DO UPDATE SET
             product_id = excluded.product_id,
             field_id = excluded.field_id,
@@ -69,6 +72,7 @@ pub async fn publish_product(
             gsd_m_per_px = NULL,
             spatial_ref_json = excluded.spatial_ref_json,
             source_image_ids_json = excluded.source_image_ids_json,
+            source_scan_ids_json = excluded.source_scan_ids_json,
             publish_status = NULL,
             qa_report_ref = NULL,
             provenance_hash = NULL,
@@ -84,6 +88,7 @@ pub async fn publish_product(
     .bind(product_path.to_string_lossy().to_string())
     .bind(spatial_ref_json)
     .bind(source_image_ids_json)
+    .bind(source_scan_ids_json)
     .execute(pool)
     .await?;
 
@@ -102,6 +107,7 @@ pub async fn publish_georeferenced_product(
     height_px: u32,
     gsd_m_per_px: f64,
     source_image_ids: Vec<String>,
+    source_scan_ids: Vec<String>,
 ) -> Result<ProductPublication> {
     if product_path.as_os_str().is_empty() {
         return Err(ProductPublishError::EmptyProductPath.into());
@@ -142,7 +148,17 @@ pub async fn publish_georeferenced_product(
         .into_iter()
         .filter_map(|value| normalize_optional(&value))
         .collect::<Vec<_>>();
+    let source_scan_ids = source_scan_ids
+        .into_iter()
+        .filter_map(|value| normalize_optional(&value))
+        .collect::<Vec<_>>();
     if source_image_ids.is_empty() {
+        return Err(ProductPublishError::MissingSourceImageIds {
+            scene_id: scene_id.clone(),
+        }
+        .into());
+    }
+    if source_scan_ids.is_empty() {
         return Err(ProductPublishError::MissingSourceImageIds {
             scene_id: scene_id.clone(),
         }
@@ -153,6 +169,8 @@ pub async fn publish_georeferenced_product(
         serde_json::to_string(spatial_ref).context("failed to encode product spatial_ref")?;
     let source_image_ids_json = serde_json::to_string(&source_image_ids)
         .context("failed to encode product source_image_ids")?;
+    let source_scan_ids_json = serde_json::to_string(&source_scan_ids)
+        .context("failed to encode product source_scan_ids")?;
     let product_id = format!("{scene_id}:{product_kind}");
 
     sqlx::query(
@@ -160,9 +178,9 @@ pub async fn publish_georeferenced_product(
         INSERT INTO products (
             product_id, scene_id, field_id, season_id, kind, path,
             width_px, height_px, gsd_m_per_px,
-            spatial_ref_json, source_image_ids_json, created_at
+            spatial_ref_json, source_image_ids_json, source_scan_ids_json, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))
         ON CONFLICT(scene_id, kind) DO UPDATE SET
             product_id = excluded.product_id,
             field_id = excluded.field_id,
@@ -173,6 +191,7 @@ pub async fn publish_georeferenced_product(
             gsd_m_per_px = excluded.gsd_m_per_px,
             spatial_ref_json = excluded.spatial_ref_json,
             source_image_ids_json = excluded.source_image_ids_json,
+            source_scan_ids_json = excluded.source_scan_ids_json,
             publish_status = NULL,
             qa_report_ref = NULL,
             provenance_hash = NULL,
@@ -191,6 +210,7 @@ pub async fn publish_georeferenced_product(
     .bind(gsd_m_per_px)
     .bind(spatial_ref_json)
     .bind(source_image_ids_json)
+    .bind(source_scan_ids_json)
     .execute(pool)
     .await?;
 
@@ -202,6 +222,7 @@ pub async fn publish_georeferenced_product(
         product_kind,
         spatial_ref: spatial_ref.clone(),
         source_image_ids,
+        source_scan_ids,
         width_px: Some(width_px),
         height_px: Some(height_px),
         gsd_m_per_px: Some(gsd_m_per_px),
@@ -246,6 +267,7 @@ async fn load_publication_context(
         })?,
     };
     let source_image_ids = vec![image.image_id.to_string()];
+    let source_scan_ids: Vec<String> = Vec::new();
     if source_image_ids.iter().any(|value| value.trim().is_empty()) {
         return Err(ProductPublishError::MissingSourceImageIds {
             scene_id: scene_id.clone(),
@@ -261,6 +283,7 @@ async fn load_publication_context(
         product_kind,
         spatial_ref,
         source_image_ids,
+        source_scan_ids,
         width_px: None,
         height_px: None,
         gsd_m_per_px: None,

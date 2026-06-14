@@ -436,6 +436,27 @@ pub struct LidarElevationProducts {
     pub evidence: LidarElevationEvidence,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarCanopyHeightRaster {
+    pub kind: String,
+    pub width: u32,
+    pub height: u32,
+    pub nodata: f32,
+    pub values: Vec<f32>,
+    pub spatial_ref: RasterSpatialRef,
+    pub evidence: LidarCanopyHeightEvidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarCanopyHeightEvidence {
+    pub valid_cell_count: usize,
+    pub nodata_cell_count: usize,
+    pub min_canopy_height: Option<f32>,
+    pub max_canopy_height: Option<f32>,
+    pub mean_canopy_height: Option<f32>,
+    pub coverage_fraction: f32,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LidarElevationExportStatus {
@@ -1347,6 +1368,134 @@ impl LidarMapper {
                 dsm_valid_cells,
                 dtm_valid_cells,
                 params,
+            },
+        })
+    }
+
+    pub fn build_canopy_height_raster(
+        &self,
+        dsm: &LidarElevationRaster,
+        dtm: &LidarElevationRaster,
+    ) -> AgroResult<LidarCanopyHeightRaster> {
+        let expected_values = (dsm.width * dsm.height) as usize;
+        if expected_values == 0 {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR canopy-height products require non-empty raster dimensions".into(),
+            ));
+        }
+        if dsm.width != dtm.width || dsm.height != dtm.height {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR canopy-height products require aligned DSM and DTM extents".into(),
+            ));
+        }
+        if dsm.values.len() != expected_values || dtm.values.len() != expected_values {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR canopy-height products require aligned DSM and DTM raster sizes".into(),
+            ));
+        }
+
+        let dsm_spatial_ref =
+            assert_raster_spatial_ref(Some(&dsm.spatial_ref), dsm.width, dsm.height).map_err(
+                |err| {
+                    shared::error::AgroError::Processing(format!(
+                        "LiDAR canopy-height products failed DSM geospatial assertion: {err}"
+                    ))
+                },
+            )?;
+        let dtm_spatial_ref =
+            assert_raster_spatial_ref(Some(&dtm.spatial_ref), dtm.width, dtm.height).map_err(
+                |err| {
+                    shared::error::AgroError::Processing(format!(
+                        "LiDAR canopy-height products failed DTM geospatial assertion: {err}"
+                    ))
+                },
+            )?;
+        if dsm_spatial_ref != dtm_spatial_ref {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR canopy-height products require matching DSM and DTM CRS/extent/transform"
+                    .into(),
+            ));
+        }
+        if !dsm.nodata.is_finite() || !dtm.nodata.is_finite() {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR canopy-height products require finite nodata values".into(),
+            ));
+        }
+        if (dsm.nodata - dtm.nodata).abs() > f32::EPSILON {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR canopy-height products require matching DSM and DTM nodata values".into(),
+            ));
+        }
+
+        let mut values = Vec::with_capacity(expected_values);
+        let mut valid_cell_count = 0usize;
+        let mut nodata_cell_count = 0usize;
+        let mut min_canopy_height = None;
+        let mut max_canopy_height = None;
+        let mut mean_sum = 0.0f64;
+
+        for (dsm_value, dtm_value) in dsm.values.iter().zip(dtm.values.iter()) {
+            let chm = if Self::is_valid_elevation_cell(*dsm_value, dsm.nodata)
+                && Self::is_valid_elevation_cell(*dtm_value, dtm.nodata)
+            {
+                let raw = dsm_value - dtm_value;
+                if raw >= 0.0 {
+                    Some(raw)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            match chm {
+                Some(value) => {
+                    min_canopy_height = Some(
+                        min_canopy_height
+                            .map(|current: f32| current.min(value))
+                            .unwrap_or(value),
+                    );
+                    max_canopy_height = Some(
+                        max_canopy_height
+                            .map(|current: f32| current.max(value))
+                            .unwrap_or(value),
+                    );
+                    mean_sum += value as f64;
+                    valid_cell_count += 1;
+                    values.push(value);
+                }
+                None => {
+                    nodata_cell_count += 1;
+                    values.push(dsm.nodata);
+                }
+            }
+        }
+
+        let total_cells = (dsm.width as f64) * (dsm.height as f64);
+        let coverage_fraction = if total_cells <= 0.0 {
+            0.0
+        } else {
+            valid_cell_count as f64 / total_cells
+        };
+
+        Ok(LidarCanopyHeightRaster {
+            kind: "canopy_height".to_string(),
+            width: dsm.width,
+            height: dsm.height,
+            nodata: dsm.nodata,
+            values,
+            spatial_ref: dsm_spatial_ref,
+            evidence: LidarCanopyHeightEvidence {
+                valid_cell_count,
+                nodata_cell_count,
+                min_canopy_height,
+                max_canopy_height,
+                mean_canopy_height: if valid_cell_count == 0 {
+                    None
+                } else {
+                    Some((mean_sum / valid_cell_count as f64) as f32)
+                },
+                coverage_fraction: coverage_fraction as f32,
             },
         })
     }
@@ -3363,6 +3512,101 @@ mod tests {
         assert_eq!(products.dsm.value_at(1, 0), Some(2.5));
         assert_eq!(products.dtm.value_at(1, 0), Some(params.nodata));
         assert_ne!(products.dtm.value_at(1, 0), Some(0.0));
+    }
+
+    #[test]
+    fn build_canopy_height_raster_differences_dsm_and_dtm_with_coverage_stats() {
+        let mapper = test_mapper();
+        let dsm = LidarElevationRaster {
+            kind: "dsm".to_string(),
+            width: 2,
+            height: 2,
+            nodata: -9999.0,
+            values: vec![5.0, 10.0, -9999.0, 7.0],
+            spatial_ref: LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 2, 1.0).unwrap(),
+        };
+        let dtm = LidarElevationRaster {
+            kind: "dtm".to_string(),
+            width: 2,
+            height: 2,
+            nodata: -9999.0,
+            values: vec![1.0, 12.0, 3.0, 5.0],
+            spatial_ref: LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 2, 1.0).unwrap(),
+        };
+
+        let chm = mapper.build_canopy_height_raster(&dsm, &dtm).unwrap();
+
+        assert_eq!(chm.values[0], 4.0);
+        assert_eq!(chm.values[1], -9999.0);
+        assert_eq!(chm.values[2], -9999.0);
+        assert_eq!(chm.values[3], 2.0);
+        assert_eq!(chm.kind, "canopy_height");
+        assert_eq!(chm.width, 2);
+        assert_eq!(chm.height, 2);
+        assert_eq!(chm.spatial_ref, dsm.spatial_ref);
+        assert_eq!(
+            chm.evidence,
+            LidarCanopyHeightEvidence {
+                valid_cell_count: 2,
+                nodata_cell_count: 2,
+                min_canopy_height: Some(2.0),
+                max_canopy_height: Some(4.0),
+                mean_canopy_height: Some(3.0),
+                coverage_fraction: 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn build_canopy_height_raster_requires_extent_alignment() {
+        let mapper = test_mapper();
+        let dsm = LidarElevationRaster {
+            kind: "dsm".to_string(),
+            width: 2,
+            height: 2,
+            nodata: -9999.0,
+            values: vec![1.0; 4],
+            spatial_ref: LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 2, 1.0).unwrap(),
+        };
+        let dtm = LidarElevationRaster {
+            kind: "dtm".to_string(),
+            width: 2,
+            height: 3,
+            nodata: -9999.0,
+            values: vec![1.0; 6],
+            spatial_ref: LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 3, 1.0).unwrap(),
+        };
+
+        let err = mapper.build_canopy_height_raster(&dsm, &dtm).unwrap_err();
+        assert!(err.to_string().contains("aligned DSM and DTM extents"));
+    }
+
+    #[test]
+    fn build_canopy_height_raster_rejects_different_spatial_ref() {
+        let mapper = test_mapper();
+        let mut dtm_ref = LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 2, 1.0).unwrap();
+        dtm_ref.crs = Some("EPSG:9999".to_string());
+        let dsm = LidarElevationRaster {
+            kind: "dsm".to_string(),
+            width: 2,
+            height: 2,
+            nodata: -9999.0,
+            values: vec![1.0; 4],
+            spatial_ref: LidarMapper::occupancy_grid_spatial_ref(0, 0, 2, 2, 1.0).unwrap(),
+        };
+        let dtm = LidarElevationRaster {
+            kind: "dtm".to_string(),
+            width: 2,
+            height: 2,
+            nodata: -9999.0,
+            values: vec![1.0; 4],
+            spatial_ref: dtm_ref,
+        };
+
+        let err = mapper.build_canopy_height_raster(&dsm, &dtm).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("matching DSM and DTM CRS/extent/transform"));
     }
 
     #[test]

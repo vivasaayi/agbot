@@ -2,18 +2,19 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: a9ca52b (`batch-05-22`)
-- **Latest checkpoint commit**: a9ca52b (`batch-05-22`)
-- **Current batch**: `batch-05-22` — STORIES `05-22` & `05-23` (batch processing for M5 P2 index anomaly and vegetation-type classification).
-- **Completed feature rows**: 301 committed; 1 skipped; 1 tests_passed; 194 pending rows remain in the full-roadmap inventory.
+- **Last implementation commit**: f79547e (`batch-06-14`)
+- **Latest checkpoint commit**: f79547e (`batch-06-14`)
+- **Current batch**: `batch-06-14` — STORIES `06-14` (canopy-height model), `06-16` (product provenance and scene/field linkage), and `06-18` (obstacle-change advisory)
+- **Completed feature rows**: 304 committed; 1 tests_passed; 1 skipped; 1 blocked; 191 pending in this run.
 - **Blocker**: None
 
 ## Latest verification
 
-- `cargo fmt --all` — pass
-- `cargo check -p post_processor` — pass (warnings only)
-- `cargo test -p post_processor --lib` — pass (70 tests)
+- `cargo fmt --all --check` — pass
+- `cargo test -p post_processor --lib` — pass (77 tests)
+- `cargo test -p lidar_mapper --lib` — pass (36 tests)
+- `cargo test -p geo_hub --test products_api` — pass (104 tests)
 
 ## Next action
 
-- Select and claim STORY `06-14`.
+- Select and claim STORY `07-14`.

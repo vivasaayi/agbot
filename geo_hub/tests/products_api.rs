@@ -5589,6 +5589,36 @@ async fn orthomosaic_tile_handoff_publishes_geo_hub_layers() -> Result<()> {
                 .as_str()
         )
     );
+    assert_eq!(
+        layer_json
+            .pointer("/source_scan_ids/0")
+            .and_then(|value| value.as_str()),
+        Some("frame-001")
+    );
+
+    let orthomosaic_row = sqlx::query(
+        r#"
+        SELECT source_image_ids_json, source_scan_ids_json
+        FROM products
+        WHERE scene_id = ?1 AND kind = ?2
+        "#,
+    )
+    .bind(scene_id)
+    .bind("orthomosaic")
+    .fetch_one(&ctx.pool)
+    .await?;
+    let persisted_source_image_ids: Vec<String> =
+        serde_json::from_str(&orthomosaic_row.get::<String, _>("source_image_ids_json"))?;
+    let persisted_source_scan_ids: Vec<String> =
+        serde_json::from_str(&orthomosaic_row.get::<String, _>("source_scan_ids_json"))?;
+    assert_eq!(
+        persisted_source_image_ids,
+        vec!["frame-001".to_string(), "frame-002".to_string()]
+    );
+    assert_eq!(
+        persisted_source_scan_ids,
+        vec!["frame-001".to_string(), "frame-002".to_string()]
+    );
 
     let tile_response = ctx
         .app
@@ -5632,6 +5662,89 @@ async fn orthomosaic_tile_handoff_publishes_geo_hub_layers() -> Result<()> {
     assert_eq!(reopened.width, 2);
     assert_eq!(reopened.height, 2);
     assert_eq!(reopened.spatial_ref.crs.as_deref(), Some("EPSG:4326"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn orthomosaic_tile_handoff_rejects_missing_field_and_season_linkage() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "ortho-handoff-orphan";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let spatial_ref = orthomosaic_tile_spatial_ref_json();
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref.clone()).await?;
+
+    seed_completed_orthomosaic_reconstruction(
+        &ctx,
+        scene_id,
+        "",
+        "",
+        "frame-set-handoff-orphan",
+        "recon-ortho-handoff-orphan",
+    )
+    .await?;
+
+    let mosaic_path = scene_dir
+        .join("products")
+        .join("orthomosaic")
+        .join("orthomosaic.png");
+    let dsm_path = scene_dir.join("products").join("dsm").join("dsm.png");
+    std::fs::create_dir_all(mosaic_path.parent().expect("mosaic parent exists"))?;
+    std::fs::create_dir_all(dsm_path.parent().expect("dsm parent exists"))?;
+    write_gray_png(&mosaic_path, 180)?;
+    write_gray_png(&dsm_path, 90)?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/orthomosaic/reconstructions/recon-ortho-handoff-orphan/handoff")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "scene_id": scene_id,
+                        "recon_id": "recon-ortho-handoff-orphan",
+                        "generated_at": "2026-06-01T12:08:00Z",
+                        "source_image_ids": ["frame-001", "frame-002"],
+                        "tile_size_px": 256,
+                        "mosaic": {
+                            "uri": mosaic_path.to_string_lossy().to_string(),
+                            "width_px": 2,
+                            "height_px": 2,
+                            "spatial_ref": spatial_ref.clone(),
+                            "gsd_m_per_px": 0.05
+                        },
+                        "dsm": {
+                            "uri": dsm_path.to_string_lossy().to_string(),
+                            "width_px": 2,
+                            "height_px": 2,
+                            "spatial_ref": spatial_ref,
+                            "gsd_m_per_px": 0.05
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("missing field_id") || message.contains("missing scene_id"));
+
+    let persisted_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM products WHERE scene_id = ?1 AND kind = ?2")
+            .bind(scene_id)
+            .bind("orthomosaic")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(persisted_count, 0);
 
     Ok(())
 }
@@ -9771,7 +9884,9 @@ async fn generates_ndvi_via_db_fallback_and_persists_product_provenance() -> Res
 
     let row = sqlx::query(
         r#"
-        SELECT product_id, field_id, season_id, spatial_ref_json, source_image_ids_json, path
+        SELECT
+            product_id, field_id, season_id, spatial_ref_json,
+            source_image_ids_json, source_scan_ids_json, path
         FROM products
         WHERE scene_id = ?1 AND kind = ?2
         "#,
@@ -9806,6 +9921,9 @@ async fn generates_ndvi_via_db_fallback_and_persists_product_provenance() -> Res
     let source_image_ids: Vec<String> =
         serde_json::from_str(&row.get::<String, _>("source_image_ids_json"))?;
     assert_eq!(source_image_ids, vec![image_id.to_string()]);
+    let source_scan_ids: Vec<String> =
+        serde_json::from_str(&row.get::<String, _>("source_scan_ids_json"))?;
+    assert!(source_scan_ids.is_empty());
 
     let scene_response = ctx
         .app
@@ -9846,6 +9964,13 @@ async fn generates_ndvi_via_db_fallback_and_persists_product_provenance() -> Res
             .and_then(|value| value.as_str()),
         Some(image_id.to_string().as_str())
     );
+    assert_eq!(
+        scene_json
+            .pointer("/available_products/0/source_scan_ids")
+            .and_then(|value| value.as_array())
+            .map(|scan_ids| scan_ids.len()),
+        Some(0)
+    );
 
     let layer_response = ctx
         .app
@@ -9872,6 +9997,13 @@ async fn generates_ndvi_via_db_fallback_and_persists_product_provenance() -> Res
             .pointer("/source_image_ids/0")
             .and_then(|value| value.as_str()),
         Some(image_id.to_string().as_str())
+    );
+    assert_eq!(
+        layer_json
+            .pointer("/source_scan_ids")
+            .and_then(|value| value.as_array())
+            .map(|scan_ids| scan_ids.len()),
+        Some(0)
     );
 
     Ok(())
