@@ -1,6 +1,6 @@
 use crate::state::{
-    ReportFetchTask, ReportGenerateTask, ReportOverlayState, TileConfig, TileRenderState,
-    TileStatus,
+    ReportFetchTask, ReportGenerateTask, ReportOverlayState, ReportZoneOverlay, TileConfig,
+    TileRenderState, TileStatus,
 };
 use anyhow::{Context, Result};
 use bevy::prelude::*;
@@ -12,7 +12,10 @@ pub struct ViewerReportsPlugin;
 
 impl Plugin for ViewerReportsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (poll_report_fetch, poll_report_generate));
+        app.add_systems(
+            Update,
+            (poll_report_fetch, poll_report_generate, render_report_zones),
+        );
     }
 }
 
@@ -120,6 +123,39 @@ pub fn clear_reports(
     report_generate_task: &mut ReportGenerateTask,
 ) {
     reports.items.clear();
+    reports.zones.clear();
+    reports.last_overlay_error = None;
     report_fetch_task.0 = None;
     report_generate_task.0 = None;
+}
+
+pub fn render_report_zones(mut gizmos: Gizmos, reports: Res<ReportOverlayState>) {
+    for zone in &reports.zones {
+        draw_report_zone(&mut gizmos, zone);
+    }
+}
+
+fn draw_report_zone(gizmos: &mut Gizmos, zone: &ReportZoneOverlay) {
+    if zone.world_polygon.len() < 3 {
+        return;
+    }
+    let color = report_zone_color(zone.priority);
+    for segment in zone.world_polygon.windows(2) {
+        gizmos.line_2d(segment[0], segment[1], color);
+    }
+    let first = zone.world_polygon[0];
+    let last = *zone
+        .world_polygon
+        .last()
+        .expect("world polygon has at least three vertices");
+    gizmos.line_2d(last, first, color);
+}
+
+fn report_zone_color(priority: shared::schemas::RecommendationPriority) -> Color {
+    match priority {
+        shared::schemas::RecommendationPriority::Low => Color::srgba(0.35, 0.75, 0.45, 0.9),
+        shared::schemas::RecommendationPriority::Medium => Color::srgba(0.95, 0.78, 0.2, 0.9),
+        shared::schemas::RecommendationPriority::High => Color::srgba(0.95, 0.42, 0.16, 0.95),
+        shared::schemas::RecommendationPriority::Critical => Color::srgba(0.9, 0.12, 0.2, 1.0),
+    }
 }
