@@ -2,18 +2,18 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: a23e82b (`batch-20260614214500`)
-- **Latest checkpoint commit**: a23e82b (`batch-20260614214500`)
-- **Current batch**: batch-20260614151600 — STORY `12-18`
-- **Completed feature rows**: 324 committed; 2 tests_passed; 1 skipped; 1 blocked; 170 pending in this run.
+- **Last implementation commit**: 1d76a5f (`batch-20260614151600`)
+- **Latest checkpoint commit**: 1d76a5f (`batch-20260614151600`)
+- **Current batch**: batch-20260614192500 — STORY `22-07`
+- **Completed feature rows**: 325 committed; 2 tests_passed; 1 skipped; 1 blocked; 169 pending in this run.
 - **Blocker**: None
 
 ## Latest verification
 
-- `cargo test -p fleet_health` — pass (26 tests)
-- `cargo test -p ground_station_ui` — pass (39 tests)
+- `cargo test -p orthomosaic dense_reconstruction` — pass (2 tests)
 - `cargo fmt --all --check` — pass
+- `cargo test -p orthomosaic` — pass (28 tests)
 
 ## Next action
 
-- Commit STORY `12-18` fleet operations dashboard feed.
+- Commit STORY `22-07` dense reconstruction and point cloud.

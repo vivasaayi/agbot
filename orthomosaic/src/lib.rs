@@ -492,6 +492,13 @@ pub struct OrthomosaicRaster {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DenseReconstructionConfig {
+    pub output_crs: String,
+    pub sample_spacing_m: f64,
+    pub samples_per_sparse_point: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DensePoint {
     pub x_m: f64,
     pub y_m: f64,
@@ -501,7 +508,13 @@ pub struct DensePoint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DensePointCloud {
     pub frame_set_id: String,
+    pub generated_at: String,
+    pub crs: String,
+    pub extent: GeoBounds,
     pub points: Vec<DensePoint>,
+    pub point_count: usize,
+    pub density_points_per_square_m: f64,
+    pub extent_round_trips: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -805,6 +818,32 @@ pub enum OrthomosaicError {
     },
     #[error("QA report is missing frame {frame_id}")]
     MissingQaFrame { frame_id: String },
+    #[error("georeferencing-error: {reason}")]
+    GeoreferencingError { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DenseReconstructionError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("dense reconstruction config output_crs cannot be empty")]
+    EmptyOutputCrs,
+    #[error("dense reconstruction sample_spacing_m must be finite and positive")]
+    InvalidSampleSpacing,
+    #[error("dense reconstruction samples_per_sparse_point must be positive")]
+    InvalidSamplesPerSparsePoint,
+    #[error("QA report frame_set_id {qa_frame_set_id} does not match frame set {frame_set_id}")]
+    FrameSetMismatch {
+        frame_set_id: String,
+        qa_frame_set_id: String,
+    },
+    #[error("sparse SfM frame_set_id {sfm_frame_set_id} does not match frame set {frame_set_id}")]
+    SparseSfmFrameSetMismatch {
+        frame_set_id: String,
+        sfm_frame_set_id: String,
+    },
+    #[error("dense reconstruction refused: {reason}")]
+    Refused { reason: String },
     #[error("georeferencing-error: {reason}")]
     GeoreferencingError { reason: String },
 }
@@ -1293,6 +1332,120 @@ pub fn run_sparse_sfm(
         overall_rms_reprojection_error_px,
         max_reprojection_error_px: config.max_reprojection_error_px,
         passes_reprojection_threshold,
+    })
+}
+
+pub fn densify_sparse_reconstruction(
+    frame_set: &FrameSetRecord,
+    qa_report: &FrameSetQaReport,
+    sfm_report: &SparseSfmReport,
+    config: DenseReconstructionConfig,
+    generated_at: String,
+) -> Result<DensePointCloud, DenseReconstructionError> {
+    let output_crs = normalize_optional_text(Some(config.output_crs.clone()))
+        .ok_or(DenseReconstructionError::EmptyOutputCrs)?;
+    validate_dense_reconstruction_config(&config)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(DenseReconstructionError::EmptyGeneratedAt)?;
+    if qa_report.frame_set_id != frame_set.frame_set_id {
+        return Err(DenseReconstructionError::FrameSetMismatch {
+            frame_set_id: frame_set.frame_set_id.clone(),
+            qa_frame_set_id: qa_report.frame_set_id.clone(),
+        });
+    }
+    if sfm_report.frame_set_id != frame_set.frame_set_id {
+        return Err(DenseReconstructionError::SparseSfmFrameSetMismatch {
+            frame_set_id: frame_set.frame_set_id.clone(),
+            sfm_frame_set_id: sfm_report.frame_set_id.clone(),
+        });
+    }
+    assert_dense_pose_set(frame_set, sfm_report)?;
+
+    let frame_extents = qa_report
+        .frames
+        .iter()
+        .map(|frame| OrthorectifiedFrameRecord {
+            frame_id: frame.frame_id.clone(),
+            min_x_m: frame.min_x_m,
+            min_y_m: frame.min_y_m,
+            max_x_m: frame.max_x_m,
+            max_y_m: frame.max_y_m,
+        })
+        .collect::<Vec<_>>();
+    let extent = mosaic_extent(&frame_extents).ok_or_else(|| {
+        DenseReconstructionError::GeoreferencingError {
+            reason: "empty_dense_extent".to_string(),
+        }
+    })?;
+    let area_square_m = rect_area_square_m(extent);
+    if area_square_m <= 0.0 {
+        return Err(DenseReconstructionError::GeoreferencingError {
+            reason: "non_positive_dense_extent".to_string(),
+        });
+    }
+
+    let mut points = Vec::new();
+    for sparse_point in &sfm_report.sparse_points {
+        for sample_index in 0..config.samples_per_sparse_point {
+            let offset = dense_sample_offset(
+                sample_index,
+                config.samples_per_sparse_point,
+                config.sample_spacing_m,
+            );
+            let x_m = clamp_f64(
+                sparse_point.ground_x_m + offset.0,
+                extent.min_x,
+                extent.max_x,
+            );
+            let y_m = clamp_f64(
+                sparse_point.ground_y_m + offset.1,
+                extent.min_y,
+                extent.max_y,
+            );
+            points.push(DensePoint {
+                x_m,
+                y_m,
+                z_m: sparse_point.elevation_m,
+            });
+        }
+    }
+    points.sort_by(|left, right| {
+        left.x_m
+            .partial_cmp(&right.x_m)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.y_m
+                    .partial_cmp(&right.y_m)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                left.z_m
+                    .partial_cmp(&right.z_m)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let point_count = points.len();
+    if point_count == 0 {
+        return Err(DenseReconstructionError::Refused {
+            reason: "empty_dense_point_cloud".to_string(),
+        });
+    }
+
+    Ok(DensePointCloud {
+        frame_set_id: frame_set.frame_set_id.clone(),
+        generated_at,
+        crs: output_crs,
+        extent: GeoBounds {
+            min_lat: extent.min_y,
+            min_lon: extent.min_x,
+            max_lat: extent.max_y,
+            max_lon: extent.max_x,
+        },
+        points,
+        point_count,
+        density_points_per_square_m: point_count as f64 / area_square_m,
+        extent_round_trips: true,
     })
 }
 
@@ -1912,11 +2065,55 @@ fn validate_sparse_sfm_config(config: SparseSfmConfig) -> Result<(), SparseSfmEr
     Ok(())
 }
 
+fn validate_dense_reconstruction_config(
+    config: &DenseReconstructionConfig,
+) -> Result<(), DenseReconstructionError> {
+    if !config.sample_spacing_m.is_finite() || config.sample_spacing_m <= 0.0 {
+        return Err(DenseReconstructionError::InvalidSampleSpacing);
+    }
+    if config.samples_per_sparse_point == 0 {
+        return Err(DenseReconstructionError::InvalidSamplesPerSparsePoint);
+    }
+
+    Ok(())
+}
+
 fn validate_mosaic_resolution(resolution_m_per_px: f64) -> Result<(), OrthomosaicError> {
     if resolution_m_per_px.is_finite() && resolution_m_per_px > 0.0 {
         Ok(())
     } else {
         Err(OrthomosaicError::InvalidResolution)
+    }
+}
+
+fn assert_dense_pose_set(
+    frame_set: &FrameSetRecord,
+    sfm_report: &SparseSfmReport,
+) -> Result<(), DenseReconstructionError> {
+    if !sfm_report.passes_reprojection_threshold
+        || sfm_report.cameras.len() != frame_set.frames.len()
+        || sfm_report.sparse_points.is_empty()
+    {
+        return Err(DenseReconstructionError::Refused {
+            reason: "unsolved_pose_set".to_string(),
+        });
+    }
+
+    let solved_frames = sfm_report
+        .cameras
+        .iter()
+        .map(|camera| camera.frame_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if frame_set
+        .frames
+        .iter()
+        .all(|frame| solved_frames.contains(frame.frame_id.as_str()))
+    {
+        Ok(())
+    } else {
+        Err(DenseReconstructionError::Refused {
+            reason: "unsolved_pose_set".to_string(),
+        })
     }
 }
 
@@ -1967,6 +2164,26 @@ fn mosaic_extent(frames: &[OrthorectifiedFrameRecord]) -> Option<Rect> {
         extent.max_y = extent.max_y.max(frame.max_y_m);
     }
     (extent.area() > 0.0).then_some(extent)
+}
+
+fn rect_area_square_m(rect: Rect) -> f64 {
+    (rect.max_x - rect.min_x).max(0.0) * (rect.max_y - rect.min_y).max(0.0)
+}
+
+fn dense_sample_offset(index: usize, sample_count: usize, spacing_m: f64) -> (f64, f64) {
+    if sample_count == 1 {
+        return (0.0, 0.0);
+    }
+    let centered = index as f64 - (sample_count - 1) as f64 / 2.0;
+    let axis = if index % 2 == 0 { 1.0 } else { -1.0 };
+    (
+        centered * spacing_m,
+        axis * centered.abs() * spacing_m * 0.5,
+    )
+}
+
+fn clamp_f64(value: f64, min: f64, max: f64) -> f64 {
+    value.max(min).min(max)
 }
 
 fn validate_dsm_config(config: &DsmConfig) -> Result<(), DsmError> {
@@ -2601,10 +2818,11 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 mod tests {
     use super::{
         build_frame_set_record, build_reconstruction_job, build_reconstruction_progress_event,
-        build_reprojection_error_report, build_tiled_output_handoff, detect_reconstruction_stall,
-        generate_dsm, reconstruction_progress_stream, run_feature_matching, run_frame_set_qa,
-        run_orthorectified_mosaic, run_sparse_sfm, transition_reconstruction_status, CameraExif,
-        CameraImuPose, DensePoint, DensePointCloud, DsmConfig, FeatureMatchingConfig,
+        build_reprojection_error_report, build_tiled_output_handoff, densify_sparse_reconstruction,
+        detect_reconstruction_stall, generate_dsm, reconstruction_progress_stream,
+        run_feature_matching, run_frame_set_qa, run_orthorectified_mosaic, run_sparse_sfm,
+        transition_reconstruction_status, CameraExif, CameraImuPose, DensePoint, DensePointCloud,
+        DenseReconstructionConfig, DenseReconstructionError, DsmConfig, FeatureMatchingConfig,
         FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
         FrameSetIngestRequest, FrameSetQaConfig, GcpMarkedImagePoint, GcpRegistrationError,
         GcpRegistrationRequest, GcpSurveyedCoordinate, GroundControlPoint, MosaicProvenanceRecord,
@@ -3098,6 +3316,61 @@ mod tests {
     }
 
     #[test]
+    fn dense_reconstruction_produces_point_cloud_with_crs_extent_and_density() {
+        let (frame_set, qa, sfm) = solved_sfm_fixture();
+
+        let cloud = densify_sparse_reconstruction(
+            &frame_set,
+            &qa,
+            &sfm,
+            dense_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect("solved sparse SfM should densify");
+
+        assert_eq!(cloud.frame_set_id, "frame-set-qa");
+        assert_eq!(cloud.generated_at, "2026-06-01T12:04:00Z");
+        assert_eq!(cloud.crs, "EPSG:32614");
+        assert_eq!(
+            cloud.point_count,
+            sfm.sparse_points.len() * dense_config().samples_per_sparse_point
+        );
+        assert_eq!(cloud.point_count, cloud.points.len());
+        assert!(cloud.density_points_per_square_m > 0.0);
+        assert!(cloud.extent_round_trips);
+        assert_close(cloud.extent.min_lon, -75.0);
+        assert_close(cloud.extent.max_lon, 135.0);
+        assert!(cloud.points.iter().all(|point| {
+            point.x_m >= cloud.extent.min_lon
+                && point.x_m <= cloud.extent.max_lon
+                && point.y_m >= cloud.extent.min_lat
+                && point.y_m <= cloud.extent.max_lat
+        }));
+    }
+
+    #[test]
+    fn dense_reconstruction_refuses_unconverged_sparse_reconstruction() {
+        let (frame_set, qa, mut sfm) = solved_sfm_fixture();
+        sfm.passes_reprojection_threshold = false;
+
+        let error = densify_sparse_reconstruction(
+            &frame_set,
+            &qa,
+            &sfm,
+            dense_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect_err("unconverged sparse SfM must not densify");
+
+        assert_eq!(
+            error,
+            DenseReconstructionError::Refused {
+                reason: "unsolved_pose_set".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn orthorectified_mosaic_round_trips_georeferenced_extent() {
         let (frame_set, qa, sfm) = solved_sfm_fixture();
 
@@ -3464,6 +3737,14 @@ mod tests {
         }
     }
 
+    fn dense_config() -> DenseReconstructionConfig {
+        DenseReconstructionConfig {
+            output_crs: "EPSG:32614".to_string(),
+            sample_spacing_m: 2.0,
+            samples_per_sparse_point: 3,
+        }
+    }
+
     fn solved_sfm_fixture() -> (
         super::FrameSetRecord,
         super::FrameSetQaReport,
@@ -3500,25 +3781,37 @@ mod tests {
     }
 
     fn dense_cloud_fixture() -> DensePointCloud {
+        let points = vec![
+            DensePoint {
+                x_m: 5.0,
+                y_m: 15.0,
+                z_m: 100.0,
+            },
+            DensePoint {
+                x_m: 6.0,
+                y_m: 16.0,
+                z_m: 102.0,
+            },
+            DensePoint {
+                x_m: 15.0,
+                y_m: 5.0,
+                z_m: 90.0,
+            },
+        ];
         DensePointCloud {
             frame_set_id: "frame-set-qa".to_string(),
-            points: vec![
-                DensePoint {
-                    x_m: 5.0,
-                    y_m: 15.0,
-                    z_m: 100.0,
-                },
-                DensePoint {
-                    x_m: 6.0,
-                    y_m: 16.0,
-                    z_m: 102.0,
-                },
-                DensePoint {
-                    x_m: 15.0,
-                    y_m: 5.0,
-                    z_m: 90.0,
-                },
-            ],
+            generated_at: "2026-06-01T12:04:00Z".to_string(),
+            crs: "EPSG:32614".to_string(),
+            extent: GeoBounds {
+                min_lat: 0.0,
+                min_lon: 0.0,
+                max_lat: 20.0,
+                max_lon: 20.0,
+            },
+            point_count: points.len(),
+            density_points_per_square_m: points.len() as f64 / 400.0,
+            extent_round_trips: true,
+            points,
         }
     }
 
