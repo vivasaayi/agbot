@@ -273,6 +273,73 @@ pub struct BatteryHealthTrendReport {
     pub evidence: Vec<HealthVerdictEvidence>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HealthDegradationDetectionConfig {
+    pub min_history_points: usize,
+    pub recent_window_points: usize,
+    pub min_adverse_slope_per_day: f64,
+    pub min_adverse_delta: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct HealthDegradationDetectionRequest {
+    #[serde(default)]
+    pub component_id: String,
+    #[serde(default)]
+    pub evaluated_at: String,
+    #[serde(default)]
+    pub method_version: String,
+    pub indicator: FleetHealthIndicator,
+    #[serde(default)]
+    pub samples: Vec<FleetHealthIndicatorSample>,
+    pub config: HealthDegradationDetectionConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthDegradationDetectionStatus {
+    Stable,
+    DegradationDetected,
+    InsufficientHistory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthDegradationReasonCode {
+    WithinTrendBand,
+    SustainedAdverseSlope,
+    DriftExceeded,
+    InsufficientHistory,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthDegradationEvent {
+    pub component_id: String,
+    pub indicator: FleetHealthIndicator,
+    pub reason_code: HealthDegradationReasonCode,
+    pub window_start: String,
+    pub window_end: String,
+    pub slope_per_day: f64,
+    pub delta: f64,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthDegradationDetectionReport {
+    pub component_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub indicator: FleetHealthIndicator,
+    pub status: HealthDegradationDetectionStatus,
+    pub reason_code: HealthDegradationReasonCode,
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+    pub slope_per_day: Option<f64>,
+    pub delta: Option<f64>,
+    pub evidence_refs: Vec<String>,
+    pub event: Option<HealthDegradationEvent>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentHealthVerdictStatus {
@@ -722,8 +789,12 @@ pub enum FleetHealthError {
     EmptyBatteryResistanceSamples,
     #[error("health threshold method_version cannot be empty")]
     EmptyHealthMethodVersion,
+    #[error("health degradation detection config must have at least two points and finite positive slope/delta thresholds")]
+    InvalidHealthDegradationConfig,
     #[error("telemetry value must be finite")]
     InvalidTelemetryValue,
+    #[error("telemetry sample timestamp is invalid: {value}")]
+    InvalidTelemetryTimestamp { value: String },
     #[error(
         "health threshold must be finite, non-negative, and ordered watch <= degraded <= critical"
     )]
@@ -1100,6 +1171,143 @@ pub fn evaluate_battery_health_trend(
         resistance_sample_count: resistance_samples.len(),
         status,
         evidence,
+    })
+}
+
+pub fn detect_health_indicator_degradation(
+    request: HealthDegradationDetectionRequest,
+) -> Result<HealthDegradationDetectionReport, FleetHealthError> {
+    let component_id =
+        normalize_required_text(request.component_id, FleetHealthError::EmptyComponentId)?;
+    let evaluated_at =
+        normalize_required_text(request.evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    let method_version = normalize_required_text(
+        request.method_version,
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    validate_degradation_config(request.config)?;
+
+    let mut normalized = Vec::new();
+    for sample in request.samples {
+        let sample_component_id =
+            normalize_required_text(sample.component_id, FleetHealthError::EmptyComponentId)?;
+        if sample_component_id != component_id {
+            return Err(FleetHealthError::IndicatorComponentMismatch {
+                component_id,
+                sample_component_id,
+            });
+        }
+        if sample.indicator != request.indicator {
+            continue;
+        }
+        validate_finite(sample.value)?;
+        let sample_ts =
+            normalize_required_text(sample.ts, FleetHealthError::EmptyTelemetryTimestamp)?;
+        let parsed_ts = parse_health_sample_timestamp(&sample_ts)?;
+        let source_ref =
+            normalize_required_text(sample.source_ref, FleetHealthError::EmptySourceRef)?;
+        normalized.push(ParsedHealthIndicatorSample {
+            sample: FleetHealthIndicatorSample {
+                component_id: sample_component_id,
+                indicator: sample.indicator,
+                value: sample.value,
+                ts: sample_ts,
+                source_ref,
+                created_at: sample.created_at,
+                freshness: sample.freshness,
+            },
+            parsed_ts,
+        });
+    }
+    normalized.sort_by(|left, right| {
+        left.parsed_ts
+            .cmp(&right.parsed_ts)
+            .then_with(|| left.sample.source_ref.cmp(&right.sample.source_ref))
+    });
+
+    if normalized.len() < request.config.min_history_points {
+        return Ok(HealthDegradationDetectionReport {
+            component_id,
+            evaluated_at,
+            method_version,
+            indicator: request.indicator,
+            status: HealthDegradationDetectionStatus::InsufficientHistory,
+            reason_code: HealthDegradationReasonCode::InsufficientHistory,
+            window_start: None,
+            window_end: None,
+            slope_per_day: None,
+            delta: None,
+            evidence_refs: vec![],
+            event: None,
+        });
+    }
+
+    let recent_start = normalized.len() - request.config.recent_window_points;
+    let window = &normalized[recent_start..];
+    let window_start = window
+        .first()
+        .expect("validated recent window has at least two samples")
+        .sample
+        .ts
+        .clone();
+    let window_end = window
+        .last()
+        .expect("validated recent window has at least two samples")
+        .sample
+        .ts
+        .clone();
+    let slope_per_day = linear_slope_per_day(window);
+    let delta = window
+        .last()
+        .expect("validated recent window has at least two samples")
+        .sample
+        .value
+        - window
+            .first()
+            .expect("validated recent window has at least two samples")
+            .sample
+            .value;
+    let evidence_refs = sorted_unique_evidence_refs(window);
+    let reason_code = if slope_per_day >= request.config.min_adverse_slope_per_day {
+        HealthDegradationReasonCode::SustainedAdverseSlope
+    } else if delta >= request.config.min_adverse_delta {
+        HealthDegradationReasonCode::DriftExceeded
+    } else {
+        HealthDegradationReasonCode::WithinTrendBand
+    };
+    let status = if reason_code == HealthDegradationReasonCode::WithinTrendBand {
+        HealthDegradationDetectionStatus::Stable
+    } else {
+        HealthDegradationDetectionStatus::DegradationDetected
+    };
+    let event = if status == HealthDegradationDetectionStatus::DegradationDetected {
+        Some(HealthDegradationEvent {
+            component_id: component_id.clone(),
+            indicator: request.indicator,
+            reason_code,
+            window_start: window_start.clone(),
+            window_end: window_end.clone(),
+            slope_per_day,
+            delta,
+            evidence_refs: evidence_refs.clone(),
+        })
+    } else {
+        None
+    };
+
+    Ok(HealthDegradationDetectionReport {
+        component_id,
+        evaluated_at,
+        method_version,
+        indicator: request.indicator,
+        status,
+        reason_code,
+        window_start: Some(window_start),
+        window_end: Some(window_end),
+        slope_per_day: Some(slope_per_day),
+        delta: Some(delta),
+        evidence_refs,
+        event,
     })
 }
 
@@ -1736,6 +1944,84 @@ fn has_later_gap(gaps: &[HealthTelemetryGap], component_id: &str, sample_ts: &st
         .any(|gap| gap.component_id == component_id && gap.started_at.as_str() > sample_ts)
 }
 
+struct ParsedHealthIndicatorSample {
+    sample: FleetHealthIndicatorSample,
+    parsed_ts: chrono::DateTime<chrono::Utc>,
+}
+
+fn validate_degradation_config(
+    config: HealthDegradationDetectionConfig,
+) -> Result<(), FleetHealthError> {
+    let valid_window = config.min_history_points >= 2
+        && config.recent_window_points >= 2
+        && config.recent_window_points <= config.min_history_points;
+    let valid_thresholds = config.min_adverse_slope_per_day.is_finite()
+        && config.min_adverse_delta.is_finite()
+        && config.min_adverse_slope_per_day > 0.0
+        && config.min_adverse_delta > 0.0;
+
+    if valid_window && valid_thresholds {
+        Ok(())
+    } else {
+        Err(FleetHealthError::InvalidHealthDegradationConfig)
+    }
+}
+
+fn parse_health_sample_timestamp(
+    value: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, FleetHealthError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+        .map_err(|_| FleetHealthError::InvalidTelemetryTimestamp {
+            value: value.to_string(),
+        })
+}
+
+fn linear_slope_per_day(window: &[ParsedHealthIndicatorSample]) -> f64 {
+    let first_ts = window
+        .first()
+        .expect("slope requires non-empty window")
+        .parsed_ts;
+    let xs = window.iter().map(|point| {
+        point
+            .parsed_ts
+            .signed_duration_since(first_ts)
+            .num_seconds() as f64
+            / 86_400.0
+    });
+    let ys = window.iter().map(|point| point.sample.value);
+    let count = window.len() as f64;
+    let mean_x = xs.clone().sum::<f64>() / count;
+    let mean_y = ys.clone().sum::<f64>() / count;
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    for point in window {
+        let x = point
+            .parsed_ts
+            .signed_duration_since(first_ts)
+            .num_seconds() as f64
+            / 86_400.0;
+        let y = point.sample.value;
+        numerator += (x - mean_x) * (y - mean_y);
+        denominator += (x - mean_x) * (x - mean_x);
+    }
+    if denominator == 0.0 {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+fn sorted_unique_evidence_refs(window: &[ParsedHealthIndicatorSample]) -> Vec<String> {
+    let mut refs = window
+        .iter()
+        .map(|point| point.sample.source_ref.clone())
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
 fn validate_finite(value: f64) -> Result<(), FleetHealthError> {
     if value.is_finite() {
         Ok(())
@@ -1951,19 +2237,20 @@ mod tests {
     use super::{
         accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
         build_component_record, build_fleet_operations_dashboard_feed, component_event,
-        derive_health_indicators, evaluate_battery_health_trend, evaluate_component_health_verdict,
-        evaluate_fleet_readiness, evaluate_ota_rollout, fleet_operations_source_current,
-        fleet_operations_source_unavailable, install_component, BatteryHealthTrendConfig,
-        ComponentHealthVerdict, ComponentHealthVerdictRequest, ComponentHealthVerdictStatus,
-        ComponentServiceLimit, DutyAccrualRequest, FleetComponentRecord, FleetComponentType,
-        FleetHealthError, FleetHealthIndicator, FleetOperationsFeedSource,
-        FleetOperationsFeedSourceStatus, FleetOperationsRolloutFeedState,
-        FleetReadinessBlockReason, FleetReadinessDecisionStatus, FleetReadinessRequest,
-        HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
-        HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
-        InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
-        OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
-        RegisterComponentRequest, RolloutControlAction, RolloutControlReason,
+        derive_health_indicators, detect_health_indicator_degradation,
+        evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
+        evaluate_ota_rollout, fleet_operations_source_current, fleet_operations_source_unavailable,
+        install_component, BatteryHealthTrendConfig, ComponentHealthVerdict,
+        ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
+        DutyAccrualRequest, FleetComponentRecord, FleetComponentType, FleetHealthError,
+        FleetHealthIndicator, FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
+        FleetOperationsRolloutFeedState, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
+        FleetReadinessRequest, HealthDegradationDetectionConfig, HealthDegradationDetectionRequest,
+        HealthDegradationDetectionStatus, HealthDegradationReasonCode, HealthIndicatorFreshness,
+        HealthIndicatorThreshold, HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence,
+        HealthVerdictReasonCode, InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport,
+        OtaRolloutDecisionReason, OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest,
+        OtaRolloutStage, RegisterComponentRequest, RolloutControlAction, RolloutControlReason,
         RolloutControlRequest, RolloutControlStatus, ServiceHistoryEntry,
         TelemetryHealthIndicatorRequest,
     };
@@ -2345,6 +2632,139 @@ mod tests {
             cycle_evidence.reason_code,
             HealthVerdictReasonCode::DegradedThresholdExceeded
         );
+    }
+
+    #[test]
+    fn degradation_detector_keeps_stable_series_without_event() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.21,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-15T00:00:00Z",
+                "telemetry:mission-003",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.22,
+                "2026-06-22T00:00:00Z",
+                "telemetry:mission-004",
+            ),
+        ]))
+        .expect("stable series should evaluate");
+
+        assert_eq!(report.status, HealthDegradationDetectionStatus::Stable);
+        assert_eq!(
+            report.reason_code,
+            HealthDegradationReasonCode::WithinTrendBand
+        );
+        assert!(report.event.is_none());
+        assert!(report.slope_per_day.expect("slope should be present") < 0.02);
+    }
+
+    #[test]
+    fn degradation_detector_raises_event_for_sustained_adverse_slope() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.35,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-15T00:00:00Z",
+                "telemetry:mission-003",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.65,
+                "2026-06-22T00:00:00Z",
+                "telemetry:mission-004",
+            ),
+        ]))
+        .expect("degrading series should evaluate");
+
+        assert_eq!(
+            report.status,
+            HealthDegradationDetectionStatus::DegradationDetected
+        );
+        assert_eq!(
+            report.reason_code,
+            HealthDegradationReasonCode::SustainedAdverseSlope
+        );
+        let event = report.event.expect("event should be raised");
+        assert_eq!(event.window_start, "2026-06-01T00:00:00Z");
+        assert_eq!(event.window_end, "2026-06-22T00:00:00Z");
+        assert!(event.slope_per_day >= 0.02);
+        assert_eq!(
+            event.evidence_refs,
+            vec![
+                "telemetry:mission-001".to_string(),
+                "telemetry:mission-002".to_string(),
+                "telemetry:mission-003".to_string(),
+                "telemetry:mission-004".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn degradation_detector_surfaces_insufficient_history_without_trend() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+        ]))
+        .expect("insufficient history should be reported, not errored");
+
+        assert_eq!(
+            report.status,
+            HealthDegradationDetectionStatus::InsufficientHistory
+        );
+        assert_eq!(
+            report.reason_code,
+            HealthDegradationReasonCode::InsufficientHistory
+        );
+        assert!(report.event.is_none());
+        assert!(report.slope_per_day.is_none());
+        assert!(report.evidence_refs.is_empty());
     }
 
     #[test]
@@ -2934,6 +3354,42 @@ mod tests {
             source_ref: "telemetry:session-001".to_string(),
             created_at: "2026-06-12T12:20:00Z".to_string(),
             freshness: HealthIndicatorFreshness::Fresh,
+        }
+    }
+
+    fn indicator_sample_at(
+        component_id: &str,
+        indicator: FleetHealthIndicator,
+        value: f64,
+        ts: &str,
+        source_ref: &str,
+    ) -> super::FleetHealthIndicatorSample {
+        super::FleetHealthIndicatorSample {
+            component_id: component_id.to_string(),
+            indicator,
+            value,
+            ts: ts.to_string(),
+            source_ref: source_ref.to_string(),
+            created_at: "2026-06-22T12:20:00Z".to_string(),
+            freshness: HealthIndicatorFreshness::Fresh,
+        }
+    }
+
+    fn degradation_request(
+        samples: Vec<super::FleetHealthIndicatorSample>,
+    ) -> HealthDegradationDetectionRequest {
+        HealthDegradationDetectionRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T12:30:00Z".to_string(),
+            method_version: "fleet-health-degradation-v1".to_string(),
+            indicator: FleetHealthIndicator::MotorVibration,
+            samples,
+            config: HealthDegradationDetectionConfig {
+                min_history_points: 4,
+                recent_window_points: 4,
+                min_adverse_slope_per_day: 0.02,
+                min_adverse_delta: 0.30,
+            },
         }
     }
 
