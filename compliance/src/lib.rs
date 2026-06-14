@@ -454,6 +454,70 @@ pub struct ComplianceEvidenceRecord {
     pub prior_decision_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceAlertSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+impl ComplianceAlertSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComplianceAlertSeverity::Info => "info",
+            ComplianceAlertSeverity::Warning => "warning",
+            ComplianceAlertSeverity::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceAlertEvent {
+    pub source_domain: String,
+    pub event_type: String,
+    pub subject_ref: String,
+    pub severity_hint: ComplianceAlertSeverity,
+    pub evidence_refs: Vec<String>,
+    pub occurred_at: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceRecordSourceStatus {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceRecordSourceHealth {
+    pub source_ref: String,
+    pub status: ComplianceRecordSourceStatus,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceDeadlineRecord {
+    pub deadline_ref: String,
+    pub due_at: String,
+    pub evidence_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceAlertScheduleRequest {
+    pub checked_at: String,
+    pub lead_hours: i64,
+    #[serde(default)]
+    pub certifications: Vec<OperatorCertificationRecord>,
+    #[serde(default)]
+    pub clearance_windows: Vec<ReiPhiWindow>,
+    #[serde(default)]
+    pub filing_deadlines: Vec<ComplianceDeadlineRecord>,
+    #[serde(default)]
+    pub source_health: Vec<ComplianceRecordSourceHealth>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CreateComplianceRecordRequest {
     #[serde(default)]
@@ -796,6 +860,22 @@ pub enum ComplianceEvidenceError {
     EmptyInputRef,
     #[error("compliance evidence is append-only; cannot overwrite version {version}")]
     AppendOnlyOverwriteRefused { version: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceAlertScheduleError {
+    #[error("checked_at cannot be empty")]
+    EmptyCheckedAt,
+    #[error("lead_hours must be zero or greater")]
+    InvalidLeadHours,
+    #[error("timestamp is not valid RFC3339")]
+    InvalidTimestamp,
+    #[error("source_ref cannot be empty")]
+    EmptySourceRef,
+    #[error("deadline_ref cannot be empty")]
+    EmptyDeadlineRef,
+    #[error("deadline evidence_ref cannot be empty")]
+    EmptyDeadlineEvidenceRef,
 }
 
 pub fn build_initial_compliance_record(
@@ -1407,6 +1487,107 @@ pub fn refuse_compliance_evidence_overwrite(
     ComplianceEvidenceError::AppendOnlyOverwriteRefused {
         version: existing.version,
     }
+}
+
+pub fn schedule_compliance_alerts(
+    request: ComplianceAlertScheduleRequest,
+) -> Result<Vec<ComplianceAlertEvent>, ComplianceAlertScheduleError> {
+    let checked_at_text = normalize_alert_text(
+        request.checked_at,
+        ComplianceAlertScheduleError::EmptyCheckedAt,
+    )?;
+    if request.lead_hours < 0 {
+        return Err(ComplianceAlertScheduleError::InvalidLeadHours);
+    }
+    let checked_at = parse_alert_time(&checked_at_text)?;
+    let lead_until = checked_at + Duration::hours(request.lead_hours);
+    let mut events = Vec::new();
+
+    for certification in request.certifications {
+        let expires_at = parse_alert_time(&certification.expires_at)?;
+        if expires_at >= checked_at && expires_at <= lead_until {
+            events.push(compliance_alert_event(
+                "compliance.cert_expiring",
+                format!("operator_certification:{}", certification.cert_id),
+                ComplianceAlertSeverity::Warning,
+                vec![format!("certification:{}", certification.cert_id)],
+                checked_at_text.clone(),
+            ));
+        }
+    }
+
+    for window in request.clearance_windows {
+        if let Some(rei_clear_at) = &window.rei_clear_at {
+            let clear_at = parse_alert_time(rei_clear_at)?;
+            if clear_at >= checked_at && clear_at <= lead_until {
+                events.push(compliance_alert_event(
+                    "compliance.rei_clearance_due",
+                    format!("application:{}", window.application_id),
+                    ComplianceAlertSeverity::Info,
+                    vec![window.source_application_ref.clone()],
+                    checked_at_text.clone(),
+                ));
+            }
+        }
+        if let Some(phi_clear_at) = &window.phi_clear_at {
+            let clear_at = parse_alert_time(phi_clear_at)?;
+            if clear_at >= checked_at && clear_at <= lead_until {
+                events.push(compliance_alert_event(
+                    "compliance.phi_clearance_due",
+                    format!("application:{}", window.application_id),
+                    ComplianceAlertSeverity::Info,
+                    vec![window.source_application_ref],
+                    checked_at_text.clone(),
+                ));
+            }
+        }
+    }
+
+    for deadline in request.filing_deadlines {
+        let deadline_ref = normalize_alert_text(
+            deadline.deadline_ref,
+            ComplianceAlertScheduleError::EmptyDeadlineRef,
+        )?;
+        let evidence_ref = normalize_alert_text(
+            deadline.evidence_ref,
+            ComplianceAlertScheduleError::EmptyDeadlineEvidenceRef,
+        )?;
+        let due_at = parse_alert_time(&deadline.due_at)?;
+        if due_at >= checked_at && due_at <= lead_until {
+            events.push(compliance_alert_event(
+                "compliance.deadline_due",
+                format!("deadline:{deadline_ref}"),
+                ComplianceAlertSeverity::Warning,
+                vec![evidence_ref],
+                checked_at_text.clone(),
+            ));
+        }
+    }
+
+    for source in request.source_health {
+        let source_ref = normalize_alert_text(
+            source.source_ref,
+            ComplianceAlertScheduleError::EmptySourceRef,
+        )?;
+        parse_alert_time(&source.checked_at)?;
+        if source.status == ComplianceRecordSourceStatus::Unavailable {
+            events.push(compliance_alert_event(
+                "compliance.source_unavailable",
+                format!("source:{source_ref}"),
+                ComplianceAlertSeverity::Critical,
+                vec![format!("source:{source_ref}")],
+                checked_at_text.clone(),
+            ));
+        }
+    }
+
+    events.sort_by(|left, right| {
+        left.event_type
+            .cmp(&right.event_type)
+            .then_with(|| left.subject_ref.cmp(&right.subject_ref))
+            .then_with(|| left.idempotency_key.cmp(&right.idempotency_key))
+    });
+    Ok(events)
 }
 
 pub fn airspace_zone_is_effective_at(zone: &AirspaceZoneRecord, at: Option<&str>) -> bool {
@@ -2104,6 +2285,51 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+fn compliance_alert_event(
+    event_type: &str,
+    subject_ref: String,
+    severity_hint: ComplianceAlertSeverity,
+    mut evidence_refs: Vec<String>,
+    occurred_at: String,
+) -> ComplianceAlertEvent {
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let idempotency_key = format!(
+        "compliance:{}:{}:{}:{}",
+        event_type,
+        subject_ref,
+        occurred_at,
+        evidence_refs.join("|")
+    );
+    ComplianceAlertEvent {
+        source_domain: "compliance".to_string(),
+        event_type: event_type.to_string(),
+        subject_ref,
+        severity_hint,
+        evidence_refs,
+        occurred_at,
+        idempotency_key,
+    }
+}
+
+fn parse_alert_time(value: &str) -> Result<DateTime<Utc>, ComplianceAlertScheduleError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| ComplianceAlertScheduleError::InvalidTimestamp)
+}
+
+fn normalize_alert_text(
+    value: String,
+    error: ComplianceAlertScheduleError,
+) -> Result<String, ComplianceAlertScheduleError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn point_in_polygon(point: AirspaceCoordinate, polygon: &[AirspaceCoordinate]) -> bool {
     let mut inside = false;
     for edge in polygon.windows(2) {
@@ -2191,15 +2417,17 @@ mod tests {
         AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
         AppendComplianceRecordVersionRequest, ApplicationGeometry, AuthorizationBlockReason,
         AuthorizationDecisionStatus, CertificationBlockReason, CertificationStatus,
-        ChemicalApplicationRecord, ComplianceAuditReportError, ComplianceAuditReportRequest,
-        ComplianceCheckKind, ComplianceEvidenceError, ComplianceEvidenceInput,
+        ChemicalApplicationRecord, ComplianceAlertScheduleRequest, ComplianceAlertSeverity,
+        ComplianceAuditReportError, ComplianceAuditReportRequest, ComplianceCheckKind,
+        ComplianceDeadlineRecord, ComplianceEvidenceError, ComplianceEvidenceInput,
         ComplianceEvidenceRequest, ComplianceRecordError, ComplianceRecordPayload,
-        ComplianceRecordType, CreateComplianceRecordRequest, EntryHarvestAction,
-        EntryHarvestBlockReason, EntryHarvestDecisionStatus, IntervalWindowStatus,
-        OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
-        PreflightAuthorizationRequest, ProductLabelInterval, RemoteIdFlightLogRecord,
-        RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType, SprayBufferBlockReason,
-        SprayBufferComplianceError, SprayBufferDecisionStatus, TelemetryGapRecord,
+        ComplianceRecordSourceHealth, ComplianceRecordSourceStatus, ComplianceRecordType,
+        CreateComplianceRecordRequest, EntryHarvestAction, EntryHarvestBlockReason,
+        EntryHarvestDecisionStatus, IntervalWindowStatus, OperatorCertificationRegistrationRequest,
+        PreflightAirspaceStatus, PreflightAuthorizationRequest, ProductLabelInterval,
+        RemoteIdFlightLogRecord, RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType,
+        SprayBufferBlockReason, SprayBufferComplianceError, SprayBufferDecisionStatus,
+        TelemetryGapRecord,
     };
 
     #[test]
@@ -2823,6 +3051,83 @@ mod tests {
             error,
             ComplianceEvidenceError::AppendOnlyOverwriteRefused { version: 1 }
         );
+    }
+
+    #[test]
+    fn compliance_alert_scheduler_emits_cert_expiry_with_evidence_ref() {
+        let events = super::schedule_compliance_alerts(ComplianceAlertScheduleRequest {
+            checked_at: "2026-06-14T12:00:00Z".to_string(),
+            lead_hours: 48,
+            certifications: vec![operator_cert(
+                "cert-107-valid",
+                "operator-17",
+                "part-107",
+                "2026-01-01T00:00:00Z",
+                "2026-06-16T11:00:00Z",
+            )],
+            clearance_windows: Vec::new(),
+            filing_deadlines: Vec::new(),
+            source_health: Vec::new(),
+        })
+        .expect("scheduler should run");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_domain, "compliance");
+        assert_eq!(events[0].event_type, "compliance.cert_expiring");
+        assert_eq!(
+            events[0].subject_ref,
+            "operator_certification:cert-107-valid"
+        );
+        assert_eq!(events[0].severity_hint, ComplianceAlertSeverity::Warning);
+        assert_eq!(
+            events[0].evidence_refs,
+            vec!["certification:cert-107-valid"]
+        );
+    }
+
+    #[test]
+    fn compliance_alert_scheduler_surfaces_unavailable_record_source() {
+        let events = super::schedule_compliance_alerts(ComplianceAlertScheduleRequest {
+            checked_at: "2026-06-14T12:00:00Z".to_string(),
+            lead_hours: 24,
+            certifications: Vec::new(),
+            clearance_windows: Vec::new(),
+            filing_deadlines: Vec::new(),
+            source_health: vec![ComplianceRecordSourceHealth {
+                source_ref: "state-pesticide-registry".to_string(),
+                status: ComplianceRecordSourceStatus::Unavailable,
+                checked_at: "2026-06-14T12:00:00Z".to_string(),
+            }],
+        })
+        .expect("scheduler should run");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "compliance.source_unavailable");
+        assert_eq!(events[0].subject_ref, "source:state-pesticide-registry");
+        assert_eq!(events[0].severity_hint, ComplianceAlertSeverity::Critical);
+        assert_eq!(
+            events[0].evidence_refs,
+            vec!["source:state-pesticide-registry"]
+        );
+    }
+
+    #[test]
+    fn compliance_alert_scheduler_ignores_deadlines_outside_lead_window() {
+        let events = super::schedule_compliance_alerts(ComplianceAlertScheduleRequest {
+            checked_at: "2026-06-14T12:00:00Z".to_string(),
+            lead_hours: 24,
+            certifications: Vec::new(),
+            clearance_windows: Vec::new(),
+            filing_deadlines: vec![ComplianceDeadlineRecord {
+                deadline_ref: "state-filing-1".to_string(),
+                due_at: "2026-06-17T12:00:00Z".to_string(),
+                evidence_ref: "compliance:record:chem-app-1".to_string(),
+            }],
+            source_health: Vec::new(),
+        })
+        .expect("scheduler should run");
+
+        assert!(events.is_empty());
     }
 
     #[test]
