@@ -459,6 +459,243 @@ async fn creating_field_and_linking_scene_exposes_field_scoped_gis_data() -> Res
 }
 
 #[tokio::test]
+async fn scene_refresh_advisory_appears_for_fresher_lower_cloud_scene() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_advisory_field(&ctx, "advisory-field", "2026").await?;
+
+    let current_scene_dir = ctx.data_root.join("scenes").join("current-scene");
+    insert_advisory_scene(
+        &ctx,
+        "current-scene",
+        Some("advisory-field"),
+        Some("2026"),
+        "2026-05-01T00:00:00Z",
+        Some(62.0),
+        &current_scene_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+
+    let candidate_scene_dir = ctx.data_root.join("scenes").join("candidate-scene");
+    insert_advisory_scene(
+        &ctx,
+        "candidate-scene",
+        None,
+        Some("2026"),
+        "2026-06-01T00:00:00Z",
+        Some(18.0),
+        &candidate_scene_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/advisory-field/scene-refresh-advisories")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let advisories: serde_json::Value = serde_json::from_slice(&body)?;
+
+    assert_eq!(
+        advisories
+            .get("advisory_enabled")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "response: {advisories}"
+    );
+    assert!(advisories
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .is_none());
+    let items = advisories
+        .get("advisories")
+        .and_then(|value| value.as_array())
+        .expect("advisories should be an array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]
+            .get("current_scene_id")
+            .and_then(|value| value.as_str()),
+        Some("current-scene")
+    );
+    assert_eq!(
+        items[0]
+            .get("candidate_scene_id")
+            .and_then(|value| value.as_str()),
+        Some("candidate-scene")
+    );
+    assert_eq!(
+        items[0]
+            .get("uncertainty")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scene_refresh_advisory_is_disabled_when_current_metadata_integrity_fails() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_advisory_field(&ctx, "advisory-guard-field", "2026").await?;
+
+    let current_scene_dir = ctx.data_root.join("scenes").join("guard-current");
+    insert_advisory_scene(
+        &ctx,
+        "guard-current",
+        Some("advisory-guard-field"),
+        Some("2026"),
+        "2026-05-01T00:00:00Z",
+        Some(65.0),
+        &current_scene_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+    upsert_scene_spatial_ref(
+        &ctx,
+        "guard-current",
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -1.0,
+                "min_lat": 2.0,
+                "max_lon": 3.0,
+                "max_lat": 4.0
+            },
+            "geo_transform": [-1.0, 0.05, 0.0, 4.0, 0.0, -0.05],
+            "resolution": {
+                "x": 0.05,
+                "y": 0.05
+            }
+        }),
+    )
+    .await?;
+
+    let candidate_scene_dir = ctx.data_root.join("scenes").join("guard-candidate");
+    insert_advisory_scene(
+        &ctx,
+        "guard-candidate",
+        None,
+        Some("2026"),
+        "2026-06-01T00:00:00Z",
+        Some(20.0),
+        &candidate_scene_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/advisory-guard-field/scene-refresh-advisories")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let advisories: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        advisories
+            .get("advisory_enabled")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert!(advisories
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.contains("advisory-gated: metadata-integrity")));
+    assert!(advisories
+        .get("advisories")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| items.is_empty()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scene_refresh_advisory_returns_empty_when_no_fresher_scene_exists() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_advisory_field(&ctx, "advisory-empty-field", "2026").await?;
+
+    let current_scene_dir = ctx.data_root.join("scenes").join("current-old");
+    insert_advisory_scene(
+        &ctx,
+        "current-old",
+        Some("advisory-empty-field"),
+        Some("2026"),
+        "2026-07-01T00:00:00Z",
+        Some(20.0),
+        &current_scene_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+
+    let older_scene_dir = ctx.data_root.join("scenes").join("older-scene");
+    insert_advisory_scene(
+        &ctx,
+        "older-scene",
+        None,
+        Some("2026"),
+        "2026-06-01T00:00:00Z",
+        Some(10.0),
+        &older_scene_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/advisory-empty-field/scene-refresh-advisories")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let advisories: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        advisories
+            .get("advisory_enabled")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "response: {advisories}"
+    );
+    assert!(advisories
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .is_none());
+    assert!(advisories
+        .get("advisories")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| items.is_empty()));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn linking_scene_to_field_rejects_non_overlapping_extent() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -11549,6 +11786,89 @@ fn orthomosaic_tile_spatial_ref_json() -> serde_json::Value {
             "y": 0.05
         }
     })
+}
+
+fn advisory_spatial_ref() -> serde_json::Value {
+    json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.8,
+            "min_lat": 41.0,
+            "max_lon": -96.2,
+            "max_lat": 41.6
+        },
+        "geo_transform": [-96.8, 0.3, 0.0, 41.6, 0.0, -0.3],
+        "resolution": {
+            "x": 0.3,
+            "y": 0.3
+        }
+    })
+}
+
+async fn insert_advisory_field(ctx: &TestContext, field_id: &str, season: &str) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO fields (field_id, owner, name, season, boundary_json, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(field_id)
+    .bind("org-alpha")
+    .bind(format!("{field_id} name"))
+    .bind(season)
+    .bind(
+        json!({
+            "crs": "EPSG:4326",
+            "coordinates": [
+                { "longitude": -96.8, "latitude": 41.0 },
+                { "longitude": -96.2, "latitude": 41.0 },
+                { "longitude": -96.2, "latitude": 41.6 },
+                { "longitude": -96.8, "latitude": 41.6 },
+                { "longitude": -96.8, "latitude": 41.0 }
+            ]
+        })
+        .to_string(),
+    )
+    .bind("2026-01-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_advisory_scene(
+    ctx: &TestContext,
+    scene_id: &str,
+    field_id: Option<&str>,
+    season_id: Option<&str>,
+    acquired_at: &str,
+    cloud_cover: Option<f64>,
+    scene_dir: &Path,
+    spatial_ref: serde_json::Value,
+) -> Result<()> {
+    std::fs::create_dir_all(scene_dir)?;
+
+    insert_scene_with_spatial_ref(ctx, scene_id, scene_dir, spatial_ref).await?;
+    let linked_at = field_id.map(|_| "2026-01-01T00:00:00Z");
+
+    sqlx::query(
+        r#"
+        UPDATE scenes
+        SET acquired_at = ?1, cloud_cover = ?2, field_id = ?3, season_id = ?4, linked_at = ?5
+        WHERE scene_id = ?6
+        "#,
+    )
+    .bind(acquired_at)
+    .bind(cloud_cover)
+    .bind(field_id)
+    .bind(season_id)
+    .bind(linked_at)
+    .bind(scene_id)
+    .execute(&ctx.pool)
+    .await?;
+
+    Ok(())
 }
 
 async fn setup_golden_acceptance_fixture(

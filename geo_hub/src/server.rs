@@ -350,6 +350,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/fields/:field_id/scenes",
             get(routes::list_field_scenes),
         )
+        .route(
+            "/api/fields/:field_id/scene-refresh-advisories",
+            get(routes::list_field_scene_refresh_advisories),
+        )
         .route("/api/scenes", get(routes::list_scenes))
         .route("/api/layers", get(routes::list_layers))
         .route(

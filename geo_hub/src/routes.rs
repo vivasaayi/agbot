@@ -150,6 +150,25 @@ pub struct SceneSummary {
     pub linked_at: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SceneRefreshAdvisory {
+    pub current_scene_id: String,
+    pub candidate_scene_id: String,
+    pub current_acquired_at: String,
+    pub candidate_acquired_at: String,
+    pub current_cloud_cover: Option<f64>,
+    pub candidate_cloud_cover: Option<f64>,
+    pub uncertainty: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SceneRefreshAdvisoriesResponse {
+    pub advisory_enabled: bool,
+    pub reason: Option<String>,
+    pub advisories: Vec<SceneRefreshAdvisory>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SceneDetail {
     pub scene_id: String,
@@ -6008,6 +6027,119 @@ pub async fn list_field_scenes(
         .collect();
 
     Ok(Json(scenes))
+}
+
+pub async fn list_field_scene_refresh_advisories(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SceneRefreshAdvisoriesResponse>> {
+    if load_field(&state, &field_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let current_scene_row = sqlx::query(
+        "SELECT scene_id, owner, sensor, acquired_at, data_path, metadata_json, cloud_cover, field_id, season_id, linked_at FROM scenes WHERE field_id = ?1 ORDER BY acquired_at DESC LIMIT 1",
+    )
+    .bind(&field_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    let Some(current_scene_row) = current_scene_row else {
+        return Ok(Json(SceneRefreshAdvisoriesResponse {
+            advisory_enabled: false,
+            reason: Some("no-linked-scene".to_string()),
+            advisories: Vec::new(),
+        }));
+    };
+
+    let current_scene_id: String = current_scene_row.get("scene_id");
+    let current_acquired_at: String = current_scene_row.get("acquired_at");
+    let current_cloud_cover: Option<f64> = current_scene_row.get("cloud_cover");
+    let current_season_id: Option<String> = current_scene_row.get("season_id");
+    let current_data_path: String = current_scene_row.get("data_path");
+    let current_scene_dir = FsPath::new(&current_data_path);
+    let current_metadata = load_scene_metadata(Some(&current_scene_row), current_scene_dir).await?;
+    let current_asserted_spatial_ref =
+        ingest::load_scene_spatial_ref(&state.pool, &current_scene_id).await?;
+    if let Err(error) = assert_scene_spatial_ref_integrity(
+        current_metadata.as_ref(),
+        current_asserted_spatial_ref.as_ref(),
+    ) {
+        return Ok(Json(SceneRefreshAdvisoriesResponse {
+            advisory_enabled: false,
+            reason: Some(format!("advisory-gated: {error}")),
+            advisories: Vec::new(),
+        }));
+    }
+
+    let current_acquired_at_ts = parse_acquired_at(&current_acquired_at)
+        .ok_or_else(|| AppError::BadRequest("current scene acquired_at is invalid".to_string()))?;
+
+    let candidate_rows = sqlx::query(
+        "SELECT scene_id, owner, sensor, acquired_at, data_path, metadata_json, cloud_cover, season_id FROM scenes WHERE scene_id != ?1 AND acquired_at > ?2 AND (?3 IS NULL OR season_id = ?3) ORDER BY acquired_at DESC",
+    )
+    .bind(&current_scene_id)
+    .bind(&current_acquired_at)
+    .bind(current_season_id.clone())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut advisories = Vec::new();
+    for row in candidate_rows {
+        let candidate_scene_id: String = row.get("scene_id");
+        let candidate_acquired_at: String = row.get("acquired_at");
+        let candidate_cloud_cover: Option<f64> = row.get("cloud_cover");
+        let candidate_data_path: String = row.get("data_path");
+        let candidate_scene_dir = FsPath::new(&candidate_data_path);
+        let candidate_metadata = load_scene_metadata(Some(&row), candidate_scene_dir).await?;
+        let candidate_asserted_spatial_ref =
+            ingest::load_scene_spatial_ref(&state.pool, &candidate_scene_id).await?;
+
+        let candidate_acquired_at_ts = match parse_acquired_at(&candidate_acquired_at) {
+            Some(ts) if ts > current_acquired_at_ts => ts,
+            _ => continue,
+        };
+
+        let (is_lower_cloud, cloud_is_uncertain) =
+            is_lower_cloud(current_cloud_cover, candidate_cloud_cover);
+        if !is_lower_cloud {
+            continue;
+        }
+
+        let mut uncertainty = cloud_is_uncertain;
+        if uncertainty == false
+            && !is_scene_spatially_consistent(
+                current_asserted_spatial_ref.as_ref(),
+                current_metadata.as_ref(),
+                candidate_asserted_spatial_ref.as_ref(),
+                candidate_metadata.as_ref(),
+            )
+        {
+            uncertainty = true;
+        }
+
+        advisories.push(SceneRefreshAdvisory {
+            current_scene_id: current_scene_id.clone(),
+            candidate_scene_id,
+            current_acquired_at: current_acquired_at_ts.to_rfc3339(),
+            candidate_acquired_at: candidate_acquired_at_ts.to_rfc3339(),
+            current_cloud_cover,
+            candidate_cloud_cover,
+            uncertainty,
+            reason: if uncertainty {
+                "temporal/fidelity confidence reduced".to_string()
+            } else {
+                "fresher-lower-cloud".to_string()
+            },
+        });
+    }
+
+    Ok(Json(SceneRefreshAdvisoriesResponse {
+        advisory_enabled: true,
+        reason: None,
+        advisories,
+    }))
 }
 
 pub async fn link_scene_to_field(
@@ -12321,6 +12453,54 @@ fn parse_share_timestamp(value: &str) -> AppResult<chrono::DateTime<chrono::Utc>
         .map_err(|_| AppError::BadRequest(format!("invalid report share expiry {}", value)))
 }
 
+fn parse_acquired_at(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(ts.with_timezone(&chrono::Utc));
+    }
+
+    let date_only = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0)?;
+    let naive = chrono::NaiveDateTime::new(date_only, midnight);
+    Some(chrono::DateTime::from_naive_utc_and_offset(
+        naive,
+        chrono::Utc,
+    ))
+}
+
+fn is_lower_cloud(
+    current_cloud_cover: Option<f64>,
+    candidate_cloud_cover: Option<f64>,
+) -> (bool, bool) {
+    match (current_cloud_cover, candidate_cloud_cover) {
+        (Some(current), Some(candidate)) => (candidate < current, false),
+        (None, Some(_)) => (true, true),
+        _ => (false, false),
+    }
+}
+
+fn is_scene_spatially_consistent(
+    current_asserted_spatial_ref: Option<&RasterSpatialRef>,
+    _current_metadata: Option<&MultispectralImage>,
+    candidate_asserted_spatial_ref: Option<&RasterSpatialRef>,
+    candidate_metadata: Option<&MultispectralImage>,
+) -> bool {
+    let Some(current_asserted_spatial_ref) = current_asserted_spatial_ref else {
+        return false;
+    };
+    let Some(candidate_asserted_spatial_ref) = candidate_asserted_spatial_ref else {
+        return false;
+    };
+
+    if assert_scene_spatial_ref_integrity(candidate_metadata, Some(candidate_asserted_spatial_ref))
+        .is_err()
+    {
+        return false;
+    }
+
+    assert_spatial_refs_equivalent(current_asserted_spatial_ref, candidate_asserted_spatial_ref)
+        .is_ok()
+}
+
 fn format_share_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -12860,6 +13040,15 @@ mod tests {
             },
             &field_bounds,
         ));
+    }
+
+    #[test]
+    fn is_lower_cloud_flags_fresher_and_reduces_uncertainty_only_when_comparable() {
+        assert_eq!(is_lower_cloud(Some(50.0), Some(25.0)), (true, false));
+        assert_eq!(is_lower_cloud(Some(25.0), Some(50.0)), (false, false));
+        assert_eq!(is_lower_cloud(None, Some(32.0)), (true, true));
+        assert_eq!(is_lower_cloud(Some(25.0), None), (false, false));
+        assert_eq!(is_lower_cloud(None, None), (false, false));
     }
 
     #[test]
