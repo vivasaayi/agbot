@@ -491,6 +491,57 @@ pub struct OrthomosaicRaster {
     pub extent_round_trips: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SeamlineExposureConfig {
+    pub target_luminance: Option<f64>,
+    pub max_gain: f64,
+    pub outlier_ratio_threshold: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameExposureObservation {
+    pub frame_id: String,
+    pub mean_luminance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeamlineRecord {
+    pub frame_a_id: String,
+    pub frame_b_id: String,
+    pub start_x_m: f64,
+    pub start_y_m: f64,
+    pub end_x_m: f64,
+    pub end_y_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExposureCorrectionRecord {
+    pub frame_id: String,
+    pub observed_mean_luminance: f64,
+    pub target_luminance: f64,
+    pub gain: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExposureOutlierFrame {
+    pub frame_id: String,
+    pub observed_mean_luminance: f64,
+    pub median_luminance: f64,
+    pub ratio_to_median: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeamlineExposureBalanceReport {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub spatial_ref: RasterSpatialRef,
+    pub seamlines: Vec<SeamlineRecord>,
+    pub exposure_corrections: Vec<ExposureCorrectionRecord>,
+    pub flagged_frames: Vec<ExposureOutlierFrame>,
+    pub geometry_preserved: bool,
+    pub passes: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DenseReconstructionConfig {
     pub output_crs: String,
@@ -846,6 +897,24 @@ pub enum DenseReconstructionError {
     Refused { reason: String },
     #[error("georeferencing-error: {reason}")]
     GeoreferencingError { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SeamlineExposureError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("orthomosaic has no contributing frames")]
+    EmptyContributingFrames,
+    #[error("exposure observations must include at least one frame")]
+    EmptyExposureObservations,
+    #[error("seamline/exposure config field {field} must be finite and positive")]
+    InvalidConfig { field: &'static str },
+    #[error("frame {frame_id} is missing an exposure observation")]
+    MissingExposureObservation { frame_id: String },
+    #[error("frame {frame_id} has non-finite or non-positive exposure")]
+    InvalidExposureObservation { frame_id: String },
+    #[error("orthomosaic spatial_ref is invalid: {reason}")]
+    InvalidSpatialRef { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1552,6 +1621,93 @@ pub fn run_orthorectified_mosaic(
     })
 }
 
+pub fn balance_mosaic_seamlines_and_exposure(
+    mosaic: &OrthomosaicRaster,
+    observations: Vec<FrameExposureObservation>,
+    config: SeamlineExposureConfig,
+    generated_at: String,
+) -> Result<SeamlineExposureBalanceReport, SeamlineExposureError> {
+    validate_seamline_exposure_config(&config)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(SeamlineExposureError::EmptyGeneratedAt)?;
+    if mosaic.contributing_frames.is_empty() {
+        return Err(SeamlineExposureError::EmptyContributingFrames);
+    }
+    if observations.is_empty() {
+        return Err(SeamlineExposureError::EmptyExposureObservations);
+    }
+    let spatial_ref =
+        assert_raster_spatial_ref(Some(&mosaic.spatial_ref), mosaic.width_px, mosaic.height_px)
+            .map_err(|error| SeamlineExposureError::InvalidSpatialRef {
+                reason: error.to_string(),
+            })?;
+
+    let exposure_by_frame = normalize_exposure_observations(observations)?;
+    for frame in &mosaic.contributing_frames {
+        if !exposure_by_frame.contains_key(frame.frame_id.as_str()) {
+            return Err(SeamlineExposureError::MissingExposureObservation {
+                frame_id: frame.frame_id.clone(),
+            });
+        }
+    }
+
+    let mut luminance_values = mosaic
+        .contributing_frames
+        .iter()
+        .map(|frame| exposure_by_frame[frame.frame_id.as_str()])
+        .collect::<Vec<_>>();
+    luminance_values
+        .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let median_luminance = median_sorted(&luminance_values);
+    let target_luminance = config.target_luminance.unwrap_or(median_luminance);
+    let flagged_frames = mosaic
+        .contributing_frames
+        .iter()
+        .filter_map(|frame| {
+            let observed = exposure_by_frame[frame.frame_id.as_str()];
+            let ratio_to_median = exposure_ratio(observed, median_luminance);
+            (ratio_to_median > config.outlier_ratio_threshold).then(|| ExposureOutlierFrame {
+                frame_id: frame.frame_id.clone(),
+                observed_mean_luminance: observed,
+                median_luminance,
+                ratio_to_median,
+            })
+        })
+        .collect::<Vec<_>>();
+    let flagged_frame_ids = flagged_frames
+        .iter()
+        .map(|frame| frame.frame_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let mut exposure_corrections = mosaic
+        .contributing_frames
+        .iter()
+        .filter(|frame| !flagged_frame_ids.contains(frame.frame_id.as_str()))
+        .map(|frame| {
+            let observed = exposure_by_frame[frame.frame_id.as_str()];
+            ExposureCorrectionRecord {
+                frame_id: frame.frame_id.clone(),
+                observed_mean_luminance: observed,
+                target_luminance,
+                gain: (target_luminance / observed).min(config.max_gain),
+            }
+        })
+        .collect::<Vec<_>>();
+    exposure_corrections.sort_by(|left, right| left.frame_id.cmp(&right.frame_id));
+    let passes = flagged_frame_ids.is_empty();
+
+    Ok(SeamlineExposureBalanceReport {
+        frame_set_id: mosaic.frame_set_id.clone(),
+        generated_at,
+        spatial_ref,
+        seamlines: compute_seamlines(&mosaic.contributing_frames),
+        exposure_corrections,
+        flagged_frames,
+        geometry_preserved: true,
+        passes,
+    })
+}
+
 pub fn generate_dsm(
     cloud: &DensePointCloud,
     config: DsmConfig,
@@ -2086,6 +2242,29 @@ fn validate_mosaic_resolution(resolution_m_per_px: f64) -> Result<(), Orthomosai
     }
 }
 
+fn validate_seamline_exposure_config(
+    config: &SeamlineExposureConfig,
+) -> Result<(), SeamlineExposureError> {
+    if config
+        .target_luminance
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        return Err(SeamlineExposureError::InvalidConfig {
+            field: "target_luminance",
+        });
+    }
+    if !config.max_gain.is_finite() || config.max_gain <= 0.0 {
+        return Err(SeamlineExposureError::InvalidConfig { field: "max_gain" });
+    }
+    if !config.outlier_ratio_threshold.is_finite() || config.outlier_ratio_threshold <= 1.0 {
+        return Err(SeamlineExposureError::InvalidConfig {
+            field: "outlier_ratio_threshold",
+        });
+    }
+
+    Ok(())
+}
+
 fn assert_dense_pose_set(
     frame_set: &FrameSetRecord,
     sfm_report: &SparseSfmReport,
@@ -2164,6 +2343,65 @@ fn mosaic_extent(frames: &[OrthorectifiedFrameRecord]) -> Option<Rect> {
         extent.max_y = extent.max_y.max(frame.max_y_m);
     }
     (extent.area() > 0.0).then_some(extent)
+}
+
+fn compute_seamlines(frames: &[OrthorectifiedFrameRecord]) -> Vec<SeamlineRecord> {
+    let mut seamlines = Vec::new();
+    for (left_index, left) in frames.iter().enumerate() {
+        for right in frames.iter().skip(left_index + 1) {
+            let overlap_min_x = left.min_x_m.max(right.min_x_m);
+            let overlap_max_x = left.max_x_m.min(right.max_x_m);
+            let overlap_min_y = left.min_y_m.max(right.min_y_m);
+            let overlap_max_y = left.max_y_m.min(right.max_y_m);
+            if overlap_min_x < overlap_max_x && overlap_min_y < overlap_max_y {
+                let seam_x = (overlap_min_x + overlap_max_x) / 2.0;
+                seamlines.push(SeamlineRecord {
+                    frame_a_id: left.frame_id.clone(),
+                    frame_b_id: right.frame_id.clone(),
+                    start_x_m: seam_x,
+                    start_y_m: overlap_min_y,
+                    end_x_m: seam_x,
+                    end_y_m: overlap_max_y,
+                });
+            }
+        }
+    }
+    seamlines.sort_by(|left, right| {
+        left.frame_a_id
+            .cmp(&right.frame_a_id)
+            .then(left.frame_b_id.cmp(&right.frame_b_id))
+    });
+    seamlines
+}
+
+fn normalize_exposure_observations(
+    observations: Vec<FrameExposureObservation>,
+) -> Result<BTreeMap<String, f64>, SeamlineExposureError> {
+    let mut exposure_by_frame = BTreeMap::new();
+    for observation in observations {
+        let frame_id = normalize_optional_text(Some(observation.frame_id)).ok_or_else(|| {
+            SeamlineExposureError::MissingExposureObservation {
+                frame_id: String::new(),
+            }
+        })?;
+        if !observation.mean_luminance.is_finite() || observation.mean_luminance <= 0.0 {
+            return Err(SeamlineExposureError::InvalidExposureObservation { frame_id });
+        }
+        exposure_by_frame.insert(frame_id, observation.mean_luminance);
+    }
+    Ok(exposure_by_frame)
+}
+
+fn median_sorted(values: &[f64]) -> f64 {
+    values[(values.len() - 1) / 2]
+}
+
+fn exposure_ratio(observed: f64, median: f64) -> f64 {
+    if observed >= median {
+        observed / median
+    } else {
+        median / observed
+    }
 }
 
 fn rect_area_square_m(rect: Rect) -> f64 {
@@ -2817,20 +3055,22 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_frame_set_record, build_reconstruction_job, build_reconstruction_progress_event,
-        build_reprojection_error_report, build_tiled_output_handoff, densify_sparse_reconstruction,
-        detect_reconstruction_stall, generate_dsm, reconstruction_progress_stream,
-        run_feature_matching, run_frame_set_qa, run_orthorectified_mosaic, run_sparse_sfm,
-        transition_reconstruction_status, CameraExif, CameraImuPose, DensePoint, DensePointCloud,
-        DenseReconstructionConfig, DenseReconstructionError, DsmConfig, FeatureMatchingConfig,
-        FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
+        balance_mosaic_seamlines_and_exposure, build_frame_set_record, build_reconstruction_job,
+        build_reconstruction_progress_event, build_reprojection_error_report,
+        build_tiled_output_handoff, densify_sparse_reconstruction, detect_reconstruction_stall,
+        generate_dsm, reconstruction_progress_stream, run_feature_matching, run_frame_set_qa,
+        run_orthorectified_mosaic, run_sparse_sfm, transition_reconstruction_status, CameraExif,
+        CameraImuPose, DensePoint, DensePointCloud, DenseReconstructionConfig,
+        DenseReconstructionError, DsmConfig, FeatureMatchingConfig, FieldCoverageExtent,
+        FrameExposureObservation, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
         FrameSetIngestRequest, FrameSetQaConfig, GcpMarkedImagePoint, GcpRegistrationError,
         GcpRegistrationRequest, GcpSurveyedCoordinate, GroundControlPoint, MosaicProvenanceRecord,
         MosaicPublishGateRequest, MosaicPublishStatus, MosaicQualityVerdict, OrthomosaicConfig,
         OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest,
         ReconstructionProgressStage, ReconstructionStallReasonCode, ReconstructionStatus,
-        ReprojectionReportConfig, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
-        TiledOutputHandoffError, TiledOutputHandoffRequest, TiledRasterProductRequest,
+        ReprojectionReportConfig, SeamlineExposureConfig, SparseSfmConfig, SparseSfmError,
+        SparseSfmFailureReason, TiledOutputHandoffError, TiledOutputHandoffRequest,
+        TiledRasterProductRequest,
     };
     use shared::schemas::{
         assert_raster_spatial_ref, GeoBounds, GpsCoords, RasterResolution, RasterSpatialRef,
@@ -3419,6 +3659,67 @@ mod tests {
     }
 
     #[test]
+    fn seamline_exposure_balancing_preserves_georeferencing() {
+        let (frame_set, qa, sfm) = solved_sfm_fixture();
+        let mosaic = run_orthorectified_mosaic(
+            &frame_set,
+            &qa,
+            &sfm,
+            mosaic_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect("mosaic should build");
+
+        let report = balance_mosaic_seamlines_and_exposure(
+            &mosaic,
+            vec![exposure("frame-001", 100.0), exposure("frame-002", 120.0)],
+            seamline_config(),
+            "2026-06-01T12:04:30Z".to_string(),
+        )
+        .expect("balancing should report seamlines and gains");
+
+        assert_eq!(report.frame_set_id, "frame-set-qa");
+        assert_eq!(report.spatial_ref, mosaic.spatial_ref);
+        assert!(report.geometry_preserved);
+        assert!(report.passes);
+        assert_eq!(report.flagged_frames, vec![]);
+        assert_eq!(report.seamlines.len(), 1);
+        assert_eq!(report.seamlines[0].frame_a_id, "frame-001");
+        assert_eq!(report.seamlines[0].frame_b_id, "frame-002");
+        assert_close(report.exposure_corrections[0].gain, 1.1);
+        assert_close(report.exposure_corrections[1].gain, 110.0 / 120.0);
+    }
+
+    #[test]
+    fn seamline_exposure_balancing_flags_extreme_exposure_frame() {
+        let (frame_set, qa, sfm) = solved_sfm_fixture();
+        let mosaic = run_orthorectified_mosaic(
+            &frame_set,
+            &qa,
+            &sfm,
+            mosaic_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect("mosaic should build");
+
+        let report = balance_mosaic_seamlines_and_exposure(
+            &mosaic,
+            vec![exposure("frame-001", 100.0), exposure("frame-002", 500.0)],
+            seamline_config(),
+            "2026-06-01T12:04:30Z".to_string(),
+        )
+        .expect("extreme exposure should be flagged in the report");
+
+        assert!(!report.passes);
+        assert_eq!(report.flagged_frames.len(), 1);
+        assert_eq!(report.flagged_frames[0].frame_id, "frame-002");
+        assert!(report.flagged_frames[0].ratio_to_median > 2.0);
+        assert_eq!(report.exposure_corrections.len(), 1);
+        assert_eq!(report.exposure_corrections[0].frame_id, "frame-001");
+        assert_eq!(report.spatial_ref, mosaic.spatial_ref);
+    }
+
+    #[test]
     fn dsm_generation_rasterizes_dense_points_with_geospatial_round_trip() {
         let dsm = generate_dsm(
             &dense_cloud_fixture(),
@@ -3734,6 +4035,21 @@ mod tests {
         OrthomosaicConfig {
             output_crs: "EPSG:32614".to_string(),
             resolution_m_per_px: 5.0,
+        }
+    }
+
+    fn seamline_config() -> SeamlineExposureConfig {
+        SeamlineExposureConfig {
+            target_luminance: Some(110.0),
+            max_gain: 3.0,
+            outlier_ratio_threshold: 2.0,
+        }
+    }
+
+    fn exposure(frame_id: &str, mean_luminance: f64) -> FrameExposureObservation {
+        FrameExposureObservation {
+            frame_id: frame_id.to_string(),
+            mean_luminance,
         }
     }
 
