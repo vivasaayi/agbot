@@ -57,6 +57,43 @@ pub struct MetricDefinition {
     pub expected_cadence: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeriesFreshnessState {
+    Fresh,
+    Stale,
+    NoBaseline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeriesCadenceHealthConfig {
+    pub expected_cadence_days: u32,
+    pub stale_after_days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeriesGap {
+    pub from_t: String,
+    pub to_t: String,
+    pub observed_gap_days: u32,
+    pub expected_cadence_days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeriesCadenceHealth {
+    pub entity_ref: String,
+    pub metric: String,
+    pub evaluated_at: String,
+    pub last_seen: Option<String>,
+    pub age_days: Option<u32>,
+    pub expected_cadence_days: u32,
+    pub stale_after_days: u32,
+    pub state: SeriesFreshnessState,
+    pub point_count: usize,
+    pub gap_count: usize,
+    pub gaps: Vec<SeriesGap>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RasterAlignmentConfig {
     pub target_resolution_x: f64,
@@ -508,6 +545,8 @@ pub enum TimeSeriesError {
     EmptyUnit,
     #[error("expected cadence cannot be empty for {metric}")]
     EmptyExpectedCadence { metric: String },
+    #[error("cadence health config requires expected_cadence_days and stale_after_days greater than zero")]
+    InvalidCadenceHealthConfig,
     #[error("timestamp cannot be empty")]
     EmptyTimestamp,
     #[error("source_ref cannot be empty")]
@@ -1134,6 +1173,86 @@ pub fn derive_ranked_change_events(
             .then_with(|| left.zone_ref.cmp(&right.zone_ref))
     });
     Ok(events)
+}
+
+pub fn evaluate_series_cadence_health(
+    points: &[SeriesPoint],
+    entity_ref: String,
+    metric: String,
+    evaluated_at: String,
+    config: SeriesCadenceHealthConfig,
+) -> Result<SeriesCadenceHealth, TimeSeriesError> {
+    let entity_ref = normalize_required_text(entity_ref, TimeSeriesError::EmptyEntityRef)?;
+    let metric = normalize_required_text(metric, TimeSeriesError::EmptyMetric)?;
+    let evaluated_at = normalize_required_text(evaluated_at, TimeSeriesError::EmptyTimestamp)?;
+    if config.expected_cadence_days == 0 || config.stale_after_days == 0 {
+        return Err(TimeSeriesError::InvalidCadenceHealthConfig);
+    }
+    let evaluated_day = timestamp_day_index(&evaluated_at)?;
+    let mut scoped = points
+        .iter()
+        .filter(|point| point.entity_ref == entity_ref && point.metric == metric)
+        .cloned()
+        .collect::<Vec<_>>();
+    scoped.sort_by(|left, right| left.t.cmp(&right.t));
+
+    if scoped.is_empty() {
+        return Ok(SeriesCadenceHealth {
+            entity_ref,
+            metric,
+            evaluated_at,
+            last_seen: None,
+            age_days: None,
+            expected_cadence_days: config.expected_cadence_days,
+            stale_after_days: config.stale_after_days,
+            state: SeriesFreshnessState::NoBaseline,
+            point_count: 0,
+            gap_count: 0,
+            gaps: Vec::new(),
+        });
+    }
+
+    let mut gaps = Vec::new();
+    for pair in scoped.windows(2) {
+        let from = &pair[0];
+        let to = &pair[1];
+        let observed_gap_days =
+            (timestamp_day_index(&to.t)? - timestamp_day_index(&from.t)?).max(0) as u32;
+        if observed_gap_days > config.expected_cadence_days {
+            gaps.push(SeriesGap {
+                from_t: from.t.clone(),
+                to_t: to.t.clone(),
+                observed_gap_days,
+                expected_cadence_days: config.expected_cadence_days,
+            });
+        }
+    }
+
+    let last_seen = scoped
+        .last()
+        .expect("non-empty scoped series checked above")
+        .t
+        .clone();
+    let age_days = (evaluated_day - timestamp_day_index(&last_seen)?).max(0) as u32;
+    let state = if age_days > config.stale_after_days {
+        SeriesFreshnessState::Stale
+    } else {
+        SeriesFreshnessState::Fresh
+    };
+
+    Ok(SeriesCadenceHealth {
+        entity_ref,
+        metric,
+        evaluated_at,
+        last_seen: Some(last_seen),
+        age_days: Some(age_days),
+        expected_cadence_days: config.expected_cadence_days,
+        stale_after_days: config.stale_after_days,
+        state,
+        point_count: scoped.len(),
+        gap_count: gaps.len(),
+        gaps,
+    })
 }
 
 pub fn export_series_csv(points: &[SeriesPoint]) -> Result<SeriesCsvExport, TimeSeriesError> {
@@ -2385,16 +2504,17 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::{
         align_raster_pair, build_compare_view_feed, compare_view_refusal_from_guard,
-        compute_aligned_raster_change, derive_ranked_change_events, export_change_mask_geotiff,
-        export_change_zones_geojson, export_series_csv, guard_coregisterable_pair,
-        AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason,
-        ChangeEvent, ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection,
-        ChangeEventReasonCode, ChangeZoneExportFeature, ChangeZonePolygon, GeoExtent,
-        MetricDefinition, MetricKind, RasterAlignmentConfig, RasterAlignmentEvidence,
+        compute_aligned_raster_change, derive_ranked_change_events, evaluate_series_cadence_health,
+        export_change_mask_geotiff, export_change_zones_geojson, export_series_csv,
+        guard_coregisterable_pair, AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof,
+        AlignmentRefusalReason, ChangeEvent, ChangeEventConfig, ChangeEventDerivationInput,
+        ChangeEventDirection, ChangeEventReasonCode, ChangeZoneExportFeature, ChangeZonePolygon,
+        GeoExtent, MetricDefinition, MetricKind, RasterAlignmentConfig, RasterAlignmentEvidence,
         RasterChangeConfig, RasterChangeResult, RasterResolution, RasterSeriesValue,
-        RollingBaselineConfig, SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesPoint,
-        SeriesProductIngest, SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine,
-        TimeSeriesError, TimeSeriesStore, TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
+        RollingBaselineConfig, SeasonalComparisonConfig, SeasonalComparisonTarget,
+        SeriesCadenceHealthConfig, SeriesFreshnessState, SeriesPoint, SeriesProductIngest,
+        SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
+        TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
     };
 
     #[test]
@@ -2500,6 +2620,65 @@ mod tests {
                 t: "2026-06-12T10:00:00Z".to_string()
             }
         );
+    }
+
+    #[test]
+    fn series_cadence_health_reports_freshness_and_gaps() {
+        let points = vec![
+            scalar_point("field:alpha", "ndvi_mean", "2026-06-01T10:00:00Z", 0.62),
+            scalar_point("field:alpha", "ndvi_mean", "2026-06-03T10:00:00Z", 0.58),
+            scalar_point("field:alpha", "ndvi_mean", "2026-06-04T10:00:00Z", 0.57),
+        ];
+
+        let health = evaluate_series_cadence_health(
+            &points,
+            "field:alpha".to_string(),
+            "ndvi_mean".to_string(),
+            "2026-06-05T10:00:00Z".to_string(),
+            cadence_config(),
+        )
+        .expect("cadence health should evaluate");
+
+        assert_eq!(health.state, SeriesFreshnessState::Fresh);
+        assert_eq!(health.last_seen.as_deref(), Some("2026-06-04T10:00:00Z"));
+        assert_eq!(health.age_days, Some(1));
+        assert_eq!(health.point_count, 3);
+        assert_eq!(health.gap_count, 1);
+        assert_eq!(health.gaps[0].from_t, "2026-06-01T10:00:00Z");
+        assert_eq!(health.gaps[0].to_t, "2026-06-03T10:00:00Z");
+        assert_eq!(health.gaps[0].observed_gap_days, 2);
+    }
+
+    #[test]
+    fn series_cadence_health_marks_stale_and_no_baseline() {
+        let points = vec![scalar_point(
+            "field:alpha",
+            "ndvi_mean",
+            "2026-06-01T10:00:00Z",
+            0.62,
+        )];
+        let stale = evaluate_series_cadence_health(
+            &points,
+            "field:alpha".to_string(),
+            "ndvi_mean".to_string(),
+            "2026-06-05T10:00:00Z".to_string(),
+            cadence_config(),
+        )
+        .expect("stale cadence health should evaluate");
+        assert_eq!(stale.state, SeriesFreshnessState::Stale);
+        assert_eq!(stale.age_days, Some(4));
+
+        let empty = evaluate_series_cadence_health(
+            &points,
+            "field:alpha".to_string(),
+            "soil_moisture".to_string(),
+            "2026-06-05T10:00:00Z".to_string(),
+            cadence_config(),
+        )
+        .expect("empty cadence health should evaluate");
+        assert_eq!(empty.state, SeriesFreshnessState::NoBaseline);
+        assert_eq!(empty.last_seen, None);
+        assert_eq!(empty.point_count, 0);
     }
 
     #[test]
@@ -3614,6 +3793,13 @@ mod tests {
 
     fn scalar_point(entity_ref: &str, metric: &str, t: &str, value: f64) -> SeriesPoint {
         scalar_point_with_unit(entity_ref, metric, "index", t, value)
+    }
+
+    fn cadence_config() -> SeriesCadenceHealthConfig {
+        SeriesCadenceHealthConfig {
+            expected_cadence_days: 1,
+            stale_after_days: 2,
+        }
     }
 
     fn scalar_point_with_unit(
