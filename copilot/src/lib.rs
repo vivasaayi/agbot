@@ -217,6 +217,50 @@ pub struct GroundedCopilotTurn {
     pub answer: Option<GroundedCopilotAnswer>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotTurnAuditRequest {
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub field_id: String,
+    pub question: String,
+    pub turn: GroundedCopilotTurn,
+    pub interface_version: String,
+    pub ts: String,
+    pub ledger_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotTurnAuditRecord {
+    pub audit_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub field_id: String,
+    pub question: String,
+    pub refused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<CopilotRefusalReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    pub cited_evidence_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    pub interface_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    pub ts: String,
+    pub ledger_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotAuditedTurn {
+    pub turn: GroundedCopilotTurn,
+    pub audit: CopilotTurnAuditRecord,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceFreshnessStatus {
@@ -438,8 +482,34 @@ pub enum CopilotTurnError {
     Grounding(#[from] CopilotGroundingError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotAuditError {
+    #[error("conversation_id cannot be empty")]
+    EmptyConversationId,
+    #[error("turn_id cannot be empty")]
+    EmptyTurnId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("question cannot be empty")]
+    EmptyQuestion,
+    #[error("interface_version cannot be empty")]
+    EmptyInterfaceVersion,
+    #[error("audit timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("ledger_ref cannot be empty")]
+    EmptyLedgerRef,
+    #[error("completed answer must cite at least one evidence id before audit")]
+    AnswerWithoutCitations,
+    #[error("copilot audit write failed: {reason}")]
+    AuditWriteFailed { reason: String },
+}
+
 pub trait CopilotModel {
     fn answer(&self, request: CopilotAnswerRequest) -> Result<CopilotAnswer, CopilotModelError>;
+}
+
+pub trait CopilotAuditSink {
+    fn write_turn_audit(&mut self, record: &CopilotTurnAuditRecord) -> Result<(), String>;
 }
 
 impl DeterministicCopilotModel {
@@ -541,6 +611,72 @@ pub fn answer_grounded_question(
         refused: false,
         refusal: None,
         answer: Some(grounded),
+    })
+}
+
+pub fn finalize_audited_turn(
+    sink: &mut impl CopilotAuditSink,
+    request: CopilotTurnAuditRequest,
+) -> Result<CopilotAuditedTurn, CopilotAuditError> {
+    let conversation_id = normalize_audit_text(
+        request.conversation_id,
+        CopilotAuditError::EmptyConversationId,
+    )?;
+    let turn_id = normalize_audit_text(request.turn_id, CopilotAuditError::EmptyTurnId)?;
+    let field_id = normalize_audit_text(request.field_id, CopilotAuditError::EmptyFieldId)?;
+    let question = normalize_audit_text(request.question, CopilotAuditError::EmptyQuestion)?;
+    let interface_version = normalize_audit_text(
+        request.interface_version,
+        CopilotAuditError::EmptyInterfaceVersion,
+    )?;
+    let ts = normalize_audit_text(request.ts, CopilotAuditError::EmptyTimestamp)?;
+    let ledger_ref = normalize_audit_text(request.ledger_ref, CopilotAuditError::EmptyLedgerRef)?;
+
+    let (answer, cited_evidence_ids, confidence, model_provider, model_id, model_version) =
+        if request.turn.refused {
+            (None, Vec::new(), None, None, None, None)
+        } else {
+            let answer = request
+                .turn
+                .answer
+                .as_ref()
+                .ok_or(CopilotAuditError::AnswerWithoutCitations)?;
+            let cited_evidence_ids = normalize_audit_citations(answer.cited_evidence_ids.clone())?;
+            (
+                Some(answer.text.clone()),
+                cited_evidence_ids,
+                Some(answer.confidence),
+                Some(answer.model_provider.clone()),
+                Some(answer.model_id.clone()),
+                Some(answer.model_version.clone()),
+            )
+        };
+    let refusal_reason = request.turn.refusal.as_ref().map(|refusal| refusal.reason);
+
+    let audit = CopilotTurnAuditRecord {
+        audit_id: format!("copilot-audit:{conversation_id}:{turn_id}:{ts}"),
+        conversation_id,
+        turn_id,
+        field_id,
+        question,
+        refused: request.turn.refused,
+        refusal_reason,
+        answer,
+        cited_evidence_ids,
+        confidence,
+        interface_version,
+        model_provider,
+        model_id,
+        model_version,
+        ts,
+        ledger_ref,
+    };
+    sink.write_turn_audit(&audit)
+        .map_err(|reason| CopilotAuditError::AuditWriteFailed { reason })?;
+
+    Ok(CopilotAuditedTurn {
+        turn: request.turn,
+        audit,
     })
 }
 
@@ -1095,6 +1231,27 @@ fn normalize_grounding_text(
     normalize_text(value).ok_or(error)
 }
 
+fn normalize_audit_text(
+    value: String,
+    error: CopilotAuditError,
+) -> Result<String, CopilotAuditError> {
+    normalize_text(value).ok_or(error)
+}
+
+fn normalize_audit_citations(values: Vec<String>) -> Result<Vec<String>, CopilotAuditError> {
+    let cited_evidence_ids = values
+        .into_iter()
+        .filter_map(normalize_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if cited_evidence_ids.is_empty() {
+        Err(CopilotAuditError::AnswerWithoutCitations)
+    } else {
+        Ok(cited_evidence_ids)
+    }
+}
+
 fn normalize_draft_text(
     value: String,
     error: CopilotRecommendationDraftError,
@@ -1174,16 +1331,17 @@ mod tests {
     use super::{
         annotate_answer_uncertainty, answer_grounded_question, approve_recommendation_draft,
         build_evidence_retrieval_index, create_copilot_turn, draft_recommendation_from_answer,
-        post_check_grounded_answer, start_copilot_conversation, CopilotAnswer, CopilotAnswerClaim,
-        CopilotAnswerRequest, CopilotConfidenceLevel, CopilotConversationError,
+        finalize_audited_turn, post_check_grounded_answer, start_copilot_conversation,
+        CopilotAnswer, CopilotAnswerClaim, CopilotAnswerRequest, CopilotAuditError,
+        CopilotAuditSink, CopilotConfidenceLevel, CopilotConversationError,
         CopilotConversationStartRequest, CopilotGroundingError, CopilotIndexError, CopilotModel,
         CopilotModelError, CopilotRecommendationApproval, CopilotRecommendationDraftError,
         CopilotRecommendationDraftRequest, CopilotRecommendationDraftStatus, CopilotRefusalReason,
-        CopilotTurnCreateRequest, CopilotTurnRole, DeterministicAnswerFixture,
-        DeterministicCopilotModel, EvidenceCandidate, EvidenceFreshnessRecord,
-        EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind, EvidenceRejectionReason,
-        GroundedCopilotAnswer, GroundedCopilotQuestionRequest, LedgerEvidenceResolver,
-        UnavailableCopilotModel, UncertaintyReasonCode,
+        CopilotTurnAuditRecord, CopilotTurnAuditRequest, CopilotTurnCreateRequest, CopilotTurnRole,
+        DeterministicAnswerFixture, DeterministicCopilotModel, EvidenceCandidate,
+        EvidenceFreshnessRecord, EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind,
+        EvidenceRejectionReason, GroundedCopilotAnswer, GroundedCopilotQuestionRequest,
+        LedgerEvidenceResolver, UnavailableCopilotModel, UncertaintyReasonCode,
     };
     use shared::schemas::{RecommendationLifecycleRegistry, RecommendationPriority};
 
@@ -1635,6 +1793,89 @@ mod tests {
     }
 
     #[test]
+    fn completed_turn_writes_cited_audit_record_before_finalizing() {
+        let turn = answer_grounded_question(
+            &RecordingCopilotModel::new(fixture_answer()),
+            grounded_question_request(
+                "why is the northeast zone stressed?",
+                vec![retrieved_evidence("evidence-ndvi-001")],
+            ),
+        )
+        .expect("grounded answer should return");
+        let mut sink = RecordingAuditSink::default();
+
+        let finalized = finalize_audited_turn(&mut sink, audit_request(turn))
+            .expect("audit write should finalize turn");
+
+        assert!(!finalized.turn.refused);
+        assert_eq!(sink.records.len(), 1);
+        assert_eq!(
+            finalized.audit.question,
+            "why is the northeast zone stressed?"
+        );
+        assert_eq!(
+            finalized.audit.answer.as_deref(),
+            Some("The northeast zone is stressed.")
+        );
+        assert_eq!(
+            finalized.audit.cited_evidence_ids,
+            vec!["evidence-ndvi-001"]
+        );
+        assert_eq!(finalized.audit.confidence, Some(0.82));
+        assert_eq!(finalized.audit.interface_version, "copilot-interface-v1");
+        assert_eq!(finalized.audit.ledger_ref, "ledger:30:copilot:turn-001");
+        assert_eq!(
+            finalized.audit.model_provider.as_deref(),
+            Some("test-double")
+        );
+    }
+
+    #[test]
+    fn audit_write_failure_blocks_final_answer() {
+        let turn = answer_grounded_question(
+            &RecordingCopilotModel::new(fixture_answer()),
+            grounded_question_request(
+                "why is the northeast zone stressed?",
+                vec![retrieved_evidence("evidence-ndvi-001")],
+            ),
+        )
+        .expect("grounded answer should return");
+        let mut sink = FailingAuditSink;
+
+        let error = finalize_audited_turn(&mut sink, audit_request(turn))
+            .expect_err("failed audit must block finalization");
+
+        assert_eq!(
+            error,
+            CopilotAuditError::AuditWriteFailed {
+                reason: "ledger unavailable".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn refused_turn_is_audited_without_model_citations() {
+        let turn = answer_grounded_question(
+            &RecordingCopilotModel::new(fixture_answer()),
+            grounded_question_request("why is the northeast zone stressed?", vec![]),
+        )
+        .expect("no-evidence turn should refuse");
+        let mut sink = RecordingAuditSink::default();
+
+        let finalized = finalize_audited_turn(&mut sink, audit_request(turn))
+            .expect("refusal audit should finalize");
+
+        assert!(finalized.turn.refused);
+        assert_eq!(
+            finalized.audit.refusal_reason,
+            Some(CopilotRefusalReason::NoEvidence)
+        );
+        assert!(finalized.audit.answer.is_none());
+        assert!(finalized.audit.cited_evidence_ids.is_empty());
+        assert_eq!(sink.records.len(), 1);
+    }
+
+    #[test]
     fn uncertainty_marker_is_high_for_fully_cited_fresh_answer() {
         let annotated = annotate_answer_uncertainty(
             grounded_answer_with_claims(vec![CopilotAnswerClaim {
@@ -1849,6 +2090,39 @@ mod tests {
             model_provider: "test-double".to_string(),
             model_id: "fixture-rag".to_string(),
             model_version: "2026-06-12".to_string(),
+        }
+    }
+
+    fn audit_request(turn: super::GroundedCopilotTurn) -> CopilotTurnAuditRequest {
+        CopilotTurnAuditRequest {
+            conversation_id: "conversation-001".to_string(),
+            turn_id: "turn-001".to_string(),
+            field_id: "field-001".to_string(),
+            question: "why is the northeast zone stressed?".to_string(),
+            turn,
+            interface_version: "copilot-interface-v1".to_string(),
+            ts: "2026-06-13T16:02:00Z".to_string(),
+            ledger_ref: "ledger:30:copilot:turn-001".to_string(),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAuditSink {
+        records: Vec<CopilotTurnAuditRecord>,
+    }
+
+    impl CopilotAuditSink for RecordingAuditSink {
+        fn write_turn_audit(&mut self, record: &CopilotTurnAuditRecord) -> Result<(), String> {
+            self.records.push(record.clone());
+            Ok(())
+        }
+    }
+
+    struct FailingAuditSink;
+
+    impl CopilotAuditSink for FailingAuditSink {
+        fn write_turn_audit(&mut self, _record: &CopilotTurnAuditRecord) -> Result<(), String> {
+            Err("ledger unavailable".to_string())
         }
     }
 
