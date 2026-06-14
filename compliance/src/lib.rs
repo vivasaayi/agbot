@@ -200,6 +200,46 @@ pub struct ApplicationGeometry {
     pub coordinates: Vec<AirspaceCoordinate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitiveFeatureType {
+    Water,
+    Dwelling,
+    OrganicField,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensitiveBufferFeature {
+    pub feature_ref: String,
+    pub feature_type: SensitiveFeatureType,
+    pub geometry: ApplicationGeometry,
+    pub required_buffer_m: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SprayBufferDecisionStatus {
+    Compliant,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SprayBufferBlockReason {
+    BufferBreach,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SprayBufferComplianceDecision {
+    pub application_id: String,
+    pub checked_at: String,
+    pub status: SprayBufferDecisionStatus,
+    pub reason_code: Option<SprayBufferBlockReason>,
+    pub feature_ref: Option<String>,
+    pub required_buffer_m: Option<f64>,
+    pub actual_separation_m: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct OperatorCertificationRegistrationRequest {
     #[serde(default)]
@@ -660,6 +700,26 @@ pub enum ReiPhiError {
     InvalidReiHours,
     #[error("PHI days must be zero or greater")]
     InvalidPhiDays,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SprayBufferComplianceError {
+    #[error("checked_at cannot be empty")]
+    EmptyCheckedAt,
+    #[error("sensitive feature_ref cannot be empty")]
+    EmptyFeatureRef,
+    #[error("required buffer must be finite and zero or greater")]
+    InvalidRequiredBuffer,
+    #[error("application geometry is invalid: {source}")]
+    InvalidApplicationGeometry {
+        #[source]
+        source: ComplianceRecordError,
+    },
+    #[error("sensitive feature geometry is invalid: {source}")]
+    InvalidFeatureGeometry {
+        #[source]
+        source: ComplianceRecordError,
+    },
 }
 
 pub fn build_initial_compliance_record(
@@ -1183,6 +1243,71 @@ pub fn airspace_zone_intersects_polygon(
     Ok(false)
 }
 
+pub fn evaluate_spray_buffer_compliance(
+    application: &ChemicalApplicationRecord,
+    sensitive_features: Vec<SensitiveBufferFeature>,
+    checked_at: String,
+) -> Result<SprayBufferComplianceDecision, SprayBufferComplianceError> {
+    let checked_at =
+        normalize_spray_buffer_text(checked_at, SprayBufferComplianceError::EmptyCheckedAt)?;
+    let application_geometry = validate_application_geometry(application.geometry.clone())
+        .map_err(|source| SprayBufferComplianceError::InvalidApplicationGeometry { source })?;
+    let application_extent = extent_from_coordinates(&application_geometry.coordinates);
+
+    let mut closest_breach = None::<(String, f64, f64)>;
+    for feature in sensitive_features {
+        let feature_ref = normalize_spray_buffer_text(
+            feature.feature_ref,
+            SprayBufferComplianceError::EmptyFeatureRef,
+        )?;
+        if !feature.required_buffer_m.is_finite() || feature.required_buffer_m < 0.0 {
+            return Err(SprayBufferComplianceError::InvalidRequiredBuffer);
+        }
+        let feature_geometry = validate_application_geometry(feature.geometry)
+            .map_err(|source| SprayBufferComplianceError::InvalidFeatureGeometry { source })?;
+        let feature_extent = extent_from_coordinates(&feature_geometry.coordinates);
+        let intersects = polygons_intersect(
+            &application_geometry.coordinates,
+            &feature_geometry.coordinates,
+        );
+        let separation_m = if intersects {
+            0.0
+        } else {
+            extent_separation_m(application_extent, feature_extent)
+        };
+        if separation_m < feature.required_buffer_m {
+            match &closest_breach {
+                Some((_, _, current_actual)) if *current_actual <= separation_m => {}
+                _ => {
+                    closest_breach = Some((feature_ref, feature.required_buffer_m, separation_m));
+                }
+            }
+        }
+    }
+
+    if let Some((feature_ref, required_buffer_m, actual_separation_m)) = closest_breach {
+        Ok(SprayBufferComplianceDecision {
+            application_id: application.application_id.clone(),
+            checked_at,
+            status: SprayBufferDecisionStatus::Blocked,
+            reason_code: Some(SprayBufferBlockReason::BufferBreach),
+            feature_ref: Some(feature_ref),
+            required_buffer_m: Some(required_buffer_m),
+            actual_separation_m: Some(actual_separation_m),
+        })
+    } else {
+        Ok(SprayBufferComplianceDecision {
+            application_id: application.application_id.clone(),
+            checked_at,
+            status: SprayBufferDecisionStatus::Compliant,
+            reason_code: None,
+            feature_ref: None,
+            required_buffer_m: None,
+            actual_separation_m: None,
+        })
+    }
+}
+
 pub fn airspace_zone_is_effective_at(zone: &AirspaceZoneRecord, at: Option<&str>) -> bool {
     let Some(at) = at.and_then(|value| normalize_optional_text(Some(value.to_string()))) else {
         return true;
@@ -1677,6 +1802,83 @@ fn compute_airspace_extent(
     Ok(extent)
 }
 
+fn extent_from_coordinates(coordinates: &[AirspaceCoordinate]) -> AirspaceZoneExtent {
+    let mut extent = AirspaceZoneExtent {
+        min_lon: f64::INFINITY,
+        min_lat: f64::INFINITY,
+        max_lon: f64::NEG_INFINITY,
+        max_lat: f64::NEG_INFINITY,
+    };
+    for coordinate in coordinates {
+        extent.min_lon = extent.min_lon.min(coordinate.longitude);
+        extent.min_lat = extent.min_lat.min(coordinate.latitude);
+        extent.max_lon = extent.max_lon.max(coordinate.longitude);
+        extent.max_lat = extent.max_lat.max(coordinate.latitude);
+    }
+    extent
+}
+
+fn polygons_intersect(left: &[AirspaceCoordinate], right: &[AirspaceCoordinate]) -> bool {
+    if left
+        .iter()
+        .copied()
+        .any(|point| point_in_polygon(point, right))
+    {
+        return true;
+    }
+    if right
+        .iter()
+        .copied()
+        .any(|point| point_in_polygon(point, left))
+    {
+        return true;
+    }
+    for left_edge in left.windows(2) {
+        for right_edge in right.windows(2) {
+            if segments_intersect(left_edge[0], left_edge[1], right_edge[0], right_edge[1]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn extent_separation_m(left: AirspaceZoneExtent, right: AirspaceZoneExtent) -> f64 {
+    let lon_gap = if left.max_lon < right.min_lon {
+        right.min_lon - left.max_lon
+    } else if right.max_lon < left.min_lon {
+        left.min_lon - right.max_lon
+    } else {
+        0.0
+    };
+    let lat_gap = if left.max_lat < right.min_lat {
+        right.min_lat - left.max_lat
+    } else if right.max_lat < left.min_lat {
+        left.min_lat - right.max_lat
+    } else {
+        0.0
+    };
+    let mean_lat_rad =
+        ((left.min_lat + left.max_lat + right.min_lat + right.max_lat) / 4.0).to_radians();
+    let meters_per_degree_lon = 111_320.0 * mean_lat_rad.cos().abs().max(0.01);
+    let meters_per_degree_lat = 110_540.0;
+    let dx = lon_gap * meters_per_degree_lon;
+    let dy = lat_gap * meters_per_degree_lat;
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn normalize_spray_buffer_text(
+    value: String,
+    error: SprayBufferComplianceError,
+) -> Result<String, SprayBufferComplianceError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn point_in_polygon(point: AirspaceCoordinate, polygon: &[AirspaceCoordinate]) -> bool {
     let mut inside = false;
     for edge in polygon.windows(2) {
@@ -1759,16 +1961,18 @@ mod tests {
         build_compliance_audit_report, build_initial_compliance_record,
         build_operator_certification_record, check_operator_certification, compute_rei_phi_window,
         evaluate_entry_harvest_clearance, evaluate_preflight_authorization,
-        refuse_in_place_mutation, AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError,
-        AirspaceZoneIngestRequest, AppendComplianceRecordVersionRequest, ApplicationGeometry,
-        AuthorizationBlockReason, AuthorizationDecisionStatus, CertificationBlockReason,
-        CertificationStatus, ChemicalApplicationRecord, ComplianceAuditReportError,
-        ComplianceAuditReportRequest, ComplianceRecordError, ComplianceRecordPayload,
-        ComplianceRecordType, CreateComplianceRecordRequest, EntryHarvestAction,
-        EntryHarvestBlockReason, EntryHarvestDecisionStatus, IntervalWindowStatus,
-        OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
-        PreflightAuthorizationRequest, ProductLabelInterval, RemoteIdFlightLogRecord,
-        RemoteIdTrackPoint, TelemetryGapRecord,
+        evaluate_spray_buffer_compliance, refuse_in_place_mutation, AirspaceCoordinate,
+        AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
+        AppendComplianceRecordVersionRequest, ApplicationGeometry, AuthorizationBlockReason,
+        AuthorizationDecisionStatus, CertificationBlockReason, CertificationStatus,
+        ChemicalApplicationRecord, ComplianceAuditReportError, ComplianceAuditReportRequest,
+        ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
+        CreateComplianceRecordRequest, EntryHarvestAction, EntryHarvestBlockReason,
+        EntryHarvestDecisionStatus, IntervalWindowStatus, OperatorCertificationRegistrationRequest,
+        PreflightAirspaceStatus, PreflightAuthorizationRequest, ProductLabelInterval,
+        RemoteIdFlightLogRecord, RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType,
+        SprayBufferBlockReason, SprayBufferComplianceError, SprayBufferDecisionStatus,
+        TelemetryGapRecord,
     };
 
     #[test]
@@ -2276,6 +2480,76 @@ mod tests {
     }
 
     #[test]
+    fn spray_buffer_compliance_allows_application_outside_required_buffers() {
+        let decision = evaluate_spray_buffer_compliance(
+            &chemical_application("app-1", application_square(0.0, 0.0, 0.001, 0.001)),
+            vec![sensitive_feature(
+                "water:creek-1",
+                SensitiveFeatureType::Water,
+                application_square(0.01, 0.0, 0.011, 0.001),
+                25.0,
+            )],
+            "2026-06-14T20:45:00Z".to_string(),
+        )
+        .expect("buffer check should run");
+
+        assert_eq!(decision.application_id, "app-1");
+        assert_eq!(decision.status, SprayBufferDecisionStatus::Compliant);
+        assert_eq!(decision.reason_code, None);
+        assert_eq!(decision.feature_ref, None);
+    }
+
+    #[test]
+    fn spray_buffer_compliance_blocks_water_buffer_breach_with_measured_separation() {
+        let decision = evaluate_spray_buffer_compliance(
+            &chemical_application("app-1", application_square(0.0, 0.0, 0.001, 0.001)),
+            vec![sensitive_feature(
+                "water:creek-1",
+                SensitiveFeatureType::Water,
+                application_square(0.0011, 0.0, 0.002, 0.001),
+                25.0,
+            )],
+            "2026-06-14T20:45:00Z".to_string(),
+        )
+        .expect("buffer check should run");
+
+        assert_eq!(decision.status, SprayBufferDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(SprayBufferBlockReason::BufferBreach)
+        );
+        assert_eq!(decision.feature_ref.as_deref(), Some("water:creek-1"));
+        assert_eq!(decision.required_buffer_m, Some(25.0));
+        assert!(
+            decision.actual_separation_m.expect("actual separation") < 25.0,
+            "separation should be inside required buffer"
+        );
+    }
+
+    #[test]
+    fn spray_buffer_compliance_refuses_feature_crs_mismatch() {
+        let error = evaluate_spray_buffer_compliance(
+            &chemical_application("app-1", application_square(0.0, 0.0, 0.001, 0.001)),
+            vec![SensitiveBufferFeature {
+                feature_ref: "water:creek-1".to_string(),
+                feature_type: SensitiveFeatureType::Water,
+                geometry: ApplicationGeometry {
+                    crs: "EPSG:3857".to_string(),
+                    coordinates: square(0.0011, 0.0, 0.002, 0.001),
+                },
+                required_buffer_m: 25.0,
+            }],
+            "2026-06-14T20:45:00Z".to_string(),
+        )
+        .expect_err("non-EPSG:4326 feature should be refused");
+
+        assert!(matches!(
+            error,
+            SprayBufferComplianceError::InvalidFeatureGeometry { .. }
+        ));
+    }
+
+    #[test]
     fn in_place_mutation_is_refused() {
         let error = refuse_in_place_mutation("delete");
 
@@ -2567,6 +2841,74 @@ mod tests {
             units: "L/ha".to_string(),
             operator_id: "operator-17".to_string(),
         }
+    }
+
+    fn chemical_application(
+        application_id: &str,
+        geometry: ApplicationGeometry,
+    ) -> ChemicalApplicationRecord {
+        ChemicalApplicationRecord {
+            application_id: application_id.to_string(),
+            product: "Example Herbicide".to_string(),
+            epa_or_label_ref: "EPA-12345-LBL".to_string(),
+            field_id: "field-north".to_string(),
+            geometry,
+            applied_at: "2026-06-12T13:00:00Z".to_string(),
+            rate: 1.75,
+            units: "L/ha".to_string(),
+            operator_id: "operator-17".to_string(),
+        }
+    }
+
+    fn sensitive_feature(
+        feature_ref: &str,
+        feature_type: SensitiveFeatureType,
+        geometry: ApplicationGeometry,
+        required_buffer_m: f64,
+    ) -> SensitiveBufferFeature {
+        SensitiveBufferFeature {
+            feature_ref: feature_ref.to_string(),
+            feature_type,
+            geometry,
+            required_buffer_m,
+        }
+    }
+
+    fn application_square(
+        min_lon: f64,
+        min_lat: f64,
+        max_lon: f64,
+        max_lat: f64,
+    ) -> ApplicationGeometry {
+        ApplicationGeometry {
+            crs: "EPSG:4326".to_string(),
+            coordinates: square(min_lon, min_lat, max_lon, max_lat),
+        }
+    }
+
+    fn square(min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) -> Vec<AirspaceCoordinate> {
+        vec![
+            AirspaceCoordinate {
+                longitude: min_lon,
+                latitude: min_lat,
+            },
+            AirspaceCoordinate {
+                longitude: max_lon,
+                latitude: min_lat,
+            },
+            AirspaceCoordinate {
+                longitude: max_lon,
+                latitude: max_lat,
+            },
+            AirspaceCoordinate {
+                longitude: min_lon,
+                latitude: max_lat,
+            },
+            AirspaceCoordinate {
+                longitude: min_lon,
+                latitude: min_lat,
+            },
+        ]
     }
 
     fn preflight_request(
