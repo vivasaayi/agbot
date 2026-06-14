@@ -109,6 +109,37 @@ pub struct MissionStatusSnapshot {
 pub struct SystemStatusSnapshot {
     pub status: String,
     pub message: String,
+    pub severity: SystemAlertSeverity,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+    pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemAlertSeverity {
+    Info,
+    Warn,
+    Critical,
+}
+
+impl SystemAlertSeverity {
+    fn rank_desc(self) -> u8 {
+        match self {
+            Self::Critical => 3,
+            Self::Warn => 2,
+            Self::Info => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SystemAlertPanelEntry {
+    pub status: String,
+    pub message: String,
+    pub severity: SystemAlertSeverity,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+    pub acknowledged: bool,
+    pub visually_distinct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -229,6 +260,9 @@ impl MessageDispatchState {
                 self.system_statuses.push(SystemStatusSnapshot {
                     status: status.clone(),
                     message: message.clone(),
+                    severity: system_alert_severity(status),
+                    received_at,
+                    acknowledged: false,
                 });
                 MessageRoute::SystemStatus
             }
@@ -307,6 +341,32 @@ impl MessageDispatchState {
         )
     }
 
+    pub fn system_alert_panel(&self) -> Vec<SystemAlertPanelEntry> {
+        let mut alerts = self
+            .system_statuses
+            .iter()
+            .map(|status| SystemAlertPanelEntry {
+                status: status.status.clone(),
+                message: status.message.clone(),
+                severity: status.severity,
+                received_at: status.received_at,
+                acknowledged: status.acknowledged,
+                visually_distinct: status.severity == SystemAlertSeverity::Critical
+                    && !status.acknowledged,
+            })
+            .collect::<Vec<_>>();
+
+        alerts.sort_by(|left, right| {
+            right
+                .severity
+                .rank_desc()
+                .cmp(&left.severity.rank_desc())
+                .then(right.received_at.cmp(&left.received_at))
+                .then(left.message.cmp(&right.message))
+        });
+        alerts
+    }
+
     pub fn set_mission_overlay(&mut self, mission_overlay: MissionOverlayInput) {
         self.mission_overlay = Some(mission_overlay);
     }
@@ -363,6 +423,14 @@ fn age_seconds(
     now.signed_duration_since(last_update_at)
         .num_seconds()
         .max(0) as u64
+}
+
+fn system_alert_severity(status: &str) -> SystemAlertSeverity {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "info" | "ok" | "healthy" | "nominal" => SystemAlertSeverity::Info,
+        "critical" | "error" | "fatal" | "emergency" => SystemAlertSeverity::Critical,
+        "warn" | "warning" | _ => SystemAlertSeverity::Warn,
+    }
 }
 
 pub fn shared_message_dispatch_state() -> SharedMessageDispatchState {
@@ -705,6 +773,42 @@ mod tests {
         let lidar_events = state.capture_events(Some(CaptureEventKind::Lidar));
         assert_eq!(lidar_events.len(), 1);
         assert!(lidar_events[0].summary.contains("2 points"));
+    }
+
+    #[test]
+    fn system_alert_panel_sorts_by_severity_then_recency_and_falls_back_to_warn() {
+        let mut state = MessageDispatchState::default();
+        state.dispatch_message_at(
+            &WebSocketMessage::SystemStatus {
+                status: "info".to_string(),
+                message: "link nominal".to_string(),
+            },
+            timestamp_at("2026-01-01T00:00:01Z"),
+        );
+        state.dispatch_message_at(
+            &WebSocketMessage::SystemStatus {
+                status: "mystery".to_string(),
+                message: "unknown status value".to_string(),
+            },
+            timestamp_at("2026-01-01T00:00:03Z"),
+        );
+        state.dispatch_message_at(
+            &WebSocketMessage::SystemStatus {
+                status: "critical".to_string(),
+                message: "battery failsafe".to_string(),
+            },
+            timestamp_at("2026-01-01T00:00:02Z"),
+        );
+
+        let panel = state.system_alert_panel();
+
+        assert_eq!(panel.len(), 3);
+        assert_eq!(panel[0].severity, SystemAlertSeverity::Critical);
+        assert_eq!(panel[0].message, "battery failsafe");
+        assert!(panel[0].visually_distinct);
+        assert_eq!(panel[1].severity, SystemAlertSeverity::Warn);
+        assert_eq!(panel[1].status, "mystery");
+        assert_eq!(panel[2].severity, SystemAlertSeverity::Info);
     }
 
     fn sample_telemetry(mode: &str, battery_percentage: u8) -> Telemetry {
