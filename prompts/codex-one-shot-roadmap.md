@@ -34,6 +34,7 @@ Batch loop:
   - Re-read the active checkpoint.
   - Verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and the roadmap hash.
   - Select and atomically claim the next deterministic batch using the same P0 -> P1 -> P2 priority rules.
+  - Optional accelerator: claim multiple pending rows at once with `scripts/roadmap_batch_claim.sh --run-id <id> --batch-size <N> --agent <name>` before implementing.
   - Implement, validate, checkpoint, commit, and repeat.
 - Do not stop merely because a batch completed, the next batch is larger, or the worktree is clean after a checkpoint.
 - Stop the loop only when a hard stop condition is hit:

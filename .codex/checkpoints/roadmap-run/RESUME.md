@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 86a594d (`batch-20260614060726`)
-- **Latest checkpoint commit**: 86a594d (`batch-20260614060726`)
+- **Last implementation commit**: 65466f2 (`batch-20260614174536`)
+- **Latest checkpoint commit**: 65466f2 (`batch-20260614174536`)
 - **Current batch**: `batch-20260614174536` — STORIES `10-10` and `10-12`
-- **Completed feature rows**: 306 committed; 3 tests_passed; 1 skipped; 1 blocked; 187 pending in this run.
+- **Completed feature rows**: 308 committed; 1 tests_passed; 1 skipped; 1 blocked; 187 pending in this run.
 - **Blocker**: None
 
 ## Latest verification
@@ -18,4 +18,4 @@
 
 ## Next action
 
-- Commit verified batch `batch-20260614174536`, then update checkpoint with the commit SHA and select the next pending feature(s).
+- Select and claim next pending feature(s) per roadmap priority order.

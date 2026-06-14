@@ -24,12 +24,98 @@ When the task is to execute the AGBot roadmap, do not ask the user which item to
 
 - Start from `docs/product-roadmap/` including `README.md`, `product-doctrine.md`, `requirements-rigor.md`, `implementation-sequencing.md`, and the domain folders; also inspect `docs/reference/product-requirements.md` and the `prompts/` directory (`init.md`, `simulation.md`, `visualization.md`, `codex-one-shot-roadmap.md`) when present.
 - Enumerate all milestone and backlog items before selecting work.
-- Process the backlog in deterministic batches. Do not attempt to load all items into context at once.
+- Process large or cross-domain roadmap runs through the Roadmap MapReduce Execution Model below. Do not attempt to load all items into context at once.
 - Prioritize P0, then P1, then P2. Within each priority, prefer foundational inventory and observable-foundation work before later milestones.
 - Use a progress ledger or checkpoint so a later run can resume exactly.
 - If subagents are available, use them for backlog triage, Rust crate work, GIS/visualization work, tests, and independent verification. If subagents are unavailable, run those passes sequentially.
 - Commit each completed, verified batch when the task definition requires commits.
 - Never claim the whole roadmap is complete unless every item has been processed and verified.
+
+## Roadmap MapReduce Execution Model
+
+Use this model for large roadmap runs. The goal is to reason globally, execute independently, integrate centrally, and verify continuously.
+
+### Map Phase: Roadmap Decomposition
+
+Before implementation, the coordinator reads the roadmap, checkpoint, and current repository state, then maps the roadmap into candidate macro-batches. This phase is non-mutating unless a checkpoint must be initialized.
+
+Identify:
+
+- Product capabilities and feature IDs.
+- Dependency relationships and critical-path blockers.
+- Shared contracts, domain foundations, and acceptance gates.
+- Affected crates, modules, routes, schemas, migrations, generated outputs, and tests.
+- Candidate macro-batches and safe parallel lanes.
+- Conflict zones that must be serialized.
+
+The Map phase must not produce implementation code unless the roadmap graph and candidate macro-batches are already known or valid in the checkpoint.
+
+### Shuffle Phase: Claiming and Coordination
+
+Group dependency-ready work into macro-batches and assign lanes through SQLite.
+
+Rules:
+
+- Every lane must atomically claim feature IDs before implementation.
+- Do not assign two lanes to the same crate, module, route, controller, migration, generated file, or shared contract at the same time.
+- Prefer independent lanes: shared contracts, GIS/backend, imagery/analytics, viewer/UI, simulator/flight, tests, and verification.
+- If work overlaps, serialize it through the coordinator.
+- If a conflict appears, pause the lower-priority lane, record the event in SQLite, and requeue, merge, or split the work.
+
+### Worker Phase: Independent Implementation
+
+Each worker lane implements only its claimed macro-batch.
+
+Workers must return compact evidence:
+
+- Claimed feature IDs and batch ID.
+- Files changed.
+- Contracts or APIs changed.
+- Tests added or updated.
+- Commands run and results.
+- Failures encountered.
+- Product outcome achieved.
+- Commit readiness.
+- Exact next action.
+
+Workers must avoid broad speculative scaffolding. Code is valuable only when it supports a verified workflow, shared foundation, acceptance gate, simulator behavior, test fixture, or critical-path dependency.
+
+### Reduce Phase: Integration
+
+The coordinator integrates worker outputs.
+
+The coordinator must:
+
+- Review worker evidence.
+- Resolve integration conflicts.
+- Remove duplicate or incompatible models.
+- Ensure shared contracts are authoritative.
+- Prune speculative code not required by the accepted workflow.
+- Run required validation commands.
+- Stage only files that belong to the verified batch.
+- Commit one verified batch at a time.
+- Update SQLite and `RESUME.md`.
+
+Commits remain serialized even when implementation work is parallel.
+
+### Verify Phase: Acceptance and Metrics
+
+A MapReduce cycle is complete only when the integrated batch is verified.
+
+Record:
+
+- Accepted workflow or critical-path foundation completed.
+- Validation commands and results.
+- Files changed.
+- Net lines added/deleted when available.
+- Downstream items unblocked.
+- Product progress score.
+- Last commit SHA.
+- Exact next action.
+
+A cycle is not successful because it generated code. A cycle is successful only when it increases accepted product capability.
+
+Operating principle: Map the roadmap globally. Shuffle work safely. Implement in independent lanes. Reduce through one coordinator. Verify before commit. Checkpoint after every accepted product slice. Maximize accepted product capability per token, not code volume per hour.
 
 ## Roadmap Batch Loop Mode
 
@@ -38,7 +124,7 @@ Use this mode only when the user or one-shot prompt explicitly asks the agent to
 - Continue selecting and executing deterministic batches until every roadmap item is processed and verified, or until a hard stop condition is reached.
 - After each verified commit, update `checkpoint.sqlite` and `RESUME.md`, then re-read the active checkpoint before selecting the next batch.
 - Before starting each next batch, verify `git status --short`, `runs.last_commit`, `current_batch_id`, `next_action`, and the roadmap hash. If the roadmap hash changed, re-evaluate selection before claiming work.
-- Select, claim, implement, validate, commit, and checkpoint the next batch using the same P0 -> P1 -> P2 priority rules.
+- Select, claim, implement, validate, commit, and checkpoint the next batch using the Roadmap MapReduce Execution Model and the same P0 -> P1 -> P2 priority rules.
 - Do not stop merely because a batch completed, the next batch is larger, or the worktree is clean after a checkpoint.
 - Stop the loop only when there are no pending items, validation fails and cannot be fixed within the current batch, unrelated worktree changes create a conflict, a real blocker prevents progress, the user explicitly stops the run, or context/token/rate-limit/timeout pressure makes it impossible to continue safely.
 - Treat context, token, rate-limit, and timeout pressure as hard stop conditions only when there is concrete evidence that continuing another batch would likely lose work or prevent a checkpoint. Do not stop speculatively.
@@ -51,10 +137,10 @@ Speed matters, but parallelism must not corrupt the worktree.
 
 - Prefer 2-4 parallel lanes when the runtime supports subagents or background agents.
 - Use SQLite as the coordination source of truth. Every agent must atomically claim feature IDs before work begins.
-- Parallelize only independent slices: different crates, different files, or analysis/test work that will not edit the same modules.
+- Parallelize only independent MapReduce lanes: different crates, different files, or analysis/test work that will not edit the same modules.
 - Do not let two agents edit the same Rust crate, module, route, controller, migration, proto, or generated file at the same time.
-- Keep one coordinator responsible for batch selection, conflict checks, final integration, validation, staging, commits, and checkpoint updates.
-- Agents should return compact evidence: claimed feature IDs, files changed, tests run, failures, commit readiness, and exact next action.
+- Keep one coordinator responsible for Map, Shuffle, Reduce, Verify, conflict checks, staging, commits, and checkpoint updates.
+- Agents should return compact worker evidence: claimed feature IDs, batch ID, files changed, contracts or APIs changed, tests run, failures, product outcome, commit readiness, and exact next action.
 - Run expensive validations in parallel only when they do not compete for the same build lock or mutate shared output. Otherwise serialize validation. The Rust `target/` build lock is shared across the workspace.
 - Commits must be serialized. One committed, verified batch at a time.
 - If parallel lanes conflict, pause the lower-priority lane, write an event to SQLite, and let the coordinator decide whether to rebase, merge manually, or requeue.
