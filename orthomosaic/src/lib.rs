@@ -774,6 +774,45 @@ pub enum MosaicQualityVerdict {
     NotPublishable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MosaicQualityReportConfig {
+    pub max_mean_gsd_m_per_px: f64,
+    pub min_overlap_fraction: f64,
+    pub min_coverage_fraction: f64,
+    pub max_reprojection_rms_px: f64,
+    pub max_gcp_rmse_m: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MosaicQualityMetric {
+    MeanGsd,
+    MinimumOverlap,
+    Coverage,
+    ReprojectionRms,
+    GcpOverallRmse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MosaicQualityMetricRecord {
+    pub metric: MosaicQualityMetric,
+    pub observed_value: f64,
+    pub threshold_value: f64,
+    pub unit: String,
+    pub evidence_ref: String,
+    pub passes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MosaicQualityReport {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub verdict: MosaicQualityVerdict,
+    pub metrics: Vec<MosaicQualityMetricRecord>,
+    pub failing_metrics: Vec<MosaicQualityMetric>,
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MosaicPublishStatus {
@@ -1032,6 +1071,18 @@ pub enum MosaicPublishGateError {
     EmptyGcpId,
     #[error("provenance hash failed: {reason}")]
     ProvenanceHashFailed { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum MosaicQualityReportError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("quality report config field {field} must be finite and non-negative")]
+    InvalidConfig { field: &'static str },
+    #[error("quality report frame_set_id mismatch: {left} vs {right}")]
+    FrameSetMismatch { left: String, right: String },
+    #[error("quality report has no overlap evidence")]
+    EmptyOverlapEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -2055,6 +2106,95 @@ pub fn register_ground_control_points(
     })
 }
 
+pub fn build_mosaic_quality_report(
+    qa_report: &FrameSetQaReport,
+    reprojection_report: &ReprojectionErrorReport,
+    gcp_report: &GcpAccuracyReport,
+    config: MosaicQualityReportConfig,
+    generated_at: String,
+) -> Result<MosaicQualityReport, MosaicQualityReportError> {
+    validate_mosaic_quality_report_config(config)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(MosaicQualityReportError::EmptyGeneratedAt)?;
+    assert_quality_frame_set_match(&qa_report.frame_set_id, &reprojection_report.frame_set_id)?;
+    assert_quality_frame_set_match(&qa_report.frame_set_id, &gcp_report.frame_set_id)?;
+    let min_overlap = qa_report
+        .overlaps
+        .iter()
+        .map(|overlap| overlap.overlap_fraction)
+        .reduce(f64::min)
+        .ok_or(MosaicQualityReportError::EmptyOverlapEvidence)?;
+
+    let metrics = vec![
+        quality_metric(
+            MosaicQualityMetric::MeanGsd,
+            qa_report.mean_gsd_m_per_px,
+            config.max_mean_gsd_m_per_px,
+            "m_per_px",
+            "frame_set_qa:mean_gsd",
+            qa_report.mean_gsd_m_per_px <= config.max_mean_gsd_m_per_px,
+        ),
+        quality_metric(
+            MosaicQualityMetric::MinimumOverlap,
+            min_overlap,
+            config.min_overlap_fraction,
+            "fraction",
+            "frame_set_qa:overlap",
+            min_overlap >= config.min_overlap_fraction,
+        ),
+        quality_metric(
+            MosaicQualityMetric::Coverage,
+            qa_report.coverage_fraction,
+            config.min_coverage_fraction,
+            "fraction",
+            "frame_set_qa:coverage",
+            qa_report.coverage_fraction >= config.min_coverage_fraction && qa_report.passes,
+        ),
+        quality_metric(
+            MosaicQualityMetric::ReprojectionRms,
+            reprojection_report.overall_rms_error_px,
+            config.max_reprojection_rms_px,
+            "px",
+            "reprojection_report:overall_rms",
+            reprojection_report.overall_rms_error_px <= config.max_reprojection_rms_px
+                && reprojection_report.passes,
+        ),
+        quality_metric(
+            MosaicQualityMetric::GcpOverallRmse,
+            gcp_report.overall_rmse_m,
+            config.max_gcp_rmse_m,
+            "m",
+            "gcp_accuracy:overall_rmse",
+            gcp_report.overall_rmse_m <= config.max_gcp_rmse_m,
+        ),
+    ];
+    let failing_metrics = metrics
+        .iter()
+        .filter(|metric| !metric.passes)
+        .map(|metric| metric.metric)
+        .collect::<Vec<_>>();
+    let verdict = if failing_metrics.is_empty() {
+        MosaicQualityVerdict::Publishable
+    } else {
+        MosaicQualityVerdict::NotPublishable
+    };
+    let evidence_refs = metrics
+        .iter()
+        .map(|metric| metric.evidence_ref.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    Ok(MosaicQualityReport {
+        frame_set_id: qa_report.frame_set_id.clone(),
+        generated_at,
+        verdict,
+        metrics,
+        failing_metrics,
+        evidence_refs,
+    })
+}
+
 pub fn build_tiled_output_handoff(
     request: TiledOutputHandoffRequest,
 ) -> Result<TiledOutputHandoff, TiledOutputHandoffError> {
@@ -2624,6 +2764,52 @@ fn validate_reprojection_report_config(
         }
     }
     Ok(())
+}
+
+fn validate_mosaic_quality_report_config(
+    config: MosaicQualityReportConfig,
+) -> Result<(), MosaicQualityReportError> {
+    for (field, value) in [
+        ("max_mean_gsd_m_per_px", config.max_mean_gsd_m_per_px),
+        ("min_overlap_fraction", config.min_overlap_fraction),
+        ("min_coverage_fraction", config.min_coverage_fraction),
+        ("max_reprojection_rms_px", config.max_reprojection_rms_px),
+        ("max_gcp_rmse_m", config.max_gcp_rmse_m),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(MosaicQualityReportError::InvalidConfig { field });
+        }
+    }
+    Ok(())
+}
+
+fn assert_quality_frame_set_match(left: &str, right: &str) -> Result<(), MosaicQualityReportError> {
+    if left == right {
+        Ok(())
+    } else {
+        Err(MosaicQualityReportError::FrameSetMismatch {
+            left: left.to_string(),
+            right: right.to_string(),
+        })
+    }
+}
+
+fn quality_metric(
+    metric: MosaicQualityMetric,
+    observed_value: f64,
+    threshold_value: f64,
+    unit: &str,
+    evidence_ref: &str,
+    passes: bool,
+) -> MosaicQualityMetricRecord {
+    MosaicQualityMetricRecord {
+        metric,
+        observed_value,
+        threshold_value,
+        unit: unit.to_string(),
+        evidence_ref: evidence_ref.to_string(),
+        passes,
+    }
 }
 
 fn gcp_residual(
@@ -3221,23 +3407,24 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        balance_mosaic_seamlines_and_exposure, build_frame_set_record, build_reconstruction_job,
-        build_reconstruction_progress_event, build_reprojection_error_report,
-        build_tiled_output_handoff, densify_sparse_reconstruction, derive_dtm_from_dsm,
-        detect_reconstruction_stall, generate_dsm, reconstruction_progress_stream,
-        run_feature_matching, run_frame_set_qa, run_orthorectified_mosaic, run_sparse_sfm,
-        transition_reconstruction_status, CameraExif, CameraImuPose, DensePoint, DensePointCloud,
-        DenseReconstructionConfig, DenseReconstructionError, DsmConfig, DtmConfig,
-        DtmGroundClassification, FeatureMatchingConfig, FieldCoverageExtent,
-        FrameExposureObservation, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
-        FrameSetIngestRequest, FrameSetQaConfig, GcpMarkedImagePoint, GcpRegistrationError,
-        GcpRegistrationRequest, GcpSurveyedCoordinate, GroundControlPoint, MosaicProvenanceRecord,
-        MosaicPublishGateRequest, MosaicPublishStatus, MosaicQualityVerdict, OrthomosaicConfig,
-        OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest,
-        ReconstructionProgressStage, ReconstructionStallReasonCode, ReconstructionStatus,
-        ReprojectionReportConfig, SeamlineExposureConfig, SparseSfmConfig, SparseSfmError,
-        SparseSfmFailureReason, TiledOutputHandoffError, TiledOutputHandoffRequest,
-        TiledRasterProductRequest,
+        balance_mosaic_seamlines_and_exposure, build_frame_set_record, build_mosaic_quality_report,
+        build_reconstruction_job, build_reconstruction_progress_event,
+        build_reprojection_error_report, build_tiled_output_handoff, densify_sparse_reconstruction,
+        derive_dtm_from_dsm, detect_reconstruction_stall, generate_dsm,
+        reconstruction_progress_stream, run_feature_matching, run_frame_set_qa,
+        run_orthorectified_mosaic, run_sparse_sfm, transition_reconstruction_status, CameraExif,
+        CameraImuPose, DensePoint, DensePointCloud, DenseReconstructionConfig,
+        DenseReconstructionError, DsmConfig, DtmConfig, DtmGroundClassification,
+        FeatureMatchingConfig, FieldCoverageExtent, FrameExposureObservation, FrameIngestRequest,
+        FrameQaReasonCode, FrameSetIngestError, FrameSetIngestRequest, FrameSetQaConfig,
+        GcpAccuracyReport, GcpMarkedImagePoint, GcpRegistrationError, GcpRegistrationRequest,
+        GcpSurveyedCoordinate, GroundControlPoint, MosaicProvenanceRecord,
+        MosaicPublishGateRequest, MosaicPublishStatus, MosaicQualityMetric,
+        MosaicQualityReportConfig, MosaicQualityVerdict, OrthomosaicConfig, OrthomosaicError,
+        ReconstructionJobError, ReconstructionJobRequest, ReconstructionProgressStage,
+        ReconstructionStallReasonCode, ReconstructionStatus, ReprojectionReportConfig,
+        SeamlineExposureConfig, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
+        TiledOutputHandoffError, TiledOutputHandoffRequest, TiledRasterProductRequest,
     };
     use shared::schemas::{
         assert_raster_spatial_ref, GeoBounds, GpsCoords, RasterResolution, RasterSpatialRef,
@@ -4086,6 +4273,65 @@ mod tests {
     }
 
     #[test]
+    fn mosaic_quality_report_assembles_publishable_metrics_with_evidence_refs() {
+        let qa = passing_qa_report();
+        let reprojection = passing_reprojection_report();
+        let gcp = passing_gcp_report();
+
+        let report = build_mosaic_quality_report(
+            &qa,
+            &reprojection,
+            &gcp,
+            mosaic_quality_config(),
+            "2026-06-01T12:08:00Z".to_string(),
+        )
+        .expect("quality report should assemble");
+
+        assert_eq!(report.frame_set_id, "frame-set-qa");
+        assert_eq!(report.verdict, MosaicQualityVerdict::Publishable);
+        assert_eq!(report.metrics.len(), 5);
+        assert!(report.failing_metrics.is_empty());
+        assert!(report
+            .metrics
+            .iter()
+            .any(|metric| metric.metric == MosaicQualityMetric::Coverage
+                && metric.observed_value == 1.0
+                && metric.passes));
+        assert_eq!(
+            report.evidence_refs,
+            vec![
+                "frame_set_qa:coverage".to_string(),
+                "frame_set_qa:mean_gsd".to_string(),
+                "frame_set_qa:overlap".to_string(),
+                "gcp_accuracy:overall_rmse".to_string(),
+                "reprojection_report:overall_rms".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mosaic_quality_report_marks_not_publishable_when_any_metric_fails() {
+        let mut qa = passing_qa_report();
+        qa.coverage_fraction = 0.72;
+        qa.passes = false;
+        let report = build_mosaic_quality_report(
+            &qa,
+            &passing_reprojection_report(),
+            &passing_gcp_report(),
+            mosaic_quality_config(),
+            "2026-06-01T12:08:00Z".to_string(),
+        )
+        .expect("quality report should assemble failing verdict");
+
+        assert_eq!(report.verdict, MosaicQualityVerdict::NotPublishable);
+        assert_eq!(report.failing_metrics, vec![MosaicQualityMetric::Coverage]);
+        let json = serde_json::to_value(&report).expect("report should serialize");
+        assert_eq!(json["verdict"], "not_publishable");
+        assert_eq!(json["metrics"].as_array().expect("metrics array").len(), 5);
+        assert_eq!(json["failing_metrics"][0], "coverage");
+    }
+
+    #[test]
     fn tiled_output_handoff_reports_pyramid_metadata_for_mosaic_and_dsm() {
         let handoff = build_tiled_output_handoff(tiled_handoff_request(
             Some(tile_spatial_ref()),
@@ -4410,6 +4656,55 @@ mod tests {
             max_camera_error_px: 0.5,
             max_point_error_px: 0.5,
         }
+    }
+
+    fn mosaic_quality_config() -> MosaicQualityReportConfig {
+        MosaicQualityReportConfig {
+            max_mean_gsd_m_per_px: 0.2,
+            min_overlap_fraction: 0.3,
+            min_coverage_fraction: 0.9,
+            max_reprojection_rms_px: 0.5,
+            max_gcp_rmse_m: 5.0,
+        }
+    }
+
+    fn passing_qa_report() -> super::FrameSetQaReport {
+        let frame_set = qa_frame_set(vec![
+            qa_frame("frame-001", 0.0, "2026-06-01T12:00:00Z"),
+            qa_frame("frame-002", 60.0, "2026-06-01T12:00:05Z"),
+        ]);
+        run_frame_set_qa(
+            &frame_set,
+            field_extent(-75.0, -50.0, 135.0, 50.0),
+            qa_config(),
+            "2026-06-01T12:01:00Z".to_string(),
+        )
+        .expect("QA should pass")
+    }
+
+    fn passing_reprojection_report() -> super::ReprojectionErrorReport {
+        let (_, _, sfm) = solved_sfm_fixture();
+        build_reprojection_error_report(
+            &sfm,
+            reprojection_config(),
+            "2026-06-01T12:06:00Z".to_string(),
+        )
+        .expect("reprojection should pass")
+    }
+
+    fn passing_gcp_report() -> GcpAccuracyReport {
+        super::register_ground_control_points(gcp_request(vec![gcp(
+            "GCP-1",
+            "EPSG:32614",
+            100.0,
+            200.0,
+            10.0,
+            vec![
+                marked("frame-001", 101.0, 202.0, 12.0),
+                marked("frame-002", 99.0, 198.0, 8.0),
+            ],
+        )]))
+        .expect("GCP should pass")
     }
 
     fn gcp_request(gcps: Vec<GroundControlPoint>) -> GcpRegistrationRequest {
