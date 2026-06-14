@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 shared = { path = "../shared" }
+fleet_health = { path = "../fleet_health" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

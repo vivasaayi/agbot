@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use shared::{fleet_alerts::FleetAlertRecord, schemas::FleetVersionInventory};
 use timeseries::{SeriesPoint, SeriesValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,6 +581,68 @@ pub struct RolloutControlDecision {
     pub status: RolloutControlStatus,
     pub reason_code: RolloutControlReason,
     pub audit: RolloutControlAuditRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetOperationsFeedSource {
+    Inventory,
+    Health,
+    Alerts,
+    Rollouts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetOperationsFeedSourceStatus {
+    Current,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetOperationsFeedSourceState {
+    pub source: FleetOperationsFeedSource,
+    pub status: FleetOperationsFeedSourceStatus,
+    pub observed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetOperationsRolloutFeedState {
+    Advancing,
+    HaltedRolledBack,
+    Refused,
+    Started,
+    Paused,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetOperationsRolloutFeedEntry {
+    pub rollout_id: String,
+    pub stage: OtaRolloutStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub state: FleetOperationsRolloutFeedState,
+    pub reason_code: String,
+    pub updated_at: String,
+    pub evaluated_node_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetOperationsDashboardFeed {
+    pub generated_at: String,
+    pub inventory: FleetVersionInventory,
+    #[serde(default)]
+    pub alerts: Vec<FleetAlertRecord>,
+    #[serde(default)]
+    pub rollouts: Vec<FleetOperationsRolloutFeedEntry>,
+    #[serde(default)]
+    pub sources: Vec<FleetOperationsFeedSourceState>,
+    #[serde(default)]
+    pub source_gaps: Vec<FleetOperationsFeedSourceState>,
 }
 
 impl FleetReadinessDecision {
@@ -1421,6 +1484,121 @@ pub fn apply_rollout_control(
     })
 }
 
+pub fn build_fleet_operations_dashboard_feed(
+    generated_at: impl Into<String>,
+    inventory: FleetVersionInventory,
+    alerts: Vec<FleetAlertRecord>,
+    rollout_decisions: Vec<OtaRolloutDecision>,
+    rollout_controls: Vec<RolloutControlDecision>,
+    sources: Vec<FleetOperationsFeedSourceState>,
+) -> FleetOperationsDashboardFeed {
+    let mut rollouts = rollout_decisions
+        .into_iter()
+        .map(rollout_decision_feed_entry)
+        .chain(rollout_controls.into_iter().map(rollout_control_feed_entry))
+        .collect::<Vec<_>>();
+    rollouts.sort_by(|left, right| {
+        left.rollout_id
+            .cmp(&right.rollout_id)
+            .then(left.updated_at.cmp(&right.updated_at))
+            .then(left.reason_code.cmp(&right.reason_code))
+    });
+    let source_gaps = sources
+        .iter()
+        .filter(|source| source.status == FleetOperationsFeedSourceStatus::Unavailable)
+        .cloned()
+        .collect();
+
+    FleetOperationsDashboardFeed {
+        generated_at: generated_at.into(),
+        inventory,
+        alerts,
+        rollouts,
+        sources,
+        source_gaps,
+    }
+}
+
+pub fn fleet_operations_source_current(
+    source: FleetOperationsFeedSource,
+    observed_at: impl Into<String>,
+) -> FleetOperationsFeedSourceState {
+    FleetOperationsFeedSourceState {
+        source,
+        status: FleetOperationsFeedSourceStatus::Current,
+        observed_at: observed_at.into(),
+        message: None,
+    }
+}
+
+pub fn fleet_operations_source_unavailable(
+    source: FleetOperationsFeedSource,
+    observed_at: impl Into<String>,
+    message: impl Into<String>,
+) -> FleetOperationsFeedSourceState {
+    FleetOperationsFeedSourceState {
+        source,
+        status: FleetOperationsFeedSourceStatus::Unavailable,
+        observed_at: observed_at.into(),
+        message: Some(message.into()),
+    }
+}
+
+fn rollout_decision_feed_entry(decision: OtaRolloutDecision) -> FleetOperationsRolloutFeedEntry {
+    FleetOperationsRolloutFeedEntry {
+        rollout_id: decision.rollout_id,
+        stage: decision.current_stage,
+        version: None,
+        state: match decision.status {
+            OtaRolloutDecisionStatus::Advance => FleetOperationsRolloutFeedState::Advancing,
+            OtaRolloutDecisionStatus::HaltedRolledBack => {
+                FleetOperationsRolloutFeedState::HaltedRolledBack
+            }
+            OtaRolloutDecisionStatus::Refused => FleetOperationsRolloutFeedState::Refused,
+        },
+        reason_code: ota_rollout_reason_code(decision.reason_code).to_string(),
+        updated_at: decision.evaluated_at,
+        evaluated_node_count: decision.evaluated_node_count,
+    }
+}
+
+fn rollout_control_feed_entry(decision: RolloutControlDecision) -> FleetOperationsRolloutFeedEntry {
+    FleetOperationsRolloutFeedEntry {
+        rollout_id: decision.rollout_id,
+        stage: decision.stage,
+        version: Some(decision.version),
+        state: match decision.status {
+            RolloutControlStatus::Started => FleetOperationsRolloutFeedState::Started,
+            RolloutControlStatus::Paused => FleetOperationsRolloutFeedState::Paused,
+            RolloutControlStatus::Aborted => FleetOperationsRolloutFeedState::Aborted,
+            RolloutControlStatus::Refused => FleetOperationsRolloutFeedState::Refused,
+        },
+        reason_code: rollout_control_reason_code(decision.reason_code).to_string(),
+        updated_at: decision.requested_at,
+        evaluated_node_count: 0,
+    }
+}
+
+fn ota_rollout_reason_code(reason: OtaRolloutDecisionReason) -> &'static str {
+    match reason {
+        OtaRolloutDecisionReason::StageHealthy => "stage_healthy",
+        OtaRolloutDecisionReason::HealthRegression => "health_regression",
+        OtaRolloutDecisionReason::MissingSignedRollbackTarget => "missing_signed_rollback_target",
+        OtaRolloutDecisionReason::UnsignedTargetVersion => "unsigned_target_version",
+        OtaRolloutDecisionReason::MissingStageNode => "missing_stage_node",
+        OtaRolloutDecisionReason::MissingHealthReport => "missing_health_report",
+    }
+}
+
+fn rollout_control_reason_code(reason: RolloutControlReason) -> &'static str {
+    match reason {
+        RolloutControlReason::StartedByOperator => "started_by_operator",
+        RolloutControlReason::PausedByOperator => "paused_by_operator",
+        RolloutControlReason::AbortedByOperator => "aborted_by_operator",
+        RolloutControlReason::SimulationValidationRequired => "simulation_validation_required",
+    }
+}
+
 pub fn component_event(
     component_id: &str,
     event_type: &str,
@@ -1772,19 +1950,31 @@ fn validate_nonnegative_finite(
 mod tests {
     use super::{
         accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
-        build_component_record, component_event, derive_health_indicators,
-        evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
-        evaluate_ota_rollout, install_component, BatteryHealthTrendConfig, ComponentHealthVerdict,
-        ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
-        DutyAccrualRequest, FleetComponentRecord, FleetComponentType, FleetHealthError,
-        FleetHealthIndicator, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
-        FleetReadinessRequest, HealthIndicatorFreshness, HealthIndicatorThreshold,
-        HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
+        build_component_record, build_fleet_operations_dashboard_feed, component_event,
+        derive_health_indicators, evaluate_battery_health_trend, evaluate_component_health_verdict,
+        evaluate_fleet_readiness, evaluate_ota_rollout, fleet_operations_source_current,
+        fleet_operations_source_unavailable, install_component, BatteryHealthTrendConfig,
+        ComponentHealthVerdict, ComponentHealthVerdictRequest, ComponentHealthVerdictStatus,
+        ComponentServiceLimit, DutyAccrualRequest, FleetComponentRecord, FleetComponentType,
+        FleetHealthError, FleetHealthIndicator, FleetOperationsFeedSource,
+        FleetOperationsFeedSourceStatus, FleetOperationsRolloutFeedState,
+        FleetReadinessBlockReason, FleetReadinessDecisionStatus, FleetReadinessRequest,
+        HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
+        HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
         InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
         OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
         RegisterComponentRequest, RolloutControlAction, RolloutControlReason,
         RolloutControlRequest, RolloutControlStatus, ServiceHistoryEntry,
         TelemetryHealthIndicatorRequest,
+    };
+    use shared::fleet_alerts::{
+        FleetAlertComparator, FleetAlertEvidence, FleetAlertKind, FleetAlertRecord,
+        FleetAlertRoute, FleetAlertSeverity,
+    };
+    use shared::schemas::{
+        FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeHealthState,
+        FleetNodeInventoryEntry, FleetNodeKind, FleetNodeRuntimeMode, FleetNodeStatus,
+        FleetVersionInventory,
     };
     use timeseries::SeriesValue;
 
@@ -2601,6 +2791,134 @@ mod tests {
         );
         assert_eq!(decision.audit.actor, "ops@example.com");
         assert_eq!(decision.audit.result, RolloutControlStatus::Refused);
+    }
+
+    #[test]
+    fn fleet_operations_feed_reflects_inventory_alerts_and_rollout_state() {
+        let rollout = evaluate_ota_rollout(ota_rollout_request(
+            OtaRolloutStage::Canary,
+            Some(signed_version("agbot-edge", "1.9.0")),
+            vec![ota_node("node-canary-1", OtaRolloutStage::Canary)],
+            vec![ota_health(
+                "node-canary-1",
+                ComponentHealthVerdictStatus::Ok,
+                vec![],
+            )],
+        ))
+        .expect("rollout should evaluate");
+        let control = apply_rollout_control(rollout_control_request(
+            RolloutControlAction::Start,
+            true,
+            true,
+        ))
+        .expect("control action should evaluate");
+
+        let feed = build_fleet_operations_dashboard_feed(
+            "2026-06-12T13:01:00Z",
+            sample_fleet_inventory(),
+            vec![sample_fleet_alert()],
+            vec![rollout],
+            vec![control],
+            vec![
+                fleet_operations_source_current(
+                    FleetOperationsFeedSource::Inventory,
+                    "2026-06-12T13:00:59Z",
+                ),
+                fleet_operations_source_current(
+                    FleetOperationsFeedSource::Alerts,
+                    "2026-06-12T13:00:58Z",
+                ),
+                fleet_operations_source_current(
+                    FleetOperationsFeedSource::Rollouts,
+                    "2026-06-12T13:00:57Z",
+                ),
+            ],
+        );
+
+        assert_eq!(feed.inventory.entries[0].node_id, "node-canary-1");
+        assert_eq!(feed.alerts[0].node_id, "node-canary-1");
+        assert!(feed.source_gaps.is_empty());
+        assert!(feed.rollouts.iter().any(|rollout| rollout.state
+            == FleetOperationsRolloutFeedState::Advancing
+            && rollout.reason_code == "stage_healthy"));
+        assert!(feed.rollouts.iter().any(|rollout| rollout.state
+            == FleetOperationsRolloutFeedState::Started
+            && rollout.version.as_deref() == Some("2.0.0")));
+    }
+
+    #[test]
+    fn fleet_operations_feed_surfaces_unavailable_source_gap() {
+        let feed = build_fleet_operations_dashboard_feed(
+            "2026-06-12T13:02:00Z",
+            sample_fleet_inventory(),
+            vec![],
+            vec![],
+            vec![],
+            vec![fleet_operations_source_unavailable(
+                FleetOperationsFeedSource::Alerts,
+                "2026-06-12T13:01:59Z",
+                "alert store unavailable",
+            )],
+        );
+
+        assert_eq!(feed.alerts.len(), 0);
+        assert_eq!(feed.source_gaps.len(), 1);
+        assert_eq!(
+            feed.source_gaps[0].source,
+            FleetOperationsFeedSource::Alerts
+        );
+        assert_eq!(
+            feed.source_gaps[0].status,
+            FleetOperationsFeedSourceStatus::Unavailable
+        );
+        assert_eq!(
+            feed.source_gaps[0].message.as_deref(),
+            Some("alert store unavailable")
+        );
+    }
+
+    fn sample_fleet_inventory() -> FleetVersionInventory {
+        FleetVersionInventory {
+            entries: vec![FleetNodeInventoryEntry {
+                node_id: "node-canary-1".to_string(),
+                owner_org_id: "org-ops".to_string(),
+                kind: FleetNodeKind::Drone,
+                runtime_mode: FleetNodeRuntimeMode::Flight,
+                status: FleetNodeStatus::Enrolled,
+                maintenance: false,
+                version: Some("agbot-edge 2.0.0".to_string()),
+                config_version: Some(4),
+                components: vec![FleetNodeComponentStatus {
+                    component: "flight-controller".to_string(),
+                    health: FleetNodeComponentHealth::Ok,
+                    message: None,
+                }],
+                capabilities: vec!["ota".to_string(), "multispectral".to_string()],
+                health_state: Some(FleetNodeHealthState::Fresh),
+                heartbeat_age_seconds: Some(4),
+            }],
+        }
+    }
+
+    fn sample_fleet_alert() -> FleetAlertRecord {
+        FleetAlertRecord {
+            alert_id: "fleet-alert:node-canary-1:low_disk".to_string(),
+            node_id: "node-canary-1".to_string(),
+            correlation_id: Some("rollout-2026-06-12".to_string()),
+            kind: FleetAlertKind::LowDisk,
+            severity: FleetAlertSeverity::Warning,
+            route: FleetAlertRoute::OperatorConsole,
+            evidence: FleetAlertEvidence {
+                metric_name: "disk_free_gb".to_string(),
+                observed_value: 8.0,
+                threshold_value: 10.0,
+                comparator: FleetAlertComparator::LessThanOrEqual,
+            },
+            message: "disk free capacity is below threshold".to_string(),
+            evaluated_at: chrono::DateTime::parse_from_rfc3339("2026-06-12T13:00:30Z")
+                .expect("valid timestamp")
+                .with_timezone(&chrono::Utc),
+        }
     }
 
     fn indicator_sample(
