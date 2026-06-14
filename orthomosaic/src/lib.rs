@@ -593,6 +593,36 @@ pub struct DsmRaster {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DtmConfig {
+    pub max_ground_elevation_m: f64,
+    pub min_ground_support_count: u32,
+    pub interpolation_radius_cells: u32,
+    pub nodata_value: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DtmGroundClassification {
+    Ground,
+    NonGround,
+    NoData,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DtmRaster {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub elevation_m: Vec<f64>,
+    pub ground_classification: Vec<DtmGroundClassification>,
+    pub low_confidence_mask: Vec<bool>,
+    pub nodata_mask: Vec<bool>,
+    pub extent_round_trips: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ReprojectionReportConfig {
     pub max_overall_rms_error_px: f64,
     pub max_camera_error_px: f64,
@@ -1022,6 +1052,22 @@ pub enum DsmError {
     NonFinitePoint,
     #[error("georeferencing-error: {reason}")]
     GeoreferencingError { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DtmError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("DTM config field {field} must be finite")]
+    NonFiniteConfig { field: &'static str },
+    #[error("DTM min_ground_support_count must be positive")]
+    InvalidGroundSupport,
+    #[error("DSM raster dimensions do not match cell arrays")]
+    DsmCellCountMismatch,
+    #[error("DSM raster contains a non-finite elevation")]
+    NonFiniteElevation,
+    #[error("DSM spatial_ref is invalid: {reason}")]
+    InvalidSpatialRef { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1795,6 +1841,90 @@ pub fn generate_dsm(
     })
 }
 
+pub fn derive_dtm_from_dsm(
+    dsm: &DsmRaster,
+    config: DtmConfig,
+    generated_at: String,
+) -> Result<DtmRaster, DtmError> {
+    validate_dtm_config(&config)?;
+    let generated_at =
+        normalize_optional_text(Some(generated_at)).ok_or(DtmError::EmptyGeneratedAt)?;
+    let cell_count = dsm.width_px as usize * dsm.height_px as usize;
+    if dsm.elevation_m.len() != cell_count
+        || dsm.point_support_counts.len() != cell_count
+        || dsm.nodata_mask.len() != cell_count
+    {
+        return Err(DtmError::DsmCellCountMismatch);
+    }
+    if dsm
+        .elevation_m
+        .iter()
+        .zip(dsm.nodata_mask.iter())
+        .any(|(elevation, nodata)| !*nodata && !elevation.is_finite())
+    {
+        return Err(DtmError::NonFiniteElevation);
+    }
+    let spatial_ref =
+        assert_raster_spatial_ref(Some(&dsm.spatial_ref), dsm.width_px, dsm.height_px).map_err(
+            |error| DtmError::InvalidSpatialRef {
+                reason: error.to_string(),
+            },
+        )?;
+
+    let mut elevation_m = vec![config.nodata_value; cell_count];
+    let mut ground_classification = vec![DtmGroundClassification::NoData; cell_count];
+    let mut low_confidence_mask = vec![true; cell_count];
+    let mut nodata_mask = vec![true; cell_count];
+    let ground_indices = dsm
+        .elevation_m
+        .iter()
+        .enumerate()
+        .filter_map(|(index, elevation)| {
+            let is_ground = !dsm.nodata_mask[index]
+                && dsm.point_support_counts[index] >= config.min_ground_support_count
+                && *elevation <= config.max_ground_elevation_m;
+            is_ground.then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    for index in 0..cell_count {
+        if dsm.nodata_mask[index] {
+            continue;
+        }
+        if ground_indices.contains(&index) {
+            elevation_m[index] = dsm.elevation_m[index];
+            ground_classification[index] = DtmGroundClassification::Ground;
+            low_confidence_mask[index] = false;
+            nodata_mask[index] = false;
+            continue;
+        }
+
+        ground_classification[index] = DtmGroundClassification::NonGround;
+        if let Some(ground_index) = nearest_ground_index(
+            index,
+            &ground_indices,
+            dsm.width_px,
+            config.interpolation_radius_cells,
+        ) {
+            elevation_m[index] = dsm.elevation_m[ground_index];
+            nodata_mask[index] = false;
+        }
+    }
+
+    Ok(DtmRaster {
+        frame_set_id: dsm.frame_set_id.clone(),
+        generated_at,
+        width_px: dsm.width_px,
+        height_px: dsm.height_px,
+        spatial_ref,
+        elevation_m,
+        ground_classification,
+        low_confidence_mask,
+        nodata_mask,
+        extent_round_trips: true,
+    })
+}
+
 pub fn build_reprojection_error_report(
     sfm_report: &SparseSfmReport,
     config: ReprojectionReportConfig,
@@ -2445,6 +2575,42 @@ fn validate_dsm_config(config: &DsmConfig) -> Result<(), DsmError> {
     Ok(())
 }
 
+fn validate_dtm_config(config: &DtmConfig) -> Result<(), DtmError> {
+    for (field, value) in [
+        ("max_ground_elevation_m", config.max_ground_elevation_m),
+        ("nodata_value", config.nodata_value),
+    ] {
+        if !value.is_finite() {
+            return Err(DtmError::NonFiniteConfig { field });
+        }
+    }
+    if config.min_ground_support_count == 0 {
+        return Err(DtmError::InvalidGroundSupport);
+    }
+    Ok(())
+}
+
+fn nearest_ground_index(
+    index: usize,
+    ground_indices: &[usize],
+    width_px: u32,
+    radius_cells: u32,
+) -> Option<usize> {
+    let width = width_px as i64;
+    let x = index as i64 % width;
+    let y = index as i64 / width;
+    ground_indices
+        .iter()
+        .filter_map(|candidate| {
+            let candidate_x = *candidate as i64 % width;
+            let candidate_y = *candidate as i64 / width;
+            let distance = (candidate_x - x).abs().max((candidate_y - y).abs());
+            (distance <= radius_cells as i64).then_some((*candidate, distance))
+        })
+        .min_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))
+        .map(|(candidate, _)| candidate)
+}
+
 fn validate_reprojection_report_config(
     config: ReprojectionReportConfig,
 ) -> Result<(), ReprojectionReportError> {
@@ -3057,11 +3223,12 @@ mod tests {
     use super::{
         balance_mosaic_seamlines_and_exposure, build_frame_set_record, build_reconstruction_job,
         build_reconstruction_progress_event, build_reprojection_error_report,
-        build_tiled_output_handoff, densify_sparse_reconstruction, detect_reconstruction_stall,
-        generate_dsm, reconstruction_progress_stream, run_feature_matching, run_frame_set_qa,
-        run_orthorectified_mosaic, run_sparse_sfm, transition_reconstruction_status, CameraExif,
-        CameraImuPose, DensePoint, DensePointCloud, DenseReconstructionConfig,
-        DenseReconstructionError, DsmConfig, FeatureMatchingConfig, FieldCoverageExtent,
+        build_tiled_output_handoff, densify_sparse_reconstruction, derive_dtm_from_dsm,
+        detect_reconstruction_stall, generate_dsm, reconstruction_progress_stream,
+        run_feature_matching, run_frame_set_qa, run_orthorectified_mosaic, run_sparse_sfm,
+        transition_reconstruction_status, CameraExif, CameraImuPose, DensePoint, DensePointCloud,
+        DenseReconstructionConfig, DenseReconstructionError, DsmConfig, DtmConfig,
+        DtmGroundClassification, FeatureMatchingConfig, FieldCoverageExtent,
         FrameExposureObservation, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
         FrameSetIngestRequest, FrameSetQaConfig, GcpMarkedImagePoint, GcpRegistrationError,
         GcpRegistrationRequest, GcpSurveyedCoordinate, GroundControlPoint, MosaicProvenanceRecord,
@@ -3759,6 +3926,61 @@ mod tests {
     }
 
     #[test]
+    fn dtm_derivation_filters_ground_and_preserves_geospatial_extent() {
+        let dsm = generate_dsm(
+            &dense_cloud_fixture(),
+            dsm_config(),
+            "2026-06-01T12:05:00Z".to_string(),
+        )
+        .expect("DSM should generate");
+
+        let dtm = derive_dtm_from_dsm(&dsm, dtm_config(), "2026-06-01T12:05:30Z".to_string())
+            .expect("DTM should derive from DSM");
+
+        assert_eq!(dtm.frame_set_id, "frame-set-qa");
+        assert_eq!(dtm.width_px, dsm.width_px);
+        assert_eq!(dtm.height_px, dsm.height_px);
+        assert_eq!(dtm.spatial_ref, dsm.spatial_ref);
+        assert!(dtm.extent_round_trips);
+        assert_eq!(
+            dtm.ground_classification[3],
+            DtmGroundClassification::Ground
+        );
+        assert_close(dtm.elevation_m[3], 90.0);
+        assert!(!dtm.nodata_mask[0]);
+        assert!(dtm.low_confidence_mask[0]);
+        assert_eq!(
+            dtm.ground_classification[0],
+            DtmGroundClassification::NonGround
+        );
+    }
+
+    #[test]
+    fn dtm_derivation_marks_canopy_only_cells_low_confidence_nodata() {
+        let dsm = generate_dsm(
+            &canopy_only_dense_cloud_fixture(),
+            dsm_config(),
+            "2026-06-01T12:05:00Z".to_string(),
+        )
+        .expect("DSM should generate");
+
+        let dtm = derive_dtm_from_dsm(&dsm, dtm_config(), "2026-06-01T12:05:30Z".to_string())
+            .expect("DTM should derive without fabricating ground");
+
+        assert!(dtm.nodata_mask[0]);
+        assert!(dtm.low_confidence_mask[0]);
+        assert_eq!(
+            dtm.ground_classification[0],
+            DtmGroundClassification::NonGround
+        );
+        assert_eq!(dtm.elevation_m[0], dtm_config().nodata_value);
+        assert!(dtm
+            .ground_classification
+            .iter()
+            .all(|class| *class != DtmGroundClassification::Ground));
+    }
+
+    #[test]
     fn reprojection_report_passes_known_residual_scene() {
         let (_, _, sfm) = solved_sfm_fixture();
 
@@ -4131,6 +4353,36 @@ mod tests {
         }
     }
 
+    fn canopy_only_dense_cloud_fixture() -> DensePointCloud {
+        let points = vec![
+            DensePoint {
+                x_m: 5.0,
+                y_m: 15.0,
+                z_m: 140.0,
+            },
+            DensePoint {
+                x_m: 6.0,
+                y_m: 16.0,
+                z_m: 142.0,
+            },
+        ];
+        DensePointCloud {
+            frame_set_id: "frame-set-qa".to_string(),
+            generated_at: "2026-06-01T12:04:00Z".to_string(),
+            crs: "EPSG:32614".to_string(),
+            extent: GeoBounds {
+                min_lat: 0.0,
+                min_lon: 0.0,
+                max_lat: 20.0,
+                max_lon: 20.0,
+            },
+            point_count: points.len(),
+            density_points_per_square_m: points.len() as f64 / 400.0,
+            extent_round_trips: true,
+            points,
+        }
+    }
+
     fn dsm_config() -> DsmConfig {
         DsmConfig {
             output_crs: "EPSG:32614".to_string(),
@@ -4139,6 +4391,15 @@ mod tests {
             min_y_m: 0.0,
             max_x_m: 20.0,
             max_y_m: 20.0,
+            nodata_value: -9999.0,
+        }
+    }
+
+    fn dtm_config() -> DtmConfig {
+        DtmConfig {
+            max_ground_elevation_m: 95.0,
+            min_ground_support_count: 1,
+            interpolation_radius_cells: 2,
             nodata_value: -9999.0,
         }
     }
