@@ -4322,11 +4322,20 @@ pub struct WorkOrderCreateRequest {
     pub due: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkOrderQueueQuery {
+    pub org_id: String,
+    pub assignee_user_id: String,
+    #[serde(default)]
+    pub statuses: Vec<WorkOrderStatus>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkOrderChangeType {
     Created,
     StatusChanged,
+    Reassigned,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4367,6 +4376,14 @@ pub enum WorkOrderPersistenceError {
     InvalidStatusTransition {
         from: WorkOrderStatus,
         to: WorkOrderStatus,
+    },
+    #[error(
+        "assignee {assignee_user_id} belongs to org {actual_org_id}, expected {expected_org_id}"
+    )]
+    AssigneeOrgMismatch {
+        assignee_user_id: String,
+        expected_org_id: String,
+        actual_org_id: String,
     },
 }
 
@@ -4472,6 +4489,63 @@ impl WorkOrderRegistry {
         Ok(work_order)
     }
 
+    pub fn reassign_work_order(
+        &mut self,
+        org_id: &str,
+        work_order_id: &str,
+        actor_user_id: &str,
+        assignee_user_id: &str,
+        assignee_org_id: &str,
+        at: &str,
+    ) -> Result<WorkOrderRecord, WorkOrderPersistenceError> {
+        let org_id = normalize_work_order_arg(org_id, WorkOrderPersistenceError::EmptyOrgId)?;
+        let work_order_id =
+            normalize_work_order_arg(work_order_id, WorkOrderPersistenceError::EmptyWorkOrderId)?;
+        let actor_user_id =
+            normalize_work_order_arg(actor_user_id, WorkOrderPersistenceError::EmptyActorUserId)?;
+        let assignee_user_id = normalize_work_order_arg(
+            assignee_user_id,
+            WorkOrderPersistenceError::EmptyAssigneeUserId,
+        )?;
+        let assignee_org_id =
+            normalize_work_order_arg(assignee_org_id, WorkOrderPersistenceError::EmptyOrgId)?;
+        let at = normalize_work_order_arg(at, WorkOrderPersistenceError::EmptyTimestamp)?;
+        let before = self.work_order_for_org(&org_id, &work_order_id)?;
+        if assignee_org_id != org_id {
+            self.history.push(WorkOrderChangeRecord {
+                work_order_id: work_order_id.clone(),
+                actor_user_id,
+                before: Some(before.status),
+                after: before.status,
+                at,
+                change_type: WorkOrderChangeType::Reassigned,
+            });
+            return Err(WorkOrderPersistenceError::AssigneeOrgMismatch {
+                assignee_user_id,
+                expected_org_id: org_id,
+                actual_org_id: assignee_org_id,
+            });
+        }
+
+        let mut after = before.clone();
+        if after.status == WorkOrderStatus::Created {
+            after.status = WorkOrderStatus::Assigned;
+        }
+        after.assignee_user_id = Some(assignee_user_id);
+        after.updated_at = at.clone();
+        self.work_orders
+            .insert(work_order_id.clone(), after.clone());
+        self.history.push(WorkOrderChangeRecord {
+            work_order_id,
+            actor_user_id,
+            before: Some(before.status),
+            after: after.status,
+            at,
+            change_type: WorkOrderChangeType::Reassigned,
+        });
+        Ok(after)
+    }
+
     pub fn transition_work_order_status(
         &mut self,
         org_id: &str,
@@ -4508,6 +4582,31 @@ impl WorkOrderRegistry {
             change_type: WorkOrderChangeType::StatusChanged,
         });
         Ok(after)
+    }
+
+    pub fn operator_work_order_queue(&self, query: WorkOrderQueueQuery) -> Vec<WorkOrderRecord> {
+        let Some(org_id) = normalize_farm_field_text(query.org_id) else {
+            return Vec::new();
+        };
+        let Some(assignee_user_id) = normalize_farm_field_text(query.assignee_user_id) else {
+            return Vec::new();
+        };
+        let mut work_orders = self
+            .work_orders
+            .values()
+            .filter(|work_order| work_order.org_id == org_id)
+            .filter(|work_order| work_order.assignee_user_id.as_deref() == Some(&assignee_user_id))
+            .filter(|work_order| {
+                query.statuses.is_empty() || query.statuses.contains(&work_order.status)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        work_orders.sort_by(|left, right| {
+            left.due
+                .cmp(&right.due)
+                .then_with(|| left.work_order_id.cmp(&right.work_order_id))
+        });
+        work_orders
     }
 
     pub fn work_orders_for_org(&self, org_id: &str) -> Vec<WorkOrderRecord> {
@@ -5123,7 +5222,8 @@ mod tests {
         TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
         TractorRegistrationRequest, TractorRegistry, WeatherIngestError,
         WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
+        WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -7703,6 +7803,96 @@ mod tests {
     }
 
     #[test]
+    fn work_order_queue_scopes_by_operator_org_and_status() {
+        let mut registry = WorkOrderRegistry::default();
+        create_assigned_work_order(
+            &mut registry,
+            "wo-1",
+            "rec-1",
+            "org-a",
+            "field-1",
+            "operator-1",
+            "2026-05-10",
+        );
+        create_assigned_work_order(
+            &mut registry,
+            "wo-2",
+            "rec-2",
+            "org-a",
+            "field-1",
+            "operator-2",
+            "2026-05-08",
+        );
+        create_assigned_work_order(
+            &mut registry,
+            "wo-3",
+            "rec-3",
+            "org-b",
+            "field-2",
+            "operator-1",
+            "2026-05-06",
+        );
+
+        let queue = registry.operator_work_order_queue(WorkOrderQueueQuery {
+            org_id: "org-a".to_string(),
+            assignee_user_id: "operator-1".to_string(),
+            statuses: vec![WorkOrderStatus::Assigned],
+        });
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].work_order_id, "wo-1");
+        assert_eq!(queue[0].org_id, "org-a");
+        assert_eq!(queue[0].assignee_user_id.as_deref(), Some("operator-1"));
+        assert_eq!(queue[0].status, WorkOrderStatus::Assigned);
+    }
+
+    #[test]
+    fn work_order_reassignment_rejects_cross_org_assignee_and_audits() {
+        let mut registry = WorkOrderRegistry::default();
+        create_assigned_work_order(
+            &mut registry,
+            "wo-1",
+            "rec-1",
+            "org-a",
+            "field-1",
+            "operator-1",
+            "2026-05-10",
+        );
+
+        let error = registry
+            .reassign_work_order(
+                "org-a",
+                "wo-1",
+                "manager-1",
+                "operator-foreign",
+                "org-b",
+                "2026-05-05T12:00:00Z",
+            )
+            .expect_err("cross-org reassignment is rejected");
+
+        assert_eq!(
+            error,
+            WorkOrderPersistenceError::AssigneeOrgMismatch {
+                assignee_user_id: "operator-foreign".to_string(),
+                expected_org_id: "org-a".to_string(),
+                actual_org_id: "org-b".to_string(),
+            }
+        );
+        let queue = registry.operator_work_order_queue(WorkOrderQueueQuery {
+            org_id: "org-a".to_string(),
+            assignee_user_id: "operator-1".to_string(),
+            statuses: vec![WorkOrderStatus::Assigned],
+        });
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].assignee_user_id.as_deref(), Some("operator-1"));
+
+        let history = registry.work_order_history("org-a", "wo-1");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].change_type, WorkOrderChangeType::Reassigned);
+        assert_eq!(history[2].actor_user_id, "manager-1");
+    }
+
+    #[test]
     fn work_order_without_source_recommendation_is_rejected() {
         let mut registry = WorkOrderRegistry::default();
         let error = registry
@@ -7756,6 +7946,40 @@ mod tests {
                 to: WorkOrderStatus::Done
             }
         );
+    }
+
+    fn create_assigned_work_order(
+        registry: &mut WorkOrderRegistry,
+        work_order_id: &str,
+        recommendation_id: &str,
+        org_id: &str,
+        field_id: &str,
+        assignee_user_id: &str,
+        due: &str,
+    ) -> WorkOrderRecord {
+        let mut recommendation = open_recommendation();
+        recommendation.recommendation_id = recommendation_id.to_string();
+        recommendation.org_id = org_id.to_string();
+        recommendation.field_id = Some(field_id.to_string());
+        registry
+            .create_work_order_from_recommendation(WorkOrderCreateRequest {
+                work_order_id: work_order_id.to_string(),
+                source_recommendation: Some(recommendation),
+                actor_user_id: "manager-1".to_string(),
+                created_at: "2026-05-04T00:00:00Z".to_string(),
+                assignee_user_id: None,
+                due: Some(due.to_string()),
+            })
+            .expect("work order persists");
+        registry
+            .assign_work_order(
+                org_id,
+                work_order_id,
+                "manager-1",
+                assignee_user_id,
+                "2026-05-05T00:00:00Z",
+            )
+            .expect("assignment persists")
     }
 
     fn open_recommendation() -> RecommendationRecord {
