@@ -1,6 +1,6 @@
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// GPS coordinates
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -315,12 +315,14 @@ impl std::str::FromStr for FleetNodeRuntimeMode {
 #[serde(rename_all = "snake_case")]
 pub enum FleetNodeStatus {
     Enrolled,
+    Maintenance,
 }
 
 impl FleetNodeStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             FleetNodeStatus::Enrolled => "enrolled",
+            FleetNodeStatus::Maintenance => "maintenance",
         }
     }
 }
@@ -331,6 +333,7 @@ impl std::str::FromStr for FleetNodeStatus {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "enrolled" => Ok(FleetNodeStatus::Enrolled),
+            "maintenance" => Ok(FleetNodeStatus::Maintenance),
             _ => Err(FleetNodeEnrollmentError::UnsupportedStatus {
                 value: value.to_string(),
             }),
@@ -2421,6 +2424,49 @@ pub struct FleetHeartbeatEvaluation {
     pub health: FleetNodeHealthSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetNodeInventoryEntry {
+    pub node_id: String,
+    pub owner_org_id: String,
+    pub kind: FleetNodeKind,
+    pub runtime_mode: FleetNodeRuntimeMode,
+    pub status: FleetNodeStatus,
+    pub maintenance: bool,
+    pub version: Option<String>,
+    pub config_version: Option<u64>,
+    pub components: Vec<FleetNodeComponentStatus>,
+    pub capabilities: Vec<String>,
+    pub health_state: Option<FleetNodeHealthState>,
+    pub heartbeat_age_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetInventoryFilter {
+    #[serde(default)]
+    pub owner_org_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<FleetNodeStatus>,
+    #[serde(default)]
+    pub runtime_mode: Option<FleetNodeRuntimeMode>,
+    #[serde(default)]
+    pub include_maintenance: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetVersionInventory {
+    pub entries: Vec<FleetNodeInventoryEntry>,
+}
+
+impl FleetVersionInventory {
+    pub fn rollout_target_node_ids(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.maintenance)
+            .map(|entry| entry.node_id.clone())
+            .collect()
+    }
+}
+
 impl FleetHeartbeatEvaluation {
     pub fn from_heartbeat(
         record: &FleetNodeRecord,
@@ -2510,6 +2556,67 @@ pub fn apply_fleet_node_heartbeat(
             state,
         },
     })
+}
+
+pub fn build_fleet_version_inventory(
+    records: &[FleetNodeRecord],
+    health_snapshots: &[FleetNodeHealthSnapshot],
+    filter: FleetInventoryFilter,
+) -> FleetVersionInventory {
+    let health_by_node = health_snapshots
+        .iter()
+        .map(|health| (health.node_id.as_str(), health))
+        .collect::<BTreeMap<_, _>>();
+    let owner_filter = filter
+        .owner_org_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut entries = records
+        .iter()
+        .filter(|record| owner_filter.is_none_or(|owner| record.owner_org_id == owner))
+        .filter(|record| filter.status.is_none_or(|status| record.status == status))
+        .filter(|record| {
+            filter
+                .runtime_mode
+                .is_none_or(|mode| record.runtime_mode == mode)
+        })
+        .filter(|record| {
+            filter.include_maintenance || record.status != FleetNodeStatus::Maintenance
+        })
+        .map(|record| {
+            let health = health_by_node.get(record.node_id.as_str()).copied();
+            FleetNodeInventoryEntry {
+                node_id: record.node_id.clone(),
+                owner_org_id: record.owner_org_id.clone(),
+                kind: record.kind,
+                runtime_mode: health
+                    .map(|snapshot| snapshot.runtime_mode)
+                    .unwrap_or(record.runtime_mode),
+                status: record.status,
+                maintenance: record.status == FleetNodeStatus::Maintenance,
+                version: health.map(|snapshot| snapshot.version.clone()),
+                config_version: health.map(|snapshot| snapshot.config_version),
+                components: health
+                    .map(|snapshot| snapshot.components.clone())
+                    .unwrap_or_default(),
+                capabilities: health
+                    .map(|snapshot| snapshot.capabilities.clone())
+                    .unwrap_or_else(|| record.capabilities.clone()),
+                health_state: health.map(|snapshot| snapshot.state),
+                heartbeat_age_seconds: health.map(|snapshot| snapshot.heartbeat_age_seconds),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|left, right| {
+        left.owner_org_id
+            .cmp(&right.owner_org_id)
+            .then(left.node_id.cmp(&right.node_id))
+    });
+
+    FleetVersionInventory { entries }
 }
 
 pub fn assert_flight_operation_allowed(
@@ -4985,37 +5092,38 @@ mod tests {
     use super::{
         append_content_version, apply_fleet_node_heartbeat, assert_flight_operation_allowed,
         assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-        build_collaboration_channel, build_collaboration_message, build_marketplace_account_record,
-        build_soil_moisture_reading, build_sustainability_record, compute_drought_index,
-        create_versioned_content, normalize_weather_provider_forecast, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, transition_marketplace_account_status,
-        validate_field_boundary, verify_and_apply_fleet_config_bundle,
-        weather_fetch_failure_record, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
+        build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
+        compute_drought_index, create_versioned_content, normalize_weather_provider_forecast,
+        sign_fleet_config_bundle, soil_moisture_rejection_record,
+        transition_marketplace_account_status, validate_field_boundary,
+        verify_and_apply_fleet_config_bundle, weather_fetch_failure_record,
+        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
+        AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
         CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
         ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
         DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
         FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
         FieldBoundary, FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus,
         FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeEnrollmentError,
-        FleetNodeEnrollmentRequest, FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind,
-        FleetNodeOperationError, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds,
-        GeoPoint, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, RasterResolution,
-        RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
-        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
-        RecommendationStatus, RecommendationStatusChangeType, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
-        SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
-        SoilMoistureRejectionReason, SustainabilityMetricType, SustainabilityRecordCreateRequest,
-        SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
-        TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
-        TractorMotionCommandRequest, TractorRegistrationRequest, TractorRegistry,
-        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
-        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry,
-        WorkOrderStatus,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
+        MarketplacePartyType, MultispectralImage, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, ReportDeliverableRegistry, ReportFormat,
+        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
+        SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
+        SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+        SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
+        TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
+        TractorRegistrationRequest, TractorRegistry, WeatherIngestError,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -5158,6 +5266,74 @@ mod tests {
         assert_eq!(stale.health.heartbeat_age_seconds, 20);
         assert_eq!(down.health.state, FleetNodeHealthState::Down);
         assert_eq!(down.health.heartbeat_age_seconds, 70);
+    }
+
+    #[test]
+    fn fleet_version_inventory_aggregates_versions_and_excludes_maintenance_rollouts() {
+        let active = sample_fleet_node(FleetNodeRuntimeMode::Flight);
+        let mut maintenance = sample_fleet_node(FleetNodeRuntimeMode::Simulation);
+        maintenance.node_id = "node-maint".to_string();
+        maintenance.hardware_id = "hw-edge-maint".to_string();
+        maintenance.kind = FleetNodeKind::Edge;
+        maintenance.status = FleetNodeStatus::Maintenance;
+
+        let active_health = apply_fleet_node_heartbeat(
+            &active,
+            sample_fleet_heartbeat("2026-06-12T12:00:00Z", FleetNodeRuntimeMode::Flight),
+            dt("2026-06-12T12:00:05Z"),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("active node heartbeat evaluates")
+        .health;
+        let mut maintenance_health = active_health.clone();
+        maintenance_health.node_id = maintenance.node_id.clone();
+        maintenance_health.version = "agbot-node 1.3.2".to_string();
+        maintenance_health.runtime_mode = FleetNodeRuntimeMode::Simulation;
+        maintenance_health.state = FleetNodeHealthState::Stale;
+
+        let default_inventory = build_fleet_version_inventory(
+            &[active.clone(), maintenance.clone()],
+            &[active_health.clone(), maintenance_health.clone()],
+            FleetInventoryFilter::default(),
+        );
+
+        assert_eq!(default_inventory.entries.len(), 1);
+        assert_eq!(default_inventory.entries[0].node_id, "node-001");
+        assert_eq!(
+            default_inventory.entries[0].version.as_deref(),
+            Some("agbot-node 1.4.0")
+        );
+        assert_eq!(default_inventory.entries[0].config_version, Some(7));
+        assert_eq!(
+            default_inventory.rollout_target_node_ids(),
+            vec!["node-001".to_string()]
+        );
+
+        let full_inventory = build_fleet_version_inventory(
+            &[active, maintenance],
+            &[active_health, maintenance_health],
+            FleetInventoryFilter {
+                include_maintenance: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(full_inventory.entries.len(), 2);
+        let maintenance_entry = full_inventory
+            .entries
+            .iter()
+            .find(|entry| entry.node_id == "node-maint")
+            .expect("maintenance node is included when requested");
+        assert!(maintenance_entry.maintenance);
+        assert_eq!(
+            maintenance_entry.version.as_deref(),
+            Some("agbot-node 1.3.2")
+        );
+        assert_eq!(
+            full_inventory.rollout_target_node_ids(),
+            vec!["node-001".to_string()]
+        );
     }
 
     #[test]
