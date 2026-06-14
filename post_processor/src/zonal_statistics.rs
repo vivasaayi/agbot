@@ -1,5 +1,6 @@
 use crate::evidence::{evidence_parameters, make_analysis_evidence};
 use crate::AnalysisStatistics;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use shared::schemas::{
     assert_raster_spatial_ref, GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
@@ -7,7 +8,7 @@ use shared::schemas::{
 use std::collections::HashMap;
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductGrid {
     pub width: u32,
     pub height: u32,

@@ -10,6 +10,9 @@ use uuid::Uuid;
 pub mod evidence;
 pub mod findings_export;
 pub mod grower_report;
+pub mod index_anomaly;
+pub mod index_trend;
+pub mod index_vegetation_classification;
 pub mod lidar_analysis;
 pub mod ndvi_analysis;
 pub mod product_anomalies;
@@ -28,6 +31,22 @@ pub use findings_export::{
 pub use grower_report::{
     render_grower_ready_pdf, FieldReportMetadata, GrowerReportError, GrowerReportRequest,
     SceneReportMetadata,
+};
+pub use index_anomaly::{
+    analyze_index_anomalies, IndexAnomalyDecision, IndexAnomalyError, IndexAnomalyRequest,
+    INDEX_ANOMALY_FEATURE_FLAG_KEY, INDEX_ANOMALY_PAYLOAD_KEY,
+};
+pub use index_trend::{
+    analyze_index_trend, IndexTrendCalibrationStatus, IndexTrendDecision, IndexTrendError,
+    IndexTrendRequest, INDEX_TREND_FEATURE_FLAG_KEY, INDEX_TREND_PAYLOAD_KEY,
+};
+pub use index_vegetation_classification::{
+    analyze_index_vegetation_type_classification, IndexVegetationTypeClassificationError,
+    IndexVegetationTypeClassificationRequest, IndexVegetationTypeClassificationResult,
+    IndexVegetationTypeClassificationSnapshot, VegetationTypeClassZone,
+    VegetationTypeClassificationClassStat, VegetationTypeClassificationDecision,
+    VegetationTypeSignature, INDEX_VEGETATION_CLASSIFICATION_FEATURE_FLAG_KEY,
+    INDEX_VEGETATION_CLASSIFICATION_PAYLOAD_KEY,
 };
 pub use lidar_analysis::{LidarAnalysisConfig, LidarAnalysisProcessor};
 pub use ndvi_analysis::{NdviAnalysisConfig, NdviAnalysisProcessor};
@@ -122,6 +141,9 @@ pub enum JobType {
     CompositeReport,
     HealthAssessment,
     YieldPrediction,
+    IndexAnomalyDetection,
+    IndexTrendAdvisory,
+    IndexVegetationTypeClassification,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,7 +223,7 @@ pub struct AnalysisResultListPage {
     pub page_size: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ResultType {
     NdviMap,
     ElevationModel,
@@ -498,6 +520,11 @@ impl PostProcessorService {
             JobType::CompositeReport => self.generate_composite_report(job).await,
             JobType::HealthAssessment => self.assess_crop_health(job).await,
             JobType::YieldPrediction => self.predict_yield(job).await,
+            JobType::IndexAnomalyDetection => self.analyze_index_anomaly(job).await,
+            JobType::IndexTrendAdvisory => self.analyze_index_trend(job).await,
+            JobType::IndexVegetationTypeClassification => {
+                self.analyze_index_vegetation_type_classification(job).await
+            }
         }
     }
 
@@ -721,6 +748,263 @@ impl PostProcessorService {
         Ok(result)
     }
 
+    async fn analyze_index_trend(&self, job: &ProcessingJob) -> Result<AnalysisResult> {
+        self.ensure_index_trend_feature_enabled(job)?;
+        let request = self.resolve_index_trend_request(job)?;
+        let trend = analyze_index_trend(request).map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        let (result_data, statistics) = match trend.decision {
+            IndexTrendDecision::Available { .. } => {
+                let stats = trend
+                    .delta_statistics
+                    .expect("available trend must include statistics");
+                (
+                    ResultData::GridData {
+                        width: trend.width,
+                        height: trend.height,
+                        values: trend.delta_values.unwrap_or_default(),
+                        bounds: (
+                            trend.common_extent.min_lon,
+                            trend.common_extent.min_lat,
+                            trend.common_extent.max_lon,
+                            trend.common_extent.max_lat,
+                        ),
+                        units: "index_delta".to_string(),
+                    },
+                    stats.statistics,
+                )
+            }
+            IndexTrendDecision::LowConfidence { .. } | IndexTrendDecision::Unavailable { .. } => (
+                ResultData::ZonalData {
+                    zones: Vec::new(),
+                    aggregated_values: HashMap::from([
+                        ("coverage_fraction".to_string(), trend.coverage_fraction),
+                        ("available".to_string(), 0.0),
+                    ]),
+                },
+                AnalysisStatistics {
+                    min_value: 0.0,
+                    max_value: 0.0,
+                    mean_value: 0.0,
+                    std_deviation: 0.0,
+                    percentiles: HashMap::new(),
+                    coverage_area_m2: 0.0,
+                    valid_pixel_count: 0,
+                    total_pixel_count: trend.width.saturating_mul(trend.height),
+                },
+            ),
+        };
+
+        Ok(AnalysisResult {
+            id: Uuid::new_v4(),
+            job_id: job.id,
+            result_type: ResultType::StressIndicators,
+            data: result_data,
+            statistics,
+            visualizations: Vec::new(),
+            recommendations: if trend.decision.label() == "unavailable" {
+                vec![Recommendation {
+                    category: RecommendationCategory::General,
+                    priority: Priority::Medium,
+                    title: "Index trend unavailable".to_string(),
+                    description: "Trend comparison was blocked by comparability constraints."
+                        .to_string(),
+                    action_items: Vec::new(),
+                    affected_areas: Vec::new(),
+                    confidence_score: 0.2,
+                }]
+            } else {
+                Vec::new()
+            },
+            evidence_refs: vec![trend.evidence_input_hash],
+            uncertainty: Some(trend.uncertainty),
+            created_at: Utc::now(),
+        })
+    }
+
+    async fn analyze_index_anomaly(&self, job: &ProcessingJob) -> Result<AnalysisResult> {
+        self.ensure_index_anomaly_feature_enabled(job)?;
+        let request = self.resolve_index_anomaly_request(job)?;
+        let anomaly =
+            analyze_index_anomalies(request).map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        let zone_count = anomaly.zones.len() as f32;
+        let (result_data, statistics) = match anomaly.decision {
+            IndexAnomalyDecision::Available { .. } => {
+                let stats = anomaly
+                    .layer_statistics
+                    .expect("available anomaly result must include statistics");
+                (
+                    ResultData::ZonalData {
+                        zones: anomaly
+                            .zones
+                            .into_iter()
+                            .map(|zone| AnalysisZone {
+                                id: zone.zone_id,
+                                boundary: zone.polygon.coordinates,
+                                area_m2: zone.area_m2,
+                                values: HashMap::from([("zone_area_m2".to_string(), zone.area_m2)]),
+                                classification: Some("index_anomaly".to_string()),
+                            })
+                            .collect(),
+                        aggregated_values: HashMap::from([
+                            ("anomaly_count".to_string(), anomaly.anomaly_count as f32),
+                            ("zone_count".to_string(), zone_count),
+                            ("coverage_fraction".to_string(), anomaly.coverage_fraction),
+                        ]),
+                    },
+                    stats.statistics,
+                )
+            }
+            IndexAnomalyDecision::Unavailable { .. } => (
+                ResultData::ZonalData {
+                    zones: Vec::new(),
+                    aggregated_values: HashMap::from([
+                        ("coverage_fraction".to_string(), anomaly.coverage_fraction),
+                        ("available".to_string(), 0.0),
+                    ]),
+                },
+                AnalysisStatistics {
+                    min_value: 0.0,
+                    max_value: 0.0,
+                    mean_value: 0.0,
+                    std_deviation: 0.0,
+                    percentiles: HashMap::new(),
+                    coverage_area_m2: 0.0,
+                    valid_pixel_count: 0,
+                    total_pixel_count: anomaly.width.saturating_mul(anomaly.height),
+                },
+            ),
+        };
+
+        Ok(AnalysisResult {
+            id: Uuid::new_v4(),
+            job_id: job.id,
+            result_type: ResultType::StressIndicators,
+            data: result_data,
+            statistics,
+            visualizations: Vec::new(),
+            recommendations: if anomaly.decision.label() == "unavailable" {
+                vec![Recommendation {
+                    category: RecommendationCategory::General,
+                    priority: Priority::Medium,
+                    title: "Index anomaly unavailable".to_string(),
+                    description: "Anomaly detection was blocked because index data is not georeferenced or lacks sufficient valid pixels.".to_string(),
+                    action_items: Vec::new(),
+                    affected_areas: Vec::new(),
+                    confidence_score: 0.2,
+                }]
+            } else {
+                Vec::new()
+            },
+            evidence_refs: vec![anomaly.evidence_input_hash],
+            uncertainty: Some(anomaly.uncertainty),
+            created_at: Utc::now(),
+        })
+    }
+
+    async fn analyze_index_vegetation_type_classification(
+        &self,
+        job: &ProcessingJob,
+    ) -> Result<AnalysisResult> {
+        self.ensure_index_vegetation_classification_feature_enabled(job)?;
+        let request = self.resolve_index_vegetation_type_classification_request(job)?;
+        let result = analyze_index_vegetation_type_classification(request)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        let (result_data, statistics) = match &result.decision {
+            VegetationTypeClassificationDecision::Available { .. }
+            | VegetationTypeClassificationDecision::LowConfidence { .. } => (
+                ResultData::ZonalData {
+                    zones: result
+                        .zones
+                        .into_iter()
+                        .map(|zone| AnalysisZone {
+                            id: zone.zone_id,
+                            boundary: zone.polygon,
+                            area_m2: zone.area_m2,
+                            values: HashMap::from([
+                                ("pixel_count".to_string(), zone.pixel_count as f32),
+                                ("mean_confidence".to_string(), zone.mean_confidence),
+                                ("coverage_fraction".to_string(), zone.coverage_fraction),
+                                (
+                                    "match_distance".to_string(),
+                                    zone.matched_signature_distance,
+                                ),
+                            ]),
+                            classification: Some(zone.class_name),
+                        })
+                        .collect(),
+                    aggregated_values: HashMap::from([
+                        ("coverage_fraction".to_string(), result.coverage_fraction),
+                        ("class_count".to_string(), result.class_stats.len() as f32),
+                        ("mean_confidence".to_string(), result.mean_confidence),
+                    ]),
+                },
+                AnalysisStatistics {
+                    min_value: 0.0,
+                    max_value: 1.0,
+                    mean_value: result.mean_confidence,
+                    std_deviation: 0.0,
+                    percentiles: HashMap::from([(
+                        "class_coverage".to_string(),
+                        result.coverage_fraction,
+                    )]),
+                    coverage_area_m2: result.width as f32 * result.height as f32,
+                    valid_pixel_count: (result.coverage_fraction
+                        * (result.width as f32 * result.height as f32))
+                        .round() as u32,
+                    total_pixel_count: result.width.saturating_mul(result.height),
+                },
+            ),
+            VegetationTypeClassificationDecision::Unavailable { .. } => (
+                ResultData::ZonalData {
+                    zones: Vec::new(),
+                    aggregated_values: HashMap::from([
+                        ("coverage_fraction".to_string(), result.coverage_fraction),
+                        ("available".to_string(), 0.0),
+                    ]),
+                },
+                AnalysisStatistics {
+                    min_value: 0.0,
+                    max_value: 0.0,
+                    mean_value: 0.0,
+                    std_deviation: 0.0,
+                    percentiles: HashMap::new(),
+                    coverage_area_m2: 0.0,
+                    valid_pixel_count: 0,
+                    total_pixel_count: result.width.saturating_mul(result.height),
+                },
+            ),
+        };
+
+        Ok(AnalysisResult {
+            id: Uuid::new_v4(),
+            job_id: job.id,
+            result_type: ResultType::StressIndicators,
+            data: result_data,
+            statistics,
+            visualizations: Vec::new(),
+            recommendations: if result.decision.label() == "unavailable" {
+                vec![Recommendation {
+                    category: RecommendationCategory::General,
+                    priority: Priority::Medium,
+                    title: "Vegetation-type classification unavailable".to_string(),
+                    description: "Classification was blocked by data comparability constraints."
+                        .to_string(),
+                    action_items: Vec::new(),
+                    affected_areas: Vec::new(),
+                    confidence_score: 0.2,
+                }]
+            } else {
+                Vec::new()
+            },
+            evidence_refs: vec![result.evidence_input_hash],
+            uncertainty: Some(result.uncertainty),
+            created_at: Utc::now(),
+        })
+    }
+
     fn resolve_yield_product_refs(&self, job: &ProcessingJob) -> Result<Vec<String>> {
         let identity = self
             .analysis_job_identities
@@ -765,6 +1049,113 @@ impl PostProcessorService {
         if !enabled {
             return Err(anyhow::anyhow!(
                 "crop yield prediction is disabled until feature flag is enabled"
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_index_anomaly_request(&self, job: &ProcessingJob) -> Result<IndexAnomalyRequest> {
+        let _identity = self.analysis_job_identities.get(&job.id).ok_or_else(|| {
+            anyhow::anyhow!("missing analysis identity for index anomaly detection")
+        })?;
+
+        let payload = job
+            .parameters
+            .custom_parameters
+            .get(INDEX_ANOMALY_PAYLOAD_KEY)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "index anomaly request requires '{}' payload",
+                    INDEX_ANOMALY_PAYLOAD_KEY
+                )
+            })?;
+        serde_json::from_value(payload.clone())
+            .map_err(|error| anyhow::anyhow!("invalid index anomaly payload: {error}"))
+    }
+
+    fn ensure_index_anomaly_feature_enabled(&self, job: &ProcessingJob) -> Result<()> {
+        let enabled = matches!(
+            job.parameters
+                .custom_parameters
+                .get(INDEX_ANOMALY_FEATURE_FLAG_KEY),
+            Some(value) if value.as_bool().unwrap_or(false)
+        );
+        if !enabled {
+            return Err(anyhow::anyhow!(
+                "index anomaly detection is disabled until feature flag is enabled"
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_index_vegetation_type_classification_request(
+        &self,
+        job: &ProcessingJob,
+    ) -> Result<IndexVegetationTypeClassificationRequest> {
+        let _identity = self.analysis_job_identities.get(&job.id).ok_or_else(|| {
+            anyhow::anyhow!("missing analysis identity for index vegetation classification")
+        })?;
+
+        let payload = job
+            .parameters
+            .custom_parameters
+            .get(INDEX_VEGETATION_CLASSIFICATION_PAYLOAD_KEY)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "index vegetation-type request requires '{}' payload",
+                    INDEX_VEGETATION_CLASSIFICATION_PAYLOAD_KEY
+                )
+            })?;
+        serde_json::from_value(payload.clone())
+            .map_err(|error| anyhow::anyhow!("invalid index vegetation-type payload: {error}"))
+    }
+
+    fn ensure_index_vegetation_classification_feature_enabled(
+        &self,
+        job: &ProcessingJob,
+    ) -> Result<()> {
+        let enabled = matches!(
+            job.parameters
+                .custom_parameters
+                .get(INDEX_VEGETATION_CLASSIFICATION_FEATURE_FLAG_KEY),
+            Some(value) if value.as_bool().unwrap_or(false)
+        );
+        if !enabled {
+            return Err(anyhow::anyhow!(
+                "index vegetation-type classification is disabled until feature flag is enabled"
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_index_trend_request(&self, job: &ProcessingJob) -> Result<IndexTrendRequest> {
+        let _identity = self
+            .analysis_job_identities
+            .get(&job.id)
+            .ok_or_else(|| anyhow::anyhow!("missing analysis identity for index trend advisory"))?;
+
+        let payload = job
+            .parameters
+            .custom_parameters
+            .get(INDEX_TREND_PAYLOAD_KEY)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "index trend request requires '{}' payload",
+                    INDEX_TREND_PAYLOAD_KEY
+                )
+            })?;
+        serde_json::from_value(payload.clone())
+            .map_err(|error| anyhow::anyhow!("invalid index trend payload: {error}"))
+    }
+
+    fn ensure_index_trend_feature_enabled(&self, job: &ProcessingJob) -> Result<()> {
+        let enabled = matches!(
+            job.parameters.custom_parameters.get(INDEX_TREND_FEATURE_FLAG_KEY),
+            Some(value) if value.as_bool().unwrap_or(false)
+        );
+        if !enabled {
+            return Err(anyhow::anyhow!(
+                "index trend advisory is disabled until feature flag is enabled"
             ));
         }
         Ok(())
@@ -1167,7 +1558,7 @@ mod tests {
     use serde_json::json;
     use shared::schemas::{
         FarmFieldEntityStatus, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord,
-        GeoBounds, GeoPoint, SceneRecord, SeasonRecord,
+        GeoBounds, GeoPoint, RasterResolution, SceneRecord, SeasonRecord,
     };
     use tempfile::tempdir;
 
@@ -1518,6 +1909,379 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_trend_advisory_requires_feature_flag() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::IndexTrendAdvisory;
+        request.parameters.custom_parameters.insert(
+            INDEX_TREND_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(trend_request()).expect("valid request"),
+        );
+        request
+            .parameters
+            .custom_parameters
+            .insert(INDEX_TREND_FEATURE_FLAG_KEY.to_string(), json!(false));
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let job_id = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("trend request is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted");
+        assert!(result.is_none());
+
+        let identity = service
+            .analysis_job_identity(&job_id)
+            .expect("identity exists after failure");
+        assert!(matches!(identity.status, JobStatus::Failed));
+        assert!(identity
+            .failure_reason
+            .as_ref()
+            .is_some_and(|message| message.contains("disabled")));
+    }
+
+    #[tokio::test]
+    async fn index_trend_advisory_produces_delta_for_comparable_calibrated_scenes() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::IndexTrendAdvisory;
+        request.parameters.custom_parameters.insert(
+            INDEX_TREND_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(trend_request()).expect("valid request"),
+        );
+        request
+            .parameters
+            .custom_parameters
+            .insert(INDEX_TREND_FEATURE_FLAG_KEY.to_string(), json!(true));
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let _ = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("trend request is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted")
+            .expect("trend result produced");
+
+        assert_eq!(result.result_type, ResultType::StressIndicators);
+        assert!(matches!(result.data, ResultData::GridData { .. }));
+        assert!(result.uncertainty.is_some());
+    }
+
+    #[tokio::test]
+    async fn index_trend_advisory_marks_low_confidence_when_uncalibrated() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::IndexTrendAdvisory;
+        let mut payload = trend_request();
+        payload.snapshots[0].calibration_status = IndexTrendCalibrationStatus::UncalibratedDn;
+        request.parameters.custom_parameters.insert(
+            INDEX_TREND_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(payload).expect("valid request"),
+        );
+        request
+            .parameters
+            .custom_parameters
+            .insert(INDEX_TREND_FEATURE_FLAG_KEY.to_string(), json!(true));
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let _ = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("trend request is accepted");
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted")
+            .expect("trend result produced");
+
+        assert!(matches!(result.data, ResultData::ZonalData { .. }));
+        assert!(result.uncertainty.is_some());
+    }
+
+    #[tokio::test]
+    async fn index_anomaly_detection_requires_feature_flag() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::IndexAnomalyDetection;
+        request.parameters.custom_parameters.insert(
+            INDEX_ANOMALY_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(anomaly_request()).expect("valid request"),
+        );
+        request
+            .parameters
+            .custom_parameters
+            .insert(INDEX_ANOMALY_FEATURE_FLAG_KEY.to_string(), json!(false));
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let job_id = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("anomaly request is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted");
+        assert!(result.is_none());
+
+        let identity = service
+            .analysis_job_identity(&job_id)
+            .expect("identity exists after failure");
+        assert!(matches!(identity.status, JobStatus::Failed));
+        assert!(identity
+            .failure_reason
+            .as_ref()
+            .is_some_and(|message| message.contains("disabled")));
+    }
+
+    #[tokio::test]
+    async fn index_anomaly_detection_marks_ungeoreferenced_as_unavailable() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = anomaly_request();
+        request.grid.spatial_ref.georeferenced = false;
+        request.grid.spatial_ref.crs = None;
+
+        let mut job_request = analysis_job_request(temp_dir.path());
+        job_request.job_type = JobType::IndexAnomalyDetection;
+        job_request.parameters.custom_parameters.insert(
+            INDEX_ANOMALY_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(request).expect("valid request"),
+        );
+        job_request
+            .parameters
+            .custom_parameters
+            .insert(INDEX_ANOMALY_FEATURE_FLAG_KEY.to_string(), json!(true));
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let _ = service
+            .submit_analysis_job(&catalog, job_request)
+            .await
+            .expect("anomaly request is accepted");
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted")
+            .expect("anomaly result produced");
+
+        assert_eq!(result.result_type, ResultType::StressIndicators);
+        assert!(matches!(result.data, ResultData::ZonalData { .. }));
+        assert_eq!(result.statistics.total_pixel_count, 12);
+        assert!(result.uncertainty.is_some());
+    }
+
+    #[tokio::test]
+    async fn index_anomaly_detection_returns_zones_and_reproducible_evidence_hash() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::IndexAnomalyDetection;
+        request.parameters.custom_parameters.insert(
+            INDEX_ANOMALY_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(anomaly_request()).expect("valid request"),
+        );
+        request
+            .parameters
+            .custom_parameters
+            .insert(INDEX_ANOMALY_FEATURE_FLAG_KEY.to_string(), json!(true));
+
+        let mut first_result = {
+            let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+            let _ = service
+                .submit_analysis_job(&catalog, request.clone())
+                .await
+                .expect("anomaly job is accepted");
+            service
+                .process_next_job()
+                .await
+                .expect("processing attempted")
+                .expect("anomaly result produced")
+        };
+
+        let mut second_result = {
+            let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+            let _ = service
+                .submit_analysis_job(&catalog, request)
+                .await
+                .expect("anomaly job is accepted");
+            service
+                .process_next_job()
+                .await
+                .expect("processing attempted")
+                .expect("anomaly result produced")
+        };
+
+        first_result.evidence_refs.sort();
+        second_result.evidence_refs.sort();
+        assert!(matches!(first_result.data, ResultData::ZonalData { .. }));
+        assert_eq!(first_result.evidence_refs, second_result.evidence_refs);
+        assert_eq!(
+            first_result.statistics.mean_value,
+            second_result.statistics.mean_value
+        );
+        assert_eq!(first_result.statistics.total_pixel_count, 12);
+    }
+
+    #[tokio::test]
+    async fn index_vegetation_classification_requires_feature_flag() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::IndexVegetationTypeClassification;
+        request.parameters.custom_parameters.insert(
+            INDEX_VEGETATION_CLASSIFICATION_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(vegetation_classification_request()).expect("valid request"),
+        );
+        request.parameters.custom_parameters.insert(
+            INDEX_VEGETATION_CLASSIFICATION_FEATURE_FLAG_KEY.to_string(),
+            json!(false),
+        );
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let job_id = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("vegetation request is accepted");
+
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted");
+        assert!(result.is_none());
+
+        let identity = service
+            .analysis_job_identity(&job_id)
+            .expect("identity exists after failure");
+        assert!(matches!(identity.status, JobStatus::Failed));
+        assert!(identity
+            .failure_reason
+            .as_ref()
+            .is_some_and(|message| message.contains("disabled")));
+    }
+
+    #[tokio::test]
+    async fn index_vegetation_classification_produces_zones_when_calibrated() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::IndexVegetationTypeClassification;
+        request.parameters.custom_parameters.insert(
+            INDEX_VEGETATION_CLASSIFICATION_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(vegetation_classification_request()).expect("valid request"),
+        );
+        request.parameters.custom_parameters.insert(
+            INDEX_VEGETATION_CLASSIFICATION_FEATURE_FLAG_KEY.to_string(),
+            json!(true),
+        );
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let _ = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("vegetation request is accepted");
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted")
+            .expect("vegetation result produced");
+
+        assert_eq!(result.result_type, ResultType::StressIndicators);
+        assert!(matches!(result.data, ResultData::ZonalData { .. }));
+        assert!(result.uncertainty.is_some());
+        assert!(matches!(result.statistics.total_pixel_count, 4));
+    }
+
+    #[tokio::test]
+    async fn index_vegetation_classification_marks_low_confidence_for_uncalibrated_scene() {
+        let mut request_payload = vegetation_classification_request();
+        request_payload.snapshots[1].calibrated = false;
+
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::IndexVegetationTypeClassification;
+        request.parameters.custom_parameters.insert(
+            INDEX_VEGETATION_CLASSIFICATION_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(request_payload).expect("valid request"),
+        );
+        request.parameters.custom_parameters.insert(
+            INDEX_VEGETATION_CLASSIFICATION_FEATURE_FLAG_KEY.to_string(),
+            json!(true),
+        );
+
+        let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let _ = service
+            .submit_analysis_job(&catalog, request)
+            .await
+            .expect("vegetation request is accepted");
+        let result = service
+            .process_next_job()
+            .await
+            .expect("processing attempted")
+            .expect("vegetation result produced");
+        assert_eq!(result.evidence_refs.len(), 1);
+        assert!(result.statistics.mean_value >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn index_vegetation_classification_zones_have_reproducible_evidence() {
+        let temp_dir = tempdir().unwrap();
+        let catalog = analysis_catalog();
+        let mut request = analysis_job_request(temp_dir.path());
+        request.job_type = JobType::IndexVegetationTypeClassification;
+        request.parameters.custom_parameters.insert(
+            INDEX_VEGETATION_CLASSIFICATION_PAYLOAD_KEY.to_string(),
+            serde_json::to_value(vegetation_classification_request()).expect("valid request"),
+        );
+        request.parameters.custom_parameters.insert(
+            INDEX_VEGETATION_CLASSIFICATION_FEATURE_FLAG_KEY.to_string(),
+            json!(true),
+        );
+
+        let mut first = {
+            let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+            let _ = service
+                .submit_analysis_job(&catalog, request.clone())
+                .await
+                .expect("vegetation request is accepted");
+            service
+                .process_next_job()
+                .await
+                .expect("processing attempted")
+                .expect("vegetation result produced")
+        };
+
+        let mut second = {
+            let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
+            let _ = service
+                .submit_analysis_job(&catalog, request)
+                .await
+                .expect("vegetation request is accepted");
+            service
+                .process_next_job()
+                .await
+                .expect("processing attempted")
+                .expect("vegetation result produced")
+        };
+
+        first.evidence_refs.sort();
+        second.evidence_refs.sort();
+        assert_eq!(first.evidence_refs, second.evidence_refs);
+    }
+
+    #[tokio::test]
     async fn analysis_job_failure_records_reason_code() {
         let temp_dir = tempdir().unwrap();
         let mut service = PostProcessorService::new(temp_dir.path().to_path_buf()).unwrap();
@@ -1665,6 +2429,178 @@ mod tests {
             input_files: Vec::new(),
             output_directory: output_directory.to_path_buf(),
             parameters: ProcessingParameters::default(),
+        }
+    }
+
+    fn trend_request() -> IndexTrendRequest {
+        IndexTrendRequest {
+            snapshots: vec![
+                trend_snapshot("scene-2026-05-01", "2026-05-01T00:00:00Z"),
+                trend_snapshot("scene-2026-06-01", "2026-06-01T00:00:00Z"),
+            ],
+        }
+    }
+
+    fn anomaly_request() -> IndexAnomalyRequest {
+        IndexAnomalyRequest {
+            field_id: "field-a".to_string(),
+            scene_id: "scene-2026-05-01".to_string(),
+            product_ref: "layer-ndvi-2026-05-01".to_string(),
+            acquired_at: DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+                .expect("valid time")
+                .with_timezone(&Utc),
+            grid: ProductGrid {
+                width: 4,
+                height: 3,
+                values: vec![
+                    0.1, 0.25, 0.3, 0.85, 0.4, 0.45, 0.48, 0.5, 0.52, 0.55, 0.58, 0.6,
+                ],
+                nodata_mask: vec![false; 12],
+                spatial_ref: shared::schemas::RasterSpatialRef {
+                    georeferenced: true,
+                    crs: Some("EPSG:32614".to_string()),
+                    bbox: Some(GeoBounds {
+                        min_lon: 500000.0,
+                        min_lat: 4500000.0,
+                        max_lon: 500040.0,
+                        max_lat: 4500030.0,
+                    }),
+                    geo_transform: Some([500000.0, 10.0, 0.0, 4500030.0, 0.0, -10.0]),
+                    resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+                },
+            },
+            low_threshold: Some(0.2),
+            high_threshold: Some(0.8),
+            std_dev_multiplier: Some(2.0),
+        }
+    }
+
+    fn vegetation_classification_request() -> IndexVegetationTypeClassificationRequest {
+        IndexVegetationTypeClassificationRequest {
+            snapshots: vec![
+                vegetation_snapshot(
+                    "scene-2026-05-01",
+                    "2026-05-01T00:00:00Z",
+                    vec![0.45, 0.47, 0.49, 0.48],
+                ),
+                vegetation_snapshot(
+                    "scene-2026-06-01",
+                    "2026-06-01T00:00:00Z",
+                    vec![0.44, 0.46, 0.45, 0.47],
+                ),
+            ],
+            signature_library: Some(vec![
+                VegetationTypeSignature {
+                    name: "cotton".to_string(),
+                    mean_ndvi: 0.42,
+                    std_ndvi: 0.16,
+                    trend_ndvi: 0.0,
+                    mean_tolerance: 0.22,
+                    std_tolerance: 0.19,
+                    trend_tolerance: 0.20,
+                },
+                VegetationTypeSignature {
+                    name: "forest".to_string(),
+                    mean_ndvi: 0.72,
+                    std_ndvi: 0.08,
+                    trend_ndvi: 0.0,
+                    mean_tolerance: 0.18,
+                    std_tolerance: 0.16,
+                    trend_tolerance: 0.20,
+                },
+                VegetationTypeSignature {
+                    name: "bush".to_string(),
+                    mean_ndvi: 0.30,
+                    std_ndvi: 0.14,
+                    trend_ndvi: -0.01,
+                    mean_tolerance: 0.20,
+                    std_tolerance: 0.16,
+                    trend_tolerance: 0.22,
+                },
+                VegetationTypeSignature {
+                    name: "palm".to_string(),
+                    mean_ndvi: 0.60,
+                    std_ndvi: 0.12,
+                    trend_ndvi: 0.02,
+                    mean_tolerance: 0.20,
+                    std_tolerance: 0.14,
+                    trend_tolerance: 0.24,
+                },
+                VegetationTypeSignature {
+                    name: "rice".to_string(),
+                    mean_ndvi: 0.36,
+                    std_ndvi: 0.15,
+                    trend_ndvi: 0.00,
+                    mean_tolerance: 0.24,
+                    std_tolerance: 0.20,
+                    trend_tolerance: 0.25,
+                },
+            ]),
+        }
+    }
+
+    fn vegetation_snapshot(
+        scene_id: &str,
+        captured_at: &str,
+        values: Vec<f32>,
+    ) -> IndexVegetationTypeClassificationSnapshot {
+        IndexVegetationTypeClassificationSnapshot {
+            field_id: "field-a".to_string(),
+            scene_id: scene_id.to_string(),
+            product_ref: format!("layer-ndvi-{scene_id}"),
+            acquired_at: chrono::DateTime::parse_from_rfc3339(captured_at)
+                .expect("capture time is valid")
+                .with_timezone(&Utc),
+            grid: ProductGrid {
+                width: 2,
+                height: 2,
+                values,
+                nodata_mask: vec![false; 4],
+                spatial_ref: shared::schemas::RasterSpatialRef {
+                    georeferenced: true,
+                    crs: Some("EPSG:32614".to_string()),
+                    bbox: Some(GeoBounds {
+                        min_lon: 500000.0,
+                        min_lat: 4500000.0,
+                        max_lon: 500020.0,
+                        max_lat: 4500020.0,
+                    }),
+                    geo_transform: Some([500000.0, 10.0, 0.0, 4500020.0, 0.0, -10.0]),
+                    resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+                },
+            },
+            calibrated: true,
+        }
+    }
+
+    fn trend_snapshot(scene_id: &str, captured_at: &str) -> index_trend::IndexTrendSnapshotPayload {
+        let acquired_at = chrono::DateTime::parse_from_rfc3339(captured_at)
+            .expect("captured time is valid")
+            .with_timezone(&Utc);
+        index_trend::IndexTrendSnapshotPayload {
+            field_id: "field-a".to_string(),
+            scene_id: scene_id.to_string(),
+            product_ref: format!("layer-{scene_id}"),
+            acquired_at,
+            grid: ProductGrid {
+                width: 2,
+                height: 2,
+                values: vec![0.2, 0.3, 0.4, 0.5],
+                nodata_mask: vec![false; 4],
+                spatial_ref: shared::schemas::RasterSpatialRef {
+                    georeferenced: true,
+                    crs: Some("EPSG:32614".to_string()),
+                    bbox: Some(GeoBounds {
+                        min_lon: 500000.0,
+                        min_lat: 4500000.0,
+                        max_lon: 500020.0,
+                        max_lat: 4500020.0,
+                    }),
+                    geo_transform: Some([500000.0, 10.0, 0.0, 4500020.0, 0.0, -10.0]),
+                    resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+                },
+            },
+            calibration_status: IndexTrendCalibrationStatus::CalibratedReflectance,
         }
     }
 
