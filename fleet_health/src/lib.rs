@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
-use shared::{fleet_alerts::FleetAlertRecord, schemas::FleetVersionInventory};
+use shared::{
+    fleet_alerts::{
+        FleetAlertComparator, FleetAlertEvidence, FleetAlertKind, FleetAlertRecord,
+        FleetAlertRoute, FleetAlertSeverity,
+    },
+    schemas::FleetVersionInventory,
+};
 use timeseries::{SeriesPoint, SeriesValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -805,6 +811,46 @@ pub struct FleetOperationsDashboardFeed {
     pub sources: Vec<FleetOperationsFeedSourceState>,
     #[serde(default)]
     pub source_gaps: Vec<FleetOperationsFeedSourceState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FleetHealthDashboardRequest {
+    #[serde(default)]
+    pub generated_at: String,
+    #[serde(default)]
+    pub components: Vec<FleetComponentRecord>,
+    #[serde(default)]
+    pub readiness_decisions: Vec<FleetReadinessDecision>,
+    #[serde(default)]
+    pub health_verdicts: Vec<ComponentHealthVerdict>,
+    #[serde(default)]
+    pub degradation_reports: Vec<HealthDegradationDetectionReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetHealthDashboardAircraftStatus {
+    Ready,
+    Blocked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetHealthDashboardAircraft {
+    pub airframe_id: String,
+    pub status: FleetHealthDashboardAircraftStatus,
+    pub readiness_status: FleetReadinessDecisionStatus,
+    pub worst_component_id: Option<String>,
+    pub worst_component_status: Option<ComponentHealthVerdictStatus>,
+    pub stale_health: bool,
+    pub blocker_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetHealthDashboard {
+    pub generated_at: String,
+    pub aircraft: Vec<FleetHealthDashboardAircraft>,
+    pub alerts: Vec<FleetAlertRecord>,
 }
 
 impl FleetReadinessDecision {
@@ -2101,6 +2147,92 @@ pub fn build_fleet_operations_dashboard_feed(
     }
 }
 
+pub fn build_fleet_health_dashboard(
+    request: FleetHealthDashboardRequest,
+) -> Result<FleetHealthDashboard, FleetHealthError> {
+    let generated_at =
+        normalize_required_text(request.generated_at, FleetHealthError::EmptyCreatedAt)?;
+    let evaluated_at = parse_health_sample_timestamp(&generated_at)?;
+    let mut aircraft = request
+        .readiness_decisions
+        .iter()
+        .map(|decision| {
+            let component_ids = request
+                .components
+                .iter()
+                .filter(|component| component.airframe_id.as_deref() == Some(&decision.airframe_id))
+                .map(|component| component.component_id.as_str())
+                .collect::<Vec<_>>();
+            let verdicts = request
+                .health_verdicts
+                .iter()
+                .filter(|verdict| component_ids.contains(&verdict.component_id.as_str()))
+                .collect::<Vec<_>>();
+            let worst = verdicts
+                .iter()
+                .max_by(|left, right| {
+                    left.status
+                        .severity_rank()
+                        .cmp(&right.status.severity_rank())
+                        .then_with(|| left.component_id.cmp(&right.component_id))
+                })
+                .copied();
+            let stale_health =
+                decision.blockers.iter().any(|blocker| {
+                    blocker.reason_code == FleetReadinessBlockReason::StaleHealthData
+                }) || verdicts
+                    .iter()
+                    .any(|verdict| verdict.freshness == HealthIndicatorFreshness::Stale)
+                    || verdicts.is_empty();
+            let status = if stale_health {
+                FleetHealthDashboardAircraftStatus::Unknown
+            } else if decision.status == FleetReadinessDecisionStatus::Permitted {
+                FleetHealthDashboardAircraftStatus::Ready
+            } else {
+                FleetHealthDashboardAircraftStatus::Blocked
+            };
+            FleetHealthDashboardAircraft {
+                airframe_id: decision.airframe_id.clone(),
+                status,
+                readiness_status: decision.status,
+                worst_component_id: worst.map(|verdict| verdict.component_id.clone()),
+                worst_component_status: worst.map(|verdict| verdict.status),
+                stale_health,
+                blocker_count: decision.blockers.len(),
+            }
+        })
+        .collect::<Vec<_>>();
+    aircraft.sort_by(|left, right| left.airframe_id.cmp(&right.airframe_id));
+
+    let mut alerts = Vec::new();
+    for verdict in &request.health_verdicts {
+        if verdict.status.severity_rank() >= ComponentHealthVerdictStatus::Degraded.severity_rank()
+        {
+            alerts.push(fleet_health_verdict_alert(
+                verdict,
+                &request.components,
+                evaluated_at,
+            ));
+        }
+    }
+    for report in &request.degradation_reports {
+        if report.status == HealthDegradationDetectionStatus::DegradationDetected {
+            alerts.push(fleet_health_degradation_alert(
+                report,
+                &request.components,
+                evaluated_at,
+            ));
+        }
+    }
+    alerts.sort_by(|left, right| left.alert_id.cmp(&right.alert_id));
+
+    Ok(FleetHealthDashboard {
+        generated_at,
+        aircraft,
+        alerts,
+    })
+}
+
 pub fn fleet_operations_source_current(
     source: FleetOperationsFeedSource,
     observed_at: impl Into<String>,
@@ -2179,6 +2311,86 @@ fn rollout_control_reason_code(reason: RolloutControlReason) -> &'static str {
         RolloutControlReason::AbortedByOperator => "aborted_by_operator",
         RolloutControlReason::SimulationValidationRequired => "simulation_validation_required",
     }
+}
+
+fn fleet_health_verdict_alert(
+    verdict: &ComponentHealthVerdict,
+    components: &[FleetComponentRecord],
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+) -> FleetAlertRecord {
+    let airframe_id = airframe_for_component(components, &verdict.component_id);
+    let indicator = verdict
+        .indicator
+        .map(FleetHealthIndicator::as_str)
+        .unwrap_or("unknown_indicator");
+    let reason_code = health_verdict_reason_code(verdict.reason_code);
+    FleetAlertRecord {
+        alert_id: format!(
+            "fleet-health:{}:{}:{}",
+            verdict.component_id, indicator, reason_code
+        ),
+        node_id: airframe_id,
+        correlation_id: Some(format!("component:{}", verdict.component_id)),
+        kind: FleetAlertKind::FleetHealth,
+        severity: if verdict.status == ComponentHealthVerdictStatus::Critical {
+            FleetAlertSeverity::Critical
+        } else {
+            FleetAlertSeverity::Warning
+        },
+        route: FleetAlertRoute::OperatorConsole,
+        evidence: FleetAlertEvidence {
+            metric_name: indicator.to_string(),
+            observed_value: verdict.value.unwrap_or(0.0),
+            threshold_value: verdict.threshold.unwrap_or(0.0),
+            comparator: FleetAlertComparator::GreaterThanOrEqual,
+        },
+        message: format!(
+            "component {} health verdict {:?}: {}",
+            verdict.component_id, verdict.status, reason_code
+        ),
+        evaluated_at,
+    }
+}
+
+fn fleet_health_degradation_alert(
+    report: &HealthDegradationDetectionReport,
+    components: &[FleetComponentRecord],
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+) -> FleetAlertRecord {
+    let airframe_id = airframe_for_component(components, &report.component_id);
+    let reason_code = health_degradation_reason_code(report.reason_code);
+    FleetAlertRecord {
+        alert_id: format!(
+            "fleet-health:{}:{}:{}",
+            report.component_id,
+            report.indicator.as_str(),
+            reason_code
+        ),
+        node_id: airframe_id,
+        correlation_id: Some(format!("component:{}", report.component_id)),
+        kind: FleetAlertKind::FleetHealth,
+        severity: FleetAlertSeverity::Warning,
+        route: FleetAlertRoute::OperatorConsole,
+        evidence: FleetAlertEvidence {
+            metric_name: format!("{}_slope_per_day", report.indicator.as_str()),
+            observed_value: report.slope_per_day.unwrap_or(0.0),
+            threshold_value: 0.0,
+            comparator: FleetAlertComparator::GreaterThanOrEqual,
+        },
+        message: format!(
+            "component {} degradation event: {}",
+            report.component_id, reason_code
+        ),
+        evaluated_at,
+    }
+}
+
+fn airframe_for_component(components: &[FleetComponentRecord], component_id: &str) -> String {
+    components
+        .iter()
+        .find(|component| component.component_id == component_id)
+        .and_then(|component| component.airframe_id.clone())
+        .unwrap_or_else(|| format!("component:{component_id}"))
 }
 
 pub fn component_event(
@@ -2715,16 +2927,18 @@ mod tests {
     use super::{
         accrue_component_duty, append_health_evidence_record, apply_rollout_control,
         build_component_duty_accruals, build_component_record,
-        build_degradation_event_evidence_record, build_fleet_operations_dashboard_feed,
-        build_health_verdict_evidence_record, close_maintenance_work_order, component_event,
-        derive_health_indicators, detect_health_indicator_degradation,
-        evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
+        build_degradation_event_evidence_record, build_fleet_health_dashboard,
+        build_fleet_operations_dashboard_feed, build_health_verdict_evidence_record,
+        close_maintenance_work_order, component_event, derive_health_indicators,
+        detect_health_indicator_degradation, evaluate_battery_health_trend,
+        evaluate_component_health_verdict, evaluate_fleet_readiness,
         evaluate_fleet_readiness_with_work_orders, evaluate_ota_rollout,
         fleet_operations_source_current, fleet_operations_source_unavailable, install_component,
         open_maintenance_work_order, refuse_health_evidence_overwrite, BatteryHealthTrendConfig,
         CloseMaintenanceWorkOrderRequest, ComponentHealthVerdict, ComponentHealthVerdictRequest,
         ComponentHealthVerdictStatus, ComponentServiceLimit, DutyAccrualRequest,
-        FleetComponentRecord, FleetComponentType, FleetHealthError, FleetHealthIndicator,
+        FleetComponentRecord, FleetComponentType, FleetHealthDashboardAircraftStatus,
+        FleetHealthDashboardRequest, FleetHealthError, FleetHealthIndicator,
         FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
         FleetOperationsRolloutFeedState, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
         FleetReadinessRequest, HealthDegradationDetectionConfig, HealthDegradationDetectionRequest,
@@ -3825,6 +4039,145 @@ mod tests {
         .expect_err("zero quantity part should be rejected");
 
         assert_eq!(error, FleetHealthError::InvalidPartQuantity);
+    }
+
+    #[test]
+    fn fleet_health_dashboard_surfaces_readiness_and_worst_component() {
+        let components = vec![
+            component_for_readiness(
+                "battery-pack-001",
+                FleetComponentType::Battery,
+                10.0,
+                10,
+                4.0,
+            ),
+            component_for_readiness("motor-001", FleetComponentType::Motor, 10.0, 0, 4.0),
+        ];
+        let verdicts = vec![
+            component_verdict(
+                "battery-pack-001",
+                ComponentHealthVerdictStatus::Ok,
+                HealthIndicatorFreshness::Fresh,
+            ),
+            component_verdict(
+                "motor-001",
+                ComponentHealthVerdictStatus::Degraded,
+                HealthIndicatorFreshness::Fresh,
+            ),
+        ];
+        let readiness = evaluate_fleet_readiness(readiness_request(
+            components.clone(),
+            vec![
+                service_limit("battery-pack-001", Some(100.0), Some(200), Some(100.0)),
+                service_limit("motor-001", Some(100.0), None, Some(100.0)),
+            ],
+            verdicts.clone(),
+        ))
+        .expect("readiness should evaluate");
+
+        let dashboard = build_fleet_health_dashboard(FleetHealthDashboardRequest {
+            generated_at: "2026-06-22T16:00:00Z".to_string(),
+            components,
+            readiness_decisions: vec![readiness],
+            health_verdicts: verdicts,
+            degradation_reports: vec![],
+        })
+        .expect("dashboard should build");
+
+        assert_eq!(dashboard.aircraft.len(), 1);
+        assert_eq!(
+            dashboard.aircraft[0].status,
+            FleetHealthDashboardAircraftStatus::Ready
+        );
+        assert_eq!(
+            dashboard.aircraft[0].worst_component_id.as_deref(),
+            Some("motor-001")
+        );
+        assert_eq!(
+            dashboard.aircraft[0].worst_component_status,
+            Some(ComponentHealthVerdictStatus::Degraded)
+        );
+    }
+
+    #[test]
+    fn fleet_health_dashboard_emits_alert_for_critical_component() {
+        let components = vec![component_for_readiness(
+            "motor-001",
+            FleetComponentType::Motor,
+            10.0,
+            0,
+            4.0,
+        )];
+        let verdicts = vec![component_verdict(
+            "motor-001",
+            ComponentHealthVerdictStatus::Critical,
+            HealthIndicatorFreshness::Fresh,
+        )];
+        let readiness = evaluate_fleet_readiness(readiness_request(
+            components.clone(),
+            vec![service_limit("motor-001", Some(100.0), None, Some(100.0))],
+            verdicts.clone(),
+        ))
+        .expect("readiness should evaluate");
+
+        let dashboard = build_fleet_health_dashboard(FleetHealthDashboardRequest {
+            generated_at: "2026-06-22T16:00:00Z".to_string(),
+            components,
+            readiness_decisions: vec![readiness],
+            health_verdicts: verdicts,
+            degradation_reports: vec![],
+        })
+        .expect("dashboard should build");
+
+        assert_eq!(dashboard.alerts.len(), 1);
+        assert_eq!(dashboard.alerts[0].kind, FleetAlertKind::FleetHealth);
+        assert_eq!(dashboard.alerts[0].severity, FleetAlertSeverity::Critical);
+        assert_eq!(dashboard.alerts[0].node_id, "airframe-1");
+        assert_eq!(
+            dashboard.alerts[0].evidence.metric_name,
+            FleetHealthIndicator::MotorVibration.as_str()
+        );
+    }
+
+    #[test]
+    fn fleet_health_dashboard_marks_stale_aircraft_unknown_not_ready() {
+        let components = vec![component_for_readiness(
+            "motor-001",
+            FleetComponentType::Motor,
+            10.0,
+            0,
+            4.0,
+        )];
+        let verdicts = vec![component_verdict(
+            "motor-001",
+            ComponentHealthVerdictStatus::Ok,
+            HealthIndicatorFreshness::Stale,
+        )];
+        let readiness = evaluate_fleet_readiness(readiness_request(
+            components.clone(),
+            vec![service_limit("motor-001", Some(100.0), None, Some(100.0))],
+            verdicts.clone(),
+        ))
+        .expect("readiness should evaluate");
+
+        let dashboard = build_fleet_health_dashboard(FleetHealthDashboardRequest {
+            generated_at: "2026-06-22T16:00:00Z".to_string(),
+            components,
+            readiness_decisions: vec![readiness],
+            health_verdicts: verdicts,
+            degradation_reports: vec![],
+        })
+        .expect("dashboard should build");
+
+        assert_eq!(
+            dashboard.aircraft[0].status,
+            FleetHealthDashboardAircraftStatus::Unknown
+        );
+        assert!(dashboard.aircraft[0].stale_health);
+        assert_ne!(
+            dashboard.aircraft[0].status,
+            FleetHealthDashboardAircraftStatus::Ready
+        );
     }
 
     #[test]
