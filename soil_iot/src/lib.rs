@@ -325,6 +325,51 @@ pub struct ValidatedSoilReading {
     pub excluded_from_products: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoilDeviceFreshnessState {
+    Fresh,
+    Stale,
+    NeverSeen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoilCaptureFreshnessConfig {
+    pub expected_interval_seconds: u64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilDeviceFreshnessRecord {
+    pub device_id: String,
+    pub field_id: String,
+    pub zone_id: Option<String>,
+    pub last_seen: Option<String>,
+    pub age_seconds: Option<u64>,
+    pub expected_interval_seconds: u64,
+    pub state: SoilDeviceFreshnessState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilZoneCoverageRecord {
+    pub field_id: String,
+    pub zone_id: String,
+    pub device_count: usize,
+    pub fresh_device_count: usize,
+    pub stale_device_count: usize,
+    pub never_seen_device_count: usize,
+    pub coverage_fraction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCaptureFreshnessCoverageReport {
+    pub field_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub devices: Vec<SoilDeviceFreshnessRecord>,
+    pub zones: Vec<SoilZoneCoverageRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StuckSensorWindowConfig {
     pub min_samples: usize,
@@ -705,6 +750,8 @@ pub enum SoilIotError {
     EmptyStuckWindowMethodVersion,
     #[error("sensor-health method_version cannot be empty")]
     EmptySensorHealthMethodVersion,
+    #[error("freshness coverage method_version cannot be empty")]
+    EmptyFreshnessMethodVersion,
     #[error("sensor-health evaluated_at cannot be empty")]
     EmptySensorHealthEvaluatedAt,
     #[error("sensor-health evidence_ref cannot be empty")]
@@ -725,6 +772,12 @@ pub enum SoilIotError {
     InvalidStuckWindowConfig,
     #[error("sensor-health thresholds must be finite with low_battery_voltage >= 0")]
     InvalidSensorHealthThresholds,
+    #[error("freshness expected_interval_seconds must be greater than zero")]
+    InvalidFreshnessInterval,
+    #[error("freshness timestamp is invalid: {value}")]
+    InvalidFreshnessTimestamp { value: String },
+    #[error("freshness devices must belong to one field, saw {left} and {right}")]
+    MixedFreshnessFieldScope { left: String, right: String },
     #[error("irrigation trigger config must be finite with low_moisture_threshold >= 0")]
     InvalidIrrigationTriggerConfig,
     #[error("stuck-sensor window must contain one device and metric")]
@@ -1059,6 +1112,125 @@ pub fn validate_and_calibrate_reading(
     })
 }
 
+pub fn evaluate_soil_capture_freshness_coverage(
+    devices: &[SoilDeviceRecord],
+    readings: &[ValidatedSoilReading],
+    config: SoilCaptureFreshnessConfig,
+    evaluated_at: String,
+) -> Result<SoilCaptureFreshnessCoverageReport, SoilIotError> {
+    let config = normalize_freshness_config(config)?;
+    let evaluated_at_dt = parse_freshness_ts(&evaluated_at)?;
+    let evaluated_at = normalize_required_text(evaluated_at, SoilIotError::EmptyCreatedAt)?;
+    let mut field_id: Option<String> = None;
+    let mut latest_by_device: BTreeMap<String, &ValidatedSoilReading> = BTreeMap::new();
+
+    for reading in readings {
+        let reading_ts = parse_freshness_ts(&reading.ts)?;
+        latest_by_device
+            .entry(reading.device_id.clone())
+            .and_modify(|current| {
+                if parse_freshness_ts(&current.ts)
+                    .map(|current_ts| reading_ts > current_ts)
+                    .unwrap_or(false)
+                {
+                    *current = reading;
+                }
+            })
+            .or_insert(reading);
+    }
+
+    let mut device_records = Vec::new();
+    let mut zone_accumulators: BTreeMap<String, ZoneCoverageAccumulator> = BTreeMap::new();
+    for device in devices
+        .iter()
+        .filter(|device| device.status != SoilDeviceStatus::Retired)
+    {
+        let device_field_id =
+            normalize_required_text(device.field_id.clone(), SoilIotError::EmptyFieldId)?;
+        match field_id.as_ref() {
+            Some(existing) if existing != &device_field_id => {
+                return Err(SoilIotError::MixedFreshnessFieldScope {
+                    left: existing.clone(),
+                    right: device_field_id,
+                });
+            }
+            None => field_id = Some(device_field_id.clone()),
+            _ => {}
+        }
+
+        let latest = latest_by_device.get(&device.device_id).copied();
+        let (last_seen, age_seconds, state) = match latest {
+            Some(reading) => {
+                let last_seen_dt = parse_freshness_ts(&reading.ts)?;
+                let age_seconds = evaluated_at_dt
+                    .signed_duration_since(last_seen_dt)
+                    .num_seconds()
+                    .max(0) as u64;
+                let state = if age_seconds <= config.expected_interval_seconds {
+                    SoilDeviceFreshnessState::Fresh
+                } else {
+                    SoilDeviceFreshnessState::Stale
+                };
+                (Some(reading.ts.clone()), Some(age_seconds), state)
+            }
+            None => (None, None, SoilDeviceFreshnessState::NeverSeen),
+        };
+        let zone_id = device
+            .zone_id
+            .clone()
+            .unwrap_or_else(|| "unassigned".to_string());
+        let entry =
+            zone_accumulators
+                .entry(zone_id.clone())
+                .or_insert_with(|| ZoneCoverageAccumulator {
+                    field_id: device_field_id.clone(),
+                    zone_id,
+                    ..ZoneCoverageAccumulator::default()
+                });
+        entry.device_count += 1;
+        match state {
+            SoilDeviceFreshnessState::Fresh => entry.fresh_device_count += 1,
+            SoilDeviceFreshnessState::Stale => entry.stale_device_count += 1,
+            SoilDeviceFreshnessState::NeverSeen => entry.never_seen_device_count += 1,
+        }
+        device_records.push(SoilDeviceFreshnessRecord {
+            device_id: device.device_id.clone(),
+            field_id: device_field_id,
+            zone_id: device.zone_id.clone(),
+            last_seen,
+            age_seconds,
+            expected_interval_seconds: config.expected_interval_seconds,
+            state,
+        });
+    }
+
+    device_records.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+    let zones = zone_accumulators
+        .into_values()
+        .map(|zone| SoilZoneCoverageRecord {
+            field_id: zone.field_id,
+            zone_id: zone.zone_id,
+            device_count: zone.device_count,
+            fresh_device_count: zone.fresh_device_count,
+            stale_device_count: zone.stale_device_count,
+            never_seen_device_count: zone.never_seen_device_count,
+            coverage_fraction: if zone.device_count > 0 {
+                zone.fresh_device_count as f64 / zone.device_count as f64
+            } else {
+                0.0
+            },
+        })
+        .collect();
+
+    Ok(SoilCaptureFreshnessCoverageReport {
+        field_id: field_id.unwrap_or_default(),
+        evaluated_at,
+        method_version: config.method_version,
+        devices: device_records,
+        zones,
+    })
+}
+
 pub fn detect_stuck_sensor_window(
     readings: &[ValidatedSoilReading],
     config: StuckSensorWindowConfig,
@@ -1322,6 +1494,39 @@ fn normalize_calibration_profile(
     } else {
         Err(SoilIotError::InvalidCalibrationProfile { profile_ref })
     }
+}
+
+#[derive(Default)]
+struct ZoneCoverageAccumulator {
+    field_id: String,
+    zone_id: String,
+    device_count: usize,
+    fresh_device_count: usize,
+    stale_device_count: usize,
+    never_seen_device_count: usize,
+}
+
+fn normalize_freshness_config(
+    config: SoilCaptureFreshnessConfig,
+) -> Result<SoilCaptureFreshnessConfig, SoilIotError> {
+    if config.expected_interval_seconds == 0 {
+        return Err(SoilIotError::InvalidFreshnessInterval);
+    }
+    Ok(SoilCaptureFreshnessConfig {
+        expected_interval_seconds: config.expected_interval_seconds,
+        method_version: normalize_required_text(
+            config.method_version,
+            SoilIotError::EmptyFreshnessMethodVersion,
+        )?,
+    })
+}
+
+fn parse_freshness_ts(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>, SoilIotError> {
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+        SoilIotError::InvalidFreshnessTimestamp {
+            value: value.to_string(),
+        }
+    })
 }
 
 fn normalize_stuck_window_config(
@@ -1640,7 +1845,8 @@ mod tests {
     use super::{
         build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
         decode_gateway_payload, detect_stuck_sensor_window, emit_sensor_health_alert_events,
-        evaluate_irrigation_trigger, evaluate_sensor_health_snapshot, ingest_gateway_readings,
+        evaluate_irrigation_trigger, evaluate_sensor_health_snapshot,
+        evaluate_soil_capture_freshness_coverage, ingest_gateway_readings,
         reading_rejection_for_device, transition_soil_config_push_status,
         transition_soil_device_status, validate_and_calibrate_reading, CalibrationProfile,
         GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
@@ -1649,8 +1855,9 @@ mod tests {
         ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
         SensorHealthEventKind, SensorHealthLinkStatus, SensorHealthMonitorState,
         SensorHealthReasonCode, SensorHealthSnapshot, SensorHealthThresholds, SimulatedGateway,
-        SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate,
-        SoilDeviceStatus, SoilIotError, SoilSensorType, StuckSensorRail, StuckSensorWindowConfig,
+        SoilCaptureFreshnessConfig, SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus,
+        SoilDeviceConfigPushStatusUpdate, SoilDeviceFreshnessState, SoilDeviceStatus, SoilIotError,
+        SoilSensorType, StuckSensorRail, StuckSensorWindowConfig, ValidatedSoilReading,
         ZoneSoilMoistureProduct,
     };
     use alerting::{AlertEventBackbone, AlertSeverityHint};
@@ -2053,6 +2260,76 @@ mod tests {
     }
 
     #[test]
+    fn freshness_coverage_counts_fresh_and_stale_devices_per_zone() {
+        let devices = vec![
+            soil_device("soil-probe-001", "zone-ne"),
+            soil_device("soil-probe-002", "zone-ne"),
+            soil_device("soil-probe-003", "zone-sw"),
+        ];
+        let report = evaluate_soil_capture_freshness_coverage(
+            &devices,
+            &[
+                validated_reading(
+                    "payload-001",
+                    "soil-probe-001",
+                    "zone-ne",
+                    "2026-06-12T10:09:30Z",
+                ),
+                validated_reading(
+                    "payload-002",
+                    "soil-probe-002",
+                    "zone-ne",
+                    "2026-06-12T10:00:00Z",
+                ),
+            ],
+            freshness_config(),
+            "2026-06-12T10:10:00Z".to_string(),
+        )
+        .expect("freshness report should evaluate");
+
+        assert_eq!(report.field_id, "field-001");
+        assert_eq!(report.devices.len(), 3);
+        assert_eq!(report.devices[0].state, SoilDeviceFreshnessState::Fresh);
+        assert_eq!(report.devices[0].age_seconds, Some(30));
+        assert_eq!(report.devices[1].state, SoilDeviceFreshnessState::Stale);
+        assert_eq!(report.devices[1].age_seconds, Some(600));
+        assert_eq!(report.devices[2].state, SoilDeviceFreshnessState::NeverSeen);
+
+        let zone_ne = report
+            .zones
+            .iter()
+            .find(|zone| zone.zone_id == "zone-ne")
+            .expect("zone-ne coverage should exist");
+        assert_eq!(zone_ne.device_count, 2);
+        assert_eq!(zone_ne.fresh_device_count, 1);
+        assert_eq!(zone_ne.stale_device_count, 1);
+        assert_eq!(zone_ne.coverage_fraction, 0.5);
+    }
+
+    #[test]
+    fn freshness_marks_silent_device_stale_after_interval_elapses() {
+        let devices = vec![soil_device("soil-probe-001", "zone-ne")];
+        let report = evaluate_soil_capture_freshness_coverage(
+            &devices,
+            &[validated_reading(
+                "payload-old",
+                "soil-probe-001",
+                "zone-ne",
+                "2026-06-12T10:00:00Z",
+            )],
+            freshness_config(),
+            "2026-06-12T10:06:01Z".to_string(),
+        )
+        .expect("freshness report should evaluate");
+
+        assert_eq!(report.devices[0].state, SoilDeviceFreshnessState::Stale);
+        assert_eq!(report.devices[0].age_seconds, Some(361));
+        assert_eq!(report.zones[0].fresh_device_count, 0);
+        assert_eq!(report.zones[0].stale_device_count, 1);
+        assert_eq!(report.zones[0].coverage_fraction, 0.0);
+    }
+
+    #[test]
     fn stuck_sensor_detection_ignores_normal_variation() {
         let readings = validated_window([34.5, 35.1, 33.8, 34.9]);
 
@@ -2336,6 +2613,42 @@ mod tests {
             raw_value: 34.5,
             gateway_ts: "2026-06-12T10:00:00Z".to_string(),
             received_at: "2026-06-12T10:00:03Z".to_string(),
+        }
+    }
+
+    fn soil_device(device_id: &str, zone_id: &str) -> super::SoilDeviceRecord {
+        let mut device = valid_device();
+        device.device_id = device_id.to_string();
+        device.zone_id = Some(zone_id.to_string());
+        device
+    }
+
+    fn validated_reading(
+        payload_id: &str,
+        device_id: &str,
+        zone_id: &str,
+        ts: &str,
+    ) -> ValidatedSoilReading {
+        ValidatedSoilReading {
+            payload_id: payload_id.to_string(),
+            device_id: device_id.to_string(),
+            metric: GatewayReadingMetric::SoilMoisturePercent,
+            raw_value: 34.5,
+            calibrated_value: 34.5,
+            ts: ts.to_string(),
+            received_at: ts.to_string(),
+            field_id: "field-001".to_string(),
+            zone_id: Some(zone_id.to_string()),
+            source_qa_flags: vec![],
+            qa_flags: vec![],
+            excluded_from_products: false,
+        }
+    }
+
+    fn freshness_config() -> SoilCaptureFreshnessConfig {
+        SoilCaptureFreshnessConfig {
+            expected_interval_seconds: 300,
+            method_version: "soil-capture-freshness-v1".to_string(),
         }
     }
 
