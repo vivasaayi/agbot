@@ -62,6 +62,16 @@ pub struct AlertCandidateRecord {
     pub accepted_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertIdempotencyDecision {
+    pub idempotency_key: String,
+    pub alert_candidate_id: String,
+    pub first_seen_at: String,
+    pub reemitted_at: String,
+    pub duplicate_count: usize,
+    pub decision: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertRule {
     pub rule_id: String,
@@ -479,6 +489,8 @@ pub struct RuleEvaluationOutcome {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AlertEventBackbone {
     candidates: Vec<AlertCandidateRecord>,
+    idempotency_index: BTreeMap<String, usize>,
+    idempotency_decisions: Vec<AlertIdempotencyDecision>,
     rejected_event_count: u32,
 }
 
@@ -590,6 +602,33 @@ impl SourceAdapter for AlertEventBackbone {
     fn emit(&mut self, event: AlertEvent) -> Result<AlertCandidateRecord, AlertingError> {
         match normalize_event(event) {
             Ok(event) => {
+                if let Some(index) = self.idempotency_index.get(&event.idempotency_key).copied() {
+                    let candidate = &mut self.candidates[index];
+                    let first_seen_at = candidate.accepted_at.clone();
+                    candidate.occurred_at = event.occurred_at.clone();
+                    candidate.accepted_at = event.occurred_at.clone();
+                    for evidence_ref in event.evidence_refs {
+                        if !candidate.evidence_refs.contains(&evidence_ref) {
+                            candidate.evidence_refs.push(evidence_ref);
+                        }
+                    }
+                    candidate.evidence_refs.sort();
+                    let duplicate_count = self
+                        .idempotency_decisions
+                        .iter()
+                        .filter(|decision| decision.idempotency_key == candidate.idempotency_key)
+                        .count()
+                        + 1;
+                    self.idempotency_decisions.push(AlertIdempotencyDecision {
+                        idempotency_key: candidate.idempotency_key.clone(),
+                        alert_candidate_id: candidate.alert_candidate_id.clone(),
+                        first_seen_at,
+                        reemitted_at: candidate.accepted_at.clone(),
+                        duplicate_count,
+                        decision: "collapsed_to_existing_candidate".to_string(),
+                    });
+                    return Ok(candidate.clone());
+                }
                 let candidate = AlertCandidateRecord {
                     alert_candidate_id: format!(
                         "alert-candidate-{number:06}",
@@ -604,6 +643,8 @@ impl SourceAdapter for AlertEventBackbone {
                     idempotency_key: event.idempotency_key,
                     accepted_at: event.occurred_at,
                 };
+                self.idempotency_index
+                    .insert(candidate.idempotency_key.clone(), self.candidates.len());
                 self.candidates.push(candidate.clone());
                 Ok(candidate)
             }
@@ -709,6 +750,10 @@ impl ChannelAdapter for MockChannelAdapter {
 impl AlertEventBackbone {
     pub fn list_candidates(&self) -> Vec<AlertCandidateRecord> {
         self.candidates.clone()
+    }
+
+    pub fn list_idempotency_decisions(&self) -> Vec<AlertIdempotencyDecision> {
+        self.idempotency_decisions.clone()
     }
 
     pub fn rejected_event_count(&self) -> u32 {
@@ -1859,6 +1904,42 @@ mod tests {
         );
         assert_eq!(backbone.list_candidates().len(), 1);
         assert_eq!(backbone.rejected_event_count(), 0);
+    }
+
+    #[test]
+    fn source_adapter_collapses_reemitted_event_by_idempotency_key() {
+        let mut backbone = AlertEventBackbone::default();
+        let first = backbone
+            .emit(sensor_health_event())
+            .expect("first event should be accepted");
+        let mut reemit = sensor_health_event();
+        reemit.occurred_at = "2026-06-12T10:01:00Z".to_string();
+        reemit
+            .evidence_refs
+            .push("reading:soil-probe-001:retry".to_string());
+
+        let second = backbone
+            .emit(reemit)
+            .expect("duplicate idempotency key should be accepted");
+
+        assert_eq!(first.alert_candidate_id, second.alert_candidate_id);
+        assert_eq!(backbone.list_candidates().len(), 1);
+        let candidate = &backbone.list_candidates()[0];
+        assert_eq!(candidate.occurred_at, "2026-06-12T10:01:00Z");
+        assert_eq!(
+            candidate.evidence_refs,
+            vec![
+                "reading:soil-probe-001:latest".to_string(),
+                "reading:soil-probe-001:retry".to_string()
+            ]
+        );
+        let decisions = backbone.list_idempotency_decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].decision,
+            "collapsed_to_existing_candidate".to_string()
+        );
+        assert_eq!(decisions[0].duplicate_count, 1);
     }
 
     #[test]
