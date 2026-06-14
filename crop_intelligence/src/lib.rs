@@ -587,6 +587,77 @@ pub struct CropDetectionCorrectionLabel {
     pub evidence_tile_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingDatasetSplit {
+    Train,
+    Validation,
+    Test,
+}
+
+impl TrainingDatasetSplit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrainingDatasetSplit::Train => "train",
+            TrainingDatasetSplit::Validation => "validation",
+            TrainingDatasetSplit::Test => "test",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TrainingDatasetSplitConfig {
+    pub train_fraction: f64,
+    pub validation_fraction: f64,
+    pub test_fraction: f64,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabeledTileRecord {
+    pub tile_ref: String,
+    pub field_id: String,
+    pub captured_at: String,
+    pub label: String,
+    pub labeler: String,
+    pub source_run: String,
+    pub provenance_ref: String,
+    #[serde(default)]
+    pub assigned_split: Option<TrainingDatasetSplit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrainingDatasetTile {
+    pub tile_ref: String,
+    pub field_id: String,
+    pub capture_date: String,
+    pub label: String,
+    pub labeler: String,
+    pub source_run: String,
+    pub provenance_ref: String,
+    pub split: TrainingDatasetSplit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrainingDatasetSplitCounts {
+    pub train: usize,
+    pub validation: usize,
+    pub test: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrainingDatasetManifest {
+    pub dataset_id: String,
+    pub generated_at: String,
+    pub provenance_ref: String,
+    pub split_config: TrainingDatasetSplitConfig,
+    pub split_counts: TrainingDatasetSplitCounts,
+    pub label_count: usize,
+    pub field_date_count: usize,
+    pub label_provenance_refs: Vec<String>,
+    pub tiles: Vec<TrainingDatasetTile>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CropDetectionVerificationRecord {
     pub detection_id: String,
@@ -868,6 +939,34 @@ pub enum WeedMappingError {
     CoverFieldMismatch { expected: String, actual: String },
     #[error("candidate on tile {tile_id} falls outside the deterministic cover tile extent")]
     ZoneOutsideTileExtent { tile_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TrainingDatasetError {
+    #[error("dataset_id cannot be empty")]
+    EmptyDatasetId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("provenance_ref cannot be empty")]
+    EmptyProvenanceRef,
+    #[error("labeled tile set cannot be empty")]
+    EmptyLabels,
+    #[error("labeled tile has an empty required field")]
+    EmptyLabelField,
+    #[error("split fractions must be finite, non-negative, and sum to 1")]
+    InvalidSplitFractions,
+    #[error("tile {tile_ref} is assigned to both {first:?} and {second:?}")]
+    ConflictingTileSplit {
+        tile_ref: String,
+        first: TrainingDatasetSplit,
+        second: TrainingDatasetSplit,
+    },
+    #[error("field/date {field_date_key} leaks across {first:?} and {second:?}")]
+    FieldDateLeakage {
+        field_date_key: String,
+        first: TrainingDatasetSplit,
+        second: TrainingDatasetSplit,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1656,6 +1755,125 @@ pub fn run_weed_mapping(
     })
 }
 
+pub fn build_training_dataset_manifest(
+    dataset_id: String,
+    labels: Vec<LabeledTileRecord>,
+    config: TrainingDatasetSplitConfig,
+    provenance_ref: String,
+    generated_at: String,
+) -> Result<TrainingDatasetManifest, TrainingDatasetError> {
+    let dataset_id = normalize_training_text(dataset_id, TrainingDatasetError::EmptyDatasetId)?;
+    let provenance_ref =
+        normalize_training_text(provenance_ref, TrainingDatasetError::EmptyProvenanceRef)?;
+    let generated_at =
+        normalize_training_text(generated_at, TrainingDatasetError::EmptyGeneratedAt)?;
+    validate_training_split_config(config)?;
+    if labels.is_empty() {
+        return Err(TrainingDatasetError::EmptyLabels);
+    }
+
+    let mut explicit_tile_splits: BTreeMap<String, TrainingDatasetSplit> = BTreeMap::new();
+    let mut group_splits: BTreeMap<String, TrainingDatasetSplit> = BTreeMap::new();
+    let mut normalized_labels = Vec::with_capacity(labels.len());
+
+    for label in labels {
+        let tile_ref =
+            normalize_training_text(label.tile_ref, TrainingDatasetError::EmptyLabelField)?;
+        let field_id =
+            normalize_training_text(label.field_id, TrainingDatasetError::EmptyLabelField)?;
+        let captured_at =
+            normalize_training_text(label.captured_at, TrainingDatasetError::EmptyLabelField)?;
+        let label_text =
+            normalize_training_text(label.label, TrainingDatasetError::EmptyLabelField)?;
+        let labeler =
+            normalize_training_text(label.labeler, TrainingDatasetError::EmptyLabelField)?;
+        let source_run =
+            normalize_training_text(label.source_run, TrainingDatasetError::EmptyLabelField)?;
+        let label_provenance =
+            normalize_training_text(label.provenance_ref, TrainingDatasetError::EmptyLabelField)?;
+        let capture_date = capture_date_key(&captured_at);
+        let field_date_key = format!("{field_id}:{capture_date}");
+
+        if let Some(split) = label.assigned_split {
+            if let Some(first) = explicit_tile_splits.insert(tile_ref.clone(), split) {
+                if first != split {
+                    return Err(TrainingDatasetError::ConflictingTileSplit {
+                        tile_ref,
+                        first,
+                        second: split,
+                    });
+                }
+            }
+            if let Some(first) = group_splits.insert(field_date_key.clone(), split) {
+                if first != split {
+                    return Err(TrainingDatasetError::FieldDateLeakage {
+                        field_date_key,
+                        first,
+                        second: split,
+                    });
+                }
+            }
+        }
+
+        normalized_labels.push((
+            tile_ref,
+            field_id,
+            capture_date,
+            label_text,
+            labeler,
+            source_run,
+            label_provenance,
+            field_date_key,
+        ));
+    }
+
+    let mut tiles = Vec::with_capacity(normalized_labels.len());
+    let mut label_provenance_refs = BTreeSet::new();
+    let mut field_date_keys = BTreeSet::new();
+    for (
+        tile_ref,
+        field_id,
+        capture_date,
+        label,
+        labeler,
+        source_run,
+        label_provenance,
+        field_date_key,
+    ) in normalized_labels
+    {
+        let split = group_splits
+            .get(&field_date_key)
+            .copied()
+            .unwrap_or_else(|| assign_split_for_group(&field_date_key, config));
+        label_provenance_refs.insert(label_provenance.clone());
+        field_date_keys.insert(field_date_key);
+        tiles.push(TrainingDatasetTile {
+            tile_ref,
+            field_id,
+            capture_date,
+            label,
+            labeler,
+            source_run,
+            provenance_ref: label_provenance,
+            split,
+        });
+    }
+    tiles.sort_by(|left, right| left.tile_ref.cmp(&right.tile_ref));
+    let split_counts = training_split_counts(&tiles);
+
+    Ok(TrainingDatasetManifest {
+        dataset_id,
+        generated_at,
+        provenance_ref,
+        split_config: config,
+        split_counts,
+        label_count: tiles.len(),
+        field_date_count: field_date_keys.len(),
+        label_provenance_refs: label_provenance_refs.into_iter().collect(),
+        tiles,
+    })
+}
+
 pub fn apply_detection_verification(
     request: CropDetectionVerificationRequest,
 ) -> Result<CropDetectionVerificationRecord, CropDetectionVerificationError> {
@@ -2220,6 +2438,83 @@ fn normalize_pest_text(
     }
 }
 
+fn normalize_training_text(
+    value: String,
+    error: TrainingDatasetError,
+) -> Result<String, TrainingDatasetError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn validate_training_split_config(
+    config: TrainingDatasetSplitConfig,
+) -> Result<(), TrainingDatasetError> {
+    let sum = config.train_fraction + config.validation_fraction + config.test_fraction;
+    let valid = config.train_fraction.is_finite()
+        && config.validation_fraction.is_finite()
+        && config.test_fraction.is_finite()
+        && config.train_fraction >= 0.0
+        && config.validation_fraction >= 0.0
+        && config.test_fraction >= 0.0
+        && (sum - 1.0).abs() <= 1.0e-9;
+    if valid {
+        Ok(())
+    } else {
+        Err(TrainingDatasetError::InvalidSplitFractions)
+    }
+}
+
+fn capture_date_key(captured_at: &str) -> String {
+    captured_at
+        .split_once('T')
+        .map(|(date, _)| date)
+        .unwrap_or(captured_at)
+        .to_string()
+}
+
+fn assign_split_for_group(
+    field_date_key: &str,
+    config: TrainingDatasetSplitConfig,
+) -> TrainingDatasetSplit {
+    let bucket = stable_split_bucket(config.seed, field_date_key) as f64 / 10_000.0;
+    if bucket < config.train_fraction {
+        TrainingDatasetSplit::Train
+    } else if bucket < config.train_fraction + config.validation_fraction {
+        TrainingDatasetSplit::Validation
+    } else {
+        TrainingDatasetSplit::Test
+    }
+}
+
+fn stable_split_bucket(seed: u64, value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash % 10_000
+}
+
+fn training_split_counts(tiles: &[TrainingDatasetTile]) -> TrainingDatasetSplitCounts {
+    let mut counts = TrainingDatasetSplitCounts {
+        train: 0,
+        validation: 0,
+        test: 0,
+    };
+    for tile in tiles {
+        match tile.split {
+            TrainingDatasetSplit::Train => counts.train += 1,
+            TrainingDatasetSplit::Validation => counts.validation += 1,
+            TrainingDatasetSplit::Test => counts.test += 1,
+        }
+    }
+    counts
+}
+
 fn is_unit_fraction(value: f64) -> bool {
     value.is_finite() && (0.0..=1.0).contains(&value)
 }
@@ -2379,8 +2674,8 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 mod tests {
     use super::{
         apply_detection_verification, assemble_detection_finding, build_inference_run_record,
-        build_model_version_record, estimate_growth_stage, run_canopy_cover,
-        run_disease_lesion_detection, run_pest_detection, run_stand_count,
+        build_model_version_record, build_training_dataset_manifest, estimate_growth_stage,
+        run_canopy_cover, run_disease_lesion_detection, run_pest_detection, run_stand_count,
         run_tiled_inference_pipeline, run_weed_mapping, transition_inference_run_status,
         validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
         CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
@@ -2389,9 +2684,10 @@ mod tests {
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
         FindingPromotionRequest, GrowthIndexObservation, GrowthStage, GrowthStageConfidence,
         GrowthStageConfig, InferenceModelReference, InferenceRunError, InferenceRunStatus,
-        InferenceRunSubmissionRequest, ModelVersionRegistrationRequest, PestDetectionCandidate,
-        PestDetectionConfig, PestDetectionError, PlantCountConfig, PlantCountTile,
-        PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason, WeedMappingConfig,
+        InferenceRunSubmissionRequest, LabeledTileRecord, ModelVersionRegistrationRequest,
+        PestDetectionCandidate, PestDetectionConfig, PestDetectionError, PlantCountConfig,
+        PlantCountTile, PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason,
+        TrainingDatasetError, TrainingDatasetSplit, TrainingDatasetSplitConfig, WeedMappingConfig,
         WeedMappingError, WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
@@ -3271,6 +3567,133 @@ mod tests {
     }
 
     #[test]
+    fn training_dataset_manifest_produces_reproducible_splits_with_provenance() {
+        let labels = vec![
+            labeled_tile("tile-a", "field-1", "2026-06-01T10:00:00Z", "aphid", None),
+            labeled_tile("tile-b", "field-1", "2026-06-01T11:00:00Z", "aphid", None),
+            labeled_tile(
+                "tile-c",
+                "field-2",
+                "2026-06-02T10:00:00Z",
+                "corn_earworm",
+                Some(TrainingDatasetSplit::Validation),
+            ),
+            labeled_tile(
+                "tile-d",
+                "field-3",
+                "2026-06-03T10:00:00Z",
+                "healthy",
+                Some(TrainingDatasetSplit::Test),
+            ),
+        ];
+
+        let first = build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            labels.clone(),
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect("dataset manifest should build");
+        let second = build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            labels,
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect("dataset manifest should be reproducible");
+
+        assert_eq!(first, second);
+        assert_eq!(first.dataset_id, "dataset:pest:v1");
+        assert_eq!(first.label_count, 4);
+        assert_eq!(first.field_date_count, 3);
+        assert_eq!(first.label_provenance_refs.len(), 4);
+        assert_eq!(
+            first.tiles[0].split, first.tiles[1].split,
+            "same field/date must remain in one split"
+        );
+        assert_eq!(first.tiles[2].split, TrainingDatasetSplit::Validation);
+        assert_eq!(first.tiles[3].split, TrainingDatasetSplit::Test);
+        assert_eq!(
+            first.split_counts.train + first.split_counts.validation + first.split_counts.test,
+            4
+        );
+    }
+
+    #[test]
+    fn training_dataset_rejects_field_date_leakage_across_splits() {
+        let error = build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            vec![
+                labeled_tile(
+                    "tile-a",
+                    "field-1",
+                    "2026-06-01T10:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Train),
+                ),
+                labeled_tile(
+                    "tile-b",
+                    "field-1",
+                    "2026-06-01T11:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Validation),
+                ),
+            ],
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect_err("same field/date cannot leak across splits");
+
+        assert!(matches!(
+            error,
+            TrainingDatasetError::FieldDateLeakage {
+                field_date_key,
+                first: TrainingDatasetSplit::Train,
+                second: TrainingDatasetSplit::Validation,
+            } if field_date_key == "field-1:2026-06-01"
+        ));
+    }
+
+    #[test]
+    fn training_dataset_rejects_conflicting_tile_split_assignment() {
+        let error = build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            vec![
+                labeled_tile(
+                    "tile-a",
+                    "field-1",
+                    "2026-06-01T10:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Train),
+                ),
+                labeled_tile(
+                    "tile-a",
+                    "field-2",
+                    "2026-06-02T10:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Test),
+                ),
+            ],
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect_err("same tile cannot be assigned to conflicting splits");
+
+        assert_eq!(
+            error,
+            TrainingDatasetError::ConflictingTileSplit {
+                tile_ref: "tile-a".to_string(),
+                first: TrainingDatasetSplit::Train,
+                second: TrainingDatasetSplit::Test,
+            }
+        );
+    }
+
+    #[test]
     fn human_verification_records_actor_timestamp_and_correction_label() {
         let record = apply_detection_verification(CropDetectionVerificationRequest {
             detection_id: "disease:tile-1:1".to_string(),
@@ -3602,6 +4025,34 @@ mod tests {
             tile_id: tile_id.to_string(),
             confidence,
             bbox,
+        }
+    }
+
+    fn split_config() -> TrainingDatasetSplitConfig {
+        TrainingDatasetSplitConfig {
+            train_fraction: 0.6,
+            validation_fraction: 0.2,
+            test_fraction: 0.2,
+            seed: 42,
+        }
+    }
+
+    fn labeled_tile(
+        tile_ref: &str,
+        field_id: &str,
+        captured_at: &str,
+        label: &str,
+        assigned_split: Option<TrainingDatasetSplit>,
+    ) -> LabeledTileRecord {
+        LabeledTileRecord {
+            tile_ref: tile_ref.to_string(),
+            field_id: field_id.to_string(),
+            captured_at: captured_at.to_string(),
+            label: label.to_string(),
+            labeler: "labeler-7".to_string(),
+            source_run: format!("run:{tile_ref}"),
+            provenance_ref: format!("provenance:label:{tile_ref}"),
+            assigned_split,
         }
     }
 
