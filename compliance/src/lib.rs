@@ -518,6 +518,58 @@ pub struct ComplianceAlertScheduleRequest {
     pub source_health: Vec<ComplianceRecordSourceHealth>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceRetentionClass {
+    FlightSafety,
+    ChemicalApplication,
+    AuditEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceRecordStoragePlan {
+    pub record_id: String,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceRetentionPolicyRule {
+    pub residency_tag: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub allowed_storage_regions: Vec<String>,
+    pub min_retention_days: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompliancePolicyDecisionStatus {
+    Allowed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompliancePolicyBlockReason {
+    ResidencyRegionMismatch,
+    RetentionPeriodActive,
+    MissingPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompliancePolicyDecision {
+    pub record_id: String,
+    pub checked_at: String,
+    pub status: CompliancePolicyDecisionStatus,
+    pub reason_code: Option<CompliancePolicyBlockReason>,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub min_retention_until: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CreateComplianceRecordRequest {
     #[serde(default)]
@@ -876,6 +928,26 @@ pub enum ComplianceAlertScheduleError {
     EmptyDeadlineRef,
     #[error("deadline evidence_ref cannot be empty")]
     EmptyDeadlineEvidenceRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompliancePolicyError {
+    #[error("record_id cannot be empty")]
+    EmptyRecordId,
+    #[error("residency_tag cannot be empty")]
+    EmptyResidencyTag,
+    #[error("storage_region cannot be empty")]
+    EmptyStorageRegion,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("checked_at cannot be empty")]
+    EmptyCheckedAt,
+    #[error("allowed_storage_regions cannot contain an empty value")]
+    EmptyAllowedStorageRegion,
+    #[error("min_retention_days must be zero or greater")]
+    InvalidMinRetentionDays,
+    #[error("timestamp is not valid RFC3339")]
+    InvalidTimestamp,
 }
 
 pub fn build_initial_compliance_record(
@@ -1588,6 +1660,85 @@ pub fn schedule_compliance_alerts(
             .then_with(|| left.idempotency_key.cmp(&right.idempotency_key))
     });
     Ok(events)
+}
+
+pub fn evaluate_compliance_record_storage(
+    plan: ComplianceRecordStoragePlan,
+    policies: &[ComplianceRetentionPolicyRule],
+    checked_at: String,
+) -> Result<CompliancePolicyDecision, CompliancePolicyError> {
+    let plan = normalize_storage_plan(plan)?;
+    let checked_at = normalize_policy_text(checked_at, CompliancePolicyError::EmptyCheckedAt)?;
+    parse_policy_time(&checked_at)?;
+    let Some(policy) = find_retention_policy(&plan, policies)? else {
+        return Ok(policy_decision(
+            plan,
+            checked_at,
+            CompliancePolicyDecisionStatus::Blocked,
+            Some(CompliancePolicyBlockReason::MissingPolicy),
+            None,
+        ));
+    };
+    let min_retention_until = min_retention_until(&plan.created_at, policy.min_retention_days)?;
+    if !policy
+        .allowed_storage_regions
+        .iter()
+        .any(|region| region == &plan.storage_region)
+    {
+        return Ok(policy_decision(
+            plan,
+            checked_at,
+            CompliancePolicyDecisionStatus::Blocked,
+            Some(CompliancePolicyBlockReason::ResidencyRegionMismatch),
+            Some(min_retention_until),
+        ));
+    }
+
+    Ok(policy_decision(
+        plan,
+        checked_at,
+        CompliancePolicyDecisionStatus::Allowed,
+        None,
+        Some(min_retention_until),
+    ))
+}
+
+pub fn evaluate_compliance_record_deletion(
+    plan: ComplianceRecordStoragePlan,
+    policies: &[ComplianceRetentionPolicyRule],
+    checked_at: String,
+) -> Result<CompliancePolicyDecision, CompliancePolicyError> {
+    let plan = normalize_storage_plan(plan)?;
+    let checked_at = normalize_policy_text(checked_at, CompliancePolicyError::EmptyCheckedAt)?;
+    let checked_at_time = parse_policy_time(&checked_at)?;
+    let Some(policy) = find_retention_policy(&plan, policies)? else {
+        return Ok(policy_decision(
+            plan,
+            checked_at,
+            CompliancePolicyDecisionStatus::Blocked,
+            Some(CompliancePolicyBlockReason::MissingPolicy),
+            None,
+        ));
+    };
+    let min_retention_until = min_retention_until(&plan.created_at, policy.min_retention_days)?;
+    let min_retention_time = parse_policy_time(&min_retention_until)?;
+    if checked_at_time < min_retention_time {
+        return Ok(policy_decision(
+            plan,
+            checked_at,
+            CompliancePolicyDecisionStatus::Blocked,
+            Some(CompliancePolicyBlockReason::RetentionPeriodActive),
+            Some(min_retention_until),
+        ));
+    }
+
+    Ok(policy_decision(
+        plan,
+        checked_at,
+        CompliancePolicyDecisionStatus::Allowed,
+        None,
+        Some(min_retention_until),
+    ))
 }
 
 pub fn airspace_zone_is_effective_at(zone: &AirspaceZoneRecord, at: Option<&str>) -> bool {
@@ -2330,6 +2481,104 @@ fn normalize_alert_text(
     }
 }
 
+fn normalize_storage_plan(
+    plan: ComplianceRecordStoragePlan,
+) -> Result<ComplianceRecordStoragePlan, CompliancePolicyError> {
+    let record_id = normalize_policy_text(plan.record_id, CompliancePolicyError::EmptyRecordId)?;
+    let residency_tag =
+        normalize_policy_text(plan.residency_tag, CompliancePolicyError::EmptyResidencyTag)?;
+    let storage_region = normalize_policy_text(
+        plan.storage_region,
+        CompliancePolicyError::EmptyStorageRegion,
+    )?;
+    let created_at = normalize_policy_text(plan.created_at, CompliancePolicyError::EmptyCreatedAt)?;
+    parse_policy_time(&created_at)?;
+
+    Ok(ComplianceRecordStoragePlan {
+        record_id,
+        residency_tag,
+        storage_region,
+        retention_class: plan.retention_class,
+        created_at,
+    })
+}
+
+fn find_retention_policy(
+    plan: &ComplianceRecordStoragePlan,
+    policies: &[ComplianceRetentionPolicyRule],
+) -> Result<Option<ComplianceRetentionPolicyRule>, CompliancePolicyError> {
+    let mut matching_policy = None;
+    for policy in policies {
+        let residency_tag = normalize_policy_text(
+            policy.residency_tag.clone(),
+            CompliancePolicyError::EmptyResidencyTag,
+        )?;
+        if policy.min_retention_days < 0 {
+            return Err(CompliancePolicyError::InvalidMinRetentionDays);
+        }
+        let mut allowed_storage_regions = Vec::new();
+        for region in &policy.allowed_storage_regions {
+            allowed_storage_regions.push(normalize_policy_text(
+                region.clone(),
+                CompliancePolicyError::EmptyAllowedStorageRegion,
+            )?);
+        }
+        if residency_tag == plan.residency_tag && policy.retention_class == plan.retention_class {
+            matching_policy = Some(ComplianceRetentionPolicyRule {
+                residency_tag,
+                retention_class: policy.retention_class,
+                allowed_storage_regions,
+                min_retention_days: policy.min_retention_days,
+            });
+            break;
+        }
+    }
+    Ok(matching_policy)
+}
+
+fn min_retention_until(created_at: &str, min_days: i64) -> Result<String, CompliancePolicyError> {
+    Ok(format_rfc3339(
+        parse_policy_time(created_at)? + Duration::days(min_days),
+    ))
+}
+
+fn policy_decision(
+    plan: ComplianceRecordStoragePlan,
+    checked_at: String,
+    status: CompliancePolicyDecisionStatus,
+    reason_code: Option<CompliancePolicyBlockReason>,
+    min_retention_until: Option<String>,
+) -> CompliancePolicyDecision {
+    CompliancePolicyDecision {
+        record_id: plan.record_id,
+        checked_at,
+        status,
+        reason_code,
+        residency_tag: plan.residency_tag,
+        storage_region: plan.storage_region,
+        retention_class: plan.retention_class,
+        min_retention_until,
+    }
+}
+
+fn parse_policy_time(value: &str) -> Result<DateTime<Utc>, CompliancePolicyError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| CompliancePolicyError::InvalidTimestamp)
+}
+
+fn normalize_policy_text(
+    value: String,
+    error: CompliancePolicyError,
+) -> Result<String, CompliancePolicyError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn point_in_polygon(point: AirspaceCoordinate, polygon: &[AirspaceCoordinate]) -> bool {
     let mut inside = false;
     for edge in polygon.windows(2) {
@@ -2411,7 +2660,8 @@ mod tests {
         append_compliance_record_version, build_airspace_zone_record,
         build_compliance_audit_report, build_compliance_evidence_record,
         build_initial_compliance_record, build_operator_certification_record,
-        check_operator_certification, compute_rei_phi_window, evaluate_entry_harvest_clearance,
+        check_operator_certification, compute_rei_phi_window, evaluate_compliance_record_deletion,
+        evaluate_compliance_record_storage, evaluate_entry_harvest_clearance,
         evaluate_preflight_authorization, evaluate_spray_buffer_compliance,
         refuse_compliance_evidence_overwrite, refuse_in_place_mutation, AirspaceCoordinate,
         AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
@@ -2420,14 +2670,15 @@ mod tests {
         ChemicalApplicationRecord, ComplianceAlertScheduleRequest, ComplianceAlertSeverity,
         ComplianceAuditReportError, ComplianceAuditReportRequest, ComplianceCheckKind,
         ComplianceDeadlineRecord, ComplianceEvidenceError, ComplianceEvidenceInput,
-        ComplianceEvidenceRequest, ComplianceRecordError, ComplianceRecordPayload,
-        ComplianceRecordSourceHealth, ComplianceRecordSourceStatus, ComplianceRecordType,
-        CreateComplianceRecordRequest, EntryHarvestAction, EntryHarvestBlockReason,
-        EntryHarvestDecisionStatus, IntervalWindowStatus, OperatorCertificationRegistrationRequest,
-        PreflightAirspaceStatus, PreflightAuthorizationRequest, ProductLabelInterval,
-        RemoteIdFlightLogRecord, RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType,
-        SprayBufferBlockReason, SprayBufferComplianceError, SprayBufferDecisionStatus,
-        TelemetryGapRecord,
+        ComplianceEvidenceRequest, CompliancePolicyBlockReason, CompliancePolicyDecisionStatus,
+        ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordSourceHealth,
+        ComplianceRecordSourceStatus, ComplianceRecordStoragePlan, ComplianceRecordType,
+        ComplianceRetentionClass, ComplianceRetentionPolicyRule, CreateComplianceRecordRequest,
+        EntryHarvestAction, EntryHarvestBlockReason, EntryHarvestDecisionStatus,
+        IntervalWindowStatus, OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
+        PreflightAuthorizationRequest, ProductLabelInterval, RemoteIdFlightLogRecord,
+        RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType, SprayBufferBlockReason,
+        SprayBufferComplianceError, SprayBufferDecisionStatus, TelemetryGapRecord,
     };
 
     #[test]
@@ -3131,6 +3382,91 @@ mod tests {
     }
 
     #[test]
+    fn compliance_policy_allows_record_storage_in_residency_region() {
+        let decision = evaluate_compliance_record_storage(
+            storage_plan(
+                "record-1",
+                "us",
+                "us-east-1",
+                ComplianceRetentionClass::AuditEvidence,
+            ),
+            &[retention_policy(
+                "us",
+                ComplianceRetentionClass::AuditEvidence,
+                &["us-east-1"],
+                365,
+            )],
+            "2026-06-14T12:00:00Z".to_string(),
+        )
+        .expect("storage policy should evaluate");
+
+        assert_eq!(decision.status, CompliancePolicyDecisionStatus::Allowed);
+        assert_eq!(decision.reason_code, None);
+        assert_eq!(decision.residency_tag, "us");
+        assert_eq!(decision.storage_region, "us-east-1");
+        assert_eq!(
+            decision.min_retention_until.as_deref(),
+            Some("2027-06-14T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn compliance_policy_blocks_storage_in_wrong_residency_region() {
+        let decision = evaluate_compliance_record_storage(
+            storage_plan(
+                "record-1",
+                "us",
+                "eu-central-1",
+                ComplianceRetentionClass::AuditEvidence,
+            ),
+            &[retention_policy(
+                "us",
+                ComplianceRetentionClass::AuditEvidence,
+                &["us-east-1"],
+                365,
+            )],
+            "2026-06-14T12:00:00Z".to_string(),
+        )
+        .expect("storage policy should evaluate");
+
+        assert_eq!(decision.status, CompliancePolicyDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(CompliancePolicyBlockReason::ResidencyRegionMismatch)
+        );
+    }
+
+    #[test]
+    fn compliance_policy_refuses_deletion_before_minimum_retention() {
+        let decision = evaluate_compliance_record_deletion(
+            storage_plan(
+                "record-chem-app-1",
+                "us",
+                "us-east-1",
+                ComplianceRetentionClass::ChemicalApplication,
+            ),
+            &[retention_policy(
+                "us",
+                ComplianceRetentionClass::ChemicalApplication,
+                &["us-east-1"],
+                30,
+            )],
+            "2026-06-20T12:00:00Z".to_string(),
+        )
+        .expect("deletion policy should evaluate");
+
+        assert_eq!(decision.status, CompliancePolicyDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(CompliancePolicyBlockReason::RetentionPeriodActive)
+        );
+        assert_eq!(
+            decision.min_retention_until.as_deref(),
+            Some("2026-07-14T12:00:00Z")
+        );
+    }
+
+    #[test]
     fn in_place_mutation_is_refused() {
         let error = refuse_in_place_mutation("delete");
 
@@ -3477,6 +3813,35 @@ mod tests {
                     value: "11.132".to_string(),
                 },
             ],
+        }
+    }
+
+    fn storage_plan(
+        record_id: &str,
+        residency_tag: &str,
+        storage_region: &str,
+        retention_class: ComplianceRetentionClass,
+    ) -> ComplianceRecordStoragePlan {
+        ComplianceRecordStoragePlan {
+            record_id: record_id.to_string(),
+            residency_tag: residency_tag.to_string(),
+            storage_region: storage_region.to_string(),
+            retention_class,
+            created_at: "2026-06-14T12:00:00Z".to_string(),
+        }
+    }
+
+    fn retention_policy(
+        residency_tag: &str,
+        retention_class: ComplianceRetentionClass,
+        regions: &[&str],
+        min_retention_days: i64,
+    ) -> ComplianceRetentionPolicyRule {
+        ComplianceRetentionPolicyRule {
+            residency_tag: residency_tag.to_string(),
+            retention_class,
+            allowed_storage_regions: regions.iter().map(|region| (*region).to_string()).collect(),
+            min_retention_days,
         }
     }
 
