@@ -427,6 +427,43 @@ pub struct DiseaseDetectionReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PestDetectionConfig {
+    pub detection_threshold: f64,
+    pub low_confidence_threshold: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PestDetectionCandidate {
+    pub tile_id: String,
+    pub pest_label: String,
+    pub confidence: f64,
+    pub bbox: GeoBounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PestDetection {
+    pub detection_id: String,
+    pub pest_label: String,
+    pub confidence: f64,
+    pub low_confidence: bool,
+    pub evidence_tile_ref: String,
+    pub zone_geometry: DetectionZoneGeometry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PestDetectionReport {
+    pub field_id: String,
+    pub crs: String,
+    pub generated_at: String,
+    pub model: ModelGateResponse,
+    pub deterministic_cover_valid_pixels: usize,
+    pub detection_threshold: f64,
+    pub rejected_candidate_count: usize,
+    pub low_confidence_count: usize,
+    pub detections: Vec<PestDetection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WeedMappingConfig {
     pub low_confidence_threshold: f64,
 }
@@ -761,6 +798,37 @@ pub enum DiseaseDetectionError {
     InvalidThreshold,
     #[error("tile_id cannot be empty")]
     EmptyTileId,
+    #[error("candidate on tile {tile_id} has invalid confidence")]
+    InvalidConfidence { tile_id: String },
+    #[error("candidate on tile {tile_id} has invalid zone geometry")]
+    InvalidZoneGeometry { tile_id: String },
+    #[error("candidate references tile {tile_id} without deterministic cover evidence")]
+    MissingCoverTile { tile_id: String },
+    #[error("cover report field {actual} does not match requested field {expected}")]
+    CoverFieldMismatch { expected: String, actual: String },
+    #[error("candidate on tile {tile_id} falls outside the deterministic cover tile extent")]
+    ZoneOutsideTileExtent { tile_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum PestDetectionError {
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("deterministic canopy cover is required before pest detection")]
+    DeterministicCoverRequired,
+    #[error("pest model gate failed: {source}")]
+    ModelGate {
+        #[source]
+        source: CropModelRegistryError,
+    },
+    #[error("detection thresholds must be finite, between 0 and 1, and ordered")]
+    InvalidThreshold,
+    #[error("tile_id cannot be empty")]
+    EmptyTileId,
+    #[error("pest_label cannot be empty")]
+    EmptyPestLabel,
     #[error("candidate on tile {tile_id} has invalid confidence")]
     InvalidConfidence { tile_id: String },
     #[error("candidate on tile {tile_id} has invalid zone geometry")]
@@ -1396,6 +1464,107 @@ pub fn run_disease_lesion_detection(
         generated_at,
         model,
         deterministic_cover_valid_pixels: cover.valid_pixels,
+        low_confidence_count,
+        detections,
+    })
+}
+
+pub fn run_pest_detection(
+    field_id: String,
+    model: InferenceModelReference,
+    model_registered: bool,
+    deterministic_cover: Option<&CanopyCoverReport>,
+    candidates: Vec<PestDetectionCandidate>,
+    config: PestDetectionConfig,
+    generated_at: String,
+) -> Result<PestDetectionReport, PestDetectionError> {
+    let field_id = normalize_pest_text(field_id, PestDetectionError::EmptyFieldId)?;
+    let generated_at = normalize_pest_text(generated_at, PestDetectionError::EmptyGeneratedAt)?;
+    if !is_unit_fraction(config.detection_threshold)
+        || !is_unit_fraction(config.low_confidence_threshold)
+        || config.detection_threshold > config.low_confidence_threshold
+    {
+        return Err(PestDetectionError::InvalidThreshold);
+    }
+    let model = validate_model_reference(model, model_registered)
+        .map_err(|source| PestDetectionError::ModelGate { source })?;
+    let cover = deterministic_cover.ok_or(PestDetectionError::DeterministicCoverRequired)?;
+    if cover.field_id != field_id {
+        return Err(PestDetectionError::CoverFieldMismatch {
+            expected: field_id,
+            actual: cover.field_id.clone(),
+        });
+    }
+
+    let cover_tiles = cover
+        .tiles
+        .iter()
+        .map(|tile| (tile.tile_id.as_str(), tile))
+        .collect::<BTreeMap<_, _>>();
+    let mut detections = Vec::new();
+    let mut tile_detection_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut rejected_candidate_count = 0;
+
+    for candidate in candidates {
+        let tile_id =
+            normalize_pest_text(candidate.tile_id.clone(), PestDetectionError::EmptyTileId)?;
+        let pest_label = normalize_pest_text(
+            candidate.pest_label.clone(),
+            PestDetectionError::EmptyPestLabel,
+        )?;
+        if !is_unit_fraction(candidate.confidence) {
+            return Err(PestDetectionError::InvalidConfidence { tile_id });
+        }
+        let cover_tile = cover_tiles.get(tile_id.as_str()).ok_or_else(|| {
+            PestDetectionError::MissingCoverTile {
+                tile_id: tile_id.clone(),
+            }
+        })?;
+        let tile_bbox = cover_tile.spatial_ref.bbox.as_ref().ok_or_else(|| {
+            PestDetectionError::MissingCoverTile {
+                tile_id: tile_id.clone(),
+            }
+        })?;
+        if !valid_bbox(&candidate.bbox) {
+            return Err(PestDetectionError::InvalidZoneGeometry { tile_id });
+        }
+        if !bbox_within(&candidate.bbox, tile_bbox) {
+            return Err(PestDetectionError::ZoneOutsideTileExtent { tile_id });
+        }
+        if candidate.confidence < config.detection_threshold {
+            rejected_candidate_count += 1;
+            continue;
+        }
+
+        let sequence = tile_detection_counts.entry(tile_id.clone()).or_insert(0);
+        *sequence += 1;
+        detections.push(PestDetection {
+            detection_id: format!("pest:{tile_id}:{}", *sequence),
+            pest_label,
+            confidence: candidate.confidence,
+            low_confidence: candidate.confidence < config.low_confidence_threshold,
+            evidence_tile_ref: tile_id,
+            zone_geometry: DetectionZoneGeometry {
+                crs: cover.crs.clone(),
+                bbox: candidate.bbox,
+            },
+        });
+    }
+
+    detections.sort_by(|left, right| left.detection_id.cmp(&right.detection_id));
+    let low_confidence_count = detections
+        .iter()
+        .filter(|detection| detection.low_confidence)
+        .count();
+
+    Ok(PestDetectionReport {
+        field_id,
+        crs: cover.crs.clone(),
+        generated_at,
+        model,
+        deterministic_cover_valid_pixels: cover.valid_pixels,
+        detection_threshold: config.detection_threshold,
+        rejected_candidate_count,
         low_confidence_count,
         detections,
     })
@@ -2039,6 +2208,18 @@ fn normalize_disease_text(
     }
 }
 
+fn normalize_pest_text(
+    value: String,
+    error: PestDetectionError,
+) -> Result<String, PestDetectionError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn is_unit_fraction(value: f64) -> bool {
     value.is_finite() && (0.0..=1.0).contains(&value)
 }
@@ -2199,18 +2380,19 @@ mod tests {
     use super::{
         apply_detection_verification, assemble_detection_finding, build_inference_run_record,
         build_model_version_record, estimate_growth_stage, run_canopy_cover,
-        run_disease_lesion_detection, run_stand_count, run_tiled_inference_pipeline,
-        run_weed_mapping, transition_inference_run_status, validate_detection_finding_promotion,
-        validate_model_reference, CanopyCoverConfig, CanopyCoverError, CanopyCoverTile,
-        CropDetectionFindingError, CropDetectionFindingRequest, CropDetectionVerificationAction,
-        CropDetectionVerificationRequest, CropModelRegistryError, CropModelTask,
-        DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
+        run_disease_lesion_detection, run_pest_detection, run_stand_count,
+        run_tiled_inference_pipeline, run_weed_mapping, transition_inference_run_status,
+        validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
+        CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
+        CropDetectionVerificationAction, CropDetectionVerificationRequest, CropModelRegistryError,
+        CropModelTask, DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
         FindingPromotionRequest, GrowthIndexObservation, GrowthStage, GrowthStageConfidence,
         GrowthStageConfig, InferenceModelReference, InferenceRunError, InferenceRunStatus,
-        InferenceRunSubmissionRequest, ModelVersionRegistrationRequest, PlantCountConfig,
-        PlantCountTile, PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason,
-        WeedMappingConfig, WeedMappingError, WeedZoneCandidate,
+        InferenceRunSubmissionRequest, ModelVersionRegistrationRequest, PestDetectionCandidate,
+        PestDetectionConfig, PestDetectionError, PlantCountConfig, PlantCountTile,
+        PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason, WeedMappingConfig,
+        WeedMappingError, WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -2900,6 +3082,109 @@ mod tests {
     }
 
     #[test]
+    fn pest_detection_returns_confidence_evidence_and_bounded_zone() {
+        let cover = cover_report();
+        let report = run_pest_detection(
+            "field-1".to_string(),
+            pest_model(),
+            true,
+            Some(&cover),
+            vec![pest_candidate(
+                "tile-1",
+                "corn_earworm",
+                0.88,
+                GeoBounds {
+                    min_lon: 4.0,
+                    min_lat: 6.0,
+                    max_lon: 16.0,
+                    max_lat: 18.0,
+                },
+            )],
+            PestDetectionConfig {
+                detection_threshold: 0.5,
+                low_confidence_threshold: 0.7,
+            },
+            "2026-06-01T12:18:00Z".to_string(),
+        )
+        .expect("pest detection should run");
+
+        assert_eq!(report.field_id, "field-1");
+        assert_eq!(report.crs, "EPSG:32614");
+        assert_eq!(report.model.model_id, "pest-detector");
+        assert_eq!(report.deterministic_cover_valid_pixels, cover.valid_pixels);
+        assert_eq!(report.detection_threshold, 0.5);
+        assert_eq!(report.rejected_candidate_count, 0);
+        assert_eq!(report.detections.len(), 1);
+        let detection = &report.detections[0];
+        assert_eq!(detection.detection_id, "pest:tile-1:1");
+        assert_eq!(detection.pest_label, "corn_earworm");
+        assert_eq!(detection.evidence_tile_ref, "tile-1");
+        assert_eq!(detection.confidence, 0.88);
+        assert!(!detection.low_confidence);
+        assert_eq!(detection.zone_geometry.crs, "EPSG:32614");
+        assert_eq!(
+            detection.zone_geometry.bbox,
+            GeoBounds {
+                min_lon: 4.0,
+                min_lat: 6.0,
+                max_lon: 16.0,
+                max_lat: 18.0,
+            }
+        );
+    }
+
+    #[test]
+    fn pest_detection_clear_field_excludes_below_threshold_without_false_zones() {
+        let cover = cover_report();
+        let report = run_pest_detection(
+            "field-1".to_string(),
+            pest_model(),
+            true,
+            Some(&cover),
+            vec![pest_candidate(
+                "tile-1",
+                "aphid",
+                0.24,
+                GeoBounds {
+                    min_lon: 0.0,
+                    min_lat: 0.0,
+                    max_lon: 8.0,
+                    max_lat: 8.0,
+                },
+            )],
+            PestDetectionConfig {
+                detection_threshold: 0.5,
+                low_confidence_threshold: 0.7,
+            },
+            "2026-06-01T12:18:00Z".to_string(),
+        )
+        .expect("clear-field pest report should run");
+
+        assert!(report.detections.is_empty());
+        assert_eq!(report.rejected_candidate_count, 1);
+        assert_eq!(report.low_confidence_count, 0);
+    }
+
+    #[test]
+    fn pest_detection_refuses_to_run_without_deterministic_cover() {
+        let error = run_pest_detection(
+            "field-1".to_string(),
+            pest_model(),
+            true,
+            None,
+            Vec::new(),
+            PestDetectionConfig {
+                detection_threshold: 0.5,
+                low_confidence_threshold: 0.7,
+            },
+            "2026-06-01T12:18:00Z".to_string(),
+        )
+        .expect_err("deterministic cover is required");
+
+        assert_eq!(error, PestDetectionError::DeterministicCoverRequired);
+    }
+
+    #[test]
     fn weed_mapping_returns_georeferenced_confidence_zones_and_area() {
         let cover = cover_report();
         let report = run_weed_mapping(
@@ -3279,6 +3564,27 @@ mod tests {
     fn lesion_candidate(tile_id: &str, confidence: f64, bbox: GeoBounds) -> DiseaseLesionCandidate {
         DiseaseLesionCandidate {
             tile_id: tile_id.to_string(),
+            confidence,
+            bbox,
+        }
+    }
+
+    fn pest_model() -> InferenceModelReference {
+        InferenceModelReference {
+            model_id: "pest-detector".to_string(),
+            version: "2026.06.1".to_string(),
+        }
+    }
+
+    fn pest_candidate(
+        tile_id: &str,
+        pest_label: &str,
+        confidence: f64,
+        bbox: GeoBounds,
+    ) -> PestDetectionCandidate {
+        PestDetectionCandidate {
+            tile_id: tile_id.to_string(),
+            pest_label: pest_label.to_string(),
             confidence,
             bbox,
         }
