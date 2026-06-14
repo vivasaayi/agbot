@@ -61,6 +61,74 @@ pub struct ServiceHistoryEntry {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceWorkOrderSeverity {
+    Routine,
+    Degraded,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceWorkOrderStatus {
+    Open,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaintenancePartUsage {
+    pub part_id: String,
+    pub quantity: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OpenMaintenanceWorkOrderRequest {
+    #[serde(default)]
+    pub wo_id: Option<String>,
+    #[serde(default)]
+    pub component_id: String,
+    #[serde(default)]
+    pub reason: String,
+    pub severity: MaintenanceWorkOrderSeverity,
+    #[serde(default)]
+    pub opened_at: String,
+    #[serde(default)]
+    pub technician: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CloseMaintenanceWorkOrderRequest {
+    #[serde(default)]
+    pub closed_at: String,
+    #[serde(default)]
+    pub technician: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub parts: Vec<MaintenancePartUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceWorkOrder {
+    pub wo_id: String,
+    pub component_id: String,
+    pub reason: String,
+    pub severity: MaintenanceWorkOrderSeverity,
+    pub status: MaintenanceWorkOrderStatus,
+    pub opened_at: String,
+    pub closed_at: Option<String>,
+    pub technician: String,
+    pub parts: Vec<MaintenancePartUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceWorkOrderCloseResult {
+    pub component: FleetComponentRecord,
+    pub work_order: MaintenanceWorkOrder,
+    pub service_history_entry: ServiceHistoryEntry,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RegisterComponentRequest {
     #[serde(default)]
@@ -488,6 +556,7 @@ pub enum FleetReadinessBlockReason {
     StaleHealthData,
     CriticalHealthVerdict,
     BatteryHealthBelowThreshold,
+    OpenCriticalWorkOrder,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -860,6 +929,16 @@ pub enum FleetHealthError {
     EmptyServiceTechnician,
     #[error("service action cannot be empty")]
     EmptyServiceAction,
+    #[error("work_order_id cannot be empty")]
+    EmptyWorkOrderId,
+    #[error("work order reason cannot be empty")]
+    EmptyWorkOrderReason,
+    #[error("work order part_id cannot be empty")]
+    EmptyPartId,
+    #[error("work order part quantity must be greater than zero")]
+    InvalidPartQuantity,
+    #[error("work order {wo_id} is already closed")]
+    WorkOrderAlreadyClosed { wo_id: String },
     #[error("unsupported fleet component type {value}")]
     UnsupportedComponentType { value: String },
     #[error("unsupported fleet health indicator {value}")]
@@ -1691,6 +1770,117 @@ pub fn evaluate_fleet_readiness(
     })
 }
 
+pub fn open_maintenance_work_order(
+    request: OpenMaintenanceWorkOrderRequest,
+    generated_wo_id: String,
+) -> Result<MaintenanceWorkOrder, FleetHealthError> {
+    let wo_id = match request.wo_id {
+        Some(wo_id) => normalize_required_text(wo_id, FleetHealthError::EmptyWorkOrderId)?,
+        None => normalize_required_text(generated_wo_id, FleetHealthError::EmptyWorkOrderId)?,
+    };
+
+    Ok(MaintenanceWorkOrder {
+        wo_id,
+        component_id: normalize_required_text(
+            request.component_id,
+            FleetHealthError::EmptyComponentId,
+        )?,
+        reason: normalize_required_text(request.reason, FleetHealthError::EmptyWorkOrderReason)?,
+        severity: request.severity,
+        status: MaintenanceWorkOrderStatus::Open,
+        opened_at: normalize_required_text(request.opened_at, FleetHealthError::EmptyCreatedAt)?,
+        closed_at: None,
+        technician: normalize_required_text(
+            request.technician,
+            FleetHealthError::EmptyServiceTechnician,
+        )?,
+        parts: Vec::new(),
+    })
+}
+
+pub fn close_maintenance_work_order(
+    component: &FleetComponentRecord,
+    work_order: &MaintenanceWorkOrder,
+    request: CloseMaintenanceWorkOrderRequest,
+    updated_at: String,
+) -> Result<MaintenanceWorkOrderCloseResult, FleetHealthError> {
+    if work_order.status == MaintenanceWorkOrderStatus::Closed {
+        return Err(FleetHealthError::WorkOrderAlreadyClosed {
+            wo_id: work_order.wo_id.clone(),
+        });
+    }
+    let component_id = normalize_required_text(
+        component.component_id.clone(),
+        FleetHealthError::EmptyComponentId,
+    )?;
+    if work_order.component_id != component_id {
+        return Err(FleetHealthError::IndicatorComponentMismatch {
+            component_id,
+            sample_component_id: work_order.component_id.clone(),
+        });
+    }
+
+    let closed_at = normalize_required_text(request.closed_at, FleetHealthError::EmptyCreatedAt)?;
+    let technician =
+        normalize_required_text(request.technician, FleetHealthError::EmptyServiceTechnician)?;
+    let action = normalize_required_text(request.action, FleetHealthError::EmptyServiceAction)?;
+    let parts = normalize_work_order_parts(request.parts)?;
+    let service_history_entry = ServiceHistoryEntry {
+        service_id: work_order.wo_id.clone(),
+        performed_at: closed_at.clone(),
+        technician: technician.clone(),
+        action: action.clone(),
+        notes: Some(format_work_order_parts_note(&work_order.reason, &parts)),
+    };
+    let mut updated_component = component.clone();
+    updated_component
+        .service_history
+        .push(service_history_entry.clone());
+    updated_component.updated_at =
+        normalize_required_text(updated_at, FleetHealthError::EmptyCreatedAt)?;
+    let mut closed_work_order = work_order.clone();
+    closed_work_order.status = MaintenanceWorkOrderStatus::Closed;
+    closed_work_order.closed_at = Some(closed_at);
+    closed_work_order.technician = technician;
+    closed_work_order.parts = parts;
+
+    Ok(MaintenanceWorkOrderCloseResult {
+        component: updated_component,
+        work_order: closed_work_order,
+        service_history_entry,
+    })
+}
+
+pub fn evaluate_fleet_readiness_with_work_orders(
+    request: FleetReadinessRequest,
+    work_orders: &[MaintenanceWorkOrder],
+) -> Result<FleetReadinessDecision, FleetHealthError> {
+    let mut decision = evaluate_fleet_readiness(request)?;
+    for work_order in work_orders {
+        if work_order.status == MaintenanceWorkOrderStatus::Open
+            && work_order.severity == MaintenanceWorkOrderSeverity::Critical
+            && decision
+                .blockers
+                .iter()
+                .all(|blocker| blocker.component_ref.as_deref() != Some(&work_order.component_id))
+        {
+            decision.blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::OpenCriticalWorkOrder,
+                Some(work_order.component_id.clone()),
+                None,
+                None,
+                None,
+            ));
+        }
+    }
+    decision.status = if decision.blockers.is_empty() {
+        FleetReadinessDecisionStatus::Permitted
+    } else {
+        FleetReadinessDecisionStatus::Blocked
+    };
+    Ok(decision)
+}
+
 pub fn evaluate_ota_rollout(
     request: OtaRolloutRequest,
 ) -> Result<OtaRolloutDecision, FleetHealthError> {
@@ -2454,6 +2644,38 @@ fn normalize_service_history_entry(
     })
 }
 
+fn normalize_work_order_parts(
+    parts: Vec<MaintenancePartUsage>,
+) -> Result<Vec<MaintenancePartUsage>, FleetHealthError> {
+    parts
+        .into_iter()
+        .map(|part| {
+            if part.quantity == 0 {
+                return Err(FleetHealthError::InvalidPartQuantity);
+            }
+            Ok(MaintenancePartUsage {
+                part_id: normalize_required_text(part.part_id, FleetHealthError::EmptyPartId)?,
+                quantity: part.quantity,
+            })
+        })
+        .collect()
+}
+
+fn format_work_order_parts_note(reason: &str, parts: &[MaintenancePartUsage]) -> String {
+    if parts.is_empty() {
+        return format!("work_order_reason={reason};parts=none");
+    }
+    let mut rendered_parts = parts
+        .iter()
+        .map(|part| format!("{}x{}", part.part_id, part.quantity))
+        .collect::<Vec<_>>();
+    rendered_parts.sort();
+    format!(
+        "work_order_reason={reason};parts={}",
+        rendered_parts.join(",")
+    )
+}
+
 fn normalize_required_text(
     value: String,
     error: FleetHealthError,
@@ -2494,23 +2716,26 @@ mod tests {
         accrue_component_duty, append_health_evidence_record, apply_rollout_control,
         build_component_duty_accruals, build_component_record,
         build_degradation_event_evidence_record, build_fleet_operations_dashboard_feed,
-        build_health_verdict_evidence_record, component_event, derive_health_indicators,
-        detect_health_indicator_degradation, evaluate_battery_health_trend,
-        evaluate_component_health_verdict, evaluate_fleet_readiness, evaluate_ota_rollout,
+        build_health_verdict_evidence_record, close_maintenance_work_order, component_event,
+        derive_health_indicators, detect_health_indicator_degradation,
+        evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
+        evaluate_fleet_readiness_with_work_orders, evaluate_ota_rollout,
         fleet_operations_source_current, fleet_operations_source_unavailable, install_component,
-        refuse_health_evidence_overwrite, BatteryHealthTrendConfig, ComponentHealthVerdict,
-        ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
-        DutyAccrualRequest, FleetComponentRecord, FleetComponentType, FleetHealthError,
-        FleetHealthIndicator, FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
+        open_maintenance_work_order, refuse_health_evidence_overwrite, BatteryHealthTrendConfig,
+        CloseMaintenanceWorkOrderRequest, ComponentHealthVerdict, ComponentHealthVerdictRequest,
+        ComponentHealthVerdictStatus, ComponentServiceLimit, DutyAccrualRequest,
+        FleetComponentRecord, FleetComponentType, FleetHealthError, FleetHealthIndicator,
+        FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
         FleetOperationsRolloutFeedState, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
         FleetReadinessRequest, HealthDegradationDetectionConfig, HealthDegradationDetectionRequest,
         HealthDegradationDetectionStatus, HealthDegradationReasonCode, HealthEvidenceRecord,
         HealthEvidenceSubjectKind, HealthIndicatorFreshness, HealthIndicatorThreshold,
         HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
-        InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
-        OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
-        RegisterComponentRequest, RolloutControlAction, RolloutControlReason,
-        RolloutControlRequest, RolloutControlStatus, ServiceHistoryEntry,
+        InstallComponentRequest, MaintenancePartUsage, MaintenanceWorkOrderSeverity,
+        MaintenanceWorkOrderStatus, OpenMaintenanceWorkOrderRequest, OtaArtifactVersion,
+        OtaNodeHealthReport, OtaRolloutDecisionReason, OtaRolloutDecisionStatus, OtaRolloutNode,
+        OtaRolloutRequest, OtaRolloutStage, RegisterComponentRequest, RolloutControlAction,
+        RolloutControlReason, RolloutControlRequest, RolloutControlStatus, ServiceHistoryEntry,
         TelemetryHealthIndicatorRequest,
     };
     use shared::fleet_alerts::{
@@ -3478,6 +3703,128 @@ mod tests {
             missing.blockers[0].reason_code,
             FleetReadinessBlockReason::MissingHealthData
         );
+    }
+
+    #[test]
+    fn work_order_close_records_parts_and_updates_service_history() {
+        let component =
+            component_for_readiness("motor-001", FleetComponentType::Motor, 10.0, 0, 4.0);
+        let work_order = open_maintenance_work_order(
+            OpenMaintenanceWorkOrderRequest {
+                wo_id: Some("wo-001".to_string()),
+                component_id: "motor-001".to_string(),
+                reason: "motor vibration above degraded threshold".to_string(),
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                opened_at: "2026-06-22T13:00:00Z".to_string(),
+                technician: "tech-1".to_string(),
+            },
+            "generated-wo".to_string(),
+        )
+        .expect("work order should open");
+        let closed = close_maintenance_work_order(
+            &component,
+            &work_order,
+            CloseMaintenanceWorkOrderRequest {
+                closed_at: "2026-06-22T15:00:00Z".to_string(),
+                technician: "tech-2".to_string(),
+                action: "replaced motor bearing".to_string(),
+                parts: vec![MaintenancePartUsage {
+                    part_id: "bearing-kit-22".to_string(),
+                    quantity: 1,
+                }],
+            },
+            "2026-06-22T15:01:00Z".to_string(),
+        )
+        .expect("work order should close");
+
+        assert_eq!(closed.work_order.status, MaintenanceWorkOrderStatus::Closed);
+        assert_eq!(closed.work_order.parts[0].part_id, "bearing-kit-22");
+        assert_eq!(closed.component.service_history.len(), 1);
+        assert_eq!(closed.component.service_history[0].service_id, "wo-001");
+        assert_eq!(
+            closed.component.service_history[0].action,
+            "replaced motor bearing"
+        );
+        assert!(closed.component.service_history[0]
+            .notes
+            .as_deref()
+            .expect("parts note should be present")
+            .contains("bearing-kit-22x1"));
+    }
+
+    #[test]
+    fn open_critical_work_order_keeps_readiness_blocked_until_closed() {
+        let component =
+            component_for_readiness("motor-001", FleetComponentType::Motor, 10.0, 0, 4.0);
+        let request = readiness_request(
+            vec![component],
+            vec![service_limit("motor-001", Some(100.0), None, Some(50.0))],
+            vec![component_verdict(
+                "motor-001",
+                ComponentHealthVerdictStatus::Ok,
+                HealthIndicatorFreshness::Fresh,
+            )],
+        );
+        let work_order = open_maintenance_work_order(
+            OpenMaintenanceWorkOrderRequest {
+                wo_id: Some("wo-critical-001".to_string()),
+                component_id: "motor-001".to_string(),
+                reason: "propulsion critical inspection".to_string(),
+                severity: MaintenanceWorkOrderSeverity::Critical,
+                opened_at: "2026-06-22T13:00:00Z".to_string(),
+                technician: "tech-1".to_string(),
+            },
+            "generated-wo".to_string(),
+        )
+        .expect("critical work order should open");
+
+        let blocked = evaluate_fleet_readiness_with_work_orders(request.clone(), &[work_order])
+            .expect("readiness should evaluate");
+        assert_eq!(blocked.status, FleetReadinessDecisionStatus::Blocked);
+        assert_eq!(
+            blocked.blockers[0].reason_code,
+            FleetReadinessBlockReason::OpenCriticalWorkOrder
+        );
+
+        let permitted = evaluate_fleet_readiness_with_work_orders(request, &[])
+            .expect("readiness should evaluate after closure");
+        assert_eq!(permitted.status, FleetReadinessDecisionStatus::Permitted);
+    }
+
+    #[test]
+    fn work_order_rejects_zero_quantity_part() {
+        let component =
+            component_for_readiness("motor-001", FleetComponentType::Motor, 10.0, 0, 4.0);
+        let work_order = open_maintenance_work_order(
+            OpenMaintenanceWorkOrderRequest {
+                wo_id: Some("wo-001".to_string()),
+                component_id: "motor-001".to_string(),
+                reason: "motor vibration above degraded threshold".to_string(),
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                opened_at: "2026-06-22T13:00:00Z".to_string(),
+                technician: "tech-1".to_string(),
+            },
+            "generated-wo".to_string(),
+        )
+        .expect("work order should open");
+
+        let error = close_maintenance_work_order(
+            &component,
+            &work_order,
+            CloseMaintenanceWorkOrderRequest {
+                closed_at: "2026-06-22T15:00:00Z".to_string(),
+                technician: "tech-2".to_string(),
+                action: "attempted parts update".to_string(),
+                parts: vec![MaintenancePartUsage {
+                    part_id: "bearing-kit-22".to_string(),
+                    quantity: 0,
+                }],
+            },
+            "2026-06-22T15:01:00Z".to_string(),
+        )
+        .expect_err("zero quantity part should be rejected");
+
+        assert_eq!(error, FleetHealthError::InvalidPartQuantity);
     }
 
     #[test]
