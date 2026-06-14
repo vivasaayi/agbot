@@ -414,6 +414,66 @@ pub struct HealthDegradationDetectionReport {
     pub event: Option<HealthDegradationEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RemainingUsefulLifeRequest {
+    #[serde(default)]
+    pub component_id: String,
+    #[serde(default)]
+    pub evaluated_at: String,
+    #[serde(default)]
+    pub method_version: String,
+    #[serde(default)]
+    pub enabled: bool,
+    pub trend_report: HealthDegradationDetectionReport,
+    pub readiness_decision: FleetReadinessDecision,
+    pub current_value: f64,
+    pub failure_threshold: f64,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemainingUsefulLifeStatus {
+    Available,
+    Unavailable,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemainingUsefulLifeReasonCode {
+    TrendBasedEstimate,
+    FeatureDisabled,
+    InsufficientHistory,
+    StaleOrMissingTrend,
+    NonDegradingTrend,
+    InvalidTrend,
+    ReadinessGateBlocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemainingUsefulLifeEstimate {
+    pub component_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub status: RemainingUsefulLifeStatus,
+    pub reason_code: RemainingUsefulLifeReasonCode,
+    pub indicator: FleetHealthIndicator,
+    pub expected_days: Option<f64>,
+    pub lower_days: Option<f64>,
+    pub upper_days: Option<f64>,
+    pub confidence: f64,
+    pub evidence_refs: Vec<String>,
+    pub readiness_status: FleetReadinessDecisionStatus,
+}
+
+impl RemainingUsefulLifeEstimate {
+    fn with_status(mut self, status: RemainingUsefulLifeStatus) -> Self {
+        self.status = status;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthEvidenceSubjectKind {
@@ -944,6 +1004,8 @@ pub enum FleetHealthError {
     InvalidTelemetryTimestamp { value: String },
     #[error("health evidence record {record_id} already exists with a different decision hash")]
     HealthEvidenceOverwriteRefused { record_id: String },
+    #[error("remaining useful life confidence must be finite and in the range 0.0..=1.0")]
+    InvalidRemainingUsefulLifeConfidence,
     #[error(
         "health threshold must be finite, non-negative, and ordered watch <= degraded <= critical"
     )]
@@ -1467,6 +1529,128 @@ pub fn detect_health_indicator_degradation(
         delta: Some(delta),
         evidence_refs,
         event,
+    })
+}
+
+pub fn estimate_remaining_useful_life(
+    request: RemainingUsefulLifeRequest,
+) -> Result<RemainingUsefulLifeEstimate, FleetHealthError> {
+    let component_id =
+        normalize_required_text(request.component_id, FleetHealthError::EmptyComponentId)?;
+    let evaluated_at =
+        normalize_required_text(request.evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    let method_version = normalize_required_text(
+        request.method_version,
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    validate_finite(request.current_value)?;
+    validate_finite(request.failure_threshold)?;
+    validate_confidence(request.confidence)?;
+    if request.trend_report.component_id != component_id {
+        return Err(FleetHealthError::IndicatorComponentMismatch {
+            component_id,
+            sample_component_id: request.trend_report.component_id,
+        });
+    }
+    if !request.enabled {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::FeatureDisabled,
+            request.confidence,
+            vec![],
+            request.readiness_decision.status,
+        ));
+    }
+    if request.readiness_decision.status == FleetReadinessDecisionStatus::Blocked {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::ReadinessGateBlocked,
+            request.confidence,
+            request.trend_report.evidence_refs,
+            request.readiness_decision.status,
+        )
+        .with_status(RemainingUsefulLifeStatus::Refused));
+    }
+    if request.trend_report.status == HealthDegradationDetectionStatus::InsufficientHistory {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::InsufficientHistory,
+            request.confidence,
+            vec![],
+            request.readiness_decision.status,
+        ));
+    }
+    if request.trend_report.evidence_refs.is_empty()
+        || request.trend_report.slope_per_day.is_none()
+        || request.trend_report.delta.is_none()
+    {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::StaleOrMissingTrend,
+            request.confidence,
+            request.trend_report.evidence_refs,
+            request.readiness_decision.status,
+        ));
+    }
+    if request.trend_report.status != HealthDegradationDetectionStatus::DegradationDetected {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::NonDegradingTrend,
+            request.confidence,
+            request.trend_report.evidence_refs,
+            request.readiness_decision.status,
+        ));
+    }
+    let slope_per_day = request
+        .trend_report
+        .slope_per_day
+        .expect("slope presence checked above");
+    if slope_per_day <= 0.0 || request.current_value >= request.failure_threshold {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::InvalidTrend,
+            request.confidence,
+            request.trend_report.evidence_refs,
+            request.readiness_decision.status,
+        ));
+    }
+
+    let expected_days = (request.failure_threshold - request.current_value) / slope_per_day;
+    let uncertainty = (1.0 - request.confidence).max(0.0);
+    let lower_days = (expected_days * (1.0 - uncertainty)).max(0.0);
+    let upper_days = expected_days * (1.0 + uncertainty);
+
+    Ok(RemainingUsefulLifeEstimate {
+        component_id,
+        evaluated_at,
+        method_version,
+        status: RemainingUsefulLifeStatus::Available,
+        reason_code: RemainingUsefulLifeReasonCode::TrendBasedEstimate,
+        indicator: request.trend_report.indicator,
+        expected_days: Some(expected_days),
+        lower_days: Some(lower_days),
+        upper_days: Some(upper_days),
+        confidence: request.confidence,
+        evidence_refs: request.trend_report.evidence_refs,
+        readiness_status: request.readiness_decision.status,
     })
 }
 
@@ -2688,6 +2872,40 @@ fn validate_finite(value: f64) -> Result<(), FleetHealthError> {
     }
 }
 
+fn validate_confidence(value: f64) -> Result<(), FleetHealthError> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(FleetHealthError::InvalidRemainingUsefulLifeConfidence)
+    }
+}
+
+fn rul_unavailable(
+    component_id: String,
+    evaluated_at: String,
+    method_version: String,
+    indicator: FleetHealthIndicator,
+    reason_code: RemainingUsefulLifeReasonCode,
+    confidence: f64,
+    evidence_refs: Vec<String>,
+    readiness_status: FleetReadinessDecisionStatus,
+) -> RemainingUsefulLifeEstimate {
+    RemainingUsefulLifeEstimate {
+        component_id,
+        evaluated_at,
+        method_version,
+        status: RemainingUsefulLifeStatus::Unavailable,
+        reason_code,
+        indicator,
+        expected_days: None,
+        lower_days: None,
+        upper_days: None,
+        confidence,
+        evidence_refs,
+        readiness_status,
+    }
+}
+
 fn normalize_health_threshold(
     threshold: HealthIndicatorThreshold,
 ) -> Result<HealthIndicatorThreshold, FleetHealthError> {
@@ -2930,8 +3148,8 @@ mod tests {
         build_degradation_event_evidence_record, build_fleet_health_dashboard,
         build_fleet_operations_dashboard_feed, build_health_verdict_evidence_record,
         close_maintenance_work_order, component_event, derive_health_indicators,
-        detect_health_indicator_degradation, evaluate_battery_health_trend,
-        evaluate_component_health_verdict, evaluate_fleet_readiness,
+        detect_health_indicator_degradation, estimate_remaining_useful_life,
+        evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
         evaluate_fleet_readiness_with_work_orders, evaluate_ota_rollout,
         fleet_operations_source_current, fleet_operations_source_unavailable, install_component,
         open_maintenance_work_order, refuse_health_evidence_overwrite, BatteryHealthTrendConfig,
@@ -2940,17 +3158,19 @@ mod tests {
         FleetComponentRecord, FleetComponentType, FleetHealthDashboardAircraftStatus,
         FleetHealthDashboardRequest, FleetHealthError, FleetHealthIndicator,
         FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
-        FleetOperationsRolloutFeedState, FleetReadinessBlockReason, FleetReadinessDecisionStatus,
-        FleetReadinessRequest, HealthDegradationDetectionConfig, HealthDegradationDetectionRequest,
-        HealthDegradationDetectionStatus, HealthDegradationReasonCode, HealthEvidenceRecord,
-        HealthEvidenceSubjectKind, HealthIndicatorFreshness, HealthIndicatorThreshold,
-        HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
+        FleetOperationsRolloutFeedState, FleetReadinessBlockReason, FleetReadinessDecision,
+        FleetReadinessDecisionStatus, FleetReadinessRequest, HealthDegradationDetectionConfig,
+        HealthDegradationDetectionRequest, HealthDegradationDetectionStatus,
+        HealthDegradationReasonCode, HealthEvidenceRecord, HealthEvidenceSubjectKind,
+        HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
+        HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
         InstallComponentRequest, MaintenancePartUsage, MaintenanceWorkOrderSeverity,
         MaintenanceWorkOrderStatus, OpenMaintenanceWorkOrderRequest, OtaArtifactVersion,
         OtaNodeHealthReport, OtaRolloutDecisionReason, OtaRolloutDecisionStatus, OtaRolloutNode,
-        OtaRolloutRequest, OtaRolloutStage, RegisterComponentRequest, RolloutControlAction,
-        RolloutControlReason, RolloutControlRequest, RolloutControlStatus, ServiceHistoryEntry,
-        TelemetryHealthIndicatorRequest,
+        OtaRolloutRequest, OtaRolloutStage, RegisterComponentRequest,
+        RemainingUsefulLifeReasonCode, RemainingUsefulLifeRequest, RemainingUsefulLifeStatus,
+        RolloutControlAction, RolloutControlReason, RolloutControlRequest, RolloutControlStatus,
+        ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
     };
     use shared::fleet_alerts::{
         FleetAlertComparator, FleetAlertEvidence, FleetAlertKind, FleetAlertRecord,
@@ -3611,6 +3831,102 @@ mod tests {
             .as_deref()
             .expect("window value should be present")
             .contains("window_start=2026-06-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn rul_estimate_returns_range_with_confidence_and_evidence() {
+        let report = degrading_trend_report();
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: report,
+            readiness_decision: permitted_readiness_decision(),
+            current_value: 0.65,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should estimate");
+
+        assert_eq!(estimate.status, RemainingUsefulLifeStatus::Available);
+        assert_eq!(
+            estimate.reason_code,
+            RemainingUsefulLifeReasonCode::TrendBasedEstimate
+        );
+        assert!(estimate.expected_days.expect("expected days") > 20.0);
+        assert!(estimate.lower_days.expect("lower days") < estimate.expected_days.unwrap());
+        assert!(estimate.upper_days.expect("upper days") > estimate.expected_days.unwrap());
+        assert_eq!(estimate.confidence, 0.80);
+        assert_eq!(estimate.evidence_refs.len(), 4);
+    }
+
+    #[test]
+    fn rul_estimate_is_unavailable_for_insufficient_history() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+        ]))
+        .expect("insufficient history should evaluate");
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: report,
+            readiness_decision: permitted_readiness_decision(),
+            current_value: 0.50,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should return unavailable");
+
+        assert_eq!(estimate.status, RemainingUsefulLifeStatus::Unavailable);
+        assert_eq!(
+            estimate.reason_code,
+            RemainingUsefulLifeReasonCode::InsufficientHistory
+        );
+        assert!(estimate.expected_days.is_none());
+        assert!(estimate.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn rul_estimate_refuses_to_clear_blocked_readiness_gate() {
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: degrading_trend_report(),
+            readiness_decision: blocked_readiness_decision(),
+            current_value: 0.65,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should refuse advisory clearance");
+
+        assert_eq!(estimate.status, RemainingUsefulLifeStatus::Refused);
+        assert_eq!(
+            estimate.reason_code,
+            RemainingUsefulLifeReasonCode::ReadinessGateBlocked
+        );
+        assert_eq!(
+            estimate.readiness_status,
+            FleetReadinessDecisionStatus::Blocked
+        );
+        assert!(estimate.expected_days.is_none());
     }
 
     #[test]
@@ -4497,6 +4813,68 @@ mod tests {
                 min_adverse_slope_per_day: 0.02,
                 min_adverse_delta: 0.30,
             },
+        }
+    }
+
+    fn degrading_trend_report() -> super::HealthDegradationDetectionReport {
+        detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.35,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-15T00:00:00Z",
+                "telemetry:mission-003",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.65,
+                "2026-06-22T00:00:00Z",
+                "telemetry:mission-004",
+            ),
+        ]))
+        .expect("degrading trend should evaluate")
+    }
+
+    fn permitted_readiness_decision() -> FleetReadinessDecision {
+        FleetReadinessDecision {
+            airframe_id: "airframe-1".to_string(),
+            checked_at: "2026-06-22T15:30:00Z".to_string(),
+            status: FleetReadinessDecisionStatus::Permitted,
+            blockers: vec![],
+            component_count: 1,
+            verdict_count: 1,
+        }
+    }
+
+    fn blocked_readiness_decision() -> FleetReadinessDecision {
+        FleetReadinessDecision {
+            airframe_id: "airframe-1".to_string(),
+            checked_at: "2026-06-22T15:30:00Z".to_string(),
+            status: FleetReadinessDecisionStatus::Blocked,
+            blockers: vec![super::FleetReadinessBlocker {
+                reason_code: FleetReadinessBlockReason::CriticalHealthVerdict,
+                component_ref: Some("motor-001".to_string()),
+                indicator: Some(FleetHealthIndicator::MotorVibration),
+                observed_value: Some(1.8),
+                threshold: Some(1.5),
+            }],
+            component_count: 1,
+            verdict_count: 1,
         }
     }
 
