@@ -400,6 +400,60 @@ pub struct EntryHarvestDecision {
     pub clear_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceCheckKind {
+    Authorization,
+    ReiPhi,
+    SprayBuffer,
+}
+
+impl ComplianceCheckKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComplianceCheckKind::Authorization => "authorization",
+            ComplianceCheckKind::ReiPhi => "rei_phi",
+            ComplianceCheckKind::SprayBuffer => "spray_buffer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceEvidenceInput {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceEvidenceRequest {
+    pub check_id: String,
+    pub check_kind: ComplianceCheckKind,
+    pub rule_version: String,
+    pub evaluated_at: String,
+    pub decision_status: String,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub input_refs: Vec<String>,
+    #[serde(default)]
+    pub raw_inputs: Vec<ComplianceEvidenceInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceEvidenceRecord {
+    pub check_id: String,
+    pub version: u32,
+    pub check_kind: ComplianceCheckKind,
+    pub rule_version: String,
+    pub evaluated_at: String,
+    pub decision_status: String,
+    pub reason_code: Option<String>,
+    pub input_refs: Vec<String>,
+    pub raw_inputs: Vec<ComplianceEvidenceInput>,
+    pub decision_hash: String,
+    pub prior_decision_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CreateComplianceRecordRequest {
     #[serde(default)]
@@ -720,6 +774,28 @@ pub enum SprayBufferComplianceError {
         #[source]
         source: ComplianceRecordError,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceEvidenceError {
+    #[error("check_id cannot be empty")]
+    EmptyCheckId,
+    #[error("rule_version cannot be empty")]
+    EmptyRuleVersion,
+    #[error("evaluated_at cannot be empty")]
+    EmptyEvaluatedAt,
+    #[error("decision_status cannot be empty")]
+    EmptyDecisionStatus,
+    #[error("reason_code cannot be empty")]
+    EmptyReasonCode,
+    #[error("raw input key cannot be empty")]
+    EmptyInputKey,
+    #[error("raw input value cannot be empty")]
+    EmptyInputValue,
+    #[error("input_refs cannot contain an empty value")]
+    EmptyInputRef,
+    #[error("compliance evidence is append-only; cannot overwrite version {version}")]
+    AppendOnlyOverwriteRefused { version: u32 },
 }
 
 pub fn build_initial_compliance_record(
@@ -1308,6 +1384,31 @@ pub fn evaluate_spray_buffer_compliance(
     }
 }
 
+pub fn build_compliance_evidence_record(
+    request: ComplianceEvidenceRequest,
+) -> Result<ComplianceEvidenceRecord, ComplianceEvidenceError> {
+    build_compliance_evidence_record_version(request, 1, None)
+}
+
+pub fn append_compliance_evidence_record(
+    latest: &ComplianceEvidenceRecord,
+    request: ComplianceEvidenceRequest,
+) -> Result<ComplianceEvidenceRecord, ComplianceEvidenceError> {
+    build_compliance_evidence_record_version(
+        request,
+        latest.version + 1,
+        Some(latest.decision_hash.clone()),
+    )
+}
+
+pub fn refuse_compliance_evidence_overwrite(
+    existing: &ComplianceEvidenceRecord,
+) -> ComplianceEvidenceError {
+    ComplianceEvidenceError::AppendOnlyOverwriteRefused {
+        version: existing.version,
+    }
+}
+
 pub fn airspace_zone_is_effective_at(zone: &AirspaceZoneRecord, at: Option<&str>) -> bool {
     let Some(at) = at.and_then(|value| normalize_optional_text(Some(value.to_string()))) else {
         return true;
@@ -1879,6 +1980,130 @@ fn normalize_spray_buffer_text(
     }
 }
 
+fn build_compliance_evidence_record_version(
+    request: ComplianceEvidenceRequest,
+    version: u32,
+    prior_decision_hash: Option<String>,
+) -> Result<ComplianceEvidenceRecord, ComplianceEvidenceError> {
+    let check_id =
+        normalize_evidence_text(request.check_id, ComplianceEvidenceError::EmptyCheckId)?;
+    let rule_version = normalize_evidence_text(
+        request.rule_version,
+        ComplianceEvidenceError::EmptyRuleVersion,
+    )?;
+    let evaluated_at = normalize_evidence_text(
+        request.evaluated_at,
+        ComplianceEvidenceError::EmptyEvaluatedAt,
+    )?;
+    let decision_status = normalize_evidence_text(
+        request.decision_status,
+        ComplianceEvidenceError::EmptyDecisionStatus,
+    )?;
+    let reason_code = request
+        .reason_code
+        .map(|value| normalize_evidence_text(value, ComplianceEvidenceError::EmptyReasonCode))
+        .transpose()?;
+    let mut input_refs = Vec::new();
+    for input_ref in request.input_refs {
+        input_refs.push(normalize_evidence_text(
+            input_ref,
+            ComplianceEvidenceError::EmptyInputRef,
+        )?);
+    }
+    input_refs.sort();
+    input_refs.dedup();
+
+    let mut raw_inputs = Vec::new();
+    for input in request.raw_inputs {
+        raw_inputs.push(ComplianceEvidenceInput {
+            key: normalize_evidence_text(input.key, ComplianceEvidenceError::EmptyInputKey)?,
+            value: normalize_evidence_text(input.value, ComplianceEvidenceError::EmptyInputValue)?,
+        });
+    }
+    raw_inputs.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    raw_inputs.dedup();
+
+    let decision_hash = compliance_decision_hash(
+        request.check_kind,
+        &rule_version,
+        &decision_status,
+        reason_code.as_deref(),
+        &input_refs,
+        &raw_inputs,
+    );
+
+    Ok(ComplianceEvidenceRecord {
+        check_id,
+        version,
+        check_kind: request.check_kind,
+        rule_version,
+        evaluated_at,
+        decision_status,
+        reason_code,
+        input_refs,
+        raw_inputs,
+        decision_hash,
+        prior_decision_hash,
+    })
+}
+
+fn normalize_evidence_text(
+    value: String,
+    error: ComplianceEvidenceError,
+) -> Result<String, ComplianceEvidenceError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn compliance_decision_hash(
+    check_kind: ComplianceCheckKind,
+    rule_version: &str,
+    decision_status: &str,
+    reason_code: Option<&str>,
+    input_refs: &[String],
+    raw_inputs: &[ComplianceEvidenceInput],
+) -> String {
+    let mut canonical = String::new();
+    canonical.push_str("kind=");
+    canonical.push_str(check_kind.as_str());
+    canonical.push_str("\nrule_version=");
+    canonical.push_str(rule_version);
+    canonical.push_str("\ndecision_status=");
+    canonical.push_str(decision_status);
+    canonical.push_str("\nreason_code=");
+    canonical.push_str(reason_code.unwrap_or(""));
+    canonical.push_str("\ninput_refs=");
+    for input_ref in input_refs {
+        canonical.push_str(input_ref);
+        canonical.push('\u{1f}');
+    }
+    canonical.push_str("\nraw_inputs=");
+    for input in raw_inputs {
+        canonical.push_str(&input.key);
+        canonical.push('=');
+        canonical.push_str(&input.value);
+        canonical.push('\u{1f}');
+    }
+    format!("fnv1a64:{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn point_in_polygon(point: AirspaceCoordinate, polygon: &[AirspaceCoordinate]) -> bool {
     let mut inside = false;
     for edge in polygon.windows(2) {
@@ -1958,21 +2183,23 @@ mod tests {
     use super::{
         airspace_zone_contains_point, airspace_zone_intersects_polygon,
         append_compliance_record_version, build_airspace_zone_record,
-        build_compliance_audit_report, build_initial_compliance_record,
-        build_operator_certification_record, check_operator_certification, compute_rei_phi_window,
-        evaluate_entry_harvest_clearance, evaluate_preflight_authorization,
-        evaluate_spray_buffer_compliance, refuse_in_place_mutation, AirspaceCoordinate,
+        build_compliance_audit_report, build_compliance_evidence_record,
+        build_initial_compliance_record, build_operator_certification_record,
+        check_operator_certification, compute_rei_phi_window, evaluate_entry_harvest_clearance,
+        evaluate_preflight_authorization, evaluate_spray_buffer_compliance,
+        refuse_compliance_evidence_overwrite, refuse_in_place_mutation, AirspaceCoordinate,
         AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
         AppendComplianceRecordVersionRequest, ApplicationGeometry, AuthorizationBlockReason,
         AuthorizationDecisionStatus, CertificationBlockReason, CertificationStatus,
         ChemicalApplicationRecord, ComplianceAuditReportError, ComplianceAuditReportRequest,
-        ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
-        CreateComplianceRecordRequest, EntryHarvestAction, EntryHarvestBlockReason,
-        EntryHarvestDecisionStatus, IntervalWindowStatus, OperatorCertificationRegistrationRequest,
-        PreflightAirspaceStatus, PreflightAuthorizationRequest, ProductLabelInterval,
-        RemoteIdFlightLogRecord, RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType,
-        SprayBufferBlockReason, SprayBufferComplianceError, SprayBufferDecisionStatus,
-        TelemetryGapRecord,
+        ComplianceCheckKind, ComplianceEvidenceError, ComplianceEvidenceInput,
+        ComplianceEvidenceRequest, ComplianceRecordError, ComplianceRecordPayload,
+        ComplianceRecordType, CreateComplianceRecordRequest, EntryHarvestAction,
+        EntryHarvestBlockReason, EntryHarvestDecisionStatus, IntervalWindowStatus,
+        OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
+        PreflightAuthorizationRequest, ProductLabelInterval, RemoteIdFlightLogRecord,
+        RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType, SprayBufferBlockReason,
+        SprayBufferComplianceError, SprayBufferDecisionStatus, TelemetryGapRecord,
     };
 
     #[test]
@@ -2550,6 +2777,55 @@ mod tests {
     }
 
     #[test]
+    fn compliance_evidence_rerun_produces_identical_decision_hash() {
+        let first = build_compliance_evidence_record(buffer_evidence_request("buffer.rules.v1"))
+            .expect("evidence should build");
+        let second = build_compliance_evidence_record(buffer_evidence_request("buffer.rules.v1"))
+            .expect("rerun evidence should build");
+
+        assert_eq!(first.decision_hash, second.decision_hash);
+        assert_eq!(first.reason_code.as_deref(), Some("buffer_breach"));
+        assert_eq!(first.raw_inputs[0].key, "actual_separation_m");
+        assert_eq!(
+            first.input_refs,
+            vec!["application:app-1", "feature:water:creek-1"]
+        );
+    }
+
+    #[test]
+    fn compliance_evidence_rule_version_change_appends_without_overwriting_prior() {
+        let first = build_compliance_evidence_record(buffer_evidence_request("buffer.rules.v1"))
+            .expect("evidence should build");
+        let second = super::append_compliance_evidence_record(
+            &first,
+            buffer_evidence_request("buffer.rules.v2"),
+        )
+        .expect("new rule version should append");
+
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 2);
+        assert_eq!(
+            second.prior_decision_hash.as_deref(),
+            Some(first.decision_hash.as_str())
+        );
+        assert_ne!(first.decision_hash, second.decision_hash);
+        assert_eq!(first.rule_version, "buffer.rules.v1");
+        assert_eq!(second.rule_version, "buffer.rules.v2");
+    }
+
+    #[test]
+    fn compliance_evidence_refuses_in_place_overwrite() {
+        let first = build_compliance_evidence_record(buffer_evidence_request("buffer.rules.v1"))
+            .expect("evidence should build");
+        let error = refuse_compliance_evidence_overwrite(&first);
+
+        assert_eq!(
+            error,
+            ComplianceEvidenceError::AppendOnlyOverwriteRefused { version: 1 }
+        );
+    }
+
+    #[test]
     fn in_place_mutation_is_refused() {
         let error = refuse_in_place_mutation("delete");
 
@@ -2871,6 +3147,31 @@ mod tests {
             feature_type,
             geometry,
             required_buffer_m,
+        }
+    }
+
+    fn buffer_evidence_request(rule_version: &str) -> ComplianceEvidenceRequest {
+        ComplianceEvidenceRequest {
+            check_id: "buffer-check:app-1".to_string(),
+            check_kind: ComplianceCheckKind::SprayBuffer,
+            rule_version: rule_version.to_string(),
+            evaluated_at: "2026-06-14T21:03:00Z".to_string(),
+            decision_status: "blocked".to_string(),
+            reason_code: Some("buffer_breach".to_string()),
+            input_refs: vec![
+                "feature:water:creek-1".to_string(),
+                "application:app-1".to_string(),
+            ],
+            raw_inputs: vec![
+                ComplianceEvidenceInput {
+                    key: "required_buffer_m".to_string(),
+                    value: "25.000".to_string(),
+                },
+                ComplianceEvidenceInput {
+                    key: "actual_separation_m".to_string(),
+                    value: "11.132".to_string(),
+                },
+            ],
         }
     }
 
