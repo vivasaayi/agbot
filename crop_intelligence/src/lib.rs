@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use shared::schemas::{
     assert_raster_spatial_ref, GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -341,6 +341,54 @@ pub struct CanopyCoverReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GrowthStageConfig {
+    pub emergence_cover_max: f64,
+    pub vegetative_cover_min: f64,
+    pub reproductive_cover_min: f64,
+    pub min_index_observations_for_confidence: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowthIndexObservation {
+    pub observed_at: String,
+    pub mean_index_value: f64,
+    pub evidence_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrowthStage {
+    Emergence,
+    Vegetative,
+    Reproductive,
+    InsufficientEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrowthStageConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowthStageEstimate {
+    pub field_id: String,
+    pub crop: String,
+    pub generated_at: String,
+    pub stage: GrowthStage,
+    pub confidence: GrowthStageConfidence,
+    pub cover_fraction: f64,
+    pub stand_density_plants_per_ha: f64,
+    pub index_observation_count: usize,
+    pub index_delta: Option<f64>,
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DiseaseDetectionConfig {
     pub low_confidence_threshold: f64,
 }
@@ -673,6 +721,27 @@ pub enum CanopyCoverError {
         expected: String,
         actual: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GrowthStageError {
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("crop cannot be empty")]
+    EmptyCrop,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error(
+        "stand count field_id {stand_field_id} does not match canopy field_id {canopy_field_id}"
+    )]
+    FieldMismatch {
+        stand_field_id: String,
+        canopy_field_id: String,
+    },
+    #[error("growth stage config is invalid")]
+    InvalidConfig,
+    #[error("index observation has invalid value or missing evidence")]
+    InvalidIndexObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1155,6 +1224,91 @@ pub fn run_canopy_cover(
         cover_fraction: cover_fraction(vegetation_pixels, valid_pixels),
         tiles: tile_reports,
         zones,
+    })
+}
+
+pub fn estimate_growth_stage(
+    crop: String,
+    stand: &StandCountReport,
+    canopy: &CanopyCoverReport,
+    mut index_observations: Vec<GrowthIndexObservation>,
+    config: GrowthStageConfig,
+    generated_at: String,
+) -> Result<GrowthStageEstimate, GrowthStageError> {
+    let crop = normalize_growth_text(crop, GrowthStageError::EmptyCrop)?;
+    let generated_at = normalize_growth_text(generated_at, GrowthStageError::EmptyGeneratedAt)?;
+    if stand.field_id != canopy.field_id {
+        return Err(GrowthStageError::FieldMismatch {
+            stand_field_id: stand.field_id.clone(),
+            canopy_field_id: canopy.field_id.clone(),
+        });
+    }
+    normalize_growth_field_id(&stand.field_id)?;
+    validate_growth_stage_config(config)?;
+    for observation in &index_observations {
+        if !observation.mean_index_value.is_finite()
+            || observation.evidence_ref.trim().is_empty()
+            || observation.observed_at.trim().is_empty()
+        {
+            return Err(GrowthStageError::InvalidIndexObservation);
+        }
+    }
+    index_observations.sort_by(|left, right| left.observed_at.cmp(&right.observed_at));
+    let index_observation_count = index_observations.len();
+    let index_delta = match (index_observations.first(), index_observations.last()) {
+        (Some(first), Some(last)) if index_observation_count >= 2 => {
+            Some(last.mean_index_value - first.mean_index_value)
+        }
+        _ => None,
+    };
+    let evidence_refs = growth_stage_evidence_refs(stand, canopy, &index_observations);
+
+    if index_observation_count < config.min_index_observations_for_confidence {
+        return Ok(GrowthStageEstimate {
+            field_id: stand.field_id.clone(),
+            crop,
+            generated_at,
+            stage: GrowthStage::InsufficientEvidence,
+            confidence: GrowthStageConfidence::Low,
+            cover_fraction: canopy.cover_fraction,
+            stand_density_plants_per_ha: stand.field_density_plants_per_ha,
+            index_observation_count,
+            index_delta,
+            evidence_refs,
+            reason_code: Some("insufficient_index_trajectory".to_string()),
+        });
+    }
+
+    let stage = if canopy.cover_fraction >= config.reproductive_cover_min
+        && index_delta.is_some_and(|delta| delta <= 0.0)
+    {
+        GrowthStage::Reproductive
+    } else if canopy.cover_fraction >= config.vegetative_cover_min {
+        GrowthStage::Vegetative
+    } else {
+        GrowthStage::Emergence
+    };
+    let confidence = if index_observation_count >= config.min_index_observations_for_confidence + 1
+        && canopy.valid_pixels > canopy.excluded_pixels
+        && stand.total_count > 0
+    {
+        GrowthStageConfidence::High
+    } else {
+        GrowthStageConfidence::Medium
+    };
+
+    Ok(GrowthStageEstimate {
+        field_id: stand.field_id.clone(),
+        crop,
+        generated_at,
+        stage,
+        confidence,
+        cover_fraction: canopy.cover_fraction,
+        stand_density_plants_per_ha: stand.field_density_plants_per_ha,
+        index_observation_count,
+        index_delta,
+        evidence_refs,
+        reason_code: None,
     })
 }
 
@@ -1817,6 +1971,54 @@ fn normalize_canopy_text(
     }
 }
 
+fn normalize_growth_text(
+    value: String,
+    error: GrowthStageError,
+) -> Result<String, GrowthStageError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_growth_field_id(value: &str) -> Result<(), GrowthStageError> {
+    if value.trim().is_empty() {
+        Err(GrowthStageError::EmptyFieldId)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_growth_stage_config(config: GrowthStageConfig) -> Result<(), GrowthStageError> {
+    let valid = is_unit_fraction(config.emergence_cover_max)
+        && is_unit_fraction(config.vegetative_cover_min)
+        && is_unit_fraction(config.reproductive_cover_min)
+        && config.emergence_cover_max <= config.vegetative_cover_min
+        && config.vegetative_cover_min <= config.reproductive_cover_min
+        && config.min_index_observations_for_confidence >= 2;
+    if valid {
+        Ok(())
+    } else {
+        Err(GrowthStageError::InvalidConfig)
+    }
+}
+
+fn growth_stage_evidence_refs(
+    stand: &StandCountReport,
+    canopy: &CanopyCoverReport,
+    observations: &[GrowthIndexObservation],
+) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    refs.insert(format!("stand_count:{}", stand.generated_at));
+    refs.insert(format!("canopy_cover:{}", canopy.generated_at));
+    for observation in observations {
+        refs.insert(observation.evidence_ref.trim().to_string());
+    }
+    refs.into_iter().collect()
+}
+
 fn cover_fraction(vegetation_pixels: usize, valid_pixels: usize) -> f64 {
     if valid_pixels > 0 {
         vegetation_pixels as f64 / valid_pixels as f64
@@ -1996,15 +2198,16 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 mod tests {
     use super::{
         apply_detection_verification, assemble_detection_finding, build_inference_run_record,
-        build_model_version_record, run_canopy_cover, run_disease_lesion_detection,
-        run_stand_count, run_tiled_inference_pipeline, run_weed_mapping,
-        transition_inference_run_status, validate_detection_finding_promotion,
+        build_model_version_record, estimate_growth_stage, run_canopy_cover,
+        run_disease_lesion_detection, run_stand_count, run_tiled_inference_pipeline,
+        run_weed_mapping, transition_inference_run_status, validate_detection_finding_promotion,
         validate_model_reference, CanopyCoverConfig, CanopyCoverError, CanopyCoverTile,
         CropDetectionFindingError, CropDetectionFindingRequest, CropDetectionVerificationAction,
         CropDetectionVerificationRequest, CropModelRegistryError, CropModelTask,
         DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
-        FindingPromotionRequest, InferenceModelReference, InferenceRunError, InferenceRunStatus,
+        FindingPromotionRequest, GrowthIndexObservation, GrowthStage, GrowthStageConfidence,
+        GrowthStageConfig, InferenceModelReference, InferenceRunError, InferenceRunStatus,
         InferenceRunSubmissionRequest, ModelVersionRegistrationRequest, PlantCountConfig,
         PlantCountTile, PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason,
         WeedMappingConfig, WeedMappingError, WeedZoneCandidate,
@@ -2531,6 +2734,69 @@ mod tests {
     }
 
     #[test]
+    fn growth_stage_estimation_uses_index_cover_and_stand_evidence() {
+        let stand = stand_count_fixture();
+        let canopy = canopy_cover_fixture(vec![0.72, 0.68, 0.74, 0.7], vec![true; 4]);
+
+        let estimate = estimate_growth_stage(
+            "corn".to_string(),
+            &stand,
+            &canopy,
+            vec![
+                index_observation("2026-06-01T00:00:00Z", 0.52, "ndvi:2026-06-01"),
+                index_observation("2026-06-08T00:00:00Z", 0.66, "ndvi:2026-06-08"),
+                index_observation("2026-06-15T00:00:00Z", 0.71, "ndvi:2026-06-15"),
+            ],
+            growth_config(),
+            "2026-06-15T12:00:00Z".to_string(),
+        )
+        .expect("growth stage should estimate");
+
+        assert_eq!(estimate.field_id, "field-1");
+        assert_eq!(estimate.stage, GrowthStage::Vegetative);
+        assert_eq!(estimate.confidence, GrowthStageConfidence::High);
+        assert_eq!(estimate.index_observation_count, 3);
+        assert!((estimate.index_delta.unwrap() - 0.19).abs() < 1e-9);
+        assert!(estimate.reason_code.is_none());
+        assert!(estimate
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence == "ndvi:2026-06-15"));
+        assert!(estimate
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("canopy_cover:")));
+    }
+
+    #[test]
+    fn growth_stage_single_date_returns_low_confidence_insufficient_evidence() {
+        let stand = stand_count_fixture();
+        let canopy = canopy_cover_fixture(vec![0.72, 0.68, 0.74, 0.7], vec![true; 4]);
+
+        let estimate = estimate_growth_stage(
+            "corn".to_string(),
+            &stand,
+            &canopy,
+            vec![index_observation(
+                "2026-06-15T00:00:00Z",
+                0.71,
+                "ndvi:2026-06-15",
+            )],
+            growth_config(),
+            "2026-06-15T12:00:00Z".to_string(),
+        )
+        .expect("single-date estimate should return a low-confidence result");
+
+        assert_eq!(estimate.stage, GrowthStage::InsufficientEvidence);
+        assert_eq!(estimate.confidence, GrowthStageConfidence::Low);
+        assert_eq!(estimate.index_delta, None);
+        assert_eq!(
+            estimate.reason_code.as_deref(),
+            Some("insufficient_index_trajectory")
+        );
+    }
+
+    #[test]
     fn disease_detection_returns_confidence_evidence_and_bounded_zone() {
         let cover = cover_report();
         let report = run_disease_lesion_detection(
@@ -2920,6 +3186,70 @@ mod tests {
             "2026-06-01T12:10:00Z".to_string(),
         )
         .expect("cover report should be valid")
+    }
+
+    fn stand_count_fixture() -> super::StandCountReport {
+        run_stand_count(
+            "field-1".to_string(),
+            "EPSG:32614".to_string(),
+            vec![plant_tile(
+                "tile-stand",
+                Some("zone-a"),
+                true,
+                vec![
+                    true, false, true, false, false, true, false, false, true, false, false, true,
+                    false, false, true, false,
+                ],
+            )],
+            PlantCountConfig {
+                min_component_pixels: 1,
+            },
+            "2026-06-01T12:05:00Z".to_string(),
+        )
+        .expect("stand count fixture should be valid")
+    }
+
+    fn canopy_cover_fixture(
+        index_values: Vec<f64>,
+        valid_mask: Vec<bool>,
+    ) -> super::CanopyCoverReport {
+        run_canopy_cover(
+            "field-1".to_string(),
+            vec![canopy_tile(
+                "tile-growth",
+                Some("zone-a"),
+                2,
+                2,
+                index_values,
+                valid_mask,
+            )],
+            CanopyCoverConfig {
+                vegetation_index_threshold: 0.5,
+            },
+            "2026-06-01T12:10:00Z".to_string(),
+        )
+        .expect("canopy cover fixture should be valid")
+    }
+
+    fn growth_config() -> GrowthStageConfig {
+        GrowthStageConfig {
+            emergence_cover_max: 0.2,
+            vegetative_cover_min: 0.35,
+            reproductive_cover_min: 0.85,
+            min_index_observations_for_confidence: 2,
+        }
+    }
+
+    fn index_observation(
+        observed_at: &str,
+        mean_index_value: f64,
+        evidence_ref: &str,
+    ) -> GrowthIndexObservation {
+        GrowthIndexObservation {
+            observed_at: observed_at.to_string(),
+            mean_index_value,
+            evidence_ref: evidence_ref.to_string(),
+        }
     }
 
     fn registered_model() -> InferenceModelReference {
