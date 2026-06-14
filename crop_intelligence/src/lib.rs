@@ -659,6 +659,52 @@ pub struct TrainingDatasetManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelEvaluationConfig {
+    pub min_precision: f64,
+    pub min_recall: f64,
+    pub min_mean_iou: f64,
+    pub max_score_drift: f64,
+    pub max_input_drift: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelEvaluationObservation {
+    pub tile_ref: String,
+    pub expected_label: String,
+    #[serde(default)]
+    pub predicted_label: Option<String>,
+    pub confidence: f64,
+    pub iou: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelDriftSample {
+    pub baseline_score_distribution: Vec<f64>,
+    pub current_score_distribution: Vec<f64>,
+    pub baseline_input_distribution: Vec<f64>,
+    pub current_input_distribution: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelEvaluationReport {
+    pub model: ModelGateResponse,
+    pub dataset_id: String,
+    pub generated_at: String,
+    pub provenance_ref: String,
+    pub evaluated_tile_count: usize,
+    pub true_positive_count: usize,
+    pub false_positive_count: usize,
+    pub false_negative_count: usize,
+    pub precision: f64,
+    pub recall: f64,
+    pub mean_iou: f64,
+    pub score_drift: f64,
+    pub input_drift: f64,
+    pub production_ready: bool,
+    pub block_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CropDetectionVerificationRecord {
     pub detection_id: String,
     pub task: CropModelTask,
@@ -967,6 +1013,29 @@ pub enum TrainingDatasetError {
         first: TrainingDatasetSplit,
         second: TrainingDatasetSplit,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ModelEvaluationError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("provenance_ref cannot be empty")]
+    EmptyProvenanceRef,
+    #[error("model gate failed: {source}")]
+    ModelGate {
+        #[source]
+        source: CropModelRegistryError,
+    },
+    #[error("held-out dataset must contain at least one validation or test tile")]
+    EmptyHeldOutSet,
+    #[error("evaluation observation has an empty required field")]
+    EmptyObservationField,
+    #[error("evaluation observation for tile {tile_ref} has invalid confidence or IoU")]
+    InvalidObservationMetric { tile_ref: String },
+    #[error("evaluation config thresholds are invalid")]
+    InvalidConfig,
+    #[error("drift distributions must be non-empty, equal length, and finite")]
+    InvalidDriftDistribution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1874,6 +1943,135 @@ pub fn build_training_dataset_manifest(
     })
 }
 
+pub fn evaluate_model_version(
+    model: InferenceModelReference,
+    model_registered: bool,
+    dataset: &TrainingDatasetManifest,
+    observations: Vec<ModelEvaluationObservation>,
+    drift: ModelDriftSample,
+    config: ModelEvaluationConfig,
+    provenance_ref: String,
+    generated_at: String,
+) -> Result<ModelEvaluationReport, ModelEvaluationError> {
+    let model = validate_model_reference(model, model_registered)
+        .map_err(|source| ModelEvaluationError::ModelGate { source })?;
+    let provenance_ref =
+        normalize_evaluation_text(provenance_ref, ModelEvaluationError::EmptyProvenanceRef)?;
+    let generated_at =
+        normalize_evaluation_text(generated_at, ModelEvaluationError::EmptyGeneratedAt)?;
+    validate_model_evaluation_config(&config)?;
+    let held_out_tiles = dataset
+        .tiles
+        .iter()
+        .filter(|tile| {
+            matches!(
+                tile.split,
+                TrainingDatasetSplit::Validation | TrainingDatasetSplit::Test
+            )
+        })
+        .map(|tile| tile.tile_ref.as_str())
+        .collect::<BTreeSet<_>>();
+    if held_out_tiles.is_empty() {
+        return Err(ModelEvaluationError::EmptyHeldOutSet);
+    }
+
+    let mut true_positive_count = 0;
+    let mut false_positive_count = 0;
+    let mut false_negative_count = 0;
+    let mut true_positive_iou = Vec::new();
+    let mut evaluated_tile_refs = BTreeSet::new();
+
+    for observation in observations {
+        let tile_ref = normalize_evaluation_text(
+            observation.tile_ref,
+            ModelEvaluationError::EmptyObservationField,
+        )?;
+        if !held_out_tiles.contains(tile_ref.as_str()) {
+            continue;
+        }
+        let expected_label = normalize_evaluation_text(
+            observation.expected_label,
+            ModelEvaluationError::EmptyObservationField,
+        )?;
+        let predicted_label = observation
+            .predicted_label
+            .map(|value| {
+                normalize_evaluation_text(value, ModelEvaluationError::EmptyObservationField)
+            })
+            .transpose()?;
+        if !is_unit_fraction(observation.confidence) || !is_unit_fraction(observation.iou) {
+            return Err(ModelEvaluationError::InvalidObservationMetric { tile_ref });
+        }
+        evaluated_tile_refs.insert(tile_ref);
+
+        let expected_positive = is_positive_label(&expected_label);
+        let predicted_positive = predicted_label.as_deref().is_some_and(is_positive_label);
+        let exact_match = predicted_label
+            .as_deref()
+            .is_some_and(|predicted| predicted == expected_label);
+
+        if expected_positive && predicted_positive && exact_match {
+            true_positive_count += 1;
+            true_positive_iou.push(observation.iou);
+        } else {
+            if predicted_positive {
+                false_positive_count += 1;
+            }
+            if expected_positive {
+                false_negative_count += 1;
+            }
+        }
+    }
+
+    let precision = ratio_or_one(
+        true_positive_count,
+        true_positive_count + false_positive_count,
+    );
+    let recall = ratio_or_one(
+        true_positive_count,
+        true_positive_count + false_negative_count,
+    );
+    let mean_iou = if true_positive_iou.is_empty() {
+        0.0
+    } else {
+        true_positive_iou.iter().sum::<f64>() / true_positive_iou.len() as f64
+    };
+    let score_drift = distribution_drift(
+        &drift.baseline_score_distribution,
+        &drift.current_score_distribution,
+    )?;
+    let input_drift = distribution_drift(
+        &drift.baseline_input_distribution,
+        &drift.current_input_distribution,
+    )?;
+    let block_reasons = model_evaluation_block_reasons(
+        precision,
+        recall,
+        mean_iou,
+        score_drift,
+        input_drift,
+        &config,
+    );
+
+    Ok(ModelEvaluationReport {
+        model,
+        dataset_id: dataset.dataset_id.clone(),
+        generated_at,
+        provenance_ref,
+        evaluated_tile_count: evaluated_tile_refs.len(),
+        true_positive_count,
+        false_positive_count,
+        false_negative_count,
+        precision,
+        recall,
+        mean_iou,
+        score_drift,
+        input_drift,
+        production_ready: block_reasons.is_empty(),
+        block_reasons,
+    })
+}
+
 pub fn apply_detection_verification(
     request: CropDetectionVerificationRequest,
 ) -> Result<CropDetectionVerificationRecord, CropDetectionVerificationError> {
@@ -2515,6 +2713,93 @@ fn training_split_counts(tiles: &[TrainingDatasetTile]) -> TrainingDatasetSplitC
     counts
 }
 
+fn normalize_evaluation_text(
+    value: String,
+    error: ModelEvaluationError,
+) -> Result<String, ModelEvaluationError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn validate_model_evaluation_config(
+    config: &ModelEvaluationConfig,
+) -> Result<(), ModelEvaluationError> {
+    let valid = is_unit_fraction(config.min_precision)
+        && is_unit_fraction(config.min_recall)
+        && is_unit_fraction(config.min_mean_iou)
+        && config.max_score_drift.is_finite()
+        && config.max_score_drift >= 0.0
+        && config.max_input_drift.is_finite()
+        && config.max_input_drift >= 0.0;
+    if valid {
+        Ok(())
+    } else {
+        Err(ModelEvaluationError::InvalidConfig)
+    }
+}
+
+fn is_positive_label(label: &str) -> bool {
+    !matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "healthy" | "none" | "no_pest" | "no_disease" | "no_weed"
+    )
+}
+
+fn ratio_or_one(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        1.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn distribution_drift(baseline: &[f64], current: &[f64]) -> Result<f64, ModelEvaluationError> {
+    if baseline.is_empty()
+        || baseline.len() != current.len()
+        || !baseline.iter().all(|value| value.is_finite())
+        || !current.iter().all(|value| value.is_finite())
+    {
+        return Err(ModelEvaluationError::InvalidDriftDistribution);
+    }
+    Ok(baseline
+        .iter()
+        .zip(current)
+        .map(|(left, right)| (left - right).abs())
+        .sum::<f64>()
+        / baseline.len() as f64)
+}
+
+fn model_evaluation_block_reasons(
+    precision: f64,
+    recall: f64,
+    mean_iou: f64,
+    score_drift: f64,
+    input_drift: f64,
+    config: &ModelEvaluationConfig,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if precision < config.min_precision {
+        reasons.push("precision_below_floor".to_string());
+    }
+    if recall < config.min_recall {
+        reasons.push("recall_below_floor".to_string());
+    }
+    if mean_iou < config.min_mean_iou {
+        reasons.push("iou_below_floor".to_string());
+    }
+    if score_drift > config.max_score_drift {
+        reasons.push("score_drift_exceeded".to_string());
+    }
+    if input_drift > config.max_input_drift {
+        reasons.push("input_drift_exceeded".to_string());
+    }
+    reasons
+}
+
 fn is_unit_fraction(value: f64) -> bool {
     value.is_finite() && (0.0..=1.0).contains(&value)
 }
@@ -2675,20 +2960,22 @@ mod tests {
     use super::{
         apply_detection_verification, assemble_detection_finding, build_inference_run_record,
         build_model_version_record, build_training_dataset_manifest, estimate_growth_stage,
-        run_canopy_cover, run_disease_lesion_detection, run_pest_detection, run_stand_count,
-        run_tiled_inference_pipeline, run_weed_mapping, transition_inference_run_status,
-        validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
-        CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
-        CropDetectionVerificationAction, CropDetectionVerificationRequest, CropModelRegistryError,
-        CropModelTask, DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
+        evaluate_model_version, run_canopy_cover, run_disease_lesion_detection, run_pest_detection,
+        run_stand_count, run_tiled_inference_pipeline, run_weed_mapping,
+        transition_inference_run_status, validate_detection_finding_promotion,
+        validate_model_reference, CanopyCoverConfig, CanopyCoverError, CanopyCoverTile,
+        CropDetectionFindingError, CropDetectionFindingRequest, CropDetectionVerificationAction,
+        CropDetectionVerificationRequest, CropModelRegistryError, CropModelTask,
+        DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
         FindingPromotionRequest, GrowthIndexObservation, GrowthStage, GrowthStageConfidence,
         GrowthStageConfig, InferenceModelReference, InferenceRunError, InferenceRunStatus,
-        InferenceRunSubmissionRequest, LabeledTileRecord, ModelVersionRegistrationRequest,
-        PestDetectionCandidate, PestDetectionConfig, PestDetectionError, PlantCountConfig,
-        PlantCountTile, PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason,
-        TrainingDatasetError, TrainingDatasetSplit, TrainingDatasetSplitConfig, WeedMappingConfig,
-        WeedMappingError, WeedZoneCandidate,
+        InferenceRunSubmissionRequest, LabeledTileRecord, ModelDriftSample, ModelEvaluationConfig,
+        ModelEvaluationObservation, ModelVersionRegistrationRequest, PestDetectionCandidate,
+        PestDetectionConfig, PestDetectionError, PlantCountConfig, PlantCountTile,
+        PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason, TrainingDatasetError,
+        TrainingDatasetManifest, TrainingDatasetSplit, TrainingDatasetSplitConfig,
+        WeedMappingConfig, WeedMappingError, WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -3694,6 +3981,76 @@ mod tests {
     }
 
     #[test]
+    fn model_evaluation_records_metrics_against_held_out_dataset() {
+        let dataset = evaluation_dataset();
+        let report = evaluate_model_version(
+            pest_model(),
+            true,
+            &dataset,
+            vec![
+                evaluation_observation("tile-c", "corn_earworm", Some("corn_earworm"), 0.91, 0.82),
+                evaluation_observation("tile-d", "healthy", None, 0.08, 0.0),
+            ],
+            stable_drift_sample(),
+            evaluation_config(),
+            "provenance:evaluation:pest:v1".to_string(),
+            "2026-06-14T20:16:00Z".to_string(),
+        )
+        .expect("evaluation should run");
+
+        assert_eq!(report.model.model_id, "pest-detector");
+        assert_eq!(report.dataset_id, "dataset:pest:v1");
+        assert_eq!(report.evaluated_tile_count, 2);
+        assert_eq!(report.true_positive_count, 1);
+        assert_eq!(report.false_positive_count, 0);
+        assert_eq!(report.false_negative_count, 0);
+        assert_eq!(report.precision, 1.0);
+        assert_eq!(report.recall, 1.0);
+        assert_eq!(report.mean_iou, 0.82);
+        assert!(report.production_ready);
+        assert!(report.block_reasons.is_empty());
+    }
+
+    #[test]
+    fn model_evaluation_blocks_subfloor_or_drifted_model() {
+        let dataset = evaluation_dataset();
+        let report = evaluate_model_version(
+            pest_model(),
+            true,
+            &dataset,
+            vec![
+                evaluation_observation("tile-c", "corn_earworm", Some("aphid"), 0.84, 0.21),
+                evaluation_observation("tile-d", "healthy", Some("aphid"), 0.72, 0.0),
+            ],
+            drifted_sample(),
+            evaluation_config(),
+            "provenance:evaluation:pest:v1".to_string(),
+            "2026-06-14T20:16:00Z".to_string(),
+        )
+        .expect("evaluation should run and block");
+
+        assert!(!report.production_ready);
+        assert_eq!(report.true_positive_count, 0);
+        assert_eq!(report.false_positive_count, 2);
+        assert_eq!(report.false_negative_count, 1);
+        assert!(report
+            .block_reasons
+            .contains(&"precision_below_floor".to_string()));
+        assert!(report
+            .block_reasons
+            .contains(&"recall_below_floor".to_string()));
+        assert!(report
+            .block_reasons
+            .contains(&"iou_below_floor".to_string()));
+        assert!(report
+            .block_reasons
+            .contains(&"score_drift_exceeded".to_string()));
+        assert!(report
+            .block_reasons
+            .contains(&"input_drift_exceeded".to_string()));
+    }
+
+    #[test]
     fn human_verification_records_actor_timestamp_and_correction_label() {
         let record = apply_detection_verification(CropDetectionVerificationRequest {
             detection_id: "disease:tile-1:1".to_string(),
@@ -4053,6 +4410,83 @@ mod tests {
             source_run: format!("run:{tile_ref}"),
             provenance_ref: format!("provenance:label:{tile_ref}"),
             assigned_split,
+        }
+    }
+
+    fn evaluation_dataset() -> TrainingDatasetManifest {
+        build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            vec![
+                labeled_tile(
+                    "tile-a",
+                    "field-1",
+                    "2026-06-01T10:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Train),
+                ),
+                labeled_tile(
+                    "tile-c",
+                    "field-2",
+                    "2026-06-02T10:00:00Z",
+                    "corn_earworm",
+                    Some(TrainingDatasetSplit::Validation),
+                ),
+                labeled_tile(
+                    "tile-d",
+                    "field-3",
+                    "2026-06-03T10:00:00Z",
+                    "healthy",
+                    Some(TrainingDatasetSplit::Test),
+                ),
+            ],
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect("evaluation dataset should build")
+    }
+
+    fn evaluation_config() -> ModelEvaluationConfig {
+        ModelEvaluationConfig {
+            min_precision: 0.8,
+            min_recall: 0.8,
+            min_mean_iou: 0.5,
+            max_score_drift: 0.15,
+            max_input_drift: 0.2,
+        }
+    }
+
+    fn evaluation_observation(
+        tile_ref: &str,
+        expected_label: &str,
+        predicted_label: Option<&str>,
+        confidence: f64,
+        iou: f64,
+    ) -> ModelEvaluationObservation {
+        ModelEvaluationObservation {
+            tile_ref: tile_ref.to_string(),
+            expected_label: expected_label.to_string(),
+            predicted_label: predicted_label.map(|value| value.to_string()),
+            confidence,
+            iou,
+        }
+    }
+
+    fn stable_drift_sample() -> ModelDriftSample {
+        ModelDriftSample {
+            baseline_score_distribution: vec![0.1, 0.5, 0.9],
+            current_score_distribution: vec![0.12, 0.48, 0.88],
+            baseline_input_distribution: vec![0.2, 0.4, 0.6],
+            current_input_distribution: vec![0.22, 0.39, 0.58],
+        }
+    }
+
+    fn drifted_sample() -> ModelDriftSample {
+        ModelDriftSample {
+            baseline_score_distribution: vec![0.1, 0.5, 0.9],
+            current_score_distribution: vec![0.8, 0.2, 0.1],
+            baseline_input_distribution: vec![0.2, 0.4, 0.6],
+            current_input_distribution: vec![0.9, 0.8, 0.1],
         }
     }
 
