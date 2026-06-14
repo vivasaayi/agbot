@@ -14,7 +14,6 @@
 - `cargo test -p post_processor --lib` — pass (77 tests)
 - `cargo test -p lidar_mapper --lib` — pass (36 tests)
 - `cargo test -p geo_hub --test products_api` — pass (104 tests)
-- `cargo test -p geo_hub --test products_api scene_refresh_advisory` — pass (3 tests)
 
 ## Next action
 
