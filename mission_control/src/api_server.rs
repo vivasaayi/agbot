@@ -20,10 +20,7 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
-    pub fn new(
-        config: Arc<AgroConfig>,
-        event_tx: broadcast::Sender<WebSocketMessage>,
-    ) -> Self {
+    pub fn new(config: Arc<AgroConfig>, event_tx: broadcast::Sender<WebSocketMessage>) -> Self {
         Self { config, event_tx }
     }
 
@@ -41,7 +38,10 @@ impl ApiServer {
             .with_state(app_state);
 
         let listener = tokio::net::TcpListener::bind(&self.config.server.api_bind_address).await?;
-        info!("API server listening on {}", self.config.server.api_bind_address);
+        info!(
+            "API server listening on {}",
+            self.config.server.api_bind_address
+        );
 
         axum::serve(listener, app).await?;
 
@@ -72,8 +72,8 @@ async fn upload_mission(
         .mission_data_path
         .join(format!("{}.json", mission.id));
 
-    let mission_json = serde_json::to_string_pretty(&mission)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mission_json =
+        serde_json::to_string_pretty(&mission).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     tokio::fs::write(&mission_path, mission_json)
         .await

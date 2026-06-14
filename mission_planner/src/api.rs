@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{Mission, MissionPlannerService, MissionStats, Waypoint};
+use crate::{
+    Mission, MissionLinkage, MissionListFilter, MissionPlannerService, MissionRevision,
+    MissionStats, MissionStatus, Waypoint,
+};
 
 /// REST API for mission planning
 pub struct MissionApi {
@@ -26,13 +29,12 @@ impl MissionApi {
 
     /// Create router with all mission endpoints
     pub fn router(service: Arc<MissionPlannerService>) -> Router {
-        let api = Self::new(service.clone());
-
         Router::new()
             .route("/missions", post(create_mission))
             .route("/missions", get(list_missions))
             .route("/missions/search", get(search_missions))
             .route("/missions/stats", get(get_mission_stats))
+            .route("/missions/:id/history", get(get_mission_history))
             .route("/missions/:id", get(get_mission))
             .route("/missions/:id", put(update_mission))
             .route("/missions/:id", delete(delete_mission))
@@ -41,20 +43,28 @@ impl MissionApi {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMissionRequest {
     pub name: String,
     pub description: String,
     pub area_of_interest: geo::Polygon<f64>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub session_id: Option<String>,
+    pub owner_id: Option<String>,
     pub waypoints: Option<Vec<Waypoint>>,
     pub metadata: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateMissionRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub area_of_interest: Option<geo::Polygon<f64>>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub session_id: Option<String>,
+    pub owner_id: Option<String>,
     pub waypoints: Option<Vec<Waypoint>>,
     pub metadata: Option<HashMap<String, String>>,
 }
@@ -63,6 +73,11 @@ pub struct UpdateMissionRequest {
 pub struct ListMissionsQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub status: Option<MissionStatus>,
+    pub created_after: Option<chrono::DateTime<Utc>>,
+    pub created_before: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,12 +85,12 @@ pub struct SearchQuery {
     pub q: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MissionResponse {
     pub mission: Mission,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MissionListResponse {
     pub missions: Vec<Mission>,
     pub total: usize,
@@ -83,13 +98,19 @@ pub struct MissionListResponse {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MissionHistoryResponse {
+    pub mission_id: Uuid,
+    pub revisions: Vec<MissionRevision>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMissionResponse {
     pub id: Uuid,
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
     pub message: String,
@@ -100,7 +121,20 @@ async fn create_mission(
     State(service): State<Arc<MissionPlannerService>>,
     Json(request): Json<CreateMissionRequest>,
 ) -> Result<Json<CreateMissionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut mission = Mission::new(request.name, request.description, request.area_of_interest);
+    let linkage = MissionLinkage::new(
+        request.field_id.unwrap_or_else(|| "unassigned".to_string()),
+        request
+            .season_id
+            .unwrap_or_else(|| "unassigned".to_string()),
+        request.session_id,
+        request.owner_id.unwrap_or_else(|| "unassigned".to_string()),
+    );
+    let mut mission = Mission::new_linked(
+        request.name,
+        request.description,
+        request.area_of_interest,
+        linkage,
+    );
 
     // Add waypoints if provided
     if let Some(waypoints) = request.waypoints {
@@ -192,6 +226,18 @@ async fn update_mission(
     if let Some(area) = request.area_of_interest {
         mission.area_of_interest = area;
     }
+    if let Some(field_id) = request.field_id {
+        mission.field_id = field_id;
+    }
+    if let Some(season_id) = request.season_id {
+        mission.season_id = season_id;
+    }
+    if let Some(session_id) = request.session_id {
+        mission.session_id = Some(session_id);
+    }
+    if let Some(owner_id) = request.owner_id {
+        mission.owner_id = owner_id;
+    }
     if let Some(waypoints) = request.waypoints {
         mission.waypoints = waypoints;
     }
@@ -201,8 +247,8 @@ async fn update_mission(
 
     mission.updated_at = Utc::now();
 
-    match service.update_mission(mission.clone()).await {
-        Ok(_) => Ok(Json(MissionResponse { mission })),
+    match service.update_mission(mission).await {
+        Ok(mission) => Ok(Json(MissionResponse { mission })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -218,20 +264,68 @@ async fn list_missions(
     State(service): State<Arc<MissionPlannerService>>,
     Query(query): Query<ListMissionsQuery>,
 ) -> Result<Json<MissionListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match service.list_missions(query.limit, query.offset).await {
-        Ok(missions) => {
-            let total = missions.len();
-            Ok(Json(MissionListResponse {
-                missions,
-                total,
-                limit: query.limit,
-                offset: query.offset,
-            }))
-        }
+    let filter = MissionListFilter {
+        limit: query.limit,
+        offset: query.offset,
+        field_id: query.field_id,
+        season_id: query.season_id,
+        status: query.status,
+        created_after: query.created_after,
+        created_before: query.created_before,
+    };
+    match service.list_missions_page(filter).await {
+        Ok(page) => Ok(Json(MissionListResponse {
+            missions: page.missions,
+            total: page.total,
+            limit: Some(page.limit),
+            offset: Some(page.offset),
+        })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: "LIST_FAILED".to_string(),
+                message: e.to_string(),
+            }),
+        )),
+    }
+}
+
+/// Get retained prior versions for a mission.
+async fn get_mission_history(
+    State(service): State<Arc<MissionPlannerService>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<MissionHistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match service.get_mission(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "NOT_FOUND".to_string(),
+                    message: "Mission not found".to_string(),
+                }),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "GET_FAILED".to_string(),
+                    message: e.to_string(),
+                }),
+            ));
+        }
+    }
+
+    match service.get_mission_history(&id).await {
+        Ok(revisions) => Ok(Json(MissionHistoryResponse {
+            mission_id: id,
+            revisions,
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "HISTORY_FAILED".to_string(),
                 message: e.to_string(),
             }),
         )),
@@ -332,8 +426,8 @@ async fn optimize_mission(
     }
 
     // Update the mission in the database
-    match service.update_mission(mission.clone()).await {
-        Ok(_) => Ok(Json(MissionResponse { mission })),
+    match service.update_mission(mission).await {
+        Ok(mission) => Ok(Json(MissionResponse { mission })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -363,7 +457,6 @@ async fn get_mission_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Method;
     use axum_test::TestServer;
     use geo::{coord, polygon};
 
@@ -396,6 +489,10 @@ mod tests {
             name: "Test API Mission".to_string(),
             description: "A test mission via API".to_string(),
             area_of_interest: area,
+            field_id: Some("field-api".to_string()),
+            season_id: Some("season-api".to_string()),
+            session_id: Some("session-api".to_string()),
+            owner_id: Some("owner-api".to_string()),
             waypoints: None,
             metadata: None,
         };
@@ -414,16 +511,16 @@ mod tests {
 
         let mission_response: MissionResponse = response.json();
         assert_eq!(mission_response.mission.name, "Test API Mission");
+        assert_eq!(mission_response.mission.field_id, "field-api");
+        assert_eq!(mission_response.mission.season_id, "season-api");
+        assert_eq!(mission_response.mission.owner_id, "owner-api");
 
         // Test list missions
         let response = server.get("/missions").await;
         assert_eq!(response.status_code(), StatusCode::OK);
 
         // Test delete mission
-        let response = server
-            .method(Method::DELETE)
-            .uri(&format!("/missions/{}", mission_id))
-            .await;
+        let response = server.delete(&format!("/missions/{}", mission_id)).await;
 
         assert_eq!(response.status_code(), StatusCode::NO_CONTENT);
     }

@@ -1,9 +1,14 @@
 use anyhow::Context;
-use shared::{schemas::MultispectralImage, AgroResult};
+use image::GrayImage;
+use shared::{error::AgroError, schemas::MultispectralImage, AgroResult};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tracing::{error, info};
 
-use crate::{IndexKind, IndexResultMeta, IndicesArgs, OutputFormat};
+use crate::{
+    IndexBandRole, IndexBandValues, IndexPixelValue, IndexResultMeta, IndexStatisticsOutcome,
+    IndicesArgs, OutputFormat,
+};
 
 const NODATA_F32: f32 = -9999.0;
 
@@ -22,690 +27,429 @@ pub async fn run_indices(args: &IndicesArgs) -> AgroResult<()> {
 
     info!(count = metadata_files.len(), index = ?args.index, "Found metadata files");
 
+    let mut failures = Vec::new();
     for mf in metadata_files {
         if let Err(e) = process_one(&mf, args).await {
             error!(file=%mf.display(), error=%e, "Failed processing");
+            failures.push(format!("{}: {}", mf.display(), e));
         }
+    }
+
+    if !failures.is_empty() {
+        return Err(AgroError::Processing(format!(
+            "{} metadata file(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        )));
     }
 
     Ok(())
 }
 
-async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<()> {
-    let metadata_content = tokio::fs::read_to_string(metadata_file).await?;
-    let image: MultispectralImage = serde_json::from_str(&metadata_content)?;
+fn processing_error(message: impl Into<String>) -> AgroError {
+    AgroError::Processing(message.into())
+}
 
-    // Resolve band names
-    let preset = args.sensor;
-    let (def_red, def_nir, def_re) = preset
-        .map(|p| p.default_bands())
-        .unwrap_or((None, None, None));
-    let (red_name, nir_name, re_name) = (
-        args.red
-            .clone()
-            .or(def_red.map(|s| s.to_string()))
-            .unwrap_or_else(|| "Red".to_string()),
-        args.nir
-            .clone()
-            .or(def_nir.map(|s| s.to_string()))
-            .unwrap_or_else(|| "NIR".to_string()),
-        args.red_edge
-            .clone()
-            .or(def_re.map(|s| s.to_string()))
-            .unwrap_or_else(|| "RE".to_string()),
-    );
-    let green_name = args.green.clone().unwrap_or_else(|| "Green".to_string());
-    let blue_name = args.blue.clone().unwrap_or_else(|| "Blue".to_string());
-    let swir1_name = args.swir1.clone().unwrap_or_else(|| "SWIR1".to_string());
-    let swir2_name = args.swir2.clone().unwrap_or_else(|| "SWIR2".to_string());
+fn require_band_path<'a>(
+    image: &'a MultispectralImage,
+    band_name: &str,
+    role: &str,
+) -> AgroResult<&'a str> {
+    image
+        .file_paths
+        .get(band_name)
+        .map(String::as_str)
+        .ok_or_else(|| processing_error(format!("{role} band '{band_name}' not found")))
+}
 
-    // Locate band files
-    let red_path = image.file_paths.get(&red_name).ok_or_else(|| {
-        shared::error::AgroError::Processing(format!("Red band '{}' not found", red_name))
-    })?;
-    let nir_path = image.file_paths.get(&nir_name).ok_or_else(|| {
-        shared::error::AgroError::Processing(format!("NIR band '{}' not found", nir_name))
-    })?;
+fn load_luma_band(
+    image: &MultispectralImage,
+    band_name: &str,
+    role: &str,
+    expected_dimensions: (u32, u32),
+) -> AgroResult<GrayImage> {
+    let band_path = require_band_path(image, band_name, role)?;
+    let band = image::open(band_path)
+        .map_err(|e| processing_error(format!("Failed to load {role} band: {e}")))?
+        .to_luma8();
 
-    // Load bands (prefer GDAL for TIFFs when enabled)
-    #[cfg(feature = "gdal-io")]
-    let use_gdal = red_path.ends_with(".tif")
-        || red_path.ends_with(".tiff")
-        || nir_path.ends_with(".tif")
-        || nir_path.ends_with(".tiff");
-    #[cfg(not(feature = "gdal-io"))]
-    let use_gdal = false;
-
-    let (red_img, nir_img, red_f32_opt, nir_f32_opt, nd_red, nd_nir) = if use_gdal {
-        #[cfg(feature = "gdal-io")]
-        {
-            let (rw, rh, red_buf, r_nd) = crate::io::gdal_util::read_first_band_as_f32(red_path)
-                .map_err(|e| {
-                    shared::error::AgroError::Processing(format!("GDAL read red failed: {}", e))
-                })?;
-            let (nw, nh, nir_buf0, n_nd0) = crate::io::gdal_util::read_first_band_as_f32(nir_path)
-                .map_err(|e| {
-                    shared::error::AgroError::Processing(format!("GDAL read nir failed: {}", e))
-                })?;
-            let (nw, nh, nir_buf, n_nd) = if rw != nw || rh != nh {
-                // Resample NIR to red dimensions
-                let (_w, _h, buf, nd) =
-                    crate::io::gdal_util::read_first_band_as_f32_resampled(nir_path, rw, rh)
-                        .map_err(|e| {
-                            shared::error::AgroError::Processing(format!(
-                                "GDAL resample nir failed: {}",
-                                e
-                            ))
-                        })?;
-                (rw, rh, buf, nd)
-            } else {
-                (nw, nh, nir_buf0, n_nd0)
-            };
-            // Normalize to 0..255 u8 quicklook for now
-            let mut red_img = image::GrayImage::new(rw as u32, rh as u32);
-            let mut nir_img = image::GrayImage::new(nw as u32, nh as u32);
-            for y in 0..rh {
-                for x in 0..rw {
-                    let i = y * rw + x;
-                    let r = red_buf[i];
-                    let n = nir_buf[i];
-                    let r8 = (r.max(0.0).min(65535.0) / 65535.0 * 255.0) as u8;
-                    let n8 = (n.max(0.0).min(65535.0) / 65535.0 * 255.0) as u8;
-                    red_img.put_pixel(x as u32, y as u32, image::Luma([r8]));
-                    nir_img.put_pixel(x as u32, y as u32, image::Luma([n8]));
-                }
-            }
-            (
-                red_img,
-                nir_img,
-                Some(red_buf),
-                Some(nir_buf),
-                r_nd.map(|v| v as f32),
-                n_nd.map(|v| v as f32),
-            )
-        }
-        #[cfg(not(feature = "gdal-io"))]
-        {
-            unreachable!()
-        }
-    } else {
-        let red_img = image::open(red_path)
-            .map_err(|e| {
-                shared::error::AgroError::Processing(format!("Failed to load Red band: {}", e))
-            })?
-            .to_luma8();
-        let nir_img = image::open(nir_path)
-            .map_err(|e| {
-                shared::error::AgroError::Processing(format!("Failed to load NIR band: {}", e))
-            })?
-            .to_luma8();
-        (
-            red_img,
-            nir_img,
-            None::<Vec<f32>>,
-            None::<Vec<f32>>,
-            None::<f32>,
-            None::<f32>,
-        )
-    };
-
-    if red_img.dimensions() != nir_img.dimensions() {
-        return Err(shared::error::AgroError::Processing(
-            "Band dimensions mismatch".into(),
-        ));
+    if band.dimensions() != expected_dimensions {
+        return Err(processing_error(format!(
+            "{role} band dimensions mismatch: expected {:?}, got {:?}",
+            expected_dimensions,
+            band.dimensions()
+        )));
     }
 
-    let (width, height) = red_img.dimensions();
-    let mut out = image::ImageBuffer::new(width, height);
-    // Optional f32 buffer for float output when GDAL used
-    let have_f32 = red_f32_opt.is_some() && nir_f32_opt.is_some();
-    let mut out_f32: Option<Vec<f32>> = if have_f32 {
-        Some(vec![NODATA_F32; (width * height) as usize])
-    } else {
-        None
-    };
+    Ok(band)
+}
 
+fn valid_mask_at(mask_img: &Option<GrayImage>, x: u32, y: u32) -> bool {
+    mask_img
+        .as_ref()
+        .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
+}
+
+fn record_invalid_pixel(reasons: &mut BTreeMap<String, usize>, reason: &'static str) {
+    *reasons.entry(reason.to_string()).or_insert(0) += 1;
+}
+
+fn calibrated_band_value(
+    raw_value: f32,
+    band_name: &str,
+    calibration: &crate::io::RadiometricCalibrationEvidence,
+) -> f32 {
+    calibration
+        .coefficients
+        .get(band_name)
+        .map(|coefficients| {
+            (raw_value * coefficients.gain + coefficients.offset)
+                .clamp(coefficients.output_min, coefficients.output_max)
+        })
+        .unwrap_or(raw_value)
+}
+
+#[derive(Debug, Clone)]
+struct LoadedIndexBand {
+    values: Vec<f32>,
+    valid: Vec<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MaskedIndexStatistics {
+    min: f32,
+    max: f32,
+    mean: f32,
+    total_pixel_count: usize,
+    clear_pixel_count: usize,
+    valid_pixel_count: usize,
+    clear_pixel_coverage: f32,
+    valid_pixel_coverage: f32,
+    outcome: IndexStatisticsOutcome,
+    invalid_pixel_reasons: BTreeMap<String, usize>,
+}
+
+fn summarize_masked_index_values(
+    index_values: &[IndexPixelValue],
+    nodata_valid: &[bool],
+    clear_mask: &[bool],
+) -> AgroResult<MaskedIndexStatistics> {
+    if index_values.len() != nodata_valid.len() || index_values.len() != clear_mask.len() {
+        return Err(processing_error(format!(
+            "masked index statistics length mismatch: values={}, nodata={}, mask={}",
+            index_values.len(),
+            nodata_valid.len(),
+            clear_mask.len()
+        )));
+    }
+
+    let total_pixel_count = index_values.len();
+    let mut clear_pixel_count = 0usize;
+    let mut valid_pixel_count = 0usize;
     let mut stats_min = f32::INFINITY;
     let mut stats_max = f32::NEG_INFINITY;
     let mut stats_sum = 0.0f64;
+    let mut invalid_pixel_reasons = BTreeMap::new();
 
-    // Optional mask: non-zero means valid pixel
-    let mask_img = if let Some(mask_path) = &args.mask {
-        Some(
-            image::open(mask_path)
-                .map_err(|e| {
-                    shared::error::AgroError::Processing(format!("Failed to load mask: {}", e))
-                })?
-                .to_luma8(),
-        )
-    } else {
-        None
-    };
+    for ((pixel_value, nodata_is_valid), is_clear) in
+        index_values.iter().zip(nodata_valid).zip(clear_mask)
+    {
+        if !*is_clear {
+            record_invalid_pixel(&mut invalid_pixel_reasons, "masked");
+            continue;
+        }
+        clear_pixel_count += 1;
 
-    match args.index {
-        IndexKind::Ndvi => {
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let valid_mask = mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0);
-                let (r, n, valid_data) =
-                    if let (Some(ref rbuf), Some(ref nbuf)) = (&red_f32_opt, &nir_f32_opt) {
-                        let i = (y * width + x) as usize;
-                        let r = rbuf[i];
-                        let n = nbuf[i];
-                        let nodata_ok = match nd_red {
-                            Some(nd) => r != nd,
-                            None => true,
-                        } && match nd_nir {
-                            Some(nd) => n != nd,
-                            None => true,
-                        };
-                        (r, n, nodata_ok)
-                    } else {
-                        (
-                            red_img.get_pixel(x, y)[0] as f32,
-                            nir_img.get_pixel(x, y)[0] as f32,
-                            true,
-                        )
-                    };
-                let denom = n + r;
-                let mut write_val = NODATA_F32;
-                if valid_mask && valid_data && denom.abs() > f32::EPSILON {
-                    let v = (n - r) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                let vis = if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                };
-                *pix = image::Luma([vis]);
-            }
+        if !*nodata_is_valid {
+            record_invalid_pixel(&mut invalid_pixel_reasons, "nodata");
+            continue;
         }
-        IndexKind::Ndre => {
-            let re_path = image.file_paths.get(&re_name).ok_or_else(|| {
-                shared::error::AgroError::Processing(format!(
-                    "Red-edge band '{}' not found",
-                    re_name
-                ))
-            })?;
-            let re_img = if use_gdal {
-                #[cfg(feature = "gdal-io")]
-                {
-                    let (rw, rh, re_buf, _nd) =
-                        crate::io::gdal_util::read_first_band_as_f32(re_path).map_err(|e| {
-                            shared::error::AgroError::Processing(format!(
-                                "GDAL read red-edge failed: {}",
-                                e
-                            ))
-                        })?;
-                    let mut re_img = image::GrayImage::new(rw as u32, rh as u32);
-                    for y in 0..rh {
-                        for x in 0..rw {
-                            let i = y * rw + x;
-                            let v = (re_buf[i].max(0.0).min(65535.0) / 65535.0 * 255.0) as u8;
-                            re_img.put_pixel(x as u32, y as u32, image::Luma([v]));
-                        }
-                    }
-                    re_img
-                }
-                #[cfg(not(feature = "gdal-io"))]
-                {
-                    unreachable!()
-                }
-            } else {
-                image::open(re_path)
-                    .map_err(|e| {
-                        shared::error::AgroError::Processing(format!(
-                            "Failed to load Red-edge band: {}",
-                            e
-                        ))
-                    })?
-                    .to_luma8()
-            };
-            if re_img.dimensions() != red_img.dimensions() {
-                return Err(shared::error::AgroError::Processing(
-                    "Band dimensions mismatch".into(),
-                ));
+
+        match pixel_value {
+            IndexPixelValue::Valid(value) if value.is_finite() => {
+                stats_min = stats_min.min(*value);
+                stats_max = stats_max.max(*value);
+                stats_sum += *value as f64;
+                valid_pixel_count += 1;
             }
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let valid_mask = mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0);
-                let (re, n, valid_data) =
-                    if let (Some(ref _rbuf), Some(ref nbuf)) = (&red_f32_opt, &nir_f32_opt) {
-                        let i = (y * width + x) as usize;
-                        // re_img is u8; use it as proxy unless we also GDAL-read RE band; for simplicity use re_img u8
-                        let re = re_img.get_pixel(x, y)[0] as f32;
-                        let n = nbuf[i];
-                        let nodata_ok = match nd_nir {
-                            Some(nd) => n != nd,
-                            None => true,
-                        };
-                        (re, n, nodata_ok)
-                    } else {
-                        (
-                            re_img.get_pixel(x, y)[0] as f32,
-                            nir_img.get_pixel(x, y)[0] as f32,
-                            true,
-                        )
-                    };
-                let denom = n + re;
-                let mut write_val = NODATA_F32;
-                if valid_mask && valid_data && denom.abs() > f32::EPSILON {
-                    let v = (n - re) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                let vis = if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                };
-                *pix = image::Luma([vis]);
+            IndexPixelValue::Valid(_) => {
+                record_invalid_pixel(&mut invalid_pixel_reasons, "non_finite");
             }
-        }
-        IndexKind::Evi => {
-            // EVI = 2.5 * (NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1)
-            // For now, approximate Blue=Red if missing
-            let blue_img = image
-                .file_paths
-                .get("Blue")
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let valid_mask = mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0);
-                let r = if let Some(ref rbuf) = red_f32_opt {
-                    rbuf[(y * width + x) as usize]
-                } else {
-                    red_img.get_pixel(x, y)[0] as f32
-                };
-                let n = if let Some(ref nbuf) = nir_f32_opt {
-                    nbuf[(y * width + x) as usize]
-                } else {
-                    nir_img.get_pixel(x, y)[0] as f32
-                };
-                let b = blue_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(r);
-                let denom = n + 6.0 * r - 7.5 * b + 1.0;
-                let mut write_val = NODATA_F32;
-                let nodata_ok = match nd_red {
-                    Some(nd) => r != nd,
-                    None => true,
-                } && match nd_nir {
-                    Some(nd) => n != nd,
-                    None => true,
-                };
-                if valid_mask && nodata_ok && denom.abs() > f32::EPSILON {
-                    let v = 2.5 * (n - r) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                let vis = if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                };
-                *pix = image::Luma([vis]);
-            }
-        }
-        IndexKind::Vari => {
-            // VARI = (G - R) / (G + R - B)
-            let g_img = image
-                .file_paths
-                .get(&green_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            let b_img = image
-                .file_paths
-                .get(&blue_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let r = red_img.get_pixel(x, y)[0] as f32;
-                let g = g_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(r);
-                let b = b_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(r);
-                let denom = g + r - b;
-                let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
-                    let v = (g - r) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                *pix = image::Luma([if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                }]);
-            }
-        }
-        IndexKind::Gndvi => {
-            // GNDVI = (NIR - G) / (NIR + G)
-            let g_img = image
-                .file_paths
-                .get(&green_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let g = g_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(red_img.get_pixel(x, y)[0] as f32);
-                let n = nir_img.get_pixel(x, y)[0] as f32;
-                let denom = n + g;
-                let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
-                    let v = (n - g) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                *pix = image::Luma([if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                }]);
-            }
-        }
-        IndexKind::Ndwi => {
-            // NDWI (McFeeters) = (G - NIR) / (G + NIR)
-            let g_img = image
-                .file_paths
-                .get(&green_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let g = g_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(red_img.get_pixel(x, y)[0] as f32);
-                let n = nir_img.get_pixel(x, y)[0] as f32;
-                let denom = g + n;
-                let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
-                    let v = (g - n) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                *pix = image::Luma([if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                }]);
-            }
-        }
-        IndexKind::Mndwi => {
-            // MNDWI (Xu) = (G - SWIR1) / (G + SWIR1)
-            let g_img = image
-                .file_paths
-                .get(&green_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            let s_img = image
-                .file_paths
-                .get(&swir1_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let g = g_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(red_img.get_pixel(x, y)[0] as f32);
-                let s = s_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(nir_img.get_pixel(x, y)[0] as f32);
-                let denom = g + s;
-                let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
-                    let v = (g - s) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                *pix = image::Luma([if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                }]);
-            }
-        }
-        IndexKind::Msavi => {
-            // MSAVI = (2*NIR + 1 - sqrt((2*NIR + 1)^2 - 8*(NIR - R))) / 2
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let r = red_img.get_pixel(x, y)[0] as f32;
-                let n = nir_img.get_pixel(x, y)[0] as f32;
-                let term = (2.0 * n + 1.0) * (2.0 * n + 1.0) - 8.0 * (n - r);
-                let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && term >= 0.0
-                {
-                    let v = (2.0 * n + 1.0 - term.sqrt()) * 0.5;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                *pix = image::Luma([if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                }]);
-            }
-        }
-        IndexKind::Nbr => {
-            // NBR = (NIR - SWIR2) / (NIR + SWIR2)
-            let s2_img = image
-                .file_paths
-                .get(&swir2_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let n = nir_img.get_pixel(x, y)[0] as f32;
-                let s2 = s2_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(n);
-                let denom = n + s2;
-                let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
-                    let v = (n - s2) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                *pix = image::Luma([if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                }]);
-            }
-        }
-        IndexKind::Ndmi => {
-            // NDMI = (NIR - SWIR1) / (NIR + SWIR1)
-            let s1_img = image
-                .file_paths
-                .get(&swir1_name)
-                .and_then(|p| image::open(p).ok())
-                .map(|i| i.to_luma8());
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let n = nir_img.get_pixel(x, y)[0] as f32;
-                let s1 = s1_img
-                    .as_ref()
-                    .map(|i| i.get_pixel(x, y)[0] as f32)
-                    .unwrap_or(n);
-                let denom = n + s1;
-                let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
-                    let v = (n - s1) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                *pix = image::Luma([if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                }]);
-            }
-        }
-        IndexKind::Evi2 => {
-            // EVI2 = 2.5 * (NIR - R) / (NIR + 2.4*R + 1)
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let r = red_img.get_pixel(x, y)[0] as f32;
-                let n = nir_img.get_pixel(x, y)[0] as f32;
-                let denom = n + 2.4 * r + 1.0;
-                let mut write_val = NODATA_F32;
-                if mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0)
-                    && denom.abs() > f32::EPSILON
-                {
-                    let v = 2.5 * (n - r) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                *pix = image::Luma([if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                }]);
-            }
-        }
-        IndexKind::Savi => {
-            // SAVI = (1+L)*(NIR-Red)/(NIR+Red+L), L typically 0.5
-            let l = 0.5f32;
-            for (x, y, pix) in out.enumerate_pixels_mut() {
-                let valid_mask = mask_img
-                    .as_ref()
-                    .map_or(true, |m| m.get_pixel(x, y)[0] != 0);
-                let r = if let Some(ref rbuf) = red_f32_opt {
-                    rbuf[(y * width + x) as usize]
-                } else {
-                    red_img.get_pixel(x, y)[0] as f32
-                };
-                let n = if let Some(ref nbuf) = nir_f32_opt {
-                    nbuf[(y * width + x) as usize]
-                } else {
-                    nir_img.get_pixel(x, y)[0] as f32
-                };
-                let denom = n + r + l;
-                let mut write_val = NODATA_F32;
-                let nodata_ok = match nd_red {
-                    Some(nd) => r != nd,
-                    None => true,
-                } && match nd_nir {
-                    Some(nd) => n != nd,
-                    None => true,
-                };
-                if valid_mask && nodata_ok && denom.abs() > f32::EPSILON {
-                    let v = (1.0 + l) * (n - r) / denom;
-                    write_val = v;
-                    stats_min = stats_min.min(v);
-                    stats_max = stats_max.max(v);
-                    stats_sum += v as f64;
-                }
-                if let Some(ref mut f32buf) = out_f32 {
-                    f32buf[(y * width + x) as usize] = write_val;
-                }
-                let vis = if write_val.is_finite() {
-                    ((write_val.clamp(-1.0, 1.0) + 1.0) * 127.5) as u8
-                } else {
-                    0
-                };
-                *pix = image::Luma([vis]);
+            IndexPixelValue::Invalid { reason } => {
+                record_invalid_pixel(&mut invalid_pixel_reasons, reason);
             }
         }
     }
 
-    let count = (width as usize) * (height as usize);
-    let mean = (stats_sum / count as f64) as f32;
+    let (min, max, mean) = if valid_pixel_count > 0 {
+        (
+            stats_min,
+            stats_max,
+            (stats_sum / valid_pixel_count as f64) as f32,
+        )
+    } else {
+        (f32::NAN, f32::NAN, f32::NAN)
+    };
+
+    let denominator = total_pixel_count as f32;
+    let clear_pixel_coverage = if total_pixel_count == 0 {
+        0.0
+    } else {
+        clear_pixel_count as f32 / denominator
+    };
+    let valid_pixel_coverage = if total_pixel_count == 0 {
+        0.0
+    } else {
+        valid_pixel_count as f32 / denominator
+    };
+    let outcome = if clear_pixel_count == 0 {
+        IndexStatisticsOutcome::NoClearPixels
+    } else if valid_pixel_count == 0 {
+        IndexStatisticsOutcome::NoValidPixels
+    } else {
+        IndexStatisticsOutcome::Computed
+    };
+
+    Ok(MaskedIndexStatistics {
+        min,
+        max,
+        mean,
+        total_pixel_count,
+        clear_pixel_count,
+        valid_pixel_count,
+        clear_pixel_coverage,
+        valid_pixel_coverage,
+        outcome,
+        invalid_pixel_reasons,
+    })
+}
+
+fn default_band_name(args: &IndicesArgs, role: IndexBandRole) -> String {
+    if let Some(override_spec) = args
+        .band_overrides
+        .iter()
+        .rev()
+        .find(|override_spec| override_spec.role == role)
+    {
+        return override_spec.band_name.clone();
+    }
+
+    let preset_default = args
+        .sensor
+        .and_then(|preset| preset.default_band_for_role(role));
+
+    match role {
+        IndexBandRole::Blue => args
+            .blue
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "Blue".to_string()),
+        IndexBandRole::Green => args
+            .green
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "Green".to_string()),
+        IndexBandRole::Red => args
+            .red
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "Red".to_string()),
+        IndexBandRole::Nir => args
+            .nir
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "NIR".to_string()),
+        IndexBandRole::RedEdge => args
+            .red_edge
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "RE".to_string()),
+        IndexBandRole::Swir1 => args
+            .swir1
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "SWIR1".to_string()),
+        IndexBandRole::Swir2 => args
+            .swir2
+            .clone()
+            .or(preset_default.map(str::to_string))
+            .unwrap_or_else(|| "SWIR2".to_string()),
+    }
+}
+
+fn resolved_index_band_names(args: &IndicesArgs) -> BTreeMap<String, String> {
+    args.index
+        .required_bands()
+        .iter()
+        .map(|role| (role.key().to_string(), default_band_name(args, *role)))
+        .collect()
+}
+
+fn load_index_band(
+    image: &MultispectralImage,
+    band_name: &str,
+    role: IndexBandRole,
+    expected_dimensions: (u32, u32),
+    calibration: &crate::io::RadiometricCalibrationEvidence,
+) -> AgroResult<LoadedIndexBand> {
+    #[cfg(feature = "gdal-io")]
+    {
+        let band_path = require_band_path(image, band_name, role.label())?;
+        if band_path.ends_with(".tif") || band_path.ends_with(".tiff") {
+            let (width, height, raw_values, nodata) =
+                crate::io::gdal_util::read_first_band_as_f32(band_path).map_err(|err| {
+                    processing_error(format!("GDAL read {} failed: {err}", role.label()))
+                })?;
+            if (width as u32, height as u32) != expected_dimensions {
+                return Err(processing_error(format!(
+                    "{} band dimensions mismatch: expected {:?}, got {:?}",
+                    role.label(),
+                    expected_dimensions,
+                    (width as u32, height as u32)
+                )));
+            }
+
+            let valid = raw_values
+                .iter()
+                .map(|value| nodata.map_or(true, |nodata| (*value as f64) != nodata))
+                .collect::<Vec<_>>();
+            let values = raw_values
+                .into_iter()
+                .map(|value| calibrated_band_value(value, band_name, calibration))
+                .collect::<Vec<_>>();
+
+            return Ok(LoadedIndexBand { values, valid });
+        }
+    }
+
+    let band = load_luma_band(image, band_name, role.label(), expected_dimensions)?;
+    let values = band
+        .pixels()
+        .map(|pixel| calibrated_band_value(pixel[0] as f32, band_name, calibration))
+        .collect::<Vec<_>>();
+    let valid = vec![true; values.len()];
+
+    Ok(LoadedIndexBand { values, valid })
+}
+
+async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<()> {
+    let image = crate::io::load_multispectral_metadata(metadata_file)
+        .await
+        .map_err(|err| processing_error(err.to_string()))?;
+    let resolved_bands = resolved_index_band_names(args);
+    let evidence = crate::io::resolve_band_ingest_evidence_for_resolved_bands(
+        &image,
+        args.sensor,
+        resolved_bands,
+    )
+    .map_err(|err| processing_error(err.to_string()))?;
+    crate::io::write_band_ingest_evidence(&args.output_dir, &evidence)
+        .await
+        .map_err(|err| processing_error(err.to_string()))?;
+
+    let (width, height) = (image.metadata.width, image.metadata.height);
+    let mut loaded_bands = BTreeMap::new();
+    for role in args.index.required_bands() {
+        let band_name = evidence
+            .resolved_bands
+            .get(role.key())
+            .ok_or_else(|| {
+                processing_error(format!(
+                    "{:?} required {} band was not resolved",
+                    args.index,
+                    role.label()
+                ))
+            })?
+            .clone();
+        let band = load_index_band(
+            &image,
+            &band_name,
+            *role,
+            (width, height),
+            &evidence.radiometric_calibration,
+        )?;
+        loaded_bands.insert(*role, band);
+    }
+
+    let mut out = image::ImageBuffer::new(width, height);
+    let mut out_f32: Option<Vec<f32>> = Some(vec![NODATA_F32; (width * height) as usize]);
+    let total_pixels = (width * height) as usize;
+    let mut index_values = Vec::with_capacity(total_pixels);
+    let mut nodata_valid = Vec::with_capacity(total_pixels);
+    let mut clear_mask = Vec::with_capacity(total_pixels);
+
+    // Optional mask: non-zero means valid pixel
+    let mask_img = if let Some(mask_path) = &args.mask {
+        let mask = image::open(mask_path)
+            .map_err(|e| processing_error(format!("Failed to load mask: {}", e)))?
+            .to_luma8();
+        if mask.dimensions() != (width, height) {
+            return Err(processing_error(format!(
+                "Mask dimensions mismatch: expected {:?}, got {:?}",
+                (width, height),
+                mask.dimensions()
+            )));
+        }
+        Some(mask)
+    } else {
+        None
+    };
+
+    let (display_min, display_max) = args.index.expected_value_range();
+    for (x, y, pix) in out.enumerate_pixels_mut() {
+        let index = (y * width + x) as usize;
+        let mut values = IndexBandValues::default();
+        let mut valid_data = true;
+        for role in args.index.required_bands() {
+            let band = loaded_bands.get(role).ok_or_else(|| {
+                processing_error(format!(
+                    "{:?} required {} band was not loaded",
+                    args.index,
+                    role.label()
+                ))
+            })?;
+            if !band.valid[index] {
+                valid_data = false;
+            }
+            values.insert(*role, band.values[index]);
+        }
+
+        let is_clear = valid_mask_at(&mask_img, x, y);
+        clear_mask.push(is_clear);
+        nodata_valid.push(valid_data);
+
+        let pixel_value = if valid_data {
+            args.index
+                .compute_value(&values)
+                .map_err(|err| processing_error(err.to_string()))?
+        } else {
+            IndexPixelValue::Invalid { reason: "nodata" }
+        };
+        index_values.push(pixel_value);
+
+        let write_val = if is_clear && valid_data {
+            pixel_value
+                .value()
+                .filter(|value| value.is_finite())
+                .unwrap_or(NODATA_F32)
+        } else {
+            NODATA_F32
+        };
+
+        if let Some(ref mut f32buf) = out_f32 {
+            f32buf[index] = write_val;
+        }
+        let vis = if write_val.is_finite() {
+            let scaled = (write_val.clamp(display_min, display_max) - display_min)
+                / (display_max - display_min);
+            (scaled * 255.0).round() as u8
+        } else {
+            0
+        };
+        *pix = image::Luma([vis]);
+    }
+
+    let stats = summarize_masked_index_values(&index_values, &nodata_valid, &clear_mask)?;
 
     let out_path = match args.out_format {
         OutputFormat::Png => {
@@ -719,6 +463,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
             out.save(&p).map_err(|e| {
                 shared::error::AgroError::Processing(format!("Failed to save index image: {}", e))
             })?;
+            crate::io::write_png_spatial_sidecar(&p, Some(&evidence.spatial_ref)).await?;
             p
         }
         OutputFormat::Geotiff => {
@@ -760,14 +505,17 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                         ))
                     })?;
                 }
-                // Try to copy georeferencing from one of the source bands
-                let src_ref = image
-                    .file_paths
-                    .get(&nir_name)
-                    .or_else(|| image.file_paths.get(&red_name));
-                if let Some(src) = src_ref {
-                    let _ = crate::io::gdal_util::copy_geo_from(src, p.to_string_lossy().as_ref());
-                }
+                crate::io::gdal_util::apply_spatial_ref(
+                    p.to_string_lossy().as_ref(),
+                    &ingest.evidence.spatial_ref,
+                )
+                .map_err(|e| {
+                    shared::error::AgroError::Processing(format!(
+                        "Apply GeoTIFF spatial reference failed: {}",
+                        e
+                    ))
+                })?;
+                crate::io::write_geotiff_spatial_sidecar(&p, &ingest.evidence.spatial_ref).await?;
                 p
             }
             #[cfg(not(feature = "gdal-io"))]
@@ -779,14 +527,72 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }
     };
 
+    let mut output_hashes = BTreeMap::new();
+    output_hashes.insert(
+        "product".to_string(),
+        crate::io::file_output_hash(&out_path).await?,
+    );
+    let mask_ref = args
+        .mask
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let band_overrides = args
+        .band_overrides
+        .iter()
+        .map(|override_spec| {
+            serde_json::json!({
+                "role": override_spec.role.key(),
+                "band_name": override_spec.band_name,
+            })
+        })
+        .collect::<Vec<_>>();
+    let reproducibility = crate::io::ProductReproducibilityEvidence::new(
+        vec![image.image_id],
+        "index",
+        serde_json::json!({
+            "index": format!("{:?}", args.index).to_lowercase(),
+            "out_format": format!("{:?}", args.out_format).to_lowercase(),
+            "sensor": args.sensor.map(|sensor| format!("{:?}", sensor).to_lowercase()),
+            "resolved_bands": evidence.resolved_bands.clone(),
+            "band_overrides": band_overrides,
+        }),
+        Some(evidence.radiometric_calibration.clone()),
+        mask_ref,
+        serde_json::json!({
+            "min": stats.min,
+            "max": stats.max,
+            "mean": stats.mean,
+            "statistics_outcome": stats.outcome,
+            "invalid_pixel_reasons": stats.invalid_pixel_reasons.clone(),
+        }),
+        serde_json::json!({
+            "total_pixel_count": stats.total_pixel_count,
+            "clear_pixel_count": stats.clear_pixel_count,
+            "valid_pixel_count": stats.valid_pixel_count,
+            "clear_pixel_coverage": stats.clear_pixel_coverage,
+            "valid_pixel_coverage": stats.valid_pixel_coverage,
+        }),
+        output_hashes,
+    );
+
     let meta = IndexResultMeta {
         timestamp: chrono::Utc::now(),
         source_images: vec![image.image_id],
         output_path: out_path.to_string_lossy().to_string(),
         index: format!("{:?}", args.index).to_lowercase(),
-        min: stats_min,
-        max: stats_max,
-        mean,
+        min: stats.min,
+        max: stats.max,
+        mean: stats.mean,
+        total_pixel_count: stats.total_pixel_count,
+        clear_pixel_count: stats.clear_pixel_count,
+        valid_pixel_count: stats.valid_pixel_count,
+        clear_pixel_coverage: stats.clear_pixel_coverage,
+        valid_pixel_coverage: stats.valid_pixel_coverage,
+        statistics_outcome: stats.outcome,
+        invalid_pixel_reasons: stats.invalid_pixel_reasons,
+        radiometric_calibration: evidence.radiometric_calibration.clone(),
+        spatial_ref: evidence.spatial_ref.clone(),
+        reproducibility,
     };
 
     let meta_name = format!(
@@ -799,4 +605,65 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
     tokio::fs::write(meta_path, serde_json::to_string_pretty(&meta)?).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IndexStatisticsOutcome;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "actual {actual} did not match expected {expected}"
+        );
+    }
+
+    #[test]
+    fn masked_index_statistics_exclude_cloud_and_nodata_pixels() {
+        let stats = summarize_masked_index_values(
+            &[
+                IndexPixelValue::Valid(0.2),
+                IndexPixelValue::Valid(0.9),
+                IndexPixelValue::Valid(0.4),
+                IndexPixelValue::Valid(0.8),
+            ],
+            &[true, true, false, true],
+            &[true, false, true, false],
+        )
+        .expect("statistics compute");
+
+        assert_eq!(stats.outcome, IndexStatisticsOutcome::Computed);
+        assert_eq!(stats.total_pixel_count, 4);
+        assert_eq!(stats.clear_pixel_count, 2);
+        assert_eq!(stats.valid_pixel_count, 1);
+        assert_close(stats.clear_pixel_coverage, 0.5);
+        assert_close(stats.valid_pixel_coverage, 0.25);
+        assert_close(stats.min, 0.2);
+        assert_close(stats.max, 0.2);
+        assert_close(stats.mean, 0.2);
+        assert_eq!(stats.invalid_pixel_reasons.get("masked"), Some(&2));
+        assert_eq!(stats.invalid_pixel_reasons.get("nodata"), Some(&1));
+    }
+
+    #[test]
+    fn fully_clouded_index_statistics_report_no_clear_pixels() {
+        let stats = summarize_masked_index_values(
+            &[IndexPixelValue::Valid(0.2), IndexPixelValue::Valid(0.4)],
+            &[true, true],
+            &[false, false],
+        )
+        .expect("statistics compute");
+
+        assert_eq!(stats.outcome, IndexStatisticsOutcome::NoClearPixels);
+        assert_eq!(stats.total_pixel_count, 2);
+        assert_eq!(stats.clear_pixel_count, 0);
+        assert_eq!(stats.valid_pixel_count, 0);
+        assert_eq!(stats.clear_pixel_coverage, 0.0);
+        assert_eq!(stats.valid_pixel_coverage, 0.0);
+        assert!(stats.min.is_nan());
+        assert!(stats.max.is_nan());
+        assert!(stats.mean.is_nan());
+        assert_eq!(stats.invalid_pixel_reasons.get("masked"), Some(&2));
+    }
 }

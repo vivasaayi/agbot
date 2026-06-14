@@ -8,8 +8,10 @@ services:
     environment:
       POSTGRES_DB: agbot
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD_FILE: /run/secrets/agbot_postgres_password
       PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - agbot_postgres_password
     ports:
       - "5432:5432"
     volumes:
@@ -30,8 +32,10 @@ services:
     environment:
       POSTGRES_DB: agbot_test
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD_FILE: /run/secrets/agbot_postgres_test_password
       PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - agbot_postgres_test_password
     ports:
       - "5433:5432"
     volumes:
@@ -51,8 +55,10 @@ services:
     restart: unless-stopped
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@agbot.local
-      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_DEFAULT_PASSWORD_FILE: /run/secrets/agbot_pgadmin_password
       PGADMIN_CONFIG_SERVER_MODE: 'False'
+    secrets:
+      - agbot_pgadmin_password
     ports:
       - "8080:80"
     volumes:
@@ -70,6 +76,14 @@ volumes:
     driver: local
   pgadmin_data:
     driver: local
+
+secrets:
+  agbot_postgres_password:
+    file: ${AGBOT_POSTGRES_PASSWORD_FILE:-./secrets/postgres_password}
+  agbot_postgres_test_password:
+    file: ${AGBOT_POSTGRES_TEST_PASSWORD_FILE:-./secrets/postgres_test_password}
+  agbot_pgadmin_password:
+    file: ${AGBOT_PGADMIN_PASSWORD_FILE:-./secrets/pgadmin_password}
 
 networks:
   agbot-network:

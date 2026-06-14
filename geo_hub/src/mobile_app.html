@@ -1,0 +1,811 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>AgBot Field Imagery</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f4;
+      --panel: #ffffff;
+      --ink: #172018;
+      --muted: #637064;
+      --line: #dce2db;
+      --accent: #197a4f;
+      --accent-strong: #0d5d3b;
+      --warn: #9f5b10;
+      --info: #235a86;
+      --shadow: 0 12px 32px rgba(28, 40, 30, 0.14);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      min-height: 100svh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      padding: max(16px, env(safe-area-inset-top)) 16px 12px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    .subhead {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .controls {
+      padding: 12px 16px;
+      display: grid;
+      gap: 10px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .map-picker {
+      padding: 12px 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      gap: 8px;
+    }
+
+    .map-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .map-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    #locationMap {
+      width: 100%;
+      height: 310px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #dde8dc;
+    }
+
+    .leaflet-container {
+      font: inherit;
+    }
+
+    .leaflet-control-attribution {
+      font-size: 10px;
+    }
+
+    label {
+      display: grid;
+      gap: 5px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    input, select, button {
+      width: 100%;
+      min-height: 44px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      font: inherit;
+      letter-spacing: 0;
+    }
+
+    input, select {
+      padding: 10px 12px;
+      background: #fff;
+      color: var(--ink);
+    }
+
+    button {
+      border: 0;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      padding: 10px 14px;
+    }
+
+    button.secondary {
+      background: #eef4ef;
+      color: var(--accent-strong);
+      border: 1px solid #c9dacd;
+    }
+
+    button:disabled {
+      opacity: 0.55;
+    }
+
+    .manual-location {
+      display: grid;
+      gap: 10px;
+    }
+
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .stage {
+      flex: 1;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: 0;
+    }
+
+    .layerbar {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding: 10px 16px;
+      background: #eef2ec;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .chip {
+      flex: 0 0 auto;
+      width: auto;
+      min-height: 36px;
+      padding: 8px 11px;
+      border-radius: 999px;
+      border: 1px solid #c8d7cc;
+      background: #fff;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .chip.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    .viewer {
+      min-height: 280px;
+      display: grid;
+      place-items: center;
+      padding: 14px;
+      background:
+        linear-gradient(90deg, rgba(0,0,0,0.035) 1px, transparent 1px),
+        linear-gradient(rgba(0,0,0,0.035) 1px, transparent 1px),
+        #dfe8dd;
+      background-size: 32px 32px;
+      overflow: hidden;
+    }
+
+    .viewer img {
+      width: min(100%, 620px);
+      max-height: 54svh;
+      object-fit: contain;
+      image-rendering: auto;
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      background: #fff;
+    }
+
+    .placeholder {
+      padding: 28px 20px;
+      text-align: center;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .summary {
+      background: var(--panel);
+      border-top: 1px solid var(--line);
+      padding: 12px 16px max(16px, env(safe-area-inset-bottom));
+      display: grid;
+      gap: 8px;
+    }
+
+    .metric {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 14px;
+    }
+
+    .metric span:first-child { color: var(--muted); }
+    .metric span:last-child { font-weight: 700; text-align: right; }
+
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    .status.error { color: #a12821; }
+    .status.warn { color: var(--warn); }
+
+    .scene-note {
+      border: 1px solid #c9d9e7;
+      background: #f0f6fb;
+      color: var(--info);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .scene-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .scene-card {
+      min-height: 0;
+      display: grid;
+      gap: 4px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      text-align: left;
+      font-weight: 600;
+    }
+
+    .scene-card.active {
+      border-color: var(--accent);
+      box-shadow: inset 0 0 0 1px var(--accent);
+    }
+
+    .scene-card span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 1.3;
+    }
+
+    @media (min-width: 760px) {
+      main {
+        max-width: 920px;
+        margin: 0 auto;
+        border-left: 1px solid var(--line);
+        border-right: 1px solid var(--line);
+      }
+      .controls {
+        grid-template-columns: 1fr 1fr auto;
+        align-items: end;
+      }
+      .controls .wide { grid-column: span 2; }
+      #locationMap { height: 360px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Field Imagery</h1>
+      <p class="subhead">Tap the map to pick a field location. The backend handles imagery and calculations.</p>
+    </header>
+
+    <section class="map-picker">
+      <div class="map-title">
+        <span>FIELD LOCATION</span>
+        <span id="pickedLocation">36.778300, -119.417900</span>
+      </div>
+      <div class="map-actions">
+        <button id="drawField" class="secondary">Draw Field</button>
+        <button id="clearField" class="secondary">Clear Field</button>
+      </div>
+      <div id="fieldStatus" class="status">No field boundary selected.</div>
+      <div id="locationMap" aria-label="Map location picker"></div>
+    </section>
+
+    <section class="controls">
+      <div class="grid2 wide manual-location">
+        <label>
+          Latitude
+          <input id="lat" inputmode="decimal" value="36.7783" />
+        </label>
+        <label>
+          Longitude
+          <input id="lon" inputmode="decimal" value="-119.4179" />
+        </label>
+      </div>
+      <div class="grid2 wide">
+        <label>
+          Target Date
+          <input id="date" type="date" />
+        </label>
+        <label>
+          Window
+          <select id="days">
+            <option value="3">3 days</option>
+            <option value="7">7 days</option>
+            <option value="14" selected>14 days</option>
+          </select>
+        </label>
+      </div>
+      <label class="wide">
+        Imagery Source
+        <select id="source">
+          <option value="auto">Best available satellite</option>
+          <option value="sentinel2">Sentinel-2 L2A</option>
+          <option value="landsat">Landsat 8/9</option>
+          <option value="sample">Sample products only</option>
+        </select>
+      </label>
+      <button id="locate" class="secondary">Use My Location</button>
+      <button id="searchScenes" class="secondary">Find Scenes</button>
+      <button id="analyze">Analyze Selected</button>
+      <div id="status" class="status wide">Ready.</div>
+      <div id="sceneList" class="scene-list wide"></div>
+    </section>
+
+    <section class="stage">
+      <div id="layers" class="layerbar"></div>
+      <div class="viewer">
+        <div id="placeholder" class="placeholder">Results will appear here after analysis.</div>
+        <img id="productImage" alt="Selected analysis layer" hidden />
+      </div>
+      <div id="summary" class="summary"></div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = {
+      response: null,
+      selected: null,
+      scenes: [],
+      selectedSceneId: null,
+      map: null,
+      marker: null,
+      fieldMode: false,
+      fieldPoints: [],
+      fieldLayer: null,
+      fieldVertexLayers: []
+    };
+
+    $("date").value = new Date().toISOString().slice(0, 10);
+    initLocationMap();
+
+    $("lat").addEventListener("change", syncMapFromInputs);
+    $("lon").addEventListener("change", syncMapFromInputs);
+    $("date").addEventListener("change", clearScenes);
+    $("days").addEventListener("change", clearScenes);
+    $("source").addEventListener("change", clearScenes);
+
+    $("locate").addEventListener("click", () => {
+      if (!navigator.geolocation) {
+        setStatus("Location is not available in this browser.", "error");
+        return;
+      }
+      setStatus("Requesting location...");
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          setPickedLocation(position.coords.latitude, position.coords.longitude, true);
+          setStatus("Location set. Tap analyze.");
+        },
+        (error) => setStatus(error.message || "Unable to get location.", "error"),
+        { enableHighAccuracy: true, timeout: 10000 }
+      );
+    });
+
+    function initLocationMap() {
+      const lat = Number($("lat").value);
+      const lon = Number($("lon").value);
+
+      if (!window.L) {
+        setStatus("Map library did not load. You can still enter latitude and longitude manually.", "warn");
+        updatePickedLocationText(lat, lon);
+        return;
+      }
+
+      state.map = L.map("locationMap", {
+        zoomControl: true,
+        attributionControl: true
+      }).setView([lat, lon], 13);
+
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap"
+      }).addTo(state.map);
+
+      state.marker = L.marker([lat, lon], { draggable: true }).addTo(state.map);
+      state.marker.on("dragend", () => {
+        const point = state.marker.getLatLng();
+        setPickedLocation(point.lat, point.lng, false);
+      });
+
+      state.map.on("click", (event) => {
+        if (state.fieldMode) {
+          addFieldPoint(event.latlng);
+        } else {
+          setPickedLocation(event.latlng.lat, event.latlng.lng, false);
+        }
+      });
+
+      setTimeout(() => state.map.invalidateSize(), 50);
+      updatePickedLocationText(lat, lon);
+    }
+
+    function syncMapFromInputs() {
+      const lat = Number($("lat").value);
+      const lon = Number($("lon").value);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+      setPickedLocation(lat, lon, false);
+    }
+
+    function setPickedLocation(latitude, longitude, recenter) {
+      $("lat").value = latitude.toFixed(6);
+      $("lon").value = longitude.toFixed(6);
+      updatePickedLocationText(latitude, longitude);
+      clearScenes();
+
+      if (state.marker) {
+        state.marker.setLatLng([latitude, longitude]);
+      }
+      if (state.map && recenter) {
+        state.map.setView([latitude, longitude], Math.max(state.map.getZoom(), 14));
+      } else if (state.map) {
+        state.map.panTo([latitude, longitude], { animate: true });
+      }
+    }
+
+    function updatePickedLocationText(latitude, longitude) {
+      $("pickedLocation").textContent = `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
+    }
+
+    $("drawField").addEventListener("click", () => {
+      state.fieldMode = !state.fieldMode;
+      $("drawField").textContent = state.fieldMode ? "Finish Field" : "Draw Field";
+      if (!state.fieldMode && state.fieldPoints.length > 0 && state.fieldPoints.length < 3) {
+        setStatus("Add at least three field points.", "warn");
+      } else if (state.fieldMode) {
+        setStatus("Tap field corners on the map.");
+      } else if (state.fieldPoints.length >= 3) {
+        setStatus("Field boundary ready.");
+      }
+      renderFieldBoundary();
+    });
+
+    $("clearField").addEventListener("click", () => {
+      state.fieldMode = false;
+      state.fieldPoints = [];
+      $("drawField").textContent = "Draw Field";
+      renderFieldBoundary();
+      setStatus("Field boundary cleared.");
+    });
+
+    function addFieldPoint(latlng) {
+      state.fieldPoints.push([latlng.lat, latlng.lng]);
+      renderFieldBoundary();
+      setStatus(state.fieldPoints.length < 3 ? "Add at least three field points." : "Field boundary ready.");
+    }
+
+    function renderFieldBoundary() {
+      if (!state.map) return;
+      if (state.fieldLayer) {
+        state.map.removeLayer(state.fieldLayer);
+        state.fieldLayer = null;
+      }
+      for (const layer of state.fieldVertexLayers) {
+        state.map.removeLayer(layer);
+      }
+      state.fieldVertexLayers = [];
+
+      for (const point of state.fieldPoints) {
+        state.fieldVertexLayers.push(
+          L.circleMarker(point, {
+            radius: 5,
+            color: "#0d5d3b",
+            weight: 2,
+            fillColor: "#ffffff",
+            fillOpacity: 1
+          }).addTo(state.map)
+        );
+      }
+
+      if (state.fieldPoints.length >= 3) {
+        state.fieldLayer = L.polygon(state.fieldPoints, {
+          color: "#197a4f",
+          weight: 2,
+          fillColor: "#197a4f",
+          fillOpacity: 0.18
+        }).addTo(state.map);
+        $("fieldStatus").textContent = `${state.fieldPoints.length} point field boundary selected.`;
+      } else if (state.fieldPoints.length > 1) {
+        state.fieldLayer = L.polyline(state.fieldPoints, {
+          color: "#197a4f",
+          weight: 2,
+          dashArray: "4 4"
+        }).addTo(state.map);
+        $("fieldStatus").textContent = `${state.fieldPoints.length} field points selected.`;
+      } else {
+        $("fieldStatus").textContent = "No field boundary selected.";
+      }
+    }
+
+    function fieldGeometry() {
+      if (state.fieldPoints.length < 3) return null;
+      const ring = state.fieldPoints.map(([lat, lon]) => [lon, lat]);
+      const first = ring[0];
+      const last = ring[ring.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) {
+        ring.push(first);
+      }
+      return { type: "Polygon", coordinates: [ring] };
+    }
+
+    $("searchScenes").addEventListener("click", searchScenes);
+
+    async function requestMobileJson(url, payload) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const bodyText = await response.text();
+      let bodyJson = null;
+      if (bodyText) {
+        try {
+          bodyJson = JSON.parse(bodyText);
+        } catch (_error) {
+          bodyJson = null;
+        }
+      }
+
+      if (!response.ok) {
+        const message =
+          (typeof bodyJson === "object" && bodyJson !== null && (bodyJson.error || bodyJson.message)) ||
+          bodyText ||
+          "Request failed.";
+        throw new Error(String(message));
+      }
+
+      if (!bodyText.trim()) {
+        throw new Error("Server returned an empty response.");
+      }
+
+      if (bodyJson === null) {
+        throw new Error("Server response is not valid JSON.");
+      }
+
+      return bodyJson;
+    }
+
+    async function searchScenes() {
+      const latitude = Number($("lat").value);
+      const longitude = Number($("lon").value);
+      const date = $("date").value;
+      const days = Number($("days").value);
+
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+        setStatus("Enter a valid latitude and longitude.", "error");
+        return;
+      }
+
+      const source = $("source").value;
+      if (source === "sample") {
+        clearScenes();
+        setStatus("Sample mode does not need a satellite scene.");
+        return;
+      }
+
+      $("searchScenes").disabled = true;
+      $("analyze").disabled = true;
+      setStatus("Searching available satellite scenes...");
+      renderSceneList([]);
+
+      try {
+        const payload = await requestMobileJson("/api/mobile/scenes/search", {
+          latitude,
+          longitude,
+          date,
+          days,
+          source,
+        });
+        state.scenes = payload.scenes || [];
+        state.selectedSceneId = state.scenes[0]?.external_scene_id || null;
+        renderSceneList(state.scenes);
+        if (state.selectedSceneId) {
+          setStatus(`${state.scenes.length} satellite scene${state.scenes.length === 1 ? "" : "s"} found.`);
+        } else {
+          setStatus("No satellite scenes found for this location and window.", "warn");
+        }
+      } catch (error) {
+        setStatus(error.message || "Scene search failed.", "error");
+      } finally {
+        $("searchScenes").disabled = false;
+        $("analyze").disabled = false;
+      }
+    }
+
+    function renderSceneList(scenes) {
+      const container = $("sceneList");
+      container.innerHTML = "";
+      for (const scene of scenes) {
+        const button = document.createElement("button");
+        button.className = "scene-card" + (scene.external_scene_id === state.selectedSceneId ? " active" : "");
+        const cloud = typeof scene.cloud_cover === "number" ? `${scene.cloud_cover.toFixed(1)}% cloud` : "cloud unknown";
+        const acquired = formatSceneDate(scene.acquired_at);
+        const resolution = typeof scene.resolution_m === "number" ? `${scene.resolution_m.toFixed(0)}m` : "resolution unknown";
+        button.innerHTML = `${escapeHtml(scene.external_scene_id)}<span>${escapeHtml(scene.dataset_label || scene.collection)} · ${escapeHtml(resolution)} · ${escapeHtml(acquired)} · ${escapeHtml(cloud)}</span>`;
+        button.addEventListener("click", () => {
+          state.selectedSceneId = scene.external_scene_id;
+          renderSceneList(state.scenes);
+          setStatus(`Selected ${scene.external_scene_id}.`);
+        });
+        container.appendChild(button);
+      }
+    }
+
+    function clearScenes() {
+      state.scenes = [];
+      state.selectedSceneId = null;
+      renderSceneList([]);
+    }
+
+    function selectedScene() {
+      return state.scenes.find((scene) => scene.external_scene_id === state.selectedSceneId) || null;
+    }
+
+    $("analyze").addEventListener("click", async () => {
+      const latitude = Number($("lat").value);
+      const longitude = Number($("lon").value);
+      const date = $("date").value;
+      const days = Number($("days").value);
+      const source = $("source").value;
+
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+        setStatus("Enter a valid latitude and longitude.", "error");
+        return;
+      }
+
+      $("analyze").disabled = true;
+      setStatus(source === "sample" ? "Preparing sample products..." : "Preparing satellite products...");
+      renderLayers([]);
+      $("summary").innerHTML = "";
+      $("productImage").hidden = true;
+      $("placeholder").hidden = false;
+
+      try {
+        state.response = await requestMobileJson("/api/mobile/analyze", {
+          latitude,
+          longitude,
+          date,
+          days,
+          source,
+          external_scene_id: state.selectedSceneId,
+          selected_scene: selectedScene(),
+          field_geometry: fieldGeometry(),
+          products: ["ndvi", "ndmi", "nbr", "mndwi", "evi2"],
+        });
+        state.selected = state.response.products[0]?.kind || null;
+        if (state.response.external_scene_id) {
+          setStatus(`${state.response.dataset_label || "Satellite"} scene ${state.response.external_scene_id} selected.`);
+        } else {
+          setStatus(`Sample scene ${state.response.scene_id} ready.`);
+        }
+        renderLayers(state.response.products);
+        renderSelected();
+      } catch (error) {
+        setStatus(error.message || "Analysis failed.", "error");
+      } finally {
+        $("analyze").disabled = false;
+      }
+    });
+
+    function renderLayers(products) {
+      const container = $("layers");
+      container.innerHTML = "";
+      for (const product of products) {
+        const button = document.createElement("button");
+        button.className = "chip" + (product.kind === state.selected ? " active" : "");
+        button.textContent = product.kind.toUpperCase();
+        button.title = product.label;
+        button.addEventListener("click", () => {
+          state.selected = product.kind;
+          renderLayers(state.response.products);
+          renderSelected();
+        });
+        container.appendChild(button);
+      }
+    }
+
+    function renderSelected() {
+      const product = state.response?.products.find((item) => item.kind === state.selected);
+      if (!product) return;
+
+      const image = $("productImage");
+      image.src = product.url_path + "?t=" + Date.now();
+      image.hidden = false;
+      $("placeholder").hidden = true;
+
+      const stats = product.stats || {};
+      const rows = [
+        ["Product Mode", state.response.real_products_ready ? "Real processed imagery" : "Sample products"],
+        ["Layer", product.label],
+        ["Source", state.response.source],
+        ["Acquired", state.response.acquired_at],
+      ];
+      if (state.response.provider) rows.push(["Provider", state.response.provider]);
+      if (state.response.dataset_label) rows.push(["Dataset", state.response.dataset_label]);
+      if (state.response.collection) rows.push(["Collection", state.response.collection]);
+      if (typeof state.response.resolution_m === "number") rows.push(["Resolution", `${state.response.resolution_m.toFixed(0)}m`]);
+      if (state.response.external_scene_id) rows.push(["Satellite Scene", state.response.external_scene_id]);
+      if (typeof state.response.cloud_cover === "number") rows.push(["Cloud Cover", `${state.response.cloud_cover.toFixed(1)}%`]);
+      if (typeof state.response.asset_count === "number" && state.response.asset_count > 0) rows.push(["Band Assets", state.response.asset_count]);
+      if (typeof state.response.search_days === "number") rows.push(["Search Window", `${state.response.search_days} days`]);
+      if (typeof stats.mean === "number") rows.push(["Mean", stats.mean.toFixed(3)]);
+      if (typeof stats.min === "number") rows.push(["Min", stats.min.toFixed(3)]);
+      if (typeof stats.max === "number") rows.push(["Max", stats.max.toFixed(3)]);
+      if (stats.summary_scope) rows.push(["Summary Area", stats.summary_scope === "field_aoi" ? "Field boundary" : "Full scene"]);
+      if (typeof stats.valid_percent === "number") rows.push(["Valid Pixels", `${stats.valid_percent.toFixed(1)}%`]);
+      if (typeof stats.masked_pixels === "number") rows.push(["Masked Pixels", Math.round(stats.masked_pixels).toLocaleString()]);
+      if (product.kind === "ndvi" && typeof stats.mean === "number") rows.push(["NDVI Status", ndviStatus(stats.mean)]);
+      rows.push(["Tile URL", product.tile_url_template.replace("{z}", "0").replace("{x}", "0").replace("{y}", "0")]);
+
+      const note = state.response.real_products_ready ? "" :
+        `<div class="scene-note">${escapeHtml("No usable Landsat scene was found for this location and date window. The backend is showing sample fallback products.")}</div>`;
+      $("summary").innerHTML = note + rows.map(([label, value]) =>
+        `<div class="metric"><span>${escapeHtml(label)}</span><span>${escapeHtml(String(value))}</span></div>`
+      ).join("");
+    }
+
+    function setStatus(message, level = "") {
+      const status = $("status");
+      status.textContent = message;
+      status.className = "status " + level;
+    }
+
+    function formatSceneDate(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+    }
+
+    function ndviStatus(mean) {
+      if (mean < 0.1) return "Bare or very low vegetation";
+      if (mean < 0.25) return "Low vegetation";
+      if (mean < 0.45) return "Moderate vegetation";
+      return "Strong vegetation";
+    }
+
+    function escapeHtml(value) {
+      return value.replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+      }[char]));
+    }
+  </script>
+</body>
+</html>

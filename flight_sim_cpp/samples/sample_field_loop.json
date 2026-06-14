@@ -1,0 +1,84 @@
+{
+  "name": "AgBot FlightSim Sandbox Loop",
+  "home": {
+    "latitude": 36.7783,
+    "longitude": -119.4179,
+    "altitude": 0.0,
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.0
+  },
+  "cruise_speed_mps": 12.0,
+  "acceptance_radius_m": 1.5,
+  "field_boundary": {
+    "field_id": "sandbox-field",
+    "coordinates": [
+      { "latitude": 36.777312, "longitude": -119.419582 },
+      { "latitude": 36.777312, "longitude": -119.415769 },
+      { "latitude": 36.779647, "longitude": -119.415769 },
+      { "latitude": 36.779647, "longitude": -119.419582 },
+      { "latitude": 36.777312, "longitude": -119.419582 }
+    ]
+  },
+  "waypoints": [
+    {
+      "name": "takeoff_to_30m",
+      "action": "takeoff",
+      "x": 0.0,
+      "y": 30.0,
+      "z": 0.0,
+      "speed_mps": 5.0
+    },
+    {
+      "name": "north_entry",
+      "action": "fly",
+      "x": 0.0,
+      "y": 30.0,
+      "z": 120.0
+    },
+    {
+      "name": "east_leg",
+      "action": "fly",
+      "x": 160.0,
+      "y": 30.0,
+      "z": 120.0
+    },
+    {
+      "name": "south_leg",
+      "action": "fly",
+      "x": 160.0,
+      "y": 30.0,
+      "z": -80.0
+    },
+    {
+      "name": "west_leg",
+      "action": "fly",
+      "x": -120.0,
+      "y": 30.0,
+      "z": -80.0
+    },
+    {
+      "name": "inspection_hover",
+      "action": "loiter",
+      "x": -120.0,
+      "y": 30.0,
+      "z": 80.0,
+      "hold_seconds": 3.0
+    },
+    {
+      "name": "return_home",
+      "action": "return_home",
+      "x": 0.0,
+      "y": 30.0,
+      "z": 0.0
+    },
+    {
+      "name": "land_home",
+      "action": "land",
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0,
+      "speed_mps": 4.0
+    }
+  ]
+}

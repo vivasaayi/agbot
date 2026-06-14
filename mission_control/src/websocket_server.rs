@@ -1,5 +1,8 @@
 use axum::{
-    extract::{ws::{WebSocket, WebSocketUpgrade, Message}, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     response::Response,
     routing::get,
     Router,
@@ -16,10 +19,7 @@ pub struct WebSocketServer {
 }
 
 impl WebSocketServer {
-    pub fn new(
-        config: Arc<AgroConfig>,
-        event_rx: broadcast::Receiver<WebSocketMessage>,
-    ) -> Self {
+    pub fn new(config: Arc<AgroConfig>, event_rx: broadcast::Receiver<WebSocketMessage>) -> Self {
         Self { config, event_rx }
     }
 
@@ -33,7 +33,10 @@ impl WebSocketServer {
             .with_state(app_state);
 
         let listener = tokio::net::TcpListener::bind(&self.config.server.ws_bind_address).await?;
-        info!("WebSocket server listening on {}", self.config.server.ws_bind_address);
+        info!(
+            "WebSocket server listening on {}",
+            self.config.server.ws_bind_address
+        );
 
         axum::serve(listener, app).await?;
 
@@ -46,10 +49,7 @@ struct AppState {
     event_tx: Arc<broadcast::Receiver<WebSocketMessage>>,
 }
 
-async fn websocket_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
+async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
@@ -61,18 +61,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Spawn task to handle incoming messages from client
     let recv_task = tokio::spawn(async move {
-        while let Some(msg) = receiver.next().await {                match msg {
-                    Ok(Message::Text(_)) | Ok(Message::Binary(_)) => {
-                        // Handle incoming messages from client if needed
-                        info!("Received message from client: {:?}", msg);
-                    }
-                    Ok(Message::Close(_)) => {
-                        info!("WebSocket close message received");
-                        break;
-                    }
-                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
-                        // Handle ping/pong frames
-                    }
+        while let Some(msg) = receiver.next().await {
+            match msg {
+                Ok(Message::Text(_)) | Ok(Message::Binary(_)) => {
+                    // Handle incoming messages from client if needed
+                    info!("Received message from client: {:?}", msg);
+                }
+                Ok(Message::Close(_)) => {
+                    info!("WebSocket close message received");
+                    break;
+                }
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                    // Handle ping/pong frames
+                }
                 Err(e) => {
                     warn!("WebSocket error: {}", e);
                     break;
@@ -86,11 +87,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         while let Ok(event) = event_rx.recv().await {
             match serde_json::to_string(&event) {
                 Ok(json) => {
-                    if sender
-                        .send(Message::Text(json))
-                        .await
-                        .is_err()
-                    {
+                    if sender.send(Message::Text(json)).await.is_err() {
                         break;
                     }
                 }

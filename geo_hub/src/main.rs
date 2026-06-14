@@ -13,8 +13,15 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to create data directories")?;
 
     // Connect to database pool
-    let pool = db::connect_pool(&config).await.context("failed to connect database")?;
+    let pool = db::connect_pool(&config)
+        .await
+        .context("failed to connect database")?;
 
-    info!(bind = %config.bind_address, "starting geo_hub");
+    info!(
+        bind = %config.bind_address,
+        runtime_mode = %config.runtime_mode,
+        landsat_source = %config.landsat.source,
+        "starting geo_hub"
+    );
     serve(config, pool).await
 }

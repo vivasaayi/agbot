@@ -7,6 +7,7 @@ edition = "2021"
 # Workspace dependencies
 tokio = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
@@ -21,3 +22,6 @@ shared = { path = "../shared" }
 
 # Specific dependencies
 walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

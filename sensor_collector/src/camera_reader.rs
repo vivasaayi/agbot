@@ -1,10 +1,10 @@
 use shared::{
     config::AgroConfig,
-    schemas::{MultispectralImage, ImageMetadata, GpsCoords},
+    schemas::{GpsCoords, ImageMetadata, MultispectralImage},
     AgroResult,
 };
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tracing::{info, error};
+use tracing::{error, info};
 
 pub struct CameraReader {
     config: Arc<AgroConfig>,
@@ -17,11 +17,14 @@ impl CameraReader {
     }
 
     pub async fn run(&self) -> AgroResult<()> {
-        info!("Starting multispectral camera reader on {}", self.config.camera.device);
-
-        let mut capture_interval = tokio::time::interval(
-            std::time::Duration::from_millis(self.config.camera.capture_interval_ms)
+        info!(
+            "Starting multispectral camera reader on {}",
+            self.config.camera.device
         );
+
+        let mut capture_interval = tokio::time::interval(std::time::Duration::from_millis(
+            self.config.camera.capture_interval_ms,
+        ));
 
         loop {
             capture_interval.tick().await;
@@ -49,8 +52,13 @@ impl CameraReader {
             altitude: self.config.gps.home_altitude,
         });
 
-        let bands = vec!["Red".to_string(), "NIR".to_string(), "Green".to_string(), "Blue".to_string()];
-        
+        let bands = vec![
+            "Red".to_string(),
+            "NIR".to_string(),
+            "Green".to_string(),
+            "Blue".to_string(),
+        ];
+
         let metadata = ImageMetadata {
             timestamp,
             gps_position,
@@ -59,20 +67,23 @@ impl CameraReader {
             gain: self.config.camera.gain,
             width: 1280,
             height: 1024,
+            spatial_ref: None,
         };
 
         // Create placeholder image files for each band
         let mut file_paths = HashMap::new();
-        let session_dir = self.data_dir.join(timestamp.format("%Y%m%d_%H%M%S").to_string());
+        let session_dir = self
+            .data_dir
+            .join(timestamp.format("%Y%m%d_%H%M%S").to_string());
         tokio::fs::create_dir_all(&session_dir).await?;
 
         for band in &bands {
             let filename = format!("{}_{}.tiff", image_id, band.to_lowercase());
             let filepath = session_dir.join(&filename);
-            
+
             // Create a simple test image (in real implementation, capture from camera)
             self.create_test_image(&filepath, band).await?;
-            
+
             file_paths.insert(band.clone(), filepath.to_string_lossy().to_string());
         }
 
@@ -86,7 +97,7 @@ impl CameraReader {
     async fn create_test_image(&self, filepath: &PathBuf, band: &str) -> AgroResult<()> {
         // Create a simple test image using the image crate
         let (width, height) = (1280u32, 1024u32);
-        
+
         let color = match band {
             "Red" => [255u8, 0u8, 0u8],
             "NIR" => [128u8, 128u8, 128u8],
@@ -100,8 +111,9 @@ impl CameraReader {
             *pixel = image::Rgb(color);
         }
 
-        img.save(filepath)
-            .map_err(|e| shared::error::AgroError::Processing(format!("Failed to save image: {}", e)))?;
+        img.save(filepath).map_err(|e| {
+            shared::error::AgroError::Processing(format!("Failed to save image: {}", e))
+        })?;
 
         Ok(())
     }
@@ -134,16 +146,19 @@ impl SimulatedCameraReader {
     pub async fn run(&self) -> AgroResult<()> {
         info!("Starting simulated multispectral camera reader");
 
-        let mut capture_interval = tokio::time::interval(
-            std::time::Duration::from_millis(self.config.camera.capture_interval_ms)
-        );
+        let mut capture_interval = tokio::time::interval(std::time::Duration::from_millis(
+            self.config.camera.capture_interval_ms,
+        ));
 
         loop {
             capture_interval.tick().await;
 
             let image = self.generate_simulated_image().await?;
             self.save_image(&image).await?;
-            info!("Generated simulated multispectral image: {}", image.image_id);
+            info!(
+                "Generated simulated multispectral image: {}",
+                image.image_id
+            );
         }
     }
 
@@ -158,8 +173,13 @@ impl SimulatedCameraReader {
             altitude: self.config.gps.home_altitude + (rand::random::<f64>() - 0.5) * 50.0,
         });
 
-        let bands = vec!["Red".to_string(), "NIR".to_string(), "Green".to_string(), "Blue".to_string()];
-        
+        let bands = vec![
+            "Red".to_string(),
+            "NIR".to_string(),
+            "Green".to_string(),
+            "Blue".to_string(),
+        ];
+
         let metadata = ImageMetadata {
             timestamp,
             gps_position,
@@ -168,19 +188,22 @@ impl SimulatedCameraReader {
             gain: self.config.camera.gain,
             width: 1280,
             height: 1024,
+            spatial_ref: None,
         };
 
         // Create simulated image files for each band
         let mut file_paths = HashMap::new();
-        let session_dir = self.data_dir.join(format!("sim_{}", timestamp.format("%Y%m%d_%H%M%S")));
+        let session_dir = self
+            .data_dir
+            .join(format!("sim_{}", timestamp.format("%Y%m%d_%H%M%S")));
         tokio::fs::create_dir_all(&session_dir).await?;
 
         for band in &bands {
             let filename = format!("sim_{}_{}.tiff", image_id, band.to_lowercase());
             let filepath = session_dir.join(&filename);
-            
+
             self.create_simulated_band_image(&filepath, band).await?;
-            
+
             file_paths.insert(band.clone(), filepath.to_string_lossy().to_string());
         }
 
@@ -198,7 +221,7 @@ impl SimulatedCameraReader {
         for (x, y, pixel) in img.enumerate_pixels_mut() {
             // Create a pattern that simulates vegetation and soil
             let vegetation_mask = ((x + y) % 50) < 25;
-            
+
             let color = match band {
                 "Red" => {
                     if vegetation_mask {
@@ -234,8 +257,9 @@ impl SimulatedCameraReader {
             *pixel = image::Rgb(color);
         }
 
-        img.save(filepath)
-            .map_err(|e| shared::error::AgroError::Processing(format!("Failed to save simulated image: {}", e)))?;
+        img.save(filepath).map_err(|e| {
+            shared::error::AgroError::Processing(format!("Failed to save simulated image: {}", e))
+        })?;
 
         Ok(())
     }

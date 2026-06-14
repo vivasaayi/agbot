@@ -1,17 +1,29 @@
 [workspace]
 members = [
+    "mission_control",
+    "sensor_collector",
     "mission_planner",
-    "drone_simulator",
     "sensor_overlay_engine",
     "multi_drone_control",
     "data_collector",
     "post_processor",
     "shared",
-    "simulator",
+    "alerting",
+    "orthomosaic",
+    "crop_intelligence",
+    "copilot",
+    "compliance",
+    "fleet_health",
+    "soil_iot",
+    "timeseries",
+    "provenance",
+    "plugin_sdk",
+    "interop",
     "lidar_mapper",
     "imagery_processor",
     "geo_hub",
     "geo_viewer",
+    "ground_station_ui",
 ]
 resolver = "2"
 
@@ -96,7 +108,6 @@ polars = { version = "0.35", features = ["lazy"] }
 # 3D Visualization & Game Engine
 bevy = { version = "0.14", features = ["dynamic_linking"] }
 bevy_egui = "0.28"
-bevy-inspector-egui = "0.25"
 
 [profile.release]
 lto = true

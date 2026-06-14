@@ -17,8 +17,28 @@ clap = { workspace = true }
 config = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+geojson = { workspace = true }
 sqlx = { version = "0.7", default-features = false, features = ["sqlite", "runtime-tokio-rustls", "macros"] }
 shared = { path = "../shared" }
+alerting = { path = "../alerting" }
 imagery_processor = { path = "../imagery_processor" }
+interop = { path = "../interop" }
+orthomosaic = { path = "../orthomosaic" }
+crop_intelligence = { path = "../crop_intelligence" }
+copilot = { path = "../copilot" }
+compliance = { path = "../compliance" }
+fleet_health = { path = "../fleet_health" }
+soil_iot = { path = "../soil_iot" }
+timeseries = { path = "../timeseries" }
+provenance = { path = "../provenance" }
+plugin_sdk = { path = "../plugin_sdk" }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
+image = { workspace = true }
+csv = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+tower = { workspace = true, features = ["util"] }
+image = { workspace = true }

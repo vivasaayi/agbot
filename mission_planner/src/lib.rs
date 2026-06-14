@@ -2,23 +2,87 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use geo::{Point, Polygon};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt, str::FromStr};
 use uuid::Uuid;
 
+pub mod abort_recovery;
 pub mod api;
+pub mod automated_failsafe;
+pub mod autonomous_execution;
 pub mod database;
+pub mod dispatch_safety;
 pub mod flight_path;
+pub mod guarded_dispatch;
 pub mod mavlink_integration;
+pub mod mission_audit;
 pub mod mission_optimizer;
+pub mod preflight_checklist;
+pub mod survey_template;
+pub mod telemetry;
 pub mod waypoint;
 pub mod weather_integration;
 pub mod websocket_handler;
 
+pub use abort_recovery::{
+    abort_mission_with_recovery, evaluate_abort_recovery, AbortRecoveryAction,
+    AbortRecoveryAuditEvent, AbortRecoveryCommand, AbortRecoveryConfig, AbortRecoveryContext,
+    AbortRecoveryError, AbortRecoveryPlan, AbortTrigger,
+};
 pub use api::MissionApi;
+pub use automated_failsafe::{
+    assert_failsafe_ready_for_arming, evaluate_automated_failsafe, AutomatedFailsafeAuditEvent,
+    AutomatedFailsafeAuditEventKind, AutomatedFailsafeConfig, AutomatedFailsafeError,
+    AutomatedFailsafeEvaluation, AutomatedFailsafeState, AutomatedFailsafeTrigger,
+};
+pub use autonomous_execution::{
+    execute_autonomous_mission_in_simulation, AutonomousExecutionError,
+    AutonomousExecutionErrorCode, AutonomousExecutionOutcome, AutonomousExecutionPlan,
+    AutonomousOperatorApproval, AutonomousRuntimeMode,
+};
 pub use database::{DatabaseService, MissionStats};
-pub use flight_path::{FlightPath, PathSegment};
-pub use mission_optimizer::MissionOptimizer;
-pub use waypoint::{Action, Waypoint, WaypointType};
+pub use dispatch_safety::{
+    evaluate_dispatch_safety, evaluate_dispatch_safety_with_constraints, AirspaceConstraint,
+    DispatchSafetyConfig, DispatchSafetyError, DispatchSafetyReport, NoFlyZone, SafetyViolation,
+    SafetyViolationCode, SafetyViolationSeverity,
+};
+pub use flight_path::{FlightPath, PathSegment, SurveyPattern};
+pub use guarded_dispatch::{
+    dispatch_guarded_simulation_command, GuardedDispatchAuditEvent, GuardedDispatchAuditEventKind,
+    GuardedDispatchCommand, GuardedDispatchContext, GuardedDispatchError, GuardedDispatchOutcome,
+};
+pub use mission_audit::{
+    replay_mission_from_audit, validate_mission_audit_timeline, MissionAuditEvent,
+    MissionAuditEventKind, MissionAuditGap, MissionAuditGapCode, MissionAuditLog,
+    MissionAuditTimeline, MissionAuditValidationReport, MissionReplay, MissionReplayCommand,
+    MissionReplayCommandStatus, MissionReplayError, MissionReplayErrorCode, MissionReplayEvent,
+    MissionReplayEventKind,
+};
+pub use mission_optimizer::{
+    assert_mission_budget_allows_arming, evaluate_mission_budget, MissionBudgetConfig,
+    MissionBudgetError, MissionBudgetErrorCode, MissionBudgetReport, MissionOptimizer,
+};
+pub use preflight_checklist::{
+    evaluate_preflight_checklist, GpsFixStatus, GpsFixType, PreflightArmError, PreflightCheckName,
+    PreflightCheckResult, PreflightCheckStatus, PreflightChecklistConfig,
+    PreflightChecklistContext, PreflightChecklistReport,
+};
+pub use survey_template::{
+    generate_survey_template, validate_plan_bounds, PlanBoundsConfig, PlanBoundsError,
+    PlanBoundsIssue, PlanBoundsIssueCode, SurveyTemplateConfig, SurveyTemplateError,
+    SurveyTemplateErrorCode, SurveyTemplateResult,
+};
+pub use telemetry::{
+    FailsafeTransition, LinkHealthConfig, LinkHealthState, LinkHealthTransition, LinkHealthWarning,
+    MavlinkFailsafeFlag, MissionFailsafeSample, MissionFailsafeState, MissionLinkHealth,
+    MissionLinkHealthSample, MissionTelemetrySample, TelemetryFreshness, TelemetryFreshnessConfig,
+    TelemetryGapEvent, TelemetryHistory, TelemetryLinkState, TelemetryRecordError,
+    TelemetryRecordErrorCode,
+};
+pub use waypoint::{
+    validate_waypoint_sanity, Action, Waypoint, WaypointType, WaypointValidationCode,
+    WaypointValidationConfig, WaypointValidationError, WaypointValidationIssue,
+};
+pub use weather_integration::{AlertSeverity, FlightConditionResult, WeatherAlert, WeatherData};
 
 /// Core mission planning structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +92,18 @@ pub struct Mission {
     pub description: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default = "default_mission_version")]
+    pub version: u32,
+    #[serde(default = "default_unassigned_id")]
+    pub field_id: String,
+    #[serde(default = "default_unassigned_id")]
+    pub season_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default = "default_unassigned_id")]
+    pub owner_id: String,
+    #[serde(default)]
+    pub status: MissionStatus,
     pub area_of_interest: Polygon<f64>,
     pub waypoints: Vec<Waypoint>,
     pub flight_paths: Vec<FlightPath>,
@@ -38,6 +114,90 @@ pub struct Mission {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionListFilter {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub status: Option<MissionStatus>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
+}
+
+impl Default for MissionListFilter {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            offset: None,
+            field_id: None,
+            season_id: None,
+            status: None,
+            created_after: None,
+            created_before: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionListPage {
+    pub missions: Vec<Mission>,
+    pub total: usize,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionRevision {
+    pub mission_id: Uuid,
+    pub version: u32,
+    pub archived_at: DateTime<Utc>,
+    pub mission: Mission,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionLinkage {
+    pub field_id: String,
+    pub season_id: String,
+    pub session_id: Option<String>,
+    pub owner_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MissionStatus {
+    Draft,
+    Validated,
+    Armed,
+    InFlight,
+    Completed,
+    Aborted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MissionStateErrorCode {
+    OutOfOrderTransition,
+    TerminalState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionStateTransitionError {
+    pub code: MissionStateErrorCode,
+    pub from: MissionStatus,
+    pub to: MissionStatus,
+}
+
+#[derive(Debug)]
+pub enum MissionValidationError {
+    State(MissionStateTransitionError),
+    Waypoint(WaypointValidationError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionStatusParseError {
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeatherConstraints {
     pub max_wind_speed_ms: f32,
     pub max_precipitation_mm: f32,
@@ -45,8 +205,152 @@ pub struct WeatherConstraints {
     pub temperature_range_celsius: (f32, f32),
 }
 
+fn default_unassigned_id() -> String {
+    "unassigned".to_string()
+}
+
+fn default_mission_version() -> u32 {
+    1
+}
+
+impl MissionLinkage {
+    pub fn new(
+        field_id: String,
+        season_id: String,
+        session_id: Option<String>,
+        owner_id: String,
+    ) -> Self {
+        Self {
+            field_id,
+            season_id,
+            session_id,
+            owner_id,
+        }
+    }
+
+    pub fn unassigned() -> Self {
+        Self {
+            field_id: default_unassigned_id(),
+            season_id: default_unassigned_id(),
+            session_id: None,
+            owner_id: default_unassigned_id(),
+        }
+    }
+}
+
+impl Default for MissionStatus {
+    fn default() -> Self {
+        Self::Draft
+    }
+}
+
+impl MissionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "Draft",
+            Self::Validated => "Validated",
+            Self::Armed => "Armed",
+            Self::InFlight => "InFlight",
+            Self::Completed => "Completed",
+            Self::Aborted => "Aborted",
+            Self::Failed => "Failed",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Aborted | Self::Failed)
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        match (self, next) {
+            (Self::Draft, Self::Validated) => true,
+            (Self::Validated, Self::Armed) => true,
+            (Self::Armed, Self::InFlight | Self::Aborted | Self::Failed) => true,
+            (Self::InFlight, Self::Completed | Self::Aborted | Self::Failed) => true,
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for MissionStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MissionStatus {
+    type Err = MissionStatusParseError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "Draft" => Ok(Self::Draft),
+            "Validated" => Ok(Self::Validated),
+            "Armed" => Ok(Self::Armed),
+            "InFlight" => Ok(Self::InFlight),
+            "Completed" => Ok(Self::Completed),
+            "Aborted" => Ok(Self::Aborted),
+            "Failed" => Ok(Self::Failed),
+            _ => Err(MissionStatusParseError {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for MissionStatusParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unknown mission status: {}", self.value)
+    }
+}
+
+impl std::error::Error for MissionStatusParseError {}
+
+impl fmt::Display for MissionStateTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "mission state transition rejected: {} -> {} ({:?})",
+            self.from, self.to, self.code
+        )
+    }
+}
+
+impl std::error::Error for MissionStateTransitionError {}
+
+impl fmt::Display for MissionValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(error) => write!(formatter, "{error}"),
+            Self::Waypoint(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for MissionValidationError {}
+
+impl From<MissionStateTransitionError> for MissionValidationError {
+    fn from(error: MissionStateTransitionError) -> Self {
+        Self::State(error)
+    }
+}
+
+impl From<WaypointValidationError> for MissionValidationError {
+    fn from(error: WaypointValidationError) -> Self {
+        Self::Waypoint(error)
+    }
+}
+
 impl Mission {
     pub fn new(name: String, description: String, area: Polygon<f64>) -> Self {
+        Self::new_linked(name, description, area, MissionLinkage::unassigned())
+    }
+
+    pub fn new_linked(
+        name: String,
+        description: String,
+        area: Polygon<f64>,
+        linkage: MissionLinkage,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -54,6 +358,12 @@ impl Mission {
             description,
             created_at: now,
             updated_at: now,
+            version: default_mission_version(),
+            field_id: linkage.field_id,
+            season_id: linkage.season_id,
+            session_id: linkage.session_id,
+            owner_id: linkage.owner_id,
+            status: MissionStatus::Draft,
             area_of_interest: area,
             waypoints: Vec::new(),
             flight_paths: Vec::new(),
@@ -62,6 +372,90 @@ impl Mission {
             weather_constraints: WeatherConstraints::default(),
             metadata: HashMap::new(),
         }
+    }
+
+    pub fn bump_version(&mut self) -> u32 {
+        self.version = self.version.saturating_add(1);
+        self.updated_at = Utc::now();
+        self.version
+    }
+
+    pub fn transition_status(
+        &mut self,
+        next: MissionStatus,
+    ) -> std::result::Result<(), MissionStateTransitionError> {
+        if self.status.is_terminal() {
+            return Err(MissionStateTransitionError {
+                code: MissionStateErrorCode::TerminalState,
+                from: self.status,
+                to: next,
+            });
+        }
+        if !self.status.can_transition_to(next) {
+            return Err(MissionStateTransitionError {
+                code: MissionStateErrorCode::OutOfOrderTransition,
+                from: self.status,
+                to: next,
+            });
+        }
+
+        self.status = next;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn validate(&mut self) -> std::result::Result<(), MissionValidationError> {
+        validate_waypoint_sanity(&self.waypoints, WaypointValidationConfig::default())?;
+        self.transition_status(MissionStatus::Validated)?;
+        Ok(())
+    }
+
+    pub fn arm(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::Armed)
+    }
+
+    pub fn arm_with_dispatch_safety(
+        &mut self,
+        current_position: Option<Point<f64>>,
+        no_fly_zones: &[NoFlyZone],
+        config: DispatchSafetyConfig,
+    ) -> std::result::Result<DispatchSafetyReport, DispatchSafetyError> {
+        let report = evaluate_dispatch_safety(self, current_position, no_fly_zones, config);
+        if !report.is_clear() {
+            return Err(DispatchSafetyError::SafetyViolation(report));
+        }
+
+        self.arm()?;
+        Ok(report)
+    }
+
+    pub fn arm_with_preflight_checklist(
+        &mut self,
+        context: &PreflightChecklistContext,
+    ) -> std::result::Result<PreflightChecklistReport, PreflightArmError> {
+        let report = evaluate_preflight_checklist(self, context);
+        if !report.is_clear() {
+            return Err(PreflightArmError::Checklist(report));
+        }
+
+        self.arm()?;
+        Ok(report)
+    }
+
+    pub fn start(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::InFlight)
+    }
+
+    pub fn complete(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::Completed)
+    }
+
+    pub fn abort(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::Aborted)
+    }
+
+    pub fn fail(&mut self) -> std::result::Result<(), MissionStateTransitionError> {
+        self.transition_status(MissionStatus::Failed)
     }
 
     pub fn add_waypoint(&mut self, waypoint: Waypoint) {
@@ -128,7 +522,7 @@ impl MissionPlannerService {
     }
 
     /// Update an existing mission
-    pub async fn update_mission(&self, mission: Mission) -> Result<()> {
+    pub async fn update_mission(&self, mission: Mission) -> Result<Mission> {
         self.db.update_mission(&mission).await
     }
 
@@ -139,6 +533,16 @@ impl MissionPlannerService {
         offset: Option<i64>,
     ) -> Result<Vec<Mission>> {
         self.db.list_missions(limit, offset).await
+    }
+
+    /// List missions with pagination and field/season/status/date filters.
+    pub async fn list_missions_page(&self, filter: MissionListFilter) -> Result<MissionListPage> {
+        self.db.list_missions_page(filter).await
+    }
+
+    /// Read retained prior revisions for a mission.
+    pub async fn get_mission_history(&self, id: &Uuid) -> Result<Vec<MissionRevision>> {
+        self.db.get_mission_history(id).await
     }
 
     /// Delete a mission
@@ -202,8 +606,179 @@ mod tests {
 
         assert_eq!(mission.name, "Test Mission");
         assert_eq!(mission.description, "A test mission");
+        assert_eq!(mission.status, MissionStatus::Draft);
+        assert_eq!(mission.field_id, "unassigned");
+        assert_eq!(mission.season_id, "unassigned");
+        assert_eq!(mission.owner_id, "unassigned");
+        assert!(mission.session_id.is_none());
         assert!(mission.waypoints.is_empty());
         assert!(mission.flight_paths.is_empty());
+    }
+
+    #[test]
+    fn test_mission_version_starts_at_one_and_bumps_deterministically() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+
+        let mut mission = Mission::new(
+            "Versioned Mission".to_string(),
+            "A mission with retained revisions".to_string(),
+            area,
+        );
+
+        assert_eq!(mission.version, 1);
+        assert_eq!(mission.bump_version(), 2);
+        assert_eq!(mission.version, 2);
+    }
+
+    #[test]
+    fn test_mission_creation_with_linkage_records_identity() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+
+        let mission = Mission::new_linked(
+            "Linked Mission".to_string(),
+            "A linked mission".to_string(),
+            area,
+            MissionLinkage::new(
+                "field-1".to_string(),
+                "season-2026".to_string(),
+                Some("session-1".to_string()),
+                "owner-1".to_string(),
+            ),
+        );
+
+        assert_eq!(mission.field_id, "field-1");
+        assert_eq!(mission.season_id, "season-2026");
+        assert_eq!(mission.session_id.as_deref(), Some("session-1"));
+        assert_eq!(mission.owner_id, "owner-1");
+        assert_eq!(mission.status, MissionStatus::Draft);
+    }
+
+    #[test]
+    fn test_arm_before_validate_is_rejected_with_state_code() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+        let mut mission = Mission::new(
+            "State Mission".to_string(),
+            "A state mission".to_string(),
+            area,
+        );
+
+        let error = mission.arm().expect_err("draft mission cannot arm");
+        assert_eq!(error.code, MissionStateErrorCode::OutOfOrderTransition);
+        assert_eq!(error.from, MissionStatus::Draft);
+        assert_eq!(error.to, MissionStatus::Armed);
+        assert_eq!(mission.status, MissionStatus::Draft);
+
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.0, y: 0.0),
+            10.0,
+            WaypointType::Takeoff,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.5, y: 0.5),
+            20.0,
+            WaypointType::Navigation,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 1.0, y: 1.0),
+            0.0,
+            WaypointType::Landing,
+        ));
+        mission.validate().expect("draft can validate");
+        mission.arm().expect("validated can arm");
+        mission.start().expect("armed can start");
+        mission.complete().expect("in-flight can complete");
+        assert_eq!(mission.status, MissionStatus::Completed);
+    }
+
+    #[test]
+    fn test_valid_waypoints_mark_mission_validated() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+        let mut mission = Mission::new(
+            "Waypoint Mission".to_string(),
+            "A valid waypoint mission".to_string(),
+            area,
+        );
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.0, y: 0.0),
+            10.0,
+            WaypointType::Takeoff,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.5, y: 0.5),
+            20.0,
+            WaypointType::Survey,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 1.0, y: 1.0),
+            0.0,
+            WaypointType::Landing,
+        ));
+
+        mission.validate().expect("valid waypoint plan validates");
+        assert_eq!(mission.status, MissionStatus::Validated);
+    }
+
+    #[test]
+    fn test_missing_landing_waypoint_is_rejected_with_reason_code() {
+        let area = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+        let mut mission = Mission::new(
+            "Invalid Waypoint Mission".to_string(),
+            "Missing landing".to_string(),
+            area,
+        );
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.0, y: 0.0),
+            10.0,
+            WaypointType::Takeoff,
+        ));
+        mission.add_waypoint(Waypoint::new(
+            geo::point!(x: 0.5, y: 0.5),
+            20.0,
+            WaypointType::Navigation,
+        ));
+
+        let error = mission.validate().expect_err("missing landing must fail");
+        match error {
+            MissionValidationError::Waypoint(validation) => {
+                assert_eq!(
+                    validation.primary_code(),
+                    Some(WaypointValidationCode::MissingLanding)
+                );
+                assert_eq!(validation.issues[0].waypoint_index, None);
+            }
+            other => panic!("expected waypoint validation error, got {other:?}"),
+        }
+        assert_eq!(mission.status, MissionStatus::Draft);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use image::{ImageBuffer, Rgb, RgbImage};
+use image::{ImageBuffer, Rgb, RgbImage, Rgba, RgbaImage};
 use nalgebra::{Point3, Vector3};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,12 +12,14 @@ pub mod ndvi;
 pub mod thermal;
 
 pub use composite::CompositeOverlayEngine;
-pub use lidar_overlay::LidarOverlayProcessor;
+pub use lidar_overlay::{
+    LidarOverlayProcessor, LidarProductOverlay, LidarRasterOverlayKind, LidarRasterOverlayProduct,
+};
 pub use ndvi::NdviProcessor;
 pub use thermal::ThermalProcessor;
 
 /// Custom serializable RGB color type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RgbColor {
     pub r: u8,
     pub g: u8,
@@ -62,7 +64,7 @@ pub enum OverlayType {
     Custom(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpatialBounds {
     pub min_x: f64,
     pub min_y: f64,
@@ -367,6 +369,65 @@ impl Default for OverlayEngine {
 pub mod utils {
     use super::*;
 
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+    pub struct OverlayValueRange {
+        pub min: f32,
+        pub max: f32,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct LegendStop {
+        pub value: f32,
+        pub color: RgbColor,
+        pub alpha: u8,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct OverlayRenderMetadata {
+        pub colormap: String,
+        pub value_range: Option<OverlayValueRange>,
+        pub legend_stops: Vec<LegendStop>,
+        pub valid_pixel_count: usize,
+        pub nodata_pixel_count: usize,
+        pub spatial_bounds: SpatialBounds,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct RenderedValueOverlay {
+        pub image: RgbaImage,
+        pub metadata: OverlayRenderMetadata,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+    pub struct IdwInterpolationParams {
+        pub power: f32,
+        pub smoothing: f32,
+    }
+
+    impl Default for IdwInterpolationParams {
+        fn default() -> Self {
+            Self {
+                power: 2.0,
+                smoothing: 1e-6,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct IdwInterpolationMetadata {
+        pub method: String,
+        pub params: IdwInterpolationParams,
+        pub point_count: usize,
+        pub spatial_bounds: SpatialBounds,
+        pub resolution: (u32, u32),
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct InterpolatedGrid {
+        pub values: Vec<f32>,
+        pub metadata: IdwInterpolationMetadata,
+    }
+
     pub fn create_heatmap_image(
         values: &[f32],
         width: u32,
@@ -393,17 +454,129 @@ pub mod utils {
                 0.5
             };
 
-            let color = match color_map {
-                "viridis" => viridis_colormap(normalized),
-                "jet" => jet_colormap(normalized),
-                "hot" => hot_colormap(normalized),
-                _ => grayscale_colormap(normalized),
-            };
+            let color = colormap_color(color_map, normalized);
 
             img.put_pixel(x, y, color);
         }
 
         Ok(img)
+    }
+
+    pub fn render_value_overlay(
+        values: &[f32],
+        width: u32,
+        height: u32,
+        spatial_bounds: &SpatialBounds,
+        colormap: &str,
+        fixed_range: Option<(f32, f32)>,
+        legend_stop_count: usize,
+    ) -> Result<RenderedValueOverlay> {
+        if values.len() != (width * height) as usize {
+            return Err(anyhow::anyhow!("Values length doesn't match dimensions"));
+        }
+
+        let finite_values = values
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        let nodata_pixel_count = values.len() - finite_values.len();
+        if finite_values.is_empty() {
+            let image = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+            return Ok(RenderedValueOverlay {
+                image,
+                metadata: OverlayRenderMetadata {
+                    colormap: colormap.to_string(),
+                    value_range: None,
+                    legend_stops: Vec::new(),
+                    valid_pixel_count: 0,
+                    nodata_pixel_count,
+                    spatial_bounds: spatial_bounds.clone(),
+                },
+            });
+        }
+
+        let actual_min = finite_values.iter().copied().fold(f32::INFINITY, f32::min);
+        let actual_max = finite_values
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let (range_min, range_max) = fixed_range.unwrap_or((actual_min, actual_max));
+        let value_range = OverlayValueRange {
+            min: range_min,
+            max: range_max,
+        };
+
+        let mut image = ImageBuffer::new(width, height);
+        for (index, value) in values.iter().copied().enumerate() {
+            let x = (index as u32) % width;
+            let y = (index as u32) / width;
+            if !value.is_finite() {
+                image.put_pixel(x, y, Rgba([0, 0, 0, 0]));
+                continue;
+            }
+
+            let normalized = normalize_value(value, range_min, range_max);
+            let color = colormap_color(colormap, normalized);
+            image.put_pixel(x, y, Rgba([color.0[0], color.0[1], color.0[2], 255]));
+        }
+
+        Ok(RenderedValueOverlay {
+            image,
+            metadata: OverlayRenderMetadata {
+                colormap: colormap.to_string(),
+                value_range: Some(value_range),
+                legend_stops: legend_stops(colormap, value_range, legend_stop_count),
+                valid_pixel_count: finite_values.len(),
+                nodata_pixel_count,
+                spatial_bounds: spatial_bounds.clone(),
+            },
+        })
+    }
+
+    fn normalize_value(value: f32, min: f32, max: f32) -> f32 {
+        let range = max - min;
+        if range.abs() > f32::EPSILON {
+            ((value - min) / range).clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
+    }
+
+    fn legend_stops(
+        colormap: &str,
+        range: OverlayValueRange,
+        legend_stop_count: usize,
+    ) -> Vec<LegendStop> {
+        if legend_stop_count == 0 {
+            return Vec::new();
+        }
+
+        let last = legend_stop_count.saturating_sub(1);
+        (0..legend_stop_count)
+            .map(|index| {
+                let t = if last == 0 {
+                    0.0
+                } else {
+                    index as f32 / last as f32
+                };
+                let value = range.min + (range.max - range.min) * t;
+                LegendStop {
+                    value,
+                    color: RgbColor::from(colormap_color(colormap, t)),
+                    alpha: 255,
+                }
+            })
+            .collect()
+    }
+
+    fn colormap_color(color_map: &str, normalized: f32) -> Rgb<u8> {
+        match color_map {
+            "viridis" => viridis_colormap(normalized),
+            "jet" => jet_colormap(normalized),
+            "hot" => hot_colormap(normalized),
+            _ => grayscale_colormap(normalized),
+        }
     }
 
     fn viridis_colormap(t: f32) -> Rgb<u8> {
@@ -472,7 +645,42 @@ pub mod utils {
         bounds: &SpatialBounds,
         resolution: (u32, u32),
     ) -> Vec<f32> {
+        interpolate_grid_idw(
+            points,
+            bounds,
+            resolution,
+            IdwInterpolationParams::default(),
+        )
+        .map(|grid| grid.values)
+        .unwrap_or_else(|_| vec![0.0f32; (resolution.0 * resolution.1) as usize])
+    }
+
+    pub fn interpolate_grid_idw(
+        points: &[(f64, f64, f32)],
+        bounds: &SpatialBounds,
+        resolution: (u32, u32),
+        params: IdwInterpolationParams,
+    ) -> Result<InterpolatedGrid> {
         let (width, height) = resolution;
+        if width == 0 || height == 0 {
+            return Err(anyhow::anyhow!(
+                "IDW interpolation requires non-zero resolution"
+            ));
+        }
+        if points.is_empty() {
+            return Err(anyhow::anyhow!(
+                "IDW interpolation requires at least one point"
+            ));
+        }
+        if params.power <= 0.0 || !params.power.is_finite() {
+            return Err(anyhow::anyhow!("IDW interpolation power must be positive"));
+        }
+        if params.smoothing < 0.0 || !params.smoothing.is_finite() {
+            return Err(anyhow::anyhow!(
+                "IDW interpolation smoothing must be finite and non-negative"
+            ));
+        }
+
         let mut grid = vec![0.0f32; (width * height) as usize];
 
         let dx = (bounds.max_x - bounds.min_x) / width as f64;
@@ -494,7 +702,8 @@ pub mod utils {
                         weight_sum = 1.0;
                         break;
                     } else {
-                        let weight = 1.0 / (distance as f32 + 1e-6);
+                        let adjusted_distance = distance + params.smoothing as f64;
+                        let weight = (1.0 / adjusted_distance.powf(params.power as f64)) as f32;
                         weighted_sum += value * weight;
                         weight_sum += weight;
                     }
@@ -509,7 +718,16 @@ pub mod utils {
             }
         }
 
-        grid
+        Ok(InterpolatedGrid {
+            values: grid,
+            metadata: IdwInterpolationMetadata {
+                method: "idw".to_string(),
+                params,
+                point_count: points.len(),
+                spatial_bounds: bounds.clone(),
+                resolution,
+            },
+        })
     }
 }
 
@@ -540,5 +758,70 @@ mod tests {
         let values = vec![0.0, 0.5, 1.0, 0.25];
         let result = utils::create_heatmap_image(&values, 2, 2, "viridis");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn idw_interpolation_records_parameters_and_extent() {
+        let bounds = SpatialBounds::new(0.0, 0.0, 2.0, 1.0);
+        let params = utils::IdwInterpolationParams {
+            power: 2.0,
+            smoothing: 0.0,
+        };
+
+        let result = utils::interpolate_grid_idw(
+            &[(0.0, 0.0, 10.0), (1.0, 0.0, 20.0)],
+            &bounds,
+            (2, 1),
+            params,
+        )
+        .expect("IDW interpolation should succeed");
+
+        assert_eq!(result.values, vec![10.0, 20.0]);
+        assert_eq!(result.metadata.method, "idw");
+        assert_eq!(result.metadata.params.power, 2.0);
+        assert_eq!(result.metadata.params.smoothing, 0.0);
+        assert_eq!(result.metadata.point_count, 2);
+        assert_eq!(result.metadata.spatial_bounds, bounds);
+        assert_eq!(result.metadata.resolution, (2, 1));
+    }
+
+    #[test]
+    fn test_value_overlay_records_colormap_legend_and_extent() {
+        let bounds = SpatialBounds::new(-74.1, 40.6, -73.9, 40.8);
+        let values = vec![-1.0, 0.0, 1.0, f32::NAN];
+
+        let rendered =
+            utils::render_value_overlay(&values, 2, 2, &bounds, "viridis", Some((-1.0, 1.0)), 5)
+                .unwrap();
+
+        assert_eq!(rendered.image.width(), 2);
+        assert_eq!(rendered.image.height(), 2);
+        assert_eq!(rendered.image.get_pixel(1, 1).0[3], 0);
+        assert_eq!(rendered.image.get_pixel(0, 0).0[3], 255);
+        assert_eq!(rendered.metadata.colormap, "viridis");
+        assert_eq!(rendered.metadata.valid_pixel_count, 3);
+        assert_eq!(rendered.metadata.nodata_pixel_count, 1);
+        assert_eq!(rendered.metadata.value_range.as_ref().unwrap().min, -1.0);
+        assert_eq!(rendered.metadata.value_range.as_ref().unwrap().max, 1.0);
+        assert_eq!(rendered.metadata.legend_stops.len(), 5);
+        assert_eq!(rendered.metadata.legend_stops.first().unwrap().value, -1.0);
+        assert_eq!(rendered.metadata.legend_stops.last().unwrap().value, 1.0);
+        assert_eq!(rendered.metadata.spatial_bounds.min_x, bounds.min_x);
+        assert_eq!(rendered.metadata.spatial_bounds.max_y, bounds.max_y);
+    }
+
+    #[test]
+    fn test_all_nodata_overlay_is_transparent_without_default_legend() {
+        let bounds = SpatialBounds::new(0.0, 0.0, 1.0, 1.0);
+        let values = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+
+        let rendered = utils::render_value_overlay(&values, 2, 2, &bounds, "hot", None, 5).unwrap();
+
+        assert!(rendered.image.pixels().all(|pixel| pixel.0[3] == 0));
+        assert_eq!(rendered.metadata.valid_pixel_count, 0);
+        assert_eq!(rendered.metadata.nodata_pixel_count, 4);
+        assert!(rendered.metadata.value_range.is_none());
+        assert!(rendered.metadata.legend_stops.is_empty());
+        assert_eq!(rendered.metadata.colormap, "hot");
     }
 }

@@ -38,10 +38,12 @@ pub enum PathType {
     Custom(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SurveyPattern {
     Grid,
+    Lawnmower,
     Zigzag,
+    Perimeter,
     Spiral,
     RandomWalk,
     AdaptiveSampling,

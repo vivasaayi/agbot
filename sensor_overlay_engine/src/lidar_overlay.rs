@@ -1,11 +1,13 @@
 use crate::{
-    OverlayData, OverlayProcessor, OverlayType, RgbColor, SensorInput, SensorOverlay, SpatialBounds,
+    utils::RenderedValueOverlay, OverlayData, OverlayProcessor, OverlayType, RgbColor, SensorInput,
+    SensorOverlay, SpatialBounds,
 };
 use anyhow::Result;
 use chrono::Utc;
 use image::{ImageBuffer, Rgba, RgbaImage};
-use nalgebra::{Point3, Vector3};
+use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
+use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef};
 use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
@@ -33,9 +35,98 @@ pub struct HeightColorMapping {
     pub obstacles: [u8; 4],         // RGBA for obstacles
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LidarRasterOverlayKind {
+    Elevation,
+    OccupancyDensity,
+}
+
+impl LidarRasterOverlayKind {
+    fn overlay_type(self) -> OverlayType {
+        match self {
+            Self::Elevation => OverlayType::LidarElevation,
+            Self::OccupancyDensity => OverlayType::LidarIntensity,
+        }
+    }
+
+    fn colormap(self) -> &'static str {
+        match self {
+            Self::Elevation => "jet",
+            Self::OccupancyDensity => "hot",
+        }
+    }
+
+    fn fixed_range(self) -> Option<(f32, f32)> {
+        match self {
+            Self::Elevation => None,
+            Self::OccupancyDensity => Some((0.0, 1.0)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LidarRasterOverlayProduct {
+    pub kind: LidarRasterOverlayKind,
+    pub width: u32,
+    pub height: u32,
+    pub values: Vec<f32>,
+    pub spatial_ref: RasterSpatialRef,
+}
+
+#[derive(Debug, Clone)]
+pub struct LidarProductOverlay {
+    pub overlay_type: OverlayType,
+    pub spatial_ref: RasterSpatialRef,
+    pub render: RenderedValueOverlay,
+}
+
+impl Default for LidarConfig {
+    fn default() -> Self {
+        Self {
+            point_cloud_resolution: 0.1,
+            height_color_mapping: HeightColorMapping {
+                ground_level: [139, 69, 19, 255],
+                low_vegetation: [50, 205, 50, 255],
+                medium_vegetation: [34, 139, 34, 255],
+                high_vegetation: [0, 100, 0, 255],
+                obstacles: [255, 0, 0, 255],
+            },
+            occupancy_grid_resolution: 0.2,
+            max_range: 100.0,
+        }
+    }
+}
+
 impl LidarOverlayProcessor {
     pub fn new(config: LidarConfig) -> Self {
         Self { config }
+    }
+
+    pub fn render_raster_product(
+        &self,
+        product: &LidarRasterOverlayProduct,
+    ) -> Result<LidarProductOverlay> {
+        let spatial_ref =
+            assert_raster_spatial_ref(Some(&product.spatial_ref), product.width, product.height)
+                .map_err(|err| {
+                    anyhow::anyhow!("LiDAR product spatial reference assertion failed: {err}")
+                })?;
+        let spatial_bounds = spatial_bounds_from_ref(&spatial_ref)?;
+        let render = crate::utils::render_value_overlay(
+            &product.values,
+            product.width,
+            product.height,
+            &spatial_bounds,
+            product.kind.colormap(),
+            product.kind.fixed_range(),
+            5,
+        )?;
+
+        Ok(LidarProductOverlay {
+            overlay_type: product.kind.overlay_type(),
+            spatial_ref,
+            render,
+        })
     }
 
     /// Process LiDAR point cloud data into a 2D height map overlay
@@ -353,6 +444,21 @@ impl LidarOverlayProcessor {
     }
 }
 
+fn spatial_bounds_from_ref(spatial_ref: &RasterSpatialRef) -> Result<SpatialBounds> {
+    let bbox = spatial_ref
+        .bbox
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("LiDAR product spatial_ref missing bbox"))?;
+    Ok(SpatialBounds {
+        min_x: bbox.min_lon,
+        min_y: bbox.min_lat,
+        max_x: bbox.max_lon,
+        max_y: bbox.max_lat,
+        min_z: None,
+        max_z: None,
+    })
+}
+
 impl OverlayProcessor for LidarOverlayProcessor {
     fn process(&self, _inputs: &[SensorInput]) -> Result<SensorOverlay> {
         // Create a basic LiDAR elevation overlay
@@ -461,6 +567,7 @@ pub struct TerrainStatistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
     #[test]
     fn test_height_map_creation() {
@@ -495,5 +602,96 @@ mod tests {
         // Test high vegetation
         let tree_color = processor.height_to_color(9.5, 0.0, 10.0);
         assert_eq!(tree_color, [255, 0, 0, 255]); // Should be obstacles color
+    }
+
+    #[test]
+    fn renders_elevation_product_with_spatial_ref_and_legend() {
+        let processor = LidarOverlayProcessor::new(LidarConfig::default());
+        let product = LidarRasterOverlayProduct {
+            kind: LidarRasterOverlayKind::Elevation,
+            width: 2,
+            height: 2,
+            values: vec![0.0, 1.0, 2.0, f32::NAN],
+            spatial_ref: valid_spatial_ref(true),
+        };
+
+        let overlay = processor
+            .render_raster_product(&product)
+            .expect("georeferenced elevation product should render");
+
+        assert_eq!(overlay.overlay_type, OverlayType::LidarElevation);
+        assert_eq!(overlay.spatial_ref, product.spatial_ref);
+        assert_eq!(overlay.render.metadata.legend_stops.len(), 5);
+        assert_eq!(overlay.render.metadata.valid_pixel_count, 3);
+        assert_eq!(overlay.render.metadata.nodata_pixel_count, 1);
+        assert_eq!(
+            overlay.render.metadata.spatial_bounds,
+            SpatialBounds {
+                min_x: -96.7,
+                min_y: 41.1,
+                max_x: -96.5,
+                max_y: 41.3,
+                min_z: None,
+                max_z: None,
+            }
+        );
+    }
+
+    #[test]
+    fn renders_occupancy_product_with_density_legend() {
+        let processor = LidarOverlayProcessor::new(LidarConfig::default());
+        let product = LidarRasterOverlayProduct {
+            kind: LidarRasterOverlayKind::OccupancyDensity,
+            width: 2,
+            height: 2,
+            values: vec![0.0, 0.25, 0.75, 1.0],
+            spatial_ref: valid_spatial_ref(true),
+        };
+
+        let overlay = processor
+            .render_raster_product(&product)
+            .expect("georeferenced occupancy product should render");
+
+        assert_eq!(overlay.overlay_type, OverlayType::LidarIntensity);
+        assert_eq!(
+            overlay.render.metadata.value_range,
+            Some(crate::utils::OverlayValueRange { min: 0.0, max: 1.0 })
+        );
+        assert_eq!(overlay.render.metadata.legend_stops.len(), 5);
+    }
+
+    #[test]
+    fn refuses_ungeoreferenced_lidar_product_overlay() {
+        let processor = LidarOverlayProcessor::new(LidarConfig::default());
+        let product = LidarRasterOverlayProduct {
+            kind: LidarRasterOverlayKind::Elevation,
+            width: 2,
+            height: 2,
+            values: vec![0.0, 1.0, 2.0, 3.0],
+            spatial_ref: valid_spatial_ref(false),
+        };
+
+        let err = processor
+            .render_raster_product(&product)
+            .expect_err("ungeoreferenced product should be refused");
+
+        assert!(err
+            .to_string()
+            .contains("spatial reference assertion failed"));
+    }
+
+    fn valid_spatial_ref(georeferenced: bool) -> RasterSpatialRef {
+        RasterSpatialRef {
+            georeferenced,
+            crs: Some("EPSG:4326".to_string()),
+            bbox: Some(GeoBounds {
+                min_lon: -96.7,
+                min_lat: 41.1,
+                max_lon: -96.5,
+                max_lat: 41.3,
+            }),
+            geo_transform: Some([-96.7, 0.1, 0.0, 41.1, 0.0, 0.1]),
+            resolution: Some(RasterResolution { x: 0.1, y: 0.1 }),
+        }
     }
 }

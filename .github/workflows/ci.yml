@@ -17,6 +17,12 @@ jobs:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
+
+    - name: Scan plaintext secrets
+      run: bash scripts/verify-secrets.sh
+
+    - name: Validate ARM cross CI contract
+      run: bash scripts/verify-arm-ci.sh
     
     - name: Check formatting
       run: cargo fmt --all -- --check
@@ -45,19 +51,39 @@ jobs:
     needs: test
     strategy:
       matrix:
-        target:
-          - aarch64-unknown-linux-gnu  # ARM64 (Jetson)
-          - armv7-unknown-linux-gnueabihf  # ARM (Raspberry Pi)
+        include:
+          - target: aarch64-unknown-linux-gnu
+            just_recipe: arm64
+            artifact_name: agbot-aarch64-jetson
+          - target: armv7-unknown-linux-gnueabihf
+            just_recipe: arm
+            artifact_name: agbot-armv7-raspberry-pi
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
+    - uses: docker/setup-qemu-action@v3
     
-    - name: Install cross
-      run: cargo install cross
+    - name: Install cross and just
+      run: |
+        cargo install cross --locked
+        cargo install just --locked
       
     - name: Cross compile
-      run: cross build --target ${{ matrix.target }} --release
+      run: just ${{ matrix.just_recipe }}
+
+    - name: Smoke boot target artifacts
+      run: scripts/smoke-arm-artifacts.sh ${{ matrix.target }}
+
+    - name: Package target artifacts
+      run: scripts/package-arm-artifacts.sh ${{ matrix.target }}
+
+    - name: Upload target artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: dist/arm/${{ matrix.target }}/agbot-${{ matrix.target }}.tar.gz
+        if-no-files-found: error
 
   docker:
     name: Docker Build
@@ -68,12 +94,17 @@ jobs:
     
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
+
+    - name: Validate Dockerfile pins and manifest
+      run: bash scripts/verify-container-build.sh
       
     - name: Build Docker image
       uses: docker/build-push-action@v5
       with:
         context: .
         push: false
-        tags: agrodrone:latest
+        tags: agrodrone:${{ github.sha }}
+        build-args: |
+          AGRODRONE_COMMIT=${{ github.sha }}
         cache-from: type=gha
         cache-to: type=gha,mode=max

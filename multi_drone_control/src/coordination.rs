@@ -1,16 +1,23 @@
-use anyhow::Result;
-use chrono::{DateTime, Utc};
+use crate::{swarm::generate_formation_slots, Formation};
+use anyhow::{ensure, Result};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
-use shared::{GeoCoordinate, Mission};
-use std::collections::HashMap;
+use shared::GeoCoordinate;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
+
+const EARTH_RADIUS_M: f64 = 6_371_000.0;
+const GEOMETRY_EPSILON: f64 = 1e-9;
 
 /// Multi-drone coordination system
 pub struct CoordinationEngine {
     active_drones: HashMap<Uuid, DroneState>,
     coordination_rules: Vec<CoordinationRule>,
+    coordination_rule_audit_log: Vec<CoordinationRuleAuditEvent>,
     communication_range: f64, // meters
     update_interval: std::time::Duration,
+    telemetry_freshness_timeout: ChronoDuration,
+    heartbeat_timeout: ChronoDuration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +41,168 @@ pub enum DroneOperationStatus {
     Returning,
     Emergency,
     Maintenance,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DroneTelemetryFreshness {
+    Fresh,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SwarmTelemetryStatus {
+    NoDrones,
+    Fresh,
+    Degraded,
+    Stale,
+}
+
+impl Default for SwarmTelemetryStatus {
+    fn default() -> Self {
+        Self::NoDrones
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DroneTelemetrySnapshot {
+    pub drone_id: Uuid,
+    pub position: GeoCoordinate,
+    pub battery_level: f32,
+    pub operation_status: DroneOperationStatus,
+    pub current_mission: Option<Uuid>,
+    pub last_update: DateTime<Utc>,
+    pub age_seconds: i64,
+    pub communication_quality: f32,
+    pub freshness: DroneTelemetryFreshness,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmTelemetryReport {
+    pub generated_at: DateTime<Utc>,
+    pub total_drones: usize,
+    pub fresh_drones: usize,
+    pub stale_drones: usize,
+    pub status: SwarmTelemetryStatus,
+    pub drones: Vec<DroneTelemetrySnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DroneLinkHealth {
+    Healthy,
+    Degraded,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DroneLinkStatus {
+    pub drone_id: Uuid,
+    pub last_heartbeat: DateTime<Utc>,
+    pub heartbeat_age_seconds: i64,
+    pub link_quality: f32,
+    pub health: DroneLinkHealth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationRuleAuditEvent {
+    pub rule_id: Uuid,
+    pub rule_name: String,
+    pub drone_id: Option<Uuid>,
+    pub triggered_at: DateTime<Utc>,
+    pub condition: String,
+    pub action: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkQualityReport {
+    pub generated_at: DateTime<Utc>,
+    pub total_links: usize,
+    pub healthy_links: usize,
+    pub degraded_links: usize,
+    pub timed_out_links: usize,
+    pub links: Vec<DroneLinkStatus>,
+    pub audit_events: Vec<CoordinationRuleAuditEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CoordinationRuleExecutionKind {
+    ReturnToBase,
+    LandImmediate,
+    AvoidanceAltitude { delta: f32 },
+    LandAtNearestEmergencySite,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinationRuleExecution {
+    pub rule_id: Uuid,
+    pub rule_name: String,
+    pub drone_id: Uuid,
+    pub priority: u8,
+    pub action: CoordinationRuleExecutionKind,
+    pub condition: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct FormationOptimizationConfig {
+    pub minimum_separation_m: f64,
+}
+
+impl Default for FormationOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            minimum_separation_m: 25.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormationAssignment {
+    pub drone_id: Uuid,
+    pub slot_index: usize,
+    pub start_position: GeoCoordinate,
+    pub target_position: GeoCoordinate,
+    pub travel_distance_m: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormationOptimizationReport {
+    pub assignments: Vec<FormationAssignment>,
+    pub total_travel_m: f64,
+    pub minimum_path_separation_m: f64,
+    pub rejected_assignment_count: usize,
+    pub validated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalPoint {
+    east_m: f64,
+    north_m: f64,
+    altitude_m: f64,
+}
+
+#[derive(Debug, Clone)]
+struct FormationSlotTarget {
+    slot_index: usize,
+    local: LocalPoint,
+    geo: GeoCoordinate,
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentCandidate {
+    drone_id: Uuid,
+    slot_index: usize,
+    start_local: LocalPoint,
+    target_local: LocalPoint,
+    start_position: GeoCoordinate,
+    target_position: GeoCoordinate,
+    travel_distance_m: f64,
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentSearchResult {
+    assignments: Vec<AssignmentCandidate>,
+    total_travel_m: f64,
 }
 
 pub struct CoordinationRule {
@@ -136,6 +305,7 @@ pub enum RuleAction {
     ChangeAltitude { delta: f32 },
     ReturnToBase,
     LandImmediate,
+    LandAtNearestEmergencySite,
     FormFormation { formation_type: String },
     SendAlert { message: String },
     Custom(Box<dyn Fn(&mut DroneState) + Send + Sync>),
@@ -148,6 +318,7 @@ impl Clone for RuleAction {
             RuleAction::ChangeAltitude { delta } => RuleAction::ChangeAltitude { delta: *delta },
             RuleAction::ReturnToBase => RuleAction::ReturnToBase,
             RuleAction::LandImmediate => RuleAction::LandImmediate,
+            RuleAction::LandAtNearestEmergencySite => RuleAction::LandAtNearestEmergencySite,
             RuleAction::FormFormation { formation_type } => RuleAction::FormFormation {
                 formation_type: formation_type.clone(),
             },
@@ -175,6 +346,9 @@ impl std::fmt::Debug for RuleAction {
                 .finish(),
             RuleAction::ReturnToBase => f.debug_struct("ReturnToBase").finish(),
             RuleAction::LandImmediate => f.debug_struct("LandImmediate").finish(),
+            RuleAction::LandAtNearestEmergencySite => {
+                f.debug_struct("LandAtNearestEmergencySite").finish()
+            }
             RuleAction::FormFormation { formation_type } => f
                 .debug_struct("FormFormation")
                 .field("formation_type", formation_type)
@@ -196,8 +370,11 @@ impl CoordinationEngine {
         Self {
             active_drones: HashMap::new(),
             coordination_rules: Self::default_rules(),
+            coordination_rule_audit_log: Vec::new(),
             communication_range: 1000.0, // 1km
             update_interval: std::time::Duration::from_millis(500),
+            telemetry_freshness_timeout: ChronoDuration::seconds(5),
+            heartbeat_timeout: ChronoDuration::seconds(30),
         }
     }
 
@@ -215,10 +392,10 @@ impl CoordinationEngine {
             },
             CoordinationRule {
                 id: Uuid::new_v4(),
-                name: "Low Battery Return".to_string(),
+                name: "Low Battery Land".to_string(),
                 priority: 2,
                 condition: RuleCondition::BatteryLow { threshold: 0.2 },
-                action: RuleAction::ReturnToBase,
+                action: RuleAction::LandAtNearestEmergencySite,
                 enabled: true,
             },
             CoordinationRule {
@@ -228,7 +405,7 @@ impl CoordinationEngine {
                 condition: RuleCondition::CommunicationLoss {
                     timeout_seconds: 30,
                 },
-                action: RuleAction::LandImmediate,
+                action: RuleAction::ReturnToBase,
                 enabled: true,
             },
         ]
@@ -262,43 +439,424 @@ impl CoordinationEngine {
         Ok(())
     }
 
-    pub async fn evaluate_rules(&self, _drone_id: Uuid) -> Result<()> {
+    pub async fn update_drone_state_with_rules(
+        &mut self,
+        drone_id: Uuid,
+        state: DroneState,
+    ) -> Result<Vec<CoordinationRuleExecution>> {
+        if let Some(existing_state) = self.active_drones.get_mut(&drone_id) {
+            *existing_state = state;
+
+            self.evaluate_rules(drone_id).await
+        } else {
+            Err(anyhow::anyhow!("Drone not registered: {}", drone_id))
+        }
+    }
+
+    pub fn set_telemetry_freshness_timeout(&mut self, timeout: ChronoDuration) -> Result<()> {
+        ensure!(
+            timeout > ChronoDuration::zero(),
+            "telemetry freshness timeout must be positive"
+        );
+        self.telemetry_freshness_timeout = timeout;
+        Ok(())
+    }
+
+    pub fn set_heartbeat_timeout(&mut self, timeout: ChronoDuration) -> Result<()> {
+        ensure!(
+            timeout > ChronoDuration::zero(),
+            "heartbeat timeout must be positive"
+        );
+        self.heartbeat_timeout = timeout;
+        for rule in &mut self.coordination_rules {
+            if let RuleCondition::CommunicationLoss { timeout_seconds } = &mut rule.condition {
+                *timeout_seconds = timeout.num_seconds().max(1) as u32;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn record_heartbeat(
+        &mut self,
+        drone_id: Uuid,
+        received_at: DateTime<Utc>,
+        link_quality: f32,
+    ) -> Result<DroneLinkStatus> {
+        ensure!(
+            link_quality.is_finite() && (0.0..=1.0).contains(&link_quality),
+            "link quality must be finite and between 0.0 and 1.0"
+        );
+        let snapshot = {
+            let state = self
+                .active_drones
+                .get_mut(&drone_id)
+                .ok_or_else(|| anyhow::anyhow!("Drone not registered: {}", drone_id))?;
+            state.last_update = received_at;
+            state.communication_quality = link_quality;
+            state.clone()
+        };
+        Ok(self.link_status_for(&snapshot, received_at))
+    }
+
+    pub fn coordination_rule_audit_log(&self) -> &[CoordinationRuleAuditEvent] {
+        &self.coordination_rule_audit_log
+    }
+
+    pub async fn swarm_telemetry_report_at(
+        &self,
+        checked_at: DateTime<Utc>,
+    ) -> SwarmTelemetryReport {
+        self.build_swarm_telemetry_report(checked_at)
+    }
+
+    fn build_swarm_telemetry_report(&self, checked_at: DateTime<Utc>) -> SwarmTelemetryReport {
+        let mut drones = self
+            .active_drones
+            .values()
+            .map(|state| {
+                let age_seconds = Self::telemetry_age_seconds(state.last_update, checked_at);
+                let freshness = self.telemetry_freshness_for(state, checked_at);
+                DroneTelemetrySnapshot {
+                    drone_id: state.id,
+                    position: state.position.clone(),
+                    battery_level: state.battery_level,
+                    operation_status: state.status.clone(),
+                    current_mission: state.current_mission,
+                    last_update: state.last_update,
+                    age_seconds,
+                    communication_quality: state.communication_quality,
+                    freshness,
+                }
+            })
+            .collect::<Vec<_>>();
+        drones.sort_by_key(|drone| drone.drone_id);
+
+        let total_drones = drones.len();
+        let fresh_drones = drones
+            .iter()
+            .filter(|drone| drone.freshness == DroneTelemetryFreshness::Fresh)
+            .count();
+        let stale_drones = total_drones - fresh_drones;
+
+        SwarmTelemetryReport {
+            generated_at: checked_at,
+            total_drones,
+            fresh_drones,
+            stale_drones,
+            status: Self::aggregate_telemetry_status(total_drones, fresh_drones, stale_drones),
+            drones,
+        }
+    }
+
+    fn telemetry_freshness_for(
+        &self,
+        state: &DroneState,
+        checked_at: DateTime<Utc>,
+    ) -> DroneTelemetryFreshness {
+        let age = checked_at.signed_duration_since(state.last_update);
+        if age <= self.telemetry_freshness_timeout {
+            DroneTelemetryFreshness::Fresh
+        } else {
+            DroneTelemetryFreshness::Stale
+        }
+    }
+
+    fn telemetry_age_seconds(last_update: DateTime<Utc>, checked_at: DateTime<Utc>) -> i64 {
+        checked_at
+            .signed_duration_since(last_update)
+            .num_seconds()
+            .max(0)
+    }
+
+    fn aggregate_telemetry_status(
+        total_drones: usize,
+        fresh_drones: usize,
+        stale_drones: usize,
+    ) -> SwarmTelemetryStatus {
+        match (total_drones, fresh_drones, stale_drones) {
+            (0, _, _) => SwarmTelemetryStatus::NoDrones,
+            (_, _, 0) => SwarmTelemetryStatus::Fresh,
+            (_, 0, _) => SwarmTelemetryStatus::Stale,
+            _ => SwarmTelemetryStatus::Degraded,
+        }
+    }
+
+    pub async fn evaluate_link_rules_at(
+        &mut self,
+        checked_at: DateTime<Utc>,
+    ) -> Result<LinkQualityReport> {
+        let mut report = self.build_link_quality_report(checked_at);
+        let mut audit_events = Vec::new();
+
+        for rule in self.coordination_rules.iter().filter(|rule| {
+            rule.enabled && matches!(rule.condition, RuleCondition::CommunicationLoss { .. })
+        }) {
+            for link in report
+                .links
+                .iter()
+                .filter(|link| link.health == DroneLinkHealth::TimedOut)
+            {
+                audit_events.push(CoordinationRuleAuditEvent {
+                    rule_id: rule.id,
+                    rule_name: rule.name.clone(),
+                    drone_id: Some(link.drone_id),
+                    triggered_at: checked_at,
+                    condition: "communication_loss".to_string(),
+                    action: Self::rule_action_label(&rule.action).to_string(),
+                    message: format!(
+                        "Drone {} heartbeat timed out after {}s",
+                        link.drone_id, link.heartbeat_age_seconds
+                    ),
+                });
+            }
+        }
+
+        self.coordination_rule_audit_log
+            .extend(audit_events.iter().cloned());
+        report.audit_events = audit_events;
+        Ok(report)
+    }
+
+    fn build_link_quality_report(&self, checked_at: DateTime<Utc>) -> LinkQualityReport {
+        let mut links = self
+            .active_drones
+            .values()
+            .map(|state| self.link_status_for(state, checked_at))
+            .collect::<Vec<_>>();
+        links.sort_by_key(|link| link.drone_id);
+
+        let healthy_links = links
+            .iter()
+            .filter(|link| link.health == DroneLinkHealth::Healthy)
+            .count();
+        let degraded_links = links
+            .iter()
+            .filter(|link| link.health == DroneLinkHealth::Degraded)
+            .count();
+        let timed_out_links = links
+            .iter()
+            .filter(|link| link.health == DroneLinkHealth::TimedOut)
+            .count();
+
+        LinkQualityReport {
+            generated_at: checked_at,
+            total_links: links.len(),
+            healthy_links,
+            degraded_links,
+            timed_out_links,
+            links,
+            audit_events: Vec::new(),
+        }
+    }
+
+    fn link_status_for(&self, state: &DroneState, checked_at: DateTime<Utc>) -> DroneLinkStatus {
+        let heartbeat_age_seconds = Self::telemetry_age_seconds(state.last_update, checked_at);
+        let health = if checked_at.signed_duration_since(state.last_update) > self.heartbeat_timeout
+        {
+            DroneLinkHealth::TimedOut
+        } else if state.communication_quality >= 0.7 {
+            DroneLinkHealth::Healthy
+        } else {
+            DroneLinkHealth::Degraded
+        };
+
+        DroneLinkStatus {
+            drone_id: state.id,
+            last_heartbeat: state.last_update,
+            heartbeat_age_seconds,
+            link_quality: state.communication_quality,
+            health,
+        }
+    }
+
+    fn rule_action_label(action: &RuleAction) -> &'static str {
+        match action {
+            RuleAction::ChangeSpeed { .. } => "ChangeSpeed",
+            RuleAction::ChangeAltitude { .. } => "ChangeAltitude",
+            RuleAction::ReturnToBase => "ReturnToBase",
+            RuleAction::LandImmediate => "LandImmediate",
+            RuleAction::LandAtNearestEmergencySite => "LandAtNearestEmergencySite",
+            RuleAction::FormFormation { .. } => "FormFormation",
+            RuleAction::SendAlert { .. } => "SendAlert",
+            RuleAction::Custom(_) => "Custom",
+        }
+    }
+
+    pub async fn evaluate_rules(
+        &mut self,
+        _drone_id: Uuid,
+    ) -> Result<Vec<CoordinationRuleExecution>> {
+        let checked_at = Utc::now();
         let states: Vec<&DroneState> = self.active_drones.values().collect();
+        let mut candidates = Vec::new();
 
         for rule in &self.coordination_rules {
             if !rule.enabled {
                 continue;
             }
 
-            let should_trigger = match &rule.condition {
-                RuleCondition::ProximityAlert { distance_threshold } => {
-                    self.check_proximity_violations(*distance_threshold, &states)
-                }
+            let (condition, affected_drone_ids) = match &rule.condition {
+                RuleCondition::ProximityAlert { distance_threshold } => (
+                    "proximity".to_string(),
+                    self.proximity_violations(*distance_threshold, &states),
+                ),
                 RuleCondition::BatteryLow { threshold } => {
-                    states.iter().any(|s| s.battery_level < *threshold)
+                    let affected = states
+                        .iter()
+                        .filter(|state| state.battery_level < *threshold)
+                        .map(|state| state.id)
+                        .collect::<Vec<_>>();
+                    ("battery_low".to_string(), affected)
                 }
                 RuleCondition::CommunicationLoss { timeout_seconds } => {
                     let timeout = chrono::Duration::seconds(*timeout_seconds as i64);
-                    let cutoff = Utc::now() - timeout;
-                    states.iter().any(|s| s.last_update < cutoff)
+                    let cutoff = checked_at - timeout;
+                    let affected = states
+                        .iter()
+                        .filter(|state| state.last_update < cutoff)
+                        .map(|state| state.id)
+                        .collect::<Vec<_>>();
+                    ("communication_loss".to_string(), affected)
                 }
-                RuleCondition::WeatherCondition { condition: _ } => {
-                    // TODO: Integrate with weather data
-                    false
+                RuleCondition::WeatherCondition { condition } => {
+                    (format!("weather:{condition}"), Vec::new())
                 }
-                RuleCondition::Custom(_) => {
-                    // TODO: Implement custom rule evaluation
-                    false
-                }
+                RuleCondition::Custom(_) => ("custom".to_string(), Vec::new()),
             };
 
-            if should_trigger {
-                tracing::warn!("Coordination rule triggered: {}", rule.name);
-                // TODO: Execute rule action
+            if let Some(action) = self.action_to_execution(&rule.action) {
+                for drone_id in affected_drone_ids {
+                    candidates.push(CoordinationRuleExecution {
+                        rule_id: rule.id,
+                        rule_name: rule.name.clone(),
+                        drone_id,
+                        priority: rule.priority,
+                        action,
+                        condition: condition.clone(),
+                        message: format!(
+                            "Rule {} (priority {}) triggered for drone {}",
+                            rule.name, rule.priority, drone_id
+                        ),
+                    });
+                }
+            }
+        }
+
+        candidates.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.rule_name.cmp(&right.rule_name))
+                .then_with(|| left.rule_id.cmp(&right.rule_id))
+                .then_with(|| left.drone_id.cmp(&right.drone_id))
+        });
+
+        let mut selected = HashMap::new();
+        for candidate in candidates {
+            selected
+                .entry(candidate.drone_id)
+                .or_insert_with(|| candidate);
+        }
+        let mut actions = selected.values().cloned().collect::<Vec<_>>();
+        actions.sort_by_key(|execution| execution.drone_id);
+
+        for action in &actions {
+            self.apply_rule_action(action)?;
+            self.coordination_rule_audit_log
+                .push(self.execution_as_audit_event(action, checked_at));
+            tracing::warn!(
+                "Coordination rule executed: {} on {}",
+                action.rule_name,
+                action.drone_id
+            );
+        }
+
+        Ok(actions)
+    }
+
+    fn action_to_execution(&self, action: &RuleAction) -> Option<CoordinationRuleExecutionKind> {
+        match action {
+            RuleAction::ChangeAltitude { delta } => {
+                Some(CoordinationRuleExecutionKind::AvoidanceAltitude { delta: *delta })
+            }
+            RuleAction::ReturnToBase => Some(CoordinationRuleExecutionKind::ReturnToBase),
+            RuleAction::LandImmediate => Some(CoordinationRuleExecutionKind::LandImmediate),
+            RuleAction::LandAtNearestEmergencySite => {
+                Some(CoordinationRuleExecutionKind::LandAtNearestEmergencySite)
+            }
+            RuleAction::ChangeSpeed { .. }
+            | RuleAction::FormFormation { .. }
+            | RuleAction::SendAlert { .. }
+            | RuleAction::Custom(_) => None,
+        }
+    }
+
+    fn execution_as_audit_event(
+        &self,
+        action: &CoordinationRuleExecution,
+        checked_at: DateTime<Utc>,
+    ) -> CoordinationRuleAuditEvent {
+        CoordinationRuleAuditEvent {
+            rule_id: action.rule_id,
+            rule_name: action.rule_name.clone(),
+            drone_id: Some(action.drone_id),
+            triggered_at: checked_at,
+            condition: action.condition.clone(),
+            action: match action.action {
+                CoordinationRuleExecutionKind::ReturnToBase => "ReturnToBase".to_string(),
+                CoordinationRuleExecutionKind::LandImmediate => "LandImmediate".to_string(),
+                CoordinationRuleExecutionKind::LandAtNearestEmergencySite => {
+                    "LandAtNearestEmergencySite".to_string()
+                }
+                CoordinationRuleExecutionKind::AvoidanceAltitude { .. } => {
+                    "AvoidanceAltitude".to_string()
+                }
+            },
+            message: action.message.clone(),
+        }
+    }
+
+    fn apply_rule_action(&mut self, action: &CoordinationRuleExecution) -> Result<()> {
+        let state = self
+            .active_drones
+            .get_mut(&action.drone_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Drone not registered for rule action: {}", action.drone_id)
+            })?;
+
+        match action.action {
+            CoordinationRuleExecutionKind::ReturnToBase => {
+                state.status = DroneOperationStatus::Returning;
+            }
+            CoordinationRuleExecutionKind::LandImmediate => {
+                state.status = DroneOperationStatus::Emergency;
+                state.position.altitude_m = 0.0;
+            }
+            CoordinationRuleExecutionKind::LandAtNearestEmergencySite => {
+                state.status = DroneOperationStatus::Emergency;
+                state.position.altitude_m = 0.0;
+            }
+            CoordinationRuleExecutionKind::AvoidanceAltitude { delta } => {
+                state.position.altitude_m = (state.position.altitude_m + delta).max(0.0);
             }
         }
 
         Ok(())
+    }
+
+    fn proximity_violations(&self, threshold: f64, states: &[&DroneState]) -> Vec<Uuid> {
+        let mut drone_ids = HashSet::new();
+        for (left_index, left_state) in states.iter().enumerate() {
+            for right_state in states.iter().skip(left_index + 1) {
+                if self.calculate_distance(&left_state.position, &right_state.position) < threshold
+                {
+                    drone_ids.insert(left_state.id);
+                    drone_ids.insert(right_state.id);
+                }
+            }
+        }
+        let mut sorted_ids = drone_ids.into_iter().collect::<Vec<_>>();
+        sorted_ids.sort();
+        sorted_ids
     }
 
     fn check_proximity_violations(&self, threshold: f64, states: &[&DroneState]) -> bool {
@@ -327,6 +885,13 @@ impl CoordinationEngine {
     }
 
     pub async fn get_coordination_status(&self) -> CoordinationStatus {
+        self.get_coordination_status_at(Utc::now()).await
+    }
+
+    pub async fn get_coordination_status_at(
+        &self,
+        checked_at: DateTime<Utc>,
+    ) -> CoordinationStatus {
         let total_drones = self.active_drones.len();
         let active_drones = self
             .active_drones
@@ -343,20 +908,241 @@ impl CoordinationEngine {
         } else {
             1.0
         };
+        let telemetry_report = self.build_swarm_telemetry_report(checked_at);
 
         CoordinationStatus {
             total_drones,
             active_drones,
+            fresh_drones: telemetry_report.fresh_drones,
+            stale_drones: telemetry_report.stale_drones,
+            telemetry_status: telemetry_report.status,
             coordination_quality,
             active_rules: self.coordination_rules.iter().filter(|r| r.enabled).count(),
-            last_update: Utc::now(),
+            last_update: checked_at,
         }
     }
 
-    pub async fn optimize_formations(&mut self) -> Result<()> {
-        // TODO: Implement formation optimization algorithms
-        tracing::info!("Formation optimization not yet implemented");
-        Ok(())
+    pub async fn optimize_formations(&mut self) -> Result<FormationOptimizationReport> {
+        if self.active_drones.is_empty() {
+            tracing::info!("Formation optimization skipped because no drones are active");
+            return Ok(FormationOptimizationReport {
+                assignments: Vec::new(),
+                total_travel_m: 0.0,
+                minimum_path_separation_m: 0.0,
+                rejected_assignment_count: 0,
+                validated: true,
+            });
+        }
+
+        let mut drones = self.active_drones.values().collect::<Vec<_>>();
+        drones.sort_by_key(|state| state.id);
+        let leader_position = drones[0].position.clone();
+        let drone_count = drones.len();
+        let cols = (drone_count as f64).sqrt().ceil() as u32;
+        let rows = ((drone_count as f64) / f64::from(cols)).ceil() as u32;
+        let formation = Formation::Grid {
+            rows,
+            cols,
+            spacing_m: FormationOptimizationConfig::default().minimum_separation_m as f32,
+        };
+
+        let report = self
+            .optimize_formation_slots(
+                &formation,
+                leader_position,
+                FormationOptimizationConfig::default(),
+            )
+            .await?;
+        tracing::info!(
+            assignments = report.assignments.len(),
+            total_travel_m = report.total_travel_m,
+            minimum_path_separation_m = report.minimum_path_separation_m,
+            "Optimized active formation slot assignment"
+        );
+        Ok(report)
+    }
+
+    pub async fn optimize_formation_slots(
+        &self,
+        formation: &Formation,
+        leader_position: GeoCoordinate,
+        config: FormationOptimizationConfig,
+    ) -> Result<FormationOptimizationReport> {
+        ensure!(
+            config.minimum_separation_m.is_finite() && config.minimum_separation_m > 0.0,
+            "minimum formation separation must be finite and positive"
+        );
+        ensure!(
+            leader_position.latitude.is_finite()
+                && leader_position.longitude.is_finite()
+                && leader_position.altitude_m.is_finite(),
+            "leader position must be finite"
+        );
+        ensure!(
+            !self.active_drones.is_empty(),
+            "formation optimization requires at least one active drone"
+        );
+
+        let mut drones = self.active_drones.values().collect::<Vec<_>>();
+        drones.sort_by_key(|state| state.id);
+        let slots = generate_formation_slots(formation, drones.len(), config.minimum_separation_m)?;
+        let mut slot_targets = slots
+            .into_iter()
+            .map(|slot| {
+                let local = LocalPoint {
+                    east_m: slot.offset_m.0,
+                    north_m: slot.offset_m.1,
+                    altitude_m: f64::from(slot.offset_m.2),
+                };
+                FormationSlotTarget {
+                    slot_index: slot.slot_index,
+                    local,
+                    geo: local_to_geo(&leader_position, local),
+                }
+            })
+            .collect::<Vec<_>>();
+        slot_targets.sort_by_key(|slot| slot.slot_index);
+
+        let mut used_slots = vec![false; slot_targets.len()];
+        let mut current = Vec::with_capacity(drones.len());
+        let mut rejected_assignment_count = 0;
+        let mut best = None;
+        Self::search_assignments(
+            &drones,
+            &slot_targets,
+            &leader_position,
+            config.minimum_separation_m,
+            0,
+            0.0,
+            &mut used_slots,
+            &mut current,
+            &mut best,
+            &mut rejected_assignment_count,
+        );
+
+        let best = best.ok_or_else(|| {
+            anyhow::anyhow!("no separation-respecting formation assignment found")
+        })?;
+        let minimum_path_separation_m = Self::minimum_assignment_separation(&best.assignments);
+        let validated =
+            best.assignments.len() < 2 || minimum_path_separation_m >= config.minimum_separation_m;
+        let assignments = best
+            .assignments
+            .into_iter()
+            .map(|assignment| FormationAssignment {
+                drone_id: assignment.drone_id,
+                slot_index: assignment.slot_index,
+                start_position: assignment.start_position,
+                target_position: assignment.target_position,
+                travel_distance_m: assignment.travel_distance_m,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(FormationOptimizationReport {
+            assignments,
+            total_travel_m: best.total_travel_m,
+            minimum_path_separation_m,
+            rejected_assignment_count,
+            validated,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_assignments(
+        drones: &[&DroneState],
+        slot_targets: &[FormationSlotTarget],
+        leader_position: &GeoCoordinate,
+        minimum_separation_m: f64,
+        drone_index: usize,
+        current_cost: f64,
+        used_slots: &mut [bool],
+        current: &mut Vec<AssignmentCandidate>,
+        best: &mut Option<AssignmentSearchResult>,
+        rejected_assignment_count: &mut usize,
+    ) {
+        if let Some(best) = best {
+            if current_cost >= best.total_travel_m {
+                return;
+            }
+        }
+
+        if drone_index == drones.len() {
+            *best = Some(AssignmentSearchResult {
+                assignments: current.clone(),
+                total_travel_m: current_cost,
+            });
+            return;
+        }
+
+        let drone = drones[drone_index];
+        let start_local = geo_to_local(leader_position, &drone.position);
+        for slot_index in 0..slot_targets.len() {
+            if used_slots[slot_index] {
+                continue;
+            }
+            let slot = &slot_targets[slot_index];
+            let candidate = AssignmentCandidate {
+                drone_id: drone.id,
+                slot_index: slot.slot_index,
+                start_local,
+                target_local: slot.local,
+                start_position: drone.position.clone(),
+                target_position: slot.geo.clone(),
+                travel_distance_m: local_distance(start_local, slot.local),
+            };
+            if !Self::candidate_is_safe(current, &candidate, minimum_separation_m) {
+                *rejected_assignment_count += 1;
+                continue;
+            }
+
+            used_slots[slot_index] = true;
+            current.push(candidate);
+            Self::search_assignments(
+                drones,
+                slot_targets,
+                leader_position,
+                minimum_separation_m,
+                drone_index + 1,
+                current_cost
+                    + current
+                        .last()
+                        .expect("candidate was pushed")
+                        .travel_distance_m,
+                used_slots,
+                current,
+                best,
+                rejected_assignment_count,
+            );
+            current.pop();
+            used_slots[slot_index] = false;
+        }
+    }
+
+    fn candidate_is_safe(
+        current: &[AssignmentCandidate],
+        candidate: &AssignmentCandidate,
+        minimum_separation_m: f64,
+    ) -> bool {
+        current.iter().all(|existing| {
+            assignment_pair_minimum_distance(existing, candidate) + GEOMETRY_EPSILON
+                >= minimum_separation_m
+        })
+    }
+
+    fn minimum_assignment_separation(assignments: &[AssignmentCandidate]) -> f64 {
+        if assignments.len() < 2 {
+            return 0.0;
+        }
+        let mut minimum = f64::INFINITY;
+        for left_index in 0..assignments.len() {
+            for right_index in (left_index + 1)..assignments.len() {
+                minimum = minimum.min(assignment_pair_minimum_distance(
+                    &assignments[left_index],
+                    &assignments[right_index],
+                ));
+            }
+        }
+        minimum
     }
 
     pub async fn handle_emergency(
@@ -393,10 +1179,163 @@ impl CoordinationEngine {
     }
 }
 
+fn geo_to_local(origin: &GeoCoordinate, position: &GeoCoordinate) -> LocalPoint {
+    let origin_lat_rad = origin.latitude.to_radians();
+    LocalPoint {
+        east_m: (position.longitude - origin.longitude).to_radians()
+            * EARTH_RADIUS_M
+            * origin_lat_rad.cos(),
+        north_m: (position.latitude - origin.latitude).to_radians() * EARTH_RADIUS_M,
+        altitude_m: f64::from(position.altitude_m - origin.altitude_m),
+    }
+}
+
+fn local_to_geo(origin: &GeoCoordinate, local: LocalPoint) -> GeoCoordinate {
+    let origin_lat_rad = origin.latitude.to_radians();
+    GeoCoordinate {
+        latitude: origin.latitude + (local.north_m / EARTH_RADIUS_M).to_degrees(),
+        longitude: origin.longitude
+            + (local.east_m / (EARTH_RADIUS_M * origin_lat_rad.cos())).to_degrees(),
+        altitude_m: origin.altitude_m + local.altitude_m as f32,
+    }
+}
+
+fn local_distance(left: LocalPoint, right: LocalPoint) -> f64 {
+    ((left.east_m - right.east_m).powi(2)
+        + (left.north_m - right.north_m).powi(2)
+        + (left.altitude_m - right.altitude_m).powi(2))
+    .sqrt()
+}
+
+fn assignment_pair_minimum_distance(
+    left: &AssignmentCandidate,
+    right: &AssignmentCandidate,
+) -> f64 {
+    let synchronous_distance = minimum_synchronous_path_distance(
+        left.start_local,
+        left.target_local,
+        right.start_local,
+        right.target_local,
+    );
+    if segments_intersect_2d(
+        left.start_local,
+        left.target_local,
+        right.start_local,
+        right.target_local,
+    ) {
+        synchronous_distance.min(0.0)
+    } else {
+        synchronous_distance
+    }
+}
+
+fn minimum_synchronous_path_distance(
+    left_start: LocalPoint,
+    left_target: LocalPoint,
+    right_start: LocalPoint,
+    right_target: LocalPoint,
+) -> f64 {
+    let relative_start = LocalPoint {
+        east_m: left_start.east_m - right_start.east_m,
+        north_m: left_start.north_m - right_start.north_m,
+        altitude_m: left_start.altitude_m - right_start.altitude_m,
+    };
+    let relative_velocity = LocalPoint {
+        east_m: (left_target.east_m - left_start.east_m)
+            - (right_target.east_m - right_start.east_m),
+        north_m: (left_target.north_m - left_start.north_m)
+            - (right_target.north_m - right_start.north_m),
+        altitude_m: (left_target.altitude_m - left_start.altitude_m)
+            - (right_target.altitude_m - right_start.altitude_m),
+    };
+    let velocity_norm = relative_velocity.east_m.powi(2)
+        + relative_velocity.north_m.powi(2)
+        + relative_velocity.altitude_m.powi(2);
+    let closest_t = if velocity_norm <= GEOMETRY_EPSILON {
+        0.0
+    } else {
+        -((relative_start.east_m * relative_velocity.east_m)
+            + (relative_start.north_m * relative_velocity.north_m)
+            + (relative_start.altitude_m * relative_velocity.altitude_m))
+            / velocity_norm
+    }
+    .clamp(0.0, 1.0);
+
+    let closest = LocalPoint {
+        east_m: relative_start.east_m + relative_velocity.east_m * closest_t,
+        north_m: relative_start.north_m + relative_velocity.north_m * closest_t,
+        altitude_m: relative_start.altitude_m + relative_velocity.altitude_m * closest_t,
+    };
+    local_distance(
+        closest,
+        LocalPoint {
+            east_m: 0.0,
+            north_m: 0.0,
+            altitude_m: 0.0,
+        },
+    )
+}
+
+fn segments_intersect_2d(
+    left_start: LocalPoint,
+    left_target: LocalPoint,
+    right_start: LocalPoint,
+    right_target: LocalPoint,
+) -> bool {
+    if point_distance_2d(left_start, left_target) <= GEOMETRY_EPSILON
+        && point_distance_2d(right_start, right_target) <= GEOMETRY_EPSILON
+    {
+        return point_distance_2d(left_start, right_start) <= GEOMETRY_EPSILON;
+    }
+
+    let o1 = orientation_2d(left_start, left_target, right_start);
+    let o2 = orientation_2d(left_start, left_target, right_target);
+    let o3 = orientation_2d(right_start, right_target, left_start);
+    let o4 = orientation_2d(right_start, right_target, left_target);
+
+    if o1.abs() <= GEOMETRY_EPSILON && on_segment_2d(left_start, right_start, left_target) {
+        return true;
+    }
+    if o2.abs() <= GEOMETRY_EPSILON && on_segment_2d(left_start, right_target, left_target) {
+        return true;
+    }
+    if o3.abs() <= GEOMETRY_EPSILON && on_segment_2d(right_start, left_start, right_target) {
+        return true;
+    }
+    if o4.abs() <= GEOMETRY_EPSILON && on_segment_2d(right_start, left_target, right_target) {
+        return true;
+    }
+
+    ((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0))
+        && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0))
+}
+
+fn orientation_2d(a: LocalPoint, b: LocalPoint, c: LocalPoint) -> f64 {
+    (b.east_m - a.east_m) * (c.north_m - a.north_m)
+        - (b.north_m - a.north_m) * (c.east_m - a.east_m)
+}
+
+fn on_segment_2d(a: LocalPoint, b: LocalPoint, c: LocalPoint) -> bool {
+    b.east_m >= a.east_m.min(c.east_m) - GEOMETRY_EPSILON
+        && b.east_m <= a.east_m.max(c.east_m) + GEOMETRY_EPSILON
+        && b.north_m >= a.north_m.min(c.north_m) - GEOMETRY_EPSILON
+        && b.north_m <= a.north_m.max(c.north_m) + GEOMETRY_EPSILON
+}
+
+fn point_distance_2d(left: LocalPoint, right: LocalPoint) -> f64 {
+    ((left.east_m - right.east_m).powi(2) + (left.north_m - right.north_m).powi(2)).sqrt()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinationStatus {
     pub total_drones: usize,
     pub active_drones: usize,
+    #[serde(default)]
+    pub fresh_drones: usize,
+    #[serde(default)]
+    pub stale_drones: usize,
+    #[serde(default)]
+    pub telemetry_status: SwarmTelemetryStatus,
     pub coordination_quality: f32,
     pub active_rules: usize,
     pub last_update: DateTime<Utc>,
@@ -413,6 +1352,79 @@ pub enum EmergencyType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixed_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-13T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn test_state(drone_id: Uuid, last_update: DateTime<Utc>, battery_level: f32) -> DroneState {
+        DroneState {
+            id: drone_id,
+            position: GeoCoordinate {
+                latitude: 40.7128,
+                longitude: -74.0060,
+                altitude_m: 100.0,
+            },
+            velocity: (5.0, 0.0, 0.0),
+            heading: 0.0,
+            battery_level,
+            status: DroneOperationStatus::ExecutingMission,
+            current_mission: None,
+            last_update,
+            communication_quality: 0.95,
+        }
+    }
+
+    fn test_state_at(
+        drone_id: Uuid,
+        position: GeoCoordinate,
+        last_update: DateTime<Utc>,
+    ) -> DroneState {
+        DroneState {
+            id: drone_id,
+            position,
+            velocity: (0.0, 0.0, 0.0),
+            heading: 0.0,
+            battery_level: 0.8,
+            status: DroneOperationStatus::Idle,
+            current_mission: None,
+            last_update,
+            communication_quality: 0.95,
+        }
+    }
+
+    fn test_state_with_battery(
+        drone_id: Uuid,
+        position: GeoCoordinate,
+        last_update: DateTime<Utc>,
+        battery_level: f32,
+    ) -> DroneState {
+        DroneState {
+            id: drone_id,
+            position,
+            velocity: (0.0, 0.0, 0.0),
+            heading: 0.0,
+            battery_level,
+            status: DroneOperationStatus::ExecutingMission,
+            current_mission: None,
+            last_update,
+            communication_quality: 0.95,
+        }
+    }
+
+    fn geo_offset(origin: &GeoCoordinate, east_m: f64, north_m: f64) -> GeoCoordinate {
+        const EARTH_RADIUS_M: f64 = 6_371_000.0;
+        let latitude = origin.latitude + (north_m / EARTH_RADIUS_M).to_degrees();
+        let longitude = origin.longitude
+            + (east_m / (EARTH_RADIUS_M * origin.latitude.to_radians().cos())).to_degrees();
+        GeoCoordinate {
+            latitude,
+            longitude,
+            altitude_m: origin.altitude_m,
+        }
+    }
 
     #[tokio::test]
     async fn test_coordination_engine() {
@@ -440,6 +1452,369 @@ mod tests {
         let status = engine.get_coordination_status().await;
         assert_eq!(status.total_drones, 1);
         assert_eq!(status.active_drones, 1);
+    }
+
+    #[tokio::test]
+    async fn per_drone_freshness_reports_fresh_and_aggregates_steady_swarm() {
+        let mut engine = CoordinationEngine::new();
+        engine
+            .set_telemetry_freshness_timeout(chrono::Duration::seconds(5))
+            .unwrap();
+        let checked_at = fixed_time();
+        let left_id = Uuid::from_u128(11);
+        let right_id = Uuid::from_u128(12);
+
+        engine
+            .register_drone(
+                left_id,
+                test_state(left_id, checked_at - chrono::Duration::seconds(1), 0.82),
+            )
+            .await
+            .unwrap();
+        engine
+            .register_drone(
+                right_id,
+                test_state(right_id, checked_at - chrono::Duration::seconds(2), 0.76),
+            )
+            .await
+            .unwrap();
+
+        let report = engine.swarm_telemetry_report_at(checked_at).await;
+        let status = engine.get_coordination_status_at(checked_at).await;
+
+        assert_eq!(report.status, SwarmTelemetryStatus::Fresh);
+        assert_eq!(report.total_drones, 2);
+        assert_eq!(report.fresh_drones, 2);
+        assert_eq!(report.stale_drones, 0);
+        assert_eq!(report.drones.len(), 2);
+        assert_eq!(report.drones[0].drone_id, left_id);
+        assert_eq!(report.drones[0].freshness, DroneTelemetryFreshness::Fresh);
+        assert_eq!(report.drones[0].battery_level, 0.82);
+        assert_eq!(status.telemetry_status, SwarmTelemetryStatus::Fresh);
+        assert_eq!(status.fresh_drones, 2);
+        assert_eq!(status.stale_drones, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_drone_degrades_swarm_telemetry_status() {
+        let mut engine = CoordinationEngine::new();
+        engine
+            .set_telemetry_freshness_timeout(chrono::Duration::seconds(5))
+            .unwrap();
+        let checked_at = fixed_time();
+        let fresh_id = Uuid::from_u128(21);
+        let stale_id = Uuid::from_u128(22);
+
+        engine
+            .register_drone(
+                fresh_id,
+                test_state(fresh_id, checked_at - chrono::Duration::seconds(1), 0.91),
+            )
+            .await
+            .unwrap();
+        engine
+            .register_drone(
+                stale_id,
+                test_state(stale_id, checked_at - chrono::Duration::seconds(30), 0.63),
+            )
+            .await
+            .unwrap();
+
+        let report = engine.swarm_telemetry_report_at(checked_at).await;
+        let status = engine.get_coordination_status_at(checked_at).await;
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert_eq!(report.status, SwarmTelemetryStatus::Degraded);
+        assert_eq!(report.total_drones, 2);
+        assert_eq!(report.fresh_drones, 1);
+        assert_eq!(report.stale_drones, 1);
+        assert_eq!(report.drones[1].drone_id, stale_id);
+        assert_eq!(report.drones[1].freshness, DroneTelemetryFreshness::Stale);
+        assert_eq!(report.drones[1].age_seconds, 30);
+        assert_eq!(status.telemetry_status, SwarmTelemetryStatus::Degraded);
+        assert_eq!(status.fresh_drones, 1);
+        assert_eq!(status.stale_drones, 1);
+        assert!(json.contains("\"freshness\":\"Stale\""));
+        assert!(json.contains("\"status\":\"Degraded\""));
+    }
+
+    #[tokio::test]
+    async fn regular_heartbeats_keep_link_healthy_without_rule_audit() {
+        let mut engine = CoordinationEngine::new();
+        engine
+            .set_heartbeat_timeout(chrono::Duration::seconds(10))
+            .unwrap();
+        let checked_at = fixed_time();
+        let drone_id = Uuid::from_u128(31);
+
+        engine
+            .register_drone(
+                drone_id,
+                test_state(drone_id, checked_at - chrono::Duration::seconds(30), 0.84),
+            )
+            .await
+            .unwrap();
+        engine
+            .record_heartbeat(drone_id, checked_at - chrono::Duration::seconds(2), 0.93)
+            .await
+            .unwrap();
+
+        let report = engine.evaluate_link_rules_at(checked_at).await.unwrap();
+
+        assert_eq!(report.healthy_links, 1);
+        assert_eq!(report.timed_out_links, 0);
+        assert_eq!(report.links[0].health, DroneLinkHealth::Healthy);
+        assert_eq!(report.links[0].link_quality, 0.93);
+        assert!(report.audit_events.is_empty());
+        assert!(engine.coordination_rule_audit_log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_fires_comm_loss_rule_and_is_audited() {
+        let mut engine = CoordinationEngine::new();
+        engine
+            .set_heartbeat_timeout(chrono::Duration::seconds(10))
+            .unwrap();
+        let checked_at = fixed_time();
+        let stale_id = Uuid::from_u128(32);
+
+        engine
+            .register_drone(
+                stale_id,
+                test_state(stale_id, checked_at - chrono::Duration::seconds(45), 0.59),
+            )
+            .await
+            .unwrap();
+
+        let report = engine.evaluate_link_rules_at(checked_at).await.unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert_eq!(report.healthy_links, 0);
+        assert_eq!(report.timed_out_links, 1);
+        assert_eq!(report.links[0].drone_id, stale_id);
+        assert_eq!(report.links[0].health, DroneLinkHealth::TimedOut);
+        assert_eq!(report.links[0].heartbeat_age_seconds, 45);
+        assert_eq!(report.audit_events.len(), 1);
+        assert_eq!(report.audit_events[0].rule_name, "Communication Loss");
+        assert_eq!(report.audit_events[0].drone_id, Some(stale_id));
+        assert_eq!(report.audit_events[0].triggered_at, checked_at);
+        assert_eq!(engine.coordination_rule_audit_log().len(), 1);
+        assert!(json.contains("\"health\":\"TimedOut\""));
+        assert!(json.contains("\"condition\":\"communication_loss\""));
+    }
+
+    #[tokio::test]
+    async fn evaluate_rules_applies_highest_priority_when_multiple_rules_match() {
+        let mut engine = CoordinationEngine::new();
+        let low_priority_rule_id = Uuid::from_u128(1001);
+        let high_priority_rule_id = Uuid::from_u128(1002);
+        engine.coordination_rules = vec![
+            CoordinationRule {
+                id: low_priority_rule_id,
+                name: "Low Battery Land".to_string(),
+                priority: 2,
+                condition: RuleCondition::BatteryLow { threshold: 0.2 },
+                action: RuleAction::LandAtNearestEmergencySite,
+                enabled: true,
+            },
+            CoordinationRule {
+                id: high_priority_rule_id,
+                name: "Comm Loss RTB".to_string(),
+                priority: 1,
+                condition: RuleCondition::CommunicationLoss { timeout_seconds: 1 },
+                action: RuleAction::ReturnToBase,
+                enabled: true,
+            },
+        ];
+
+        let drone_id = Uuid::from_u128(1003);
+        let stale_state = test_state_with_battery(
+            drone_id,
+            GeoCoordinate {
+                latitude: 40.0,
+                longitude: -74.0,
+                altitude_m: 100.0,
+            },
+            Utc::now() - chrono::Duration::seconds(20),
+            0.1,
+        );
+
+        engine
+            .register_drone(drone_id, stale_state.clone())
+            .await
+            .unwrap();
+
+        let actions = engine
+            .update_drone_state_with_rules(drone_id, stale_state)
+            .await
+            .unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].drone_id, drone_id);
+        assert_eq!(actions[0].priority, 1);
+        assert_eq!(
+            actions[0].action,
+            CoordinationRuleExecutionKind::ReturnToBase
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_rules_prefers_proximity_avoidance_over_low_battery() {
+        let mut engine = CoordinationEngine::new();
+        let checked_at = fixed_time();
+        let drone_a = Uuid::from_u128(1101);
+        let drone_b = Uuid::from_u128(1102);
+        let leader = GeoCoordinate {
+            latitude: 40.0,
+            longitude: -74.0,
+            altitude_m: 100.0,
+        };
+
+        engine
+            .register_drone(
+                drone_a,
+                test_state_with_battery(drone_a, geo_offset(&leader, 0.0, 0.0), checked_at, 0.1),
+            )
+            .await
+            .unwrap();
+        engine
+            .register_drone(
+                drone_b,
+                test_state_with_battery(drone_b, geo_offset(&leader, 10.0, 0.0), checked_at, 0.1),
+            )
+            .await
+            .unwrap();
+
+        let actions = engine
+            .update_drone_state_with_rules(
+                drone_a,
+                test_state_with_battery(drone_a, geo_offset(&leader, 0.0, 0.0), checked_at, 0.1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|action| matches!(
+            action.action,
+            CoordinationRuleExecutionKind::AvoidanceAltitude { .. }
+        )));
+        assert!(actions.iter().any(|action| action.drone_id == drone_a));
+        assert!(actions.iter().any(|action| action.drone_id == drone_b));
+    }
+
+    #[tokio::test]
+    async fn formation_optimizer_assigns_grid_slots_deterministically() {
+        let mut engine = CoordinationEngine::new();
+        let checked_at = fixed_time();
+        let leader = GeoCoordinate {
+            latitude: 40.0,
+            longitude: -96.0,
+            altitude_m: 100.0,
+        };
+        let drone_ids = [
+            Uuid::from_u128(101),
+            Uuid::from_u128(102),
+            Uuid::from_u128(103),
+            Uuid::from_u128(104),
+        ];
+        for (drone_id, east_m, north_m) in [
+            (drone_ids[0], 1.0, 1.0),
+            (drone_ids[1], 29.0, 1.0),
+            (drone_ids[2], 1.0, 29.0),
+            (drone_ids[3], 29.0, 29.0),
+        ] {
+            engine
+                .register_drone(
+                    drone_id,
+                    test_state_at(drone_id, geo_offset(&leader, east_m, north_m), checked_at),
+                )
+                .await
+                .unwrap();
+        }
+
+        let report = engine
+            .optimize_formation_slots(
+                &crate::Formation::Grid {
+                    rows: 2,
+                    cols: 2,
+                    spacing_m: 30.0,
+                },
+                leader,
+                FormationOptimizationConfig {
+                    minimum_separation_m: 25.0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let assignments = report
+            .assignments
+            .iter()
+            .map(|assignment| (assignment.drone_id, assignment.slot_index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assignments,
+            vec![
+                (drone_ids[0], 0),
+                (drone_ids[1], 1),
+                (drone_ids[2], 2),
+                (drone_ids[3], 3),
+            ]
+        );
+        assert!(report.validated);
+        assert!(report.minimum_path_separation_m >= 25.0);
+        assert!(report.total_travel_m < 8.0);
+    }
+
+    #[tokio::test]
+    async fn formation_optimizer_rejects_crossing_slot_swap_and_resolves_safe_assignment() {
+        let mut engine = CoordinationEngine::new();
+        let checked_at = fixed_time();
+        let leader = GeoCoordinate {
+            latitude: 40.0,
+            longitude: -96.0,
+            altitude_m: 100.0,
+        };
+        let left_id = Uuid::from_u128(201);
+        let right_id = Uuid::from_u128(202);
+        engine
+            .register_drone(
+                left_id,
+                test_state_at(left_id, geo_offset(&leader, 30.0, 0.0), checked_at),
+            )
+            .await
+            .unwrap();
+        engine
+            .register_drone(
+                right_id,
+                test_state_at(right_id, geo_offset(&leader, 0.0, 0.0), checked_at),
+            )
+            .await
+            .unwrap();
+
+        let report = engine
+            .optimize_formation_slots(
+                &crate::Formation::Line {
+                    spacing_m: 30.0,
+                    heading_deg: 90.0,
+                },
+                leader,
+                FormationOptimizationConfig {
+                    minimum_separation_m: 25.0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let assignments = report
+            .assignments
+            .iter()
+            .map(|assignment| (assignment.drone_id, assignment.slot_index))
+            .collect::<Vec<_>>();
+        assert_eq!(assignments, vec![(left_id, 1), (right_id, 0)]);
+        assert!(report.rejected_assignment_count > 0);
+        assert!(report.validated);
+        assert!(report.minimum_path_separation_m >= 25.0);
     }
 
     #[test]

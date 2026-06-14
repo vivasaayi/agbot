@@ -5,7 +5,7 @@ use shared::{
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio_serial::SerialPortBuilderExt;
-use tracing::{info, error};
+use tracing::{error, info};
 
 pub struct LidarReader {
     config: Arc<AgroConfig>,
@@ -18,15 +18,21 @@ impl LidarReader {
     }
 
     pub async fn run(&self) -> AgroResult<()> {
-        info!("Connecting to RPLIDAR A3 on {}", self.config.lidar.serial_port);
-
-        let mut port = tokio_serial::new(&self.config.lidar.serial_port, self.config.lidar.baud_rate)
-            .open_native_async()
-            .map_err(|e| shared::error::AgroError::Sensor(format!("Failed to open LiDAR port: {}", e)))?;
-
-        let mut scan_interval = tokio::time::interval(
-            std::time::Duration::from_secs_f32(1.0 / self.config.lidar.scan_frequency)
+        info!(
+            "Connecting to RPLIDAR A3 on {}",
+            self.config.lidar.serial_port
         );
+
+        let mut port =
+            tokio_serial::new(&self.config.lidar.serial_port, self.config.lidar.baud_rate)
+                .open_native_async()
+                .map_err(|e| {
+                    shared::error::AgroError::Sensor(format!("Failed to open LiDAR port: {}", e))
+                })?;
+
+        let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs_f32(
+            1.0 / self.config.lidar.scan_frequency,
+        ));
 
         loop {
             scan_interval.tick().await;
@@ -48,10 +54,11 @@ impl LidarReader {
 
         // Simplified RPLIDAR A3 protocol implementation
         // In a real implementation, you'd implement the full protocol
-        
+
         let mut buf = [0u8; 1024];
-        let _n = port.read(&mut buf).await
-            .map_err(|e| shared::error::AgroError::Sensor(format!("Failed to read from LiDAR: {}", e)))?;
+        let _n = port.read(&mut buf).await.map_err(|e| {
+            shared::error::AgroError::Sensor(format!("Failed to read from LiDAR: {}", e))
+        })?;
 
         // Parse scan data (mock implementation)
         let mut points = Vec::new();
@@ -106,16 +113,19 @@ impl SimulatedLidarReader {
     pub async fn run(&self) -> AgroResult<()> {
         info!("Starting simulated LiDAR reader");
 
-        let mut scan_interval = tokio::time::interval(
-            std::time::Duration::from_secs_f32(1.0 / self.config.lidar.scan_frequency)
-        );
+        let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs_f32(
+            1.0 / self.config.lidar.scan_frequency,
+        ));
 
         loop {
             scan_interval.tick().await;
 
             let scan = self.generate_simulated_scan();
             self.save_scan(&scan).await?;
-            info!("Generated simulated LiDAR scan with {} points", scan.points.len());
+            info!(
+                "Generated simulated LiDAR scan with {} points",
+                scan.points.len()
+            );
         }
     }
 

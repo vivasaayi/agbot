@@ -10,5 +10,9 @@ bevy_egui = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 image = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 futures-lite = "2.3"
+shared = { path = "../shared" }
+sensor_overlay_engine = { path = "../sensor_overlay_engine" }

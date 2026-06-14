@@ -1,3 +1,4 @@
+use crate::Formation;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,8 @@ use uuid::Uuid;
 pub struct DroneSwarm {
     pub id: Uuid,
     pub name: String,
+    #[serde(default = "default_owner_id")]
+    pub owner_id: String,
     pub drones: HashMap<Uuid, DroneInfo>,
     pub formation: FormationType,
     pub leader_id: Option<Uuid>,
@@ -22,6 +25,10 @@ pub struct DroneSwarm {
 fn default_broadcast_channel() -> broadcast::Sender<SwarmMessage> {
     let (sender, _) = broadcast::channel(100);
     sender
+}
+
+fn default_owner_id() -> String {
+    "unassigned".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +94,7 @@ pub enum DroneStatus {
     Offline,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SwarmStatus {
     Inactive,
     Forming,
@@ -103,6 +110,209 @@ pub enum FormationType {
     V,
     Circle,
     Custom(Vec<(f64, f64)>), // relative positions
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FormationSlot {
+    pub slot_index: usize,
+    pub offset_m: (f64, f64, f32),
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
+pub enum FormationGeometryError {
+    #[error("minimum formation spacing must be finite and non-negative")]
+    InvalidMinimumSpacing,
+    #[error("formation parameter is invalid: {reason}")]
+    InvalidFormationParameter { reason: String },
+    #[error("grid formation has capacity {capacity} but {drone_count} drone slots were requested")]
+    GridCapacity { capacity: usize, drone_count: usize },
+    #[error("custom formation requires {expected} positions but got {actual}")]
+    CustomSlotCount { expected: usize, actual: usize },
+    #[error(
+        "formation slots {left_slot} and {right_slot} are {observed_m:.1}m apart, below required {minimum_m:.1}m"
+    )]
+    SpacingBelowMinimum {
+        left_slot: usize,
+        right_slot: usize,
+        observed_m: f64,
+        minimum_m: f64,
+    },
+}
+
+pub fn generate_formation_slots(
+    formation: &Formation,
+    drone_count: usize,
+    minimum_spacing_m: f64,
+) -> std::result::Result<Vec<FormationSlot>, FormationGeometryError> {
+    if !minimum_spacing_m.is_finite() || minimum_spacing_m < 0.0 {
+        return Err(FormationGeometryError::InvalidMinimumSpacing);
+    }
+
+    let offsets = match formation {
+        Formation::Custom { positions } => {
+            if positions.len() != drone_count {
+                return Err(FormationGeometryError::CustomSlotCount {
+                    expected: drone_count,
+                    actual: positions.len(),
+                });
+            }
+            positions
+                .iter()
+                .map(|(x, y, z)| (f64::from(*x), f64::from(*y), *z))
+                .collect::<Vec<_>>()
+        }
+        Formation::Line {
+            spacing_m,
+            heading_deg,
+        } => {
+            let spacing = validate_spacing(*spacing_m, minimum_spacing_m, "line spacing")?;
+            let heading = validate_degrees(*heading_deg, "line heading")?.to_radians();
+            (0..drone_count)
+                .map(|index| {
+                    let offset = spacing * index as f64;
+                    (offset * heading.sin(), offset * heading.cos(), 0.0)
+                })
+                .collect::<Vec<_>>()
+        }
+        Formation::Grid {
+            rows,
+            cols,
+            spacing_m,
+        } => {
+            let rows = *rows as usize;
+            let cols = *cols as usize;
+            if rows == 0 || cols == 0 {
+                return Err(FormationGeometryError::InvalidFormationParameter {
+                    reason: "grid rows and columns must be greater than zero".to_string(),
+                });
+            }
+            let capacity = rows * cols;
+            if capacity < drone_count {
+                return Err(FormationGeometryError::GridCapacity {
+                    capacity,
+                    drone_count,
+                });
+            }
+            let spacing = validate_spacing(*spacing_m, minimum_spacing_m, "grid spacing")?;
+            (0..drone_count)
+                .map(|index| {
+                    let row = index / cols;
+                    let col = index % cols;
+                    (spacing * col as f64, spacing * row as f64, 0.0)
+                })
+                .collect::<Vec<_>>()
+        }
+        Formation::Circle { radius_m, center } => {
+            let radius = f64::from(*radius_m);
+            if !radius.is_finite() || radius < 0.0 || !center.0.is_finite() || !center.1.is_finite()
+            {
+                return Err(FormationGeometryError::InvalidFormationParameter {
+                    reason: "circle radius and center must be finite".to_string(),
+                });
+            }
+            (0..drone_count)
+                .map(|index| {
+                    let angle = (index as f64 / drone_count.max(1) as f64) * std::f64::consts::TAU;
+                    (
+                        center.0 + radius * angle.cos(),
+                        center.1 + radius * angle.sin(),
+                        0.0,
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+        Formation::VFormation {
+            spacing_m,
+            angle_deg,
+        } => {
+            let spacing = validate_spacing(*spacing_m, minimum_spacing_m, "v spacing")?;
+            let angle = validate_degrees(*angle_deg, "v angle")?.to_radians();
+            (0..drone_count)
+                .map(|index| {
+                    if index == 0 {
+                        return (0.0, 0.0, 0.0);
+                    }
+                    let side = if index % 2 == 0 { -1.0 } else { 1.0 };
+                    let rank = ((index + 1) / 2) as f64;
+                    (
+                        side * rank * spacing * angle.sin(),
+                        rank * spacing * angle.cos(),
+                        0.0,
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let slots = offsets
+        .into_iter()
+        .enumerate()
+        .map(|(slot_index, offset_m)| FormationSlot {
+            slot_index,
+            offset_m,
+        })
+        .collect::<Vec<_>>();
+    validate_slot_spacing(&slots, minimum_spacing_m)?;
+    Ok(slots)
+}
+
+fn validate_spacing(
+    spacing_m: f32,
+    minimum_spacing_m: f64,
+    label: &str,
+) -> std::result::Result<f64, FormationGeometryError> {
+    let spacing = f64::from(spacing_m);
+    if !spacing.is_finite() || spacing < 0.0 {
+        return Err(FormationGeometryError::InvalidFormationParameter {
+            reason: format!("{label} must be finite and non-negative"),
+        });
+    }
+    if spacing < minimum_spacing_m {
+        return Err(FormationGeometryError::SpacingBelowMinimum {
+            left_slot: 0,
+            right_slot: 1,
+            observed_m: spacing,
+            minimum_m: minimum_spacing_m,
+        });
+    }
+    Ok(spacing)
+}
+
+fn validate_degrees(degrees: f32, label: &str) -> std::result::Result<f64, FormationGeometryError> {
+    let degrees = f64::from(degrees);
+    if !degrees.is_finite() {
+        return Err(FormationGeometryError::InvalidFormationParameter {
+            reason: format!("{label} must be finite"),
+        });
+    }
+    Ok(degrees)
+}
+
+fn validate_slot_spacing(
+    slots: &[FormationSlot],
+    minimum_spacing_m: f64,
+) -> std::result::Result<(), FormationGeometryError> {
+    for left_index in 0..slots.len() {
+        for right_index in (left_index + 1)..slots.len() {
+            let observed_m = slot_distance(slots[left_index].offset_m, slots[right_index].offset_m);
+            if observed_m < minimum_spacing_m {
+                return Err(FormationGeometryError::SpacingBelowMinimum {
+                    left_slot: slots[left_index].slot_index,
+                    right_slot: slots[right_index].slot_index,
+                    observed_m,
+                    minimum_m: minimum_spacing_m,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn slot_distance(left: (f64, f64, f32), right: (f64, f64, f32)) -> f64 {
+    let altitude_delta = f64::from(left.2 - right.2);
+    (left.0 - right.0)
+        .hypot(left.1 - right.1)
+        .hypot(altitude_delta)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +378,7 @@ impl SwarmController {
         let swarm = DroneSwarm {
             id: swarm_id,
             name,
+            owner_id: default_owner_id(),
             drones: HashMap::new(),
             formation,
             leader_id: None,
@@ -327,12 +538,30 @@ impl DroneSwarm {
         Self {
             id: Uuid::new_v4(),
             name,
+            owner_id: default_owner_id(),
             drones,
             formation,
             leader_id: None,
             communication_channel: sender,
             status: SwarmStatus::Inactive,
         }
+    }
+
+    pub fn new_owned(
+        name: String,
+        drone_ids: Vec<Uuid>,
+        formation: FormationType,
+        owner_id: String,
+    ) -> Self {
+        let mut swarm = Self::new(name, drone_ids, formation);
+        swarm.owner_id = owner_id;
+        swarm
+    }
+
+    pub fn drone_ids(&self) -> Vec<Uuid> {
+        let mut drone_ids: Vec<Uuid> = self.drones.keys().copied().collect();
+        drone_ids.sort();
+        drone_ids
     }
 }
 
@@ -349,6 +578,108 @@ pub struct SwarmHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimum_distance(slots: &[FormationSlot]) -> f64 {
+        let mut minimum = f64::INFINITY;
+        for left in 0..slots.len() {
+            for right in (left + 1)..slots.len() {
+                minimum = minimum.min(slot_distance(slots[left].offset_m, slots[right].offset_m));
+            }
+        }
+        minimum
+    }
+
+    #[test]
+    fn grid_formation_generates_non_overlapping_slots_at_minimum_spacing() {
+        let slots = generate_formation_slots(
+            &Formation::Grid {
+                rows: 2,
+                cols: 2,
+                spacing_m: 25.0,
+            },
+            4,
+            25.0,
+        )
+        .expect("grid geometry should generate");
+
+        assert_eq!(slots.len(), 4);
+        assert_eq!(slots[0].offset_m, (0.0, 0.0, 0.0));
+        assert_eq!(slots[1].offset_m, (25.0, 0.0, 0.0));
+        assert_eq!(slots[2].offset_m, (0.0, 25.0, 0.0));
+        assert!(minimum_distance(&slots) >= 25.0);
+    }
+
+    #[test]
+    fn formation_spacing_below_minimum_is_rejected() {
+        let err = generate_formation_slots(
+            &Formation::Line {
+                spacing_m: 10.0,
+                heading_deg: 0.0,
+            },
+            2,
+            25.0,
+        )
+        .expect_err("unsafe spacing should reject");
+
+        assert!(matches!(
+            err,
+            FormationGeometryError::SpacingBelowMinimum {
+                observed_m,
+                minimum_m,
+                ..
+            } if observed_m == 10.0 && minimum_m == 25.0
+        ));
+    }
+
+    #[test]
+    fn formation_generator_covers_line_circle_v_and_custom_slots() {
+        let line = generate_formation_slots(
+            &Formation::Line {
+                spacing_m: 20.0,
+                heading_deg: 90.0,
+            },
+            3,
+            10.0,
+        )
+        .expect("line slots should generate");
+        assert_eq!(line.len(), 3);
+        assert!((line[2].offset_m.0 - 40.0).abs() < 0.001);
+
+        let circle = generate_formation_slots(
+            &Formation::Circle {
+                radius_m: 20.0,
+                center: (5.0, -5.0),
+            },
+            4,
+            10.0,
+        )
+        .expect("circle slots should generate");
+        assert_eq!(circle.len(), 4);
+        assert_eq!(circle[0].offset_m, (25.0, -5.0, 0.0));
+
+        let v = generate_formation_slots(
+            &Formation::VFormation {
+                spacing_m: 20.0,
+                angle_deg: 45.0,
+            },
+            3,
+            10.0,
+        )
+        .expect("v slots should generate");
+        assert_eq!(v[0].offset_m, (0.0, 0.0, 0.0));
+        assert!(v[1].offset_m.0 > 0.0);
+        assert!(v[2].offset_m.0 < 0.0);
+
+        let custom = generate_formation_slots(
+            &Formation::Custom {
+                positions: vec![(0.0, 0.0, 20.0), (30.0, 0.0, 20.0)],
+            },
+            2,
+            25.0,
+        )
+        .expect("custom slots should generate");
+        assert_eq!(custom[1].offset_m, (30.0, 0.0, 20.0));
+    }
 
     #[tokio::test]
     async fn test_swarm_creation() {

@@ -28,6 +28,10 @@ async fn main() -> Result<()> {
             info!("Running masks processing");
             proc.run_masks(&args).await?;
         }
+        Commands::Export(args) => {
+            info!("Running product export");
+            proc.run_export(&args).await?;
+        }
     }
 
     Ok(())

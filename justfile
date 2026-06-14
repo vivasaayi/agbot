@@ -14,8 +14,13 @@ help:
     @echo ""
     @echo "Build:"
     @echo "  build     - Build all workspace members"
+    @echo "  flight-sim-build - Build C++ FlightSim"
+    @echo "  flight-sim-test - Test C++ FlightSim"
+    @echo "  flight-sim-run - Run C++ FlightSim viewer"
     @echo "  check     - Check code without building"
     @echo "  test      - Run tests"
+    @echo "  gis-test  - Run fast GIS regression suite"
+    @echo "  gis-acceptance - Run GIS acceptance tests"
     @echo "  fmt       - Format code"
     @echo "  clippy    - Run clippy linter"
     @echo ""
@@ -31,7 +36,10 @@ help:
     @echo ""
     @echo "Deployment:"
     @echo "  docker    - Build Docker image"
-    @echo "  arm       - Cross-compile for ARM (Jetson/Pi)"
+    @echo "  arm64     - Cross-compile for ARM64 (Jetson)"
+    @echo "  arm       - Cross-compile for ARMv7 (Raspberry Pi)"
+    @echo "  arm64-ci  - Build, smoke, and package ARM64 artifacts"
+    @echo "  arm-ci    - Build, smoke, and package ARMv7 artifacts"
 
 # Setup project
 setup:
@@ -53,6 +61,22 @@ build-release:
     @echo "🔨 Building release version..."
     cargo build --release
 
+# Build the standalone C++ flight simulator
+flight-sim-build:
+    @echo "🛩️ Building AgBot FlightSim C++..."
+    cmake -S flight_sim_cpp -B flight_sim_cpp/build
+    cmake --build flight_sim_cpp/build
+
+# Test the standalone C++ flight simulator
+flight-sim-test: flight-sim-build
+    @echo "🧪 Testing AgBot FlightSim C++..."
+    ctest --test-dir flight_sim_cpp/build --output-on-failure
+
+# Run the macOS OpenGL FlightSim viewer
+flight-sim-run: flight-sim-build
+    @echo "🛩️ Starting AgBot FlightSim viewer..."
+    flight_sim_cpp/build/agbot_flight_sim_viewer
+
 # Check code
 check:
     @echo "🔍 Checking code..."
@@ -62,6 +86,18 @@ check:
 test:
     @echo "🧪 Running tests..."
     cargo test
+
+# Fast GIS regression suite
+gis-test:
+    @echo "🗺️ Running GIS regression suite..."
+    cargo test -p shared --lib
+    cargo test -p geo_hub --tests --lib
+    cargo test -p geo_viewer
+
+# GIS acceptance workflow checks
+gis-acceptance:
+    @echo "🧭 Running GIS acceptance tests..."
+    cargo test -p geo_hub acceptance_
 
 # Format code
 fmt:
@@ -107,7 +143,7 @@ ui-cli:
 # Process NDVI from sample data
 ndvi:
     @echo "🌱 Processing NDVI..."
-    cargo run --bin ndvi_processor -- --input-dir data/camera --output-dir processed/ndvi
+    cargo run --bin imagery_processor -- indices --input-dir data/camera --output-dir processed/ndvi --index ndvi
 
 # Process LiDAR from sample data
 lidar:
@@ -117,17 +153,44 @@ lidar:
 # Build Docker image
 docker:
     @echo "🐳 Building Docker image..."
-    docker build -t agrodrone:latest .
+    bash scripts/verify-container-build.sh
+    docker build --build-arg AGRODRONE_COMMIT=$(git rev-parse HEAD) -t agrodrone:$(git rev-parse --short HEAD) .
 
 # Cross-compile for ARM64 (Jetson)
 arm64:
     @echo "🔧 Cross-compiling for ARM64..."
     cross build --target aarch64-unknown-linux-gnu --release
 
+# Smoke-check ARM64 artifacts under cross/QEMU
+arm64-smoke: arm64
+    @echo "🧪 Smoke-checking ARM64 artifacts..."
+    scripts/smoke-arm-artifacts.sh aarch64-unknown-linux-gnu
+
+# Package ARM64 artifacts for CI upload
+arm64-package: arm64
+    @echo "📦 Packaging ARM64 artifacts..."
+    scripts/package-arm-artifacts.sh aarch64-unknown-linux-gnu
+
+# CI path for ARM64 artifacts
+arm64-ci: arm64 arm64-smoke arm64-package
+
 # Cross-compile for ARM (Raspberry Pi)
 arm:
     @echo "🔧 Cross-compiling for ARM..."
     cross build --target armv7-unknown-linux-gnueabihf --release
+
+# Smoke-check ARMv7 artifacts under cross/QEMU
+arm-smoke: arm
+    @echo "🧪 Smoke-checking ARMv7 artifacts..."
+    scripts/smoke-arm-artifacts.sh armv7-unknown-linux-gnueabihf
+
+# Package ARMv7 artifacts for CI upload
+arm-package: arm
+    @echo "📦 Packaging ARMv7 artifacts..."
+    scripts/package-arm-artifacts.sh armv7-unknown-linux-gnueabihf
+
+# CI path for ARMv7 artifacts
+arm-ci: arm arm-smoke arm-package
 
 # Install development tools
 install-tools:
@@ -145,34 +208,7 @@ watch:
 sample-mission:
     @echo "📋 Generating sample mission..."
     @mkdir -p missions
-    @cat > missions/sample_mission.json << 'EOF'
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "name": "Sample Survey Mission",
-  "created_at": "2024-01-01T12:00:00Z",
-  "home_position": {
-    "latitude": 37.7749,
-    "longitude": -122.4194,
-    "altitude": 100.0
-  },
-  "waypoints": [
-    {
-      "sequence": 0,
-      "position": {"latitude": 37.7750, "longitude": -122.4195, "altitude": 100.0},
-      "command": 16,
-      "auto_continue": true,
-      "param1": 0.0, "param2": 0.0, "param3": 0.0, "param4": 0.0
-    },
-    {
-      "sequence": 1,
-      "position": {"latitude": 37.7751, "longitude": -122.4195, "altitude": 100.0},
-      "command": 16,
-      "auto_continue": true,
-      "param1": 0.0, "param2": 0.0, "param3": 0.0, "param4": 0.0
-    }
-  ]
-}
-EOF
+    @cp mission_planner/samples/sample_mission.json missions/sample_mission.json
     @echo "✅ Sample mission created at missions/sample_mission.json"
 
 # Show project status

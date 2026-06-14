@@ -32,6 +32,23 @@ pub struct ColorMapping {
     pub soil: [u8; 3],
 }
 
+impl Default for NdviConfig {
+    fn default() -> Self {
+        Self {
+            red_band_index: 0,
+            nir_band_index: 1,
+            output_format: "PNG".to_string(),
+            color_mapping: ColorMapping {
+                low_vegetation: [255, 0, 0],
+                medium_vegetation: [255, 255, 0],
+                high_vegetation: [0, 255, 0],
+                water: [0, 0, 255],
+                soil: [139, 69, 19],
+            },
+        }
+    }
+}
+
 impl NdviProcessor {
     pub fn new(config: NdviConfig) -> Self {
         Self { config }
@@ -82,6 +99,25 @@ impl NdviProcessor {
         }
 
         Ok(image)
+    }
+
+    pub fn render_colormap_overlay(
+        &self,
+        ndvi_values: &[f32],
+        width: u32,
+        height: u32,
+        spatial_bounds: &SpatialBounds,
+        colormap: &str,
+    ) -> Result<crate::utils::RenderedValueOverlay> {
+        crate::utils::render_value_overlay(
+            ndvi_values,
+            width,
+            height,
+            spatial_bounds,
+            colormap,
+            Some((-1.0, 1.0)),
+            5,
+        )
     }
 
     /// Map NDVI value to color based on vegetation health
@@ -176,7 +212,7 @@ impl NdviProcessor {
 }
 
 impl OverlayProcessor for NdviProcessor {
-    fn process(&self, inputs: &[SensorInput]) -> Result<SensorOverlay> {
+    fn process(&self, _inputs: &[SensorInput]) -> Result<SensorOverlay> {
         // For now, create a basic NDVI overlay
         // In a real implementation, this would process the multispectral data
         let overlay = SensorOverlay {
@@ -269,5 +305,22 @@ mod tests {
         // Test high vegetation
         let veg_color = processor.map_ndvi_to_color(0.8);
         assert_eq!(veg_color, [0, 255, 0]);
+    }
+
+    #[test]
+    fn test_ndvi_colormap_overlay_metadata() {
+        let processor = NdviProcessor::new(NdviConfig::default());
+        let bounds = SpatialBounds::new(-74.1, 40.6, -73.9, 40.8);
+
+        let rendered = processor
+            .render_colormap_overlay(&[-1.0, 0.0, 1.0], 3, 1, &bounds, "viridis")
+            .unwrap();
+
+        assert_eq!(rendered.metadata.colormap, "viridis");
+        let value_range = rendered.metadata.value_range.unwrap();
+        assert_eq!(value_range.min, -1.0);
+        assert_eq!(value_range.max, 1.0);
+        assert_eq!(rendered.metadata.legend_stops.len(), 5);
+        assert_eq!(rendered.metadata.spatial_bounds, bounds);
     }
 }
