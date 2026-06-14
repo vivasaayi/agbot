@@ -2354,6 +2354,7 @@ pub enum FleetConfigRejectionReason {
     MissingSignature,
     InvalidSignature,
     OlderOrEqualVersion,
+    DryRunFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2365,6 +2366,28 @@ pub struct FleetConfigApplyOutcome {
     #[serde(default)]
     pub rejection_reason: Option<FleetConfigRejectionReason>,
     pub updated_state: FleetConfigState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetConfigDryRunDiff {
+    pub field: String,
+    pub current: String,
+    pub proposed: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetConfigDryRunReport {
+    pub node_id: String,
+    pub previous_version: u64,
+    pub requested_version: u64,
+    pub status: FleetConfigApplyStatus,
+    pub would_apply: bool,
+    #[serde(default)]
+    pub rejection_reason: Option<FleetConfigRejectionReason>,
+    #[serde(default)]
+    pub diffs: Vec<FleetConfigDryRunDiff>,
+    pub bundle_signature: String,
+    pub payload_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -2379,6 +2402,8 @@ pub enum FleetConfigDistributionError {
     EmptySigningKey,
     #[error("config bundle node_id {actual} does not match node {expected}")]
     NodeIdMismatch { expected: String, actual: String },
+    #[error("config dry-run report does not match the bundle being applied")]
+    DryRunBundleMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2683,6 +2708,104 @@ pub fn verify_and_apply_fleet_config_bundle(
     verifying_key: &str,
     applied_at: String,
 ) -> Result<FleetConfigApplyOutcome, FleetConfigDistributionError> {
+    let validation = validate_fleet_config_bundle(current, bundle, verifying_key)?;
+    if let Some(reason) = validation.rejection_reason {
+        return Ok(rejected_config_outcome(
+            validation.current_state,
+            validation.bundle.version,
+            reason,
+        ));
+    }
+
+    let applied_at =
+        normalize_config_text(applied_at, FleetConfigDistributionError::EmptyAppliedAt)?;
+    let previous_version = validation.current_state.applied_version;
+    let updated_state = FleetConfigState {
+        node_id: validation.current_state.node_id.clone(),
+        applied_version: validation.bundle.version,
+        payload: validation.bundle.payload,
+        applied_at,
+    };
+
+    Ok(FleetConfigApplyOutcome {
+        node_id: updated_state.node_id.clone(),
+        previous_version,
+        requested_version: updated_state.applied_version,
+        status: FleetConfigApplyStatus::Applied,
+        rejection_reason: None,
+        updated_state,
+    })
+}
+
+pub fn dry_run_fleet_config_bundle(
+    current: &FleetConfigState,
+    bundle: FleetConfigBundle,
+    verifying_key: &str,
+) -> Result<FleetConfigDryRunReport, FleetConfigDistributionError> {
+    let validation = validate_fleet_config_bundle(current, bundle, verifying_key)?;
+    let status = if validation.rejection_reason.is_some() {
+        FleetConfigApplyStatus::Rejected
+    } else {
+        FleetConfigApplyStatus::Applied
+    };
+    let would_apply = status == FleetConfigApplyStatus::Applied;
+    let diffs = if would_apply {
+        fleet_config_diffs(&validation.current_state, &validation.bundle)
+    } else {
+        Vec::new()
+    };
+
+    Ok(FleetConfigDryRunReport {
+        node_id: validation.current_state.node_id,
+        previous_version: validation.current_state.applied_version,
+        requested_version: validation.bundle.version,
+        status,
+        would_apply,
+        rejection_reason: validation.rejection_reason,
+        diffs,
+        bundle_signature: validation.bundle.signature,
+        payload_fingerprint: config_payload_fingerprint(&validation.bundle.payload),
+    })
+}
+
+pub fn apply_dry_run_validated_fleet_config_bundle(
+    current: &FleetConfigState,
+    bundle: FleetConfigBundle,
+    verifying_key: &str,
+    applied_at: String,
+    dry_run: &FleetConfigDryRunReport,
+) -> Result<FleetConfigApplyOutcome, FleetConfigDistributionError> {
+    let current_state = normalize_config_state(current)?;
+    let bundle = normalize_config_bundle(bundle)?;
+    if !dry_run_matches_bundle(&current_state, &bundle, dry_run) {
+        return Err(FleetConfigDistributionError::DryRunBundleMismatch);
+    }
+
+    if dry_run.status != FleetConfigApplyStatus::Applied || !dry_run.would_apply {
+        return Ok(rejected_config_outcome(
+            current_state,
+            bundle.version,
+            dry_run
+                .rejection_reason
+                .unwrap_or(FleetConfigRejectionReason::DryRunFailed),
+        ));
+    }
+
+    verify_and_apply_fleet_config_bundle(current, bundle, verifying_key, applied_at)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FleetConfigValidation {
+    current_state: FleetConfigState,
+    bundle: FleetConfigBundle,
+    rejection_reason: Option<FleetConfigRejectionReason>,
+}
+
+fn validate_fleet_config_bundle(
+    current: &FleetConfigState,
+    bundle: FleetConfigBundle,
+    verifying_key: &str,
+) -> Result<FleetConfigValidation, FleetConfigDistributionError> {
     let current_state = normalize_config_state(current)?;
     let bundle = normalize_config_bundle(bundle)?;
     let verifying_key = normalize_config_text(
@@ -2697,53 +2820,28 @@ pub fn verify_and_apply_fleet_config_bundle(
         });
     }
 
-    if bundle.signature.is_empty() {
-        return Ok(rejected_config_outcome(
-            current_state,
+    let rejection_reason = if bundle.signature.is_empty() {
+        Some(FleetConfigRejectionReason::MissingSignature)
+    } else {
+        let expected_signature = sign_fleet_config_bundle(
+            &bundle.node_id,
             bundle.version,
-            FleetConfigRejectionReason::MissingSignature,
-        ));
-    }
-
-    let expected_signature = sign_fleet_config_bundle(
-        &bundle.node_id,
-        bundle.version,
-        &bundle.payload,
-        &verifying_key,
-    );
-    if bundle.signature != expected_signature {
-        return Ok(rejected_config_outcome(
-            current_state,
-            bundle.version,
-            FleetConfigRejectionReason::InvalidSignature,
-        ));
-    }
-
-    if bundle.version <= current_state.applied_version {
-        return Ok(rejected_config_outcome(
-            current_state,
-            bundle.version,
-            FleetConfigRejectionReason::OlderOrEqualVersion,
-        ));
-    }
-
-    let applied_at =
-        normalize_config_text(applied_at, FleetConfigDistributionError::EmptyAppliedAt)?;
-    let previous_version = current_state.applied_version;
-    let updated_state = FleetConfigState {
-        node_id: current_state.node_id.clone(),
-        applied_version: bundle.version,
-        payload: bundle.payload,
-        applied_at,
+            &bundle.payload,
+            &verifying_key,
+        );
+        if bundle.signature != expected_signature {
+            Some(FleetConfigRejectionReason::InvalidSignature)
+        } else if bundle.version <= current_state.applied_version {
+            Some(FleetConfigRejectionReason::OlderOrEqualVersion)
+        } else {
+            None
+        }
     };
 
-    Ok(FleetConfigApplyOutcome {
-        node_id: updated_state.node_id.clone(),
-        previous_version,
-        requested_version: updated_state.applied_version,
-        status: FleetConfigApplyStatus::Applied,
-        rejection_reason: None,
-        updated_state,
+    Ok(FleetConfigValidation {
+        current_state,
+        bundle,
+        rejection_reason,
     })
 }
 
@@ -2760,6 +2858,44 @@ fn rejected_config_outcome(
         rejection_reason: Some(reason),
         updated_state: current_state,
     }
+}
+
+fn fleet_config_diffs(
+    current: &FleetConfigState,
+    bundle: &FleetConfigBundle,
+) -> Vec<FleetConfigDryRunDiff> {
+    let mut diffs = Vec::new();
+    if current.applied_version != bundle.version {
+        diffs.push(FleetConfigDryRunDiff {
+            field: "applied_version".to_string(),
+            current: current.applied_version.to_string(),
+            proposed: bundle.version.to_string(),
+        });
+    }
+    if current.payload != bundle.payload {
+        diffs.push(FleetConfigDryRunDiff {
+            field: "payload".to_string(),
+            current: current.payload.clone(),
+            proposed: bundle.payload.clone(),
+        });
+    }
+    diffs
+}
+
+fn dry_run_matches_bundle(
+    current: &FleetConfigState,
+    bundle: &FleetConfigBundle,
+    dry_run: &FleetConfigDryRunReport,
+) -> bool {
+    dry_run.node_id == current.node_id
+        && dry_run.previous_version == current.applied_version
+        && dry_run.requested_version == bundle.version
+        && dry_run.bundle_signature == bundle.signature
+        && dry_run.payload_fingerprint == config_payload_fingerprint(&bundle.payload)
+}
+
+fn config_payload_fingerprint(payload: &str) -> String {
+    format!("{:016x}", fnv1a64(payload.as_bytes()))
 }
 
 fn normalize_config_state(
@@ -5189,16 +5325,17 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_content_version, apply_fleet_node_heartbeat, assert_flight_operation_allowed,
-        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-        build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
+        append_content_version, apply_dry_run_validated_fleet_config_bundle,
+        apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
+        bind_fleet_node_identity, bounds_from_points, build_collaboration_channel,
+        build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
-        compute_drought_index, create_versioned_content, normalize_weather_provider_forecast,
-        sign_fleet_config_bundle, soil_moisture_rejection_record,
-        transition_marketplace_account_status, validate_field_boundary,
-        verify_and_apply_fleet_config_bundle, weather_fetch_failure_record,
-        AnnotationAuditRegistry, AnnotationChangeType, AnnotationGeometry,
-        AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        compute_drought_index, create_versioned_content, dry_run_fleet_config_bundle,
+        normalize_weather_provider_forecast, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, transition_marketplace_account_status,
+        validate_field_boundary, verify_and_apply_fleet_config_bundle,
+        weather_fetch_failure_record, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
         CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
         ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
         DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
@@ -5477,6 +5614,101 @@ mod tests {
         .expect("heartbeat should evaluate");
 
         assert_eq!(evaluation.health.config_version, 3);
+    }
+
+    #[test]
+    fn fleet_config_dry_run_reports_diff_without_mutating_state() {
+        let current = FleetConfigState {
+            node_id: "node-001".to_string(),
+            applied_version: 2,
+            payload: "mavlink.rate_hz=1".to_string(),
+            applied_at: "2026-06-12T11:00:00Z".to_string(),
+        };
+        let bundle = FleetConfigBundle {
+            node_id: "node-001".to_string(),
+            version: 3,
+            payload: "mavlink.rate_hz=2".to_string(),
+            signature: sign_fleet_config_bundle("node-001", 3, "mavlink.rate_hz=2", "fleet-key"),
+        };
+
+        let dry_run = dry_run_fleet_config_bundle(&current, bundle, "fleet-key")
+            .expect("signed bundle should dry-run");
+
+        assert_eq!(current.applied_version, 2);
+        assert_eq!(current.payload, "mavlink.rate_hz=1");
+        assert_eq!(dry_run.status, FleetConfigApplyStatus::Applied);
+        assert!(dry_run.would_apply);
+        assert_eq!(dry_run.rejection_reason, None);
+        assert_eq!(dry_run.previous_version, 2);
+        assert_eq!(dry_run.requested_version, 3);
+        assert!(dry_run.diffs.iter().any(|diff| {
+            diff.field == "applied_version" && diff.current == "2" && diff.proposed == "3"
+        }));
+        assert!(dry_run.diffs.iter().any(|diff| {
+            diff.field == "payload"
+                && diff.current == "mavlink.rate_hz=1"
+                && diff.proposed == "mavlink.rate_hz=2"
+        }));
+
+        let apply_bundle = FleetConfigBundle {
+            node_id: "node-001".to_string(),
+            version: 3,
+            payload: "mavlink.rate_hz=2".to_string(),
+            signature: sign_fleet_config_bundle("node-001", 3, "mavlink.rate_hz=2", "fleet-key"),
+        };
+        let applied = apply_dry_run_validated_fleet_config_bundle(
+            &current,
+            apply_bundle,
+            "fleet-key",
+            "2026-06-12T12:00:00Z".to_string(),
+            &dry_run,
+        )
+        .expect("passing dry-run should allow apply");
+
+        assert_eq!(applied.status, FleetConfigApplyStatus::Applied);
+        assert_eq!(applied.updated_state.applied_version, 3);
+        assert_eq!(applied.updated_state.payload, "mavlink.rate_hz=2");
+    }
+
+    #[test]
+    fn fleet_config_apply_requires_passing_dry_run() {
+        let current = FleetConfigState {
+            node_id: "node-001".to_string(),
+            applied_version: 3,
+            payload: "mavlink.rate_hz=2".to_string(),
+            applied_at: "2026-06-12T12:00:00Z".to_string(),
+        };
+        let unsigned = FleetConfigBundle {
+            node_id: "node-001".to_string(),
+            version: 4,
+            payload: "mavlink.rate_hz=4".to_string(),
+            signature: String::new(),
+        };
+        let failed_dry_run = dry_run_fleet_config_bundle(&current, unsigned.clone(), "fleet-key")
+            .expect("unsigned bundle should return a failed dry-run report");
+
+        assert_eq!(failed_dry_run.status, FleetConfigApplyStatus::Rejected);
+        assert!(!failed_dry_run.would_apply);
+        assert_eq!(
+            failed_dry_run.rejection_reason,
+            Some(FleetConfigRejectionReason::MissingSignature)
+        );
+
+        let blocked_apply = apply_dry_run_validated_fleet_config_bundle(
+            &current,
+            unsigned,
+            "fleet-key",
+            "2026-06-12T12:05:00Z".to_string(),
+            &failed_dry_run,
+        )
+        .expect("failed dry-run should block as a rejected outcome");
+
+        assert_eq!(blocked_apply.status, FleetConfigApplyStatus::Rejected);
+        assert_eq!(
+            blocked_apply.rejection_reason,
+            Some(FleetConfigRejectionReason::MissingSignature)
+        );
+        assert_eq!(blocked_apply.updated_state, current);
     }
 
     #[test]
