@@ -18,4 +18,4 @@
 
 ## Next action
 
-- Select and claim STORY `07-16`.
+- Select and claim next pending feature(s) per roadmap priority order.
