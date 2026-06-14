@@ -497,6 +497,12 @@ pub struct WeedMapReport {
     pub zones: Vec<WeedMapZone>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeedSpotSprayPrescriptionConfig {
+    pub rate_per_zone: f64,
+    pub unit: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectionVerificationState {
@@ -1036,6 +1042,34 @@ pub enum ModelEvaluationError {
     InvalidConfig,
     #[error("drift distributions must be non-empty, equal length, and finite")]
     InvalidDriftDistribution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeedPrescriptionError {
+    #[error("prescription_id cannot be empty")]
+    EmptyPrescriptionId,
+    #[error("field boundary CRS cannot be empty")]
+    EmptyFieldBoundaryCrs,
+    #[error("unit cannot be empty")]
+    EmptyUnit,
+    #[error("verified weed map must contain at least one zone")]
+    EmptyZones,
+    #[error("rate_per_zone must be finite and positive")]
+    InvalidRate,
+    #[error("field boundary geometry is invalid")]
+    InvalidFieldBoundary,
+    #[error("field boundary CRS {field_crs} does not match weed map CRS {weed_crs}")]
+    FieldCrsMismatch { field_crs: String, weed_crs: String },
+    #[error("weed zone {zone_id} CRS {zone_crs} does not match field CRS {field_crs}")]
+    ZoneCrsMismatch {
+        zone_id: String,
+        zone_crs: String,
+        field_crs: String,
+    },
+    #[error("weed zone {zone_id} is outside the field boundary")]
+    ZoneOutsideField { zone_id: String },
+    #[error("weed zone {zone_id} has not been verified")]
+    UnverifiedZone { zone_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1820,6 +1854,79 @@ pub fn run_weed_mapping(
         deterministic_cover_valid_pixels: cover.valid_pixels,
         total_weed_area_m2,
         low_confidence_count,
+        zones,
+    })
+}
+
+pub fn build_weed_spot_spray_prescription(
+    prescription_id: String,
+    weed_map: &WeedMapReport,
+    field_boundary: DetectionZoneGeometry,
+    verified_zone_ids: Vec<String>,
+    config: WeedSpotSprayPrescriptionConfig,
+) -> Result<interop::PrescriptionShapefileRequest, WeedPrescriptionError> {
+    let prescription_id =
+        normalize_prescription_text(prescription_id, WeedPrescriptionError::EmptyPrescriptionId)?;
+    let unit = normalize_prescription_text(config.unit, WeedPrescriptionError::EmptyUnit)?;
+    if !config.rate_per_zone.is_finite() || config.rate_per_zone <= 0.0 {
+        return Err(WeedPrescriptionError::InvalidRate);
+    }
+    let field_crs = normalize_prescription_text(
+        field_boundary.crs,
+        WeedPrescriptionError::EmptyFieldBoundaryCrs,
+    )?;
+    if field_crs != weed_map.crs {
+        return Err(WeedPrescriptionError::FieldCrsMismatch {
+            field_crs,
+            weed_crs: weed_map.crs.clone(),
+        });
+    }
+    if !valid_bbox(&field_boundary.bbox) {
+        return Err(WeedPrescriptionError::InvalidFieldBoundary);
+    }
+    if weed_map.zones.is_empty() {
+        return Err(WeedPrescriptionError::EmptyZones);
+    }
+    let verified_zone_ids = verified_zone_ids
+        .into_iter()
+        .map(|zone_id| normalize_prescription_text(zone_id, WeedPrescriptionError::EmptyZones))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+
+    let mut zones = Vec::new();
+    for zone in &weed_map.zones {
+        if !verified_zone_ids.contains(&zone.zone_id) {
+            return Err(WeedPrescriptionError::UnverifiedZone {
+                zone_id: zone.zone_id.clone(),
+            });
+        }
+        if zone.geometry.crs != field_crs {
+            return Err(WeedPrescriptionError::ZoneCrsMismatch {
+                zone_id: zone.zone_id.clone(),
+                zone_crs: zone.geometry.crs.clone(),
+                field_crs: field_crs.clone(),
+            });
+        }
+        if !bbox_within(&zone.geometry.bbox, &field_boundary.bbox) {
+            return Err(WeedPrescriptionError::ZoneOutsideField {
+                zone_id: zone.zone_id.clone(),
+            });
+        }
+        zones.push(interop::PrescriptionZone {
+            zone_id: zone.zone_id.clone(),
+            polygon: bbox_to_interop_ring(&zone.geometry.bbox),
+            crs: field_crs.clone(),
+            rate: config.rate_per_zone,
+            unit: unit.clone(),
+        });
+    }
+
+    Ok(interop::PrescriptionShapefileRequest {
+        prescription_id,
+        field: interop::PrescriptionField {
+            field_id: weed_map.field_id.clone(),
+            crs: field_crs,
+            boundary: bbox_to_interop_ring(&field_boundary.bbox),
+        },
         zones,
     })
 }
@@ -2800,6 +2907,43 @@ fn model_evaluation_block_reasons(
     reasons
 }
 
+fn normalize_prescription_text(
+    value: String,
+    error: WeedPrescriptionError,
+) -> Result<String, WeedPrescriptionError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn bbox_to_interop_ring(bbox: &GeoBounds) -> Vec<interop::InteropCoordinate> {
+    vec![
+        interop::InteropCoordinate {
+            x: bbox.min_lon,
+            y: bbox.min_lat,
+        },
+        interop::InteropCoordinate {
+            x: bbox.max_lon,
+            y: bbox.min_lat,
+        },
+        interop::InteropCoordinate {
+            x: bbox.max_lon,
+            y: bbox.max_lat,
+        },
+        interop::InteropCoordinate {
+            x: bbox.min_lon,
+            y: bbox.max_lat,
+        },
+        interop::InteropCoordinate {
+            x: bbox.min_lon,
+            y: bbox.min_lat,
+        },
+    ]
+}
+
 fn is_unit_fraction(value: f64) -> bool {
     value.is_finite() && (0.0..=1.0).contains(&value)
 }
@@ -2959,14 +3103,14 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 mod tests {
     use super::{
         apply_detection_verification, assemble_detection_finding, build_inference_run_record,
-        build_model_version_record, build_training_dataset_manifest, estimate_growth_stage,
-        evaluate_model_version, run_canopy_cover, run_disease_lesion_detection, run_pest_detection,
-        run_stand_count, run_tiled_inference_pipeline, run_weed_mapping,
-        transition_inference_run_status, validate_detection_finding_promotion,
-        validate_model_reference, CanopyCoverConfig, CanopyCoverError, CanopyCoverTile,
-        CropDetectionFindingError, CropDetectionFindingRequest, CropDetectionVerificationAction,
-        CropDetectionVerificationRequest, CropModelRegistryError, CropModelTask,
-        DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
+        build_model_version_record, build_training_dataset_manifest,
+        build_weed_spot_spray_prescription, estimate_growth_stage, evaluate_model_version,
+        run_canopy_cover, run_disease_lesion_detection, run_pest_detection, run_stand_count,
+        run_tiled_inference_pipeline, run_weed_mapping, transition_inference_run_status,
+        validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
+        CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
+        CropDetectionVerificationAction, CropDetectionVerificationRequest, CropModelRegistryError,
+        CropModelTask, DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
         FindingPromotionRequest, GrowthIndexObservation, GrowthStage, GrowthStageConfidence,
         GrowthStageConfig, InferenceModelReference, InferenceRunError, InferenceRunStatus,
@@ -2975,7 +3119,8 @@ mod tests {
         PestDetectionConfig, PestDetectionError, PlantCountConfig, PlantCountTile,
         PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason, TrainingDatasetError,
         TrainingDatasetManifest, TrainingDatasetSplit, TrainingDatasetSplitConfig,
-        WeedMappingConfig, WeedMappingError, WeedZoneCandidate,
+        WeedMappingConfig, WeedMappingError, WeedPrescriptionError,
+        WeedSpotSprayPrescriptionConfig, WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -3854,6 +3999,91 @@ mod tests {
     }
 
     #[test]
+    fn verified_weed_map_builds_vra_prescription_request_for_interop() {
+        let request = build_weed_spot_spray_prescription(
+            "rx:weed:field-1".to_string(),
+            &verified_weed_map(),
+            detection_geometry(0.0, 0.0, 10.0, 10.0),
+            vec!["weed:tile-1:1".to_string()],
+            spot_spray_config(),
+        )
+        .expect("verified weed map should become a prescription request");
+
+        assert_eq!(request.prescription_id, "rx:weed:field-1");
+        assert_eq!(request.field.field_id, "field-1");
+        assert_eq!(request.field.crs, "EPSG:32614");
+        assert_eq!(request.zones.len(), 1);
+        assert_eq!(request.zones[0].zone_id, "weed:tile-1:1");
+        assert_eq!(request.zones[0].rate, 12.5);
+        assert_eq!(request.zones[0].unit, "l_ha");
+
+        let taskdata = interop::export_prescription_taskdata(request)
+            .expect("aligned request should export through interop");
+        assert_eq!(taskdata.prescription_id, "rx:weed:field-1");
+        assert_eq!(taskdata.zone_count, 1);
+        assert!(taskdata.validation.valid);
+    }
+
+    #[test]
+    fn weed_prescription_refuses_crs_or_extent_mismatch() {
+        let weed_map = verified_weed_map();
+        let crs_error = build_weed_spot_spray_prescription(
+            "rx:weed:field-1".to_string(),
+            &weed_map,
+            DetectionZoneGeometry {
+                crs: "EPSG:4326".to_string(),
+                bbox: GeoBounds {
+                    min_lon: 0.0,
+                    min_lat: 0.0,
+                    max_lon: 100.0,
+                    max_lat: 100.0,
+                },
+            },
+            vec!["weed:tile-1:1".to_string()],
+            spot_spray_config(),
+        )
+        .expect_err("CRS mismatch should be refused");
+        assert!(matches!(
+            crs_error,
+            WeedPrescriptionError::FieldCrsMismatch { .. }
+        ));
+
+        let extent_error = build_weed_spot_spray_prescription(
+            "rx:weed:field-1".to_string(),
+            &weed_map,
+            detection_geometry(0.0, 0.0, 5.0, 5.0),
+            vec!["weed:tile-1:1".to_string()],
+            spot_spray_config(),
+        )
+        .expect_err("out-of-field weed zone should be refused");
+        assert_eq!(
+            extent_error,
+            WeedPrescriptionError::ZoneOutsideField {
+                zone_id: "weed:tile-1:1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn weed_prescription_refuses_unverified_zone() {
+        let error = build_weed_spot_spray_prescription(
+            "rx:weed:field-1".to_string(),
+            &verified_weed_map(),
+            detection_geometry(0.0, 0.0, 100.0, 100.0),
+            Vec::new(),
+            spot_spray_config(),
+        )
+        .expect_err("unverified zone should be refused");
+
+        assert_eq!(
+            error,
+            WeedPrescriptionError::UnverifiedZone {
+                zone_id: "weed:tile-1:1".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn training_dataset_manifest_produces_reproducible_splits_with_provenance() {
         let labels = vec![
             labeled_tile("tile-a", "field-1", "2026-06-01T10:00:00Z", "aphid", None),
@@ -4382,6 +4612,38 @@ mod tests {
             tile_id: tile_id.to_string(),
             confidence,
             bbox,
+        }
+    }
+
+    fn verified_weed_map() -> super::WeedMapReport {
+        let cover = cover_report();
+        run_weed_mapping(
+            "field-1".to_string(),
+            weed_model(),
+            true,
+            Some(&cover),
+            vec![weed_candidate(
+                "tile-1",
+                0.76,
+                GeoBounds {
+                    min_lon: 0.0,
+                    min_lat: 0.0,
+                    max_lon: 10.0,
+                    max_lat: 10.0,
+                },
+            )],
+            WeedMappingConfig {
+                low_confidence_threshold: 0.65,
+            },
+            "2026-06-01T12:20:00Z".to_string(),
+        )
+        .expect("weed map should build")
+    }
+
+    fn spot_spray_config() -> WeedSpotSprayPrescriptionConfig {
+        WeedSpotSprayPrescriptionConfig {
+            rate_per_zone: 12.5,
+            unit: "l_ha".to_string(),
         }
     }
 
