@@ -1,6 +1,7 @@
 use crate::schemas::{
-    FarmFieldRegistry, FarmRecord, FieldRecord, RecommendationLifecycleRegistry,
+    FarmFieldRegistry, FarmRecord, FieldRecord, GeoBounds, RecommendationLifecycleRegistry,
     RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportRecord,
+    SceneLayerRecord,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -281,6 +282,49 @@ pub struct GrowerRecommendationRow {
     pub status: RecommendationStatus,
     pub title: String,
     pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowerFieldMapOverlay {
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub field_id: String,
+    pub layer_id: String,
+    pub product_type: String,
+    pub crs: String,
+    pub field_extent: GeoBounds,
+    pub layer_extent: GeoBounds,
+    pub read_only: bool,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum GrowerFieldMapError {
+    #[error(transparent)]
+    Access(#[from] GrowerPortalAccessError),
+    #[error("layer {layer_id} is not in scope for field {field_id}")]
+    LayerOutOfScope { field_id: String, layer_id: String },
+    #[error("layer {layer_id} missing CRS")]
+    MissingLayerCrs { layer_id: String },
+    #[error("field {field_id} missing boundary CRS")]
+    MissingFieldCrs { field_id: String },
+    #[error("layer {layer_id} missing extent")]
+    MissingLayerExtent { layer_id: String },
+    #[error("CRS mismatch for field {field_id} and layer {layer_id}: field {field_crs} != layer {layer_crs}")]
+    CrsMismatch {
+        field_id: String,
+        layer_id: String,
+        field_crs: String,
+        layer_crs: String,
+    },
+    #[error("extent mismatch for field {field_id} and layer {layer_id}: {edge} field={field_value} layer={layer_value}")]
+    ExtentMismatch {
+        field_id: String,
+        layer_id: String,
+        edge: &'static str,
+        field_value: f64,
+        layer_value: f64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -909,6 +953,140 @@ fn grower_recommendation_row(
     }
 }
 
+pub fn build_grower_field_map_overlay(
+    scope: &GrowerPortalSessionScope,
+    farm_fields: &FarmFieldRegistry,
+    field_id: &str,
+    layer: &SceneLayerRecord,
+) -> Result<GrowerFieldMapOverlay, GrowerFieldMapError> {
+    let org_key = scope.org_id.to_string();
+    let field = farm_fields
+        .fields_for_org(&org_key)
+        .into_iter()
+        .find(|field| field.field_id == field_id)
+        .ok_or_else(|| GrowerPortalAccessError::FieldNotFound {
+            field_id: field_id.to_string(),
+        })?;
+    if !scope.field_ids.iter().any(|scoped| scoped == field_id) {
+        return Err(GrowerPortalAccessError::Forbidden {
+            evidence: GrowerPortalAccessEvidence {
+                grower_id: scope.grower_id,
+                org_id: scope.org_id,
+                role: scope.role,
+                action: ControlPlaneAction::ReadEntity,
+                field_id: field_id.to_string(),
+                target_org_id: Some(field.org_id.clone()),
+                decision: AuthorizationDecision::Denied,
+                reason_code: "field_out_of_scope".to_string(),
+            },
+        }
+        .into());
+    }
+    if layer.scene_id.trim().is_empty() || layer.layer_id.trim().is_empty() {
+        return Err(GrowerFieldMapError::LayerOutOfScope {
+            field_id: field_id.to_string(),
+            layer_id: layer.layer_id.clone(),
+        });
+    }
+    let field_crs = field
+        .boundary
+        .crs
+        .as_deref()
+        .map(str::trim)
+        .filter(|crs| !crs.is_empty())
+        .ok_or_else(|| GrowerFieldMapError::MissingFieldCrs {
+            field_id: field_id.to_string(),
+        })?;
+    let layer_crs = layer
+        .crs
+        .trim()
+        .is_empty()
+        .then_some(())
+        .map_or(Some(layer.crs.trim()), |_| None)
+        .ok_or_else(|| GrowerFieldMapError::MissingLayerCrs {
+            layer_id: layer.layer_id.clone(),
+        })?;
+    if field_crs != layer_crs {
+        return Err(GrowerFieldMapError::CrsMismatch {
+            field_id: field_id.to_string(),
+            layer_id: layer.layer_id.clone(),
+            field_crs: field_crs.to_string(),
+            layer_crs: layer_crs.to_string(),
+        });
+    }
+    let layer_extent =
+        layer
+            .extent
+            .clone()
+            .ok_or_else(|| GrowerFieldMapError::MissingLayerExtent {
+                layer_id: layer.layer_id.clone(),
+            })?;
+    assert_overlay_extent_edge(
+        field_id,
+        &layer.layer_id,
+        "min_lon",
+        field.extent.min_lon,
+        layer_extent.min_lon,
+    )?;
+    assert_overlay_extent_edge(
+        field_id,
+        &layer.layer_id,
+        "min_lat",
+        field.extent.min_lat,
+        layer_extent.min_lat,
+    )?;
+    assert_overlay_extent_edge(
+        field_id,
+        &layer.layer_id,
+        "max_lon",
+        field.extent.max_lon,
+        layer_extent.max_lon,
+    )?;
+    assert_overlay_extent_edge(
+        field_id,
+        &layer.layer_id,
+        "max_lat",
+        field.extent.max_lat,
+        layer_extent.max_lat,
+    )?;
+
+    Ok(GrowerFieldMapOverlay {
+        grower_id: scope.grower_id,
+        org_id: scope.org_id,
+        field_id: field.field_id,
+        layer_id: layer.layer_id.clone(),
+        product_type: layer.product_type.clone(),
+        crs: field_crs.to_string(),
+        field_extent: field.extent,
+        layer_extent,
+        read_only: true,
+        evidence_refs: vec![
+            format!("field:{field_id}:boundary"),
+            format!("layer:{}:{}", layer.layer_id, layer.product_type),
+        ],
+    })
+}
+
+fn assert_overlay_extent_edge(
+    field_id: &str,
+    layer_id: &str,
+    edge: &'static str,
+    field_value: f64,
+    layer_value: f64,
+) -> Result<(), GrowerFieldMapError> {
+    if (field_value - layer_value).abs() <= crate::schemas::GEO_EXTENT_ASSERTION_TOLERANCE {
+        Ok(())
+    } else {
+        Err(GrowerFieldMapError::ExtentMismatch {
+            field_id: field_id.to_string(),
+            layer_id: layer_id.to_string(),
+            edge,
+            field_value,
+            layer_value,
+        })
+    }
+}
+
 impl TenantScoped for OrganizationRecord {
     fn tenant_org_id(&self) -> Uuid {
         self.org_id
@@ -1359,7 +1537,7 @@ mod tests {
         FarmFieldEntityStatus, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord,
         GeoBounds, GeoPoint, RecommendationLifecycleRegistry, RecommendationPriority,
         RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType, ReportFormat,
-        ReportRecord, ReportVisibility,
+        ReportRecord, ReportVisibility, SceneLayerRecord,
     };
     use chrono::TimeZone;
 
@@ -1967,6 +2145,108 @@ mod tests {
     }
 
     #[test]
+    fn grower_field_map_overlay_accepts_matching_boundary_and_layer_extent() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_a = control
+            .create_organization("Org A".to_string())
+            .expect("org A creates");
+        let grower = control
+            .create_user_with_role(
+                org_a.org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let mut farm_fields = FarmFieldRegistry::default();
+        insert_test_farm_field_scope(&mut farm_fields, org_a.org_id, "farm-a", "field-a");
+        let scope =
+            resolve_grower_portal_session_scope(&control, &farm_fields, grower.user.user_id)
+                .expect("grower scope resolves");
+
+        let overlay = build_grower_field_map_overlay(
+            &scope,
+            &farm_fields,
+            "field-a",
+            &scene_layer("layer-ndvi", "EPSG:4326", Some(test_extent())),
+        )
+        .expect("matching layer should overlay");
+
+        assert_eq!(overlay.field_id, "field-a");
+        assert_eq!(overlay.product_type, "ndvi");
+        assert_eq!(overlay.crs, "EPSG:4326");
+        assert!(overlay.read_only);
+        assert_eq!(overlay.field_extent, overlay.layer_extent);
+    }
+
+    #[test]
+    fn grower_field_map_overlay_refuses_crs_mismatch() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_a = control
+            .create_organization("Org A".to_string())
+            .expect("org A creates");
+        let grower = control
+            .create_user_with_role(
+                org_a.org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let mut farm_fields = FarmFieldRegistry::default();
+        insert_test_farm_field_scope(&mut farm_fields, org_a.org_id, "farm-a", "field-a");
+        let scope =
+            resolve_grower_portal_session_scope(&control, &farm_fields, grower.user.user_id)
+                .expect("grower scope resolves");
+
+        let error = build_grower_field_map_overlay(
+            &scope,
+            &farm_fields,
+            "field-a",
+            &scene_layer("layer-ndvi", "EPSG:3857", Some(test_extent())),
+        )
+        .expect_err("mismatched CRS should be refused");
+
+        assert!(matches!(error, GrowerFieldMapError::CrsMismatch { .. }));
+    }
+
+    #[test]
+    fn grower_field_map_overlay_refuses_extent_mismatch() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_a = control
+            .create_organization("Org A".to_string())
+            .expect("org A creates");
+        let grower = control
+            .create_user_with_role(
+                org_a.org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let mut farm_fields = FarmFieldRegistry::default();
+        insert_test_farm_field_scope(&mut farm_fields, org_a.org_id, "farm-a", "field-a");
+        let scope =
+            resolve_grower_portal_session_scope(&control, &farm_fields, grower.user.user_id)
+                .expect("grower scope resolves");
+        let mut mismatched = test_extent();
+        mismatched.max_lon += 0.1;
+
+        let error = build_grower_field_map_overlay(
+            &scope,
+            &farm_fields,
+            "field-a",
+            &scene_layer("layer-ndvi", "EPSG:4326", Some(mismatched)),
+        )
+        .expect_err("mismatched extent should be refused");
+
+        assert!(matches!(
+            error,
+            GrowerFieldMapError::ExtentMismatch {
+                edge: "max_lon",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn grower_portal_field_read_denies_cross_tenant_and_audits() {
         let mut control = ControlPlaneRegistry::default();
         let org_a = control
@@ -2364,6 +2644,18 @@ mod tests {
             annotation_ids: Vec::new(),
             created_at: "2026-06-15T12:00:00Z".to_string(),
             updated_at: "2026-06-15T12:00:00Z".to_string(),
+        }
+    }
+
+    fn scene_layer(layer_id: &str, crs: &str, extent: Option<GeoBounds>) -> SceneLayerRecord {
+        SceneLayerRecord {
+            layer_id: layer_id.to_string(),
+            scene_id: "scene-a".to_string(),
+            product_type: "ndvi".to_string(),
+            crs: crs.to_string(),
+            extent,
+            resolution: None,
+            uri: format!("file:///layers/{layer_id}.tif"),
         }
     }
 
