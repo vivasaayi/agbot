@@ -516,6 +516,30 @@ pub struct ScalarConsumerEvaluation {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetCarbonConsumerEvaluationRequest {
+    #[serde(default)]
+    pub registrations: Vec<ScalarConsumerMetricRegistration>,
+    #[serde(default)]
+    pub points: Vec<ScalarConsumerPoint>,
+    pub fleet_target: ZonalTrendTarget,
+    pub fleet_trend_config: ZonalTrendConfig,
+    pub fleet_baseline_config: RollingBaselineConfig,
+    pub carbon_target: SeasonalComparisonTarget,
+    pub carbon_config: SeasonalComparisonConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetCarbonConsumerEvaluation {
+    pub registered_metric_count: usize,
+    pub appended_point_count: usize,
+    pub fleet_rul_trend: ZonalTrendResult,
+    pub fleet_anomaly: RollingBaselineResult,
+    pub carbon_seasonal_change: SeasonalComparisonResult,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompareViewFeed {
     pub schema_version: String,
     pub entity_ref: String,
@@ -1374,39 +1398,8 @@ pub fn build_change_reproducibility_report(
 pub fn evaluate_scalar_consumer_series(
     request: ScalarConsumerEvaluationRequest,
 ) -> Result<ScalarConsumerEvaluation, TimeSeriesError> {
-    if request.registrations.is_empty() {
-        return Err(TimeSeriesError::EmptyScalarConsumerRegistrations);
-    }
-    if request.points.is_empty() {
-        return Err(TimeSeriesError::EmptyScalarConsumerPoints);
-    }
-
-    let mut engine = TimeSeriesEngine::default();
-    let registered_metric_count = request.registrations.len();
-    for registration in request.registrations {
-        let registration = normalize_scalar_consumer_registration(registration)?;
-        engine.register_metric(MetricDefinition {
-            metric: registration.metric,
-            unit: registration.unit,
-            kind: MetricKind::Scalar,
-            expected_cadence: registration.expected_cadence,
-        })?;
-    }
-
-    let mut appended_point_count = 0;
-    for point in request.points {
-        let point = normalize_scalar_consumer_point(point)?;
-        engine.append(SeriesPoint {
-            entity_ref: point.entity_ref,
-            metric: point.metric,
-            unit: point.unit,
-            t: point.t,
-            value: SeriesValue::Scalar { value: point.value },
-            source_ref: point.source_ref,
-            created_at: point.created_at,
-        })?;
-        appended_point_count += 1;
-    }
+    let (engine, registered_metric_count, appended_point_count) =
+        build_scalar_consumer_engine(request.registrations, request.points)?;
 
     let trend = engine.compute_zonal_trend(request.target.clone(), request.trend_config)?;
     let baseline = engine.compute_rolling_baseline(request.target, request.baseline_config)?;
@@ -1420,6 +1413,39 @@ pub fn evaluate_scalar_consumer_series(
         appended_point_count,
         trend,
         baseline,
+        evidence_refs,
+    })
+}
+
+pub fn evaluate_fleet_carbon_consumers(
+    request: FleetCarbonConsumerEvaluationRequest,
+) -> Result<FleetCarbonConsumerEvaluation, TimeSeriesError> {
+    let (engine, registered_metric_count, appended_point_count) =
+        build_scalar_consumer_engine(request.registrations, request.points)?;
+
+    let fleet_rul_trend =
+        engine.compute_zonal_trend(request.fleet_target.clone(), request.fleet_trend_config)?;
+    let fleet_anomaly =
+        engine.compute_rolling_baseline(request.fleet_target, request.fleet_baseline_config)?;
+    let carbon_seasonal_change =
+        engine.compute_seasonal_comparison(request.carbon_target, request.carbon_config)?;
+
+    let mut evidence_refs = Vec::new();
+    for reference in fleet_rul_trend
+        .evidence_refs
+        .iter()
+        .chain(&fleet_anomaly.evidence_refs)
+        .chain(&carbon_seasonal_change.evidence_refs)
+    {
+        push_unique(&mut evidence_refs, reference.clone());
+    }
+
+    Ok(FleetCarbonConsumerEvaluation {
+        registered_metric_count,
+        appended_point_count,
+        fleet_rul_trend,
+        fleet_anomaly,
+        carbon_seasonal_change,
         evidence_refs,
     })
 }
@@ -2234,6 +2260,47 @@ fn normalize_metric_definition(
     Ok(definition)
 }
 
+fn build_scalar_consumer_engine(
+    registrations: Vec<ScalarConsumerMetricRegistration>,
+    points: Vec<ScalarConsumerPoint>,
+) -> Result<(TimeSeriesEngine, usize, usize), TimeSeriesError> {
+    if registrations.is_empty() {
+        return Err(TimeSeriesError::EmptyScalarConsumerRegistrations);
+    }
+    if points.is_empty() {
+        return Err(TimeSeriesError::EmptyScalarConsumerPoints);
+    }
+
+    let mut engine = TimeSeriesEngine::default();
+    let registered_metric_count = registrations.len();
+    for registration in registrations {
+        let registration = normalize_scalar_consumer_registration(registration)?;
+        engine.register_metric(MetricDefinition {
+            metric: registration.metric,
+            unit: registration.unit,
+            kind: MetricKind::Scalar,
+            expected_cadence: registration.expected_cadence,
+        })?;
+    }
+
+    let mut appended_point_count = 0;
+    for point in points {
+        let point = normalize_scalar_consumer_point(point)?;
+        engine.append(SeriesPoint {
+            entity_ref: point.entity_ref,
+            metric: point.metric,
+            unit: point.unit,
+            t: point.t,
+            value: SeriesValue::Scalar { value: point.value },
+            source_ref: point.source_ref,
+            created_at: point.created_at,
+        })?;
+        appended_point_count += 1;
+    }
+
+    Ok((engine, registered_metric_count, appended_point_count))
+}
+
 fn normalize_scalar_consumer_registration(
     registration: ScalarConsumerMetricRegistration,
 ) -> Result<ScalarConsumerMetricRegistration, TimeSeriesError> {
@@ -3040,20 +3107,22 @@ mod tests {
     use super::{
         align_raster_pair, build_change_reproducibility_report, build_compare_view_feed,
         compare_view_refusal_from_guard, compute_aligned_raster_change,
-        derive_ranked_change_events, evaluate_scalar_consumer_series,
-        evaluate_series_cadence_health, export_change_mask_geotiff, export_change_zones_geojson,
-        export_series_csv, guard_coregisterable_pair, normalize_raster_change, AlignedRasterGrid,
+        derive_ranked_change_events, evaluate_fleet_carbon_consumers,
+        evaluate_scalar_consumer_series, evaluate_series_cadence_health,
+        export_change_mask_geotiff, export_change_zones_geojson, export_series_csv,
+        guard_coregisterable_pair, normalize_raster_change, AlignedRasterGrid,
         AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason, ChangeEvent,
         ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection, ChangeEventReasonCode,
         ChangeReproducibilityRequest, ChangeSourcePair, ChangeZoneExportFeature, ChangeZonePolygon,
-        GeoExtent, MetricDefinition, MetricKind, NormalizedChangeOutcome,
-        NormalizedRasterChangeConfig, RasterAlignmentConfig, RasterAlignmentEvidence,
-        RasterChangeConfig, RasterChangeNormalizationMethod, RasterChangeResult, RasterResolution,
-        RasterSeriesValue, RollingBaselineConfig, ScalarConsumerEvaluationRequest,
-        ScalarConsumerMetricRegistration, ScalarConsumerPoint, SeasonalComparisonConfig,
-        SeasonalComparisonTarget, SeriesCadenceHealthConfig, SeriesFreshnessState, SeriesPoint,
-        SeriesProductIngest, SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine,
-        TimeSeriesError, TimeSeriesStore, TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
+        FleetCarbonConsumerEvaluationRequest, GeoExtent, MetricDefinition, MetricKind,
+        NormalizedChangeOutcome, NormalizedRasterChangeConfig, RasterAlignmentConfig,
+        RasterAlignmentEvidence, RasterChangeConfig, RasterChangeNormalizationMethod,
+        RasterChangeResult, RasterResolution, RasterSeriesValue, RollingBaselineConfig,
+        ScalarConsumerEvaluationRequest, ScalarConsumerMetricRegistration, ScalarConsumerPoint,
+        SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesCadenceHealthConfig,
+        SeriesFreshnessState, SeriesPoint, SeriesProductIngest, SeriesQuery, SeriesValue,
+        TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore, TrendDirection,
+        ZonalTrendConfig, ZonalTrendTarget,
     };
 
     #[test]
@@ -3442,6 +3511,165 @@ mod tests {
                 metric: "soil_moisture_percent".to_string(),
                 expected_unit: "percent".to_string(),
                 actual_unit: "fraction".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn fleet_health_and_carbon_consumers_reuse_shared_trend_and_seasonal_logic() {
+        let evaluation = evaluate_fleet_carbon_consumers(FleetCarbonConsumerEvaluationRequest {
+            registrations: fleet_carbon_consumer_registrations(),
+            points: vec![
+                consumer_point(
+                    "fleet_health",
+                    "drone:hawk-7:motor:left-front",
+                    "remaining_useful_life_hours",
+                    "hour",
+                    "2026-06-01T10:00:00Z",
+                    120.0,
+                ),
+                consumer_point(
+                    "fleet_health",
+                    "drone:hawk-7:motor:left-front",
+                    "remaining_useful_life_hours",
+                    "hour",
+                    "2026-06-08T10:00:00Z",
+                    98.0,
+                ),
+                consumer_point(
+                    "fleet_health",
+                    "drone:hawk-7:motor:left-front",
+                    "remaining_useful_life_hours",
+                    "hour",
+                    "2026-06-15T10:00:00Z",
+                    70.0,
+                ),
+                consumer_point(
+                    "carbon",
+                    "field:alpha:zone:NE",
+                    "carbon_stock_tonnes_per_ha",
+                    "tonne_per_hectare",
+                    "2024-06-14T10:00:00Z",
+                    46.0,
+                ),
+                consumer_point(
+                    "carbon",
+                    "field:alpha:zone:NE",
+                    "carbon_stock_tonnes_per_ha",
+                    "tonne_per_hectare",
+                    "2025-06-15T10:00:00Z",
+                    50.0,
+                ),
+                consumer_point(
+                    "carbon",
+                    "field:alpha:zone:NE",
+                    "carbon_stock_tonnes_per_ha",
+                    "tonne_per_hectare",
+                    "2026-06-15T10:00:00Z",
+                    56.0,
+                ),
+            ],
+            fleet_target: fleet_rul_target(),
+            fleet_trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            fleet_baseline_config: RollingBaselineConfig {
+                window_points: 2,
+                anomaly_band: 20.0,
+            },
+            carbon_target: SeasonalComparisonTarget {
+                entity_ref: "field:alpha:zone:NE".to_string(),
+                metric: "carbon_stock_tonnes_per_ha".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32614".to_string(),
+                current_t: "2026-06-15T10:00:00Z".to_string(),
+            },
+            carbon_config: SeasonalComparisonConfig {
+                min_seasonal_points: 2,
+                day_of_year_tolerance: 1,
+            },
+        })
+        .expect("fleet and carbon consumers should evaluate on shared engine");
+
+        assert_eq!(evaluation.registered_metric_count, 2);
+        assert_eq!(evaluation.appended_point_count, 6);
+        assert_eq!(
+            evaluation.fleet_rul_trend.direction,
+            TrendDirection::Decreasing
+        );
+        assert!(evaluation.fleet_rul_trend.slope_per_day < 0.0);
+        assert!(evaluation.fleet_anomaly.anomaly);
+        assert!((evaluation.fleet_anomaly.delta_from_baseline - -39.0).abs() < 0.000001);
+        assert_eq!(evaluation.carbon_seasonal_change.seasonal_points.len(), 2);
+        assert!(
+            (evaluation
+                .carbon_seasonal_change
+                .delta_from_seasonal_baseline
+                - 8.0)
+                .abs()
+                < 0.000001
+        );
+        assert!(evaluation.evidence_refs.contains(
+            &"fleet_health:remaining_useful_life_hours:2026-06-15T10:00:00Z".to_string()
+        ));
+        assert!(evaluation
+            .evidence_refs
+            .contains(&"carbon:carbon_stock_tonnes_per_ha:2026-06-15T10:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn fleet_carbon_consumers_refuse_insufficient_fleet_history() {
+        let error = evaluate_fleet_carbon_consumers(FleetCarbonConsumerEvaluationRequest {
+            registrations: fleet_carbon_consumer_registrations(),
+            points: vec![
+                consumer_point(
+                    "fleet_health",
+                    "drone:hawk-7:motor:left-front",
+                    "remaining_useful_life_hours",
+                    "hour",
+                    "2026-06-15T10:00:00Z",
+                    70.0,
+                ),
+                consumer_point(
+                    "carbon",
+                    "field:alpha:zone:NE",
+                    "carbon_stock_tonnes_per_ha",
+                    "tonne_per_hectare",
+                    "2026-06-15T10:00:00Z",
+                    56.0,
+                ),
+            ],
+            fleet_target: fleet_rul_target(),
+            fleet_trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            fleet_baseline_config: RollingBaselineConfig {
+                window_points: 2,
+                anomaly_band: 20.0,
+            },
+            carbon_target: SeasonalComparisonTarget {
+                entity_ref: "field:alpha:zone:NE".to_string(),
+                metric: "carbon_stock_tonnes_per_ha".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32614".to_string(),
+                current_t: "2026-06-15T10:00:00Z".to_string(),
+            },
+            carbon_config: SeasonalComparisonConfig {
+                min_seasonal_points: 2,
+                day_of_year_tolerance: 1,
+            },
+        })
+        .expect_err("insufficient fleet history should be refused");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::InsufficientTrendHistory {
+                entity_ref: "drone:hawk-7:motor:left-front".to_string(),
+                metric: "remaining_useful_life_hours".to_string(),
+                observed_points: 1,
+                required_points: 3
             }
         );
     }
@@ -4873,6 +5101,23 @@ mod tests {
             consumer_registration("drought", "drought_spi", "index"),
             consumer_registration("soil_iot", "soil_moisture_percent", "percent"),
         ]
+    }
+
+    fn fleet_carbon_consumer_registrations() -> Vec<ScalarConsumerMetricRegistration> {
+        vec![
+            consumer_registration("fleet_health", "remaining_useful_life_hours", "hour"),
+            consumer_registration("carbon", "carbon_stock_tonnes_per_ha", "tonne_per_hectare"),
+        ]
+    }
+
+    fn fleet_rul_target() -> ZonalTrendTarget {
+        ZonalTrendTarget {
+            entity_ref: "drone:hawk-7:motor:left-front".to_string(),
+            metric: "remaining_useful_life_hours".to_string(),
+            zone_ref: "component:left-front-motor".to_string(),
+            zone_crs: "asset-local".to_string(),
+            range: TimeRange::default(),
+        }
     }
 
     fn consumer_registration(
