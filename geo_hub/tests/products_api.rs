@@ -8778,6 +8778,40 @@ async fn recommendation_creation_rejects_dangling_annotation_reference() -> Resu
 }
 
 #[tokio::test]
+async fn mobile_spa_serves_search_analyze_ui_with_error_surface() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/app")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 256 * 1024).await?;
+    let html = String::from_utf8_lossy(&body);
+
+    assert!(html.contains("/api/mobile/scenes/search"));
+    assert!(html.contains("/api/mobile/analyze"));
+    assert!(html.contains("renderSceneList(state.scenes)"));
+    assert!(html.contains("scene.cloud_cover"));
+    assert!(html.contains("formatSceneDate(scene.acquired_at)"));
+    assert!(html.contains("setStatus(error.message || \"Scene search failed.\", \"error\")"));
+    assert!(html.contains("setStatus(error.message || \"Analysis failed.\", \"error\")"));
+    assert!(html.contains("Server response is not valid JSON."));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn mobile_sample_endpoints_return_products_and_handle_invalid_inputs() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

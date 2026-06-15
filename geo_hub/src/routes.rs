@@ -13108,8 +13108,8 @@ mod tests {
     use super::{
         build_field_record, build_geospatial_metadata, build_product_summary,
         cached_landsat_scene_id, content_type_for_path, fields_from_geojson, geojson_from_fields,
-        is_missing_scene_error, is_png, normalize_field_geometry, scene_extent_intersects_bounds,
-        AppError, CreateFieldRequest,
+        is_lower_cloud, is_missing_scene_error, is_png, normalize_field_geometry,
+        scene_extent_intersects_bounds, AppError, CreateFieldRequest,
     };
     use crate::landsat;
     use geojson::{Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue};
