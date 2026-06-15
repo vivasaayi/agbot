@@ -8271,6 +8271,15 @@ pub struct MarketplaceCatalogItemRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketplacePortalEntry {
+    pub org_id: String,
+    pub account_id: String,
+    pub label: String,
+    pub href: String,
+    pub visible: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarketplaceAccountError {
     #[error("marketplace account_id cannot be empty")]
@@ -8331,6 +8340,24 @@ pub enum MarketplaceCatalogError {
     UnsupportedUnit { value: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarketplacePortalEntryError {
+    #[error("marketplace portal org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("marketplace portal account is required")]
+    MissingAccount,
+    #[error("marketplace portal account {account_id} belongs to {account_org_id}, not {org_id}")]
+    OrgMismatch {
+        account_id: String,
+        account_org_id: String,
+        org_id: String,
+    },
+    #[error("marketplace portal account {account_id} is not active")]
+    AccountNotActive { account_id: String },
+    #[error("marketplace portal account {account_id} has no marketplace access role")]
+    MissingMarketplaceRole { account_id: String },
+}
+
 pub fn build_marketplace_account_record(
     request: MarketplaceAccountCreateRequest,
     org_exists: bool,
@@ -8356,6 +8383,44 @@ pub fn build_marketplace_account_record(
         status: request.status.unwrap_or_default(),
         created_at: created_at.clone(),
         updated_at: created_at,
+    })
+}
+
+pub fn build_marketplace_portal_entry(
+    account: Option<&MarketplaceAccountRecord>,
+    org_id: String,
+) -> Result<MarketplacePortalEntry, MarketplacePortalEntryError> {
+    let org_id =
+        normalize_marketplace_text(org_id).ok_or(MarketplacePortalEntryError::EmptyOrgId)?;
+    let account = account.ok_or(MarketplacePortalEntryError::MissingAccount)?;
+    if account.org_id != org_id {
+        return Err(MarketplacePortalEntryError::OrgMismatch {
+            account_id: account.account_id.clone(),
+            account_org_id: account.org_id.clone(),
+            org_id,
+        });
+    }
+    if account.status != MarketplaceAccountStatus::Active {
+        return Err(MarketplacePortalEntryError::AccountNotActive {
+            account_id: account.account_id.clone(),
+        });
+    }
+    let has_marketplace_role = account
+        .role_refs
+        .iter()
+        .any(|role_ref| role_ref == "marketplace:access" || role_ref.starts_with("marketplace:"));
+    if !has_marketplace_role {
+        return Err(MarketplacePortalEntryError::MissingMarketplaceRole {
+            account_id: account.account_id.clone(),
+        });
+    }
+
+    Ok(MarketplacePortalEntry {
+        org_id: account.org_id.clone(),
+        account_id: account.account_id.clone(),
+        label: "Marketplace".to_string(),
+        href: format!("/marketplace?org_id={}", account.org_id),
+        visible: true,
     })
 }
 
@@ -12360,11 +12425,11 @@ mod tests {
         apply_tractor_implement_command, assemble_drought_report, assert_flight_operation_allowed,
         assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
         build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
-        build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
-        build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
-        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
-        compute_water_evapotranspiration, compute_weather_growing_degree_day,
-        compute_weather_reference_et, create_versioned_content,
+        build_marketplace_account_record, build_marketplace_portal_entry,
+        build_soil_moisture_reading, build_sustainability_record, build_tractor_field_ops_replay,
+        build_tractor_field_ops_session_log, compute_drought_baseline_trend, compute_drought_index,
+        compute_drought_risk_score, compute_water_evapotranspiration,
+        compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -12412,11 +12477,11 @@ mod tests {
         MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
         MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
         MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplacePartyType,
-        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
-        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        MarketplacePortalEntryError, MarketplaceUnitOfMeasure, MultispectralImage,
+        OpenDataPublishError, OpenDataPublishRefusalReason, OpenDataPublishRequest,
+        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
+        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
+        RecommendationStatus, RecommendationStatusChangeType, RemoteSensingMoistureIndex,
         RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
         RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
         ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
@@ -13888,6 +13953,46 @@ mod tests {
             error,
             MarketplaceCatalogError::UnsupportedUnit {
                 value: "pallet".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn marketplace_portal_entry_renders_for_marketplace_role() {
+        let account = marketplace_account_fixture(
+            "grower-001",
+            "org-alpha",
+            MarketplacePartyType::Grower,
+            MarketplaceAccountStatus::Active,
+        );
+
+        let entry = build_marketplace_portal_entry(Some(&account), " org-alpha ".to_string())
+            .expect("marketplace role should show portal entry");
+
+        assert_eq!(entry.org_id, "org-alpha");
+        assert_eq!(entry.account_id, "grower-001");
+        assert_eq!(entry.label, "Marketplace");
+        assert_eq!(entry.href, "/marketplace?org_id=org-alpha");
+        assert!(entry.visible);
+    }
+
+    #[test]
+    fn marketplace_portal_entry_rejects_account_without_access_role() {
+        let mut account = marketplace_account_fixture(
+            "grower-001",
+            "org-alpha",
+            MarketplacePartyType::Grower,
+            MarketplaceAccountStatus::Active,
+        );
+        account.role_refs = vec!["portal:viewer".to_string()];
+
+        let error = build_marketplace_portal_entry(Some(&account), "org-alpha".to_string())
+            .expect_err("missing marketplace role should hide entry");
+
+        assert_eq!(
+            error,
+            MarketplacePortalEntryError::MissingMarketplaceRole {
+                account_id: "grower-001".to_string()
             }
         );
     }

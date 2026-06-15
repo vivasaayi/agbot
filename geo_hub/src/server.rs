@@ -250,6 +250,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_marketplace_catalog_item),
         )
         .route(
+            "/api/portal/marketplace-entry",
+            get(routes::get_marketplace_portal_entry),
+        )
+        .route(
             "/api/sustainability/records",
             get(routes::list_sustainability_records).post(routes::create_sustainability_record),
         )

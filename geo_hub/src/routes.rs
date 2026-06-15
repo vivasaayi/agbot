@@ -87,12 +87,13 @@ use shared::schemas::{
     append_content_version, assert_raster_spatial_ref, bind_fleet_node_identity,
     bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
     build_collaboration_message, build_marketplace_account_record,
-    build_marketplace_catalog_item_record, build_soil_moisture_reading,
-    build_sustainability_record, build_tractor_record, compute_drought_index,
-    create_versioned_content, normalize_weather_provider_forecast, parse_content_status,
-    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
-    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
-    parse_marketplace_party_type, parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
+    build_marketplace_catalog_item_record, build_marketplace_portal_entry,
+    build_soil_moisture_reading, build_sustainability_record, build_tractor_record,
+    compute_drought_index, create_versioned_content, normalize_weather_provider_forecast,
+    parse_content_status, parse_content_type, parse_drought_index_type,
+    parse_marketplace_account_status, parse_marketplace_catalog_category,
+    parse_marketplace_catalog_item_kind, parse_marketplace_party_type,
+    parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
     prepare_open_data_publication, soil_moisture_rejection_reason_for_error,
     soil_moisture_rejection_record, transition_marketplace_account_status, validate_field_boundary,
@@ -108,19 +109,19 @@ use shared::schemas::{
     ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
     MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
     MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
-    MarketplaceCatalogItemRecord, MarketplacePartyType, MultispectralImage, OpenDataPublication,
-    OpenDataPublishError, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-    RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
-    ReportVisibility, SoilMoistureReadingError, SoilMoistureReadingRecord,
-    SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
-    SustainabilityMetricType, SustainabilityRecord, SustainabilityRecordCreateRequest,
-    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
-    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
-    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
-    TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
-    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
-    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
-    GEO_EXTENT_ASSERTION_TOLERANCE,
+    MarketplaceCatalogItemRecord, MarketplacePartyType, MarketplacePortalEntry,
+    MarketplacePortalEntryError, MultispectralImage, OpenDataPublication, OpenDataPublishError,
+    OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
+    SoilMoistureReadingError, SoilMoistureReadingRecord, SoilMoistureReadingRequest,
+    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, SustainabilityMetricType,
+    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
+    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
+    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
+    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
+    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
+    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -632,6 +633,12 @@ pub struct MarketplaceCatalogListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketplaceCatalogScopeQuery {
     pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplacePortalEntryQuery {
+    pub org_id: Option<String>,
+    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3190,6 +3197,22 @@ pub async fn get_marketplace_catalog_item(
     }
 
     Ok(Json(item))
+}
+
+pub async fn get_marketplace_portal_entry(
+    Query(query): Query<MarketplacePortalEntryQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplacePortalEntry>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let account_id = normalize_optional_text(query.account_id).ok_or_else(|| {
+        AppError::BadRequest("account_id query parameter is required".to_string())
+    })?;
+    let account = load_marketplace_account(&state, &account_id).await?;
+    let entry = build_marketplace_portal_entry(account.as_ref(), org_id)
+        .map_err(marketplace_portal_entry_error)?;
+
+    Ok(Json(entry))
 }
 
 pub async fn create_sustainability_record(
@@ -8310,6 +8333,18 @@ fn marketplace_account_error(error: MarketplaceAccountError) -> AppError {
 
 fn marketplace_catalog_error(error: MarketplaceCatalogError) -> AppError {
     AppError::BadRequest(error.to_string())
+}
+
+fn marketplace_portal_entry_error(error: MarketplacePortalEntryError) -> AppError {
+    match error {
+        MarketplacePortalEntryError::MissingAccount
+        | MarketplacePortalEntryError::OrgMismatch { .. }
+        | MarketplacePortalEntryError::AccountNotActive { .. }
+        | MarketplacePortalEntryError::MissingMarketplaceRole { .. } => {
+            AppError::Forbidden(error.to_string())
+        }
+        MarketplacePortalEntryError::EmptyOrgId => AppError::BadRequest(error.to_string()),
+    }
 }
 
 fn sustainability_record_error(error: SustainabilityRecordError) -> AppError {

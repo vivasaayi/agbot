@@ -3383,6 +3383,66 @@ async fn marketplace_catalog_item_rejects_invalid_unit_without_writing() -> Resu
 }
 
 #[tokio::test]
+async fn marketplace_portal_entry_is_visible_only_with_access_role() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "grower-001", "org-alpha", "grower").await?;
+    seed_marketplace_account_with_roles(
+        &ctx,
+        "viewer-001",
+        "org-alpha",
+        "grower",
+        &["portal:viewer"],
+    )
+    .await?;
+
+    let entry = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/marketplace-entry?org_id=org-alpha&account_id=grower-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(entry.status(), StatusCode::OK);
+    let body = to_bytes(entry.into_body(), 64 * 1024).await?;
+    let entry: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        entry.get("label").and_then(|value| value.as_str()),
+        Some("Marketplace")
+    );
+    assert_eq!(
+        entry.get("href").and_then(|value| value.as_str()),
+        Some("/marketplace?org_id=org-alpha")
+    );
+    assert_eq!(
+        entry.get("visible").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let forbidden = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/marketplace-entry?org_id=org-alpha&account_id=viewer-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn sustainability_records_create_get_and_list_field_scoped() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -11946,6 +12006,23 @@ async fn seed_marketplace_account(
     org_id: &str,
     party_type: &str,
 ) -> Result<()> {
+    seed_marketplace_account_with_roles(
+        ctx,
+        account_id,
+        org_id,
+        party_type,
+        &["marketplace:seller"],
+    )
+    .await
+}
+
+async fn seed_marketplace_account_with_roles(
+    ctx: &TestContext,
+    account_id: &str,
+    org_id: &str,
+    party_type: &str,
+    role_refs: &[&str],
+) -> Result<()> {
     let response = ctx
         .app
         .clone()
@@ -11959,7 +12036,7 @@ async fn seed_marketplace_account(
                         "account_id": account_id,
                         "org_id": org_id,
                         "party_type": party_type,
-                        "role_refs": ["marketplace:seller"]
+                        "role_refs": role_refs
                     })
                     .to_string(),
                 ))
