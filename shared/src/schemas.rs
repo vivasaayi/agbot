@@ -8181,6 +8181,96 @@ pub struct MarketplaceAccountRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceCatalogItemKind {
+    Input,
+    Produce,
+}
+
+impl MarketplaceCatalogItemKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketplaceCatalogItemKind::Input => "input",
+            MarketplaceCatalogItemKind::Produce => "produce",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceCatalogCategory {
+    Seed,
+    Fertilizer,
+    CropProtection,
+    Service,
+    Grain,
+    Produce,
+}
+
+impl MarketplaceCatalogCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketplaceCatalogCategory::Seed => "seed",
+            MarketplaceCatalogCategory::Fertilizer => "fertilizer",
+            MarketplaceCatalogCategory::CropProtection => "crop_protection",
+            MarketplaceCatalogCategory::Service => "service",
+            MarketplaceCatalogCategory::Grain => "grain",
+            MarketplaceCatalogCategory::Produce => "produce",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceUnitOfMeasure {
+    Kg,
+    Tonne,
+    Litre,
+    Bag,
+    Bushel,
+    Crate,
+    Acre,
+}
+
+impl MarketplaceUnitOfMeasure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketplaceUnitOfMeasure::Kg => "kg",
+            MarketplaceUnitOfMeasure::Tonne => "tonne",
+            MarketplaceUnitOfMeasure::Litre => "litre",
+            MarketplaceUnitOfMeasure::Bag => "bag",
+            MarketplaceUnitOfMeasure::Bushel => "bushel",
+            MarketplaceUnitOfMeasure::Crate => "crate",
+            MarketplaceUnitOfMeasure::Acre => "acre",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceCatalogItemCreateRequest {
+    #[serde(default)]
+    pub item_id: Option<String>,
+    pub org_id: String,
+    pub kind: MarketplaceCatalogItemKind,
+    pub category: MarketplaceCatalogCategory,
+    pub name: String,
+    pub unit_of_measure: MarketplaceUnitOfMeasure,
+    pub owner_account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketplaceCatalogItemRecord {
+    pub item_id: String,
+    pub org_id: String,
+    pub kind: MarketplaceCatalogItemKind,
+    pub category: MarketplaceCatalogCategory,
+    pub name: String,
+    pub unit_of_measure: MarketplaceUnitOfMeasure,
+    pub owner_account_id: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarketplaceAccountError {
     #[error("marketplace account_id cannot be empty")]
@@ -8207,6 +8297,38 @@ pub enum MarketplaceAccountError {
     UnsupportedPartyType { value: String },
     #[error("unsupported marketplace account status {value}")]
     UnsupportedStatus { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarketplaceCatalogError {
+    #[error("marketplace catalog item_id cannot be empty")]
+    EmptyItemId,
+    #[error("marketplace catalog org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("marketplace catalog item name cannot be empty")]
+    EmptyName,
+    #[error("marketplace catalog owner_account_id cannot be empty")]
+    EmptyOwnerAccountId,
+    #[error("marketplace catalog created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("marketplace catalog owner account is required")]
+    MissingOwnerAccount,
+    #[error("marketplace catalog owner account {account_id} is not active")]
+    OwnerAccountNotActive { account_id: String },
+    #[error("marketplace catalog owner account {account_id} belongs to {account_org_id}, not {item_org_id}")]
+    OwnerOrgMismatch {
+        account_id: String,
+        account_org_id: String,
+        item_org_id: String,
+    },
+    #[error("marketplace catalog owner account {account_id} is not allowed to own catalog items")]
+    OwnerPartyNotAllowed { account_id: String },
+    #[error("unsupported marketplace catalog item kind {value}")]
+    UnsupportedItemKind { value: String },
+    #[error("unsupported marketplace catalog category {value}")]
+    UnsupportedCategory { value: String },
+    #[error("unsupported marketplace catalog unit {value}")]
+    UnsupportedUnit { value: String },
 }
 
 pub fn build_marketplace_account_record(
@@ -8237,6 +8359,60 @@ pub fn build_marketplace_account_record(
     })
 }
 
+pub fn build_marketplace_catalog_item_record(
+    request: MarketplaceCatalogItemCreateRequest,
+    owner_account: Option<&MarketplaceAccountRecord>,
+    generated_item_id: String,
+    created_at: String,
+) -> Result<MarketplaceCatalogItemRecord, MarketplaceCatalogError> {
+    let item_id = normalize_marketplace_optional_text(request.item_id)
+        .or_else(|| normalize_marketplace_text(generated_item_id))
+        .ok_or(MarketplaceCatalogError::EmptyItemId)?;
+    let org_id =
+        normalize_marketplace_text(request.org_id).ok_or(MarketplaceCatalogError::EmptyOrgId)?;
+    let name =
+        normalize_marketplace_text(request.name).ok_or(MarketplaceCatalogError::EmptyName)?;
+    let owner_account_id = normalize_marketplace_text(request.owner_account_id)
+        .ok_or(MarketplaceCatalogError::EmptyOwnerAccountId)?;
+    let created_at =
+        normalize_marketplace_text(created_at).ok_or(MarketplaceCatalogError::EmptyCreatedAt)?;
+    let owner_account = owner_account.ok_or(MarketplaceCatalogError::MissingOwnerAccount)?;
+    if owner_account.account_id != owner_account_id {
+        return Err(MarketplaceCatalogError::MissingOwnerAccount);
+    }
+    if owner_account.status != MarketplaceAccountStatus::Active {
+        return Err(MarketplaceCatalogError::OwnerAccountNotActive {
+            account_id: owner_account.account_id.clone(),
+        });
+    }
+    if owner_account.org_id != org_id {
+        return Err(MarketplaceCatalogError::OwnerOrgMismatch {
+            account_id: owner_account.account_id.clone(),
+            account_org_id: owner_account.org_id.clone(),
+            item_org_id: org_id,
+        });
+    }
+    if !matches!(
+        owner_account.party_type,
+        MarketplacePartyType::Supplier | MarketplacePartyType::Grower
+    ) {
+        return Err(MarketplaceCatalogError::OwnerPartyNotAllowed {
+            account_id: owner_account.account_id.clone(),
+        });
+    }
+
+    Ok(MarketplaceCatalogItemRecord {
+        item_id,
+        org_id,
+        kind: request.kind,
+        category: request.category,
+        name,
+        unit_of_measure: request.unit_of_measure,
+        owner_account_id,
+        created_at,
+    })
+}
+
 pub fn transition_marketplace_account_status(
     record: &MarketplaceAccountRecord,
     to: MarketplaceAccountStatus,
@@ -8255,6 +8431,51 @@ pub fn transition_marketplace_account_status(
     updated.status = to;
     updated.updated_at = updated_at;
     Ok(updated)
+}
+
+pub fn parse_marketplace_catalog_item_kind(
+    value: &str,
+) -> Result<MarketplaceCatalogItemKind, MarketplaceCatalogError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "input" => Ok(MarketplaceCatalogItemKind::Input),
+        "produce" => Ok(MarketplaceCatalogItemKind::Produce),
+        _ => Err(MarketplaceCatalogError::UnsupportedItemKind {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_marketplace_catalog_category(
+    value: &str,
+) -> Result<MarketplaceCatalogCategory, MarketplaceCatalogError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "seed" => Ok(MarketplaceCatalogCategory::Seed),
+        "fertilizer" => Ok(MarketplaceCatalogCategory::Fertilizer),
+        "crop_protection" => Ok(MarketplaceCatalogCategory::CropProtection),
+        "service" => Ok(MarketplaceCatalogCategory::Service),
+        "grain" => Ok(MarketplaceCatalogCategory::Grain),
+        "produce" => Ok(MarketplaceCatalogCategory::Produce),
+        _ => Err(MarketplaceCatalogError::UnsupportedCategory {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_marketplace_unit_of_measure(
+    value: &str,
+) -> Result<MarketplaceUnitOfMeasure, MarketplaceCatalogError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "kg" => Ok(MarketplaceUnitOfMeasure::Kg),
+        "tonne" => Ok(MarketplaceUnitOfMeasure::Tonne),
+        "litre" => Ok(MarketplaceUnitOfMeasure::Litre),
+        "bag" => Ok(MarketplaceUnitOfMeasure::Bag),
+        "bushel" => Ok(MarketplaceUnitOfMeasure::Bushel),
+        "crate" => Ok(MarketplaceUnitOfMeasure::Crate),
+        "acre" => Ok(MarketplaceUnitOfMeasure::Acre),
+        _ => Err(MarketplaceCatalogError::UnsupportedUnit {
+            value: value.to_string(),
+        }),
+    }
 }
 
 pub fn parse_marketplace_party_type(
@@ -12188,8 +12409,10 @@ mod tests {
         IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
         IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
         IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
-        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
-        MarketplacePartyType, MultispectralImage, OpenDataPublishError,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+        MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
+        MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplacePartyType,
+        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
         OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
         RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus,
@@ -13573,6 +13796,98 @@ mod tests {
             error,
             MarketplaceAccountError::OrganizationNotFound {
                 org_id: "org-missing".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn marketplace_catalog_item_persists_for_active_owner_account() {
+        let owner = marketplace_account_fixture(
+            "supplier-001",
+            "org-alpha",
+            MarketplacePartyType::Supplier,
+            MarketplaceAccountStatus::Active,
+        );
+
+        let item = super::build_marketplace_catalog_item_record(
+            MarketplaceCatalogItemCreateRequest {
+                item_id: Some(" seed-corn-001 ".to_string()),
+                org_id: " org-alpha ".to_string(),
+                kind: MarketplaceCatalogItemKind::Input,
+                category: MarketplaceCatalogCategory::Seed,
+                name: " Hybrid corn seed ".to_string(),
+                unit_of_measure: MarketplaceUnitOfMeasure::Bag,
+                owner_account_id: " supplier-001 ".to_string(),
+            },
+            Some(&owner),
+            "generated-item".to_string(),
+            " 2026-06-14T09:00:00Z ".to_string(),
+        )
+        .expect("active supplier should own catalog item");
+
+        assert_eq!(item.item_id, "seed-corn-001");
+        assert_eq!(item.org_id, "org-alpha");
+        assert_eq!(item.kind, MarketplaceCatalogItemKind::Input);
+        assert_eq!(item.category, MarketplaceCatalogCategory::Seed);
+        assert_eq!(item.name, "Hybrid corn seed");
+        assert_eq!(item.unit_of_measure, MarketplaceUnitOfMeasure::Bag);
+        assert_eq!(item.owner_account_id, "supplier-001");
+    }
+
+    #[test]
+    fn marketplace_catalog_item_rejects_non_active_or_cross_org_owner() {
+        let suspended = marketplace_account_fixture(
+            "supplier-001",
+            "org-alpha",
+            MarketplacePartyType::Supplier,
+            MarketplaceAccountStatus::Suspended,
+        );
+        let error = super::build_marketplace_catalog_item_record(
+            marketplace_catalog_item_request(MarketplaceUnitOfMeasure::Bag),
+            Some(&suspended),
+            "generated-item".to_string(),
+            "2026-06-14T09:00:00Z".to_string(),
+        )
+        .expect_err("suspended account cannot own catalog item");
+        assert_eq!(
+            error,
+            MarketplaceCatalogError::OwnerAccountNotActive {
+                account_id: "supplier-001".to_string()
+            }
+        );
+
+        let foreign_org = marketplace_account_fixture(
+            "supplier-001",
+            "org-beta",
+            MarketplacePartyType::Supplier,
+            MarketplaceAccountStatus::Active,
+        );
+        let error = super::build_marketplace_catalog_item_record(
+            marketplace_catalog_item_request(MarketplaceUnitOfMeasure::Bag),
+            Some(&foreign_org),
+            "generated-item".to_string(),
+            "2026-06-14T09:00:00Z".to_string(),
+        )
+        .expect_err("cross-org account cannot own catalog item");
+        assert_eq!(
+            error,
+            MarketplaceCatalogError::OwnerOrgMismatch {
+                account_id: "supplier-001".to_string(),
+                account_org_id: "org-beta".to_string(),
+                item_org_id: "org-alpha".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn marketplace_catalog_unit_vocabulary_rejects_unknown_unit() {
+        let error = super::parse_marketplace_unit_of_measure("pallet")
+            .expect_err("unsupported unit should reject");
+
+        assert_eq!(
+            error,
+            MarketplaceCatalogError::UnsupportedUnit {
+                value: "pallet".to_string()
             }
         );
     }
@@ -16229,6 +16544,37 @@ mod tests {
             extent: field.extent,
             stress_evidence,
             weather_records,
+        }
+    }
+
+    fn marketplace_account_fixture(
+        account_id: &str,
+        org_id: &str,
+        party_type: MarketplacePartyType,
+        status: MarketplaceAccountStatus,
+    ) -> MarketplaceAccountRecord {
+        MarketplaceAccountRecord {
+            account_id: account_id.to_string(),
+            org_id: org_id.to_string(),
+            party_type,
+            role_refs: vec!["marketplace:seller".to_string()],
+            status,
+            created_at: "2026-06-14T09:00:00Z".to_string(),
+            updated_at: "2026-06-14T09:00:00Z".to_string(),
+        }
+    }
+
+    fn marketplace_catalog_item_request(
+        unit_of_measure: MarketplaceUnitOfMeasure,
+    ) -> MarketplaceCatalogItemCreateRequest {
+        MarketplaceCatalogItemCreateRequest {
+            item_id: Some("seed-corn-001".to_string()),
+            org_id: "org-alpha".to_string(),
+            kind: MarketplaceCatalogItemKind::Input,
+            category: MarketplaceCatalogCategory::Seed,
+            name: "Hybrid corn seed".to_string(),
+            unit_of_measure,
+            owner_account_id: "supplier-001".to_string(),
         }
     }
 

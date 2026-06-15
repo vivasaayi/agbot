@@ -86,11 +86,13 @@ use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
     append_content_version, assert_raster_spatial_ref, bind_fleet_node_identity,
     bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
-    build_collaboration_message, build_marketplace_account_record, build_soil_moisture_reading,
+    build_collaboration_message, build_marketplace_account_record,
+    build_marketplace_catalog_item_record, build_soil_moisture_reading,
     build_sustainability_record, build_tractor_record, compute_drought_index,
     create_versioned_content, normalize_weather_provider_forecast, parse_content_status,
     parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
-    parse_marketplace_party_type, parse_soil_moisture_qa_flag,
+    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
+    parse_marketplace_party_type, parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
     prepare_open_data_publication, soil_moisture_rejection_reason_for_error,
     soil_moisture_rejection_record, transition_marketplace_account_status, validate_field_boundary,
@@ -104,19 +106,21 @@ use shared::schemas::{
     FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
     FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
     ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage,
-    OpenDataPublication, OpenDataPublishError, OpenDataPublishRequest, RasterResolution,
-    RasterSpatialRef, RecommendationPriority, RecommendationRecord, RecommendationStatus,
-    ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
-    SoilMoistureReadingRecord, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
-    SoilMoistureRejectionRecord, SustainabilityMetricType, SustainabilityRecord,
-    SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
-    TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
-    TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
-    TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
-    VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
-    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
-    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
+    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
+    MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+    MarketplaceCatalogItemRecord, MarketplacePartyType, MultispectralImage, OpenDataPublication,
+    OpenDataPublishError, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+    RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
+    ReportVisibility, SoilMoistureReadingError, SoilMoistureReadingRecord,
+    SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
+    SustainabilityMetricType, SustainabilityRecord, SustainabilityRecordCreateRequest,
+    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
+    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
+    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
+    TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
+    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
+    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
+    GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -615,6 +619,18 @@ pub struct MarketplaceAccountListQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketplaceAccountScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceCatalogListQuery {
+    pub org_id: Option<String>,
+    pub kind: Option<MarketplaceCatalogItemKind>,
+    pub category: Option<MarketplaceCatalogCategory>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceCatalogScopeQuery {
     pub org_id: Option<String>,
 }
 
@@ -3102,6 +3118,78 @@ pub async fn update_marketplace_account_status(
     update_marketplace_account_record(&state, &updated).await?;
 
     Ok(Json(updated))
+}
+
+pub async fn create_marketplace_catalog_item(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceCatalogItemCreateRequest>,
+) -> AppResult<Json<MarketplaceCatalogItemRecord>> {
+    let owner_account_id = normalize_optional_text(Some(request.owner_account_id.clone()))
+        .ok_or_else(|| {
+            AppError::BadRequest("marketplace owner_account_id is required".to_string())
+        })?;
+    let owner_account = load_marketplace_account(&state, &owner_account_id).await?;
+    let record = build_marketplace_catalog_item_record(
+        request,
+        owner_account.as_ref(),
+        format!("marketplace-item-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_catalog_error)?;
+    insert_marketplace_catalog_item_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_catalog_items(
+    Query(query): Query<MarketplaceCatalogListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceCatalogItemRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace catalog".to_string(),
+        )
+    })?;
+    let kind = query.kind.map(|kind| kind.as_str().to_string());
+    let category = query.category.map(|category| category.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT item_id, org_id, kind, category, name, unit_of_measure, owner_account_id, created_at
+        FROM marketplace_catalog_items
+        WHERE (?1 IS NULL OR org_id = ?1)
+          AND (?2 IS NULL OR kind = ?2)
+          AND (?3 IS NULL OR category = ?3)
+        ORDER BY created_at ASC, item_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(kind)
+    .bind(category)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_catalog_item_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_catalog_item(
+    Path(item_id): Path<String>,
+    Query(query): Query<MarketplaceCatalogScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceCatalogItemRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let item = load_marketplace_catalog_item(&state, &item_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if item.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(item))
 }
 
 pub async fn create_sustainability_record(
@@ -8220,6 +8308,10 @@ fn marketplace_account_error(error: MarketplaceAccountError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn marketplace_catalog_error(error: MarketplaceCatalogError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn sustainability_record_error(error: SustainabilityRecordError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -9680,6 +9772,26 @@ fn decode_marketplace_account_record(
     })
 }
 
+fn decode_marketplace_catalog_item_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceCatalogItemRecord> {
+    Ok(MarketplaceCatalogItemRecord {
+        item_id: row.get("item_id"),
+        org_id: row.get("org_id"),
+        kind: parse_marketplace_catalog_item_kind(&row.get::<String, _>("kind"))
+            .map_err(marketplace_catalog_error)?,
+        category: parse_marketplace_catalog_category(&row.get::<String, _>("category"))
+            .map_err(marketplace_catalog_error)?,
+        name: row.get("name"),
+        unit_of_measure: parse_marketplace_unit_of_measure(
+            &row.get::<String, _>("unit_of_measure"),
+        )
+        .map_err(marketplace_catalog_error)?,
+        owner_account_id: row.get("owner_account_id"),
+        created_at: row.get("created_at"),
+    })
+}
+
 fn decode_sustainability_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<SustainabilityRecord> {
     Ok(SustainabilityRecord {
         record_id: row.get("record_id"),
@@ -11094,6 +11206,33 @@ async fn update_marketplace_account_record(
     Ok(())
 }
 
+async fn insert_marketplace_catalog_item_record(
+    state: &AppState,
+    record: &MarketplaceCatalogItemRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_catalog_items (
+            item_id, org_id, kind, category, name, unit_of_measure, owner_account_id, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&record.item_id)
+    .bind(&record.org_id)
+    .bind(record.kind.as_str())
+    .bind(record.category.as_str())
+    .bind(&record.name)
+    .bind(record.unit_of_measure.as_str())
+    .bind(&record.owner_account_id)
+    .bind(&record.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn load_marketplace_account(
     state: &AppState,
     account_id: &str,
@@ -11111,6 +11250,26 @@ async fn load_marketplace_account(
     .map_err(Error::from)?;
 
     row.map(|row| decode_marketplace_account_record(&row))
+        .transpose()
+}
+
+async fn load_marketplace_catalog_item(
+    state: &AppState,
+    item_id: &str,
+) -> AppResult<Option<MarketplaceCatalogItemRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT item_id, org_id, kind, category, name, unit_of_measure, owner_account_id, created_at
+        FROM marketplace_catalog_items
+        WHERE item_id = ?1
+        "#,
+    )
+    .bind(item_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_catalog_item_record(&row))
         .transpose()
 }
 

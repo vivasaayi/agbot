@@ -241,6 +241,15 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::update_marketplace_account_status),
         )
         .route(
+            "/api/marketplace/catalog/items",
+            get(routes::list_marketplace_catalog_items)
+                .post(routes::create_marketplace_catalog_item),
+        )
+        .route(
+            "/api/marketplace/catalog/items/:item_id",
+            get(routes::get_marketplace_catalog_item),
+        )
+        .route(
             "/api/sustainability/records",
             get(routes::list_sustainability_records).post(routes::create_sustainability_record),
         )
