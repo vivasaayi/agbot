@@ -1033,6 +1033,66 @@ pub enum TractorObstacleDetectionError {
     Guidance(#[from] TractorGuidanceError),
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorPrescriptionZone {
+    pub zone_id: String,
+    pub crs: String,
+    pub extent: GeoBounds,
+    pub rate: f64,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorPrescriptionExecutionRequest {
+    pub runtime_mode: String,
+    pub field_id: String,
+    pub field_crs: String,
+    pub field_extent: GeoBounds,
+    pub zones: Vec<TractorPrescriptionZone>,
+    pub geofence: TractorGeofenceEvaluation,
+    pub motion_gate: TractorMotionGateEvaluation,
+    pub obstacle: TractorObstacleDetection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorPrescriptionAppliedRate {
+    pub zone_id: String,
+    pub rate: f64,
+    pub reason_code: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorPrescriptionExecutionLog {
+    pub field_id: String,
+    pub runtime_mode: String,
+    pub applied_rates: Vec<TractorPrescriptionAppliedRate>,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum TractorPrescriptionExecutionError {
+    #[error("tractor prescription execution only runs in simulation mode")]
+    RuntimeModeNotSimulation { runtime_mode: String },
+    #[error("tractor prescription field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("tractor prescription field CRS cannot be empty")]
+    EmptyFieldCrs,
+    #[error("tractor prescription requires at least one zone")]
+    EmptyZones,
+    #[error("tractor prescription zone {zone_id} CRS mismatch: {zone_crs} != {field_crs}")]
+    ZoneCrsMismatch {
+        zone_id: String,
+        field_crs: String,
+        zone_crs: String,
+    },
+    #[error("tractor prescription zone {zone_id} extent is outside field extent")]
+    ZoneExtentMismatch { zone_id: String },
+    #[error("tractor prescription zone {zone_id} rate is invalid")]
+    InvalidRate { zone_id: String },
+    #[error("tractor prescription blocked by safety prerequisite: {reason_code}")]
+    SafetyPrerequisiteFailed { reason_code: String },
+}
+
 impl TractorCommandRejection {
     pub fn status_code(&self) -> u16 {
         match self.reason {
@@ -2028,6 +2088,90 @@ fn tractor_path_lateral_error_m(
     let dx = point.x_m - path.start.x_m;
     let dy = point.y_m - path.start.y_m;
     dx * unit_y - dy * unit_x
+}
+
+pub fn execute_tractor_prescription(
+    request: TractorPrescriptionExecutionRequest,
+) -> Result<TractorPrescriptionExecutionLog, TractorPrescriptionExecutionError> {
+    if !request.runtime_mode.eq_ignore_ascii_case("simulation") {
+        return Err(
+            TractorPrescriptionExecutionError::RuntimeModeNotSimulation {
+                runtime_mode: request.runtime_mode,
+            },
+        );
+    }
+    let field_id = normalize_tractor_text(request.field_id)
+        .ok_or(TractorPrescriptionExecutionError::EmptyFieldId)?;
+    let field_crs = normalize_tractor_text(request.field_crs)
+        .ok_or(TractorPrescriptionExecutionError::EmptyFieldCrs)?;
+    if request.zones.is_empty() {
+        return Err(TractorPrescriptionExecutionError::EmptyZones);
+    }
+    if request.geofence.decision != TractorGeofenceDecision::Permitted {
+        return Err(
+            TractorPrescriptionExecutionError::SafetyPrerequisiteFailed {
+                reason_code: request.geofence.reason_code,
+            },
+        );
+    }
+    if request.motion_gate.decision != TractorMotionGateDecision::Allowed {
+        return Err(
+            TractorPrescriptionExecutionError::SafetyPrerequisiteFailed {
+                reason_code: request.motion_gate.audit.reason_code,
+            },
+        );
+    }
+    if request.obstacle.halted {
+        return Err(
+            TractorPrescriptionExecutionError::SafetyPrerequisiteFailed {
+                reason_code: request
+                    .obstacle
+                    .event
+                    .as_ref()
+                    .map(|event| event.reason_code.clone())
+                    .unwrap_or_else(|| "obstacle_halt".to_string()),
+            },
+        );
+    }
+
+    let mut applied_rates = Vec::new();
+    for zone in request.zones {
+        let zone_id =
+            normalize_tractor_text(zone.zone_id).unwrap_or_else(|| "unknown-zone".to_string());
+        if zone.crs != field_crs {
+            return Err(TractorPrescriptionExecutionError::ZoneCrsMismatch {
+                zone_id,
+                field_crs,
+                zone_crs: zone.crs,
+            });
+        }
+        if !tractor_bounds_contains(&request.field_extent, &zone.extent) {
+            return Err(TractorPrescriptionExecutionError::ZoneExtentMismatch { zone_id });
+        }
+        if !zone.rate.is_finite() || zone.rate < 0.0 {
+            return Err(TractorPrescriptionExecutionError::InvalidRate { zone_id });
+        }
+        applied_rates.push(TractorPrescriptionAppliedRate {
+            zone_id,
+            rate: zone.rate,
+            reason_code: "prescription_rate_applied".to_string(),
+            evidence_refs: zone.evidence_refs,
+        });
+    }
+    applied_rates.sort_by(|left, right| left.zone_id.cmp(&right.zone_id));
+
+    Ok(TractorPrescriptionExecutionLog {
+        field_id,
+        runtime_mode: "simulation".to_string(),
+        applied_rates,
+    })
+}
+
+fn tractor_bounds_contains(outer: &GeoBounds, inner: &GeoBounds) -> bool {
+    inner.min_lon >= outer.min_lon
+        && inner.max_lon <= outer.max_lon
+        && inner.min_lat >= outer.min_lat
+        && inner.max_lat <= outer.max_lat
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6693,8 +6837,9 @@ mod tests {
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
         create_versioned_content, detect_tractor_obstacle, dry_run_fleet_config_bundle,
         evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
-        evaluate_tractor_motion_gate, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        evaluate_tractor_motion_gate, execute_tractor_prescription,
+        normalize_weather_provider_forecast, plan_tractor_swath_coverage,
+        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
@@ -6728,7 +6873,9 @@ mod tests {
         TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
         TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint, TractorImplementRef,
         TractorLifecycleStatus, TractorMotionCommandRequest, TractorMotionGateDecision,
-        TractorObstacleDetectionRequest, TractorOperatorApproval, TractorRegistrationRequest,
+        TractorObstacleDetection, TractorObstacleDetectionRequest, TractorObstacleEvent,
+        TractorOperatorApproval, TractorPrescriptionExecutionError,
+        TractorPrescriptionExecutionRequest, TractorPrescriptionZone, TractorRegistrationRequest,
         TractorRegistry, TractorSwathCoverageRequest, WeatherIngestError,
         WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
         WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
@@ -7730,6 +7877,77 @@ mod tests {
     }
 
     #[test]
+    fn tractor_prescription_execution_applies_rates_per_zone() {
+        let log = execute_tractor_prescription(tractor_prescription_request(vec![
+            tractor_prescription_zone("zone-b", "EPSG:3857", 5.0, 5.0, 9.0, 9.0, 22.0),
+            tractor_prescription_zone("zone-a", "EPSG:3857", 0.0, 0.0, 4.0, 4.0, 12.5),
+        ]))
+        .expect("valid prescription executes");
+
+        assert_eq!(log.runtime_mode, "simulation");
+        assert_eq!(log.applied_rates.len(), 2);
+        assert_eq!(log.applied_rates[0].zone_id, "zone-a");
+        assert_eq!(log.applied_rates[0].rate, 12.5);
+        assert_eq!(log.applied_rates[1].zone_id, "zone-b");
+        assert_eq!(
+            log.applied_rates[1].reason_code,
+            "prescription_rate_applied"
+        );
+        assert!(log.applied_rates[1]
+            .evidence_refs
+            .contains(&"zone:zone-b".to_string()));
+    }
+
+    #[test]
+    fn tractor_prescription_execution_refuses_crs_mismatch() {
+        let error = execute_tractor_prescription(tractor_prescription_request(vec![
+            tractor_prescription_zone("zone-a", "EPSG:4326", 0.0, 0.0, 4.0, 4.0, 12.5),
+        ]))
+        .expect_err("CRS mismatch refuses execution");
+
+        assert_eq!(
+            error,
+            TractorPrescriptionExecutionError::ZoneCrsMismatch {
+                zone_id: "zone-a".to_string(),
+                field_crs: "EPSG:3857".to_string(),
+                zone_crs: "EPSG:4326".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn tractor_prescription_execution_requires_safety_prerequisites() {
+        let mut request = tractor_prescription_request(vec![tractor_prescription_zone(
+            "zone-a",
+            "EPSG:3857",
+            0.0,
+            0.0,
+            4.0,
+            4.0,
+            12.5,
+        )]);
+        request.obstacle = TractorObstacleDetection {
+            tractor_id: "tractor-001".to_string(),
+            halted: true,
+            event: Some(TractorObstacleEvent {
+                distance_m: 2.0,
+                position: TractorGuidancePoint { x_m: 2.0, y_m: 0.0 },
+                reason_code: "obstacle_in_path".to_string(),
+            }),
+        };
+
+        let error = execute_tractor_prescription(request)
+            .expect_err("obstacle halt blocks prescription execution");
+
+        assert_eq!(
+            error,
+            TractorPrescriptionExecutionError::SafetyPrerequisiteFailed {
+                reason_code: "obstacle_in_path".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn marketplace_account_links_party_to_one_org_and_normalizes_roles() {
         let record = build_marketplace_account_record(
             MarketplaceAccountCreateRequest {
@@ -8559,6 +8777,70 @@ mod tests {
             approved_by: "ops@example.com".to_string(),
             approved_at: "2026-06-15T09:59:00Z".to_string(),
             expires_at: Some("2026-06-15T10:05:00Z".to_string()),
+        }
+    }
+
+    fn tractor_prescription_request(
+        zones: Vec<TractorPrescriptionZone>,
+    ) -> TractorPrescriptionExecutionRequest {
+        TractorPrescriptionExecutionRequest {
+            runtime_mode: "simulation".to_string(),
+            field_id: "field-north".to_string(),
+            field_crs: "EPSG:3857".to_string(),
+            field_extent: GeoBounds {
+                min_lon: 0.0,
+                min_lat: 0.0,
+                max_lon: 10.0,
+                max_lat: 10.0,
+            },
+            zones,
+            geofence: evaluate_tractor_geofence(tractor_geofence_request(
+                GeoPoint {
+                    longitude: 2.0,
+                    latitude: 2.0,
+                },
+                GeoPoint {
+                    longitude: 8.0,
+                    latitude: 8.0,
+                },
+                "EPSG:3857",
+            ))
+            .expect("geofence prerequisite should pass"),
+            motion_gate: evaluate_tractor_motion_gate(
+                &tractor_motion_gate_command(),
+                None,
+                Some(&tractor_operator_approval()),
+                "2026-06-15T10:00:02Z",
+            )
+            .expect("motion gate prerequisite should pass"),
+            obstacle: TractorObstacleDetection {
+                tractor_id: "tractor-001".to_string(),
+                halted: false,
+                event: None,
+            },
+        }
+    }
+
+    fn tractor_prescription_zone(
+        zone_id: &str,
+        crs: &str,
+        min_lon: f64,
+        min_lat: f64,
+        max_lon: f64,
+        max_lat: f64,
+        rate: f64,
+    ) -> TractorPrescriptionZone {
+        TractorPrescriptionZone {
+            zone_id: zone_id.to_string(),
+            crs: crs.to_string(),
+            extent: GeoBounds {
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat,
+            },
+            rate,
+            evidence_refs: vec![format!("zone:{zone_id}")],
         }
     }
 
