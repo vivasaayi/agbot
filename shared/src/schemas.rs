@@ -6540,6 +6540,17 @@ pub enum DroughtRiskBand {
     Severe,
 }
 
+impl DroughtRiskBand {
+    pub fn as_forecast_ref(self) -> &'static str {
+        match self {
+            DroughtRiskBand::Low => "low",
+            DroughtRiskBand::Moderate => "moderate",
+            DroughtRiskBand::High => "high",
+            DroughtRiskBand::Severe => "severe",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DroughtRiskScoreRecord {
     pub field_or_region_ref: String,
@@ -6553,6 +6564,47 @@ pub struct DroughtRiskScoreRecord {
     pub thresholds: DroughtRiskThresholds,
     pub evidence_refs: Vec<String>,
     pub degradation_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtForecastRequest {
+    pub feature_enabled: bool,
+    pub requested_at: String,
+    pub risk_score_computed_at: String,
+    pub max_score_age_days: i64,
+    pub horizon_days: u32,
+    #[serde(default)]
+    pub risk_score: Option<DroughtRiskScoreRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtForecastStatus {
+    Forecast,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtForecastUncertaintyBand {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtForecastRecord {
+    pub field_or_region_ref: String,
+    pub status: DroughtForecastStatus,
+    pub horizon_days: u32,
+    #[serde(default)]
+    pub predicted_value: Option<f64>,
+    #[serde(default)]
+    pub predicted_band: Option<DroughtRiskBand>,
+    #[serde(default)]
+    pub uncertainty: Option<DroughtForecastUncertaintyBand>,
+    pub evidence_refs: Vec<String>,
+    pub unavailable_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -6622,6 +6674,20 @@ pub enum DroughtRiskScoreError {
     EmptyFieldOrRegionRef,
     #[error("drought risk thresholds must be finite and ordered within 0..=1")]
     InvalidThresholds,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DroughtForecastError {
+    #[error("drought forecast requested_at cannot be empty")]
+    EmptyRequestedAt,
+    #[error("drought forecast risk_score_computed_at cannot be empty")]
+    EmptyRiskScoreComputedAt,
+    #[error("drought forecast timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error("drought forecast horizon_days must be positive")]
+    InvalidHorizon,
+    #[error("drought forecast max_score_age_days must be positive")]
+    InvalidMaxScoreAge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -7112,6 +7178,101 @@ pub fn compute_drought_risk_score(
     })
 }
 
+pub fn forecast_drought_risk(
+    request: DroughtForecastRequest,
+) -> Result<DroughtForecastRecord, DroughtForecastError> {
+    if request.horizon_days == 0 {
+        return Err(DroughtForecastError::InvalidHorizon);
+    }
+    if request.max_score_age_days <= 0 {
+        return Err(DroughtForecastError::InvalidMaxScoreAge);
+    }
+    let requested_at = normalize_drought_text(request.requested_at)
+        .ok_or(DroughtForecastError::EmptyRequestedAt)?;
+    let risk_score_computed_at = normalize_drought_text(request.risk_score_computed_at)
+        .ok_or(DroughtForecastError::EmptyRiskScoreComputedAt)?;
+    let requested_at = parse_drought_forecast_timestamp(&requested_at)?;
+    let risk_score_computed_at = parse_drought_forecast_timestamp(&risk_score_computed_at)?;
+
+    let mut unavailable_reasons = Vec::new();
+    if !request.feature_enabled {
+        unavailable_reasons.push("forecast_feature_disabled".to_string());
+    }
+    let risk_score = match request.risk_score {
+        Some(record)
+            if record.status == DroughtRiskScoreStatus::Computed
+                && record.value.is_some()
+                && record.band.is_some() =>
+        {
+            Some(record)
+        }
+        Some(_) | None => {
+            unavailable_reasons.push("missing_risk_score".to_string());
+            None
+        }
+    };
+    let stale = requested_at
+        .signed_duration_since(risk_score_computed_at)
+        .num_days()
+        > request.max_score_age_days;
+    if stale {
+        unavailable_reasons.push("stale_risk_score".to_string());
+    }
+
+    if !unavailable_reasons.is_empty() {
+        return Ok(DroughtForecastRecord {
+            field_or_region_ref: risk_score
+                .as_ref()
+                .map(|record| record.field_or_region_ref.clone())
+                .unwrap_or_default(),
+            status: DroughtForecastStatus::Unavailable,
+            horizon_days: request.horizon_days,
+            predicted_value: None,
+            predicted_band: None,
+            uncertainty: None,
+            evidence_refs: risk_score
+                .as_ref()
+                .map(|record| record.evidence_refs.clone())
+                .unwrap_or_default(),
+            unavailable_reasons,
+        });
+    }
+
+    let risk_score = risk_score.expect("availability checked");
+    let current_value = risk_score.value.expect("computed score includes value");
+    let predicted_value = clamp_unit(current_value + (request.horizon_days as f64 / 90.0) * 0.05);
+    let predicted_band = drought_risk_band(predicted_value, &risk_score.thresholds);
+    let uncertainty = if request.horizon_days <= 14 {
+        DroughtForecastUncertaintyBand::Low
+    } else if request.horizon_days <= 45 {
+        DroughtForecastUncertaintyBand::Medium
+    } else {
+        DroughtForecastUncertaintyBand::High
+    };
+    let mut evidence_refs = risk_score.evidence_refs.clone();
+    evidence_refs.push(format!(
+        "drought_risk_score:{}:{}",
+        risk_score.field_or_region_ref,
+        risk_score
+            .band
+            .expect("computed score includes band")
+            .as_forecast_ref()
+    ));
+    evidence_refs.sort();
+    evidence_refs.dedup();
+
+    Ok(DroughtForecastRecord {
+        field_or_region_ref: risk_score.field_or_region_ref,
+        status: DroughtForecastStatus::Forecast,
+        horizon_days: request.horizon_days,
+        predicted_value: Some(predicted_value),
+        predicted_band: Some(predicted_band),
+        uncertainty: Some(uncertainty),
+        evidence_refs,
+        unavailable_reasons: Vec::new(),
+    })
+}
+
 pub fn parse_drought_index_type(value: &str) -> Result<DroughtIndexType, DroughtIndexError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "spi" => Ok(DroughtIndexType::Spi),
@@ -7225,6 +7386,16 @@ fn parse_drought_baseline_timestamp(
         timestamp,
         chrono::Utc,
     ))
+}
+
+fn parse_drought_forecast_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, DroughtForecastError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|_| DroughtForecastError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 fn valid_drought_risk_thresholds(thresholds: &DroughtRiskThresholds) -> bool {
@@ -11287,30 +11458,32 @@ mod tests {
         evaluate_crop_stage_weather_risks, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_irrigation_valve_plan,
-        execute_tractor_prescription, fuse_drought_evidence, ingest_drought_stress_evidence,
-        ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
-        map_zone_water_need, normalize_weather_provider_forecast, plan_tractor_swath_coverage,
-        query_irrigation_history, query_weather_history, report_water_use_savings,
-        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
-        schedule_irrigation_plan, sign_fleet_config_bundle, soil_moisture_rejection_record,
-        tractor_cross_track_error_m, transition_marketplace_account_status,
-        validate_field_boundary, validate_water_weather_input_contract,
-        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
-        weather_fetch_failure_record, zone_water_need_insufficient, AccessAnomalySignal,
-        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
-        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
-        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
-        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
-        ContentType, CropPlanRecord, DroughtBaselineTrendError, DroughtBaselineTrendRequest,
-        DroughtBaselineTrendStatus, DroughtEvidenceFusionError, DroughtEvidenceFusionRequest,
-        DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus, DroughtIndexComputeRequest,
-        DroughtIndexError, DroughtIndexPeriod, DroughtIndexType, DroughtRiskBand,
-        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
-        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
-        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        execute_tractor_prescription, forecast_drought_risk, fuse_drought_evidence,
+        ingest_drought_stress_evidence, ingest_remote_sensing_moisture_proxy_layer,
+        ingest_weather_sensor_stream, map_zone_water_need, normalize_weather_provider_forecast,
+        plan_tractor_swath_coverage, query_irrigation_history, query_weather_history,
+        report_water_use_savings, resolve_weather_forecast_to_field, route_weather_alert,
+        run_tractor_straight_path_guidance, schedule_irrigation_plan, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, tractor_cross_track_error_m,
+        transition_marketplace_account_status, validate_field_boundary,
+        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
+        verify_weather_forecast_accuracy, weather_fetch_failure_record,
+        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
+        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
+        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
+        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
+        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
+        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
+        DroughtForecastUncertaintyBand, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, DroughtRiskBand, DroughtRiskScoreError,
+        DroughtRiskScoreRequest, DroughtRiskScoreStatus, DroughtRiskThresholds,
+        DroughtStressEvidenceError, DroughtStressEvidenceLayer, DroughtStressIndex,
+        DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery,
+        FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError,
+        FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus, FleetConfigBundle,
+        FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
         FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
         FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
         FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
@@ -14630,6 +14803,69 @@ mod tests {
         assert_eq!(error, DroughtRiskScoreError::InvalidThresholds);
     }
 
+    #[test]
+    fn drought_forecast_runs_only_with_fresh_deterministic_score() {
+        let record =
+            forecast_drought_risk(drought_forecast_request(true, true, "2026-06-14T10:00:00Z"))
+                .expect("fresh deterministic score should unlock forecast");
+
+        assert_eq!(record.status, DroughtForecastStatus::Forecast);
+        assert_eq!(record.field_or_region_ref, "field-north");
+        assert_eq!(record.horizon_days, 30);
+        assert_eq!(record.predicted_value, Some(0.45166666666666666));
+        assert_eq!(record.predicted_band, Some(DroughtRiskBand::Moderate));
+        assert_eq!(
+            record.uncertainty,
+            Some(DroughtForecastUncertaintyBand::Medium)
+        );
+        assert!(record
+            .evidence_refs
+            .iter()
+            .any(|item| item == "drought_risk_score:field-north:moderate"));
+        assert!(record.unavailable_reasons.is_empty());
+    }
+
+    #[test]
+    fn drought_forecast_is_unavailable_when_feature_disabled() {
+        let record = forecast_drought_risk(drought_forecast_request(
+            false,
+            true,
+            "2026-06-14T10:00:00Z",
+        ))
+        .expect("disabled forecast should return unavailable state");
+
+        assert_eq!(record.status, DroughtForecastStatus::Unavailable);
+        assert_eq!(record.predicted_value, None);
+        assert_eq!(
+            record.unavailable_reasons,
+            vec!["forecast_feature_disabled".to_string()]
+        );
+    }
+
+    #[test]
+    fn drought_forecast_is_unavailable_with_stale_or_missing_score() {
+        let stale =
+            forecast_drought_risk(drought_forecast_request(true, true, "2026-06-25T10:00:00Z"))
+                .expect("stale score should return unavailable state");
+        assert_eq!(stale.status, DroughtForecastStatus::Unavailable);
+        assert_eq!(
+            stale.unavailable_reasons,
+            vec!["stale_risk_score".to_string()]
+        );
+
+        let missing = forecast_drought_risk(drought_forecast_request(
+            true,
+            false,
+            "2026-06-14T10:00:00Z",
+        ))
+        .expect("missing score should return unavailable state");
+        assert_eq!(missing.status, DroughtForecastStatus::Unavailable);
+        assert_eq!(
+            missing.unavailable_reasons,
+            vec!["missing_risk_score".to_string()]
+        );
+    }
+
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
         FleetNodeRecord {
             node_id: "node-001".to_string(),
@@ -14842,6 +15078,24 @@ mod tests {
             )),
             stress_evidence: include_stress.then(|| drought_stress_record("EPSG:4326")),
             baseline: Some(drought_baseline_record()),
+        }
+    }
+
+    fn drought_forecast_request(
+        feature_enabled: bool,
+        include_score: bool,
+        requested_at: &str,
+    ) -> DroughtForecastRequest {
+        DroughtForecastRequest {
+            feature_enabled,
+            requested_at: requested_at.to_string(),
+            risk_score_computed_at: "2026-06-13T10:00:00Z".to_string(),
+            max_score_age_days: 3,
+            horizon_days: 30,
+            risk_score: include_score.then(|| {
+                compute_drought_risk_score(drought_risk_score_request(true))
+                    .expect("risk score fixture should compute")
+            }),
         }
     }
 
