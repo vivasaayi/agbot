@@ -6505,6 +6505,56 @@ pub struct DroughtBaselineTrendRecord {
     pub degradation_reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtRiskThresholds {
+    pub moderate: f64,
+    pub high: f64,
+    pub severe: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtRiskScoreRequest {
+    pub field_or_region_ref: String,
+    pub thresholds: DroughtRiskThresholds,
+    #[serde(default)]
+    pub index_record: Option<DroughtIndexRecord>,
+    #[serde(default)]
+    pub stress_evidence: Option<DroughtStressEvidenceRecord>,
+    #[serde(default)]
+    pub baseline: Option<DroughtBaselineTrendRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtRiskScoreStatus {
+    Computed,
+    InsufficientEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtRiskBand {
+    Low,
+    Moderate,
+    High,
+    Severe,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtRiskScoreRecord {
+    pub field_or_region_ref: String,
+    #[serde(default)]
+    pub index_type: Option<DroughtIndexType>,
+    pub status: DroughtRiskScoreStatus,
+    #[serde(default)]
+    pub value: Option<f64>,
+    #[serde(default)]
+    pub band: Option<DroughtRiskBand>,
+    pub thresholds: DroughtRiskThresholds,
+    pub evidence_refs: Vec<String>,
+    pub degradation_reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DroughtStressEvidenceError {
     #[error("drought stress evidence_id cannot be empty")]
@@ -6564,6 +6614,14 @@ pub enum DroughtBaselineTrendError {
     InvalidMinSamples,
     #[error("drought baseline timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DroughtRiskScoreError {
+    #[error("drought risk field_or_region_ref cannot be empty")]
+    EmptyFieldOrRegionRef,
+    #[error("drought risk thresholds must be finite and ordered within 0..=1")]
+    InvalidThresholds,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -6957,6 +7015,103 @@ pub fn compute_drought_baseline_trend(
     })
 }
 
+pub fn compute_drought_risk_score(
+    request: DroughtRiskScoreRequest,
+) -> Result<DroughtRiskScoreRecord, DroughtRiskScoreError> {
+    let field_or_region_ref = normalize_drought_text(request.field_or_region_ref)
+        .ok_or(DroughtRiskScoreError::EmptyFieldOrRegionRef)?;
+    if !valid_drought_risk_thresholds(&request.thresholds) {
+        return Err(DroughtRiskScoreError::InvalidThresholds);
+    }
+
+    let mut evidence_refs = Vec::new();
+    let mut degradation_reasons = Vec::new();
+
+    let index_record = match request.index_record {
+        Some(record) if record.field_or_region_ref == field_or_region_ref => {
+            evidence_refs.push(format!("drought_index:{}", record.index_id));
+            Some(record)
+        }
+        Some(_) | None => {
+            degradation_reasons.push("missing_index_evidence".to_string());
+            None
+        }
+    };
+    let index_type = index_record.as_ref().map(|record| record.index_type);
+
+    let stress_evidence = match request.stress_evidence {
+        Some(record) if record.field_or_region_ref == field_or_region_ref => {
+            evidence_refs.push(format!("drought_stress:{}", record.evidence_id));
+            Some(record)
+        }
+        Some(_) | None => {
+            degradation_reasons.push("missing_stress_evidence".to_string());
+            None
+        }
+    };
+
+    let baseline = match (request.baseline, index_type) {
+        (Some(record), Some(index_type))
+            if record.field_or_region_ref == field_or_region_ref
+                && record.index_type == index_type
+                && record.status == DroughtBaselineTrendStatus::Computed =>
+        {
+            evidence_refs.push(format!(
+                "drought_baseline:{}:{}:{}",
+                record.field_or_region_ref,
+                record.index_type.as_str(),
+                record.method
+            ));
+            evidence_refs.extend(record.evidence_refs.iter().cloned());
+            Some(record)
+        }
+        (Some(_), _) | (None, _) => {
+            degradation_reasons.push("missing_baseline_evidence".to_string());
+            None
+        }
+    };
+
+    if !(index_record.is_some() && stress_evidence.is_some() && baseline.is_some()) {
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        return Ok(DroughtRiskScoreRecord {
+            field_or_region_ref,
+            index_type,
+            status: DroughtRiskScoreStatus::InsufficientEvidence,
+            value: None,
+            band: None,
+            thresholds: request.thresholds,
+            evidence_refs,
+            degradation_reasons,
+        });
+    }
+
+    let index_record = index_record.expect("presence checked");
+    let stress_evidence = stress_evidence.expect("presence checked");
+    let baseline = baseline.expect("presence checked");
+    let baseline_value = baseline
+        .baseline_value
+        .expect("computed baseline includes value");
+    let index_component = clamp_unit(-index_record.value / 2.0);
+    let stress_component = clamp_unit(-stress_evidence.value);
+    let baseline_component = clamp_unit((baseline_value - index_record.value) / 2.0);
+    let value = (index_component * 0.55) + (stress_component * 0.25) + (baseline_component * 0.20);
+    let band = drought_risk_band(value, &request.thresholds);
+
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    Ok(DroughtRiskScoreRecord {
+        field_or_region_ref,
+        index_type: Some(index_record.index_type),
+        status: DroughtRiskScoreStatus::Computed,
+        value: Some(value),
+        band: Some(band),
+        thresholds: request.thresholds,
+        evidence_refs,
+        degradation_reasons: Vec::new(),
+    })
+}
+
 pub fn parse_drought_index_type(value: &str) -> Result<DroughtIndexType, DroughtIndexError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "spi" => Ok(DroughtIndexType::Spi),
@@ -7070,6 +7225,32 @@ fn parse_drought_baseline_timestamp(
         timestamp,
         chrono::Utc,
     ))
+}
+
+fn valid_drought_risk_thresholds(thresholds: &DroughtRiskThresholds) -> bool {
+    thresholds.moderate.is_finite()
+        && thresholds.high.is_finite()
+        && thresholds.severe.is_finite()
+        && thresholds.moderate >= 0.0
+        && thresholds.moderate < thresholds.high
+        && thresholds.high < thresholds.severe
+        && thresholds.severe <= 1.0
+}
+
+fn drought_risk_band(value: f64, thresholds: &DroughtRiskThresholds) -> DroughtRiskBand {
+    if value >= thresholds.severe {
+        DroughtRiskBand::Severe
+    } else if value >= thresholds.high {
+        DroughtRiskBand::High
+    } else if value >= thresholds.moderate {
+        DroughtRiskBand::Moderate
+    } else {
+        DroughtRiskBand::Low
+    }
+}
+
+fn clamp_unit(value: f64) -> f64 {
+    value.clamp(0.0, 1.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -11097,8 +11278,9 @@ mod tests {
         build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
-        compute_drought_baseline_trend, compute_drought_index, compute_water_evapotranspiration,
-        compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
+        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
+        compute_water_evapotranspiration, compute_weather_growing_degree_day,
+        compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, detect_tractor_obstacle,
         dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         evaluate_access_anomaly_advisories, evaluate_and_route_water_alerts,
@@ -11122,20 +11304,22 @@ mod tests {
         ContentType, CropPlanRecord, DroughtBaselineTrendError, DroughtBaselineTrendRequest,
         DroughtBaselineTrendStatus, DroughtEvidenceFusionError, DroughtEvidenceFusionRequest,
         DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus, DroughtIndexComputeRequest,
-        DroughtIndexError, DroughtIndexPeriod, DroughtIndexType, DroughtStressEvidenceError,
-        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
-        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
-        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
-        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, OpenDataPublishError,
+        DroughtIndexError, DroughtIndexPeriod, DroughtIndexType, DroughtRiskBand,
+        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
+        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
+        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
+        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
+        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
+        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
+        MarketplacePartyType, MultispectralImage, OpenDataPublishError,
         OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
         RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus,
@@ -14388,6 +14572,64 @@ mod tests {
         assert_eq!(error, DroughtBaselineTrendError::InvalidMinSamples);
     }
 
+    #[test]
+    fn drought_risk_score_computes_band_and_cites_all_inputs() {
+        let record = compute_drought_risk_score(drought_risk_score_request(true))
+            .expect("complete deterministic evidence should score");
+
+        assert_eq!(record.status, DroughtRiskScoreStatus::Computed);
+        assert_eq!(record.field_or_region_ref, "field-north");
+        assert_eq!(record.index_type, Some(DroughtIndexType::Spi));
+        assert_eq!(record.value, Some(0.435));
+        assert_eq!(record.band, Some(DroughtRiskBand::Moderate));
+        assert_eq!(record.thresholds.moderate, 0.3);
+        assert!(record
+            .evidence_refs
+            .iter()
+            .any(|item| item == "drought_index:spi-current"));
+        assert!(record
+            .evidence_refs
+            .iter()
+            .any(|item| item.starts_with("drought_stress:drought-stress:field-north:ndvi")));
+        assert!(record.evidence_refs.iter().any(|item| {
+            item == "drought_baseline:field-north:spi:historical_mean_linear_trend_v1"
+        }));
+        assert!(record.degradation_reasons.is_empty());
+    }
+
+    #[test]
+    fn drought_risk_score_reports_insufficient_evidence_without_partial_score() {
+        let record = compute_drought_risk_score(drought_risk_score_request(false))
+            .expect("missing stress evidence should be a reportable state");
+
+        assert_eq!(record.status, DroughtRiskScoreStatus::InsufficientEvidence);
+        assert_eq!(record.value, None);
+        assert_eq!(record.band, None);
+        assert_eq!(
+            record.degradation_reasons,
+            vec!["missing_stress_evidence".to_string()]
+        );
+        assert!(record
+            .evidence_refs
+            .iter()
+            .any(|item| item == "drought_index:spi-current"));
+    }
+
+    #[test]
+    fn drought_risk_score_rejects_invalid_thresholds() {
+        let mut request = drought_risk_score_request(true);
+        request.thresholds = DroughtRiskThresholds {
+            moderate: 0.7,
+            high: 0.6,
+            severe: 0.8,
+        };
+
+        let error = compute_drought_risk_score(request)
+            .expect_err("unordered thresholds should reject risk scoring");
+
+        assert_eq!(error, DroughtRiskScoreError::InvalidThresholds);
+    }
+
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
         FleetNodeRecord {
             node_id: "node-001".to_string(),
@@ -14548,6 +14790,58 @@ mod tests {
             input_refs: vec![format!("weather:{field_or_region_ref}:{period_end}")],
             method: "standardized_anomaly_v1".to_string(),
             computed_at: "2026-06-13T10:00:00Z".to_string(),
+        }
+    }
+
+    fn drought_baseline_record() -> super::DroughtBaselineTrendRecord {
+        compute_drought_baseline_trend(DroughtBaselineTrendRequest {
+            field_or_region_ref: "field-north".to_string(),
+            index_type: DroughtIndexType::Spi,
+            min_samples: 3,
+            history: vec![
+                drought_index_record(
+                    "spi-001",
+                    "field-north",
+                    DroughtIndexType::Spi,
+                    -1.2,
+                    "2026-04-01",
+                ),
+                drought_index_record(
+                    "spi-002",
+                    "field-north",
+                    DroughtIndexType::Spi,
+                    -0.6,
+                    "2026-05-01",
+                ),
+                drought_index_record(
+                    "spi-003",
+                    "field-north",
+                    DroughtIndexType::Spi,
+                    0.0,
+                    "2026-05-31",
+                ),
+            ],
+        })
+        .expect("baseline fixture should compute")
+    }
+
+    fn drought_risk_score_request(include_stress: bool) -> DroughtRiskScoreRequest {
+        DroughtRiskScoreRequest {
+            field_or_region_ref: " field-north ".to_string(),
+            thresholds: DroughtRiskThresholds {
+                moderate: 0.3,
+                high: 0.6,
+                severe: 0.8,
+            },
+            index_record: Some(drought_index_record(
+                "spi-current",
+                "field-north",
+                DroughtIndexType::Spi,
+                -1.2,
+                "2026-06-13",
+            )),
+            stress_evidence: include_stress.then(|| drought_stress_record("EPSG:4326")),
+            baseline: Some(drought_baseline_record()),
         }
     }
 
