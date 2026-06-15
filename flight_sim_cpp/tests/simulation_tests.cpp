@@ -1134,7 +1134,7 @@ void test_lidar_flat_fallback_terrain_covers_offset_mission_footprint() {
 agbot::flight_sim::RunConfig unit_run_config() {
     agbot::flight_sim::RunConfig config;
     config.seed = 42;
-    config.timestep_s = 1.0 / 60.0;
+    config.timestep_s = 0.016667;
     config.record_interval_s = 0.25;
     config.max_time_s = 600.0;
     return config;
@@ -1655,6 +1655,38 @@ void test_twin_contract_version_compatibility() {
     assert(!agbot::flight_sim::is_compatible_contract_version("1.0.0", "not-semver"));
 }
 
+// Story 02-13: the canonical runner reads one mission format and emits the
+// TwinContractV1 telemetry fields from the shared TelemetryRecorder formatter.
+void test_canonical_runner_mission_and_telemetry_follow_twin_contract() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto& schema = agbot::flight_sim::twin_contract_v1_schema();
+
+    assert(result.manifest.contract_version == agbot::flight_sim::kTwinContractVersion);
+    assert(schema.has_capability("shared_command_telemetry_contract"));
+    assert(result.trace_jsonl.find("\"contract_version\":\"1.0.0\"") != std::string::npos);
+    assert(result.trace_jsonl.find("\"command_id\":\"simulation_state\"") != std::string::npos);
+    assert(result.trace_jsonl.find("\"attitude\":{\"x\":") != std::string::npos);
+    assert(result.trace_jsonl.find("\"armed\":") != std::string::npos);
+
+    const std::vector<std::string> required_fields = {
+        "contract_version",
+        "command_id",
+        "time_s",
+        "mode",
+        "position",
+        "velocity",
+        "attitude",
+        "battery_percent",
+        "target_waypoint_index",
+        "armed",
+    };
+    for (const auto& field : required_fields) {
+        assert(schema.type_has_field("TelemetryV1", field));
+        assert(result.trace_jsonl.find("\"" + field + "\"") != std::string::npos);
+    }
+}
+
 void test_trace_diff_reports_divergent_field() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
@@ -1686,6 +1718,13 @@ void test_deterministic_runner_matches_golden() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
 
+    if (result.trace_jsonl != golden) {
+        const auto diff = agbot::flight_sim::diff_trace_text(golden, result.trace_jsonl);
+        std::cerr << "unit golden mismatch at step " << diff.step_index
+                  << " field " << diff.field_path
+                  << ": left=" << diff.left_value
+                  << " right=" << diff.right_value << "\n";
+    }
     assert(result.trace_jsonl == golden);
 }
 
@@ -1932,6 +1971,7 @@ int main() {
     test_twin_contract_v1_schema_covers_required_types();
     test_twin_contract_matches_shared_command_telemetry_fixture();
     test_twin_contract_version_compatibility();
+    test_canonical_runner_mission_and_telemetry_follow_twin_contract();
     test_trace_diff_reports_divergent_field();
     test_deterministic_runner_matches_golden();
     test_fnv1a64_is_stable_and_distinct();

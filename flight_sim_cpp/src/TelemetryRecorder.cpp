@@ -1,4 +1,5 @@
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
+#include "agbot_flight_sim/DeterministicRunner.hpp"
 
 #include <iomanip>
 #include <sstream>
@@ -9,7 +10,9 @@ namespace agbot::flight_sim {
 std::string format_telemetry_sample(const DroneState& state) {
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(3)
-           << "{\"time_s\":" << state.mission_time_s
+           << "{\"contract_version\":\"" << kTwinContractVersion << "\""
+           << ",\"command_id\":\"simulation_state\""
+           << ",\"time_s\":" << state.mission_time_s
            << ",\"mode\":\"" << to_string(state.mode) << "\""
            << ",\"position\":{\"x\":" << state.position.x
            << ",\"y\":" << state.position.y
@@ -17,11 +20,15 @@ std::string format_telemetry_sample(const DroneState& state) {
            << ",\"velocity\":{\"x\":" << state.velocity.x
            << ",\"y\":" << state.velocity.y
            << ",\"z\":" << state.velocity.z << "}"
+           << ",\"attitude\":{\"x\":" << state.roll_rad
+           << ",\"y\":" << state.pitch_rad
+           << ",\"z\":" << state.yaw_rad << "}"
            << ",\"yaw_rad\":" << state.yaw_rad
            << ",\"pitch_rad\":" << state.pitch_rad
            << ",\"roll_rad\":" << state.roll_rad
            << ",\"battery_percent\":" << state.battery_percent
            << ",\"target_waypoint_index\":" << state.target_waypoint_index
+           << ",\"armed\":" << (state.armed ? "true" : "false")
            << "}";
     return stream.str();
 }
