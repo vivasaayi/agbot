@@ -3,6 +3,11 @@ use crate::AnalysisStatistics;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::schemas::{GeoBounds, RasterResolution};
+use timeseries::{
+    evaluate_series_cadence_health, MetricDefinition, MetricKind, SeriesCadenceHealthConfig,
+    SeriesFreshnessState, SeriesPoint, SeriesValue, TimeRange, TimeSeriesEngine, ZonalTrendConfig,
+    ZonalTrendTarget,
+};
 
 pub const DEFAULT_LOW_VIGOR_NDVI_THRESHOLD: f32 = 0.35;
 
@@ -53,6 +58,7 @@ pub enum VegetationTrend {
         baseline_acquired_at: DateTime<Utc>,
         mean_ndvi_delta: f32,
         low_vigor_fraction_delta: f32,
+        evidence_refs: Vec<String>,
     },
 }
 
@@ -84,23 +90,14 @@ pub fn summarize_vegetation(
         scene_id: input.scene_id.clone(),
         acquired_at: input.acquired_at,
     };
-    let trend = match prior {
-        Some(baseline) if is_comparable_baseline(&input, &stats.crs, &stats.extent, baseline) => {
-            VegetationTrend::Delta {
-                baseline_scene_id: baseline.scene_id.clone(),
-                baseline_product_ref: baseline.product_ref.clone(),
-                baseline_acquired_at: baseline.acquired_at,
-                mean_ndvi_delta: stats.statistics.mean_value - baseline.statistics.mean_value,
-                low_vigor_fraction_delta: low_vigor_fraction - baseline.low_vigor_fraction,
-            }
-        }
-        Some(_) => VegetationTrend::NoBaseline {
-            reason: "prior scene is not comparable".to_string(),
-        },
-        None => VegetationTrend::NoBaseline {
-            reason: "no baseline".to_string(),
-        },
-    };
+    let trend = vegetation_trend_from_timeseries(
+        &input,
+        &stats.crs,
+        &stats.extent,
+        stats.statistics.mean_value,
+        low_vigor_fraction,
+        prior,
+    );
 
     Ok(VegetationSummary {
         field_id: input.field_id,
@@ -160,6 +157,143 @@ fn is_comparable_baseline(
         && input.acquired_at > baseline.acquired_at
 }
 
+fn vegetation_trend_from_timeseries(
+    input: &VegetationSummaryInput,
+    current_crs: &str,
+    current_extent: &GeoBounds,
+    mean_ndvi: f32,
+    low_vigor_fraction: f32,
+    prior: Option<&VegetationSummary>,
+) -> VegetationTrend {
+    let Some(baseline) = prior else {
+        return VegetationTrend::NoBaseline {
+            reason: timeseries_no_baseline_reason(input),
+        };
+    };
+    if !is_comparable_baseline(input, current_crs, current_extent, baseline) {
+        return VegetationTrend::NoBaseline {
+            reason: "prior scene is not comparable".to_string(),
+        };
+    }
+
+    let mut engine = TimeSeriesEngine::default();
+    if engine
+        .register_metric(MetricDefinition {
+            metric: "ndvi_mean".to_string(),
+            unit: "index".to_string(),
+            kind: MetricKind::Scalar,
+            expected_cadence: "per_flight".to_string(),
+        })
+        .and_then(|_| {
+            engine.append(ndvi_mean_point(
+                &input.field_id,
+                baseline.acquired_at,
+                baseline.statistics.mean_value,
+                &baseline.product_ref,
+            ))
+        })
+        .and_then(|_| {
+            engine.append(ndvi_mean_point(
+                &input.field_id,
+                input.acquired_at,
+                mean_ndvi,
+                &input.product_ref,
+            ))
+        })
+        .is_err()
+    {
+        return VegetationTrend::NoBaseline {
+            reason: "timeseries trend unavailable".to_string(),
+        };
+    }
+
+    let page = engine.query(timeseries::SeriesQuery {
+        entity_ref: format!("field:{}", input.field_id),
+        metric: "ndvi_mean".to_string(),
+        range: TimeRange::default(),
+        limit: None,
+        cursor: None,
+    });
+    let Some(baseline_point) = page.points.first() else {
+        return VegetationTrend::NoBaseline {
+            reason: "no baseline".to_string(),
+        };
+    };
+    let SeriesValue::Scalar {
+        value: baseline_value,
+    } = baseline_point.value
+    else {
+        return VegetationTrend::NoBaseline {
+            reason: "timeseries trend unavailable".to_string(),
+        };
+    };
+    let trend = match engine.compute_zonal_trend(
+        ZonalTrendTarget {
+            entity_ref: format!("field:{}", input.field_id),
+            metric: "ndvi_mean".to_string(),
+            zone_ref: format!("field:{}", input.field_id),
+            zone_crs: current_crs.to_string(),
+            range: TimeRange::default(),
+        },
+        ZonalTrendConfig {
+            min_points: 2,
+            flat_slope_epsilon: 0.000001,
+        },
+    ) {
+        Ok(trend) => trend,
+        Err(_) => {
+            return VegetationTrend::NoBaseline {
+                reason: "no baseline".to_string(),
+            };
+        }
+    };
+
+    VegetationTrend::Delta {
+        baseline_scene_id: baseline.scene_id.clone(),
+        baseline_product_ref: baseline.product_ref.clone(),
+        baseline_acquired_at: baseline.acquired_at,
+        mean_ndvi_delta: mean_ndvi - baseline_value as f32,
+        low_vigor_fraction_delta: low_vigor_fraction - baseline.low_vigor_fraction,
+        evidence_refs: trend.evidence_refs,
+    }
+}
+
+fn timeseries_no_baseline_reason(input: &VegetationSummaryInput) -> String {
+    let health = evaluate_series_cadence_health(
+        &[],
+        format!("field:{}", input.field_id),
+        "ndvi_mean".to_string(),
+        input.acquired_at.to_rfc3339(),
+        SeriesCadenceHealthConfig {
+            expected_cadence_days: 14,
+            stale_after_days: 30,
+        },
+    );
+    match health.map(|report| report.state) {
+        Ok(SeriesFreshnessState::NoBaseline) => "no baseline".to_string(),
+        _ => "timeseries trend unavailable".to_string(),
+    }
+}
+
+fn ndvi_mean_point(
+    field_id: &str,
+    acquired_at: DateTime<Utc>,
+    value: f32,
+    source_ref: &str,
+) -> SeriesPoint {
+    SeriesPoint {
+        entity_ref: format!("field:{field_id}"),
+        metric: "ndvi_mean".to_string(),
+        unit: "index".to_string(),
+        t: acquired_at.to_rfc3339(),
+        value: SeriesValue::Scalar {
+            value: f64::from(value),
+        },
+        source_ref: source_ref.to_string(),
+        created_at: acquired_at.to_rfc3339(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,11 +337,16 @@ mod tests {
                 ref baseline_product_ref,
                 mean_ndvi_delta,
                 low_vigor_fraction_delta,
+                ref evidence_refs,
                 ..
             } if baseline_scene_id == "scene-2026-05-01"
                 && baseline_product_ref == "ndvi-2026-05-01"
                 && (mean_ndvi_delta - -0.15).abs() < 1.0e-6
                 && (low_vigor_fraction_delta - 0.25).abs() < 1.0e-6
+                && evidence_refs == &vec![
+                    "ndvi-2026-05-01".to_string(),
+                    "ndvi-2026-05-15".to_string()
+                ]
         ));
     }
 
