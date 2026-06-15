@@ -1,4 +1,4 @@
-use crate::schemas::{FarmFieldRegistry, FarmRecord, FieldRecord};
+use crate::schemas::{FarmFieldRegistry, FarmRecord, FieldRecord, ReportRecord};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -229,6 +229,45 @@ pub struct GrowerPortalOpenViewResolution {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrowerPortalPreferenceStore {
     preferences: HashMap<Uuid, GrowerPortalPreferences>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerReportInboxQuery {
+    pub field_id: Option<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for GrowerReportInboxQuery {
+    fn default() -> Self {
+        Self {
+            field_id: None,
+            date_from: None,
+            date_to: None,
+            offset: 0,
+            limit: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerReportInboxRow {
+    pub report_id: String,
+    pub field_id: String,
+    pub generated_at: String,
+    pub status: String,
+    pub title: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerReportInboxPage {
+    pub rows: Vec<GrowerReportInboxRow>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -669,6 +708,106 @@ impl GrowerPortalPreferenceStore {
                 )),
             }
         }
+    }
+}
+
+pub fn list_grower_report_inbox(
+    scope: &GrowerPortalSessionScope,
+    reports: &[ReportRecord],
+    query: GrowerReportInboxQuery,
+) -> GrowerReportInboxPage {
+    let scoped_field_ids = scope
+        .field_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let query_field = query.field_id.as_deref();
+    let mut rows = reports
+        .iter()
+        .filter_map(|report| {
+            let field_id = report.field_id.as_deref()?;
+            if !scoped_field_ids.contains(field_id) {
+                return None;
+            }
+            if query_field.is_some_and(|requested| requested != field_id) {
+                return None;
+            }
+            if query
+                .date_from
+                .as_deref()
+                .is_some_and(|from| report.created_at.as_str() < from)
+            {
+                return None;
+            }
+            if query
+                .date_to
+                .as_deref()
+                .is_some_and(|to| report.created_at.as_str() > to)
+            {
+                return None;
+            }
+            Some(grower_report_row(report, field_id))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .generated_at
+            .cmp(&left.generated_at)
+            .then(left.report_id.cmp(&right.report_id))
+    });
+    let total = rows.len();
+    let limit = query.limit.max(1);
+    let rows = rows.into_iter().skip(query.offset).take(limit).collect();
+
+    GrowerReportInboxPage {
+        rows,
+        total,
+        offset: query.offset,
+        limit,
+    }
+}
+
+pub fn read_grower_report(
+    scope: &GrowerPortalSessionScope,
+    reports: &[ReportRecord],
+    report_id: &str,
+) -> Result<ReportRecord, GrowerPortalAccessError> {
+    let report = reports
+        .iter()
+        .find(|report| report.report_id == report_id)
+        .ok_or_else(|| GrowerPortalAccessError::FieldNotFound {
+            field_id: report_id.to_string(),
+        })?;
+    let Some(field_id) = report.field_id.as_deref() else {
+        return Err(GrowerPortalAccessError::FieldNotFound {
+            field_id: report_id.to_string(),
+        });
+    };
+    if !scope.field_ids.iter().any(|scoped| scoped == field_id) {
+        return Err(GrowerPortalAccessError::Forbidden {
+            evidence: GrowerPortalAccessEvidence {
+                grower_id: scope.grower_id,
+                org_id: scope.org_id,
+                role: scope.role,
+                action: ControlPlaneAction::ReadEntity,
+                field_id: field_id.to_string(),
+                target_org_id: Some(report.org_id.clone()),
+                decision: AuthorizationDecision::Denied,
+                reason_code: "report_out_of_scope".to_string(),
+            },
+        });
+    }
+    Ok(report.clone())
+}
+
+fn grower_report_row(report: &ReportRecord, field_id: &str) -> GrowerReportInboxRow {
+    GrowerReportInboxRow {
+        report_id: report.report_id.clone(),
+        field_id: field_id.to_string(),
+        generated_at: report.created_at.clone(),
+        status: format!("{:?}", report.visibility),
+        title: report.title.clone(),
+        evidence_refs: report.source_refs.clone(),
     }
 }
 
@@ -1120,7 +1259,7 @@ mod tests {
     use super::*;
     use crate::schemas::{
         FarmFieldEntityStatus, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord,
-        GeoBounds, GeoPoint,
+        GeoBounds, GeoPoint, ReportFormat, ReportRecord, ReportVisibility,
     };
     use chrono::TimeZone;
 
@@ -1541,6 +1680,92 @@ mod tests {
     }
 
     #[test]
+    fn grower_report_inbox_lists_newest_first_with_filters_and_pagination() {
+        let grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string(), "field-c".to_string()],
+        };
+        let reports = vec![
+            report_record("report-old", "field-a", org_id, "2026-06-01T00:00:00Z"),
+            report_record("report-new", "field-a", org_id, "2026-06-12T00:00:00Z"),
+            report_record(
+                "report-other-field",
+                "field-c",
+                org_id,
+                "2026-06-10T00:00:00Z",
+            ),
+            report_record(
+                "report-foreign",
+                "field-b",
+                Uuid::new_v4(),
+                "2026-06-13T00:00:00Z",
+            ),
+        ];
+
+        let page = list_grower_report_inbox(
+            &scope,
+            &reports,
+            GrowerReportInboxQuery {
+                field_id: Some("field-a".to_string()),
+                date_from: Some("2026-06-01T00:00:00Z".to_string()),
+                date_to: Some("2026-06-30T00:00:00Z".to_string()),
+                offset: 0,
+                limit: 1,
+            },
+        );
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].report_id, "report-new");
+        assert_eq!(page.rows[0].field_id, "field-a");
+        assert_eq!(page.rows[0].generated_at, "2026-06-12T00:00:00Z");
+    }
+
+    #[test]
+    fn grower_report_read_denies_out_of_scope_report() {
+        let grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let foreign_org_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let reports = vec![
+            report_record("report-owned", "field-a", org_id, "2026-06-01T00:00:00Z"),
+            report_record(
+                "report-foreign",
+                "field-b",
+                foreign_org_id,
+                "2026-06-12T00:00:00Z",
+            ),
+        ];
+
+        let owned =
+            read_grower_report(&scope, &reports, "report-owned").expect("owned report should read");
+        assert_eq!(owned.report_id, "report-owned");
+
+        let error = read_grower_report(&scope, &reports, "report-foreign")
+            .expect_err("foreign report should be denied");
+        let GrowerPortalAccessError::Forbidden { evidence } = error else {
+            panic!("foreign report returns forbidden evidence");
+        };
+        assert_eq!(evidence.reason_code, "report_out_of_scope");
+        let expected_org_id = foreign_org_id.to_string();
+        assert_eq!(
+            evidence.target_org_id.as_deref(),
+            Some(expected_org_id.as_str())
+        );
+    }
+
+    #[test]
     fn grower_portal_field_read_denies_cross_tenant_and_audits() {
         let mut control = ControlPlaneRegistry::default();
         let org_a = control
@@ -1887,6 +2112,32 @@ mod tests {
                 }
             }),
             evidence_refs: vec![format!("scene:{scene_id}")],
+        }
+    }
+
+    fn report_record(
+        report_id: &str,
+        field_id: &str,
+        org_id: Uuid,
+        created_at: &str,
+    ) -> ReportRecord {
+        ReportRecord {
+            report_id: report_id.to_string(),
+            scene_id: format!("scene-{report_id}"),
+            field_id: Some(field_id.to_string()),
+            season_id: None,
+            org_id: org_id.to_string(),
+            generated_by: "advisor".to_string(),
+            source_refs: vec![format!("scene:scene-{report_id}")],
+            title: format!("Report {report_id}"),
+            format: ReportFormat::Html,
+            artifact_path: format!("/reports/{report_id}.html"),
+            artifact_uri: format!("file:///reports/{report_id}.html"),
+            download_url: format!("/api/reports/{report_id}"),
+            visibility: ReportVisibility::Org,
+            annotation_count: 0,
+            recommendation_count: 1,
+            created_at: created_at.to_string(),
         }
     }
 
