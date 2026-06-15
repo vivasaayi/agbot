@@ -3904,6 +3904,99 @@ async fn marketplace_orders_reject_illegal_transition_without_state_change() -> 
 }
 
 #[tokio::test]
+async fn marketplace_fulfillments_record_and_advance_confirmed_order() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+
+    let response =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "order-seed-corn-001", "org-alpha")
+            .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let fulfillment: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        fulfillment.get("status").and_then(|value| value.as_str()),
+        Some("pending")
+    );
+
+    let order_status: String =
+        sqlx::query_scalar("SELECT status FROM marketplace_orders WHERE order_id = ?1")
+            .bind("order-seed-corn-001")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(order_status, "fulfilled");
+
+    let transition = marketplace_fulfillment_transition(&ctx, "fulfillment-001", "shipped").await?;
+    assert_eq!(transition, StatusCode::OK);
+    let audits = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/fulfillments/fulfillment-001/audits?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(audits.status(), StatusCode::OK);
+    let body = to_bytes(audits.into_body(), 64 * 1024).await?;
+    let audits: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(audits.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_fulfillments_reject_cross_tenant_order_link() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+
+    let response =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "order-seed-corn-001", "org-beta")
+            .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let fulfillment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_fulfillments")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(fulfillment_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_fulfillments_reject_missing_order_without_write() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "missing-order", "org-alpha")
+            .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let fulfillment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_fulfillments")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(fulfillment_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn marketplace_demand_forecast_uses_field_and_product_evidence() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -12936,6 +13029,68 @@ async fn seed_marketplace_order(ctx: &TestContext, order_id: &str, qty: f64) -> 
         .expect("router should handle request");
     assert_eq!(response.status(), StatusCode::OK);
     Ok(())
+}
+
+async fn create_marketplace_fulfillment(
+    ctx: &TestContext,
+    fulfillment_id: &str,
+    order_ref: &str,
+    org_id: &str,
+) -> Result<Response> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/fulfillments")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "fulfillment_id": fulfillment_id,
+                        "order_ref": order_ref,
+                        "org_id": org_id,
+                        "carrier_ref": "carrier:opaque",
+                        "tracking_ref": "tracking:opaque",
+                        "actor_id": "ops-001"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    Ok(response)
+}
+
+async fn marketplace_fulfillment_transition(
+    ctx: &TestContext,
+    fulfillment_id: &str,
+    status: &str,
+) -> Result<StatusCode> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/marketplace/fulfillments/{fulfillment_id}/transition"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "org_id": "org-alpha",
+                        "actor_id": "ops-001",
+                        "status": status
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    Ok(response.status())
 }
 
 async fn seed_marketplace_demand_field(

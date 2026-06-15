@@ -8406,6 +8406,59 @@ pub struct MarketplaceOrderAuditRecord {
     pub occurred_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceFulfillmentStatus {
+    Pending,
+    Shipped,
+    Delivered,
+    Failed,
+}
+
+impl MarketplaceFulfillmentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketplaceFulfillmentStatus::Pending => "pending",
+            MarketplaceFulfillmentStatus::Shipped => "shipped",
+            MarketplaceFulfillmentStatus::Delivered => "delivered",
+            MarketplaceFulfillmentStatus::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceFulfillmentCreateRequest {
+    #[serde(default)]
+    pub fulfillment_id: Option<String>,
+    pub order_ref: String,
+    pub org_id: String,
+    pub carrier_ref: String,
+    pub tracking_ref: String,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceFulfillmentRecord {
+    pub fulfillment_id: String,
+    pub order_ref: String,
+    pub org_id: String,
+    pub carrier_ref: String,
+    pub tracking_ref: String,
+    pub status: MarketplaceFulfillmentStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceFulfillmentAuditRecord {
+    pub audit_id: String,
+    pub fulfillment_id: String,
+    pub from_status: Option<MarketplaceFulfillmentStatus>,
+    pub to_status: MarketplaceFulfillmentStatus,
+    pub actor_id: String,
+    pub occurred_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MarketplaceDemandForecastStatus {
@@ -8678,6 +8731,42 @@ pub enum MarketplaceOrderError {
     #[error("unsupported marketplace order status {value}")]
     UnsupportedStatus { value: String },
     #[error("marketplace order timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarketplaceFulfillmentError {
+    #[error("marketplace fulfillment_id cannot be empty")]
+    EmptyFulfillmentId,
+    #[error("marketplace fulfillment order_ref cannot be empty")]
+    EmptyOrderRef,
+    #[error("marketplace fulfillment org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("marketplace fulfillment carrier_ref cannot be empty")]
+    EmptyCarrierRef,
+    #[error("marketplace fulfillment tracking_ref cannot be empty")]
+    EmptyTrackingRef,
+    #[error("marketplace fulfillment actor_id cannot be empty")]
+    EmptyActorId,
+    #[error("marketplace fulfillment order is required")]
+    MissingOrder,
+    #[error("marketplace fulfillment order {order_id} belongs to {order_org_id}, not {fulfillment_org_id}")]
+    OrderOrgMismatch {
+        order_id: String,
+        order_org_id: String,
+        fulfillment_org_id: String,
+    },
+    #[error("marketplace fulfillment order {order_id} must be confirmed")]
+    OrderNotConfirmed { order_id: String },
+    #[error("invalid marketplace fulfillment transition for {fulfillment_id}: {from:?} -> {to:?}")]
+    InvalidStatusTransition {
+        fulfillment_id: String,
+        from: MarketplaceFulfillmentStatus,
+        to: MarketplaceFulfillmentStatus,
+    },
+    #[error("unsupported marketplace fulfillment status {value}")]
+    UnsupportedStatus { value: String },
+    #[error("marketplace fulfillment timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
 }
 
@@ -9107,6 +9196,102 @@ pub fn transition_marketplace_order_status(
     Ok((updated, audit))
 }
 
+pub fn create_marketplace_fulfillment_record(
+    request: MarketplaceFulfillmentCreateRequest,
+    order: Option<&MarketplaceOrderRecord>,
+    generated_fulfillment_id: String,
+    created_at: String,
+) -> Result<
+    (
+        MarketplaceFulfillmentRecord,
+        MarketplaceFulfillmentAuditRecord,
+    ),
+    MarketplaceFulfillmentError,
+> {
+    let fulfillment_id = normalize_marketplace_optional_text(request.fulfillment_id)
+        .or_else(|| normalize_marketplace_text(generated_fulfillment_id))
+        .ok_or(MarketplaceFulfillmentError::EmptyFulfillmentId)?;
+    let order_ref = normalize_marketplace_text(request.order_ref)
+        .ok_or(MarketplaceFulfillmentError::EmptyOrderRef)?;
+    let org_id = normalize_marketplace_text(request.org_id)
+        .ok_or(MarketplaceFulfillmentError::EmptyOrgId)?;
+    let carrier_ref = normalize_marketplace_text(request.carrier_ref)
+        .ok_or(MarketplaceFulfillmentError::EmptyCarrierRef)?;
+    let tracking_ref = normalize_marketplace_text(request.tracking_ref)
+        .ok_or(MarketplaceFulfillmentError::EmptyTrackingRef)?;
+    let actor_id = normalize_marketplace_text(request.actor_id)
+        .ok_or(MarketplaceFulfillmentError::EmptyActorId)?;
+    let order = order.ok_or(MarketplaceFulfillmentError::MissingOrder)?;
+    if order.order_id != order_ref || order.org_id != org_id {
+        return Err(MarketplaceFulfillmentError::OrderOrgMismatch {
+            order_id: order.order_id.clone(),
+            order_org_id: order.org_id.clone(),
+            fulfillment_org_id: org_id,
+        });
+    }
+    if order.status != MarketplaceOrderStatus::Confirmed {
+        return Err(MarketplaceFulfillmentError::OrderNotConfirmed {
+            order_id: order.order_id.clone(),
+        });
+    }
+    let created_at = normalize_marketplace_fulfillment_timestamp(created_at)?;
+    let record = MarketplaceFulfillmentRecord {
+        fulfillment_id: fulfillment_id.clone(),
+        order_ref,
+        org_id,
+        carrier_ref,
+        tracking_ref,
+        status: MarketplaceFulfillmentStatus::Pending,
+        created_at: created_at.clone(),
+        updated_at: created_at.clone(),
+    };
+    let audit = MarketplaceFulfillmentAuditRecord {
+        audit_id: format!("{fulfillment_id}:pending:{created_at}"),
+        fulfillment_id,
+        from_status: None,
+        to_status: MarketplaceFulfillmentStatus::Pending,
+        actor_id,
+        occurred_at: created_at,
+    };
+    Ok((record, audit))
+}
+
+pub fn transition_marketplace_fulfillment_status(
+    record: &MarketplaceFulfillmentRecord,
+    to: MarketplaceFulfillmentStatus,
+    actor_id: String,
+    occurred_at: String,
+) -> Result<
+    (
+        MarketplaceFulfillmentRecord,
+        MarketplaceFulfillmentAuditRecord,
+    ),
+    MarketplaceFulfillmentError,
+> {
+    let actor_id =
+        normalize_marketplace_text(actor_id).ok_or(MarketplaceFulfillmentError::EmptyActorId)?;
+    let occurred_at = normalize_marketplace_fulfillment_timestamp(occurred_at)?;
+    if !valid_marketplace_fulfillment_transition(record.status, to) {
+        return Err(MarketplaceFulfillmentError::InvalidStatusTransition {
+            fulfillment_id: record.fulfillment_id.clone(),
+            from: record.status,
+            to,
+        });
+    }
+    let mut updated = record.clone();
+    updated.status = to;
+    updated.updated_at = occurred_at.clone();
+    let audit = MarketplaceFulfillmentAuditRecord {
+        audit_id: format!("{}:{}:{occurred_at}", record.fulfillment_id, to.as_str()),
+        fulfillment_id: record.fulfillment_id.clone(),
+        from_status: Some(record.status),
+        to_status: to,
+        actor_id,
+        occurred_at,
+    };
+    Ok((updated, audit))
+}
+
 pub fn compute_marketplace_demand_forecast(
     request: MarketplaceDemandForecastRequest,
     field: Option<&FieldRecord>,
@@ -9417,6 +9602,20 @@ pub fn parse_marketplace_order_status(
     }
 }
 
+pub fn parse_marketplace_fulfillment_status(
+    value: &str,
+) -> Result<MarketplaceFulfillmentStatus, MarketplaceFulfillmentError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pending" => Ok(MarketplaceFulfillmentStatus::Pending),
+        "shipped" => Ok(MarketplaceFulfillmentStatus::Shipped),
+        "delivered" => Ok(MarketplaceFulfillmentStatus::Delivered),
+        "failed" => Ok(MarketplaceFulfillmentStatus::Failed),
+        _ => Err(MarketplaceFulfillmentError::UnsupportedStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
 pub fn parse_marketplace_demand_forecast_status(
     value: &str,
 ) -> Result<MarketplaceDemandForecastStatus, MarketplaceDemandForecastError> {
@@ -9467,6 +9666,28 @@ fn valid_marketplace_order_transition(
         ) | (
             MarketplaceOrderStatus::Fulfilled,
             MarketplaceOrderStatus::Closed
+        )
+    )
+}
+
+fn valid_marketplace_fulfillment_transition(
+    from: MarketplaceFulfillmentStatus,
+    to: MarketplaceFulfillmentStatus,
+) -> bool {
+    matches!(
+        (from, to),
+        (
+            MarketplaceFulfillmentStatus::Pending,
+            MarketplaceFulfillmentStatus::Shipped
+        ) | (
+            MarketplaceFulfillmentStatus::Pending,
+            MarketplaceFulfillmentStatus::Failed
+        ) | (
+            MarketplaceFulfillmentStatus::Shipped,
+            MarketplaceFulfillmentStatus::Delivered
+        ) | (
+            MarketplaceFulfillmentStatus::Shipped,
+            MarketplaceFulfillmentStatus::Failed
         )
     )
 }
@@ -9572,6 +9793,28 @@ fn parse_marketplace_order_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
         .map_err(|_| MarketplaceOrderError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+fn normalize_marketplace_fulfillment_timestamp(
+    timestamp: String,
+) -> Result<String, MarketplaceFulfillmentError> {
+    let timestamp = normalize_marketplace_text(timestamp).ok_or(
+        MarketplaceFulfillmentError::InvalidTimestamp {
+            timestamp: String::new(),
+        },
+    )?;
+    parse_marketplace_fulfillment_timestamp(&timestamp)?;
+    Ok(timestamp)
+}
+
+fn parse_marketplace_fulfillment_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, MarketplaceFulfillmentError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|_| MarketplaceFulfillmentError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -13464,7 +13707,8 @@ mod tests {
         build_tractor_field_ops_session_log, close_marketplace_listing_record,
         compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
         compute_marketplace_demand_forecast, compute_water_evapotranspiration,
-        compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
+        compute_weather_growing_degree_day, compute_weather_reference_et,
+        create_marketplace_fulfillment_record, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -13482,50 +13726,51 @@ mod tests {
         reserve_marketplace_inventory, resolve_weather_forecast_to_field, route_weather_alert,
         run_tractor_straight_path_guidance, schedule_irrigation_plan, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
-        transition_marketplace_account_status, transition_marketplace_order_status,
-        validate_field_boundary, validate_water_weather_input_contract,
-        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
-        weather_fetch_failure_record, zone_water_need_insufficient, AccessAnomalySignal,
-        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
-        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
-        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
-        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
-        ContentType, CropPlanRecord, DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus,
-        DroughtAlertRoutingRequest, DroughtBaselineTrendError, DroughtBaselineTrendRequest,
-        DroughtBaselineTrendStatus, DroughtEvidenceFusionError, DroughtEvidenceFusionRequest,
-        DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus, DroughtForecastRequest,
-        DroughtForecastStatus, DroughtForecastUncertaintyBand, DroughtHistoryEntry,
-        DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
-        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
-        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
-        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
-        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
-        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
-        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
-        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
-        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
-        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
-        MarketplaceDemandForecastStatus, MarketplaceInventoryError,
-        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
-        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
-        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
-        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceReportPeriod,
-        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
-        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        transition_marketplace_account_status, transition_marketplace_fulfillment_status,
+        transition_marketplace_order_status, validate_field_boundary,
+        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
+        verify_weather_forecast_accuracy, weather_fetch_failure_record,
+        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
+        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
+        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
+        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
+        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
+        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
+        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
+        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
+        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
+        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
+        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
+        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
+        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
+        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
+        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
+        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
+        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
+        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+        MarketplaceDemandForecastRequest, MarketplaceDemandForecastStatus,
+        MarketplaceFulfillmentCreateRequest, MarketplaceFulfillmentError,
+        MarketplaceFulfillmentStatus, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
+        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
+        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
+        MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
+        MarketplaceReportPeriod, MarketplaceUnitOfMeasure, MultispectralImage,
+        OpenDataPublishError, OpenDataPublishRefusalReason, OpenDataPublishRequest,
+        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
+        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
+        RecommendationStatus, RecommendationStatusChangeType, RemoteSensingMoistureIndex,
         RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
         RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
         ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
@@ -15272,6 +15517,92 @@ mod tests {
                 order_id: "order-seed-corn-001".to_string(),
                 from: MarketplaceOrderStatus::Cancelled,
                 to: MarketplaceOrderStatus::Confirmed,
+            }
+        );
+    }
+
+    #[test]
+    fn marketplace_fulfillment_records_pending_shipment_for_confirmed_order() {
+        let order = marketplace_order_fixture(
+            "order-001",
+            MarketplaceOrderStatus::Confirmed,
+            125.0,
+            "2026-06-15T09:00:00Z",
+        );
+        let (fulfillment, audit) = create_marketplace_fulfillment_record(
+            marketplace_fulfillment_request("order-001", "org-alpha"),
+            Some(&order),
+            "generated-fulfillment".to_string(),
+            "2026-06-15T10:00:00Z".to_string(),
+        )
+        .expect("confirmed order should accept fulfillment");
+
+        assert_eq!(fulfillment.status, MarketplaceFulfillmentStatus::Pending);
+        assert_eq!(fulfillment.carrier_ref, "carrier:opaque");
+        assert_eq!(audit.to_status, MarketplaceFulfillmentStatus::Pending);
+    }
+
+    #[test]
+    fn marketplace_fulfillment_transitions_to_delivered() {
+        let order = marketplace_order_fixture(
+            "order-001",
+            MarketplaceOrderStatus::Confirmed,
+            125.0,
+            "2026-06-15T09:00:00Z",
+        );
+        let (fulfillment, _) = create_marketplace_fulfillment_record(
+            marketplace_fulfillment_request("order-001", "org-alpha"),
+            Some(&order),
+            "generated-fulfillment".to_string(),
+            "2026-06-15T10:00:00Z".to_string(),
+        )
+        .expect("confirmed order should accept fulfillment");
+
+        let (shipped, _) = transition_marketplace_fulfillment_status(
+            &fulfillment,
+            MarketplaceFulfillmentStatus::Shipped,
+            "ops-001".to_string(),
+            "2026-06-15T11:00:00Z".to_string(),
+        )
+        .expect("pending fulfillment should ship");
+        let (delivered, audit) = transition_marketplace_fulfillment_status(
+            &shipped,
+            MarketplaceFulfillmentStatus::Delivered,
+            "ops-001".to_string(),
+            "2026-06-16T11:00:00Z".to_string(),
+        )
+        .expect("shipped fulfillment should deliver");
+
+        assert_eq!(delivered.status, MarketplaceFulfillmentStatus::Delivered);
+        assert_eq!(
+            audit.from_status,
+            Some(MarketplaceFulfillmentStatus::Shipped)
+        );
+    }
+
+    #[test]
+    fn marketplace_fulfillment_rejects_cross_tenant_order() {
+        let order = marketplace_order_fixture(
+            "order-001",
+            MarketplaceOrderStatus::Confirmed,
+            125.0,
+            "2026-06-15T09:00:00Z",
+        );
+
+        let error = create_marketplace_fulfillment_record(
+            marketplace_fulfillment_request("order-001", "org-beta"),
+            Some(&order),
+            "generated-fulfillment".to_string(),
+            "2026-06-15T10:00:00Z".to_string(),
+        )
+        .expect_err("foreign order should reject");
+
+        assert_eq!(
+            error,
+            MarketplaceFulfillmentError::OrderOrgMismatch {
+                order_id: "order-001".to_string(),
+                order_org_id: "org-alpha".to_string(),
+                fulfillment_org_id: "org-beta".to_string(),
             }
         );
     }
@@ -18168,6 +18499,20 @@ mod tests {
             status,
             created_at: created_at.to_string(),
             updated_at: created_at.to_string(),
+        }
+    }
+
+    fn marketplace_fulfillment_request(
+        order_ref: &str,
+        org_id: &str,
+    ) -> MarketplaceFulfillmentCreateRequest {
+        MarketplaceFulfillmentCreateRequest {
+            fulfillment_id: Some("fulfillment-order-001".to_string()),
+            order_ref: order_ref.to_string(),
+            org_id: org_id.to_string(),
+            carrier_ref: "carrier:opaque".to_string(),
+            tracking_ref: "tracking:opaque".to_string(),
+            actor_id: "ops-001".to_string(),
         }
     }
 

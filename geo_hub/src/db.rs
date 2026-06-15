@@ -1042,6 +1042,38 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS marketplace_fulfillments (
+            fulfillment_id TEXT PRIMARY KEY,
+            order_ref TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            carrier_ref TEXT NOT NULL,
+            tracking_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_fulfillment_audits (
+            audit_id TEXT PRIMARY KEY,
+            fulfillment_id TEXT NOT NULL,
+            from_status TEXT,
+            to_status TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS sustainability_records (
             record_id TEXT PRIMARY KEY,
             field_id TEXT NOT NULL,
@@ -1831,6 +1863,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_marketplace_demand_forecasts_org_field
         ON marketplace_demand_forecasts(org_id, field_id, horizon);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_fulfillments_org_order
+        ON marketplace_fulfillments(org_id, order_ref, status);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_fulfillment_audits_fulfillment
+        ON marketplace_fulfillment_audits(fulfillment_id, occurred_at);
         "#,
     )
     .execute(pool)
