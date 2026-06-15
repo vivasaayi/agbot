@@ -2957,6 +2957,44 @@ pub struct WeatherHistoryQueryResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherOperationalWindowThresholds {
+    pub max_wind_speed_mps: f64,
+    pub max_precipitation_mm: f64,
+    pub min_temperature_celsius: f64,
+    pub max_temperature_celsius: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherOperationalWindowRequest {
+    pub field_ref: String,
+    pub thresholds: WeatherOperationalWindowThresholds,
+    pub records: Vec<WeatherFreshnessAnnotatedRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeatherOperationalWindowGap {
+    pub reason_code: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherOperationalWindow {
+    pub field_ref: String,
+    pub start: String,
+    pub end: String,
+    pub gating_vars: Vec<String>,
+    pub thresholds: Vec<String>,
+    pub freshness: Vec<WeatherFreshnessState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherOperationalWindowReport {
+    pub field_ref: String,
+    pub windows: Vec<WeatherOperationalWindow>,
+    pub gaps: Vec<WeatherOperationalWindowGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
     pub wind_speed_mps: WeatherForecastValue,
@@ -3107,6 +3145,16 @@ pub enum WeatherHistoryError {
     #[error("weather history date range is invalid")]
     InvalidDateRange,
     #[error("weather history timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherOperationalWindowError {
+    #[error("weather operational window field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("weather operational window thresholds are invalid")]
+    InvalidThresholds,
+    #[error("weather operational window timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
 }
 
@@ -3576,6 +3624,189 @@ fn parse_weather_history_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.with_timezone(&chrono::Utc))
         .map_err(|_| WeatherHistoryError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+pub fn advise_weather_operational_windows(
+    request: WeatherOperationalWindowRequest,
+) -> Result<WeatherOperationalWindowReport, WeatherOperationalWindowError> {
+    let field_ref = normalize_weather_text(request.field_ref)
+        .ok_or(WeatherOperationalWindowError::EmptyFieldRef)?;
+    validate_weather_operational_thresholds(&request.thresholds)?;
+    if request.records.is_empty() {
+        return Ok(WeatherOperationalWindowReport {
+            field_ref,
+            windows: Vec::new(),
+            gaps: vec![WeatherOperationalWindowGap {
+                reason_code: "missing_forecast_inputs".to_string(),
+                details: "no annotated weather records were provided".to_string(),
+            }],
+        });
+    }
+
+    let mut records = request
+        .records
+        .into_iter()
+        .filter(|record| record.field_ref == field_ref)
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.valid_time.cmp(&right.valid_time));
+    if records.is_empty() {
+        return Ok(WeatherOperationalWindowReport {
+            field_ref,
+            windows: Vec::new(),
+            gaps: vec![WeatherOperationalWindowGap {
+                reason_code: "missing_field_forecast_inputs".to_string(),
+                details: "no annotated records matched the requested field".to_string(),
+            }],
+        });
+    }
+    let mut gaps = Vec::new();
+    if records.iter().any(|record| record.stale) {
+        for record in records.iter().filter(|record| record.stale) {
+            gaps.push(WeatherOperationalWindowGap {
+                reason_code: "stale_forecast_input".to_string(),
+                details: format!("{} at {} is stale", record.forecast_id, record.valid_time),
+            });
+        }
+        return Ok(WeatherOperationalWindowReport {
+            field_ref,
+            windows: Vec::new(),
+            gaps,
+        });
+    }
+
+    let mut windows = Vec::new();
+    let mut current_start: Option<String> = None;
+    let mut current_end: Option<String> = None;
+    for record in &records {
+        parse_weather_operational_window_timestamp(&record.valid_time)?;
+        if weather_record_passes_operational_thresholds(record, &request.thresholds) {
+            current_start.get_or_insert_with(|| record.valid_time.clone());
+            current_end = Some(record.valid_time.clone());
+        } else {
+            if let (Some(start), Some(end)) = (current_start.take(), current_end.take()) {
+                windows.push(weather_operational_window(
+                    &field_ref,
+                    start,
+                    end,
+                    &request.thresholds,
+                ));
+            }
+            gaps.push(weather_operational_threshold_gap(
+                record,
+                &request.thresholds,
+            ));
+        }
+    }
+    if let (Some(start), Some(end)) = (current_start.take(), current_end.take()) {
+        windows.push(weather_operational_window(
+            &field_ref,
+            start,
+            end,
+            &request.thresholds,
+        ));
+    }
+
+    Ok(WeatherOperationalWindowReport {
+        field_ref,
+        windows,
+        gaps,
+    })
+}
+
+fn validate_weather_operational_thresholds(
+    thresholds: &WeatherOperationalWindowThresholds,
+) -> Result<(), WeatherOperationalWindowError> {
+    if !thresholds.max_wind_speed_mps.is_finite()
+        || thresholds.max_wind_speed_mps < 0.0
+        || !thresholds.max_precipitation_mm.is_finite()
+        || thresholds.max_precipitation_mm < 0.0
+        || !thresholds.min_temperature_celsius.is_finite()
+        || !thresholds.max_temperature_celsius.is_finite()
+        || thresholds.min_temperature_celsius > thresholds.max_temperature_celsius
+    {
+        return Err(WeatherOperationalWindowError::InvalidThresholds);
+    }
+    Ok(())
+}
+
+fn weather_record_passes_operational_thresholds(
+    record: &WeatherFreshnessAnnotatedRecord,
+    thresholds: &WeatherOperationalWindowThresholds,
+) -> bool {
+    record.wind_speed_mps.value.value <= thresholds.max_wind_speed_mps
+        && record.precipitation_mm.value.value <= thresholds.max_precipitation_mm
+        && record.temperature_celsius.value.value >= thresholds.min_temperature_celsius
+        && record.temperature_celsius.value.value <= thresholds.max_temperature_celsius
+}
+
+fn weather_operational_threshold_gap(
+    record: &WeatherFreshnessAnnotatedRecord,
+    thresholds: &WeatherOperationalWindowThresholds,
+) -> WeatherOperationalWindowGap {
+    let mut failures = Vec::new();
+    if record.wind_speed_mps.value.value > thresholds.max_wind_speed_mps {
+        failures.push(format!(
+            "wind_speed_mps:{}>{}",
+            record.wind_speed_mps.value.value, thresholds.max_wind_speed_mps
+        ));
+    }
+    if record.precipitation_mm.value.value > thresholds.max_precipitation_mm {
+        failures.push(format!(
+            "precipitation_mm:{}>{}",
+            record.precipitation_mm.value.value, thresholds.max_precipitation_mm
+        ));
+    }
+    if record.temperature_celsius.value.value < thresholds.min_temperature_celsius
+        || record.temperature_celsius.value.value > thresholds.max_temperature_celsius
+    {
+        failures.push(format!(
+            "temperature_celsius:{} outside {}..{}",
+            record.temperature_celsius.value.value,
+            thresholds.min_temperature_celsius,
+            thresholds.max_temperature_celsius
+        ));
+    }
+    WeatherOperationalWindowGap {
+        reason_code: "threshold_exceeded".to_string(),
+        details: format!("{}: {}", record.valid_time, failures.join(",")),
+    }
+}
+
+fn weather_operational_window(
+    field_ref: &str,
+    start: String,
+    end: String,
+    thresholds: &WeatherOperationalWindowThresholds,
+) -> WeatherOperationalWindow {
+    WeatherOperationalWindow {
+        field_ref: field_ref.to_string(),
+        start,
+        end,
+        gating_vars: vec![
+            "wind_speed_mps".to_string(),
+            "precipitation_mm".to_string(),
+            "temperature_celsius".to_string(),
+        ],
+        thresholds: vec![
+            format!("max_wind_speed_mps:{}", thresholds.max_wind_speed_mps),
+            format!("max_precipitation_mm:{}", thresholds.max_precipitation_mm),
+            format!(
+                "temperature_celsius:{}..{}",
+                thresholds.min_temperature_celsius, thresholds.max_temperature_celsius
+            ),
+        ],
+        freshness: vec![WeatherFreshnessState::Fresh],
+    }
+}
+
+fn parse_weather_operational_window_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, WeatherOperationalWindowError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| WeatherOperationalWindowError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -8083,7 +8314,8 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        annotate_weather_record_freshness, append_content_version, append_weather_history_records,
+        advise_weather_operational_windows, annotate_weather_record_freshness,
+        append_content_version, append_weather_history_records,
         apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
         apply_tractor_implement_command, assert_flight_operation_allowed,
         assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
@@ -8139,6 +8371,7 @@ mod tests {
         TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
         WeatherForecastValue, WeatherFreshnessState, WeatherHistoryQuery, WeatherIngestError,
+        WeatherOperationalWindowRequest, WeatherOperationalWindowThresholds,
         WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherSensorIngestError,
         WeatherSensorSample, WeatherSensorStreamIngestRequest, WorkOrderChangeType,
         WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
@@ -10066,6 +10299,61 @@ mod tests {
     }
 
     #[test]
+    fn weather_operational_window_advisor_emits_fresh_safe_window() {
+        let report = advise_weather_operational_windows(weather_window_request(vec![
+            weather_window_record("2026-06-13T10:00:00Z", 3.0, 0.0, 22.0, false),
+            weather_window_record("2026-06-13T10:15:00Z", 4.0, 0.1, 23.0, false),
+        ]))
+        .expect("safe forecast should advise a window");
+
+        assert!(report.gaps.is_empty());
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].start, "2026-06-13T10:00:00Z");
+        assert_eq!(report.windows[0].end, "2026-06-13T10:15:00Z");
+        assert!(report.windows[0]
+            .gating_vars
+            .contains(&"wind_speed_mps".to_string()));
+        assert!(report.windows[0]
+            .thresholds
+            .contains(&"max_precipitation_mm:0.5".to_string()));
+        assert_eq!(
+            report.windows[0].freshness,
+            vec![WeatherFreshnessState::Fresh]
+        );
+    }
+
+    #[test]
+    fn weather_operational_window_advisor_reports_threshold_gap() {
+        let report = advise_weather_operational_windows(weather_window_request(vec![
+            weather_window_record("2026-06-13T10:00:00Z", 3.0, 0.0, 22.0, false),
+            weather_window_record("2026-06-13T10:15:00Z", 12.0, 0.0, 22.0, false),
+        ]))
+        .expect("threshold gap should evaluate");
+
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.gaps.len(), 1);
+        assert_eq!(report.gaps[0].reason_code, "threshold_exceeded");
+        assert!(report.gaps[0].details.contains("wind_speed_mps:12>6"));
+    }
+
+    #[test]
+    fn weather_operational_window_advisor_blocks_stale_or_missing_inputs() {
+        let stale = advise_weather_operational_windows(weather_window_request(vec![
+            weather_window_record("2026-06-13T10:00:00Z", 3.0, 0.0, 22.0, true),
+        ]))
+        .expect("stale forecast should evaluate");
+
+        assert!(stale.windows.is_empty());
+        assert_eq!(stale.gaps[0].reason_code, "stale_forecast_input");
+
+        let missing = advise_weather_operational_windows(weather_window_request(Vec::new()))
+            .expect("missing forecast should evaluate");
+
+        assert!(missing.windows.is_empty());
+        assert_eq!(missing.gaps[0].reason_code, "missing_forecast_inputs");
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -10690,6 +10978,54 @@ mod tests {
             offset: 0,
             limit: 50,
         }
+    }
+
+    fn weather_window_request(
+        records: Vec<super::WeatherFreshnessAnnotatedRecord>,
+    ) -> WeatherOperationalWindowRequest {
+        WeatherOperationalWindowRequest {
+            field_ref: "field-north".to_string(),
+            thresholds: WeatherOperationalWindowThresholds {
+                max_wind_speed_mps: 6.0,
+                max_precipitation_mm: 0.5,
+                min_temperature_celsius: 5.0,
+                max_temperature_celsius: 32.0,
+            },
+            records,
+        }
+    }
+
+    fn weather_window_record(
+        valid_time: &str,
+        wind_speed_mps: f64,
+        precipitation_mm: f64,
+        temperature_celsius: f64,
+        stale: bool,
+    ) -> super::WeatherFreshnessAnnotatedRecord {
+        let fetched_at = if stale {
+            "2026-06-13T08:00:00Z"
+        } else {
+            "2026-06-13T09:55:00Z"
+        };
+        let record = normalize_weather_provider_forecast(
+            "field-north".to_string(),
+            WeatherProviderForecastResponse {
+                source: "NOAA-HRRR".to_string(),
+                fetched_at: fetched_at.to_string(),
+                points: vec![WeatherProviderForecastPoint {
+                    valid_time: valid_time.to_string(),
+                    temperature_celsius,
+                    wind_speed_mps,
+                    precipitation_mm,
+                    humidity_percent: 64.0,
+                    radiation_w_m2: 720.0,
+                }],
+            },
+        )
+        .expect("weather window fixture should normalize")
+        .remove(0);
+        annotate_weather_record_freshness(record, "2026-06-13T10:00:00Z", 900)
+            .expect("weather window fixture should annotate")
     }
 
     fn tractor_prescription_request(
