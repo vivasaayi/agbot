@@ -1183,6 +1183,57 @@ pub struct TractorWeatherWindowGate {
     pub gating_inputs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorSwathReservation {
+    pub tractor_id: String,
+    pub swath: TractorSwathSegment,
+    pub priority: u8,
+    pub starts_at: String,
+    pub ends_at: String,
+    pub geofence: TractorGeofenceEvaluation,
+    pub motion_gate: TractorMotionGateEvaluation,
+    pub obstacle: TractorObstacleDetection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorDeconflictionRequest {
+    pub field_id: String,
+    pub evaluated_at: String,
+    pub reservations: Vec<TractorSwathReservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorDeconflictionDecision {
+    Proceed,
+    Halted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorDeconflictionReservationDecision {
+    pub tractor_id: String,
+    pub decision: TractorDeconflictionDecision,
+    pub reason_code: String,
+    #[serde(default)]
+    pub conflict_with: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorDeconflictionEvent {
+    pub halted_tractor_id: String,
+    pub priority_tractor_id: String,
+    pub reason_code: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorDeconflictionPlan {
+    pub field_id: String,
+    pub all_clear: bool,
+    pub decisions: Vec<TractorDeconflictionReservationDecision>,
+    pub events: Vec<TractorDeconflictionEvent>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TractorImplementControlError {
     #[error("tractor implement control implement_id cannot be empty")]
@@ -1194,6 +1245,22 @@ pub enum TractorImplementControlError {
     #[error("tractor implement control timestamp cannot be empty")]
     EmptyTimestamp,
     #[error("tractor implement control timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TractorDeconflictionError {
+    #[error("tractor deconfliction field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("tractor deconfliction evaluated_at cannot be empty")]
+    EmptyEvaluatedAt,
+    #[error("tractor deconfliction requires at least one reservation")]
+    EmptyReservations,
+    #[error("tractor deconfliction tractor_id cannot be empty")]
+    EmptyTractorId,
+    #[error("tractor deconfliction swath is invalid")]
+    InvalidSwath,
+    #[error("tractor deconfliction reservation timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
 }
 
@@ -2567,6 +2634,208 @@ fn parse_tractor_weather_window_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.with_timezone(&chrono::Utc))
         .map_err(|_| TractorWeatherWindowGateError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+pub fn deconflict_tractor_swath_reservations(
+    request: TractorDeconflictionRequest,
+) -> Result<TractorDeconflictionPlan, TractorDeconflictionError> {
+    let field_id =
+        normalize_tractor_text(request.field_id).ok_or(TractorDeconflictionError::EmptyFieldId)?;
+    let evaluated_at = normalize_tractor_text(request.evaluated_at)
+        .ok_or(TractorDeconflictionError::EmptyEvaluatedAt)?;
+    parse_tractor_deconfliction_timestamp(&evaluated_at)?;
+    if request.reservations.is_empty() {
+        return Err(TractorDeconflictionError::EmptyReservations);
+    }
+
+    let mut reservations = Vec::new();
+    let mut decisions = Vec::new();
+    let mut events = Vec::new();
+    for reservation in request.reservations {
+        let tractor_id = normalize_tractor_text(reservation.tractor_id.clone())
+            .ok_or(TractorDeconflictionError::EmptyTractorId)?;
+        validate_tractor_deconfliction_swath(&reservation.swath)?;
+        let starts_at = parse_tractor_deconfliction_timestamp(&reservation.starts_at)?;
+        let ends_at = parse_tractor_deconfliction_timestamp(&reservation.ends_at)?;
+        if ends_at <= starts_at {
+            return Err(TractorDeconflictionError::InvalidTimestamp {
+                timestamp: reservation.ends_at,
+            });
+        }
+
+        let safety_reason = tractor_deconfliction_safety_reason(&reservation);
+        decisions.push(TractorDeconflictionReservationDecision {
+            tractor_id: tractor_id.clone(),
+            decision: if safety_reason.is_some() {
+                TractorDeconflictionDecision::Halted
+            } else {
+                TractorDeconflictionDecision::Proceed
+            },
+            reason_code: safety_reason.unwrap_or("reserved".to_string()),
+            conflict_with: None,
+        });
+        reservations.push((tractor_id, reservation, starts_at, ends_at));
+    }
+
+    for left_idx in 0..reservations.len() {
+        for right_idx in (left_idx + 1)..reservations.len() {
+            if decisions[left_idx].decision == TractorDeconflictionDecision::Halted
+                || decisions[right_idx].decision == TractorDeconflictionDecision::Halted
+            {
+                continue;
+            }
+            let left = &reservations[left_idx];
+            let right = &reservations[right_idx];
+            if !tractor_reservations_conflict(left, right) {
+                continue;
+            }
+
+            let (halted_idx, priority_idx) =
+                tractor_deconfliction_halt_order(left_idx, right_idx, &reservations);
+            decisions[halted_idx].decision = TractorDeconflictionDecision::Halted;
+            decisions[halted_idx].reason_code = "swath_time_conflict".to_string();
+            decisions[halted_idx].conflict_with = Some(decisions[priority_idx].tractor_id.clone());
+            events.push(TractorDeconflictionEvent {
+                halted_tractor_id: decisions[halted_idx].tractor_id.clone(),
+                priority_tractor_id: decisions[priority_idx].tractor_id.clone(),
+                reason_code: "swath_time_conflict".to_string(),
+                at: evaluated_at.clone(),
+            });
+        }
+    }
+
+    decisions.sort_by(|left, right| left.tractor_id.cmp(&right.tractor_id));
+    events.sort_by(|left, right| {
+        left.halted_tractor_id
+            .cmp(&right.halted_tractor_id)
+            .then_with(|| left.priority_tractor_id.cmp(&right.priority_tractor_id))
+    });
+    let all_clear = decisions
+        .iter()
+        .all(|decision| decision.decision == TractorDeconflictionDecision::Proceed);
+
+    Ok(TractorDeconflictionPlan {
+        field_id,
+        all_clear,
+        decisions,
+        events,
+    })
+}
+
+fn tractor_deconfliction_safety_reason(reservation: &TractorSwathReservation) -> Option<String> {
+    if reservation.geofence.decision != TractorGeofenceDecision::Permitted {
+        return Some(reservation.geofence.reason_code.clone());
+    }
+    if reservation.motion_gate.decision != TractorMotionGateDecision::Allowed
+        || reservation.motion_gate.halted
+    {
+        return Some(reservation.motion_gate.audit.reason_code.clone());
+    }
+    if reservation.obstacle.halted {
+        return Some(
+            reservation
+                .obstacle
+                .event
+                .as_ref()
+                .map(|event| event.reason_code.clone())
+                .unwrap_or_else(|| "obstacle_halt".to_string()),
+        );
+    }
+    None
+}
+
+fn tractor_reservations_conflict(
+    left: &(
+        String,
+        TractorSwathReservation,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ),
+    right: &(
+        String,
+        TractorSwathReservation,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ),
+) -> bool {
+    left.2 < right.3
+        && right.2 < left.3
+        && tractor_swath_footprints_overlap(&left.1.swath, &right.1.swath)
+}
+
+fn tractor_deconfliction_halt_order(
+    left_idx: usize,
+    right_idx: usize,
+    reservations: &[(
+        String,
+        TractorSwathReservation,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    )],
+) -> (usize, usize) {
+    let left = &reservations[left_idx];
+    let right = &reservations[right_idx];
+    if left.1.priority > right.1.priority {
+        (left_idx, right_idx)
+    } else if right.1.priority > left.1.priority {
+        (right_idx, left_idx)
+    } else if left.0 > right.0 {
+        (left_idx, right_idx)
+    } else {
+        (right_idx, left_idx)
+    }
+}
+
+fn tractor_swath_footprints_overlap(
+    left: &TractorSwathSegment,
+    right: &TractorSwathSegment,
+) -> bool {
+    if segments_intersect(&left.start, &left.end, &right.start, &right.end) {
+        return true;
+    }
+    let left_bounds = tractor_swath_footprint_bounds(left);
+    let right_bounds = tractor_swath_footprint_bounds(right);
+    left_bounds.min_lon <= right_bounds.max_lon
+        && left_bounds.max_lon >= right_bounds.min_lon
+        && left_bounds.min_lat <= right_bounds.max_lat
+        && left_bounds.max_lat >= right_bounds.min_lat
+}
+
+fn tractor_swath_footprint_bounds(swath: &TractorSwathSegment) -> GeoBounds {
+    let half_width = swath.width_m / 2.0;
+    GeoBounds {
+        min_lon: swath.start.longitude.min(swath.end.longitude) - half_width,
+        min_lat: swath.start.latitude.min(swath.end.latitude) - half_width,
+        max_lon: swath.start.longitude.max(swath.end.longitude) + half_width,
+        max_lat: swath.start.latitude.max(swath.end.latitude) + half_width,
+    }
+}
+
+fn validate_tractor_deconfliction_swath(
+    swath: &TractorSwathSegment,
+) -> Result<(), TractorDeconflictionError> {
+    if !swath.start.longitude.is_finite()
+        || !swath.start.latitude.is_finite()
+        || !swath.end.longitude.is_finite()
+        || !swath.end.latitude.is_finite()
+        || !swath.width_m.is_finite()
+        || swath.width_m <= 0.0
+        || (swath.start.longitude == swath.end.longitude
+            && swath.start.latitude == swath.end.latitude)
+    {
+        return Err(TractorDeconflictionError::InvalidSwath);
+    }
+    Ok(())
+}
+
+fn parse_tractor_deconfliction_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, TractorDeconflictionError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| TractorDeconflictionError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -7240,11 +7509,11 @@ mod tests {
         build_fleet_version_inventory, build_marketplace_account_record,
         build_soil_moisture_reading, build_sustainability_record, build_tractor_field_ops_replay,
         build_tractor_field_ops_session_log, compute_drought_index, create_versioned_content,
-        detect_tractor_obstacle, dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
-        evaluate_tractor_geofence, evaluate_tractor_motion_gate,
-        evaluate_tractor_weather_window_gate, execute_tractor_prescription,
-        normalize_weather_provider_forecast, plan_tractor_swath_coverage,
-        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        deconflict_tractor_swath_reservations, detect_tractor_obstacle,
+        dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
+        evaluate_tractor_motion_gate, evaluate_tractor_weather_window_gate,
+        execute_tractor_prescription, normalize_weather_provider_forecast,
+        plan_tractor_swath_coverage, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
@@ -7272,21 +7541,22 @@ mod tests {
         SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
         SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorEstopState, TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent,
-        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
-        TractorFieldOpsTelemetrySample, TractorGeofenceDecision, TractorGeofenceError,
-        TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
-        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
+        TractorDeconflictionDecision, TractorDeconflictionRequest, TractorEstopState,
+        TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
+        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGeofenceDecision,
+        TractorGeofenceError, TractorGeofenceEvaluationRequest, TractorGuidanceConfig,
+        TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
         TractorImplementAdapterSpec, TractorImplementCommand, TractorImplementDecision,
         TractorImplementRef, TractorImplementState, TractorLifecycleStatus,
         TractorMotionCommandRequest, TractorMotionGateDecision, TractorObstacleDetection,
         TractorObstacleDetectionRequest, TractorObstacleEvent, TractorOperatorApproval,
         TractorPrescriptionExecutionError, TractorPrescriptionExecutionRequest,
         TractorPrescriptionZone, TractorRegistrationRequest, TractorRegistry,
-        TractorSwathCoverageRequest, TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
-        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
-        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
-        WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry, WorkOrderStatus,
+        TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
+        TractorWeatherWindowDecision, TractorWeatherWindowGateRequest, WeatherIngestError,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
+        WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -8474,6 +8744,78 @@ mod tests {
     }
 
     #[test]
+    fn tractor_deconfliction_allows_non_overlapping_swaths() {
+        let plan = deconflict_tractor_swath_reservations(TractorDeconflictionRequest {
+            field_id: "field-north".to_string(),
+            evaluated_at: "2026-06-15T10:00:00Z".to_string(),
+            reservations: vec![
+                tractor_swath_reservation("tractor-001", 1, 1.0, 0.0, 10.0),
+                tractor_swath_reservation("tractor-002", 2, 4.0, 0.0, 10.0),
+            ],
+        })
+        .expect("non-overlapping swaths should deconflict");
+
+        assert!(plan.all_clear);
+        assert!(plan.events.is_empty());
+        assert!(plan
+            .decisions
+            .iter()
+            .all(|decision| decision.decision == TractorDeconflictionDecision::Proceed));
+    }
+
+    #[test]
+    fn tractor_deconfliction_halts_lower_priority_on_conflict() {
+        let plan = deconflict_tractor_swath_reservations(TractorDeconflictionRequest {
+            field_id: "field-north".to_string(),
+            evaluated_at: "2026-06-15T10:00:00Z".to_string(),
+            reservations: vec![
+                tractor_swath_reservation("tractor-001", 1, 1.0, 0.0, 10.0),
+                tractor_swath_reservation("tractor-002", 3, 1.2, 0.0, 10.0),
+            ],
+        })
+        .expect("conflicting swaths should deconflict");
+
+        assert!(!plan.all_clear);
+        assert_eq!(plan.events.len(), 1);
+        assert_eq!(plan.events[0].halted_tractor_id, "tractor-002");
+        let halted = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.tractor_id == "tractor-002")
+            .expect("halted tractor decision is present");
+        assert_eq!(halted.decision, TractorDeconflictionDecision::Halted);
+        assert_eq!(halted.reason_code, "swath_time_conflict");
+        assert_eq!(halted.conflict_with.as_deref(), Some("tractor-001"));
+    }
+
+    #[test]
+    fn tractor_deconfliction_halts_failed_safety_prerequisite() {
+        let mut reservation = tractor_swath_reservation("tractor-002", 2, 4.0, 0.0, 10.0);
+        reservation.obstacle = TractorObstacleDetection {
+            tractor_id: "tractor-002".to_string(),
+            halted: true,
+            event: Some(TractorObstacleEvent {
+                distance_m: 1.0,
+                position: TractorGuidancePoint { x_m: 1.0, y_m: 0.0 },
+                reason_code: "obstacle_in_path".to_string(),
+            }),
+        };
+        let plan = deconflict_tractor_swath_reservations(TractorDeconflictionRequest {
+            field_id: "field-north".to_string(),
+            evaluated_at: "2026-06-15T10:00:00Z".to_string(),
+            reservations: vec![reservation],
+        })
+        .expect("failed safety prerequisite should halt");
+
+        assert!(!plan.all_clear);
+        assert_eq!(
+            plan.decisions[0].decision,
+            TractorDeconflictionDecision::Halted
+        );
+        assert_eq!(plan.decisions[0].reason_code, "obstacle_in_path");
+    }
+
+    #[test]
     fn marketplace_account_links_party_to_one_org_and_normalizes_roles() {
         let record = build_marketplace_account_record(
             MarketplaceAccountCreateRequest {
@@ -9378,6 +9720,50 @@ mod tests {
             allowed,
             reason_code: reason_code.to_string(),
             gating_inputs: vec!["wind_mps:3.2".to_string(), "precip_mm:0.0".to_string()],
+        }
+    }
+
+    fn tractor_swath_reservation(
+        tractor_id: &str,
+        priority: u8,
+        y_m: f64,
+        start_x_m: f64,
+        end_x_m: f64,
+    ) -> TractorSwathReservation {
+        TractorSwathReservation {
+            tractor_id: tractor_id.to_string(),
+            swath: TractorSwathSegment {
+                start: GeoPoint {
+                    longitude: start_x_m,
+                    latitude: y_m,
+                },
+                end: GeoPoint {
+                    longitude: end_x_m,
+                    latitude: y_m,
+                },
+                width_m: 1.0,
+            },
+            priority,
+            starts_at: "2026-06-15T10:00:00Z".to_string(),
+            ends_at: "2026-06-15T10:30:00Z".to_string(),
+            geofence: evaluate_tractor_geofence(tractor_geofence_request(
+                GeoPoint {
+                    longitude: 2.0,
+                    latitude: 2.0,
+                },
+                GeoPoint {
+                    longitude: 8.0,
+                    latitude: 8.0,
+                },
+                "EPSG:3857",
+            ))
+            .expect("geofence prerequisite should pass"),
+            motion_gate: tractor_allowed_motion_gate(),
+            obstacle: TractorObstacleDetection {
+                tractor_id: tractor_id.to_string(),
+                halted: false,
+                event: None,
+            },
         }
     }
 
