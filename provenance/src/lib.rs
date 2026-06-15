@@ -150,6 +150,28 @@ pub struct LineageGap {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProductLineageEmissionRequest {
+    pub product_id: String,
+    pub product_kind: ArtifactKind,
+    pub source_scene_ref: String,
+    #[serde(default)]
+    pub additional_inputs: Vec<String>,
+    pub method: String,
+    pub parameters: ProvenanceParameters,
+    pub operator: String,
+    pub actor: ActorIdentity,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProductLineageEmission {
+    pub record: LineageRecord,
+    pub source_scene_ref: String,
+    #[serde(default)]
+    pub preserved_geospatial_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReproducibilityManifest {
     pub product_id: String,
     pub input_digests: Vec<String>,
@@ -303,6 +325,8 @@ pub enum ProvenanceError {
     EmptyActorId,
     #[error("input artifact id cannot be empty for {artifact_id}")]
     EmptyInputArtifactId { artifact_id: String },
+    #[error("source scene ref cannot be empty for {product_id}")]
+    EmptySourceSceneRef { product_id: String },
     #[error("method cannot be empty for {artifact_id}")]
     EmptyMethod { artifact_id: String },
     #[error("operator cannot be empty for {artifact_id}")]
@@ -821,6 +845,38 @@ pub fn build_reproducibility_manifest(
     })
 }
 
+pub fn emit_product_lineage(
+    ledger: &mut LineageLedger,
+    request: ProductLineageEmissionRequest,
+) -> Result<ProductLineageEmission, ProvenanceError> {
+    let request = normalize_product_lineage_emission_request(request)?;
+    let mut inputs = Vec::with_capacity(1 + request.additional_inputs.len());
+    inputs.push(request.source_scene_ref.clone());
+    for input in request.additional_inputs {
+        if !inputs.contains(&input) {
+            inputs.push(input);
+        }
+    }
+
+    let preserved_geospatial_refs = geospatial_refs_from_parameters(request.parameters.as_json());
+    let record = ledger.record_lineage(LineageRecord {
+        artifact_id: request.product_id,
+        kind: request.product_kind,
+        inputs,
+        method: request.method,
+        parameters: request.parameters,
+        operator: request.operator,
+        actor: request.actor,
+        created_at: request.created_at,
+    })?;
+
+    Ok(ProductLineageEmission {
+        record,
+        source_scene_ref: request.source_scene_ref,
+        preserved_geospatial_refs,
+    })
+}
+
 pub fn output_hash_for_bytes(bytes: &[u8]) -> String {
     digest_for_bytes(EVIDENCE_DIGEST_ALGORITHM, bytes)
 }
@@ -1075,6 +1131,82 @@ fn normalize_lineage_record(mut record: LineageRecord) -> Result<LineageRecord, 
         },
     )?;
     Ok(record)
+}
+
+fn normalize_product_lineage_emission_request(
+    mut request: ProductLineageEmissionRequest,
+) -> Result<ProductLineageEmissionRequest, ProvenanceError> {
+    request.product_id =
+        normalize_required_text(request.product_id, ProvenanceError::EmptyArtifactId)?;
+    request.source_scene_ref = normalize_required_text(
+        request.source_scene_ref,
+        ProvenanceError::EmptySourceSceneRef {
+            product_id: request.product_id.clone(),
+        },
+    )?;
+    request.additional_inputs = request
+        .additional_inputs
+        .into_iter()
+        .map(|input| {
+            normalize_required_text(
+                input,
+                ProvenanceError::EmptyInputArtifactId {
+                    artifact_id: request.product_id.clone(),
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    request.method = normalize_required_text(
+        request.method,
+        ProvenanceError::EmptyMethod {
+            artifact_id: request.product_id.clone(),
+        },
+    )?;
+    request.operator = normalize_required_text(
+        request.operator,
+        ProvenanceError::EmptyOperator {
+            artifact_id: request.product_id.clone(),
+        },
+    )?;
+    request.actor = normalize_actor_identity(request.actor)?;
+    request.created_at = normalize_required_text(
+        request.created_at,
+        ProvenanceError::EmptyCreatedAt {
+            artifact_id: request.product_id.clone(),
+        },
+    )?;
+    Ok(request)
+}
+
+fn geospatial_refs_from_parameters(parameters: &serde_json::Value) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    collect_geospatial_refs(parameters, &mut refs);
+    refs.into_iter().collect()
+}
+
+fn collect_geospatial_refs(value: &serde_json::Value, refs: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                let captures_ref = matches!(
+                    key.as_str(),
+                    "crs" | "extent_ref" | "grid_ref" | "scene_ref" | "source_scene_ref"
+                );
+                if captures_ref {
+                    if let Some(text) = value.as_str().and_then(normalize_optional_text) {
+                        refs.insert(format!("{key}:{text}"));
+                    }
+                }
+                collect_geospatial_refs(value, refs);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_geospatial_refs(value, refs);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn normalize_actor_identity(mut actor: ActorIdentity) -> Result<ActorIdentity, ProvenanceError> {
@@ -1336,11 +1468,12 @@ fn normalize_optional_text_owned(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_evidence_pack, build_reproducibility_manifest, output_hash_for_bytes,
-        verify_audit_chain, verify_evidence_pack_schema, verify_reproducible_output, ActionContext,
-        ActorIdentity, ActorKind, ArtifactKind, AuditAction, AuditChainBreachReason, AuditLedger,
-        AuditOutcome, AuditRefusalReason, EvidenceObject, EvidencePackRequest, EvidenceStore,
-        LineageLedger, LineageRecord, ProvenanceError, ProvenanceParameters,
+        build_evidence_pack, build_reproducibility_manifest, emit_product_lineage,
+        output_hash_for_bytes, verify_audit_chain, verify_evidence_pack_schema,
+        verify_reproducible_output, ActionContext, ActorIdentity, ActorKind, ArtifactKind,
+        AuditAction, AuditChainBreachReason, AuditLedger, AuditOutcome, AuditRefusalReason,
+        EvidenceObject, EvidencePackRequest, EvidenceStore, LineageLedger, LineageRecord,
+        ProductLineageEmissionRequest, ProvenanceError, ProvenanceParameters,
         ReproducibilityInputBytes, ReproducibilityManifestStore, ReproducibilityMismatchReason,
     };
 
@@ -1384,6 +1517,95 @@ mod tests {
                 "zone": "NE"
             }))
         );
+    }
+
+    #[test]
+    fn product_domain_emission_records_source_scene_parameters_and_geospatial_refs() {
+        let mut ledger = LineageLedger::default();
+        ledger
+            .record_lineage(capture_lineage())
+            .expect("capture lineage should be recorded");
+        ledger
+            .record_lineage(scene_lineage_with_capture())
+            .expect("scene lineage should be recorded");
+
+        let ndvi = emit_product_lineage(
+            &mut ledger,
+            domain_product_request(
+                "product:05:ndvi-alpha",
+                "05.imagery_ndvi",
+                serde_json::json!({
+                    "index": "ndvi",
+                    "crs": "EPSG:32614",
+                    "extent_ref": "extent:field-alpha:2026-06-12"
+                }),
+            ),
+        )
+        .expect("imagery product should emit lineage");
+        let canopy = emit_product_lineage(
+            &mut ledger,
+            domain_product_request(
+                "product:06:canopy-height-alpha",
+                "06.lidar_canopy_height",
+                serde_json::json!({
+                    "grid_ref": "grid:canopy-alpha-1m",
+                    "crs": "EPSG:32614"
+                }),
+            ),
+        )
+        .expect("lidar product should emit lineage");
+        let orthomosaic = emit_product_lineage(
+            &mut ledger,
+            domain_product_request(
+                "product:22:orthomosaic-alpha",
+                "22.orthomosaic_publish",
+                serde_json::json!({
+                    "scene_ref": "scene:alpha-2026-06-12",
+                    "crs": "EPSG:32614",
+                    "extent_ref": "extent:field-alpha:2026-06-12"
+                }),
+            ),
+        )
+        .expect("orthomosaic product should emit lineage");
+
+        assert_eq!(ndvi.record.inputs, vec!["scene:alpha-2026-06-12"]);
+        assert_eq!(canopy.record.inputs, vec!["scene:alpha-2026-06-12"]);
+        assert_eq!(orthomosaic.record.inputs, vec!["scene:alpha-2026-06-12"]);
+        assert!(ndvi
+            .preserved_geospatial_refs
+            .contains(&"crs:EPSG:32614".to_string()));
+        assert!(ndvi
+            .preserved_geospatial_refs
+            .contains(&"extent_ref:extent:field-alpha:2026-06-12".to_string()));
+        assert!(canopy
+            .preserved_geospatial_refs
+            .contains(&"grid_ref:grid:canopy-alpha-1m".to_string()));
+        assert!(orthomosaic
+            .preserved_geospatial_refs
+            .contains(&"scene_ref:scene:alpha-2026-06-12".to_string()));
+        assert_eq!(ledger.artifact_count(), 5);
+    }
+
+    #[test]
+    fn product_domain_emission_refuses_missing_source_scene_ref() {
+        let mut ledger = LineageLedger::default();
+        let mut request = domain_product_request(
+            "product:05:ndvi-alpha",
+            "05.imagery_ndvi",
+            serde_json::json!({ "index": "ndvi" }),
+        );
+        request.source_scene_ref = " ".to_string();
+
+        let error = emit_product_lineage(&mut ledger, request)
+            .expect_err("missing source scene should fail emission");
+
+        assert_eq!(
+            error,
+            ProvenanceError::EmptySourceSceneRef {
+                product_id: "product:05:ndvi-alpha".to_string(),
+            }
+        );
+        assert_eq!(ledger.artifact_count(), 0);
     }
 
     #[test]
@@ -2279,6 +2501,24 @@ mod tests {
             operator: "operator:dsp-7".to_string(),
             actor: sample_actor(),
             created_at: "2026-06-12T13:20:00Z".to_string(),
+        }
+    }
+
+    fn domain_product_request(
+        product_id: &str,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> ProductLineageEmissionRequest {
+        ProductLineageEmissionRequest {
+            product_id: product_id.to_string(),
+            product_kind: ArtifactKind::Product,
+            source_scene_ref: "scene:alpha-2026-06-12".to_string(),
+            additional_inputs: Vec::new(),
+            method: method.to_string(),
+            parameters: ProvenanceParameters::from_json(parameters),
+            operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
+            created_at: "2026-06-12T13:10:00Z".to_string(),
         }
     }
 
