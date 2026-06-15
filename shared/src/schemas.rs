@@ -891,6 +891,57 @@ pub struct TractorFieldOpsReplay {
     pub gap_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorGeofenceEvaluationRequest {
+    pub tractor_id: String,
+    pub field_id: String,
+    pub boundary_ref: String,
+    pub boundary: FieldBoundary,
+    pub current_position: GeoPoint,
+    pub predicted_position: GeoPoint,
+    pub position_crs: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorGeofenceDecision {
+    Permitted,
+    Halted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorGeofenceEvaluation {
+    pub tractor_id: String,
+    pub field_id: String,
+    pub boundary_ref: String,
+    pub decision: TractorGeofenceDecision,
+    pub reason_code: String,
+    pub position: GeoPoint,
+    pub predicted_position: GeoPoint,
+    pub boundary_crs: String,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum TractorGeofenceError {
+    #[error(transparent)]
+    InvalidBoundary(#[from] FieldBoundaryValidationError),
+    #[error("tractor geofence tractor_id cannot be empty")]
+    EmptyTractorId,
+    #[error("tractor geofence field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("tractor geofence boundary_ref cannot be empty")]
+    EmptyBoundaryRef,
+    #[error("tractor geofence position CRS cannot be empty")]
+    EmptyPositionCrs,
+    #[error("tractor geofence CRS mismatch: position {position_crs} != boundary {boundary_crs}")]
+    CrsMismatch {
+        position_crs: String,
+        boundary_crs: String,
+    },
+    #[error("tractor geofence position contains invalid coordinates")]
+    InvalidPosition,
+}
+
 impl TractorCommandRejection {
     pub fn status_code(&self) -> u16 {
         match self.reason {
@@ -1611,6 +1662,103 @@ fn replay_frame_order(frame_type: TractorFieldOpsReplayFrameType) -> u8 {
         TractorFieldOpsReplayFrameType::SafetyEvent => 1,
         TractorFieldOpsReplayFrameType::TelemetryGap => 2,
     }
+}
+
+pub fn evaluate_tractor_geofence(
+    request: TractorGeofenceEvaluationRequest,
+) -> Result<TractorGeofenceEvaluation, TractorGeofenceError> {
+    let tractor_id =
+        normalize_tractor_text(request.tractor_id).ok_or(TractorGeofenceError::EmptyTractorId)?;
+    let field_id =
+        normalize_tractor_text(request.field_id).ok_or(TractorGeofenceError::EmptyFieldId)?;
+    let boundary_ref = normalize_tractor_text(request.boundary_ref)
+        .ok_or(TractorGeofenceError::EmptyBoundaryRef)?;
+    let position_crs = normalize_tractor_text(request.position_crs)
+        .ok_or(TractorGeofenceError::EmptyPositionCrs)?;
+    validate_tractor_geofence_position(&request.current_position)?;
+    validate_tractor_geofence_position(&request.predicted_position)?;
+
+    let validated = validate_field_boundary(&request.boundary)?;
+    let boundary_crs = validated
+        .boundary
+        .crs
+        .clone()
+        .ok_or(FieldBoundaryValidationError::MissingCrs)?;
+    if boundary_crs != position_crs {
+        return Err(TractorGeofenceError::CrsMismatch {
+            position_crs,
+            boundary_crs,
+        });
+    }
+
+    let current_inside =
+        tractor_point_inside_polygon(&request.current_position, &validated.boundary.coordinates);
+    let predicted_inside =
+        tractor_point_inside_polygon(&request.predicted_position, &validated.boundary.coordinates);
+    let path_crosses_boundary = tractor_motion_crosses_boundary(
+        &request.current_position,
+        &request.predicted_position,
+        &validated.boundary.coordinates,
+    );
+    let (decision, reason_code) = if current_inside && predicted_inside && !path_crosses_boundary {
+        (TractorGeofenceDecision::Permitted, "inside_geofence")
+    } else {
+        (TractorGeofenceDecision::Halted, "geofence_predicted_breach")
+    };
+
+    Ok(TractorGeofenceEvaluation {
+        tractor_id,
+        field_id,
+        boundary_ref,
+        decision,
+        reason_code: reason_code.to_string(),
+        position: request.current_position,
+        predicted_position: request.predicted_position,
+        boundary_crs,
+    })
+}
+
+fn validate_tractor_geofence_position(point: &GeoPoint) -> Result<(), TractorGeofenceError> {
+    if point.longitude.is_finite() && point.latitude.is_finite() {
+        Ok(())
+    } else {
+        Err(TractorGeofenceError::InvalidPosition)
+    }
+}
+
+fn tractor_point_inside_polygon(point: &GeoPoint, ring: &[GeoPoint]) -> bool {
+    if ring.len() < 4 {
+        return false;
+    }
+    if ring
+        .windows(2)
+        .any(|edge| point_on_segment(&edge[0], point, &edge[1]))
+    {
+        return true;
+    }
+
+    let mut inside = false;
+    let mut previous = ring.last().expect("ring length checked");
+    for current in ring {
+        let crosses_lat =
+            (current.latitude > point.latitude) != (previous.latitude > point.latitude);
+        if crosses_lat {
+            let lon_at_lat = (previous.longitude - current.longitude)
+                * (point.latitude - current.latitude)
+                / (previous.latitude - current.latitude)
+                + current.longitude;
+            if point.longitude < lon_at_lat {
+                inside = !inside;
+            }
+        }
+        previous = current;
+    }
+    inside
+}
+
+fn tractor_motion_crosses_boundary(start: &GeoPoint, end: &GeoPoint, ring: &[GeoPoint]) -> bool {
+    ring.windows(2)
+        .any(|edge| segments_intersect(start, end, &edge[0], &edge[1]))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6275,8 +6423,8 @@ mod tests {
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
         create_versioned_content, dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
-        normalize_weather_provider_forecast, plan_tractor_swath_coverage,
-        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        evaluate_tractor_geofence, normalize_weather_provider_forecast,
+        plan_tractor_swath_coverage, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
@@ -6305,7 +6453,8 @@ mod tests {
         SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
         SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
         TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
-        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGuidanceConfig,
+        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGeofenceDecision,
+        TractorGeofenceError, TractorGeofenceEvaluationRequest, TractorGuidanceConfig,
         TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
         TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
         TractorRegistrationRequest, TractorRegistry, TractorSwathCoverageRequest,
@@ -7142,6 +7291,71 @@ mod tests {
     }
 
     #[test]
+    fn tractor_geofence_permits_move_inside_boundary() {
+        let evaluation = evaluate_tractor_geofence(tractor_geofence_request(
+            GeoPoint {
+                longitude: 2.0,
+                latitude: 2.0,
+            },
+            GeoPoint {
+                longitude: 8.0,
+                latitude: 8.0,
+            },
+            "EPSG:3857",
+        ))
+        .expect("inside geofence evaluates");
+
+        assert_eq!(evaluation.decision, TractorGeofenceDecision::Permitted);
+        assert_eq!(evaluation.reason_code, "inside_geofence");
+        assert_eq!(evaluation.boundary_ref, "field-north-boundary");
+        assert_eq!(evaluation.boundary_crs, "EPSG:3857");
+    }
+
+    #[test]
+    fn tractor_geofence_halts_predicted_boundary_crossing() {
+        let evaluation = evaluate_tractor_geofence(tractor_geofence_request(
+            GeoPoint {
+                longitude: 8.0,
+                latitude: 8.0,
+            },
+            GeoPoint {
+                longitude: 12.0,
+                latitude: 8.0,
+            },
+            "EPSG:3857",
+        ))
+        .expect("predicted breach evaluates");
+
+        assert_eq!(evaluation.decision, TractorGeofenceDecision::Halted);
+        assert_eq!(evaluation.reason_code, "geofence_predicted_breach");
+        assert_eq!(evaluation.predicted_position.longitude, 12.0);
+    }
+
+    #[test]
+    fn tractor_geofence_rejects_crs_mismatch() {
+        let error = evaluate_tractor_geofence(tractor_geofence_request(
+            GeoPoint {
+                longitude: 2.0,
+                latitude: 2.0,
+            },
+            GeoPoint {
+                longitude: 8.0,
+                latitude: 8.0,
+            },
+            "EPSG:4326",
+        ))
+        .expect_err("position CRS must match boundary CRS");
+
+        assert_eq!(
+            error,
+            TractorGeofenceError::CrsMismatch {
+                position_crs: "EPSG:4326".to_string(),
+                boundary_crs: "EPSG:3857".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn marketplace_account_links_party_to_one_org_and_normalizes_roles() {
         let record = build_marketplace_account_record(
             MarketplaceAccountCreateRequest {
@@ -7936,6 +8150,22 @@ mod tests {
             implement_width_m: 2.0,
             planned_area_m2: 24.0,
             max_telemetry_gap_seconds: 2,
+        }
+    }
+
+    fn tractor_geofence_request(
+        current_position: GeoPoint,
+        predicted_position: GeoPoint,
+        position_crs: &str,
+    ) -> TractorGeofenceEvaluationRequest {
+        TractorGeofenceEvaluationRequest {
+            tractor_id: "tractor-001".to_string(),
+            field_id: "field-north".to_string(),
+            boundary_ref: "field-north-boundary".to_string(),
+            boundary: tractor_swath_rectangle(0.0, 0.0, 10.0, 10.0, "EPSG:3857"),
+            current_position,
+            predicted_position,
+            position_crs: position_crs.to_string(),
         }
     }
 
