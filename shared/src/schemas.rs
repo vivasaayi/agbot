@@ -3161,6 +3161,38 @@ pub struct WeatherCropStageRiskAlert {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherForecastVerificationRequest {
+    pub forecast: WeatherForecastRecord,
+    pub observations: Vec<WeatherFreshnessAnnotatedRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherForecastVerificationStatus {
+    Verified,
+    NotVerifiable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherForecastErrorMetric {
+    pub variable: String,
+    pub forecast_value: f64,
+    pub observed_value: f64,
+    pub absolute_error: f64,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherForecastVerification {
+    pub field_ref: String,
+    pub source: String,
+    pub valid_time: String,
+    pub status: WeatherForecastVerificationStatus,
+    pub metrics: Vec<WeatherForecastErrorMetric>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
     pub wind_speed_mps: WeatherForecastValue,
@@ -4402,6 +4434,79 @@ pub fn evaluate_crop_stage_weather_risks(
             fallback_applied,
         })
         .collect())
+}
+
+pub fn verify_weather_forecast_accuracy(
+    request: WeatherForecastVerificationRequest,
+) -> WeatherForecastVerification {
+    let matching = request.observations.into_iter().find(|observation| {
+        observation.field_ref == request.forecast.field_ref
+            && observation.valid_time == request.forecast.valid_time
+    });
+    let Some(observation) = matching else {
+        return WeatherForecastVerification {
+            field_ref: request.forecast.field_ref,
+            source: request.forecast.source,
+            valid_time: request.forecast.valid_time,
+            status: WeatherForecastVerificationStatus::NotVerifiable,
+            metrics: Vec::new(),
+            evidence_refs: vec!["observation:not_found".to_string()],
+        };
+    };
+
+    let metrics = vec![
+        weather_forecast_error_metric(
+            "temperature_celsius",
+            &request.forecast.vars.temperature_celsius,
+            &observation.temperature_celsius.value,
+        ),
+        weather_forecast_error_metric(
+            "wind_speed_mps",
+            &request.forecast.vars.wind_speed_mps,
+            &observation.wind_speed_mps.value,
+        ),
+        weather_forecast_error_metric(
+            "precipitation_mm",
+            &request.forecast.vars.precipitation_mm,
+            &observation.precipitation_mm.value,
+        ),
+        weather_forecast_error_metric(
+            "humidity_percent",
+            &request.forecast.vars.humidity_percent,
+            &observation.humidity_percent.value,
+        ),
+        weather_forecast_error_metric(
+            "radiation_w_m2",
+            &request.forecast.vars.radiation_w_m2,
+            &observation.radiation_w_m2.value,
+        ),
+    ];
+
+    WeatherForecastVerification {
+        field_ref: request.forecast.field_ref,
+        source: request.forecast.source,
+        valid_time: request.forecast.valid_time,
+        status: WeatherForecastVerificationStatus::Verified,
+        metrics,
+        evidence_refs: vec![
+            format!("forecast:{}", request.forecast.forecast_id),
+            format!("observation:{}", observation.forecast_id),
+        ],
+    }
+}
+
+fn weather_forecast_error_metric(
+    variable: &str,
+    forecast: &WeatherForecastValue,
+    observation: &WeatherForecastValue,
+) -> WeatherForecastErrorMetric {
+    WeatherForecastErrorMetric {
+        variable: variable.to_string(),
+        forecast_value: forecast.value,
+        observed_value: observation.value,
+        absolute_error: (forecast.value - observation.value).abs(),
+        unit: forecast.unit.clone(),
+    }
 }
 
 pub fn weather_fetch_failure_record(
@@ -8926,20 +9031,20 @@ mod tests {
         route_weather_alert, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
-        verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
-        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
-        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
-        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
-        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
-        ContentType, CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
+        weather_fetch_failure_record, AccessAnomalySignal, AccessAnomalyThresholds,
+        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
+        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
+        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
+        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
         MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
         MarketplacePartyType, MultispectralImage, OpenDataPublishError,
         OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
@@ -8967,7 +9072,8 @@ mod tests {
         WeatherAlertRouteTarget, WeatherAlertRoutingRequest, WeatherAlertRoutingTarget,
         WeatherCropStageRiskRequest, WeatherCropStageThresholdSet,
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
-        WeatherForecastValue, WeatherFreshnessState, WeatherGrowingDegreeDayRequest,
+        WeatherForecastRecord, WeatherForecastValue, WeatherForecastVerificationRequest,
+        WeatherForecastVerificationStatus, WeatherFreshnessState, WeatherGrowingDegreeDayRequest,
         WeatherGrowingDegreeDayStatus, WeatherHistoryQuery, WeatherIngestError,
         WeatherOperationalWindowRequest, WeatherOperationalWindowThresholds,
         WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherReferenceEtInput,
@@ -11163,6 +11269,57 @@ mod tests {
     }
 
     #[test]
+    fn weather_forecast_verification_computes_error_metrics_for_matching_observation() {
+        let verification =
+            verify_weather_forecast_accuracy(weather_forecast_verification_request(true));
+
+        assert_eq!(
+            verification.status,
+            WeatherForecastVerificationStatus::Verified
+        );
+        assert_eq!(verification.field_ref, "field-north");
+        assert_eq!(verification.source, "NOAA-HRRR");
+        assert_eq!(verification.valid_time, "2026-06-13T10:00:00Z");
+        assert_eq!(verification.metrics.len(), 5);
+        let temperature = verification
+            .metrics
+            .iter()
+            .find(|metric| metric.variable == "temperature_celsius")
+            .expect("temperature metric should be present");
+        assert_eq!(temperature.forecast_value, 22.0);
+        assert_eq!(temperature.observed_value, 20.5);
+        assert_eq!(temperature.absolute_error, 1.5);
+        assert_eq!(temperature.unit, "deg_c");
+        assert!(verification
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("forecast:weather:field-north:NOAA-HRRR")));
+        assert!(verification
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("observation:weather:field-north:sensor")));
+    }
+
+    #[test]
+    fn weather_forecast_verification_reports_not_verifiable_without_observation() {
+        let verification =
+            verify_weather_forecast_accuracy(weather_forecast_verification_request(false));
+
+        assert_eq!(
+            verification.status,
+            WeatherForecastVerificationStatus::NotVerifiable
+        );
+        assert_eq!(verification.field_ref, "field-north");
+        assert_eq!(verification.source, "NOAA-HRRR");
+        assert_eq!(verification.valid_time, "2026-06-13T10:00:00Z");
+        assert!(verification.metrics.is_empty());
+        assert_eq!(
+            verification.evidence_refs,
+            vec!["observation:not_found".to_string()]
+        );
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -11920,6 +12077,78 @@ mod tests {
                 false,
             )],
         }
+    }
+
+    fn weather_forecast_verification_request(
+        with_observation: bool,
+    ) -> WeatherForecastVerificationRequest {
+        let forecast = weather_forecast_record(
+            "field-north",
+            "NOAA-HRRR",
+            "2026-06-13T09:55:00Z",
+            "2026-06-13T10:00:00Z",
+            22.0,
+            4.0,
+            0.2,
+            60.0,
+            700.0,
+        );
+        let observation_time = if with_observation {
+            "2026-06-13T10:00:00Z"
+        } else {
+            "2026-06-13T10:05:00Z"
+        };
+        let observation = weather_forecast_record(
+            "field-north",
+            "sensor",
+            observation_time,
+            observation_time,
+            20.5,
+            5.0,
+            0.1,
+            65.0,
+            720.0,
+        );
+        let observations =
+            vec![
+                annotate_weather_record_freshness(observation, "2026-06-13T10:10:00Z", 900)
+                    .expect("observation fixture should annotate"),
+            ];
+
+        WeatherForecastVerificationRequest {
+            forecast,
+            observations,
+        }
+    }
+
+    fn weather_forecast_record(
+        field_ref: &str,
+        source: &str,
+        fetched_at: &str,
+        valid_time: &str,
+        temperature_celsius: f64,
+        wind_speed_mps: f64,
+        precipitation_mm: f64,
+        humidity_percent: f64,
+        radiation_w_m2: f64,
+    ) -> WeatherForecastRecord {
+        normalize_weather_provider_forecast(
+            field_ref.to_string(),
+            WeatherProviderForecastResponse {
+                source: source.to_string(),
+                fetched_at: fetched_at.to_string(),
+                points: vec![WeatherProviderForecastPoint {
+                    valid_time: valid_time.to_string(),
+                    temperature_celsius,
+                    wind_speed_mps,
+                    precipitation_mm,
+                    humidity_percent,
+                    radiation_w_m2,
+                }],
+            },
+        )
+        .expect("forecast fixture should normalize")
+        .remove(0)
     }
 
     fn tractor_prescription_request(
