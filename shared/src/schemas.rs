@@ -10211,6 +10211,42 @@ pub struct CarbonFootprintResult {
     pub computed_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BiomassLayerInput {
+    pub layer_ref: String,
+    pub width: u32,
+    pub height: u32,
+    pub values: Vec<f64>,
+    pub spatial_ref: RasterSpatialRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BiomassEstimateRequest {
+    #[serde(default)]
+    pub estimate_id: Option<String>,
+    pub record_id: String,
+    pub canopy_layer: BiomassLayerInput,
+    pub vegetation_index_layer: BiomassLayerInput,
+    pub method_version: String,
+    #[serde(default = "default_biomass_coefficient")]
+    pub biomass_coefficient: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BiomassEstimateResult {
+    pub estimate_id: String,
+    pub record_id: String,
+    pub biomass_value: f64,
+    pub area: f64,
+    pub crs: String,
+    pub extent: GeoBounds,
+    pub resolution: RasterResolution,
+    pub source_layer_refs: Vec<String>,
+    pub method_version: String,
+    pub result_hash: String,
+    pub computed_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SustainabilityRecordError {
     #[error("sustainability record_id cannot be empty")]
@@ -10263,6 +10299,39 @@ pub enum CarbonFootprintError {
     UnsupportedInputKind { value: String },
     #[error("unsupported carbon footprint status {value}")]
     UnsupportedStatus { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum BiomassEstimateError {
+    #[error("biomass estimate_id cannot be empty")]
+    EmptyEstimateId,
+    #[error("biomass record_id cannot be empty")]
+    EmptyRecordId,
+    #[error("biomass method_version cannot be empty")]
+    EmptyMethodVersion,
+    #[error("biomass computed_at cannot be empty")]
+    EmptyComputedAt,
+    #[error("biomass layer_ref cannot be empty")]
+    EmptyLayerRef,
+    #[error("biomass grid values length does not match width * height for {layer_ref}")]
+    GridSizeMismatch { layer_ref: String },
+    #[error("biomass grid value is invalid for {layer_ref}")]
+    InvalidGridValue { layer_ref: String },
+    #[error("biomass coefficient is invalid")]
+    InvalidCoefficient,
+    #[error("biomass raster spatial reference invalid: {0}")]
+    SpatialRef(#[from] RasterSpatialRefError),
+    #[error("biomass CRS mismatch: canopy {canopy_crs}, vegetation index {index_crs}")]
+    CrsMismatch {
+        canopy_crs: String,
+        index_crs: String,
+    },
+    #[error("biomass extent mismatch between canopy and vegetation index")]
+    ExtentMismatch,
+    #[error("biomass resolution mismatch between canopy and vegetation index")]
+    ResolutionMismatch,
+    #[error("biomass dimensions mismatch between canopy and vegetation index")]
+    DimensionMismatch,
 }
 
 pub fn build_sustainability_record(
@@ -10406,6 +10475,110 @@ pub fn compute_carbon_footprint(
     })
 }
 
+pub fn estimate_biomass(
+    request: BiomassEstimateRequest,
+    generated_estimate_id: String,
+    computed_at: String,
+) -> Result<BiomassEstimateResult, BiomassEstimateError> {
+    let estimate_id = normalize_sustainability_optional_text(request.estimate_id)
+        .or_else(|| normalize_sustainability_text(generated_estimate_id))
+        .ok_or(BiomassEstimateError::EmptyEstimateId)?;
+    let record_id = normalize_sustainability_text(request.record_id)
+        .ok_or(BiomassEstimateError::EmptyRecordId)?;
+    let method_version = normalize_sustainability_text(request.method_version)
+        .ok_or(BiomassEstimateError::EmptyMethodVersion)?;
+    let computed_at =
+        normalize_sustainability_text(computed_at).ok_or(BiomassEstimateError::EmptyComputedAt)?;
+    if !(request.biomass_coefficient.is_finite() && request.biomass_coefficient > 0.0) {
+        return Err(BiomassEstimateError::InvalidCoefficient);
+    }
+
+    let canopy = validate_biomass_layer(request.canopy_layer)?;
+    let index = validate_biomass_layer(request.vegetation_index_layer)?;
+    if canopy.width != index.width || canopy.height != index.height {
+        return Err(BiomassEstimateError::DimensionMismatch);
+    }
+    let canopy_crs = canopy
+        .spatial_ref
+        .crs
+        .clone()
+        .ok_or(RasterSpatialRefError::MissingCrs)?;
+    let index_crs = index
+        .spatial_ref
+        .crs
+        .clone()
+        .ok_or(RasterSpatialRefError::MissingCrs)?;
+    if canopy_crs != index_crs {
+        return Err(BiomassEstimateError::CrsMismatch {
+            canopy_crs,
+            index_crs,
+        });
+    }
+    let extent = canopy
+        .spatial_ref
+        .bbox
+        .clone()
+        .ok_or(RasterSpatialRefError::MissingBbox)?;
+    let index_extent = index
+        .spatial_ref
+        .bbox
+        .clone()
+        .ok_or(RasterSpatialRefError::MissingBbox)?;
+    if !biomass_bounds_equal(&extent, &index_extent) {
+        return Err(BiomassEstimateError::ExtentMismatch);
+    }
+    let resolution = canopy
+        .spatial_ref
+        .resolution
+        .ok_or(RasterSpatialRefError::NonPositiveResolution)?;
+    let index_resolution = index
+        .spatial_ref
+        .resolution
+        .ok_or(RasterSpatialRefError::NonPositiveResolution)?;
+    if !biomass_resolution_equal(resolution, index_resolution) {
+        return Err(BiomassEstimateError::ResolutionMismatch);
+    }
+
+    let cell_area = resolution.x * resolution.y;
+    let mut biomass_value = 0.0;
+    let mut valid_cells = 0_u32;
+    for (height_m, vegetation_index) in canopy.values.iter().zip(index.values.iter()) {
+        if *height_m > 0.0 && *vegetation_index > 0.0 {
+            biomass_value += height_m
+                * vegetation_index.clamp(0.0, 1.0)
+                * cell_area
+                * request.biomass_coefficient;
+            valid_cells += 1;
+        }
+    }
+    let area = f64::from(valid_cells) * cell_area;
+    let source_layer_refs = vec![canopy.layer_ref.clone(), index.layer_ref.clone()];
+    let result_hash = biomass_estimate_hash(
+        &record_id,
+        biomass_value,
+        area,
+        &canopy_crs,
+        &extent,
+        resolution,
+        &source_layer_refs,
+        &method_version,
+    );
+
+    Ok(BiomassEstimateResult {
+        estimate_id,
+        record_id,
+        biomass_value,
+        area,
+        crs: canopy_crs,
+        extent,
+        resolution,
+        source_layer_refs,
+        method_version,
+        result_hash,
+        computed_at,
+    })
+}
+
 pub fn parse_sustainability_metric_type(
     value: &str,
 ) -> Result<SustainabilityMetricType, SustainabilityRecordError> {
@@ -10454,6 +10627,68 @@ fn normalize_sustainability_optional_text(value: Option<String>) -> Option<Strin
 fn normalize_sustainability_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn validate_biomass_layer(
+    mut layer: BiomassLayerInput,
+) -> Result<BiomassLayerInput, BiomassEstimateError> {
+    layer.layer_ref = normalize_sustainability_text(layer.layer_ref)
+        .ok_or(BiomassEstimateError::EmptyLayerRef)?;
+    let expected_len = layer.width as usize * layer.height as usize;
+    if expected_len != layer.values.len() {
+        return Err(BiomassEstimateError::GridSizeMismatch {
+            layer_ref: layer.layer_ref,
+        });
+    }
+    if layer.values.iter().any(|value| !value.is_finite()) {
+        return Err(BiomassEstimateError::InvalidGridValue {
+            layer_ref: layer.layer_ref,
+        });
+    }
+    layer.spatial_ref =
+        assert_raster_spatial_ref(Some(&layer.spatial_ref), layer.width, layer.height)?;
+    Ok(layer)
+}
+
+fn biomass_bounds_equal(left: &GeoBounds, right: &GeoBounds) -> bool {
+    (left.min_lon - right.min_lon).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+        && (left.min_lat - right.min_lat).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+        && (left.max_lon - right.max_lon).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+        && (left.max_lat - right.max_lat).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+}
+
+fn biomass_resolution_equal(left: RasterResolution, right: RasterResolution) -> bool {
+    (left.x - right.x).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+        && (left.y - right.y).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+}
+
+fn default_biomass_coefficient() -> f64 {
+    0.48
+}
+
+fn biomass_estimate_hash(
+    record_id: &str,
+    biomass_value: f64,
+    area: f64,
+    crs: &str,
+    extent: &GeoBounds,
+    resolution: RasterResolution,
+    source_layer_refs: &[String],
+    method_version: &str,
+) -> String {
+    let mut canonical = format!(
+        "record={record_id}|biomass={biomass_value:.6}|area={area:.6}|crs={crs}|extent={:.9},{:.9},{:.9},{:.9}|resolution={:.6},{:.6}|method={method_version}",
+        extent.min_lon,
+        extent.min_lat,
+        extent.max_lon,
+        extent.max_lat,
+        resolution.x,
+        resolution.y
+    );
+    for source_layer_ref in source_layer_refs {
+        canonical.push_str(&format!("|source:{source_layer_ref}"));
+    }
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
 }
 
 fn normalize_carbon_inputs(
@@ -14198,7 +14433,7 @@ mod tests {
         create_marketplace_rating_record, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
-        evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
+        estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
         evaluate_and_route_water_alerts, evaluate_crop_stage_weather_risks,
         evaluate_drought_advisory_loop, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
@@ -14220,59 +14455,60 @@ mod tests {
         zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
         AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
         AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintFactorSet,
-        CarbonFootprintInput, CarbonFootprintInputKind, CarbonFootprintStatus,
-        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
-        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
-        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
-        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
-        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
-        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
-        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
-        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
-        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
-        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
-        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
-        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
-        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
-        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
-        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
-        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
-        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
-        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
-        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
-        MarketplaceDemandForecastRequest, MarketplaceDemandForecastStatus,
-        MarketplaceFulfillmentCreateRequest, MarketplaceFulfillmentError,
-        MarketplaceFulfillmentStatus, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
-        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
-        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
-        MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
-        MarketplaceRatingCreateRequest, MarketplaceRatingError, MarketplaceReportPeriod,
-        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
-        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
-        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
-        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
-        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
-        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
-        SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
-        SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
-        SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorDeconflictionDecision, TractorDeconflictionRequest, TractorEstopState,
-        TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
-        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGeofenceDecision,
-        TractorGeofenceError, TractorGeofenceEvaluationRequest, TractorGuidanceConfig,
-        TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
+        BiomassEstimateError, BiomassEstimateRequest, BiomassLayerInput, CarbonEmissionFactor,
+        CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
+        CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
+        CollaborationError, CollaborationMessageCreateRequest, ContentCreateRequest, ContentError,
+        ContentStatus, ContentType, CropPlanRecord, DroughtAdvisoryLoopRequest,
+        DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
+        DroughtBaselineTrendRequest, DroughtBaselineTrendStatus, DroughtEvidenceFusionError,
+        DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus,
+        DroughtForecastRequest, DroughtForecastStatus, DroughtForecastUncertaintyBand,
+        DroughtHistoryEntry, DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
+        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
+        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
+        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
+        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
+        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
+        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
+        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
+        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
+        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
+        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
+        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
+        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
+        MarketplaceDemandForecastStatus, MarketplaceFulfillmentCreateRequest,
+        MarketplaceFulfillmentError, MarketplaceFulfillmentStatus, MarketplaceInventoryError,
+        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
+        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
+        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
+        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceRatingCreateRequest,
+        MarketplaceRatingError, MarketplaceReportPeriod, MarketplaceUnitOfMeasure,
+        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
+        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
+        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
+        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
+        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
+        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
+        SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
+        SoilMoistureRejectionReason, SustainabilityMetricType, SustainabilityRecordCreateRequest,
+        SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
+        TractorCommandRejectionReason, TractorDeconflictionDecision, TractorDeconflictionRequest,
+        TractorEstopState, TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent,
+        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
+        TractorFieldOpsTelemetrySample, TractorGeofenceDecision, TractorGeofenceError,
+        TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
+        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
         TractorImplementAdapterSpec, TractorImplementCommand, TractorImplementDecision,
         TractorImplementRef, TractorImplementState, TractorLifecycleStatus,
         TractorMotionCommandRequest, TractorMotionGateDecision, TractorObstacleDetection,
@@ -16471,6 +16707,97 @@ mod tests {
     }
 
     #[test]
+    fn biomass_estimate_computes_value_and_preserves_georeference() {
+        let result = estimate_biomass(
+            biomass_estimate_request(),
+            "generated-biomass".to_string(),
+            "2026-06-15T12:00:00Z".to_string(),
+        )
+        .expect("matching georeferenced layers should estimate biomass");
+
+        assert_eq!(result.estimate_id, "biomass-001");
+        assert_eq!(result.record_id, "sustain-biomass-001");
+        assert_eq!(result.biomass_value, 48.0);
+        assert_eq!(result.area, 200.0);
+        assert_eq!(result.crs, "EPSG:32614");
+        assert_eq!(
+            result.extent,
+            GeoBounds {
+                min_lon: 0.0,
+                min_lat: 0.0,
+                max_lon: 20.0,
+                max_lat: 20.0,
+            }
+        );
+        assert_eq!(result.resolution, RasterResolution { x: 10.0, y: 10.0 });
+        assert_eq!(
+            result.source_layer_refs,
+            vec!["layer:canopy-height-001", "layer:ndvi-001"]
+        );
+        assert!(!result.result_hash.is_empty());
+    }
+
+    #[test]
+    fn biomass_estimate_same_georeferenced_inputs_reproduce_hash() {
+        let first = estimate_biomass(
+            biomass_estimate_request(),
+            "generated-biomass-001".to_string(),
+            "2026-06-15T12:00:00Z".to_string(),
+        )
+        .expect("first biomass estimate should compute");
+        let mut request = biomass_estimate_request();
+        request.estimate_id = Some("biomass-002".to_string());
+        let second = estimate_biomass(
+            request,
+            "generated-biomass-002".to_string(),
+            "2026-06-16T12:00:00Z".to_string(),
+        )
+        .expect("second biomass estimate should compute");
+
+        assert_eq!(first.biomass_value, second.biomass_value);
+        assert_eq!(first.extent, second.extent);
+        assert_eq!(first.result_hash, second.result_hash);
+    }
+
+    #[test]
+    fn biomass_estimate_rejects_crs_or_extent_mismatch() {
+        let mut crs_mismatch = biomass_estimate_request();
+        crs_mismatch.vegetation_index_layer.spatial_ref.crs = Some("EPSG:4326".to_string());
+        let error = estimate_biomass(
+            crs_mismatch,
+            "generated-biomass".to_string(),
+            "2026-06-15T12:00:00Z".to_string(),
+        )
+        .expect_err("CRS mismatch should reject");
+        assert_eq!(
+            error,
+            BiomassEstimateError::CrsMismatch {
+                canopy_crs: "EPSG:32614".to_string(),
+                index_crs: "EPSG:4326".to_string(),
+            }
+        );
+
+        let mut extent_mismatch = biomass_estimate_request();
+        extent_mismatch.vegetation_index_layer.spatial_ref.bbox = Some(GeoBounds {
+            min_lon: 0.0,
+            min_lat: 10.0,
+            max_lon: 20.0,
+            max_lat: 30.0,
+        });
+        extent_mismatch
+            .vegetation_index_layer
+            .spatial_ref
+            .geo_transform = Some([0.0, 10.0, 0.0, 30.0, 0.0, -10.0]);
+        let error = estimate_biomass(
+            extent_mismatch,
+            "generated-biomass".to_string(),
+            "2026-06-15T12:00:00Z".to_string(),
+        )
+        .expect_err("extent mismatch should reject");
+        assert_eq!(error, BiomassEstimateError::ExtentMismatch);
+    }
+
+    #[test]
     fn versioned_content_create_and_edit_advances_current_version() {
         let (content, first_version) = create_versioned_content(
             ContentCreateRequest {
@@ -16574,6 +16901,38 @@ mod tests {
             factor_set: CarbonFootprintFactorSet {
                 version: "agbot-carbon-factors-v1".to_string(),
                 factors,
+            },
+        }
+    }
+
+    fn biomass_estimate_request() -> BiomassEstimateRequest {
+        BiomassEstimateRequest {
+            estimate_id: Some("biomass-001".to_string()),
+            record_id: "sustain-biomass-001".to_string(),
+            canopy_layer: biomass_layer("layer:canopy-height-001", vec![1.0, 2.0, 0.0, 4.0]),
+            vegetation_index_layer: biomass_layer("layer:ndvi-001", vec![0.5, 0.25, 0.8, -0.1]),
+            method_version: "biomass.canopy_ndvi.v1".to_string(),
+            biomass_coefficient: 0.48,
+        }
+    }
+
+    fn biomass_layer(layer_ref: &str, values: Vec<f64>) -> BiomassLayerInput {
+        BiomassLayerInput {
+            layer_ref: layer_ref.to_string(),
+            width: 2,
+            height: 2,
+            values,
+            spatial_ref: RasterSpatialRef {
+                georeferenced: true,
+                crs: Some("EPSG:32614".to_string()),
+                bbox: Some(GeoBounds {
+                    min_lon: 0.0,
+                    min_lat: 0.0,
+                    max_lon: 20.0,
+                    max_lat: 20.0,
+                }),
+                geo_transform: Some([0.0, 10.0, 0.0, 20.0, 0.0, -10.0]),
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
             },
         }
     }

@@ -92,12 +92,13 @@ use shared::schemas::{
     build_soil_moisture_reading, build_sustainability_record, build_tractor_record,
     close_marketplace_listing_record, compute_carbon_footprint, compute_drought_index,
     compute_marketplace_demand_forecast, create_marketplace_fulfillment_record,
-    create_marketplace_rating_record, create_versioned_content, fulfill_marketplace_inventory,
-    normalize_weather_provider_forecast, parse_carbon_footprint_status, parse_content_status,
-    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
-    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
-    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
-    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
+    create_marketplace_rating_record, create_versioned_content, estimate_biomass,
+    fulfill_marketplace_inventory, normalize_weather_provider_forecast,
+    parse_carbon_footprint_status, parse_content_status, parse_content_type,
+    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
+    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
+    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
+    parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
     place_marketplace_order_record, prepare_open_data_publication,
@@ -106,20 +107,21 @@ use shared::schemas::{
     soil_moisture_rejection_record, transition_marketplace_account_status,
     transition_marketplace_fulfillment_status, transition_marketplace_order_status,
     validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
-    CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintError,
-    CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
-    CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
-    CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
-    ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
-    ContentType, ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError,
-    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
-    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
-    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
-    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
-    MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
-    MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
+    BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult, CarbonEmissionFactor,
+    CarbonFootprintComputeRequest, CarbonFootprintError, CarbonFootprintInput,
+    CarbonFootprintResult, CarbonFootprintStatus, CollaborationChannelCreateRequest,
+    CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
+    CollaborationMessageCreateRequest, CollaborationMessageRecord, ContentCreateRequest,
+    ContentEditRequest, ContentError, ContentRecord, ContentStatus, ContentType,
+    ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod,
+    DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus, FarmFieldListPage,
+    FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord, FieldRecord,
+    FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord,
+    FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
+    MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+    MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
+    MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplaceCatalogItemRecord,
+    MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
     MarketplaceDemandForecastRequest, MarketplaceDemandUncertaintyBand,
     MarketplaceFulfillmentAuditRecord, MarketplaceFulfillmentCreateRequest,
     MarketplaceFulfillmentError, MarketplaceFulfillmentRecord, MarketplaceFulfillmentStatus,
@@ -787,6 +789,16 @@ pub struct CarbonFootprintListQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CarbonFootprintScopeQuery {
+    pub record_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiomassEstimateListQuery {
+    pub record_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiomassEstimateScopeQuery {
     pub record_id: Option<String>,
 }
 
@@ -4228,6 +4240,76 @@ pub async fn get_carbon_footprint(
     }
 
     Ok(Json(footprint))
+}
+
+pub async fn create_biomass_estimate(
+    State(state): State<AppState>,
+    Json(request): Json<BiomassEstimateRequest>,
+) -> AppResult<Json<BiomassEstimateResult>> {
+    let requested_record_id = normalize_optional_text(Some(request.record_id.clone()))
+        .ok_or_else(|| AppError::BadRequest("biomass record_id is required".to_string()))?;
+    load_sustainability_record(&state, &requested_record_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "sustainability record {requested_record_id} is required for biomass estimate"
+            ))
+        })?;
+    let result = estimate_biomass(
+        request,
+        format!("biomass-estimate-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(biomass_estimate_error)?;
+    insert_biomass_estimate_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_biomass_estimates(
+    Query(query): Query<BiomassEstimateListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<BiomassEstimateResult>>> {
+    let record_id = normalize_optional_text(query.record_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "record_id query parameter is required for biomass estimates".to_string(),
+        )
+    })?;
+    let rows = sqlx::query(
+        r#"
+        SELECT estimate_id, record_id, biomass_value, area, crs, extent_json,
+               resolution_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biomass_estimates
+        WHERE record_id = ?1
+        ORDER BY computed_at ASC, estimate_id ASC
+        "#,
+    )
+    .bind(record_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_biomass_estimate_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_biomass_estimate(
+    Path(estimate_id): Path<String>,
+    Query(query): Query<BiomassEstimateScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<BiomassEstimateResult>> {
+    let record_id = normalize_optional_text(query.record_id)
+        .ok_or_else(|| AppError::BadRequest("record_id query parameter is required".to_string()))?;
+    let estimate = load_biomass_estimate_result(&state, &estimate_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if estimate.record_id != record_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(estimate))
 }
 
 pub async fn create_content_item(
@@ -9321,6 +9403,10 @@ fn carbon_footprint_error(error: CarbonFootprintError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn biomass_estimate_error(error: BiomassEstimateError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn content_error(error: ContentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -10999,6 +11085,43 @@ fn decode_carbon_footprint_result(
         evidence_refs,
         status: parse_carbon_footprint_status(&row.get::<String, _>("status"))
             .map_err(carbon_footprint_error)?,
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_biomass_estimate_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<BiomassEstimateResult> {
+    let extent =
+        serde_json::from_str::<GeoBounds>(&row.get::<String, _>("extent_json")).map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode biomass extent_json"))
+        })?;
+    let resolution =
+        serde_json::from_str::<RasterResolution>(&row.get::<String, _>("resolution_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode biomass resolution_json"),
+                )
+            })?;
+    let source_layer_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("source_layer_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode biomass source_layer_refs_json"),
+                )
+            })?;
+
+    Ok(BiomassEstimateResult {
+        estimate_id: row.get("estimate_id"),
+        record_id: row.get("record_id"),
+        biomass_value: row.get("biomass_value"),
+        area: row.get("area"),
+        crs: row.get("crs"),
+        extent,
+        resolution,
+        source_layer_refs,
+        method_version: row.get("method_version"),
         result_hash: row.get("result_hash"),
         computed_at: row.get("computed_at"),
     })
@@ -13285,6 +13408,64 @@ async fn load_carbon_footprint_result(
     .map_err(Error::from)?;
 
     row.map(|row| decode_carbon_footprint_result(&row))
+        .transpose()
+}
+
+async fn insert_biomass_estimate_result(
+    state: &AppState,
+    result: &BiomassEstimateResult,
+) -> AppResult<()> {
+    let extent_json =
+        serde_json::to_string(&result.extent).map_err(|err| AppError::Anyhow(err.into()))?;
+    let resolution_json =
+        serde_json::to_string(&result.resolution).map_err(|err| AppError::Anyhow(err.into()))?;
+    let source_layer_refs_json = serde_json::to_string(&result.source_layer_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO biomass_estimates (
+            estimate_id, record_id, biomass_value, area, crs, extent_json,
+            resolution_json, source_layer_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&result.estimate_id)
+    .bind(&result.record_id)
+    .bind(result.biomass_value)
+    .bind(result.area)
+    .bind(&result.crs)
+    .bind(extent_json)
+    .bind(resolution_json)
+    .bind(source_layer_refs_json)
+    .bind(&result.method_version)
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_biomass_estimate_result(
+    state: &AppState,
+    estimate_id: &str,
+) -> AppResult<Option<BiomassEstimateResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT estimate_id, record_id, biomass_value, area, crs, extent_json,
+               resolution_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biomass_estimates
+        WHERE estimate_id = ?1
+        "#,
+    )
+    .bind(estimate_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_biomass_estimate_result(&row))
         .transpose()
 }
 

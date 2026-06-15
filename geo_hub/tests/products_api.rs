@@ -4681,6 +4681,161 @@ async fn carbon_footprint_missing_inputs_persists_insufficient_without_value() -
 }
 
 #[tokio::test]
+async fn biomass_estimates_compute_get_and_list_with_georeference() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_metric_record(
+        &ctx,
+        "farm-biomass",
+        "field-biomass",
+        "season-2026",
+        "sustain-biomass-001",
+        "operation-biomass-001",
+        "biomass",
+    )
+    .await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biomass-estimates")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biomass_estimate_payload("biomass-001", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("biomass_value").and_then(|value| value.as_f64()),
+        Some(48.0)
+    );
+    assert_eq!(
+        first.get("area").and_then(|value| value.as_f64()),
+        Some(200.0)
+    );
+    assert_eq!(
+        first.get("crs").and_then(|value| value.as_str()),
+        Some("EPSG:32614")
+    );
+    assert_eq!(
+        first
+            .get("extent")
+            .and_then(|value| value.get("max_lon"))
+            .and_then(|value| value.as_f64()),
+        Some(20.0)
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biomass-estimates")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biomass_estimate_payload("biomass-002", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/biomass-estimates/biomass-001?record_id=sustain-biomass-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/biomass-estimates?record_id=sustain-biomass-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let estimates: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(estimates.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn biomass_estimate_rejects_mismatched_georeference_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_metric_record(
+        &ctx,
+        "farm-biomass-mismatch",
+        "field-biomass-mismatch",
+        "season-2026",
+        "sustain-biomass-mismatch",
+        "operation-biomass-001",
+        "biomass",
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biomass-estimates")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biomass_estimate_payload("biomass-mismatch", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM biomass_estimates")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(stored_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn content_items_create_edit_get_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -13540,6 +13695,27 @@ async fn seed_sustainability_record(
     record_id: &str,
     operation_id: &str,
 ) -> Result<()> {
+    seed_sustainability_metric_record(
+        ctx,
+        farm_id,
+        field_id,
+        season_id,
+        record_id,
+        operation_id,
+        "carbon_footprint",
+    )
+    .await
+}
+
+async fn seed_sustainability_metric_record(
+    ctx: &TestContext,
+    farm_id: &str,
+    field_id: &str,
+    season_id: &str,
+    record_id: &str,
+    operation_id: &str,
+    metric_type: &str,
+) -> Result<()> {
     seed_sustainability_field(ctx, farm_id, field_id, season_id).await?;
     let response = ctx
         .app
@@ -13555,7 +13731,7 @@ async fn seed_sustainability_record(
                         "field_id": field_id,
                         "season_id": season_id,
                         "operation_id": operation_id,
-                        "metric_type": "carbon_footprint",
+                        "metric_type": metric_type,
                         "method_version": "carbon.identity.v1"
                     })
                     .to_string(),
@@ -13635,6 +13811,61 @@ fn carbon_footprint_payload(footprint_id: &str, include_required: bool) -> serde
             "version": "agbot-carbon-factors-v1",
             "factors": factors
         }
+    })
+}
+
+fn biomass_estimate_payload(estimate_id: &str, mismatched_extent: bool) -> serde_json::Value {
+    let index_spatial_ref = if mismatched_extent {
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:32614",
+            "bbox": {
+                "min_lon": 0.0,
+                "min_lat": 10.0,
+                "max_lon": 20.0,
+                "max_lat": 30.0
+            },
+            "geo_transform": [0.0, 10.0, 0.0, 30.0, 0.0, -10.0],
+            "resolution": { "x": 10.0, "y": 10.0 }
+        })
+    } else {
+        biomass_spatial_ref()
+    };
+
+    json!({
+        "estimate_id": estimate_id,
+        "record_id": if mismatched_extent { "sustain-biomass-mismatch" } else { "sustain-biomass-001" },
+        "canopy_layer": {
+            "layer_ref": "layer:canopy-height-001",
+            "width": 2,
+            "height": 2,
+            "values": [1.0, 2.0, 0.0, 4.0],
+            "spatial_ref": biomass_spatial_ref()
+        },
+        "vegetation_index_layer": {
+            "layer_ref": "layer:ndvi-001",
+            "width": 2,
+            "height": 2,
+            "values": [0.5, 0.25, 0.8, -0.1],
+            "spatial_ref": index_spatial_ref
+        },
+        "method_version": "biomass.canopy_ndvi.v1",
+        "biomass_coefficient": 0.48
+    })
+}
+
+fn biomass_spatial_ref() -> serde_json::Value {
+    json!({
+        "georeferenced": true,
+        "crs": "EPSG:32614",
+        "bbox": {
+            "min_lon": 0.0,
+            "min_lat": 0.0,
+            "max_lon": 20.0,
+            "max_lat": 20.0
+        },
+        "geo_transform": [0.0, 10.0, 0.0, 20.0, 0.0, -10.0],
+        "resolution": { "x": 10.0, "y": 10.0 }
     })
 }
 

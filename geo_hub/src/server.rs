@@ -355,6 +355,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_carbon_footprint),
         )
         .route(
+            "/api/sustainability/biomass-estimates",
+            get(routes::list_biomass_estimates).post(routes::create_biomass_estimate),
+        )
+        .route(
+            "/api/sustainability/biomass-estimates/:estimate_id",
+            get(routes::get_biomass_estimate),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
         )
