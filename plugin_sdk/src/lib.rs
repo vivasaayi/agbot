@@ -372,6 +372,42 @@ pub struct AlertRuleFinding {
     pub sandbox_outcome: SandboxExecutionOutcome,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterDirection {
+    Import,
+    Export,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportExportAdapterRequest {
+    pub plugin_id: String,
+    pub adapter_id: String,
+    pub format: String,
+    pub direction: AdapterDirection,
+    pub payload_ref: String,
+    pub output_layer_ref: String,
+    pub expected_crs: String,
+    pub width: u32,
+    pub height: u32,
+    pub output_spatial_ref: RasterSpatialRef,
+    pub required_capabilities: Vec<String>,
+    pub estimated_runtime_ms: u64,
+    pub estimated_memory_mb: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportExportAdapterOutput {
+    pub adapter_id: String,
+    pub format: String,
+    pub direction: AdapterDirection,
+    pub payload_ref: String,
+    pub output_layer_ref: String,
+    pub spatial_ref: RasterSpatialRef,
+    pub plugin_identity: PluginInvocationIdentity,
+    pub sandbox_outcome: SandboxExecutionOutcome,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SpectralIndexInvocationError {
     #[error("unknown plugin: {plugin_id}")]
@@ -388,6 +424,31 @@ pub enum SpectralIndexInvocationError {
     },
     #[error("scene spatial reference rejected: {0}")]
     InvalidSpatialRef(#[from] RasterSpatialRefError),
+    #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
+    SandboxTerminated {
+        plugin_id: String,
+        reason: Option<SandboxTerminationReason>,
+        outcome: SandboxExecutionOutcome,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ImportExportAdapterInvocationError {
+    #[error("unknown plugin: {plugin_id}")]
+    UnknownPlugin { plugin_id: String },
+    #[error("plugin {plugin_id} is not an import/export adapter extension point")]
+    WrongExtensionPoint { plugin_id: String },
+    #[error("adapter {adapter_id} returned unprovable spatial reference: {source}")]
+    UnprovableSpatialRef {
+        adapter_id: String,
+        source: RasterSpatialRefError,
+    },
+    #[error("adapter {adapter_id} returned CRS {actual_crs}, expected {expected_crs}")]
+    CrsMismatch {
+        adapter_id: String,
+        expected_crs: String,
+        actual_crs: String,
+    },
     #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
     SandboxTerminated {
         plugin_id: String,
@@ -1115,6 +1176,84 @@ impl PluginHost {
         })
     }
 
+    pub fn invoke_import_export_adapter(
+        &mut self,
+        request: ImportExportAdapterRequest,
+        limits: PluginExecutionLimits,
+        attempted_at: &str,
+    ) -> Result<ImportExportAdapterOutput, ImportExportAdapterInvocationError> {
+        let (plugin_id, plugin_version) = self
+            .plugin_version_for_kind(&request.plugin_id, ExtensionPointKind::ImportExportAdapter)
+            .map_err(|error| match error {
+                PluginKindLookupError::UnknownPlugin { plugin_id } => {
+                    ImportExportAdapterInvocationError::UnknownPlugin { plugin_id }
+                }
+                PluginKindLookupError::WrongExtensionPoint { plugin_id } => {
+                    ImportExportAdapterInvocationError::WrongExtensionPoint { plugin_id }
+                }
+            })?;
+
+        let spatial_ref = assert_raster_spatial_ref(
+            Some(&request.output_spatial_ref),
+            request.width,
+            request.height,
+        )
+        .map_err(
+            |source| ImportExportAdapterInvocationError::UnprovableSpatialRef {
+                adapter_id: request.adapter_id.clone(),
+                source,
+            },
+        )?;
+        let actual_crs = spatial_ref.crs.clone().unwrap_or_default();
+        if actual_crs != request.expected_crs {
+            return Err(ImportExportAdapterInvocationError::CrsMismatch {
+                adapter_id: request.adapter_id,
+                expected_crs: request.expected_crs,
+                actual_crs,
+            });
+        }
+
+        let outcome = self.execute_sandboxed(
+            PluginExecutionPlan {
+                plugin_id: plugin_id.clone(),
+                required_capabilities: request.required_capabilities.clone(),
+                estimated_runtime_ms: request.estimated_runtime_ms,
+                estimated_memory_mb: request.estimated_memory_mb,
+                result: format!(
+                    "adapter {adapter_id} {direction:?} {format}",
+                    adapter_id = request.adapter_id,
+                    direction = request.direction,
+                    format = request.format
+                ),
+            },
+            limits,
+            attempted_at,
+        );
+        if outcome.status != SandboxExecutionStatus::Completed {
+            return Err(ImportExportAdapterInvocationError::SandboxTerminated {
+                plugin_id,
+                reason: outcome.termination_reason,
+                outcome,
+            });
+        }
+
+        Ok(ImportExportAdapterOutput {
+            adapter_id: request.adapter_id.clone(),
+            format: request.format,
+            direction: request.direction,
+            payload_ref: request.payload_ref,
+            output_layer_ref: request.output_layer_ref,
+            spatial_ref,
+            plugin_identity: PluginInvocationIdentity {
+                plugin_id,
+                plugin_version,
+                extension_point: ExtensionPointKind::ImportExportAdapter,
+                invocation_ref: request.adapter_id,
+            },
+            sandbox_outcome: outcome,
+        })
+    }
+
     fn plugin_version_for_kind(
         &self,
         plugin_id: &str,
@@ -1426,14 +1565,15 @@ fn normalize_optional_text(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlertRuleAction, AlertRuleEvaluationRequest, AlertRuleInvocationError, CapabilityDecision,
-        CapabilityViolationReason, CustomProcessorRequest, ManifestField, ManifestRejectionReason,
-        MapLayerInvocationError, MapLayerRenderRequest, PluginExecutionLimits, PluginExecutionPlan,
-        PluginHost, PluginLifecycleStatus, PluginLifecycleTransitionRequest,
-        PluginRegistrationError, RawPluginManifest, ReportTemplateRenderRequest,
-        SandboxExecutionStatus, SandboxTerminationReason, SpectralBandOperand,
-        SpectralIndexFormula, SpectralIndexInvocationError, SpectralIndexPluginSpec,
-        SpectralIndexScene,
+        AdapterDirection, AlertRuleAction, AlertRuleEvaluationRequest, AlertRuleInvocationError,
+        CapabilityDecision, CapabilityViolationReason, CustomProcessorRequest,
+        ImportExportAdapterInvocationError, ImportExportAdapterRequest, ManifestField,
+        ManifestRejectionReason, MapLayerInvocationError, MapLayerRenderRequest,
+        PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginLifecycleStatus,
+        PluginLifecycleTransitionRequest, PluginRegistrationError, RawPluginManifest,
+        ReportTemplateRenderRequest, SandboxExecutionStatus, SandboxTerminationReason,
+        SpectralBandOperand, SpectralIndexFormula, SpectralIndexInvocationError,
+        SpectralIndexPluginSpec, SpectralIndexScene,
     };
     use shared::plugin_extensions::ExtensionPointKind;
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError};
@@ -2075,6 +2215,65 @@ mod tests {
     }
 
     #[test]
+    fn import_export_adapter_participates_with_validated_crs() {
+        let mut host = PluginHost::default();
+        host.register_plugin(import_export_adapter_manifest())
+            .expect("adapter plugin should register");
+        enable_plugin(&mut host, "plugin.geojson_adapter");
+
+        let output = host
+            .invoke_import_export_adapter(
+                import_export_adapter_request(spatial_ref()),
+                sandbox_limits(),
+                "2026-06-12T13:00:00Z",
+            )
+            .expect("adapter should run");
+
+        assert_eq!(output.adapter_id, "adapter:geojson-partner");
+        assert_eq!(output.format, "partner_geojson");
+        assert_eq!(output.direction, AdapterDirection::Import);
+        assert_eq!(output.output_layer_ref, "layer:imported:partner-boundary");
+        assert_eq!(output.spatial_ref.crs.as_deref(), Some("EPSG:32614"));
+        assert_eq!(output.plugin_identity.plugin_id, "plugin.geojson_adapter");
+        assert_eq!(
+            output.plugin_identity.extension_point,
+            ExtensionPointKind::ImportExportAdapter
+        );
+        assert_eq!(
+            output.sandbox_outcome.status,
+            SandboxExecutionStatus::Completed
+        );
+    }
+
+    #[test]
+    fn import_export_adapter_wrong_crs_output_is_rejected_by_host() {
+        let mut host = PluginHost::default();
+        host.register_plugin(import_export_adapter_manifest())
+            .expect("adapter plugin should register");
+        enable_plugin(&mut host, "plugin.geojson_adapter");
+        let mut wrong_crs = spatial_ref();
+        wrong_crs.crs = Some("EPSG:4326".to_string());
+
+        let error = host
+            .invoke_import_export_adapter(
+                import_export_adapter_request(wrong_crs),
+                sandbox_limits(),
+                "2026-06-12T13:01:00Z",
+            )
+            .expect_err("wrong CRS should reject before rendering");
+
+        assert_eq!(
+            error,
+            ImportExportAdapterInvocationError::CrsMismatch {
+                adapter_id: "adapter:geojson-partner".to_string(),
+                expected_crs: "EPSG:32614".to_string(),
+                actual_crs: "EPSG:4326".to_string(),
+            }
+        );
+        assert!(host.capability_audit_entries().is_empty());
+    }
+
+    #[test]
     fn compatible_host_api_version_registers_within_supported_range() {
         let mut host = PluginHost::with_supported_host_api_range("2026.1", "2026.3")
             .expect("range should be valid");
@@ -2181,6 +2380,18 @@ mod tests {
             host_api_version: "2026.1".to_string(),
             capabilities: vec!["read:finding_input".to_string(), "emit:finding".to_string()],
             entrypoint: "low_vigor_alert::evaluate".to_string(),
+        }
+    }
+
+    fn import_export_adapter_manifest() -> RawPluginManifest {
+        RawPluginManifest {
+            plugin_id: "plugin.geojson_adapter".to_string(),
+            name: "Partner GeoJSON Adapter".to_string(),
+            version: "0.5.0".to_string(),
+            kind: "import_export_adapter".to_string(),
+            host_api_version: "2026.1".to_string(),
+            capabilities: vec!["read:payload".to_string(), "write:layer".to_string()],
+            entrypoint: "geojson_adapter::adapt".to_string(),
         }
     }
 
@@ -2348,6 +2559,24 @@ mod tests {
             finding_ref: "alert-finding:low-vigor:north".to_string(),
             severity: "warning".to_string(),
             message: "Mean NDVI is below the partner threshold".to_string(),
+        }
+    }
+
+    fn import_export_adapter_request(spatial_ref: RasterSpatialRef) -> ImportExportAdapterRequest {
+        ImportExportAdapterRequest {
+            plugin_id: "plugin.geojson_adapter".to_string(),
+            adapter_id: "adapter:geojson-partner".to_string(),
+            format: "partner_geojson".to_string(),
+            direction: AdapterDirection::Import,
+            payload_ref: "payload:partner-boundary:001".to_string(),
+            output_layer_ref: "layer:imported:partner-boundary".to_string(),
+            expected_crs: "EPSG:32614".to_string(),
+            width: 2,
+            height: 1,
+            output_spatial_ref: spatial_ref,
+            required_capabilities: vec!["read:payload".to_string(), "write:layer".to_string()],
+            estimated_runtime_ms: 40,
+            estimated_memory_mb: 96,
         }
     }
 
