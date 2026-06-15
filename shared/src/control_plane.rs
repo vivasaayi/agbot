@@ -1,8 +1,9 @@
 use crate::schemas::{
-    FarmFieldRegistry, FarmRecord, FieldRecord, GeoBounds, MarketplaceAccountRecord,
-    MarketplaceAccountStatus, RecommendationLifecycleRegistry, RecommendationPriority,
-    RecommendationRecord, RecommendationStatus, RecommendationStatusChangeRecord,
-    RecommendationStatusChangeType, ReportRecord, SceneLayerRecord,
+    ContentRecord, ContentStatus, FarmFieldRegistry, FarmRecord, FieldRecord, GeoBounds,
+    MarketplaceAccountRecord, MarketplaceAccountStatus, RecommendationLifecycleRegistry,
+    RecommendationPriority, RecommendationRecord, RecommendationStatus,
+    RecommendationStatusChangeRecord, RecommendationStatusChangeType, ReportRecord,
+    SceneLayerRecord,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -429,6 +430,42 @@ pub struct GrowerMarketplaceEntry {
 pub struct GrowerMarketplaceEntryResolution {
     pub entry: Option<GrowerMarketplaceEntry>,
     pub hidden_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerCommunityKnowledgeSourceItem {
+    pub content: ContentRecord,
+    pub title: String,
+    pub source: String,
+    pub region: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrowerCommunityKnowledgeFeedStatus {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerCommunityKnowledgeFeedItem {
+    pub content_id: String,
+    pub content_type: String,
+    pub title: String,
+    pub source: String,
+    pub source_org_id: String,
+    pub region: Option<String>,
+    pub published_at: String,
+    pub read_only: bool,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerCommunityKnowledgeFeed {
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub status: GrowerCommunityKnowledgeFeedStatus,
+    pub unavailable_reason: Option<String>,
+    pub items: Vec<GrowerCommunityKnowledgeFeedItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1756,6 +1793,66 @@ pub fn resolve_grower_marketplace_entry(
             ],
         }),
         hidden_reason: None,
+    }
+}
+
+pub fn build_grower_community_knowledge_feed(
+    scope: &GrowerPortalSessionScope,
+    region: Option<&str>,
+    source_items: Option<&[GrowerCommunityKnowledgeSourceItem]>,
+) -> GrowerCommunityKnowledgeFeed {
+    let Some(source_items) = source_items else {
+        return GrowerCommunityKnowledgeFeed {
+            grower_id: scope.grower_id,
+            org_id: scope.org_id,
+            status: GrowerCommunityKnowledgeFeedStatus::Unavailable,
+            unavailable_reason: Some("feed_unavailable".to_string()),
+            items: Vec::new(),
+        };
+    };
+
+    let org_id = scope.org_id.to_string();
+    let mut items = source_items
+        .iter()
+        .filter(|item| item.content.status == ContentStatus::Published)
+        .filter(|item| {
+            item.content.org_id == org_id
+                || region.is_some_and(|region| item.region.as_deref() == Some(region))
+        })
+        .map(grower_community_knowledge_feed_item)
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .published_at
+            .cmp(&left.published_at)
+            .then(left.content_id.cmp(&right.content_id))
+    });
+
+    GrowerCommunityKnowledgeFeed {
+        grower_id: scope.grower_id,
+        org_id: scope.org_id,
+        status: GrowerCommunityKnowledgeFeedStatus::Available,
+        unavailable_reason: None,
+        items,
+    }
+}
+
+fn grower_community_knowledge_feed_item(
+    item: &GrowerCommunityKnowledgeSourceItem,
+) -> GrowerCommunityKnowledgeFeedItem {
+    GrowerCommunityKnowledgeFeedItem {
+        content_id: item.content.content_id.clone(),
+        content_type: item.content.content_type.as_str().to_string(),
+        title: item.title.clone(),
+        source: item.source.clone(),
+        source_org_id: item.content.org_id.clone(),
+        region: item.region.clone(),
+        published_at: item.content.updated_at.clone(),
+        read_only: true,
+        evidence_refs: vec![
+            format!("content:{}", item.content.content_id),
+            format!("content-version:{}", item.content.current_version),
+        ],
     }
 }
 
@@ -3441,6 +3538,76 @@ mod tests {
     }
 
     #[test]
+    fn grower_community_feed_renders_read_only_scoped_items() {
+        let org_id = Uuid::new_v4();
+        let other_org = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id: Uuid::new_v4(),
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let source_items = vec![
+            community_source_item(
+                "content-owned",
+                org_id,
+                ContentStatus::Published,
+                Some("central-plains"),
+                "2026-06-15T14:00:00Z",
+            ),
+            community_source_item(
+                "content-region",
+                other_org,
+                ContentStatus::Published,
+                Some("central-plains"),
+                "2026-06-16T14:00:00Z",
+            ),
+            community_source_item(
+                "content-draft",
+                org_id,
+                ContentStatus::Draft,
+                Some("central-plains"),
+                "2026-06-17T14:00:00Z",
+            ),
+        ];
+
+        let feed = build_grower_community_knowledge_feed(
+            &scope,
+            Some("central-plains"),
+            Some(&source_items),
+        );
+
+        assert_eq!(feed.status, GrowerCommunityKnowledgeFeedStatus::Available);
+        assert_eq!(feed.unavailable_reason, None);
+        assert_eq!(feed.items.len(), 2);
+        assert_eq!(feed.items[0].content_id, "content-region");
+        assert_eq!(feed.items[1].content_id, "content-owned");
+        assert!(feed.items.iter().all(|item| item.read_only));
+        assert!(feed.items.iter().all(|item| item
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("content:"))));
+    }
+
+    #[test]
+    fn grower_community_feed_unavailable_state_is_graceful() {
+        let scope = GrowerPortalSessionScope {
+            grower_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+
+        let feed = build_grower_community_knowledge_feed(&scope, Some("central-plains"), None);
+
+        assert_eq!(feed.status, GrowerCommunityKnowledgeFeedStatus::Unavailable);
+        assert_eq!(feed.unavailable_reason.as_deref(), Some("feed_unavailable"));
+        assert!(feed.items.is_empty());
+    }
+
+    #[test]
     fn grower_portal_field_read_denies_cross_tenant_and_audits() {
         let mut control = ControlPlaneRegistry::default();
         let org_a = control
@@ -3910,6 +4077,30 @@ mod tests {
             status,
             created_at: "2026-06-15T13:00:00Z".to_string(),
             updated_at: "2026-06-15T13:00:00Z".to_string(),
+        }
+    }
+
+    fn community_source_item(
+        content_id: &str,
+        org_id: Uuid,
+        status: ContentStatus,
+        region: Option<&str>,
+        updated_at: &str,
+    ) -> GrowerCommunityKnowledgeSourceItem {
+        GrowerCommunityKnowledgeSourceItem {
+            content: ContentRecord {
+                content_id: content_id.to_string(),
+                content_type: crate::schemas::ContentType::Guide,
+                author_id: "editor".to_string(),
+                org_id: org_id.to_string(),
+                status,
+                current_version: format!("version-{content_id}"),
+                created_at: "2026-06-15T13:00:00Z".to_string(),
+                updated_at: updated_at.to_string(),
+            },
+            title: format!("Knowledge {content_id}"),
+            source: "community-domain-20".to_string(),
+            region: region.map(str::to_string),
         }
     }
 
