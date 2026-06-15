@@ -395,6 +395,26 @@ pub struct GrowerFieldSummaryExportStore {
     shares: HashMap<String, GrowerFieldSummaryShareRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrowerMobileConnectivity {
+    Online,
+    Offline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerMobileAppShell {
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub home: GrowerPortalHome,
+    pub field_overviews: Vec<GrowerPortalFieldOverview>,
+    pub report_inbox: GrowerReportInboxPage,
+    pub notification_feed: GrowerNotificationFeed,
+    pub connectivity: GrowerMobileConnectivity,
+    pub loaded_at: String,
+    pub rendered_at: String,
+    pub freshness_label: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GrowerFieldMapError {
     #[error(transparent)]
@@ -1621,6 +1641,53 @@ fn audit_grower_field_summary_export(
         decision,
         reason_code: reason_code.to_string(),
     });
+}
+
+pub fn build_grower_mobile_app_shell(
+    scope: &GrowerPortalSessionScope,
+    farm_fields: &FarmFieldRegistry,
+    activity: &[GrowerFieldActivitySummary],
+    analysis_sources: &[GrowerFieldAnalysisSource],
+    reports: &[ReportRecord],
+    report_query: GrowerReportInboxQuery,
+    notification_events: &[GrowerNotificationSourceEvent],
+    loaded_at: &str,
+) -> Result<GrowerMobileAppShell, GrowerPortalAccessError> {
+    let home = build_grower_portal_home(scope, farm_fields, activity);
+    let mut field_overviews = scope
+        .field_ids
+        .iter()
+        .map(|field_id| {
+            build_grower_portal_field_overview(scope, farm_fields, field_id, analysis_sources)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    field_overviews.sort_by(|left, right| left.field_id.cmp(&right.field_id));
+    let report_inbox = list_grower_report_inbox(scope, reports, report_query);
+    let notification_feed = build_grower_notification_feed(scope, notification_events);
+
+    Ok(GrowerMobileAppShell {
+        grower_id: scope.grower_id,
+        org_id: scope.org_id,
+        home,
+        field_overviews,
+        report_inbox,
+        notification_feed,
+        connectivity: GrowerMobileConnectivity::Online,
+        loaded_at: loaded_at.to_string(),
+        rendered_at: loaded_at.to_string(),
+        freshness_label: None,
+    })
+}
+
+pub fn build_grower_mobile_offline_shell(
+    cached: &GrowerMobileAppShell,
+    opened_at: &str,
+) -> GrowerMobileAppShell {
+    let mut shell = cached.clone();
+    shell.connectivity = GrowerMobileConnectivity::Offline;
+    shell.rendered_at = opened_at.to_string();
+    shell.freshness_label = Some(format!("offline / as of {}", cached.loaded_at));
+    shell
 }
 
 impl TenantScoped for OrganizationRecord {
@@ -3115,6 +3182,111 @@ mod tests {
                 && record.decision == AuthorizationDecision::Denied
                 && record.reason_code == "grower_field_summary_export_contains_out_of_scope_data"
         }));
+    }
+
+    #[test]
+    fn grower_mobile_app_shell_reuses_scoped_portal_apis() {
+        let mut farm_fields = FarmFieldRegistry::default();
+        let org_id = Uuid::new_v4();
+        insert_test_farm_field_scope(&mut farm_fields, org_id, "farm-a", "field-a");
+        let scope = GrowerPortalSessionScope {
+            grower_id: Uuid::new_v4(),
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let activity = vec![GrowerFieldActivitySummary {
+            field_id: "field-a".to_string(),
+            last_scene_date: Some("2026-06-15T12:00:00Z".to_string()),
+            open_recommendation_count: 1,
+            evidence_refs: vec!["scene:scene-a".to_string()],
+        }];
+        let analyses = vec![field_analysis_source(
+            "field-a",
+            "scene-a",
+            "2026-06-15T12:00:00Z",
+            GrowerFieldAnalysisStatus::Completed,
+        )];
+        let reports = vec![report_record(
+            "report-a",
+            "field-a",
+            org_id,
+            "2026-06-15T13:00:00Z",
+        )];
+        let events = vec![notification_event(
+            GrowerNotificationEventType::ReportPublished,
+            "report:report-a",
+            "field-a",
+            "2026-06-15T13:05:00Z",
+        )];
+
+        let mobile = build_grower_mobile_app_shell(
+            &scope,
+            &farm_fields,
+            &activity,
+            &analyses,
+            &reports,
+            GrowerReportInboxQuery::default(),
+            &events,
+            "2026-06-15T14:00:00Z",
+        )
+        .expect("mobile shell renders");
+
+        assert_eq!(
+            mobile.home,
+            build_grower_portal_home(&scope, &farm_fields, &activity)
+        );
+        assert_eq!(
+            mobile.report_inbox,
+            list_grower_report_inbox(&scope, &reports, GrowerReportInboxQuery::default())
+        );
+        assert_eq!(
+            mobile.notification_feed,
+            build_grower_notification_feed(&scope, &events)
+        );
+        assert_eq!(mobile.field_overviews.len(), 1);
+        assert_eq!(mobile.field_overviews[0].field_id, "field-a");
+        assert_eq!(mobile.connectivity, GrowerMobileConnectivity::Online);
+        assert_eq!(mobile.freshness_label, None);
+    }
+
+    #[test]
+    fn grower_mobile_offline_shell_uses_cached_data_with_freshness_label() {
+        let mut farm_fields = FarmFieldRegistry::default();
+        let org_id = Uuid::new_v4();
+        insert_test_farm_field_scope(&mut farm_fields, org_id, "farm-a", "field-a");
+        let scope = GrowerPortalSessionScope {
+            grower_id: Uuid::new_v4(),
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let cached = build_grower_mobile_app_shell(
+            &scope,
+            &farm_fields,
+            &[],
+            &[],
+            &[],
+            GrowerReportInboxQuery::default(),
+            &[],
+            "2026-06-15T14:00:00Z",
+        )
+        .expect("initial mobile load caches");
+
+        let offline = build_grower_mobile_offline_shell(&cached, "2026-06-15T16:30:00Z");
+
+        assert_eq!(offline.connectivity, GrowerMobileConnectivity::Offline);
+        assert_eq!(offline.rendered_at, "2026-06-15T16:30:00Z");
+        assert_eq!(
+            offline.freshness_label.as_deref(),
+            Some("offline / as of 2026-06-15T14:00:00Z")
+        );
+        assert_eq!(offline.home, cached.home);
+        assert_eq!(offline.field_overviews, cached.field_overviews);
+        assert_eq!(offline.report_inbox, cached.report_inbox);
+        assert_eq!(offline.notification_feed, cached.notification_feed);
     }
 
     #[test]
