@@ -1,6 +1,7 @@
 use crate::schemas::{
     FarmFieldRegistry, FarmRecord, FieldRecord, GeoBounds, RecommendationLifecycleRegistry,
-    RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportRecord,
+    RecommendationPriority, RecommendationRecord, RecommendationStatus,
+    RecommendationStatusChangeRecord, RecommendationStatusChangeType, ReportRecord,
     SceneLayerRecord,
 };
 use chrono::{DateTime, Utc};
@@ -330,6 +331,24 @@ pub struct GrowerNotificationFeed {
     pub grower_id: Uuid,
     pub org_id: Uuid,
     pub items: Vec<GrowerNotificationFeedItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerRecommendationHistoryRow {
+    pub recommendation_id: String,
+    pub actor_user_id: String,
+    pub before: Option<RecommendationStatus>,
+    pub after: RecommendationStatus,
+    pub at: String,
+    pub change_type: RecommendationStatusChangeType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerRecommendationHistory {
+    pub recommendation_id: String,
+    pub field_id: String,
+    pub rows: Vec<GrowerRecommendationHistoryRow>,
+    pub empty_state: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1164,6 +1183,84 @@ fn grower_notification_item(event: &GrowerNotificationSourceEvent) -> GrowerNoti
             "event:{:?}:{}:{}",
             event.event_type, event.source_ref, event.created_at
         )],
+    }
+}
+
+pub fn grower_recommendation_history(
+    scope: &GrowerPortalSessionScope,
+    registry: &RecommendationLifecycleRegistry,
+    recommendation_id: &str,
+) -> Result<GrowerRecommendationHistory, GrowerPortalAccessError> {
+    let org_id = scope.org_id.to_string();
+    let recommendation = registry
+        .recommendations_for_org(&org_id)
+        .into_iter()
+        .find(|recommendation| recommendation.recommendation_id == recommendation_id)
+        .ok_or_else(|| GrowerPortalAccessError::FieldNotFound {
+            field_id: recommendation_id.to_string(),
+        })?;
+    let field_id =
+        recommendation
+            .field_id
+            .clone()
+            .ok_or_else(|| GrowerPortalAccessError::FieldNotFound {
+                field_id: recommendation_id.to_string(),
+            })?;
+    if !scope.field_ids.iter().any(|scoped| scoped == &field_id) {
+        return Err(GrowerPortalAccessError::Forbidden {
+            evidence: GrowerPortalAccessEvidence {
+                grower_id: scope.grower_id,
+                org_id: scope.org_id,
+                role: scope.role,
+                action: ControlPlaneAction::ReadEntity,
+                field_id,
+                target_org_id: Some(recommendation.org_id),
+                decision: AuthorizationDecision::Denied,
+                reason_code: "recommendation_history_out_of_scope".to_string(),
+            },
+        });
+    }
+    let mut rows = registry
+        .recommendation_history(&org_id, recommendation_id)
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    Ok(build_grower_recommendation_history_view(
+        recommendation_id,
+        field_id,
+        &mut rows,
+    ))
+}
+
+pub fn build_grower_recommendation_history_view(
+    recommendation_id: &str,
+    field_id: String,
+    changes: &mut [RecommendationStatusChangeRecord],
+) -> GrowerRecommendationHistory {
+    changes.sort_by(|left, right| left.at.cmp(&right.at));
+    let rows = changes
+        .iter()
+        .cloned()
+        .map(grower_recommendation_history_row)
+        .collect::<Vec<_>>();
+    GrowerRecommendationHistory {
+        recommendation_id: recommendation_id.to_string(),
+        field_id,
+        empty_state: rows.is_empty(),
+        rows,
+    }
+}
+
+fn grower_recommendation_history_row(
+    change: RecommendationStatusChangeRecord,
+) -> GrowerRecommendationHistoryRow {
+    GrowerRecommendationHistoryRow {
+        recommendation_id: change.recommendation_id,
+        actor_user_id: change.actor_user_id,
+        before: change.before,
+        after: change.after,
+        at: change.at,
+        change_type: change.change_type,
     }
 }
 
@@ -2402,6 +2499,70 @@ mod tests {
             .items
             .iter()
             .all(|item| item.field_id.as_str() == "field-a"));
+    }
+
+    #[test]
+    fn grower_recommendation_history_renders_full_audit_trail() {
+        let grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let mut registry = RecommendationLifecycleRegistry::default();
+        registry
+            .create_recommendation(recommendation_record(
+                "rec-owned",
+                "field-a",
+                org_id,
+                RecommendationPriority::High,
+            ))
+            .expect("owned recommendation persists");
+        registry
+            .transition_recommendation_status(
+                &org_id.to_string(),
+                "rec-owned",
+                &grower_id.to_string(),
+                "2026-06-15T13:09:00Z",
+                RecommendationStatus::Reviewed,
+            )
+            .expect("recommendation acknowledges");
+        registry
+            .transition_recommendation_status(
+                &org_id.to_string(),
+                "rec-owned",
+                "advisor",
+                "2026-06-16T13:09:00Z",
+                RecommendationStatus::Completed,
+            )
+            .expect("recommendation completes");
+
+        let history = grower_recommendation_history(&scope, &registry, "rec-owned")
+            .expect("history should render");
+
+        assert!(!history.empty_state);
+        assert_eq!(history.rows.len(), 3);
+        assert_eq!(history.rows[0].before, None);
+        assert_eq!(history.rows[0].after, RecommendationStatus::Open);
+        assert_eq!(history.rows[1].before, Some(RecommendationStatus::Open));
+        assert_eq!(history.rows[1].after, RecommendationStatus::Reviewed);
+        assert_eq!(history.rows[1].actor_user_id, grower_id.to_string());
+        assert_eq!(history.rows[2].before, Some(RecommendationStatus::Reviewed));
+        assert_eq!(history.rows[2].after, RecommendationStatus::Completed);
+    }
+
+    #[test]
+    fn grower_recommendation_history_reports_empty_state_without_transitions() {
+        let empty =
+            build_grower_recommendation_history_view("rec-draft", "field-a".to_string(), &mut []);
+
+        assert_eq!(empty.recommendation_id, "rec-draft");
+        assert_eq!(empty.field_id, "field-a");
+        assert!(empty.empty_state);
+        assert!(empty.rows.is_empty());
     }
 
     #[test]
