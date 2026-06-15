@@ -696,6 +696,234 @@ async fn scene_refresh_advisory_returns_empty_when_no_fresher_scene_exists() -> 
 }
 
 #[tokio::test]
+async fn scene_change_advisory_summarizes_comparable_linked_scenes() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_advisory_field(&ctx, "change-field", "2026").await?;
+
+    let baseline_dir = ctx.data_root.join("scenes").join("change-baseline");
+    insert_advisory_scene(
+        &ctx,
+        "change-baseline",
+        Some("change-field"),
+        Some("2026"),
+        "2026-05-01T00:00:00Z",
+        Some(20.0),
+        &baseline_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+    let comparison_dir = ctx.data_root.join("scenes").join("change-comparison");
+    insert_advisory_scene(
+        &ctx,
+        "change-comparison",
+        Some("change-field"),
+        Some("2026"),
+        "2026-06-01T00:00:00Z",
+        Some(45.0),
+        &comparison_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/change-field/scene-change-advisories")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let advisories: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        advisories
+            .get("advisory_enabled")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    let item = advisories
+        .get("advisories")
+        .and_then(|value| value.as_array())
+        .and_then(|items| items.first())
+        .expect("change advisory should be emitted");
+    assert_eq!(
+        item.get("baseline_scene_id")
+            .and_then(|value| value.as_str()),
+        Some("change-baseline")
+    );
+    assert_eq!(
+        item.get("comparison_scene_id")
+            .and_then(|value| value.as_str()),
+        Some("change-comparison")
+    );
+    assert_eq!(
+        item.get("reason").and_then(|value| value.as_str()),
+        Some("aligned-common-extent")
+    );
+    assert_eq!(
+        item.get("confidence").and_then(|value| value.as_str()),
+        Some("medium")
+    );
+    assert_eq!(
+        item.get("coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(1.0)
+    );
+    assert_eq!(
+        item.get("change_score").and_then(|value| value.as_f64()),
+        Some(0.25)
+    );
+    assert!(item
+        .get("common_extent")
+        .is_some_and(|value| value.is_object()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scene_change_advisory_marks_spatial_mismatch_low_confidence() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_advisory_field(&ctx, "change-mismatch-field", "2026").await?;
+
+    let baseline_dir = ctx
+        .data_root
+        .join("scenes")
+        .join("change-mismatch-baseline");
+    insert_advisory_scene(
+        &ctx,
+        "change-mismatch-baseline",
+        Some("change-mismatch-field"),
+        Some("2026"),
+        "2026-05-01T00:00:00Z",
+        Some(20.0),
+        &baseline_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+    let comparison_dir = ctx
+        .data_root
+        .join("scenes")
+        .join("change-mismatch-comparison");
+    insert_advisory_scene(
+        &ctx,
+        "change-mismatch-comparison",
+        Some("change-mismatch-field"),
+        Some("2026"),
+        "2026-06-01T00:00:00Z",
+        Some(45.0),
+        &comparison_dir,
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:3857",
+            "bbox": {
+                "min_lon": -96.8,
+                "min_lat": 41.0,
+                "max_lon": -96.2,
+                "max_lat": 41.6
+            },
+            "geo_transform": [-96.8, 0.3, 0.0, 41.6, 0.0, -0.3],
+            "resolution": {
+                "x": 0.3,
+                "y": 0.3
+            }
+        }),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/change-mismatch-field/scene-change-advisories")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let advisories: serde_json::Value = serde_json::from_slice(&body)?;
+    let item = advisories
+        .get("advisories")
+        .and_then(|value| value.as_array())
+        .and_then(|items| items.first())
+        .expect("low-confidence advisory should be emitted");
+    assert_eq!(
+        item.get("confidence").and_then(|value| value.as_str()),
+        Some("low")
+    );
+    assert!(item
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.contains("spatial-ref-mismatch")));
+    assert!(item
+        .get("common_extent")
+        .is_some_and(|value| value.is_null()));
+    assert_eq!(
+        item.get("coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(0.0)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scene_change_advisory_returns_no_comparison_for_single_scene() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_advisory_field(&ctx, "change-single-field", "2026").await?;
+
+    let scene_dir = ctx.data_root.join("scenes").join("change-single");
+    insert_advisory_scene(
+        &ctx,
+        "change-single",
+        Some("change-single-field"),
+        Some("2026"),
+        "2026-05-01T00:00:00Z",
+        Some(20.0),
+        &scene_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/change-single-field/scene-change-advisories")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let advisories: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(advisories
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.contains("single-linked-scene")));
+    assert!(advisories
+        .get("advisories")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| items.is_empty()));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn linking_scene_to_field_rejects_non_overlapping_extent() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

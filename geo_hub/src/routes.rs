@@ -172,6 +172,28 @@ pub struct SceneRefreshAdvisoriesResponse {
     pub advisories: Vec<SceneRefreshAdvisory>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SceneChangeAdvisory {
+    pub baseline_scene_id: String,
+    pub comparison_scene_id: String,
+    pub baseline_acquired_at: String,
+    pub comparison_acquired_at: String,
+    pub common_extent: Option<SceneExtent>,
+    pub coverage_fraction: f64,
+    pub change_score: f64,
+    pub uncertainty_low: f64,
+    pub uncertainty_high: f64,
+    pub confidence: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SceneChangeAdvisoriesResponse {
+    pub advisory_enabled: bool,
+    pub reason: Option<String>,
+    pub advisories: Vec<SceneChangeAdvisory>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SceneDetail {
     pub scene_id: String,
@@ -6176,6 +6198,129 @@ pub async fn list_field_scene_refresh_advisories(
         advisory_enabled: true,
         reason: None,
         advisories,
+    }))
+}
+
+pub async fn list_field_scene_change_advisories(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SceneChangeAdvisoriesResponse>> {
+    if load_field(&state, &field_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let rows = sqlx::query(
+        "SELECT scene_id, acquired_at, data_path, metadata_json, cloud_cover FROM scenes WHERE field_id = ?1 ORDER BY acquired_at DESC LIMIT 2",
+    )
+    .bind(&field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    if rows.len() < 2 {
+        return Ok(Json(SceneChangeAdvisoriesResponse {
+            advisory_enabled: true,
+            reason: Some("single-linked-scene: no comparison available".to_string()),
+            advisories: Vec::new(),
+        }));
+    }
+
+    let comparison_scene_id: String = rows[0].get("scene_id");
+    let comparison_acquired_at: String = rows[0].get("acquired_at");
+    let comparison_data_path: String = rows[0].get("data_path");
+    let comparison_cloud_cover: Option<f64> = rows[0].get("cloud_cover");
+    let comparison_metadata =
+        load_scene_metadata(Some(&rows[0]), FsPath::new(&comparison_data_path)).await?;
+    let comparison_spatial_ref =
+        ingest::load_scene_spatial_ref(&state.pool, &comparison_scene_id).await?;
+
+    let baseline_scene_id: String = rows[1].get("scene_id");
+    let baseline_acquired_at: String = rows[1].get("acquired_at");
+    let baseline_data_path: String = rows[1].get("data_path");
+    let baseline_cloud_cover: Option<f64> = rows[1].get("cloud_cover");
+    let baseline_metadata =
+        load_scene_metadata(Some(&rows[1]), FsPath::new(&baseline_data_path)).await?;
+    let baseline_spatial_ref =
+        ingest::load_scene_spatial_ref(&state.pool, &baseline_scene_id).await?;
+
+    let baseline_extent =
+        scene_extent_for_link(baseline_metadata.as_ref(), baseline_spatial_ref.as_ref());
+    let comparison_extent = scene_extent_for_link(
+        comparison_metadata.as_ref(),
+        comparison_spatial_ref.as_ref(),
+    );
+
+    let comparable = baseline_spatial_ref
+        .as_ref()
+        .zip(comparison_spatial_ref.as_ref())
+        .is_some_and(|(baseline, comparison)| {
+            assert_scene_spatial_ref_integrity(baseline_metadata.as_ref(), Some(baseline)).is_ok()
+                && assert_scene_spatial_ref_integrity(
+                    comparison_metadata.as_ref(),
+                    Some(comparison),
+                )
+                .is_ok()
+                && assert_spatial_refs_equivalent(baseline, comparison).is_ok()
+        });
+
+    let common_extent = baseline_extent
+        .as_ref()
+        .zip(comparison_extent.as_ref())
+        .and_then(|(baseline, comparison)| common_scene_extent(baseline, comparison));
+    let coverage_fraction = common_extent
+        .as_ref()
+        .zip(baseline_extent.as_ref())
+        .map(|(common, baseline)| {
+            let baseline_area = scene_extent_area(baseline);
+            if baseline_area <= f64::EPSILON {
+                0.0
+            } else {
+                (scene_extent_area(common) / baseline_area).clamp(0.0, 1.0)
+            }
+        })
+        .unwrap_or(0.0);
+
+    let (change_score, uncertainty_low, uncertainty_high, reason, confidence) = if comparable {
+        let score = coarse_scene_change_score(baseline_cloud_cover, comparison_cloud_cover);
+        let uncertainty = if baseline_cloud_cover.is_some() && comparison_cloud_cover.is_some() {
+            0.05
+        } else {
+            0.25
+        };
+        (
+            score,
+            (score - uncertainty).max(0.0),
+            (score + uncertainty).min(1.0),
+            "aligned-common-extent".to_string(),
+            if uncertainty <= 0.05 { "medium" } else { "low" }.to_string(),
+        )
+    } else {
+        (
+            0.0,
+            0.0,
+            1.0,
+            "spatial-ref-mismatch: change unavailable without comparable CRS/extent/resolution"
+                .to_string(),
+            "low".to_string(),
+        )
+    };
+
+    Ok(Json(SceneChangeAdvisoriesResponse {
+        advisory_enabled: true,
+        reason: None,
+        advisories: vec![SceneChangeAdvisory {
+            baseline_scene_id,
+            comparison_scene_id,
+            baseline_acquired_at,
+            comparison_acquired_at,
+            common_extent: if comparable { common_extent } else { None },
+            coverage_fraction: if comparable { coverage_fraction } else { 0.0 },
+            change_score,
+            uncertainty_low,
+            uncertainty_high,
+            confidence,
+            reason,
+        }],
     }))
 }
 
@@ -12719,6 +12864,37 @@ fn is_lower_cloud(
         (Some(current), Some(candidate)) => (candidate < current, false),
         (None, Some(_)) => (true, true),
         _ => (false, false),
+    }
+}
+
+fn common_scene_extent(left: &SceneExtent, right: &SceneExtent) -> Option<SceneExtent> {
+    let min_lon = left.min_lon.max(right.min_lon);
+    let min_lat = left.min_lat.max(right.min_lat);
+    let max_lon = left.max_lon.min(right.max_lon);
+    let max_lat = left.max_lat.min(right.max_lat);
+    (min_lon < max_lon && min_lat < max_lat).then_some(SceneExtent {
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+    })
+}
+
+fn scene_extent_area(extent: &SceneExtent) -> f64 {
+    let width = (extent.max_lon - extent.min_lon).max(0.0);
+    let height = (extent.max_lat - extent.min_lat).max(0.0);
+    width * height
+}
+
+fn coarse_scene_change_score(
+    baseline_cloud_cover: Option<f64>,
+    comparison_cloud_cover: Option<f64>,
+) -> f64 {
+    match (baseline_cloud_cover, comparison_cloud_cover) {
+        (Some(baseline), Some(comparison)) => {
+            ((comparison - baseline).abs() / 100.0).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
     }
 }
 

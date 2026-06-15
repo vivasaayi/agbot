@@ -354,6 +354,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/fields/:field_id/scene-refresh-advisories",
             get(routes::list_field_scene_refresh_advisories),
         )
+        .route(
+            "/api/fields/:field_id/scene-change-advisories",
+            get(routes::list_field_scene_change_advisories),
+        )
         .route("/api/scenes", get(routes::list_scenes))
         .route("/api/layers", get(routes::list_layers))
         .route("/api/open-data/layers", get(routes::list_open_data_layers))
