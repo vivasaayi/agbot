@@ -748,6 +748,43 @@ pub enum TractorGuidanceError {
     InvalidMaxTicks,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorSwathCoverageRequest {
+    pub field_boundary: FieldBoundary,
+    #[serde(default)]
+    pub exclusion_boundaries: Vec<FieldBoundary>,
+    pub implement_width_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorSwathSegment {
+    pub start: GeoPoint,
+    pub end: GeoPoint,
+    pub width_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorSwathCoveragePlan {
+    pub crs: String,
+    pub swaths: Vec<TractorSwathSegment>,
+    pub coverage_fraction: f64,
+    pub all_swaths_inside_boundary: bool,
+    pub avoided_exclusions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum TractorSwathPlanningError {
+    #[error(transparent)]
+    InvalidBoundary(#[from] FieldBoundaryValidationError),
+    #[error("tractor swath implement width must be positive")]
+    InvalidImplementWidth,
+    #[error("tractor swath exclusion CRS mismatch: {exclusion_crs} != {field_crs}")]
+    ExclusionCrsMismatch {
+        field_crs: String,
+        exclusion_crs: String,
+    },
+}
+
 impl TractorCommandRejection {
     pub fn status_code(&self) -> u16 {
         match self.reason {
@@ -1180,6 +1217,131 @@ fn tractor_guidance_unit_vector(
         return Err(TractorGuidanceError::InvalidPath);
     }
     Ok((dx / length, dy / length, length))
+}
+
+pub fn plan_tractor_swath_coverage(
+    request: TractorSwathCoverageRequest,
+) -> Result<TractorSwathCoveragePlan, TractorSwathPlanningError> {
+    if !request.implement_width_m.is_finite() || request.implement_width_m <= 0.0 {
+        return Err(TractorSwathPlanningError::InvalidImplementWidth);
+    }
+    let validated = validate_field_boundary(&request.field_boundary)?;
+    let field_crs = validated
+        .boundary
+        .crs
+        .clone()
+        .ok_or(FieldBoundaryValidationError::MissingCrs)?;
+    let field_bounds = validated.extent;
+    let mut exclusion_bounds = Vec::new();
+    for exclusion in &request.exclusion_boundaries {
+        let exclusion_crs = exclusion
+            .crs
+            .clone()
+            .ok_or(FieldBoundaryValidationError::MissingCrs)?;
+        if exclusion_crs != field_crs {
+            return Err(TractorSwathPlanningError::ExclusionCrsMismatch {
+                field_crs,
+                exclusion_crs,
+            });
+        }
+        let validated_exclusion = validate_field_boundary(exclusion)?;
+        exclusion_bounds.push(validated_exclusion.extent);
+    }
+
+    let mut swaths = Vec::new();
+    let mut y = field_bounds.min_lat + request.implement_width_m / 2.0;
+    while y < field_bounds.max_lat {
+        let row_segments = tractor_swath_row_segments(&field_bounds, &exclusion_bounds, y);
+        for (start_lon, end_lon) in row_segments {
+            if end_lon > start_lon {
+                swaths.push(TractorSwathSegment {
+                    start: GeoPoint {
+                        longitude: start_lon,
+                        latitude: y,
+                    },
+                    end: GeoPoint {
+                        longitude: end_lon,
+                        latitude: y,
+                    },
+                    width_m: request.implement_width_m,
+                });
+            }
+        }
+        y += request.implement_width_m;
+    }
+
+    let covered_area = swaths
+        .iter()
+        .map(|swath| {
+            (swath.end.longitude - swath.start.longitude).abs() * request.implement_width_m
+        })
+        .sum::<f64>();
+    let field_area = (field_bounds.max_lon - field_bounds.min_lon).abs()
+        * (field_bounds.max_lat - field_bounds.min_lat).abs();
+    let coverage_fraction = if field_area > 0.0 {
+        (covered_area / field_area).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let all_swaths_inside_boundary = swaths.iter().all(|swath| {
+        tractor_point_inside_bounds(&swath.start, &field_bounds)
+            && tractor_point_inside_bounds(&swath.end, &field_bounds)
+    });
+    let avoided_exclusions = swaths.iter().all(|swath| {
+        exclusion_bounds
+            .iter()
+            .all(|exclusion| !tractor_swath_intersects_bounds(swath, exclusion))
+    });
+
+    Ok(TractorSwathCoveragePlan {
+        crs: field_crs,
+        swaths,
+        coverage_fraction,
+        all_swaths_inside_boundary,
+        avoided_exclusions,
+    })
+}
+
+fn tractor_swath_row_segments(
+    field_bounds: &GeoBounds,
+    exclusion_bounds: &[GeoBounds],
+    y: f64,
+) -> Vec<(f64, f64)> {
+    let mut segments = vec![(field_bounds.min_lon, field_bounds.max_lon)];
+    for exclusion in exclusion_bounds
+        .iter()
+        .filter(|bounds| y >= bounds.min_lat && y <= bounds.max_lat)
+    {
+        let mut next = Vec::new();
+        for (start, end) in segments {
+            if exclusion.max_lon <= start || exclusion.min_lon >= end {
+                next.push((start, end));
+                continue;
+            }
+            if exclusion.min_lon > start {
+                next.push((start, exclusion.min_lon));
+            }
+            if exclusion.max_lon < end {
+                next.push((exclusion.max_lon, end));
+            }
+        }
+        segments = next;
+    }
+    segments
+}
+
+fn tractor_point_inside_bounds(point: &GeoPoint, bounds: &GeoBounds) -> bool {
+    point.longitude >= bounds.min_lon
+        && point.longitude <= bounds.max_lon
+        && point.latitude >= bounds.min_lat
+        && point.latitude <= bounds.max_lat
+}
+
+fn tractor_swath_intersects_bounds(swath: &TractorSwathSegment, bounds: &GeoBounds) -> bool {
+    swath.start.latitude >= bounds.min_lat
+        && swath.start.latitude <= bounds.max_lat
+        && swath.start.longitude < bounds.max_lon
+        && swath.end.longitude > bounds.min_lon
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5844,7 +6006,7 @@ mod tests {
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         compute_drought_index, create_versioned_content, dry_run_fleet_config_bundle,
         evaluate_access_anomaly_advisories, normalize_weather_provider_forecast,
-        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        plan_tractor_swath_coverage, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
@@ -5875,9 +6037,10 @@ mod tests {
         TractorGuidanceConfig, TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath,
         TractorGuidancePoint, TractorImplementRef, TractorLifecycleStatus,
         TractorMotionCommandRequest, TractorRegistrationRequest, TractorRegistry,
-        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
-        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
-        WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry, WorkOrderStatus,
+        TractorSwathCoverageRequest, WeatherIngestError, WeatherProviderForecastPoint,
+        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
+        WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry,
+        WorkOrderStatus,
     };
 
     #[test]
@@ -6537,6 +6700,45 @@ mod tests {
                 runtime_mode: "production".to_string()
             }
         );
+    }
+
+    #[test]
+    fn tractor_swath_planner_generates_inside_boundary_coverage() {
+        let plan = plan_tractor_swath_coverage(TractorSwathCoverageRequest {
+            field_boundary: tractor_swath_rectangle(0.0, 0.0, 10.0, 10.0, "EPSG:3857"),
+            exclusion_boundaries: Vec::new(),
+            implement_width_m: 2.0,
+        })
+        .expect("rectangular field should plan");
+
+        assert_eq!(plan.crs, "EPSG:3857");
+        assert_eq!(plan.swaths.len(), 5);
+        assert!(plan.all_swaths_inside_boundary);
+        assert!(plan.avoided_exclusions);
+        assert_eq!(plan.coverage_fraction, 1.0);
+        assert!(plan
+            .swaths
+            .iter()
+            .all(|swath| swath.start.longitude == 0.0 && swath.end.longitude == 10.0));
+    }
+
+    #[test]
+    fn tractor_swath_planner_clips_paths_around_exclusion() {
+        let plan = plan_tractor_swath_coverage(TractorSwathCoverageRequest {
+            field_boundary: tractor_swath_rectangle(0.0, 0.0, 10.0, 10.0, "EPSG:3857"),
+            exclusion_boundaries: vec![tractor_swath_rectangle(4.0, 0.0, 6.0, 10.0, "EPSG:3857")],
+            implement_width_m: 2.0,
+        })
+        .expect("field with exclusion should plan");
+
+        assert!(plan.all_swaths_inside_boundary);
+        assert!(plan.avoided_exclusions);
+        assert!(plan.coverage_fraction < 1.0);
+        assert_eq!(plan.swaths.len(), 10);
+        assert!(plan
+            .swaths
+            .iter()
+            .all(|swath| swath.end.longitude <= 4.0 || swath.start.longitude >= 6.0));
     }
 
     #[test]
@@ -7267,6 +7469,40 @@ mod tests {
             correction_gain,
             advance_m_per_tick: 2.0,
             max_ticks: 10,
+        }
+    }
+
+    fn tractor_swath_rectangle(
+        min_lon: f64,
+        min_lat: f64,
+        max_lon: f64,
+        max_lat: f64,
+        crs: &str,
+    ) -> FieldBoundary {
+        FieldBoundary {
+            coordinates: vec![
+                GeoPoint {
+                    longitude: min_lon,
+                    latitude: min_lat,
+                },
+                GeoPoint {
+                    longitude: max_lon,
+                    latitude: min_lat,
+                },
+                GeoPoint {
+                    longitude: max_lon,
+                    latitude: max_lat,
+                },
+                GeoPoint {
+                    longitude: min_lon,
+                    latitude: max_lat,
+                },
+                GeoPoint {
+                    longitude: min_lon,
+                    latitude: min_lat,
+                },
+            ],
+            crs: Some(crs.to_string()),
         }
     }
 
