@@ -411,6 +411,34 @@ pub struct AlertLifecycleAction {
     pub idempotent: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertEscalationPolicy {
+    pub policy_id: String,
+    pub ack_window_seconds: u64,
+    pub escalation_chain: Vec<AlertRecipient>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertEscalationAuditRecord {
+    pub alert_id: String,
+    pub policy_id: String,
+    pub from_recipient_id: String,
+    pub to_recipient_id: String,
+    pub escalated_at: String,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertEscalationOutcome {
+    pub escalated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_recipient: Option<AlertRecipient>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AlertEscalationAuditRecord>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
@@ -637,6 +665,12 @@ pub enum AlertingError {
         previous_at: String,
         attempted_at: String,
     },
+    #[error("escalation policy_id cannot be empty")]
+    EmptyEscalationPolicyId,
+    #[error("escalation policy requires ack_window_seconds > 0 and a non-empty chain")]
+    InvalidEscalationPolicy,
+    #[error("invalid escalation timestamp {0}")]
+    InvalidEscalationTimestamp(String),
     #[error("severity evidence must be finite with warning <= critical <= emergency thresholds")]
     InvalidSeverityEvidence,
     #[error("dedup window requires non-empty window_start <= window_end")]
@@ -1387,6 +1421,56 @@ pub fn auto_resolve_alert(
     }
 }
 
+pub fn evaluate_no_ack_escalation(
+    alert: &FiredAlertRecord,
+    lifecycle: &AlertLifecycleRecord,
+    policy: AlertEscalationPolicy,
+    current_recipient_id: String,
+    evaluated_at: String,
+) -> Result<AlertEscalationOutcome, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    validate_lifecycle_record(lifecycle)?;
+    let policy = normalize_escalation_policy(policy)?;
+    let current_recipient_id =
+        normalize_required_text(current_recipient_id, AlertingError::EmptyRecipientId)?;
+    let evaluated_at =
+        normalize_required_text(evaluated_at, AlertingError::EmptyLifecycleTimestamp)?;
+
+    if lifecycle.alert_id != alert.alert_id
+        || !matches!(lifecycle.state, AlertLifecycleState::Fired)
+    {
+        return Ok(no_escalation());
+    }
+
+    let fired_at_seconds = escalation_timestamp_seconds(&lifecycle.fired_at)?;
+    let evaluated_at_seconds = escalation_timestamp_seconds(&evaluated_at)?;
+    if evaluated_at_seconds.saturating_sub(fired_at_seconds) <= policy.ack_window_seconds as i64 {
+        return Ok(no_escalation());
+    }
+
+    let next_recipient = next_escalation_recipient(&policy.escalation_chain, &current_recipient_id);
+    let Some(next_recipient) = next_recipient else {
+        return Ok(no_escalation());
+    };
+
+    Ok(AlertEscalationOutcome {
+        escalated: true,
+        next_recipient: Some(next_recipient.clone()),
+        audit: Some(AlertEscalationAuditRecord {
+            alert_id: alert.alert_id.clone(),
+            policy_id: policy.policy_id.clone(),
+            from_recipient_id: current_recipient_id,
+            to_recipient_id: next_recipient.recipient_id.clone(),
+            escalated_at: evaluated_at,
+            reason: format!(
+                "alert {} remained unacknowledged for more than {} seconds",
+                alert.alert_id, policy.ack_window_seconds
+            ),
+            evidence_refs: alert.evidence_refs.clone(),
+        }),
+    })
+}
+
 pub fn deliver_alert<A: ChannelAdapter + ?Sized>(
     adapter: &mut A,
     alert: &FiredAlertRecord,
@@ -1749,6 +1833,27 @@ fn normalize_retry_policy(
     Ok(policy)
 }
 
+fn normalize_escalation_policy(
+    policy: AlertEscalationPolicy,
+) -> Result<AlertEscalationPolicy, AlertingError> {
+    let policy_id =
+        normalize_required_text(policy.policy_id, AlertingError::EmptyEscalationPolicyId)?;
+    if policy.ack_window_seconds == 0 || policy.escalation_chain.is_empty() {
+        return Err(AlertingError::InvalidEscalationPolicy);
+    }
+    let escalation_chain = policy
+        .escalation_chain
+        .into_iter()
+        .map(normalize_alert_recipient)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(AlertEscalationPolicy {
+        policy_id,
+        ack_window_seconds: policy.ack_window_seconds,
+        escalation_chain,
+    })
+}
+
 fn severity_from_evidence_or_rule(
     rule_severity: AlertSeverityHint,
     evidence: &AlertSeverityEvidence,
@@ -2004,6 +2109,85 @@ fn delivery_id(
     )
 }
 
+fn no_escalation() -> AlertEscalationOutcome {
+    AlertEscalationOutcome {
+        escalated: false,
+        next_recipient: None,
+        audit: None,
+    }
+}
+
+fn next_escalation_recipient(
+    chain: &[AlertRecipient],
+    current_recipient_id: &str,
+) -> Option<AlertRecipient> {
+    let current_index = chain
+        .iter()
+        .position(|recipient| recipient.recipient_id == current_recipient_id);
+    match current_index {
+        Some(index) => chain.get(index + 1).cloned(),
+        None => chain.first().cloned(),
+    }
+}
+
+fn escalation_timestamp_seconds(timestamp: &str) -> Result<i64, AlertingError> {
+    let invalid = || AlertingError::InvalidEscalationTimestamp(timestamp.to_string());
+    let date = timestamp.get(0..10).ok_or_else(invalid)?;
+    let time = timestamp.get(11..19).ok_or_else(invalid)?;
+    if timestamp.as_bytes().get(10) != Some(&b'T') {
+        return Err(invalid());
+    }
+    let year = date[0..4].parse::<i32>().map_err(|_| invalid())?;
+    let month = date[5..7].parse::<u32>().map_err(|_| invalid())?;
+    let day = date[8..10].parse::<u32>().map_err(|_| invalid())?;
+    let hour = time[0..2].parse::<u32>().map_err(|_| invalid())?;
+    let minute = time[3..5].parse::<u32>().map_err(|_| invalid())?;
+    let second = time[6..8].parse::<u32>().map_err(|_| invalid())?;
+    if date.as_bytes().get(4) != Some(&b'-')
+        || date.as_bytes().get(7) != Some(&b'-')
+        || time.as_bytes().get(2) != Some(&b':')
+        || time.as_bytes().get(5) != Some(&b':')
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > escalation_days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(invalid());
+    }
+
+    Ok(escalation_days_from_civil(year, month, day) * 86_400
+        + i64::from(hour) * 3_600
+        + i64::from(minute) * 60
+        + i64::from(second))
+}
+
+fn escalation_days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if escalation_is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn escalation_is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn escalation_days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    i64::from(era * 146_097 + day_of_era - 719_468)
+}
+
 fn adapter_index_for_channel(
     adapters: &[&mut dyn ChannelAdapter],
     channel: AlertChannel,
@@ -2126,9 +2310,10 @@ mod tests {
         build_alert_rule_record, build_alert_rule_subscription, classify_alert_severity,
         compute_alert_dedup_key, deduplicate_alert_stream, deliver_alert,
         deliver_alert_multi_channel, evaluate_alert_rules, evaluate_managed_alert_rules,
-        filter_alert_history, open_alert_lifecycle, render_alert_message_template, resolve_alert,
-        route_alert_to_recipients, run_tracked_delivery, transition_alert_rule_status,
-        version_alert_rule_record, AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone,
+        evaluate_no_ack_escalation, filter_alert_history, open_alert_lifecycle,
+        render_alert_message_template, resolve_alert, route_alert_to_recipients,
+        run_tracked_delivery, transition_alert_rule_status, version_alert_rule_record,
+        AlertChannel, AlertDedupWindow, AlertEscalationPolicy, AlertEvent, AlertEventBackbone,
         AlertHistoryQuery, AlertLifecycleRecord, AlertLifecycleState, AlertMessageTemplate,
         AlertRecipient, AlertRoutingRule, AlertRule, AlertRuleCreateRequest, AlertRuleStatus,
         AlertRuleStatusUpdateRequest, AlertRuleSubscriptionCreateRequest,
@@ -3250,6 +3435,72 @@ mod tests {
     }
 
     #[test]
+    fn no_ack_escalation_routes_to_next_recipient_and_audits() {
+        let alert = fired_alert(
+            "alert-escalate",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let lifecycle = open_alert_lifecycle(&alert).expect("fired alert should open lifecycle");
+
+        let outcome = evaluate_no_ack_escalation(
+            &alert,
+            &lifecycle,
+            escalation_policy(),
+            "ops-001".to_string(),
+            "2026-06-12T10:06:00Z".to_string(),
+        )
+        .expect("past-window unacknowledged alert should evaluate");
+
+        assert!(outcome.escalated);
+        assert_eq!(
+            outcome.next_recipient,
+            Some(role_recipient("ops-lead", "operator"))
+        );
+        let audit = outcome.audit.expect("escalation should be audited");
+        assert_eq!(audit.alert_id, "alert-escalate");
+        assert_eq!(audit.policy_id, "policy-critical-no-ack");
+        assert_eq!(audit.from_recipient_id, "ops-001");
+        assert_eq!(audit.to_recipient_id, "ops-lead");
+        assert_eq!(audit.escalated_at, "2026-06-12T10:06:00Z");
+        assert_eq!(audit.evidence_refs, alert.evidence_refs);
+    }
+
+    #[test]
+    fn acknowledgement_within_window_stops_escalation_chain() {
+        let alert = fired_alert(
+            "alert-ack-stops-escalation",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut lifecycle =
+            open_alert_lifecycle(&alert).expect("fired alert should open lifecycle");
+        acknowledge_alert(
+            &mut lifecycle,
+            "ops-001".to_string(),
+            "2026-06-12T10:03:00Z".to_string(),
+        )
+        .expect("ack within window should succeed");
+
+        let outcome = evaluate_no_ack_escalation(
+            &alert,
+            &lifecycle,
+            escalation_policy(),
+            "ops-001".to_string(),
+            "2026-06-12T10:06:00Z".to_string(),
+        )
+        .expect("acknowledged alert should evaluate without escalation");
+
+        assert!(!outcome.escalated);
+        assert_eq!(outcome.next_recipient, None);
+        assert_eq!(outcome.audit, None);
+    }
+
+    #[test]
     fn lifecycle_rejects_transition_before_fired_or_previous_transition_time() {
         let alert = fired_alert(
             "alert-non-monotonic",
@@ -3419,6 +3670,17 @@ mod tests {
             max_attempts: 3,
             base_backoff_seconds: 5,
             max_backoff_seconds: 20,
+        }
+    }
+
+    fn escalation_policy() -> AlertEscalationPolicy {
+        AlertEscalationPolicy {
+            policy_id: "policy-critical-no-ack".to_string(),
+            ack_window_seconds: 300,
+            escalation_chain: vec![
+                role_recipient("ops-001", "operator"),
+                role_recipient("ops-lead", "operator"),
+            ],
         }
     }
 }
