@@ -568,6 +568,55 @@ pub struct ZoneSoilMoistureProduct {
     pub generated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ZoneSoilProductRequest {
+    #[serde(default)]
+    pub product_id: Option<String>,
+    #[serde(default)]
+    pub field_id: String,
+    #[serde(default)]
+    pub zone_id: String,
+    pub metric: GatewayReadingMetric,
+    #[serde(default)]
+    pub readings: Vec<ValidatedSoilReading>,
+    pub max_freshness_age_seconds: u64,
+    #[serde(default)]
+    pub generated_at: String,
+    #[serde(default)]
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoneSoilProductFreshness {
+    Fresh,
+    Stale,
+    InsufficientEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoneSoilProductSummary {
+    pub product_id: String,
+    pub field_id: String,
+    pub zone_id: String,
+    pub metric: GatewayReadingMetric,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_value: Option<f64>,
+    pub sample_count: usize,
+    pub freshness: ZoneSoilProductFreshness,
+    pub freshness_age_seconds: u64,
+    pub method_version: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub excluded_payload_ids: Vec<String>,
+    pub generated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IrrigationTriggerConfig {
     pub low_moisture_threshold: f64,
@@ -762,6 +811,19 @@ pub enum SoilIotError {
     EmptyZoneId,
     #[error("zone soil product generated_at cannot be empty")]
     EmptyZoneSoilGeneratedAt,
+    #[error("zone soil product method_version cannot be empty")]
+    EmptyZoneSoilProductMethodVersion,
+    #[error("zone soil product readings cannot be empty")]
+    EmptyZoneSoilProductReadings,
+    #[error("zone soil product freshness window must be greater than zero")]
+    InvalidZoneSoilProductFreshnessWindow,
+    #[error("unsupported zone soil product metric {metric:?}")]
+    UnsupportedZoneSoilProductMetric { metric: GatewayReadingMetric },
+    #[error("zone soil product readings must belong to field {expected_field_id} and zone {expected_zone_id}")]
+    MixedZoneSoilProductScope {
+        expected_field_id: String,
+        expected_zone_id: String,
+    },
     #[error("irrigation trigger method_version cannot be empty")]
     EmptyIrrigationTriggerMethodVersion,
     #[error("irrigation trigger evidence_refs cannot contain empty values")]
@@ -1359,6 +1421,146 @@ pub fn emit_sensor_health_alert_events(
         .collect()
 }
 
+pub fn build_zone_soil_product_summary(
+    request: ZoneSoilProductRequest,
+    generated_product_id: String,
+) -> Result<ZoneSoilProductSummary, SoilIotError> {
+    let product_id = match request.product_id {
+        Some(product_id) => {
+            normalize_required_text(product_id, SoilIotError::EmptyZoneSoilProductId)?
+        }
+        None => {
+            normalize_required_text(generated_product_id, SoilIotError::EmptyZoneSoilProductId)?
+        }
+    };
+    let field_id = normalize_required_text(request.field_id, SoilIotError::EmptyFieldId)?;
+    let zone_id = normalize_required_text(request.zone_id, SoilIotError::EmptyZoneId)?;
+    let generated_at =
+        normalize_required_text(request.generated_at, SoilIotError::EmptyZoneSoilGeneratedAt)?;
+    let method_version = normalize_required_text(
+        request.method_version,
+        SoilIotError::EmptyZoneSoilProductMethodVersion,
+    )?;
+    if request.max_freshness_age_seconds == 0 {
+        return Err(SoilIotError::InvalidZoneSoilProductFreshnessWindow);
+    }
+    if request.readings.is_empty() {
+        return Err(SoilIotError::EmptyZoneSoilProductReadings);
+    }
+    if !matches!(
+        request.metric,
+        GatewayReadingMetric::ElectricalConductivity
+            | GatewayReadingMetric::SoilMoisturePercent
+            | GatewayReadingMetric::SoilTemperatureCelsius
+    ) {
+        return Err(SoilIotError::UnsupportedZoneSoilProductMetric {
+            metric: request.metric,
+        });
+    }
+
+    let generated_at_dt = parse_freshness_ts(&generated_at)?;
+    let mut values = Vec::new();
+    let mut evidence_refs = BTreeSet::new();
+    let mut excluded_payload_ids = BTreeSet::new();
+    let mut included_max_age = 0;
+    let mut stale_min_age: Option<u64> = None;
+    let mut saw_in_scope_candidate = false;
+
+    for reading in &request.readings {
+        if reading.field_id != field_id || reading.zone_id.as_deref() != Some(zone_id.as_str()) {
+            return Err(SoilIotError::MixedZoneSoilProductScope {
+                expected_field_id: field_id,
+                expected_zone_id: zone_id,
+            });
+        }
+        if reading.metric != request.metric {
+            excluded_payload_ids.insert(reading.payload_id.clone());
+            continue;
+        }
+        saw_in_scope_candidate = true;
+
+        let reading_ts = parse_freshness_ts(&reading.ts)?;
+        let age_seconds = generated_at_dt
+            .signed_duration_since(reading_ts)
+            .num_seconds()
+            .max(0) as u64;
+        if reading.excluded_from_products || !reading.qa_flags.is_empty() {
+            excluded_payload_ids.insert(reading.payload_id.clone());
+            continue;
+        }
+        if age_seconds > request.max_freshness_age_seconds {
+            stale_min_age = Some(stale_min_age.map_or(age_seconds, |age| age.min(age_seconds)));
+            excluded_payload_ids.insert(reading.payload_id.clone());
+            continue;
+        }
+        if !reading.calibrated_value.is_finite() {
+            excluded_payload_ids.insert(reading.payload_id.clone());
+            continue;
+        }
+
+        values.push(reading.calibrated_value);
+        evidence_refs.insert(format!("soil-iot:{}", reading.payload_id));
+        included_max_age = included_max_age.max(age_seconds);
+    }
+
+    let (mean_value, min_value, max_value, freshness, freshness_age_seconds) = if values.is_empty()
+    {
+        let freshness = if stale_min_age.is_some() {
+            ZoneSoilProductFreshness::Stale
+        } else {
+            ZoneSoilProductFreshness::InsufficientEvidence
+        };
+        (None, None, None, freshness, stale_min_age.unwrap_or(0))
+    } else {
+        let sum = values.iter().sum::<f64>();
+        let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (
+            Some(sum / values.len() as f64),
+            Some(min),
+            Some(max),
+            ZoneSoilProductFreshness::Fresh,
+            included_max_age,
+        )
+    };
+
+    if !saw_in_scope_candidate {
+        return Ok(ZoneSoilProductSummary {
+            product_id,
+            field_id,
+            zone_id,
+            metric: request.metric,
+            mean_value: None,
+            min_value: None,
+            max_value: None,
+            sample_count: 0,
+            freshness: ZoneSoilProductFreshness::InsufficientEvidence,
+            freshness_age_seconds: 0,
+            method_version,
+            evidence_refs: Vec::new(),
+            excluded_payload_ids: excluded_payload_ids.into_iter().collect(),
+            generated_at,
+        });
+    }
+
+    Ok(ZoneSoilProductSummary {
+        product_id,
+        field_id,
+        zone_id,
+        metric: request.metric,
+        mean_value,
+        min_value,
+        max_value,
+        sample_count: values.len(),
+        freshness,
+        freshness_age_seconds,
+        method_version,
+        evidence_refs: evidence_refs.into_iter().collect(),
+        excluded_payload_ids: excluded_payload_ids.into_iter().collect(),
+        generated_at,
+    })
+}
+
 pub fn evaluate_irrigation_trigger(
     product: ZoneSoilMoistureProduct,
     config: IrrigationTriggerConfig,
@@ -1844,10 +2046,10 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::{
         build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
-        decode_gateway_payload, detect_stuck_sensor_window, emit_sensor_health_alert_events,
-        evaluate_irrigation_trigger, evaluate_sensor_health_snapshot,
-        evaluate_soil_capture_freshness_coverage, ingest_gateway_readings,
-        reading_rejection_for_device, transition_soil_config_push_status,
+        build_zone_soil_product_summary, decode_gateway_payload, detect_stuck_sensor_window,
+        emit_sensor_health_alert_events, evaluate_irrigation_trigger,
+        evaluate_sensor_health_snapshot, evaluate_soil_capture_freshness_coverage,
+        ingest_gateway_readings, reading_rejection_for_device, transition_soil_config_push_status,
         transition_soil_device_status, validate_and_calibrate_reading, CalibrationProfile,
         GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
         GatewayReadingRecord, GeoPosition, IrrigationTriggerConfig,
@@ -1858,7 +2060,7 @@ mod tests {
         SoilCaptureFreshnessConfig, SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus,
         SoilDeviceConfigPushStatusUpdate, SoilDeviceFreshnessState, SoilDeviceStatus, SoilIotError,
         SoilSensorType, StuckSensorRail, StuckSensorWindowConfig, ValidatedSoilReading,
-        ZoneSoilMoistureProduct,
+        ZoneSoilMoistureProduct, ZoneSoilProductFreshness, ZoneSoilProductRequest,
     };
     use alerting::{AlertEventBackbone, AlertSeverityHint};
     use timeseries::SeriesValue;
@@ -2527,6 +2729,151 @@ mod tests {
     }
 
     #[test]
+    fn zone_soil_product_summary_averages_fresh_moisture_readings() {
+        let mut first = validated_reading(
+            "payload-moisture-001",
+            "soil-probe-001",
+            "zone-ne",
+            "2026-06-12T11:58:30Z",
+        );
+        first.calibrated_value = 21.0;
+        let mut second = validated_reading(
+            "payload-moisture-002",
+            "soil-probe-002",
+            "zone-ne",
+            "2026-06-12T11:59:00Z",
+        );
+        second.calibrated_value = 29.0;
+
+        let summary = build_zone_soil_product_summary(
+            zone_product_request(
+                GatewayReadingMetric::SoilMoisturePercent,
+                vec![first, second],
+            ),
+            "generated-product".to_string(),
+        )
+        .expect("fresh moisture readings should summarize");
+
+        assert_eq!(summary.product_id, "generated-product");
+        assert_eq!(summary.field_id, "field-001");
+        assert_eq!(summary.zone_id, "zone-ne");
+        assert_eq!(summary.metric, GatewayReadingMetric::SoilMoisturePercent);
+        assert_eq!(summary.freshness, ZoneSoilProductFreshness::Fresh);
+        assert_eq!(summary.sample_count, 2);
+        assert_eq!(summary.mean_value, Some(25.0));
+        assert_eq!(summary.min_value, Some(21.0));
+        assert_eq!(summary.max_value, Some(29.0));
+        assert_eq!(summary.freshness_age_seconds, 90);
+        assert_eq!(
+            summary.evidence_refs,
+            vec![
+                "soil-iot:payload-moisture-001".to_string(),
+                "soil-iot:payload-moisture-002".to_string()
+            ]
+        );
+        assert!(summary.excluded_payload_ids.is_empty());
+    }
+
+    #[test]
+    fn zone_soil_product_summary_excludes_qa_flagged_ec_readings() {
+        let mut valid = validated_reading(
+            "payload-ec-001",
+            "soil-probe-001",
+            "zone-ne",
+            "2026-06-12T11:59:45Z",
+        );
+        valid.metric = GatewayReadingMetric::ElectricalConductivity;
+        valid.raw_value = 1.2;
+        valid.calibrated_value = 1.2;
+        let mut flagged = validated_reading(
+            "payload-ec-qa",
+            "soil-probe-002",
+            "zone-ne",
+            "2026-06-12T11:59:50Z",
+        );
+        flagged.metric = GatewayReadingMetric::ElectricalConductivity;
+        flagged.raw_value = 9.8;
+        flagged.calibrated_value = 9.8;
+        flagged.excluded_from_products = true;
+        flagged.qa_flags.push(ReadingQaFlag {
+            reason_code: ReadingQaReason::OutOfRange,
+            profile_ref: "calibration:ec:v1".to_string(),
+            method_version: "soil-calibration-v1".to_string(),
+            raw_value: 9.8,
+            calibrated_value: 9.8,
+            valid_min: 0.0,
+            valid_max: 5.0,
+        });
+
+        let summary = build_zone_soil_product_summary(
+            zone_product_request(
+                GatewayReadingMetric::ElectricalConductivity,
+                vec![valid, flagged],
+            ),
+            "zone-ec-product-001".to_string(),
+        )
+        .expect("fresh clean EC readings should summarize");
+
+        assert_eq!(summary.freshness, ZoneSoilProductFreshness::Fresh);
+        assert_eq!(summary.sample_count, 1);
+        assert_eq!(summary.mean_value, Some(1.2));
+        assert_eq!(summary.evidence_refs, vec!["soil-iot:payload-ec-001"]);
+        assert_eq!(summary.excluded_payload_ids, vec!["payload-ec-qa"]);
+    }
+
+    #[test]
+    fn zone_soil_product_summary_marks_stale_temperature_without_value() {
+        let mut stale = validated_reading(
+            "payload-temp-stale",
+            "soil-probe-001",
+            "zone-ne",
+            "2026-06-12T11:45:00Z",
+        );
+        stale.metric = GatewayReadingMetric::SoilTemperatureCelsius;
+        stale.raw_value = 18.4;
+        stale.calibrated_value = 18.4;
+
+        let summary = build_zone_soil_product_summary(
+            zone_product_request(GatewayReadingMetric::SoilTemperatureCelsius, vec![stale]),
+            "zone-temp-product-001".to_string(),
+        )
+        .expect("stale temperature readings should produce a stale product");
+
+        assert_eq!(summary.freshness, ZoneSoilProductFreshness::Stale);
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.mean_value, None);
+        assert_eq!(summary.min_value, None);
+        assert_eq!(summary.max_value, None);
+        assert_eq!(summary.freshness_age_seconds, 900);
+        assert!(summary.evidence_refs.is_empty());
+        assert_eq!(summary.excluded_payload_ids, vec!["payload-temp-stale"]);
+    }
+
+    #[test]
+    fn zone_soil_product_summary_rejects_battery_products() {
+        let mut reading = validated_reading(
+            "payload-battery-001",
+            "soil-probe-001",
+            "zone-ne",
+            "2026-06-12T11:59:00Z",
+        );
+        reading.metric = GatewayReadingMetric::BatteryVoltage;
+
+        let error = build_zone_soil_product_summary(
+            zone_product_request(GatewayReadingMetric::BatteryVoltage, vec![reading]),
+            "zone-battery-product-001".to_string(),
+        )
+        .expect_err("battery voltage is not a zone soil agronomic product");
+
+        assert_eq!(
+            error,
+            SoilIotError::UnsupportedZoneSoilProductMetric {
+                metric: GatewayReadingMetric::BatteryVoltage
+            }
+        );
+    }
+
+    #[test]
     fn irrigation_trigger_emits_domain16_payload_for_fresh_low_moisture() {
         let evaluation = evaluate_irrigation_trigger(
             zone_moisture_product(21.4, 120, vec![], vec!["soil-iot:reading-001"]),
@@ -2748,6 +3095,22 @@ mod tests {
             qa_flags,
             evidence_refs: evidence_refs.into_iter().map(ToOwned::to_owned).collect(),
             generated_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn zone_product_request(
+        metric: GatewayReadingMetric,
+        readings: Vec<ValidatedSoilReading>,
+    ) -> ZoneSoilProductRequest {
+        ZoneSoilProductRequest {
+            product_id: None,
+            field_id: "field-001".to_string(),
+            zone_id: "zone-ne".to_string(),
+            metric,
+            readings,
+            max_freshness_age_seconds: 300,
+            generated_at: "2026-06-12T12:00:00Z".to_string(),
+            method_version: "soil-zone-product-v1".to_string(),
         }
     }
 
