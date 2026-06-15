@@ -805,6 +805,7 @@ pub struct TractorFieldOpsCoverageTally {
 #[serde(rename_all = "snake_case")]
 pub enum TractorFieldOpsSafetyEventType {
     TelemetryDropout,
+    ManualEstop,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -859,6 +860,35 @@ pub enum TractorFieldOpsSessionError {
     InvalidTelemetryGapThreshold,
     #[error("tractor field-ops timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorFieldOpsReplayFrameType {
+    Telemetry,
+    SafetyEvent,
+    TelemetryGap,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorFieldOpsReplayFrame {
+    pub at: String,
+    pub frame_type: TractorFieldOpsReplayFrameType,
+    #[serde(default)]
+    pub telemetry: Option<TractorFieldOpsTelemetrySample>,
+    #[serde(default)]
+    pub safety_event: Option<TractorFieldOpsSafetyEvent>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorFieldOpsReplay {
+    pub session_id: String,
+    pub tractor_id: String,
+    pub field_id: String,
+    pub read_only: bool,
+    pub frames: Vec<TractorFieldOpsReplayFrame>,
+    pub gap_count: usize,
 }
 
 impl TractorCommandRejection {
@@ -1520,6 +1550,67 @@ fn parse_tractor_field_ops_timestamp(
         .map_err(|_| TractorFieldOpsSessionError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
+}
+
+pub fn build_tractor_field_ops_replay(
+    session: &TractorFieldOpsSessionLog,
+) -> Result<TractorFieldOpsReplay, TractorFieldOpsSessionError> {
+    let mut frames = Vec::new();
+    for sample in &session.telemetry {
+        parse_tractor_field_ops_timestamp(&sample.timestamp)?;
+        frames.push(TractorFieldOpsReplayFrame {
+            at: sample.timestamp.clone(),
+            frame_type: TractorFieldOpsReplayFrameType::Telemetry,
+            telemetry: Some(sample.clone()),
+            safety_event: None,
+            note: "telemetry_sample".to_string(),
+        });
+    }
+    for event in &session.safety_events {
+        parse_tractor_field_ops_timestamp(&event.at)?;
+        frames.push(TractorFieldOpsReplayFrame {
+            at: event.at.clone(),
+            frame_type: TractorFieldOpsReplayFrameType::SafetyEvent,
+            telemetry: None,
+            safety_event: Some(event.clone()),
+            note: event.reason_code.clone(),
+        });
+        if event.event_type == TractorFieldOpsSafetyEventType::TelemetryDropout {
+            frames.push(TractorFieldOpsReplayFrame {
+                at: event.at.clone(),
+                frame_type: TractorFieldOpsReplayFrameType::TelemetryGap,
+                telemetry: None,
+                safety_event: Some(event.clone()),
+                note: "explicit_gap_no_interpolation".to_string(),
+            });
+        }
+    }
+    frames.sort_by(|left, right| {
+        left.at
+            .cmp(&right.at)
+            .then(replay_frame_order(left.frame_type).cmp(&replay_frame_order(right.frame_type)))
+            .then(left.note.cmp(&right.note))
+    });
+
+    Ok(TractorFieldOpsReplay {
+        session_id: session.session_id.clone(),
+        tractor_id: session.tractor_id.clone(),
+        field_id: session.field_id.clone(),
+        read_only: true,
+        gap_count: frames
+            .iter()
+            .filter(|frame| frame.frame_type == TractorFieldOpsReplayFrameType::TelemetryGap)
+            .count(),
+        frames,
+    })
+}
+
+fn replay_frame_order(frame_type: TractorFieldOpsReplayFrameType) -> u8 {
+    match frame_type {
+        TractorFieldOpsReplayFrameType::Telemetry => 0,
+        TractorFieldOpsReplayFrameType::SafetyEvent => 1,
+        TractorFieldOpsReplayFrameType::TelemetryGap => 2,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6182,8 +6273,8 @@ mod tests {
         bind_fleet_node_identity, bounds_from_points, build_collaboration_channel,
         build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
-        build_tractor_field_ops_session_log, compute_drought_index, create_versioned_content,
-        dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
+        build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
+        create_versioned_content, dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
         normalize_weather_provider_forecast, plan_tractor_swath_coverage,
         run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
@@ -6213,14 +6304,14 @@ mod tests {
         SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
         SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
-        TractorFieldOpsTelemetrySample, TractorGuidanceConfig, TractorGuidanceError,
-        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint, TractorImplementRef,
-        TractorLifecycleStatus, TractorMotionCommandRequest, TractorRegistrationRequest,
-        TractorRegistry, TractorSwathCoverageRequest, WeatherIngestError,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
-        WorkOrderRegistry, WorkOrderStatus,
+        TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
+        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGuidanceConfig,
+        TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
+        TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
+        TractorRegistrationRequest, TractorRegistry, TractorSwathCoverageRequest,
+        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
+        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
+        WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -6978,6 +7069,76 @@ mod tests {
         assert_eq!(session.safety_events[0].reason_code, "telemetry_dropout");
         assert!(session.safety_events[0].details.contains("10s"));
         assert_eq!(session.coverage.distance_m, 2.0);
+    }
+
+    #[test]
+    fn tractor_replay_is_deterministic_and_read_only() {
+        let session = build_tractor_field_ops_session_log(tractor_field_ops_session_request())
+            .expect("session log should build");
+
+        let first = build_tractor_field_ops_replay(&session).expect("replay should build");
+        let second = build_tractor_field_ops_replay(&session).expect("replay should build again");
+
+        assert_eq!(first, second);
+        assert!(first.read_only);
+        assert_eq!(first.session_id, "session-001");
+        assert_eq!(first.frames.len(), 3);
+        assert!(first
+            .frames
+            .iter()
+            .all(|frame| frame.frame_type == TractorFieldOpsReplayFrameType::Telemetry));
+        assert_eq!(first.frames[0].at, "2026-06-15T10:00:00Z");
+        assert_eq!(first.frames[2].at, "2026-06-15T10:00:02Z");
+    }
+
+    #[test]
+    fn tractor_replay_renders_safety_events_on_timeline() {
+        let mut session = build_tractor_field_ops_session_log(tractor_field_ops_session_request())
+            .expect("session log should build");
+        session.safety_events.push(TractorFieldOpsSafetyEvent {
+            event_type: TractorFieldOpsSafetyEventType::ManualEstop,
+            at: "2026-06-15T10:00:01Z".to_string(),
+            reason_code: "operator_estop".to_string(),
+            details: "operator stopped tractor".to_string(),
+        });
+
+        let replay = build_tractor_field_ops_replay(&session).expect("replay should build");
+
+        assert!(replay.frames.iter().any(|frame| {
+            frame.frame_type == TractorFieldOpsReplayFrameType::SafetyEvent
+                && frame.note == "operator_estop"
+                && frame.at == "2026-06-15T10:00:01Z"
+        }));
+    }
+
+    #[test]
+    fn tractor_replay_shows_gap_without_fabricated_path() {
+        let session = build_tractor_field_ops_session_log(TractorFieldOpsSessionRequest {
+            session_id: "session-gap".to_string(),
+            tractor_id: "tractor-001".to_string(),
+            field_id: "field-north".to_string(),
+            started_at: "2026-06-15T10:00:00Z".to_string(),
+            telemetry: vec![
+                tractor_field_ops_sample("2026-06-15T10:00:00Z", 0.0, 0.0, 2.0, true),
+                tractor_field_ops_sample("2026-06-15T10:00:10Z", 2.0, 0.0, 2.0, true),
+            ],
+            implement_width_m: 2.0,
+            planned_area_m2: 10.0,
+            max_telemetry_gap_seconds: 3,
+        })
+        .expect("field ops session with gap should persist");
+
+        let replay = build_tractor_field_ops_replay(&session).expect("replay should build");
+
+        assert_eq!(replay.gap_count, 1);
+        let gap = replay
+            .frames
+            .iter()
+            .find(|frame| frame.frame_type == TractorFieldOpsReplayFrameType::TelemetryGap)
+            .expect("gap frame is explicit");
+        assert_eq!(gap.at, "2026-06-15T10:00:10Z");
+        assert_eq!(gap.telemetry, None);
+        assert_eq!(gap.note, "explicit_gap_no_interpolation");
     }
 
     #[test]
@@ -7758,6 +7919,23 @@ mod tests {
             speed_mps,
             implement_enabled,
             implement_rate: Some(1.0),
+        }
+    }
+
+    fn tractor_field_ops_session_request() -> TractorFieldOpsSessionRequest {
+        TractorFieldOpsSessionRequest {
+            session_id: "session-001".to_string(),
+            tractor_id: "tractor-001".to_string(),
+            field_id: "field-north".to_string(),
+            started_at: "2026-06-15T10:00:00Z".to_string(),
+            telemetry: vec![
+                tractor_field_ops_sample("2026-06-15T10:00:00Z", 0.0, 0.0, 2.0, true),
+                tractor_field_ops_sample("2026-06-15T10:00:01Z", 3.0, 0.0, 2.0, true),
+                tractor_field_ops_sample("2026-06-15T10:00:02Z", 6.0, 0.0, 2.0, true),
+            ],
+            implement_width_m: 2.0,
+            planned_area_m2: 24.0,
+            max_telemetry_gap_seconds: 2,
         }
     }
 
