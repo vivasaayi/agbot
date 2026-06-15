@@ -1,5 +1,9 @@
+use provenance::{
+    ActorIdentity, ArtifactKind, AuditAction, AuditEntry, AuditLedger, LineageLedger,
+    LineageRecord, ProvenanceError, ProvenanceParameters,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use shared::schemas::{
     assert_raster_spatial_ref, validate_field_boundary, FarmFieldEntityStatus, FieldBoundary,
     FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint, RasterResolution,
@@ -145,10 +149,36 @@ pub struct FieldBoundaryImportRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldBoundaryImportReport {
     pub field: FieldRecord,
+    pub format: ImportFormat,
     pub source_filename: String,
     pub source_crs: String,
     pub target_crs: String,
     pub feature_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportLineageEmissionRequest {
+    pub import_artifact_id: String,
+    pub operator: String,
+    pub actor: ActorIdentity,
+    pub imported_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportLineageEmission {
+    pub record: LineageRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportRejectionAuditRequest {
+    pub action_ref: String,
+    pub operator: String,
+    pub actor: ActorIdentity,
+    pub occurred_at: String,
+    pub source_filename: String,
+    pub format: ImportFormat,
+    pub target_crs: String,
+    pub error: InteropError,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -727,6 +757,7 @@ pub fn import_field_boundary(
     request: FieldBoundaryImportRequest,
 ) -> Result<FieldBoundaryImportReport, InteropError> {
     let source_filename = normalized_filename(request.payload.filename.clone());
+    let format = request.payload.format;
     let imported = validate_and_reproject_import(
         request.payload,
         CrsTransform {
@@ -788,11 +819,62 @@ pub fn import_field_boundary(
 
     Ok(FieldBoundaryImportReport {
         field,
+        format,
         source_filename,
         source_crs: imported.source_crs,
         target_crs: imported.target_crs,
         feature_count: imported.feature_count,
     })
+}
+
+pub fn emit_import_lineage(
+    ledger: &mut LineageLedger,
+    report: &FieldBoundaryImportReport,
+    request: ImportLineageEmissionRequest,
+) -> Result<ImportLineageEmission, ProvenanceError> {
+    let parameters = ProvenanceParameters::from_json(json!({
+        "source_filename": report.source_filename,
+        "format": report.format,
+        "source_crs": report.source_crs,
+        "target_crs": report.target_crs,
+        "feature_count": report.feature_count,
+        "operator": request.operator,
+        "field_id": report.field.field_id,
+    }));
+    let record = ledger.record_lineage(LineageRecord {
+        artifact_id: request.import_artifact_id,
+        kind: ArtifactKind::Product,
+        inputs: Vec::new(),
+        method: "import.field_boundary".to_string(),
+        parameters,
+        operator: request.operator,
+        actor: request.actor,
+        created_at: request.imported_at,
+    })?;
+    Ok(ImportLineageEmission { record })
+}
+
+pub fn record_import_rejection(
+    audit_ledger: &mut AuditLedger,
+    request: ImportRejectionAuditRequest,
+) -> Result<AuditEntry, ProvenanceError> {
+    let target_crs =
+        normalize_crs(&request.target_crs).unwrap_or_else(|| request.target_crs.trim().to_string());
+    let action = AuditAction {
+        action_ref: request.action_ref,
+        action_kind: "import.field_boundary.rejected".to_string(),
+        artifact_ref: None,
+        payload: ProvenanceParameters::from_json(json!({
+            "source_filename": normalized_filename(request.source_filename),
+            "format": request.format,
+            "target_crs": target_crs,
+            "operator": request.operator,
+            "rejection_reason": interop_error_reason_value(&request.error),
+            "error": interop_error_value(&request.error),
+        })),
+        occurred_at: request.occurred_at,
+    };
+    audit_ledger.append_action(request.actor, action)
 }
 
 pub fn export_prescription_shapefile(
@@ -2687,6 +2769,18 @@ fn rejected(filename: &str, reason: InteropRejectionReason) -> InteropError {
     }
 }
 
+fn interop_error_reason_value(error: &InteropError) -> Value {
+    match error {
+        InteropError::Rejected { reason, .. } => {
+            serde_json::to_value(reason).unwrap_or_else(|_| Value::String("unknown".to_string()))
+        }
+    }
+}
+
+fn interop_error_value(error: &InteropError) -> Value {
+    serde_json::to_value(error).unwrap_or_else(|_| Value::String(error.to_string()))
+}
+
 #[derive(Debug, Default)]
 struct ExtentBuilder {
     min_x: Option<f64>,
@@ -2728,19 +2822,21 @@ impl ExtentBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_findings_geojson, export_findings_shapefile, export_prescription_shapefile,
-        export_prescription_taskdata, export_raster_geotiff, import_field_boundary,
-        pull_john_deere_boundaries, push_john_deere_prescription, reopen_raster_geotiff,
-        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
-        validate_taskdata_xml, CrsTransform, FieldBoundaryImportRequest,
-        FieldBoundaryRejectionReason, FindingsExportFeature, FindingsExportRequest, ImportFormat,
-        ImportPayload, InteropCoordinate, InteropError, InteropExtent, InteropRejectionReason,
-        JohnDeereBoundary, JohnDeereConnectorEndpoint, JohnDeereConnectorError,
-        JohnDeereEndpointError, JohnDeerePrescriptionPushRequest, JohnDeereRetryPolicy,
-        JohnDeereUploadPayload, PrescriptionField, PrescriptionRejectionReason,
-        PrescriptionShapefileRequest, PrescriptionZone, RasterProduct, RemotePrescriptionReceipt,
-        ReprojectedGeometry,
+        emit_import_lineage, export_findings_geojson, export_findings_shapefile,
+        export_prescription_shapefile, export_prescription_taskdata, export_raster_geotiff,
+        import_field_boundary, pull_john_deere_boundaries, push_john_deere_prescription,
+        record_import_rejection, reopen_raster_geotiff, round_trip_vector_layer,
+        validate_and_reproject_import, validate_geopackage_layers, validate_taskdata_xml,
+        CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason,
+        FindingsExportFeature, FindingsExportRequest, ImportFormat, ImportLineageEmissionRequest,
+        ImportPayload, ImportRejectionAuditRequest, InteropCoordinate, InteropError, InteropExtent,
+        InteropRejectionReason, JohnDeereBoundary, JohnDeereConnectorEndpoint,
+        JohnDeereConnectorError, JohnDeereEndpointError, JohnDeerePrescriptionPushRequest,
+        JohnDeereRetryPolicy, JohnDeereUploadPayload, PrescriptionField,
+        PrescriptionRejectionReason, PrescriptionShapefileRequest, PrescriptionZone, RasterProduct,
+        RemotePrescriptionReceipt, ReprojectedGeometry,
     };
+    use provenance::{ActorIdentity, ActorKind, AuditLedger, AuditOutcome, LineageLedger};
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
     #[test]
@@ -3005,6 +3101,7 @@ mod tests {
         .expect("valid boundary should import");
 
         assert_eq!(report.source_filename, "field-alpha-boundary.geojson");
+        assert_eq!(report.format, ImportFormat::GeoJson);
         assert_eq!(report.source_crs, "EPSG:4326");
         assert_eq!(report.target_crs, "EPSG:4326");
         assert_eq!(report.feature_count, 1);
@@ -3021,6 +3118,106 @@ mod tests {
         assert!(report.field.area_ha.expect("area should be set") > 0.0);
         assert_eq!(report.field.extent.min_lon, -121.0);
         assert_eq!(report.field.extent.max_lon, -120.99);
+    }
+
+    #[test]
+    fn import_lineage_emission_records_source_format_crs_operator_and_feature_count() {
+        let report = import_field_boundary(FieldBoundaryImportRequest {
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: "field-alpha-boundary.geojson".to_string(),
+                bytes: valid_geojson("EPSG:4326").as_bytes().to_vec(),
+            },
+            target_crs: "EPSG:4326".to_string(),
+            field_id: "field-alpha".to_string(),
+            farm_id: Some("farm-alpha".to_string()),
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            name: "North Block".to_string(),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        })
+        .expect("valid boundary should import");
+        let mut ledger = LineageLedger::default();
+        let emission = emit_import_lineage(
+            &mut ledger,
+            &report,
+            ImportLineageEmissionRequest {
+                import_artifact_id: "import:field-alpha-boundary".to_string(),
+                operator: "ops-alpha".to_string(),
+                actor: ops_actor(),
+                imported_at: "2026-06-12T14:01:00Z".to_string(),
+            },
+        )
+        .expect("import lineage should emit");
+
+        assert_eq!(ledger.artifact_count(), 1);
+        assert_eq!(emission.record.artifact_id, "import:field-alpha-boundary");
+        assert_eq!(emission.record.method, "import.field_boundary");
+        assert_eq!(emission.record.operator, "ops-alpha");
+        let parameters = emission.record.parameters.as_json();
+        assert_eq!(
+            parameters["source_filename"],
+            "field-alpha-boundary.geojson"
+        );
+        assert_eq!(parameters["format"], "geo_json");
+        assert_eq!(parameters["source_crs"], "EPSG:4326");
+        assert_eq!(parameters["target_crs"], "EPSG:4326");
+        assert_eq!(parameters["feature_count"], 1);
+        assert_eq!(parameters["operator"], "ops-alpha");
+    }
+
+    #[test]
+    fn rejected_import_records_rejection_event_without_success_lineage() {
+        let error = import_field_boundary(FieldBoundaryImportRequest {
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: "bowtie-boundary.geojson".to_string(),
+                bytes: bowtie_geojson("EPSG:4326").as_bytes().to_vec(),
+            },
+            target_crs: "EPSG:4326".to_string(),
+            field_id: "field-bowtie".to_string(),
+            farm_id: None,
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            name: "Invalid Bowtie".to_string(),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        })
+        .expect_err("invalid boundary should reject");
+        let lineage = LineageLedger::default();
+        let mut audit = AuditLedger::default();
+        let entry = record_import_rejection(
+            &mut audit,
+            ImportRejectionAuditRequest {
+                action_ref: "import:bowtie-boundary:rejected".to_string(),
+                operator: "ops-alpha".to_string(),
+                actor: ops_actor(),
+                occurred_at: "2026-06-12T14:01:00Z".to_string(),
+                source_filename: " bowtie-boundary.geojson ".to_string(),
+                format: ImportFormat::GeoJson,
+                target_crs: "EPSG:4326".to_string(),
+                error,
+            },
+        )
+        .expect("rejection audit entry should append");
+
+        assert_eq!(lineage.artifact_count(), 0);
+        assert_eq!(audit.entries().len(), 1);
+        assert_eq!(entry.outcome, AuditOutcome::Accepted);
+        assert_eq!(entry.action.action_kind, "import.field_boundary.rejected");
+        assert_eq!(
+            entry.action.payload.as_json()["source_filename"],
+            "bowtie-boundary.geojson"
+        );
+        assert_eq!(entry.action.payload.as_json()["format"], "geo_json");
+        assert_eq!(entry.action.payload.as_json()["target_crs"], "EPSG:4326");
+        assert_eq!(
+            entry.action.payload.as_json()["rejection_reason"],
+            serde_json::json!({
+                "invalid_field_boundary": {
+                    "reason": "self_intersection"
+                }
+            })
+        );
     }
 
     #[test]
@@ -3856,6 +4053,13 @@ mod tests {
                 }}]
             }}"#
         )
+    }
+
+    fn ops_actor() -> ActorIdentity {
+        ActorIdentity {
+            actor_id: "ops-alpha".to_string(),
+            actor_kind: ActorKind::Operator,
+        }
     }
 
     fn raster_product() -> RasterProduct {
