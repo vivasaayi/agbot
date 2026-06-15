@@ -1093,6 +1093,69 @@ pub enum TractorPrescriptionExecutionError {
     SafetyPrerequisiteFailed { reason_code: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorImplementCommand {
+    Enable,
+    Disable,
+    SetRate { rate: f64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorImplementAdapterSpec {
+    pub implement_id: String,
+    pub implement_type: String,
+    pub min_rate: f64,
+    pub max_rate: f64,
+    pub default_rate: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorImplementState {
+    pub implement_id: String,
+    pub enabled: bool,
+    pub current_rate: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorImplementDecision {
+    Applied,
+    Refused,
+    ForcedOff,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorImplementSetpointLog {
+    pub implement_id: String,
+    pub command: TractorImplementCommand,
+    pub decision: TractorImplementDecision,
+    pub requested_rate: Option<f64>,
+    pub applied_rate: Option<f64>,
+    pub reason_code: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorImplementAdapterResult {
+    pub state: TractorImplementState,
+    pub log: TractorImplementSetpointLog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TractorImplementControlError {
+    #[error("tractor implement control implement_id cannot be empty")]
+    EmptyImplementId,
+    #[error("tractor implement control implement_type cannot be empty")]
+    EmptyImplementType,
+    #[error("tractor implement control rate bounds are invalid")]
+    InvalidRateBounds,
+    #[error("tractor implement control timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("tractor implement control timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
 impl TractorCommandRejection {
     pub fn status_code(&self) -> u16 {
         match self.reason {
@@ -2165,6 +2228,164 @@ pub fn execute_tractor_prescription(
         runtime_mode: "simulation".to_string(),
         applied_rates,
     })
+}
+
+pub fn apply_tractor_implement_command(
+    spec: TractorImplementAdapterSpec,
+    current: TractorImplementState,
+    command: TractorImplementCommand,
+    motion_gate: &TractorMotionGateEvaluation,
+    at: &str,
+) -> Result<TractorImplementAdapterResult, TractorImplementControlError> {
+    let implement_id = normalize_tractor_text(spec.implement_id)
+        .ok_or(TractorImplementControlError::EmptyImplementId)?;
+    let _implement_type = normalize_tractor_text(spec.implement_type)
+        .ok_or(TractorImplementControlError::EmptyImplementType)?;
+    if !spec.min_rate.is_finite()
+        || !spec.max_rate.is_finite()
+        || !spec.default_rate.is_finite()
+        || spec.min_rate < 0.0
+        || spec.min_rate > spec.max_rate
+    {
+        return Err(TractorImplementControlError::InvalidRateBounds);
+    }
+    let at = normalize_tractor_text(at.to_string())
+        .ok_or(TractorImplementControlError::EmptyTimestamp)?;
+    parse_tractor_implement_timestamp(&at)?;
+
+    let safe_current_rate = clamp_tractor_implement_rate(
+        if current.current_rate.is_finite() {
+            current.current_rate
+        } else {
+            spec.default_rate
+        },
+        spec.min_rate,
+        spec.max_rate,
+    );
+    let requested_rate = match &command {
+        TractorImplementCommand::SetRate { rate } => Some(*rate),
+        TractorImplementCommand::Enable | TractorImplementCommand::Disable => None,
+    };
+
+    if motion_gate.halted || motion_gate.decision != TractorMotionGateDecision::Allowed {
+        let reason_code = if motion_gate.halted {
+            "tractor_halted"
+        } else {
+            "motion_not_approved"
+        };
+        return Ok(tractor_implement_result(
+            TractorImplementState {
+                implement_id,
+                enabled: false,
+                current_rate: safe_current_rate,
+            },
+            command,
+            TractorImplementDecision::ForcedOff,
+            requested_rate,
+            Some(safe_current_rate),
+            reason_code,
+            at,
+        ));
+    }
+
+    let (state, decision, applied_rate, reason_code) = match command.clone() {
+        TractorImplementCommand::Enable => {
+            let rate =
+                clamp_tractor_implement_rate(spec.default_rate, spec.min_rate, spec.max_rate);
+            (
+                TractorImplementState {
+                    implement_id,
+                    enabled: true,
+                    current_rate: rate,
+                },
+                TractorImplementDecision::Applied,
+                Some(rate),
+                "implement_enabled",
+            )
+        }
+        TractorImplementCommand::Disable => (
+            TractorImplementState {
+                implement_id,
+                enabled: false,
+                current_rate: safe_current_rate,
+            },
+            TractorImplementDecision::Applied,
+            Some(safe_current_rate),
+            "implement_disabled",
+        ),
+        TractorImplementCommand::SetRate { rate } => {
+            if !rate.is_finite() || rate < spec.min_rate || rate > spec.max_rate {
+                (
+                    TractorImplementState {
+                        implement_id,
+                        enabled: current.enabled,
+                        current_rate: safe_current_rate,
+                    },
+                    TractorImplementDecision::Refused,
+                    Some(safe_current_rate),
+                    "rate_out_of_bounds",
+                )
+            } else {
+                (
+                    TractorImplementState {
+                        implement_id,
+                        enabled: current.enabled,
+                        current_rate: rate,
+                    },
+                    TractorImplementDecision::Applied,
+                    Some(rate),
+                    "rate_applied",
+                )
+            }
+        }
+    };
+
+    Ok(tractor_implement_result(
+        state,
+        command,
+        decision,
+        requested_rate,
+        applied_rate,
+        reason_code,
+        at,
+    ))
+}
+
+fn tractor_implement_result(
+    state: TractorImplementState,
+    command: TractorImplementCommand,
+    decision: TractorImplementDecision,
+    requested_rate: Option<f64>,
+    applied_rate: Option<f64>,
+    reason_code: &str,
+    at: String,
+) -> TractorImplementAdapterResult {
+    TractorImplementAdapterResult {
+        log: TractorImplementSetpointLog {
+            implement_id: state.implement_id.clone(),
+            command,
+            decision,
+            requested_rate,
+            applied_rate,
+            reason_code: reason_code.to_string(),
+            at,
+        },
+        state,
+    }
+}
+
+fn clamp_tractor_implement_rate(rate: f64, min_rate: f64, max_rate: f64) -> f64 {
+    rate.max(min_rate).min(max_rate)
+}
+
+fn parse_tractor_implement_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, TractorImplementControlError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| TractorImplementControlError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 fn tractor_bounds_contains(outer: &GeoBounds, inner: &GeoBounds) -> bool {
@@ -6830,14 +7051,14 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 mod tests {
     use super::{
         append_content_version, apply_dry_run_validated_fleet_config_bundle,
-        apply_fleet_node_heartbeat, assert_flight_operation_allowed, assert_raster_spatial_ref,
-        bind_fleet_node_identity, bounds_from_points, build_collaboration_channel,
-        build_collaboration_message, build_fleet_version_inventory,
-        build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
-        build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
-        create_versioned_content, detect_tractor_obstacle, dry_run_fleet_config_bundle,
-        evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
-        evaluate_tractor_motion_gate, execute_tractor_prescription,
+        apply_fleet_node_heartbeat, apply_tractor_implement_command,
+        assert_flight_operation_allowed, assert_raster_spatial_ref, bind_fleet_node_identity,
+        bounds_from_points, build_collaboration_channel, build_collaboration_message,
+        build_fleet_version_inventory, build_marketplace_account_record,
+        build_soil_moisture_reading, build_sustainability_record, build_tractor_field_ops_replay,
+        build_tractor_field_ops_session_log, compute_drought_index, create_versioned_content,
+        detect_tractor_obstacle, dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
+        evaluate_tractor_geofence, evaluate_tractor_motion_gate, execute_tractor_prescription,
         normalize_weather_provider_forecast, plan_tractor_swath_coverage,
         run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
@@ -6871,15 +7092,17 @@ mod tests {
         TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
         TractorFieldOpsTelemetrySample, TractorGeofenceDecision, TractorGeofenceError,
         TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
-        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint, TractorImplementRef,
-        TractorLifecycleStatus, TractorMotionCommandRequest, TractorMotionGateDecision,
-        TractorObstacleDetection, TractorObstacleDetectionRequest, TractorObstacleEvent,
-        TractorOperatorApproval, TractorPrescriptionExecutionError,
-        TractorPrescriptionExecutionRequest, TractorPrescriptionZone, TractorRegistrationRequest,
-        TractorRegistry, TractorSwathCoverageRequest, WeatherIngestError,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
-        WorkOrderRegistry, WorkOrderStatus,
+        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
+        TractorImplementAdapterSpec, TractorImplementCommand, TractorImplementDecision,
+        TractorImplementRef, TractorImplementState, TractorLifecycleStatus,
+        TractorMotionCommandRequest, TractorMotionGateDecision, TractorObstacleDetection,
+        TractorObstacleDetectionRequest, TractorObstacleEvent, TractorOperatorApproval,
+        TractorPrescriptionExecutionError, TractorPrescriptionExecutionRequest,
+        TractorPrescriptionZone, TractorRegistrationRequest, TractorRegistry,
+        TractorSwathCoverageRequest, WeatherIngestError, WeatherProviderForecastPoint,
+        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
+        WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry,
+        WorkOrderStatus,
     };
 
     #[test]
@@ -7948,6 +8171,62 @@ mod tests {
     }
 
     #[test]
+    fn tractor_implement_adapter_applies_valid_rate_and_logs() {
+        let result = apply_tractor_implement_command(
+            tractor_implement_spec(),
+            tractor_implement_state(true, 10.0),
+            TractorImplementCommand::SetRate { rate: 22.0 },
+            &tractor_allowed_motion_gate(),
+            "2026-06-15T10:00:03Z",
+        )
+        .expect("valid implement setpoint applies");
+
+        assert!(result.state.enabled);
+        assert_eq!(result.state.current_rate, 22.0);
+        assert_eq!(result.log.decision, TractorImplementDecision::Applied);
+        assert_eq!(result.log.requested_rate, Some(22.0));
+        assert_eq!(result.log.applied_rate, Some(22.0));
+        assert_eq!(result.log.reason_code, "rate_applied");
+    }
+
+    #[test]
+    fn tractor_implement_adapter_refuses_out_of_range_rate() {
+        let result = apply_tractor_implement_command(
+            tractor_implement_spec(),
+            tractor_implement_state(true, 10.0),
+            TractorImplementCommand::SetRate { rate: 40.0 },
+            &tractor_allowed_motion_gate(),
+            "2026-06-15T10:00:03Z",
+        )
+        .expect("out-of-range setpoint is refused without unsafe rate");
+
+        assert!(result.state.enabled);
+        assert_eq!(result.state.current_rate, 10.0);
+        assert!(result.state.current_rate <= tractor_implement_spec().max_rate);
+        assert_eq!(result.log.decision, TractorImplementDecision::Refused);
+        assert_eq!(result.log.requested_rate, Some(40.0));
+        assert_eq!(result.log.applied_rate, Some(10.0));
+        assert_eq!(result.log.reason_code, "rate_out_of_bounds");
+    }
+
+    #[test]
+    fn tractor_implement_adapter_forces_off_when_halted() {
+        let result = apply_tractor_implement_command(
+            tractor_implement_spec(),
+            tractor_implement_state(true, 18.0),
+            TractorImplementCommand::Enable,
+            &tractor_halted_motion_gate(),
+            "2026-06-15T10:00:03Z",
+        )
+        .expect("halted tractor forces implement off");
+
+        assert!(!result.state.enabled);
+        assert_eq!(result.state.current_rate, 18.0);
+        assert_eq!(result.log.decision, TractorImplementDecision::ForcedOff);
+        assert_eq!(result.log.reason_code, "tractor_halted");
+    }
+
+    #[test]
     fn marketplace_account_links_party_to_one_org_and_normalizes_roles() {
         let record = build_marketplace_account_record(
             MarketplaceAccountCreateRequest {
@@ -8777,6 +9056,50 @@ mod tests {
             approved_by: "ops@example.com".to_string(),
             approved_at: "2026-06-15T09:59:00Z".to_string(),
             expires_at: Some("2026-06-15T10:05:00Z".to_string()),
+        }
+    }
+
+    fn tractor_allowed_motion_gate() -> super::TractorMotionGateEvaluation {
+        evaluate_tractor_motion_gate(
+            &tractor_motion_gate_command(),
+            None,
+            Some(&tractor_operator_approval()),
+            "2026-06-15T10:00:02Z",
+        )
+        .expect("motion gate prerequisite should pass")
+    }
+
+    fn tractor_halted_motion_gate() -> super::TractorMotionGateEvaluation {
+        evaluate_tractor_motion_gate(
+            &tractor_motion_gate_command(),
+            Some(&TractorEstopState {
+                tractor_id: "tractor-001".to_string(),
+                active: true,
+                triggered_by: Some("ops@example.com".to_string()),
+                triggered_at: Some("2026-06-15T10:00:00Z".to_string()),
+                reason_code: Some("operator_estop".to_string()),
+            }),
+            Some(&tractor_operator_approval()),
+            "2026-06-15T10:00:02Z",
+        )
+        .expect("estop halt should evaluate")
+    }
+
+    fn tractor_implement_spec() -> TractorImplementAdapterSpec {
+        TractorImplementAdapterSpec {
+            implement_id: "sprayer-001".to_string(),
+            implement_type: "sprayer".to_string(),
+            min_rate: 0.0,
+            max_rate: 30.0,
+            default_rate: 12.0,
+        }
+    }
+
+    fn tractor_implement_state(enabled: bool, current_rate: f64) -> TractorImplementState {
+        TractorImplementState {
+            implement_id: "sprayer-001".to_string(),
+            enabled,
+            current_rate,
         }
     }
 
