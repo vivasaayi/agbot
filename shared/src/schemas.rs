@@ -218,6 +218,62 @@ impl SeasonCropPlanRolloverSuggestion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessAuditDecision {
+    Allowed,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessAuditEvent {
+    pub audit_id: String,
+    pub actor_id: String,
+    pub org_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_org_id: Option<String>,
+    pub action: String,
+    pub decision: AccessAuditDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessAnomalyThresholds {
+    pub denied_cross_org_attempts: usize,
+    pub bulk_export_count: usize,
+}
+
+impl Default for AccessAnomalyThresholds {
+    fn default() -> Self {
+        Self {
+            denied_cross_org_attempts: 3,
+            bulk_export_count: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessAnomalySignal {
+    CrossOrgProbe,
+    BulkExport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessAnomalyAdvisory {
+    pub actor_id: String,
+    pub signal: AccessAnomalySignal,
+    pub observed_count: usize,
+    pub threshold: usize,
+    #[serde(default)]
+    pub evidence_audit_ids: Vec<String>,
+    pub requires_approval: bool,
+    pub auto_blocked: bool,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SceneRecord {
     pub scene_id: String,
@@ -3802,6 +3858,101 @@ fn add_one_calendar_year(date: &NaiveDate) -> NaiveDate {
         .expect("valid rollover date")
 }
 
+pub fn evaluate_access_anomaly_advisories(
+    events: &[AccessAuditEvent],
+    thresholds: AccessAnomalyThresholds,
+) -> Vec<AccessAnomalyAdvisory> {
+    let mut cross_org_by_actor: BTreeMap<String, Vec<&AccessAuditEvent>> = BTreeMap::new();
+    let mut exports_by_actor: BTreeMap<String, Vec<&AccessAuditEvent>> = BTreeMap::new();
+
+    for event in events {
+        if event.actor_id.trim().is_empty() {
+            continue;
+        }
+        if is_denied_cross_org_attempt(event) {
+            cross_org_by_actor
+                .entry(event.actor_id.clone())
+                .or_default()
+                .push(event);
+        }
+        if is_allowed_export_access(event) {
+            exports_by_actor
+                .entry(event.actor_id.clone())
+                .or_default()
+                .push(event);
+        }
+    }
+
+    let mut advisories = Vec::new();
+    append_access_anomaly_advisories(
+        &mut advisories,
+        cross_org_by_actor,
+        AccessAnomalySignal::CrossOrgProbe,
+        thresholds.denied_cross_org_attempts,
+    );
+    append_access_anomaly_advisories(
+        &mut advisories,
+        exports_by_actor,
+        AccessAnomalySignal::BulkExport,
+        thresholds.bulk_export_count,
+    );
+    advisories
+}
+
+fn append_access_anomaly_advisories(
+    advisories: &mut Vec<AccessAnomalyAdvisory>,
+    grouped_events: BTreeMap<String, Vec<&AccessAuditEvent>>,
+    signal: AccessAnomalySignal,
+    threshold: usize,
+) {
+    if threshold == 0 {
+        return;
+    }
+    for (actor_id, events) in grouped_events {
+        if events.len() < threshold {
+            continue;
+        }
+        advisories.push(AccessAnomalyAdvisory {
+            actor_id: actor_id.clone(),
+            signal,
+            observed_count: events.len(),
+            threshold,
+            evidence_audit_ids: events
+                .iter()
+                .map(|event| event.audit_id.clone())
+                .collect::<Vec<_>>(),
+            requires_approval: true,
+            auto_blocked: false,
+            summary: match signal {
+                AccessAnomalySignal::CrossOrgProbe => format!(
+                    "actor {actor_id} has {} denied cross-org access attempts",
+                    events.len()
+                ),
+                AccessAnomalySignal::BulkExport => {
+                    format!("actor {actor_id} has {} export access events", events.len())
+                }
+            },
+        });
+    }
+}
+
+fn is_denied_cross_org_attempt(event: &AccessAuditEvent) -> bool {
+    event.decision == AccessAuditDecision::Denied
+        && (event
+            .target_org_id
+            .as_ref()
+            .is_some_and(|target_org_id| target_org_id != &event.org_id)
+            || event.reason_code.as_ref().is_some_and(|reason| {
+                let reason = reason.to_ascii_lowercase();
+                reason.contains("cross_org") || reason.contains("cross-tenant")
+            }))
+}
+
+fn is_allowed_export_access(event: &AccessAuditEvent) -> bool {
+    event.decision == AccessAuditDecision::Allowed
+        && event.action.to_ascii_lowercase().contains("export")
+}
+
 pub fn bounds_coverage_fraction(boundary: &GeoBounds, covered: &GeoBounds) -> f64 {
     let boundary_area = bounds_area(boundary);
     if boundary_area <= 0.0 {
@@ -5522,17 +5673,19 @@ mod tests {
         build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         compute_drought_index, create_versioned_content, dry_run_fleet_config_bundle,
-        normalize_weather_provider_forecast, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, transition_marketplace_account_status,
-        validate_field_boundary, verify_and_apply_fleet_config_bundle,
-        weather_fetch_failure_record, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
-        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        evaluate_access_anomaly_advisories, normalize_weather_provider_forecast,
+        sign_fleet_config_bundle, soil_moisture_rejection_record,
+        transition_marketplace_account_status, validate_field_boundary,
+        verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
+        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
+        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
+        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
+        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
+        ContentType, CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus, FleetConfigBundle,
+        FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
         FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
         FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
         FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
@@ -7684,6 +7837,97 @@ mod tests {
     }
 
     #[test]
+    fn access_anomaly_flags_denied_cross_org_spike_with_evidence() {
+        let events = vec![
+            access_event("audit-1", "actor-a", AccessAuditDecision::Denied),
+            access_event("audit-2", "actor-a", AccessAuditDecision::Denied),
+            access_event("audit-3", "actor-a", AccessAuditDecision::Denied),
+            AccessAuditEvent {
+                audit_id: "audit-other".to_string(),
+                actor_id: "actor-b".to_string(),
+                org_id: "org-a".to_string(),
+                target_org_id: Some("org-b".to_string()),
+                action: "field:read".to_string(),
+                decision: AccessAuditDecision::Denied,
+                reason_code: Some("cross_org_denied".to_string()),
+                at: "2026-06-12T10:04:00Z".to_string(),
+            },
+        ];
+
+        let advisories =
+            evaluate_access_anomaly_advisories(&events, AccessAnomalyThresholds::default());
+
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].actor_id, "actor-a");
+        assert_eq!(advisories[0].signal, AccessAnomalySignal::CrossOrgProbe);
+        assert_eq!(advisories[0].observed_count, 3);
+        assert_eq!(
+            advisories[0].evidence_audit_ids,
+            vec![
+                "audit-1".to_string(),
+                "audit-2".to_string(),
+                "audit-3".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn access_anomaly_baseline_traffic_has_no_false_positive() {
+        let events = vec![
+            AccessAuditEvent {
+                audit_id: "audit-allowed-read".to_string(),
+                actor_id: "actor-a".to_string(),
+                org_id: "org-a".to_string(),
+                target_org_id: Some("org-a".to_string()),
+                action: "field:read".to_string(),
+                decision: AccessAuditDecision::Allowed,
+                reason_code: None,
+                at: "2026-06-12T10:00:00Z".to_string(),
+            },
+            access_event("audit-denied-one", "actor-a", AccessAuditDecision::Denied),
+            AccessAuditEvent {
+                audit_id: "audit-export-one".to_string(),
+                actor_id: "actor-a".to_string(),
+                org_id: "org-a".to_string(),
+                target_org_id: Some("org-a".to_string()),
+                action: "field_records:export".to_string(),
+                decision: AccessAuditDecision::Allowed,
+                reason_code: None,
+                at: "2026-06-12T10:02:00Z".to_string(),
+            },
+        ];
+
+        let advisories =
+            evaluate_access_anomaly_advisories(&events, AccessAnomalyThresholds::default());
+
+        assert!(advisories.is_empty());
+    }
+
+    #[test]
+    fn access_anomaly_is_advisory_only_not_auto_blocking() {
+        let events = (1..=5)
+            .map(|index| AccessAuditEvent {
+                audit_id: format!("audit-export-{index}"),
+                actor_id: "actor-a".to_string(),
+                org_id: "org-a".to_string(),
+                target_org_id: Some("org-a".to_string()),
+                action: "field_records:export".to_string(),
+                decision: AccessAuditDecision::Allowed,
+                reason_code: None,
+                at: format!("2026-06-12T10:0{index}:00Z"),
+            })
+            .collect::<Vec<_>>();
+
+        let advisories =
+            evaluate_access_anomaly_advisories(&events, AccessAnomalyThresholds::default());
+
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].signal, AccessAnomalySignal::BulkExport);
+        assert!(advisories[0].requires_approval);
+        assert!(!advisories[0].auto_blocked);
+    }
+
+    #[test]
     fn scene_and_layers_are_listable_by_field_and_season() {
         let mut registry = registry_with_field_and_season();
         registry
@@ -7954,6 +8198,23 @@ mod tests {
             status,
             created_at: "2026-04-01T00:00:00Z".to_string(),
             updated_at: "2026-04-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn access_event(
+        audit_id: &str,
+        actor_id: &str,
+        decision: AccessAuditDecision,
+    ) -> AccessAuditEvent {
+        AccessAuditEvent {
+            audit_id: audit_id.to_string(),
+            actor_id: actor_id.to_string(),
+            org_id: "org-a".to_string(),
+            target_org_id: Some("org-b".to_string()),
+            action: "field:read".to_string(),
+            decision,
+            reason_code: Some("cross_org_denied".to_string()),
+            at: "2026-06-12T10:00:00Z".to_string(),
         }
     }
 
