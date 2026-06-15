@@ -26,8 +26,8 @@ pub mod zone_delineation;
 pub mod zone_recommendations;
 
 pub use findings_export::{
-    export_findings_csv, export_findings_geojson, FindingExportRecord, FindingsExportError,
-    FINDINGS_CSV_HEADER,
+    export_findings_csv, export_findings_geojson, export_findings_shapefile, FindingExportRecord,
+    FindingsExportError, FINDINGS_CSV_HEADER,
 };
 pub use grower_report::{
     render_grower_ready_pdf, FieldReportMetadata, GrowerReportError, GrowerReportRequest,

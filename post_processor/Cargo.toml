@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 # Internal dependencies
 shared = { path = "../shared" }
 timeseries = { path = "../timeseries" }
+interop = { path = "../interop" }
 
 # Specific dependencies
 ndarray = "0.15"

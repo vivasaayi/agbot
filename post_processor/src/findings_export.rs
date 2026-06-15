@@ -1,7 +1,12 @@
 use crate::product_anomalies::ProductAnomalyReasonCode;
 use crate::zone_delineation::AnomalyZone;
+use interop::{
+    export_findings_geojson as interop_export_findings_geojson,
+    export_findings_shapefile as interop_export_findings_shapefile, FindingsExportFeature,
+    FindingsExportRequest, FindingsShapefileExport, InteropCoordinate, InteropError,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use shared::schemas::RecommendationPriority;
 
 pub const FINDINGS_CSV_HEADER: &str =
@@ -25,6 +30,10 @@ pub enum FindingsExportError {
     Io(#[from] std::io::Error),
     #[error("csv output was not valid UTF-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+    #[error("interop export failed: {0}")]
+    Interop(#[from] InteropError),
+    #[error("geojson output was not valid JSON: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub fn export_findings_csv(
@@ -53,36 +62,53 @@ pub fn export_findings_csv(
     String::from_utf8(buffer).map_err(FindingsExportError::from)
 }
 
-pub fn export_findings_geojson(findings: &[FindingExportRecord]) -> Value {
-    json!({
-        "type": "FeatureCollection",
-        "features": findings.iter().map(finding_feature).collect::<Vec<_>>(),
-    })
+pub fn export_findings_geojson(
+    findings: &[FindingExportRecord],
+) -> Result<Value, FindingsExportError> {
+    let report = interop_export_findings_geojson(interop_findings_request(findings))?;
+    serde_json::from_slice(&report.exported_bytes).map_err(FindingsExportError::from)
 }
 
-fn finding_feature(finding: &FindingExportRecord) -> Value {
-    json!({
-        "type": "Feature",
-        "id": finding.finding_id,
-        "geometry": {
-            "type": "Polygon",
-            "coordinates": [finding.zone.polygon.coordinates
-                .iter()
-                .map(|(x, y)| json!([x, y]))
-                .collect::<Vec<_>>()],
+pub fn export_findings_shapefile(
+    findings: &[FindingExportRecord],
+) -> Result<FindingsShapefileExport, FindingsExportError> {
+    interop_export_findings_shapefile(interop_findings_request(findings))
+        .map_err(FindingsExportError::from)
+}
+
+fn interop_findings_request(findings: &[FindingExportRecord]) -> FindingsExportRequest {
+    let crs = findings
+        .first()
+        .map(|finding| finding.zone.crs.clone())
+        .unwrap_or_else(|| "EPSG:4326".to_string());
+    FindingsExportRequest {
+        export_id: "post_processor_findings".to_string(),
+        crs,
+        findings: findings.iter().map(interop_finding_feature).collect(),
+    }
+}
+
+fn interop_finding_feature(finding: &FindingExportRecord) -> FindingsExportFeature {
+    FindingsExportFeature {
+        finding_id: finding.finding_id.clone(),
+        zone_id: finding.zone.zone_id.clone(),
+        reason: reason_code_str(finding.reason).to_string(),
+        priority: priority_str(finding.priority).to_string(),
+        area_m2: f64::from(finding.zone.area_m2),
+        centroid: InteropCoordinate {
+            x: finding.zone.centroid.0,
+            y: finding.zone.centroid.1,
         },
-        "properties": {
-            "finding_id": finding.finding_id,
-            "zone_id": finding.zone.zone_id,
-            "reason": reason_code_str(finding.reason),
-            "priority": priority_str(finding.priority),
-            "area_m2": finding.zone.area_m2,
-            "centroid_x": finding.zone.centroid.0,
-            "centroid_y": finding.zone.centroid.1,
-            "crs": finding.zone.crs,
-            "evidence_refs": normalized_evidence_refs(&finding.evidence_refs),
-        },
-    })
+        crs: finding.zone.crs.clone(),
+        polygon: finding
+            .zone
+            .polygon
+            .coordinates
+            .iter()
+            .map(|(x, y)| InteropCoordinate { x: *x, y: *y })
+            .collect(),
+        evidence_refs: normalized_evidence_refs(&finding.evidence_refs),
+    }
 }
 
 fn normalized_evidence_refs(evidence_refs: &[String]) -> Vec<String> {
@@ -116,7 +142,8 @@ fn priority_str(priority: RecommendationPriority) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_findings_csv, export_findings_geojson, FindingExportRecord, FINDINGS_CSV_HEADER,
+        export_findings_csv, export_findings_geojson, export_findings_shapefile,
+        FindingExportRecord, FINDINGS_CSV_HEADER,
     };
     use crate::product_anomalies::ProductAnomalyReasonCode;
     use crate::zone_delineation::{AnomalyZone, AnomalyZonePolygon};
@@ -138,7 +165,8 @@ mod tests {
 
     #[test]
     fn findings_geojson_exports_zone_geometry_and_properties() {
-        let geojson = export_findings_geojson(&[finding("finding-1", "zone-1")]);
+        let geojson = export_findings_geojson(&[finding("finding-1", "zone-1")])
+            .expect("geojson export succeeds");
         let features = geojson["features"].as_array().expect("features array");
         let feature = &features[0];
 
@@ -160,7 +188,7 @@ mod tests {
     #[test]
     fn empty_findings_export_as_valid_empty_csv_and_geojson() {
         let csv = export_findings_csv(&[]).expect("empty csv export succeeds");
-        let geojson = export_findings_geojson(&[]);
+        let geojson = export_findings_geojson(&[]).expect("empty geojson export succeeds");
 
         assert_eq!(csv.trim_end(), FINDINGS_CSV_HEADER);
         assert_eq!(geojson["type"], "FeatureCollection");
@@ -168,6 +196,22 @@ mod tests {
             .as_array()
             .expect("features array")
             .is_empty());
+    }
+
+    #[test]
+    fn findings_shapefile_routes_through_interop_and_supports_empty_export() {
+        let shapefile = export_findings_shapefile(&[finding("finding-1", "zone-1")])
+            .expect("shapefile export succeeds");
+        assert_eq!(shapefile.crs, "EPSG:32614");
+        assert_eq!(shapefile.feature_count, 1);
+        assert!(!shapefile.files.shp.is_empty());
+        assert!(!shapefile.files.shx.is_empty());
+        assert!(!shapefile.files.dbf.is_empty());
+        assert!(!shapefile.files.prj.is_empty());
+
+        let empty = export_findings_shapefile(&[]).expect("empty shapefile export succeeds");
+        assert_eq!(empty.feature_count, 0);
+        assert!(empty.extent.is_none());
     }
 
     fn finding(finding_id: &str, zone_id: &str) -> FindingExportRecord {

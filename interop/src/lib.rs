@@ -182,6 +182,51 @@ pub struct PrescriptionShapefileFiles {
     pub prj: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingsShapefileFiles {
+    pub shp: Vec<u8>,
+    pub shx: Vec<u8>,
+    pub dbf: Vec<u8>,
+    pub prj: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingsExportFeature {
+    pub finding_id: String,
+    pub zone_id: String,
+    pub reason: String,
+    pub priority: String,
+    pub area_m2: f64,
+    pub centroid: InteropCoordinate,
+    pub crs: String,
+    pub polygon: Vec<InteropCoordinate>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingsExportRequest {
+    pub export_id: String,
+    pub crs: String,
+    pub findings: Vec<FindingsExportFeature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingsGeoJsonExport {
+    pub export_id: String,
+    pub crs: String,
+    pub feature_count: usize,
+    pub exported_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingsShapefileExport {
+    pub export_id: String,
+    pub crs: String,
+    pub feature_count: usize,
+    pub extent: Option<InteropExtent>,
+    pub files: FindingsShapefileFiles,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrescriptionShapefileReport {
     pub prescription_id: String,
@@ -594,6 +639,71 @@ pub fn export_raster_geotiff(product: RasterProduct) -> Result<RasterGeoTiffRepo
         width: product.width,
         height: product.height,
         exported_bytes,
+    })
+}
+
+pub fn export_findings_geojson(
+    request: FindingsExportRequest,
+) -> Result<FindingsGeoJsonExport, InteropError> {
+    let normalized = normalize_findings_export_request(request)?;
+    let features = normalized
+        .findings
+        .iter()
+        .map(finding_geojson_feature)
+        .collect::<Vec<_>>();
+    let mut crs_properties = Map::new();
+    crs_properties.insert("name".to_string(), Value::String(normalized.crs.clone()));
+    let mut crs = Map::new();
+    crs.insert("type".to_string(), Value::String("name".to_string()));
+    crs.insert("properties".to_string(), Value::Object(crs_properties));
+    let mut document = Map::new();
+    document.insert(
+        "type".to_string(),
+        Value::String("FeatureCollection".to_string()),
+    );
+    document.insert("crs".to_string(), Value::Object(crs));
+    document.insert("features".to_string(), Value::Array(features));
+    let exported_bytes = serde_json::to_vec(&Value::Object(document))
+        .map_err(|_| rejected(&normalized.export_id, InteropRejectionReason::ParseError))?;
+    Ok(FindingsGeoJsonExport {
+        export_id: normalized.export_id,
+        crs: normalized.crs,
+        feature_count: normalized.findings.len(),
+        exported_bytes,
+    })
+}
+
+pub fn export_findings_shapefile(
+    request: FindingsExportRequest,
+) -> Result<FindingsShapefileExport, InteropError> {
+    let normalized = normalize_findings_export_request(request)?;
+    let extent = findings_extent(&normalized.findings);
+    let shape_extent = extent.unwrap_or(InteropExtent {
+        min_x: 0.0,
+        min_y: 0.0,
+        max_x: 0.0,
+        max_y: 0.0,
+    });
+    let record_contents = normalized
+        .findings
+        .iter()
+        .map(|finding| {
+            let extent = extent_from_coordinates(&finding.polygon).expect("finding is normalized");
+            polygon_shapefile_record_content(&finding.polygon, extent)
+        })
+        .collect::<Vec<_>>();
+    let files = FindingsShapefileFiles {
+        shp: write_shp_bytes(shape_extent, &record_contents),
+        shx: write_shx_bytes(shape_extent, &record_contents),
+        dbf: write_findings_dbf(&normalized.findings),
+        prj: projection_wkt(&normalized.crs).into_bytes(),
+    };
+    Ok(FindingsShapefileExport {
+        export_id: normalized.export_id,
+        crs: normalized.crs,
+        feature_count: normalized.findings.len(),
+        extent,
+        files,
     })
 }
 
@@ -1047,6 +1157,55 @@ fn geometry_to_geojson(geometry: &ReprojectedGeometry) -> Value {
     Value::Object(object)
 }
 
+fn finding_geojson_feature(finding: &FindingsExportFeature) -> Value {
+    let mut properties = Map::new();
+    properties.insert(
+        "finding_id".to_string(),
+        Value::String(finding.finding_id.clone()),
+    );
+    properties.insert(
+        "zone_id".to_string(),
+        Value::String(finding.zone_id.clone()),
+    );
+    properties.insert("reason".to_string(), Value::String(finding.reason.clone()));
+    properties.insert(
+        "priority".to_string(),
+        Value::String(finding.priority.clone()),
+    );
+    properties.insert("area_m2".to_string(), Value::from(finding.area_m2));
+    properties.insert("centroid_x".to_string(), Value::from(finding.centroid.x));
+    properties.insert("centroid_y".to_string(), Value::from(finding.centroid.y));
+    properties.insert("crs".to_string(), Value::String(finding.crs.clone()));
+    properties.insert(
+        "evidence_refs".to_string(),
+        Value::Array(
+            finding
+                .evidence_refs
+                .iter()
+                .map(|value| Value::String(value.clone()))
+                .collect(),
+        ),
+    );
+    let mut geometry = Map::new();
+    geometry.insert("type".to_string(), Value::String("Polygon".to_string()));
+    geometry.insert(
+        "coordinates".to_string(),
+        Value::Array(vec![Value::Array(
+            finding
+                .polygon
+                .iter()
+                .map(|coordinate| coordinate_to_geojson(*coordinate))
+                .collect(),
+        )]),
+    );
+    let mut feature = Map::new();
+    feature.insert("type".to_string(), Value::String("Feature".to_string()));
+    feature.insert("id".to_string(), Value::String(finding.finding_id.clone()));
+    feature.insert("geometry".to_string(), Value::Object(geometry));
+    feature.insert("properties".to_string(), Value::Object(properties));
+    Value::Object(feature)
+}
+
 fn coordinate_to_geojson(coordinate: InteropCoordinate) -> Value {
     Value::Array(vec![Value::from(coordinate.x), Value::from(coordinate.y)])
 }
@@ -1083,6 +1242,75 @@ fn validate_raster_product(
     }
     assert_raster_spatial_ref(Some(&product.spatial_ref), product.width, product.height)
         .map_err(|error| raster_spatial_ref_rejection(filename, error))
+}
+
+fn normalize_findings_export_request(
+    mut request: FindingsExportRequest,
+) -> Result<FindingsExportRequest, InteropError> {
+    let export_id = normalized_filename(request.export_id.clone());
+    request.export_id = export_id.clone();
+    request.crs = normalize_crs(&request.crs)
+        .ok_or_else(|| rejected(&export_id, InteropRejectionReason::MissingCrs))?;
+    reject_unsupported_crs(&export_id, &request.crs)?;
+    for finding in &mut request.findings {
+        finding.finding_id = normalize_optional_text(&finding.finding_id)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::InvalidGeometry))?;
+        finding.zone_id = normalize_optional_text(&finding.zone_id)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::InvalidGeometry))?;
+        finding.reason = normalize_optional_text(&finding.reason)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::InvalidGeometry))?;
+        finding.priority = normalize_optional_text(&finding.priority)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::InvalidGeometry))?;
+        finding.crs = normalize_crs(&finding.crs)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::MissingCrs))?;
+        if finding.crs != request.crs {
+            return Err(rejected(
+                &export_id,
+                InteropRejectionReason::UnsupportedCrs {
+                    crs: finding.crs.clone(),
+                },
+            ));
+        }
+        if !finding.area_m2.is_finite()
+            || finding.area_m2 < 0.0
+            || !finding.centroid.x.is_finite()
+            || !finding.centroid.y.is_finite()
+        {
+            return Err(rejected(
+                &export_id,
+                InteropRejectionReason::InvalidGeometry,
+            ));
+        }
+        finding.evidence_refs = finding
+            .evidence_refs
+            .iter()
+            .filter_map(|value| normalize_optional_text(value))
+            .collect();
+        if finding.polygon.len() < 4
+            || finding
+                .polygon
+                .iter()
+                .any(|coordinate| !coordinate.x.is_finite() || !coordinate.y.is_finite())
+            || finding.polygon.first() != finding.polygon.last()
+            || extent_from_coordinates(&finding.polygon).is_none()
+        {
+            return Err(rejected(
+                &export_id,
+                InteropRejectionReason::InvalidGeometry,
+            ));
+        }
+    }
+    Ok(request)
+}
+
+fn findings_extent(findings: &[FindingsExportFeature]) -> Option<InteropExtent> {
+    let mut builder = ExtentBuilder::default();
+    for finding in findings {
+        for coordinate in &finding.polygon {
+            builder.observe(*coordinate);
+        }
+    }
+    builder.finish()
 }
 
 fn raster_spatial_ref_rejection(filename: &str, error: RasterSpatialRefError) -> InteropError {
@@ -1493,6 +1721,44 @@ fn write_prescription_dbf(zones: &[NormalizedPrescriptionZone]) -> Vec<u8> {
             fields[1].decimal_count,
         ));
         bytes.extend_from_slice(&dbf_character_value(&zone.unit, fields[2].length));
+    }
+    bytes.push(0x1A);
+    bytes
+}
+
+fn write_findings_dbf(findings: &[FindingsExportFeature]) -> Vec<u8> {
+    let fields = [
+        DbfField::character("FINDING_ID", 40),
+        DbfField::character("ZONE_ID", 32),
+        DbfField::character("REASON", 32),
+        DbfField::character("PRIORITY", 16),
+        DbfField::character("CRS", 24),
+    ];
+    let header_len = 32 + fields.len() * 32 + 1;
+    let record_len = 1 + fields
+        .iter()
+        .map(|field| field.length as usize)
+        .sum::<usize>();
+    let mut bytes = vec![0u8; 32];
+    bytes[0] = 0x03;
+    bytes[1] = 126;
+    bytes[2] = 6;
+    bytes[3] = 13;
+    bytes[4..8].copy_from_slice(&(findings.len() as u32).to_le_bytes());
+    bytes[8..10].copy_from_slice(&(header_len as u16).to_le_bytes());
+    bytes[10..12].copy_from_slice(&(record_len as u16).to_le_bytes());
+    for field in &fields {
+        bytes.extend_from_slice(&field.descriptor());
+    }
+    bytes.push(0x0D);
+
+    for finding in findings {
+        bytes.push(b' ');
+        bytes.extend_from_slice(&dbf_character_value(&finding.finding_id, fields[0].length));
+        bytes.extend_from_slice(&dbf_character_value(&finding.zone_id, fields[1].length));
+        bytes.extend_from_slice(&dbf_character_value(&finding.reason, fields[2].length));
+        bytes.extend_from_slice(&dbf_character_value(&finding.priority, fields[3].length));
+        bytes.extend_from_slice(&dbf_character_value(&finding.crs, fields[4].length));
     }
     bytes.push(0x1A);
     bytes
@@ -2382,7 +2648,9 @@ fn extract_geojson_crs(document: &Value) -> Option<String> {
 }
 
 fn reject_unsupported_crs(filename: &str, crs: &str) -> Result<(), InteropError> {
-    if crs.to_ascii_uppercase().contains("OBLIQUE") || !matches!(crs, WGS84 | WEB_MERCATOR) {
+    if crs.to_ascii_uppercase().contains("OBLIQUE")
+        || !(matches!(crs, WGS84 | WEB_MERCATOR) || epsg_utm_wkt(crs).is_some())
+    {
         return Err(rejected(
             filename,
             InteropRejectionReason::UnsupportedCrs {
@@ -2396,6 +2664,11 @@ fn reject_unsupported_crs(filename: &str, crs: &str) -> Result<(), InteropError>
 fn normalize_crs(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_ascii_uppercase())
+}
+
+fn normalize_optional_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn normalized_filename(filename: String) -> String {
@@ -2455,16 +2728,18 @@ impl ExtentBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_prescription_shapefile, export_prescription_taskdata, export_raster_geotiff,
-        import_field_boundary, pull_john_deere_boundaries, push_john_deere_prescription,
-        reopen_raster_geotiff, round_trip_vector_layer, validate_and_reproject_import,
-        validate_geopackage_layers, validate_taskdata_xml, CrsTransform,
-        FieldBoundaryImportRequest, FieldBoundaryRejectionReason, ImportFormat, ImportPayload,
-        InteropCoordinate, InteropError, InteropExtent, InteropRejectionReason, JohnDeereBoundary,
-        JohnDeereConnectorEndpoint, JohnDeereConnectorError, JohnDeereEndpointError,
-        JohnDeerePrescriptionPushRequest, JohnDeereRetryPolicy, JohnDeereUploadPayload,
-        PrescriptionField, PrescriptionRejectionReason, PrescriptionShapefileRequest,
-        PrescriptionZone, RasterProduct, RemotePrescriptionReceipt, ReprojectedGeometry,
+        export_findings_geojson, export_findings_shapefile, export_prescription_shapefile,
+        export_prescription_taskdata, export_raster_geotiff, import_field_boundary,
+        pull_john_deere_boundaries, push_john_deere_prescription, reopen_raster_geotiff,
+        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
+        validate_taskdata_xml, CrsTransform, FieldBoundaryImportRequest,
+        FieldBoundaryRejectionReason, FindingsExportFeature, FindingsExportRequest, ImportFormat,
+        ImportPayload, InteropCoordinate, InteropError, InteropExtent, InteropRejectionReason,
+        JohnDeereBoundary, JohnDeereConnectorEndpoint, JohnDeereConnectorError,
+        JohnDeereEndpointError, JohnDeerePrescriptionPushRequest, JohnDeereRetryPolicy,
+        JohnDeereUploadPayload, PrescriptionField, PrescriptionRejectionReason,
+        PrescriptionShapefileRequest, PrescriptionZone, RasterProduct, RemotePrescriptionReceipt,
+        ReprojectedGeometry,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -2639,6 +2914,75 @@ mod tests {
                 filename: "ndvi-alpha".to_string(),
                 reason: InteropRejectionReason::MissingRasterTransform
             }
+        );
+    }
+
+    #[test]
+    fn findings_geojson_export_preserves_crs_and_schema() {
+        let report = export_findings_geojson(findings_request(vec![finding_feature("finding-1")]))
+            .expect("findings GeoJSON should export");
+        let document: serde_json::Value =
+            serde_json::from_slice(&report.exported_bytes).expect("GeoJSON should parse");
+
+        assert_eq!(report.crs, "EPSG:32614");
+        assert_eq!(report.feature_count, 1);
+        assert_eq!(document["type"], "FeatureCollection");
+        assert_eq!(
+            document
+                .pointer("/crs/properties/name")
+                .and_then(|value| value.as_str()),
+            Some("EPSG:32614")
+        );
+        assert_eq!(
+            document.pointer("/features/0/properties/finding_id"),
+            Some(&serde_json::json!("finding-1"))
+        );
+        assert_eq!(
+            document.pointer("/features/0/geometry/type"),
+            Some(&serde_json::json!("Polygon"))
+        );
+    }
+
+    #[test]
+    fn findings_shapefile_export_writes_consistent_bundle() {
+        let report =
+            export_findings_shapefile(findings_request(vec![finding_feature("finding-1")]))
+                .expect("findings shapefile should export");
+
+        assert_eq!(report.crs, "EPSG:32614");
+        assert_eq!(report.feature_count, 1);
+        assert_eq!(report.extent.expect("extent").min_x, 500_000.0);
+        assert_shapefile_files_consistent(
+            &report.files.shp,
+            &report.files.shx,
+            &report.files.dbf,
+            &report.files.prj,
+            1,
+        );
+    }
+
+    #[test]
+    fn empty_findings_exports_are_valid_empty_geojson_and_shapefile() {
+        let geojson =
+            export_findings_geojson(findings_request(Vec::new())).expect("empty GeoJSON exports");
+        let document: serde_json::Value =
+            serde_json::from_slice(&geojson.exported_bytes).expect("GeoJSON should parse");
+        assert_eq!(geojson.feature_count, 0);
+        assert!(document["features"]
+            .as_array()
+            .expect("features")
+            .is_empty());
+
+        let shapefile = export_findings_shapefile(findings_request(Vec::new()))
+            .expect("empty shapefile exports");
+        assert_eq!(shapefile.feature_count, 0);
+        assert_eq!(shapefile.extent, None);
+        assert_shapefile_files_consistent(
+            &shapefile.files.shp,
+            &shapefile.files.shx,
+            &shapefile.files.dbf,
+            &shapefile.files.prj,
+            0,
         );
     }
 
@@ -3327,6 +3671,28 @@ mod tests {
         u32::from_le_bytes(bytes[4..8].try_into().expect("dbf count bytes"))
     }
 
+    fn assert_shapefile_files_consistent(
+        shp: &[u8],
+        shx: &[u8],
+        dbf: &[u8],
+        prj: &[u8],
+        records: u32,
+    ) {
+        assert_eq!(be_i32(shp, 24) as usize * 2, shp.len());
+        assert_eq!(be_i32(shx, 24) as usize * 2, shx.len());
+        assert_eq!(le_i32(shp, 32), 5);
+        assert_eq!(le_i32(shx, 32), 5);
+        assert_eq!(shx.len(), 100 + records as usize * 8);
+        assert_eq!(dbf_record_count(dbf), records);
+        assert!(String::from_utf8_lossy(prj).contains("WGS") || !prj.is_empty());
+        let dbf_header_len = le_u16(dbf, 8) as usize;
+        let dbf_record_len = le_u16(dbf, 10) as usize;
+        assert_eq!(
+            dbf.len(),
+            dbf_header_len + dbf_record_len * records as usize + 1
+        );
+    }
+
     fn assert_shapefile_bundle_consistent(files: &super::PrescriptionShapefileFiles, records: u32) {
         assert_eq!(be_i32(&files.shp, 24) as usize * 2, files.shp.len());
         assert_eq!(be_i32(&files.shx, 24) as usize * 2, files.shx.len());
@@ -3353,6 +3719,52 @@ mod tests {
             shp_offset_words += 4 + content_length_words;
         }
         assert_eq!(shp_offset_words as usize * 2, files.shp.len());
+    }
+
+    fn findings_request(findings: Vec<FindingsExportFeature>) -> FindingsExportRequest {
+        FindingsExportRequest {
+            export_id: "findings-export".to_string(),
+            crs: "EPSG:32614".to_string(),
+            findings,
+        }
+    }
+
+    fn finding_feature(finding_id: &str) -> FindingsExportFeature {
+        FindingsExportFeature {
+            finding_id: finding_id.to_string(),
+            zone_id: "zone-1".to_string(),
+            reason: "below_absolute_threshold".to_string(),
+            priority: "high".to_string(),
+            area_m2: 3_000.0,
+            centroid: InteropCoordinate {
+                x: 500_010.0,
+                y: 4_500_015.0,
+            },
+            crs: "EPSG:32614".to_string(),
+            polygon: vec![
+                InteropCoordinate {
+                    x: 500_000.0,
+                    y: 4_500_020.0,
+                },
+                InteropCoordinate {
+                    x: 500_020.0,
+                    y: 4_500_020.0,
+                },
+                InteropCoordinate {
+                    x: 500_020.0,
+                    y: 4_500_010.0,
+                },
+                InteropCoordinate {
+                    x: 500_000.0,
+                    y: 4_500_010.0,
+                },
+                InteropCoordinate {
+                    x: 500_000.0,
+                    y: 4_500_020.0,
+                },
+            ],
+            evidence_refs: vec!["zone:zone-1".to_string(), "layer:ndvi".to_string()],
+        }
     }
 
     fn first_shp_polygon(bytes: &[u8]) -> Vec<InteropCoordinate> {
