@@ -2876,6 +2876,26 @@ pub struct WeatherForecastRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherFieldForecastResolutionRequest {
+    pub field_id: String,
+    #[serde(default)]
+    pub boundary: Option<FieldBoundary>,
+    pub forecast_location: GeoPoint,
+    pub forecast_crs: String,
+    pub records: Vec<WeatherForecastRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherFieldForecastResolution {
+    pub field_id: String,
+    pub forecast_location: GeoPoint,
+    pub field_centroid: GeoPoint,
+    pub field_crs: String,
+    pub records: Vec<WeatherForecastRecord>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherProviderForecastPoint {
     pub valid_time: String,
     pub temperature_celsius: f64,
@@ -2919,6 +2939,29 @@ pub enum WeatherIngestError {
     EmptyFailureId,
     #[error("weather failure reason cannot be empty")]
     EmptyFailureReason,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum WeatherFieldForecastResolutionError {
+    #[error("weather field forecast field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("weather field forecast has no field geometry")]
+    NoFieldGeometry,
+    #[error("weather field forecast forecast_crs cannot be empty")]
+    EmptyForecastCrs,
+    #[error("weather field forecast contains no records")]
+    EmptyForecastRecords,
+    #[error("weather field forecast CRS mismatch: forecast {forecast_crs} != field {field_crs}")]
+    CrsMismatch {
+        forecast_crs: String,
+        field_crs: String,
+    },
+    #[error("weather field forecast location contains invalid coordinates")]
+    InvalidForecastLocation,
+    #[error("weather field forecast location is outside the field boundary")]
+    ForecastOutsideField,
+    #[error(transparent)]
+    InvalidBoundary(#[from] FieldBoundaryValidationError),
 }
 
 pub fn normalize_weather_provider_forecast(
@@ -2997,6 +3040,71 @@ pub fn normalize_weather_provider_forecast(
             })
         })
         .collect()
+}
+
+pub fn resolve_weather_forecast_to_field(
+    request: WeatherFieldForecastResolutionRequest,
+) -> Result<WeatherFieldForecastResolution, WeatherFieldForecastResolutionError> {
+    let field_id = normalize_weather_text(request.field_id)
+        .ok_or(WeatherFieldForecastResolutionError::EmptyFieldId)?;
+    let forecast_crs = normalize_weather_text(request.forecast_crs)
+        .ok_or(WeatherFieldForecastResolutionError::EmptyForecastCrs)?;
+    if request.records.is_empty() {
+        return Err(WeatherFieldForecastResolutionError::EmptyForecastRecords);
+    }
+    if !request.forecast_location.longitude.is_finite()
+        || !request.forecast_location.latitude.is_finite()
+    {
+        return Err(WeatherFieldForecastResolutionError::InvalidForecastLocation);
+    }
+    let boundary = request
+        .boundary
+        .ok_or(WeatherFieldForecastResolutionError::NoFieldGeometry)?;
+    let validated = validate_field_boundary(&boundary)?;
+    let field_crs = validated
+        .boundary
+        .crs
+        .clone()
+        .ok_or(FieldBoundaryValidationError::MissingCrs)?;
+    if forecast_crs != field_crs {
+        return Err(WeatherFieldForecastResolutionError::CrsMismatch {
+            forecast_crs,
+            field_crs,
+        });
+    }
+    if !tractor_point_inside_bounds(&request.forecast_location, &validated.extent)
+        || !tractor_point_inside_polygon(
+            &request.forecast_location,
+            &validated.boundary.coordinates,
+        )
+    {
+        return Err(WeatherFieldForecastResolutionError::ForecastOutsideField);
+    }
+
+    let records = request
+        .records
+        .into_iter()
+        .map(|mut record| {
+            record.field_ref = field_id.clone();
+            record
+        })
+        .collect();
+    let field_centroid = GeoPoint {
+        longitude: (validated.extent.min_lon + validated.extent.max_lon) / 2.0,
+        latitude: (validated.extent.min_lat + validated.extent.max_lat) / 2.0,
+    };
+
+    Ok(WeatherFieldForecastResolution {
+        field_id,
+        forecast_location: request.forecast_location,
+        field_centroid,
+        field_crs,
+        records,
+        evidence_refs: vec![
+            "field_boundary:validated".to_string(),
+            "forecast_location:inside_field".to_string(),
+        ],
+    })
 }
 
 pub fn weather_fetch_failure_record(
@@ -7513,7 +7621,8 @@ mod tests {
         dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
         evaluate_tractor_motion_gate, evaluate_tractor_weather_window_gate,
         execute_tractor_prescription, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        plan_tractor_swath_coverage, resolve_weather_forecast_to_field,
+        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
@@ -7553,10 +7662,11 @@ mod tests {
         TractorPrescriptionExecutionError, TractorPrescriptionExecutionRequest,
         TractorPrescriptionZone, TractorRegistrationRequest, TractorRegistry,
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
-        TractorWeatherWindowDecision, TractorWeatherWindowGateRequest, WeatherIngestError,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
-        WorkOrderRegistry, WorkOrderStatus,
+        TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
+        WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
+        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
+        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
+        WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -9227,6 +9337,75 @@ mod tests {
     }
 
     #[test]
+    fn weather_field_forecast_resolution_keys_records_on_field_boundary() {
+        let resolution =
+            resolve_weather_forecast_to_field(weather_field_resolution_request(Some((
+                tractor_swath_rectangle(0.0, 0.0, 10.0, 10.0, "EPSG:4326"),
+                GeoPoint {
+                    longitude: 5.0,
+                    latitude: 5.0,
+                },
+                "EPSG:4326",
+            ))))
+            .expect("forecast location inside field should resolve");
+
+        assert_eq!(resolution.field_id, "field-north");
+        assert_eq!(resolution.field_crs, "EPSG:4326");
+        assert_eq!(resolution.records.len(), 1);
+        assert_eq!(resolution.records[0].field_ref, "field-north");
+        assert_eq!(resolution.field_centroid.longitude, 5.0);
+        assert!(resolution
+            .evidence_refs
+            .contains(&"forecast_location:inside_field".to_string()));
+    }
+
+    #[test]
+    fn weather_field_forecast_resolution_requires_field_geometry() {
+        let error = resolve_weather_forecast_to_field(weather_field_resolution_request(None))
+            .expect_err("missing field boundary must fail explicitly");
+
+        assert_eq!(error, WeatherFieldForecastResolutionError::NoFieldGeometry);
+    }
+
+    #[test]
+    fn weather_field_forecast_resolution_rejects_crs_or_location_mismatch() {
+        let crs_error =
+            resolve_weather_forecast_to_field(weather_field_resolution_request(Some((
+                tractor_swath_rectangle(0.0, 0.0, 10.0, 10.0, "EPSG:4326"),
+                GeoPoint {
+                    longitude: 5.0,
+                    latitude: 5.0,
+                },
+                "EPSG:3857",
+            ))))
+            .expect_err("forecast CRS must match field CRS");
+
+        assert_eq!(
+            crs_error,
+            WeatherFieldForecastResolutionError::CrsMismatch {
+                forecast_crs: "EPSG:3857".to_string(),
+                field_crs: "EPSG:4326".to_string()
+            }
+        );
+
+        let outside_error =
+            resolve_weather_forecast_to_field(weather_field_resolution_request(Some((
+                tractor_swath_rectangle(0.0, 0.0, 10.0, 10.0, "EPSG:4326"),
+                GeoPoint {
+                    longitude: 20.0,
+                    latitude: 20.0,
+                },
+                "EPSG:4326",
+            ))))
+            .expect_err("forecast location outside field must fail");
+
+        assert_eq!(
+            outside_error,
+            WeatherFieldForecastResolutionError::ForecastOutsideField
+        );
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -9764,6 +9943,43 @@ mod tests {
                 halted: false,
                 event: None,
             },
+        }
+    }
+
+    fn weather_field_resolution_request(
+        field_geometry: Option<(FieldBoundary, GeoPoint, &str)>,
+    ) -> WeatherFieldForecastResolutionRequest {
+        let (boundary, forecast_location, forecast_crs) = field_geometry
+            .map(|(boundary, location, crs)| (Some(boundary), location, crs.to_string()))
+            .unwrap_or((
+                None,
+                GeoPoint {
+                    longitude: 5.0,
+                    latitude: 5.0,
+                },
+                "EPSG:4326".to_string(),
+            ));
+        WeatherFieldForecastResolutionRequest {
+            field_id: "field-north".to_string(),
+            boundary,
+            forecast_location,
+            forecast_crs,
+            records: normalize_weather_provider_forecast(
+                "station-alpha".to_string(),
+                WeatherProviderForecastResponse {
+                    source: "NOAA-HRRR".to_string(),
+                    fetched_at: "2026-06-13T10:00:00Z".to_string(),
+                    points: vec![WeatherProviderForecastPoint {
+                        valid_time: "2026-06-13T11:00:00Z".to_string(),
+                        temperature_celsius: 22.5,
+                        wind_speed_mps: 4.2,
+                        precipitation_mm: 0.1,
+                        humidity_percent: 64.0,
+                        radiation_w_m2: 720.0,
+                    }],
+                },
+            )
+            .expect("weather fixture should normalize"),
         }
     }
 
