@@ -3148,6 +3148,59 @@ pub enum WaterEvapotranspirationError {
     Weather(#[from] WeatherReferenceEtError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaterNeedZone {
+    pub zone_ref: String,
+    pub crs: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoneWaterNeedRequest {
+    pub field_ref: String,
+    pub crs: String,
+    pub zones: Vec<WaterNeedZone>,
+    pub soil_readings: Vec<SoilMoistureReadingRecord>,
+    pub moisture_proxies: Vec<RemoteSensingMoistureProxyRecord>,
+    pub evapotranspiration: WaterEvapotranspiration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoneWaterNeedStatus {
+    Computed,
+    InsufficientEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoneWaterNeed {
+    pub field_ref: String,
+    pub zone_ref: String,
+    pub crs: String,
+    pub status: ZoneWaterNeedStatus,
+    #[serde(default)]
+    pub water_need_mm: Option<f64>,
+    pub evidence_refs: Vec<String>,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ZoneWaterNeedError {
+    #[error("zone water need field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("zone water need CRS cannot be empty")]
+    EmptyCrs,
+    #[error("zone water need zone_ref cannot be empty")]
+    EmptyZoneRef,
+    #[error("zone water need requires at least one zone")]
+    MissingZones,
+    #[error("zone water need CRS mismatch for {zone_ref}: zone {zone_crs}, request {request_crs}")]
+    CrsMismatch {
+        zone_ref: String,
+        zone_crs: String,
+        request_crs: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WeatherReferenceEtStatus {
@@ -4448,6 +4501,114 @@ fn water_et_insufficient(
         method,
         input_refs: Vec::new(),
         degradation_reasons,
+    }
+}
+
+pub fn map_zone_water_need(
+    request: ZoneWaterNeedRequest,
+) -> Result<Vec<ZoneWaterNeed>, ZoneWaterNeedError> {
+    let field_ref =
+        normalize_weather_text(request.field_ref).ok_or(ZoneWaterNeedError::EmptyFieldRef)?;
+    let request_crs = normalize_weather_text(request.crs).ok_or(ZoneWaterNeedError::EmptyCrs)?;
+    if request.zones.is_empty() {
+        return Err(ZoneWaterNeedError::MissingZones);
+    }
+
+    let crop_et = request.evapotranspiration.crop_et_mm_day;
+    let et_ready = request.evapotranspiration.status == WaterEvapotranspirationStatus::Computed;
+    let mut results = Vec::with_capacity(request.zones.len());
+    for zone in request.zones {
+        let zone_ref =
+            normalize_weather_text(zone.zone_ref).ok_or(ZoneWaterNeedError::EmptyZoneRef)?;
+        let zone_crs = normalize_weather_text(zone.crs).ok_or(ZoneWaterNeedError::EmptyCrs)?;
+        if zone_crs != request_crs {
+            return Err(ZoneWaterNeedError::CrsMismatch {
+                zone_ref,
+                zone_crs,
+                request_crs,
+            });
+        }
+
+        let evidence =
+            zone_moisture_evidence(&zone_ref, &request.soil_readings, &request.moisture_proxies);
+        let Some((moisture_fraction, evidence_refs)) = evidence else {
+            results.push(zone_water_need_insufficient(
+                &field_ref,
+                &zone_ref,
+                &request_crs,
+                "missing_moisture_evidence",
+            ));
+            continue;
+        };
+        let Some(crop_et_mm_day) = crop_et.filter(|value| et_ready && value.is_finite()) else {
+            results.push(zone_water_need_insufficient(
+                &field_ref,
+                &zone_ref,
+                &request_crs,
+                "missing_et_evidence",
+            ));
+            continue;
+        };
+        let water_need_mm = (crop_et_mm_day * (1.0 - moisture_fraction)).max(0.0);
+        let mut evidence_refs = evidence_refs;
+        evidence_refs.extend(request.evapotranspiration.input_refs.clone());
+        results.push(ZoneWaterNeed {
+            field_ref: field_ref.clone(),
+            zone_ref,
+            crs: request_crs.clone(),
+            status: ZoneWaterNeedStatus::Computed,
+            water_need_mm: Some(water_need_mm),
+            evidence_refs,
+            reason_code: "computed_from_moisture_and_et".to_string(),
+        });
+    }
+
+    Ok(results)
+}
+
+fn zone_moisture_evidence(
+    zone_ref: &str,
+    soil_readings: &[SoilMoistureReadingRecord],
+    moisture_proxies: &[RemoteSensingMoistureProxyRecord],
+) -> Option<(f64, Vec<String>)> {
+    soil_readings
+        .iter()
+        .find(|reading| {
+            reading.zone_ref == zone_ref && reading.qa_flag != SoilMoistureQaFlag::Invalid
+        })
+        .map(|reading| {
+            (
+                (reading.value / 100.0).clamp(0.0, 1.0),
+                vec![format!("soil_moisture:{}", reading.reading_id)],
+            )
+        })
+        .or_else(|| {
+            moisture_proxies
+                .iter()
+                .find(|proxy| proxy.zone_ref == zone_ref)
+                .map(|proxy| {
+                    (
+                        ((proxy.value + 1.0) / 2.0).clamp(0.0, 1.0),
+                        vec![format!("moisture_proxy:{}", proxy.proxy_id)],
+                    )
+                })
+        })
+}
+
+fn zone_water_need_insufficient(
+    field_ref: &str,
+    zone_ref: &str,
+    crs: &str,
+    reason_code: &str,
+) -> ZoneWaterNeed {
+    ZoneWaterNeed {
+        field_ref: field_ref.to_string(),
+        zone_ref: zone_ref.to_string(),
+        crs: crs.to_string(),
+        status: ZoneWaterNeedStatus::InsufficientEvidence,
+        water_need_mm: None,
+        evidence_refs: Vec::new(),
+        reason_code: reason_code.to_string(),
     }
 }
 
@@ -9607,9 +9768,9 @@ mod tests {
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_tractor_prescription,
         ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
-        normalize_weather_provider_forecast, plan_tractor_swath_coverage, query_irrigation_history,
-        query_weather_history, resolve_weather_forecast_to_field, route_weather_alert,
-        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        map_zone_water_need, normalize_weather_provider_forecast, plan_tractor_swath_coverage,
+        query_irrigation_history, query_weather_history, resolve_weather_forecast_to_field,
+        route_weather_alert, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
@@ -9653,7 +9814,7 @@ mod tests {
         TractorPrescriptionZone, TractorRegistrationRequest, TractorRegistry,
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
         TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
-        WaterEvapotranspirationRequest, WaterEvapotranspirationStatus,
+        WaterEvapotranspirationRequest, WaterEvapotranspirationStatus, WaterNeedZone,
         WaterWeatherInputContractRequest, WaterWeatherInputStatus, WeatherAlertDeliveryStatus,
         WeatherAlertRouteTarget, WeatherAlertRoutingRequest, WeatherAlertRoutingTarget,
         WeatherCropStageRiskRequest, WeatherCropStageThresholdSet,
@@ -9666,7 +9827,8 @@ mod tests {
         WeatherReferenceEtStatus, WeatherRiskThresholds, WeatherRiskType, WeatherSensorIngestError,
         WeatherSensorSample, WeatherSensorStreamIngestRequest, WorkOrderChangeType,
         WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
-        WorkOrderRegistry, WorkOrderStatus,
+        WorkOrderRegistry, WorkOrderStatus, ZoneWaterNeedError, ZoneWaterNeedRequest,
+        ZoneWaterNeedStatus,
     };
 
     #[test]
@@ -11879,6 +12041,46 @@ mod tests {
     }
 
     #[test]
+    fn zone_water_need_maps_proxy_moisture_and_et_per_zone() {
+        let request = zone_water_need_request(false);
+
+        let needs = map_zone_water_need(request).expect("zone water need should map");
+
+        assert_eq!(needs.len(), 2);
+        assert_eq!(needs[0].zone_ref, "zone:north");
+        assert_eq!(needs[0].status, ZoneWaterNeedStatus::Computed);
+        assert!((needs[0].water_need_mm.expect("need should compute") - 2.49289916).abs() < 1e-6);
+        assert_eq!(needs[0].crs, "EPSG:4326");
+        assert_eq!(needs[0].reason_code, "computed_from_moisture_and_et");
+        assert!(needs[0]
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("moisture_proxy:moisture-proxy")));
+        assert!(needs[0]
+            .evidence_refs
+            .contains(&"temperature_celsius:2026-06-13T10:00:00Z".to_string()));
+        assert_eq!(needs[1].zone_ref, "zone:missing");
+        assert_eq!(needs[1].status, ZoneWaterNeedStatus::InsufficientEvidence);
+        assert_eq!(needs[1].water_need_mm, None);
+        assert_eq!(needs[1].reason_code, "missing_moisture_evidence");
+    }
+
+    #[test]
+    fn zone_water_need_rejects_zone_crs_mismatch() {
+        let error = map_zone_water_need(zone_water_need_request(true))
+            .expect_err("zone CRS mismatch should reject");
+
+        assert_eq!(
+            error,
+            ZoneWaterNeedError::CrsMismatch {
+                zone_ref: "zone:north".to_string(),
+                zone_crs: "EPSG:3857".to_string(),
+                request_crs: "EPSG:4326".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn weather_alert_routing_delivers_owned_field_to_console_and_portal() {
         let result = route_weather_alert(weather_alert_routing_request(vec![
             WeatherAlertRoutingTarget {
@@ -12897,6 +13099,45 @@ mod tests {
                 22.0,
                 stale,
             )],
+        }
+    }
+
+    fn zone_water_need_request(crs_mismatch: bool) -> ZoneWaterNeedRequest {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+        let moisture_proxies =
+            ingest_remote_sensing_moisture_proxy_layer(moisture_proxy_layer("EPSG:4326"), &field)
+                .expect("proxy fixture should ingest");
+        let weather =
+            validate_water_weather_input_contract(water_weather_input_contract_request(false))
+                .expect("fresh weather input contract should validate");
+        let evapotranspiration = compute_water_evapotranspiration(WaterEvapotranspirationRequest {
+            weather,
+            crop_coefficient: Some(1.15),
+        })
+        .expect("water ET fixture should compute");
+
+        ZoneWaterNeedRequest {
+            field_ref: " field-north ".to_string(),
+            crs: " EPSG:4326 ".to_string(),
+            zones: vec![
+                WaterNeedZone {
+                    zone_ref: " zone:north ".to_string(),
+                    crs: if crs_mismatch {
+                        "EPSG:3857".to_string()
+                    } else {
+                        "EPSG:4326".to_string()
+                    },
+                },
+                WaterNeedZone {
+                    zone_ref: "zone:missing".to_string(),
+                    crs: "EPSG:4326".to_string(),
+                },
+            ],
+            soil_readings: Vec::new(),
+            moisture_proxies,
+            evapotranspiration,
         }
     }
 
