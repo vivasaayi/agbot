@@ -338,6 +338,40 @@ pub struct MapLayerDescriptor {
     pub sandbox_outcome: SandboxExecutionOutcome,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertRuleAction {
+    EmitFinding,
+    DispatchNotification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertRuleEvaluationRequest {
+    pub plugin_id: String,
+    pub rule_id: String,
+    pub event_ref: String,
+    pub inputs: BTreeMap<String, String>,
+    pub attempted_actions: Vec<AlertRuleAction>,
+    pub required_capabilities: Vec<String>,
+    pub estimated_runtime_ms: u64,
+    pub estimated_memory_mb: u64,
+    pub finding_ref: String,
+    pub severity: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertRuleFinding {
+    pub finding_ref: String,
+    pub rule_id: String,
+    pub event_ref: String,
+    pub severity: String,
+    pub message: String,
+    pub inputs: BTreeMap<String, String>,
+    pub plugin_identity: PluginInvocationIdentity,
+    pub sandbox_outcome: SandboxExecutionOutcome,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SpectralIndexInvocationError {
     #[error("unknown plugin: {plugin_id}")]
@@ -354,6 +388,22 @@ pub enum SpectralIndexInvocationError {
     },
     #[error("scene spatial reference rejected: {0}")]
     InvalidSpatialRef(#[from] RasterSpatialRefError),
+    #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
+    SandboxTerminated {
+        plugin_id: String,
+        reason: Option<SandboxTerminationReason>,
+        outcome: SandboxExecutionOutcome,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum AlertRuleInvocationError {
+    #[error("unknown plugin: {plugin_id}")]
+    UnknownPlugin { plugin_id: String },
+    #[error("plugin {plugin_id} is not an alert-rule extension point")]
+    WrongExtensionPoint { plugin_id: String },
+    #[error("alert rule {rule_id} attempted direct notification dispatch")]
+    DirectDispatchDenied { rule_id: String },
     #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
     SandboxTerminated {
         plugin_id: String,
@@ -998,6 +1048,73 @@ impl PluginHost {
         })
     }
 
+    pub fn evaluate_alert_rule(
+        &mut self,
+        request: AlertRuleEvaluationRequest,
+        limits: PluginExecutionLimits,
+        attempted_at: &str,
+    ) -> Result<AlertRuleFinding, AlertRuleInvocationError> {
+        let (plugin_id, plugin_version) = self
+            .plugin_version_for_kind(&request.plugin_id, ExtensionPointKind::AlertRule)
+            .map_err(|error| match error {
+                PluginKindLookupError::UnknownPlugin { plugin_id } => {
+                    AlertRuleInvocationError::UnknownPlugin { plugin_id }
+                }
+                PluginKindLookupError::WrongExtensionPoint { plugin_id } => {
+                    AlertRuleInvocationError::WrongExtensionPoint { plugin_id }
+                }
+            })?;
+
+        if request
+            .attempted_actions
+            .iter()
+            .any(|action| *action == AlertRuleAction::DispatchNotification)
+        {
+            return Err(AlertRuleInvocationError::DirectDispatchDenied {
+                rule_id: request.rule_id,
+            });
+        }
+
+        let outcome = self.execute_sandboxed(
+            PluginExecutionPlan {
+                plugin_id: plugin_id.clone(),
+                required_capabilities: request.required_capabilities.clone(),
+                estimated_runtime_ms: request.estimated_runtime_ms,
+                estimated_memory_mb: request.estimated_memory_mb,
+                result: format!(
+                    "alert finding {finding_ref} from {rule_id}",
+                    finding_ref = request.finding_ref,
+                    rule_id = request.rule_id
+                ),
+            },
+            limits,
+            attempted_at,
+        );
+        if outcome.status != SandboxExecutionStatus::Completed {
+            return Err(AlertRuleInvocationError::SandboxTerminated {
+                plugin_id,
+                reason: outcome.termination_reason,
+                outcome,
+            });
+        }
+
+        Ok(AlertRuleFinding {
+            finding_ref: request.finding_ref,
+            rule_id: request.rule_id.clone(),
+            event_ref: request.event_ref,
+            severity: request.severity,
+            message: request.message,
+            inputs: request.inputs,
+            plugin_identity: PluginInvocationIdentity {
+                plugin_id,
+                plugin_version,
+                extension_point: ExtensionPointKind::AlertRule,
+                invocation_ref: request.rule_id,
+            },
+            sandbox_outcome: outcome,
+        })
+    }
+
     fn plugin_version_for_kind(
         &self,
         plugin_id: &str,
@@ -1309,13 +1426,14 @@ fn normalize_optional_text(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityDecision, CapabilityViolationReason, CustomProcessorRequest, ManifestField,
-        ManifestRejectionReason, MapLayerInvocationError, MapLayerRenderRequest,
-        PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginLifecycleStatus,
-        PluginLifecycleTransitionRequest, PluginRegistrationError, RawPluginManifest,
-        ReportTemplateRenderRequest, SandboxExecutionStatus, SandboxTerminationReason,
-        SpectralBandOperand, SpectralIndexFormula, SpectralIndexInvocationError,
-        SpectralIndexPluginSpec, SpectralIndexScene,
+        AlertRuleAction, AlertRuleEvaluationRequest, AlertRuleInvocationError, CapabilityDecision,
+        CapabilityViolationReason, CustomProcessorRequest, ManifestField, ManifestRejectionReason,
+        MapLayerInvocationError, MapLayerRenderRequest, PluginExecutionLimits, PluginExecutionPlan,
+        PluginHost, PluginLifecycleStatus, PluginLifecycleTransitionRequest,
+        PluginRegistrationError, RawPluginManifest, ReportTemplateRenderRequest,
+        SandboxExecutionStatus, SandboxTerminationReason, SpectralBandOperand,
+        SpectralIndexFormula, SpectralIndexInvocationError, SpectralIndexPluginSpec,
+        SpectralIndexScene,
     };
     use shared::plugin_extensions::ExtensionPointKind;
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError};
@@ -1897,6 +2015,66 @@ mod tests {
     }
 
     #[test]
+    fn custom_alert_rule_evaluates_to_deterministic_finding() {
+        let mut host = PluginHost::default();
+        host.register_plugin(alert_rule_manifest())
+            .expect("alert rule should register");
+        enable_plugin(&mut host, "plugin.low_vigor_alert");
+
+        let finding = host
+            .evaluate_alert_rule(
+                alert_rule_request(vec![AlertRuleAction::EmitFinding]),
+                sandbox_limits(),
+                "2026-06-12T12:55:00Z",
+            )
+            .expect("alert rule should evaluate");
+
+        assert_eq!(finding.finding_ref, "alert-finding:low-vigor:north");
+        assert_eq!(finding.rule_id, "rule:low-vigor");
+        assert_eq!(finding.severity, "warning");
+        assert_eq!(
+            finding.inputs.get("mean_ndvi").map(String::as_str),
+            Some("0.21")
+        );
+        assert_eq!(finding.plugin_identity.plugin_id, "plugin.low_vigor_alert");
+        assert_eq!(
+            finding.plugin_identity.extension_point,
+            ExtensionPointKind::AlertRule
+        );
+        assert_eq!(
+            finding.sandbox_outcome.status,
+            SandboxExecutionStatus::Completed
+        );
+    }
+
+    #[test]
+    fn custom_alert_rule_direct_notification_dispatch_is_denied() {
+        let mut host = PluginHost::default();
+        host.register_plugin(alert_rule_manifest())
+            .expect("alert rule should register");
+        enable_plugin(&mut host, "plugin.low_vigor_alert");
+
+        let error = host
+            .evaluate_alert_rule(
+                alert_rule_request(vec![
+                    AlertRuleAction::EmitFinding,
+                    AlertRuleAction::DispatchNotification,
+                ]),
+                sandbox_limits(),
+                "2026-06-12T12:56:00Z",
+            )
+            .expect_err("alert rule must not dispatch notifications");
+
+        assert_eq!(
+            error,
+            AlertRuleInvocationError::DirectDispatchDenied {
+                rule_id: "rule:low-vigor".to_string(),
+            }
+        );
+        assert!(host.capability_audit_entries().is_empty());
+    }
+
+    #[test]
     fn compatible_host_api_version_registers_within_supported_range() {
         let mut host = PluginHost::with_supported_host_api_range("2026.1", "2026.3")
             .expect("range should be valid");
@@ -1991,6 +2169,18 @@ mod tests {
             host_api_version: "2026.1".to_string(),
             capabilities: vec!["read:layer".to_string(), "render:map".to_string()],
             entrypoint: "map_overlay::layer".to_string(),
+        }
+    }
+
+    fn alert_rule_manifest() -> RawPluginManifest {
+        RawPluginManifest {
+            plugin_id: "plugin.low_vigor_alert".to_string(),
+            name: "Low Vigor Alert".to_string(),
+            version: "1.1.0".to_string(),
+            kind: "alert_rule".to_string(),
+            host_api_version: "2026.1".to_string(),
+            capabilities: vec!["read:finding_input".to_string(), "emit:finding".to_string()],
+            entrypoint: "low_vigor_alert::evaluate".to_string(),
         }
     }
 
@@ -2136,6 +2326,28 @@ mod tests {
             required_capabilities: vec!["read:layer".to_string(), "render:map".to_string()],
             estimated_runtime_ms: 20,
             estimated_memory_mb: 64,
+        }
+    }
+
+    fn alert_rule_request(attempted_actions: Vec<AlertRuleAction>) -> AlertRuleEvaluationRequest {
+        let mut inputs = BTreeMap::new();
+        inputs.insert("mean_ndvi".to_string(), "0.21".to_string());
+        inputs.insert("field_ref".to_string(), "field:north".to_string());
+        AlertRuleEvaluationRequest {
+            plugin_id: "plugin.low_vigor_alert".to_string(),
+            rule_id: "rule:low-vigor".to_string(),
+            event_ref: "event:index-finding:north".to_string(),
+            inputs,
+            attempted_actions,
+            required_capabilities: vec![
+                "read:finding_input".to_string(),
+                "emit:finding".to_string(),
+            ],
+            estimated_runtime_ms: 15,
+            estimated_memory_mb: 32,
+            finding_ref: "alert-finding:low-vigor:north".to_string(),
+            severity: "warning".to_string(),
+            message: "Mean NDVI is below the partner threshold".to_string(),
         }
     }
 
