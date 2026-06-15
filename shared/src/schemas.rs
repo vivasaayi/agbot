@@ -1,4 +1,4 @@
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -195,6 +195,27 @@ pub struct CropPlanRecord {
 pub struct FieldSeasonHistory {
     pub season: SeasonRecord,
     pub crop_plans: Vec<CropPlanRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeasonCropPlanRolloverSuggestion {
+    pub field_id: String,
+    pub org_id: String,
+    #[serde(default)]
+    pub source_history_refs: Vec<String>,
+    pub requires_approval: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_season: Option<SeasonRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_crop_plan: Option<CropPlanRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_basis_reason: Option<String>,
+}
+
+impl SeasonCropPlanRolloverSuggestion {
+    pub fn has_proposal(&self) -> bool {
+        self.proposed_season.is_some() || self.proposed_crop_plan.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3347,6 +3368,89 @@ impl FarmFieldRegistry {
             .collect()
     }
 
+    pub fn suggest_next_season_rollover(
+        &self,
+        org_id: &str,
+        field_id: &str,
+    ) -> Result<SeasonCropPlanRolloverSuggestion, FarmFieldError> {
+        let org_id =
+            normalize_farm_field_text(org_id.to_string()).ok_or(FarmFieldError::EmptyOrgId)?;
+        let field_id =
+            normalize_farm_field_text(field_id.to_string()).ok_or(FarmFieldError::EmptyFieldId)?;
+        self.fields
+            .get(&field_id)
+            .filter(|field| field.org_id == org_id)
+            .ok_or_else(|| FarmFieldError::FieldNotFound {
+                field_id: field_id.clone(),
+            })?;
+
+        let history = self.season_history_for_field(&org_id, &field_id);
+        let Some(latest) = history.last() else {
+            return Ok(SeasonCropPlanRolloverSuggestion {
+                field_id,
+                org_id,
+                source_history_refs: Vec::new(),
+                requires_approval: true,
+                proposed_season: None,
+                proposed_crop_plan: None,
+                no_basis_reason: Some("no persisted season history for field".to_string()),
+            });
+        };
+
+        let next_start = add_one_calendar_year(&parse_farm_field_date(&latest.season.start)?);
+        let next_end = add_one_calendar_year(&parse_farm_field_date(&latest.season.end)?);
+        let next_year = next_start.year();
+        let latest_crop_plan = latest.crop_plans.first().cloned();
+        let proposed_crop = latest_crop_plan
+            .as_ref()
+            .map(|crop_plan| crop_plan.crop.clone());
+        let proposed_season = SeasonRecord {
+            season_id: format!("season-{field_id}-{next_year}"),
+            field_id: field_id.clone(),
+            org_id: org_id.clone(),
+            start: next_start.format("%Y-%m-%d").to_string(),
+            end: next_end.format("%Y-%m-%d").to_string(),
+            label: proposed_crop
+                .as_ref()
+                .map(|crop| format!("{next_year} {crop}"))
+                .unwrap_or_else(|| format!("{next_year} rollover from {}", latest.season.label)),
+        };
+        let proposed_crop_plan = if let Some(crop_plan) = latest_crop_plan {
+            let planting_date = crop_plan
+                .planting_date
+                .as_deref()
+                .map(parse_farm_field_date)
+                .transpose()?
+                .map(|date| add_one_calendar_year(&date).format("%Y-%m-%d").to_string());
+            Some(CropPlanRecord {
+                crop_plan_id: format!("plan-{field_id}-{next_year}"),
+                season_id: proposed_season.season_id.clone(),
+                org_id: org_id.clone(),
+                crop: crop_plan.crop,
+                planting_date,
+            })
+        } else {
+            None
+        };
+        let mut source_history_refs = vec![format!("season:{}", latest.season.season_id)];
+        source_history_refs.extend(
+            latest
+                .crop_plans
+                .iter()
+                .map(|crop_plan| format!("crop_plan:{}", crop_plan.crop_plan_id)),
+        );
+
+        Ok(SeasonCropPlanRolloverSuggestion {
+            field_id,
+            org_id,
+            source_history_refs,
+            requires_approval: true,
+            proposed_season: Some(proposed_season),
+            proposed_crop_plan,
+            no_basis_reason: None,
+        })
+    }
+
     pub fn active_season_for_field(
         &self,
         org_id: &str,
@@ -3690,6 +3794,12 @@ fn parse_farm_field_date(value: &str) -> Result<NaiveDate, FarmFieldError> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| FarmFieldError::InvalidDate {
         value: value.to_string(),
     })
+}
+
+fn add_one_calendar_year(date: &NaiveDate) -> NaiveDate {
+    NaiveDate::from_ymd_opt(date.year() + 1, date.month(), date.day())
+        .or_else(|| NaiveDate::from_ymd_opt(date.year() + 1, date.month(), 28))
+        .expect("valid rollover date")
 }
 
 pub fn bounds_coverage_fraction(boundary: &GeoBounds, covered: &GeoBounds) -> f64 {
@@ -7452,6 +7562,125 @@ mod tests {
             .active_season_for_field("org-a", "field-a", "2026-12-01")
             .expect("no active season is explicit");
         assert_eq!(inactive.active_season, None);
+    }
+
+    #[test]
+    fn next_season_rollover_suggestion_uses_latest_history_and_cites_sources() {
+        let mut registry = registry_with_field();
+        registry
+            .insert_season(SeasonRecord {
+                season_id: "season-2025".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2025-03-01".to_string(),
+                end: "2025-10-31".to_string(),
+                label: "2025 Soy".to_string(),
+            })
+            .expect("2025 season persists");
+        registry
+            .insert_season(SeasonRecord {
+                season_id: "season-2026".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2026-03-01".to_string(),
+                end: "2026-10-31".to_string(),
+                label: "2026 Corn".to_string(),
+            })
+            .expect("2026 season persists");
+        registry
+            .insert_crop_plan(CropPlanRecord {
+                crop_plan_id: "plan-2026".to_string(),
+                season_id: "season-2026".to_string(),
+                org_id: String::new(),
+                crop: "corn".to_string(),
+                planting_date: Some("2026-04-15".to_string()),
+            })
+            .expect("crop plan persists");
+
+        let suggestion = registry
+            .suggest_next_season_rollover("org-a", "field-a")
+            .expect("suggestion should derive from history");
+
+        assert!(suggestion.requires_approval);
+        assert!(suggestion.has_proposal());
+        assert_eq!(
+            suggestion.source_history_refs,
+            vec![
+                "season:season-2026".to_string(),
+                "crop_plan:plan-2026".to_string()
+            ]
+        );
+        let proposed_season = suggestion
+            .proposed_season
+            .expect("season proposal should exist");
+        assert_eq!(proposed_season.season_id, "season-field-a-2027");
+        assert_eq!(proposed_season.start, "2027-03-01");
+        assert_eq!(proposed_season.end, "2027-10-31");
+        assert_eq!(proposed_season.label, "2027 corn");
+        let proposed_crop_plan = suggestion
+            .proposed_crop_plan
+            .expect("crop-plan proposal should exist");
+        assert_eq!(proposed_crop_plan.crop_plan_id, "plan-field-a-2027");
+        assert_eq!(proposed_crop_plan.season_id, "season-field-a-2027");
+        assert_eq!(proposed_crop_plan.crop, "corn");
+        assert_eq!(
+            proposed_crop_plan.planting_date.as_deref(),
+            Some("2027-04-15")
+        );
+    }
+
+    #[test]
+    fn rollover_suggestion_does_not_write_without_approval() {
+        let mut registry = registry_with_field();
+        registry
+            .insert_season(SeasonRecord {
+                season_id: "season-2026".to_string(),
+                field_id: "field-a".to_string(),
+                org_id: "org-a".to_string(),
+                start: "2026-03-01".to_string(),
+                end: "2026-10-31".to_string(),
+                label: "2026 Corn".to_string(),
+            })
+            .expect("season persists");
+        registry
+            .insert_crop_plan(CropPlanRecord {
+                crop_plan_id: "plan-2026".to_string(),
+                season_id: "season-2026".to_string(),
+                org_id: String::new(),
+                crop: "corn".to_string(),
+                planting_date: Some("2026-04-15".to_string()),
+            })
+            .expect("crop plan persists");
+
+        let before = registry.season_history_for_field("org-a", "field-a");
+        let suggestion = registry
+            .suggest_next_season_rollover("org-a", "field-a")
+            .expect("suggestion should not mutate");
+        let after = registry.season_history_for_field("org-a", "field-a");
+
+        assert_eq!(before, after);
+        assert!(suggestion.requires_approval);
+        assert_eq!(
+            suggestion.proposed_season.map(|season| season.season_id),
+            Some("season-field-a-2027".to_string())
+        );
+    }
+
+    #[test]
+    fn rollover_suggestion_reports_no_basis_without_history() {
+        let registry = registry_with_field();
+
+        let suggestion = registry
+            .suggest_next_season_rollover("org-a", "field-a")
+            .expect("empty history should be explicit");
+
+        assert!(!suggestion.has_proposal());
+        assert!(suggestion.requires_approval);
+        assert_eq!(suggestion.source_history_refs, Vec::<String>::new());
+        assert_eq!(
+            suggestion.no_basis_reason.as_deref(),
+            Some("no persisted season history for field")
+        );
     }
 
     #[test]
