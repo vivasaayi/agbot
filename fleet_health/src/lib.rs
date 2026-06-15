@@ -4,7 +4,7 @@ use shared::{
         FleetAlertComparator, FleetAlertEvidence, FleetAlertKind, FleetAlertRecord,
         FleetAlertRoute, FleetAlertSeverity,
     },
-    schemas::FleetVersionInventory,
+    schemas::{FleetNodeHealthState, FleetVersionInventory},
 };
 use timeseries::{SeriesPoint, SeriesValue};
 
@@ -792,6 +792,57 @@ pub struct OtaRolloutDecision {
     pub reason_code: OtaRolloutDecisionReason,
     pub rollback_actions: Vec<OtaRollbackAction>,
     pub evaluated_node_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RolloutStrategyAdvisoryRequest {
+    #[serde(default)]
+    pub rollout_id: String,
+    #[serde(default)]
+    pub requested_at: String,
+    pub target_version: OtaArtifactVersion,
+    pub inventory: FleetVersionInventory,
+    #[serde(default)]
+    pub health_reports: Vec<OtaNodeHealthReport>,
+    #[serde(default)]
+    pub canary_size: usize,
+    #[serde(default)]
+    pub staged_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutStrategyAdvisoryStatus {
+    Suggested,
+    InsufficientState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutStrategyAdvisoryReason {
+    StrategyDerivedFromFleetState,
+    EmptyInventory,
+    MissingHealthState,
+    NoHealthyCandidates,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutStrategyStep {
+    pub stage: OtaRolloutStage,
+    pub node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutStrategyAdvisory {
+    pub rollout_id: String,
+    pub requested_at: String,
+    pub target_version: OtaArtifactVersion,
+    pub status: RolloutStrategyAdvisoryStatus,
+    pub reason_code: RolloutStrategyAdvisoryReason,
+    pub proposed_steps: Vec<RolloutStrategyStep>,
+    pub evidence_refs: Vec<String>,
+    pub requires_approval: bool,
+    pub auto_started: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2421,6 +2472,124 @@ pub fn evaluate_ota_rollout(
     ))
 }
 
+pub fn suggest_rollout_strategy(
+    request: RolloutStrategyAdvisoryRequest,
+) -> Result<RolloutStrategyAdvisory, FleetHealthError> {
+    let rollout_id = normalize_required_text(request.rollout_id, FleetHealthError::EmptyRolloutId)?;
+    let requested_at =
+        normalize_required_text(request.requested_at, FleetHealthError::EmptyCreatedAt)?;
+    let target_version = normalize_ota_artifact_version(request.target_version)?;
+    let active_nodes = request
+        .inventory
+        .entries
+        .iter()
+        .filter(|entry| !entry.maintenance)
+        .collect::<Vec<_>>();
+
+    if active_nodes.is_empty() {
+        return Ok(rollout_strategy_result(
+            rollout_id,
+            requested_at,
+            target_version,
+            RolloutStrategyAdvisoryStatus::InsufficientState,
+            RolloutStrategyAdvisoryReason::EmptyInventory,
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+
+    let mut evidence_refs = Vec::new();
+    let mut candidates = Vec::new();
+    for entry in active_nodes {
+        let Some(health_state) = entry.health_state else {
+            return Ok(rollout_strategy_result(
+                rollout_id,
+                requested_at,
+                target_version,
+                RolloutStrategyAdvisoryStatus::InsufficientState,
+                RolloutStrategyAdvisoryReason::MissingHealthState,
+                Vec::new(),
+                evidence_refs,
+            ));
+        };
+        let Some(report) = request
+            .health_reports
+            .iter()
+            .find(|report| report.node_id == entry.node_id)
+        else {
+            return Ok(rollout_strategy_result(
+                rollout_id,
+                requested_at,
+                target_version,
+                RolloutStrategyAdvisoryStatus::InsufficientState,
+                RolloutStrategyAdvisoryReason::MissingHealthState,
+                Vec::new(),
+                evidence_refs,
+            ));
+        };
+        evidence_refs.push(format!(
+            "inventory:{}:health:{:?}:version:{}",
+            entry.node_id,
+            health_state,
+            entry.version.as_deref().unwrap_or("unknown")
+        ));
+        evidence_refs.push(format!(
+            "ota_health:{}:{:?}:{}",
+            report.node_id, report.status, report.checked_at
+        ));
+        if health_state == FleetNodeHealthState::Fresh
+            && report.status == ComponentHealthVerdictStatus::Ok
+            && report.blocking_alerts.is_empty()
+        {
+            candidates.push(entry.node_id.clone());
+        }
+    }
+    candidates.sort();
+
+    if candidates.is_empty() {
+        return Ok(rollout_strategy_result(
+            rollout_id,
+            requested_at,
+            target_version,
+            RolloutStrategyAdvisoryStatus::InsufficientState,
+            RolloutStrategyAdvisoryReason::NoHealthyCandidates,
+            Vec::new(),
+            evidence_refs,
+        ));
+    }
+
+    let canary_size = request.canary_size.max(1).min(candidates.len());
+    let staged_size = request.staged_size.max(1);
+    let canary_end = canary_size;
+    let staged_end = (canary_end + staged_size).min(candidates.len());
+    let mut proposed_steps = vec![RolloutStrategyStep {
+        stage: OtaRolloutStage::Canary,
+        node_ids: candidates[..canary_end].to_vec(),
+    }];
+    if staged_end > canary_end {
+        proposed_steps.push(RolloutStrategyStep {
+            stage: OtaRolloutStage::Staged,
+            node_ids: candidates[canary_end..staged_end].to_vec(),
+        });
+    }
+    if staged_end < candidates.len() {
+        proposed_steps.push(RolloutStrategyStep {
+            stage: OtaRolloutStage::Fleet,
+            node_ids: candidates[staged_end..].to_vec(),
+        });
+    }
+
+    Ok(rollout_strategy_result(
+        rollout_id,
+        requested_at,
+        target_version,
+        RolloutStrategyAdvisoryStatus::Suggested,
+        RolloutStrategyAdvisoryReason::StrategyDerivedFromFleetState,
+        proposed_steps,
+        evidence_refs,
+    ))
+}
+
 pub fn apply_rollout_control(
     request: RolloutControlRequest,
 ) -> Result<RolloutControlDecision, FleetHealthError> {
@@ -2853,6 +3022,28 @@ fn ota_decision(
         reason_code,
         rollback_actions,
         evaluated_node_count,
+    }
+}
+
+fn rollout_strategy_result(
+    rollout_id: String,
+    requested_at: String,
+    target_version: OtaArtifactVersion,
+    status: RolloutStrategyAdvisoryStatus,
+    reason_code: RolloutStrategyAdvisoryReason,
+    proposed_steps: Vec<RolloutStrategyStep>,
+    evidence_refs: Vec<String>,
+) -> RolloutStrategyAdvisory {
+    RolloutStrategyAdvisory {
+        rollout_id,
+        requested_at,
+        target_version,
+        status,
+        reason_code,
+        proposed_steps,
+        evidence_refs,
+        requires_approval: true,
+        auto_started: false,
     }
 }
 
@@ -3343,7 +3534,7 @@ mod tests {
         evaluate_fleet_readiness_with_work_orders, evaluate_ota_rollout,
         evaluate_predictive_maintenance_advisory, fleet_operations_source_current,
         fleet_operations_source_unavailable, install_component, open_maintenance_work_order,
-        refuse_health_evidence_overwrite, BatteryHealthTrendConfig,
+        refuse_health_evidence_overwrite, suggest_rollout_strategy, BatteryHealthTrendConfig,
         CloseMaintenanceWorkOrderRequest, ComponentHealthVerdict, ComponentHealthVerdictRequest,
         ComponentHealthVerdictStatus, ComponentServiceLimit, DutyAccrualRequest,
         FleetComponentRecord, FleetComponentType, FleetHealthDashboardAircraftStatus,
@@ -3363,7 +3554,8 @@ mod tests {
         PredictiveMaintenanceAdvisoryStatus, RegisterComponentRequest,
         RemainingUsefulLifeReasonCode, RemainingUsefulLifeRequest, RemainingUsefulLifeStatus,
         RolloutControlAction, RolloutControlReason, RolloutControlRequest, RolloutControlStatus,
-        ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
+        RolloutStrategyAdvisoryReason, RolloutStrategyAdvisoryRequest,
+        RolloutStrategyAdvisoryStatus, ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
     };
     use shared::fleet_alerts::{
         FleetAlertComparator, FleetAlertEvidence, FleetAlertKind, FleetAlertRecord,
@@ -4897,6 +5089,89 @@ mod tests {
     }
 
     #[test]
+    fn rollout_strategy_advisory_groups_healthy_nodes_and_cites_state() {
+        let advisory = suggest_rollout_strategy(rollout_strategy_request(
+            rollout_inventory(vec![
+                rollout_inventory_entry("node-a", Some(FleetNodeHealthState::Fresh), false),
+                rollout_inventory_entry("node-b", Some(FleetNodeHealthState::Fresh), false),
+                rollout_inventory_entry("node-c", Some(FleetNodeHealthState::Fresh), false),
+                rollout_inventory_entry("node-d", Some(FleetNodeHealthState::Fresh), false),
+            ]),
+            vec![
+                ota_health("node-a", ComponentHealthVerdictStatus::Ok, vec![]),
+                ota_health("node-b", ComponentHealthVerdictStatus::Ok, vec![]),
+                ota_health("node-c", ComponentHealthVerdictStatus::Ok, vec![]),
+                ota_health("node-d", ComponentHealthVerdictStatus::Ok, vec![]),
+            ],
+        ))
+        .expect("strategy should evaluate");
+
+        assert_eq!(advisory.status, RolloutStrategyAdvisoryStatus::Suggested);
+        assert_eq!(
+            advisory.reason_code,
+            RolloutStrategyAdvisoryReason::StrategyDerivedFromFleetState
+        );
+        assert_eq!(advisory.proposed_steps.len(), 3);
+        assert_eq!(advisory.proposed_steps[0].stage, OtaRolloutStage::Canary);
+        assert_eq!(advisory.proposed_steps[0].node_ids, vec!["node-a"]);
+        assert_eq!(advisory.proposed_steps[1].stage, OtaRolloutStage::Staged);
+        assert_eq!(
+            advisory.proposed_steps[1].node_ids,
+            vec!["node-b", "node-c"]
+        );
+        assert_eq!(advisory.proposed_steps[2].stage, OtaRolloutStage::Fleet);
+        assert_eq!(advisory.proposed_steps[2].node_ids, vec!["node-d"]);
+        assert!(advisory
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("inventory:node-a")));
+        assert!(advisory
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("ota_health:node-a")));
+    }
+
+    #[test]
+    fn rollout_strategy_advisory_is_proposal_only_and_never_auto_starts() {
+        let advisory = suggest_rollout_strategy(rollout_strategy_request(
+            rollout_inventory(vec![rollout_inventory_entry(
+                "node-a",
+                Some(FleetNodeHealthState::Fresh),
+                false,
+            )]),
+            vec![ota_health(
+                "node-a",
+                ComponentHealthVerdictStatus::Ok,
+                vec![],
+            )],
+        ))
+        .expect("strategy should evaluate");
+
+        assert_eq!(advisory.status, RolloutStrategyAdvisoryStatus::Suggested);
+        assert!(advisory.requires_approval);
+        assert!(!advisory.auto_started);
+    }
+
+    #[test]
+    fn rollout_strategy_advisory_reports_insufficient_state_when_health_missing() {
+        let advisory = suggest_rollout_strategy(rollout_strategy_request(
+            rollout_inventory(vec![rollout_inventory_entry("node-a", None, false)]),
+            vec![],
+        ))
+        .expect("strategy should evaluate");
+
+        assert_eq!(
+            advisory.status,
+            RolloutStrategyAdvisoryStatus::InsufficientState
+        );
+        assert_eq!(
+            advisory.reason_code,
+            RolloutStrategyAdvisoryReason::MissingHealthState
+        );
+        assert!(advisory.proposed_steps.is_empty());
+    }
+
+    #[test]
     fn rollout_control_pause_takes_effect_and_records_audit() {
         let decision = apply_rollout_control(rollout_control_request(
             RolloutControlAction::Pause,
@@ -5055,6 +5330,35 @@ mod tests {
                 health_state: Some(FleetNodeHealthState::Fresh),
                 heartbeat_age_seconds: Some(4),
             }],
+        }
+    }
+
+    fn rollout_inventory(entries: Vec<FleetNodeInventoryEntry>) -> FleetVersionInventory {
+        FleetVersionInventory { entries }
+    }
+
+    fn rollout_inventory_entry(
+        node_id: &str,
+        health_state: Option<FleetNodeHealthState>,
+        maintenance: bool,
+    ) -> FleetNodeInventoryEntry {
+        FleetNodeInventoryEntry {
+            node_id: node_id.to_string(),
+            owner_org_id: "org-ops".to_string(),
+            kind: FleetNodeKind::Drone,
+            runtime_mode: FleetNodeRuntimeMode::Flight,
+            status: if maintenance {
+                FleetNodeStatus::Maintenance
+            } else {
+                FleetNodeStatus::Enrolled
+            },
+            maintenance,
+            version: Some("agbot-edge 2.0.0".to_string()),
+            config_version: Some(4),
+            components: Vec::new(),
+            capabilities: vec!["ota".to_string()],
+            health_state,
+            heartbeat_age_seconds: health_state.map(|_| 5),
         }
     }
 
@@ -5300,6 +5604,21 @@ mod tests {
             requested_at: "2026-06-12T14:00:00Z".to_string(),
             simulation_validated,
             targets_flight_nodes,
+        }
+    }
+
+    fn rollout_strategy_request(
+        inventory: FleetVersionInventory,
+        health_reports: Vec<OtaNodeHealthReport>,
+    ) -> RolloutStrategyAdvisoryRequest {
+        RolloutStrategyAdvisoryRequest {
+            rollout_id: "rollout-2026-06-22".to_string(),
+            requested_at: "2026-06-22T18:00:00Z".to_string(),
+            target_version: signed_version("agbot-edge", "2.1.0"),
+            inventory,
+            health_reports,
+            canary_size: 1,
+            staged_size: 2,
         }
     }
 
