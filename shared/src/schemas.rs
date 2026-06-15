@@ -3248,6 +3248,96 @@ pub enum IrrigationScheduleError {
     InvalidApplicationRate,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationValveSpec {
+    pub zone_ref: String,
+    pub min_amount_mm: f64,
+    pub max_amount_mm: f64,
+    pub max_duration_minutes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationValveDryRunRequest {
+    pub dry_run_id: String,
+    pub checked_at: String,
+    pub schedule: IrrigationSchedule,
+    pub valves: Vec<IrrigationValveSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrrigationValveDryRunStatus {
+    Passed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrrigationValveActionStatus {
+    Planned,
+    Applied,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationValveActionAudit {
+    pub zone_ref: String,
+    pub amount_mm: f64,
+    pub duration_minutes: u32,
+    pub status: IrrigationValveActionStatus,
+    pub reason_code: String,
+    pub at: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationValveDryRun {
+    pub dry_run_id: String,
+    pub field_ref: String,
+    pub status: IrrigationValveDryRunStatus,
+    pub checked_at: String,
+    pub schedule_fingerprint: String,
+    pub audits: Vec<IrrigationValveActionAudit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationValveExecuteRequest {
+    pub executed_at: String,
+    pub schedule: IrrigationSchedule,
+    pub dry_run: IrrigationValveDryRun,
+    pub abort_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrrigationValveExecutionStatus {
+    Applied,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationValveExecution {
+    pub field_ref: String,
+    pub status: IrrigationValveExecutionStatus,
+    pub executed_at: String,
+    pub dry_run_id: String,
+    pub audits: Vec<IrrigationValveActionAudit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IrrigationValveControlError {
+    #[error("irrigation valve dry_run_id cannot be empty")]
+    EmptyDryRunId,
+    #[error("irrigation valve timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("irrigation valve timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error("irrigation valve zone_ref cannot be empty")]
+    EmptyZoneRef,
+    #[error("irrigation valve bounds are invalid for {zone_ref}")]
+    InvalidBounds { zone_ref: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WeatherReferenceEtStatus {
@@ -4726,6 +4816,191 @@ fn parse_irrigation_schedule_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.with_timezone(&chrono::Utc))
         .map_err(|_| IrrigationScheduleError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+pub fn dry_run_irrigation_valve_plan(
+    request: IrrigationValveDryRunRequest,
+) -> Result<IrrigationValveDryRun, IrrigationValveControlError> {
+    let dry_run_id = normalize_weather_text(request.dry_run_id)
+        .ok_or(IrrigationValveControlError::EmptyDryRunId)?;
+    let checked_at = normalize_weather_text(request.checked_at)
+        .ok_or(IrrigationValveControlError::EmptyTimestamp)?;
+    parse_irrigation_valve_timestamp(&checked_at)?;
+    let valves = normalize_irrigation_valve_specs(request.valves)?;
+
+    let mut audits = Vec::new();
+    for entry in &request.schedule.entries {
+        let Some(valve) = valves.iter().find(|valve| valve.zone_ref == entry.zone_ref) else {
+            audits.push(irrigation_valve_audit(
+                entry,
+                IrrigationValveActionStatus::Rejected,
+                "valve_not_found",
+                &checked_at,
+            ));
+            continue;
+        };
+        let within_bounds = entry.amount_mm >= valve.min_amount_mm
+            && entry.amount_mm <= valve.max_amount_mm
+            && entry.duration_minutes <= valve.max_duration_minutes;
+        if within_bounds {
+            audits.push(irrigation_valve_audit(
+                entry,
+                IrrigationValveActionStatus::Planned,
+                "dry_run_passed",
+                &checked_at,
+            ));
+        } else {
+            audits.push(irrigation_valve_audit(
+                entry,
+                IrrigationValveActionStatus::Rejected,
+                "valve_bounds_exceeded",
+                &checked_at,
+            ));
+        }
+    }
+
+    let status = if audits
+        .iter()
+        .all(|audit| audit.status == IrrigationValveActionStatus::Planned)
+    {
+        IrrigationValveDryRunStatus::Passed
+    } else {
+        IrrigationValveDryRunStatus::Rejected
+    };
+
+    Ok(IrrigationValveDryRun {
+        dry_run_id,
+        field_ref: request.schedule.field_ref.clone(),
+        status,
+        checked_at,
+        schedule_fingerprint: irrigation_schedule_fingerprint(&request.schedule),
+        audits,
+    })
+}
+
+pub fn execute_irrigation_valve_plan(
+    request: IrrigationValveExecuteRequest,
+) -> Result<IrrigationValveExecution, IrrigationValveControlError> {
+    let executed_at = normalize_weather_text(request.executed_at)
+        .ok_or(IrrigationValveControlError::EmptyTimestamp)?;
+    parse_irrigation_valve_timestamp(&executed_at)?;
+    let expected_fingerprint = irrigation_schedule_fingerprint(&request.schedule);
+    let rejection_reason = if request.abort_requested {
+        Some("operator_abort")
+    } else if request.dry_run.status != IrrigationValveDryRunStatus::Passed {
+        Some("dry_run_not_passed")
+    } else if request.dry_run.schedule_fingerprint != expected_fingerprint {
+        Some("dry_run_schedule_mismatch")
+    } else {
+        None
+    };
+
+    let audits = if let Some(reason_code) = rejection_reason {
+        request
+            .schedule
+            .entries
+            .iter()
+            .map(|entry| {
+                irrigation_valve_audit(
+                    entry,
+                    IrrigationValveActionStatus::Rejected,
+                    reason_code,
+                    &executed_at,
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        request
+            .schedule
+            .entries
+            .iter()
+            .map(|entry| {
+                irrigation_valve_audit(
+                    entry,
+                    IrrigationValveActionStatus::Applied,
+                    "valve_action_applied",
+                    &executed_at,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let status = if rejection_reason.is_some() {
+        IrrigationValveExecutionStatus::Rejected
+    } else {
+        IrrigationValveExecutionStatus::Applied
+    };
+
+    Ok(IrrigationValveExecution {
+        field_ref: request.schedule.field_ref,
+        status,
+        executed_at,
+        dry_run_id: request.dry_run.dry_run_id,
+        audits,
+    })
+}
+
+fn normalize_irrigation_valve_specs(
+    valves: Vec<IrrigationValveSpec>,
+) -> Result<Vec<IrrigationValveSpec>, IrrigationValveControlError> {
+    valves
+        .into_iter()
+        .map(|valve| {
+            let zone_ref = normalize_weather_text(valve.zone_ref)
+                .ok_or(IrrigationValveControlError::EmptyZoneRef)?;
+            if !(valve.min_amount_mm.is_finite()
+                && valve.max_amount_mm.is_finite()
+                && valve.min_amount_mm >= 0.0
+                && valve.max_amount_mm >= valve.min_amount_mm
+                && valve.max_duration_minutes > 0)
+            {
+                return Err(IrrigationValveControlError::InvalidBounds { zone_ref });
+            }
+            Ok(IrrigationValveSpec {
+                zone_ref,
+                min_amount_mm: valve.min_amount_mm,
+                max_amount_mm: valve.max_amount_mm,
+                max_duration_minutes: valve.max_duration_minutes,
+            })
+        })
+        .collect()
+}
+
+fn irrigation_valve_audit(
+    entry: &IrrigationScheduleEntry,
+    status: IrrigationValveActionStatus,
+    reason_code: &str,
+    at: &str,
+) -> IrrigationValveActionAudit {
+    IrrigationValveActionAudit {
+        zone_ref: entry.zone_ref.clone(),
+        amount_mm: entry.amount_mm,
+        duration_minutes: entry.duration_minutes,
+        status,
+        reason_code: reason_code.to_string(),
+        at: at.to_string(),
+        evidence_refs: entry.evidence_refs.clone(),
+    }
+}
+
+fn irrigation_schedule_fingerprint(schedule: &IrrigationSchedule) -> String {
+    let mut parts = vec![format!("field:{}", schedule.field_ref)];
+    parts.extend(schedule.entries.iter().map(|entry| {
+        format!(
+            "{}:{:.6}:{}:{}",
+            entry.zone_ref, entry.amount_mm, entry.duration_minutes, entry.start_time
+        )
+    }));
+    parts.join("|")
+}
+
+fn parse_irrigation_valve_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, IrrigationValveControlError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| IrrigationValveControlError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -9881,50 +10156,54 @@ mod tests {
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
         compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, detect_tractor_obstacle,
-        dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
-        evaluate_crop_stage_weather_risks, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
+        dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
+        evaluate_access_anomaly_advisories, evaluate_crop_stage_weather_risks,
+        evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
-        evaluate_weather_value_freshness, execute_tractor_prescription,
-        ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
-        map_zone_water_need, normalize_weather_provider_forecast, plan_tractor_swath_coverage,
-        query_irrigation_history, query_weather_history, resolve_weather_forecast_to_field,
-        route_weather_alert, run_tractor_straight_path_guidance, schedule_irrigation_plan,
-        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
-        transition_marketplace_account_status, validate_field_boundary,
-        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
-        verify_weather_forecast_accuracy, weather_fetch_failure_record,
-        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
-        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
-        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
-        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
-        MarketplacePartyType, MultispectralImage, OpenDataPublishError,
-        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
-        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
-        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
-        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
-        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
-        SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
-        SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
-        SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorDeconflictionDecision, TractorDeconflictionRequest, TractorEstopState,
-        TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
-        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGeofenceDecision,
-        TractorGeofenceError, TractorGeofenceEvaluationRequest, TractorGuidanceConfig,
-        TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
+        evaluate_weather_value_freshness, execute_irrigation_valve_plan,
+        execute_tractor_prescription, ingest_remote_sensing_moisture_proxy_layer,
+        ingest_weather_sensor_stream, map_zone_water_need, normalize_weather_provider_forecast,
+        plan_tractor_swath_coverage, query_irrigation_history, query_weather_history,
+        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
+        schedule_irrigation_plan, sign_fleet_config_bundle, soil_moisture_rejection_record,
+        tractor_cross_track_error_m, transition_marketplace_account_status,
+        validate_field_boundary, validate_water_weather_input_contract,
+        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
+        weather_fetch_failure_record, zone_water_need_insufficient, AccessAnomalySignal,
+        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
+        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
+        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
+        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
+        ContentType, CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRequest,
+        IrrigationHistoryQuery, IrrigationScheduleRequest, IrrigationValveActionStatus,
+        IrrigationValveDryRunRequest, IrrigationValveDryRunStatus, IrrigationValveExecuteRequest,
+        IrrigationValveExecutionStatus, IrrigationValveSpec, MarketplaceAccountCreateRequest,
+        MarketplaceAccountError, MarketplaceAccountStatus, MarketplacePartyType,
+        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
+        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
+        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
+        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
+        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
+        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
+        SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
+        SoilMoistureRejectionReason, SustainabilityMetricType, SustainabilityRecordCreateRequest,
+        SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
+        TractorCommandRejectionReason, TractorDeconflictionDecision, TractorDeconflictionRequest,
+        TractorEstopState, TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent,
+        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
+        TractorFieldOpsTelemetrySample, TractorGeofenceDecision, TractorGeofenceError,
+        TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
+        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
         TractorImplementAdapterSpec, TractorImplementCommand, TractorImplementDecision,
         TractorImplementRef, TractorImplementState, TractorLifecycleStatus,
         TractorMotionCommandRequest, TractorMotionGateDecision, TractorObstacleDetection,
@@ -12248,6 +12527,62 @@ mod tests {
     }
 
     #[test]
+    fn irrigation_valve_dry_run_and_execute_apply_bounded_plan() {
+        let schedule = irrigation_schedule_fixture();
+        let dry_run =
+            dry_run_irrigation_valve_plan(irrigation_valve_dry_run_request(schedule.clone(), 10.0))
+                .expect("bounded valve dry-run should pass");
+
+        assert_eq!(dry_run.status, IrrigationValveDryRunStatus::Passed);
+        assert_eq!(dry_run.audits.len(), 1);
+        assert_eq!(
+            dry_run.audits[0].status,
+            IrrigationValveActionStatus::Planned
+        );
+        assert_eq!(dry_run.audits[0].reason_code, "dry_run_passed");
+
+        let execution = execute_irrigation_valve_plan(irrigation_valve_execute_request(
+            schedule, dry_run, false,
+        ))
+        .expect("passing dry-run should execute");
+
+        assert_eq!(execution.status, IrrigationValveExecutionStatus::Applied);
+        assert_eq!(execution.audits.len(), 1);
+        assert_eq!(
+            execution.audits[0].status,
+            IrrigationValveActionStatus::Applied
+        );
+        assert_eq!(execution.audits[0].reason_code, "valve_action_applied");
+    }
+
+    #[test]
+    fn irrigation_valve_execute_refuses_out_of_bounds_or_unpassed_dry_run() {
+        let schedule = irrigation_schedule_fixture();
+        let dry_run =
+            dry_run_irrigation_valve_plan(irrigation_valve_dry_run_request(schedule.clone(), 1.0))
+                .expect("out-of-bounds dry-run should still audit");
+
+        assert_eq!(dry_run.status, IrrigationValveDryRunStatus::Rejected);
+        assert_eq!(
+            dry_run.audits[0].status,
+            IrrigationValveActionStatus::Rejected
+        );
+        assert_eq!(dry_run.audits[0].reason_code, "valve_bounds_exceeded");
+
+        let execution = execute_irrigation_valve_plan(irrigation_valve_execute_request(
+            schedule, dry_run, false,
+        ))
+        .expect("failed dry-run should refuse execution with audit");
+
+        assert_eq!(execution.status, IrrigationValveExecutionStatus::Rejected);
+        assert_eq!(
+            execution.audits[0].status,
+            IrrigationValveActionStatus::Rejected
+        );
+        assert_eq!(execution.audits[0].reason_code, "dry_run_not_passed");
+    }
+
+    #[test]
     fn weather_alert_routing_delivers_owned_field_to_console_and_portal() {
         let result = route_weather_alert(weather_alert_routing_request(vec![
             WeatherAlertRoutingTarget {
@@ -13315,6 +13650,43 @@ mod tests {
             scheduled_start: " 2026-06-13T12:00:00Z ".to_string(),
             application_rate_mm_per_hour: 5.0,
             water_needs,
+        }
+    }
+
+    fn irrigation_schedule_fixture() -> super::IrrigationSchedule {
+        let needs = map_zone_water_need(zone_water_need_request(false))
+            .expect("zone water need should map");
+        schedule_irrigation_plan(irrigation_schedule_request(needs))
+            .expect("schedule fixture should build")
+    }
+
+    fn irrigation_valve_dry_run_request(
+        schedule: super::IrrigationSchedule,
+        max_amount_mm: f64,
+    ) -> IrrigationValveDryRunRequest {
+        IrrigationValveDryRunRequest {
+            dry_run_id: " dry-run-001 ".to_string(),
+            checked_at: " 2026-06-13T11:58:00Z ".to_string(),
+            schedule,
+            valves: vec![IrrigationValveSpec {
+                zone_ref: " zone:north ".to_string(),
+                min_amount_mm: 0.0,
+                max_amount_mm,
+                max_duration_minutes: 60,
+            }],
+        }
+    }
+
+    fn irrigation_valve_execute_request(
+        schedule: super::IrrigationSchedule,
+        dry_run: super::IrrigationValveDryRun,
+        abort_requested: bool,
+    ) -> IrrigationValveExecuteRequest {
+        IrrigationValveExecuteRequest {
+            executed_at: " 2026-06-13T12:00:00Z ".to_string(),
+            schedule,
+            dry_run,
+            abort_requested,
         }
     }
 
