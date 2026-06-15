@@ -311,6 +311,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_marketplace_demand_forecast),
         )
         .route(
+            "/api/marketplace/reports/org",
+            get(routes::get_marketplace_org_report),
+        )
+        .route(
             "/api/sustainability/records",
             get(routes::list_sustainability_records).post(routes::create_sustainability_record),
         )

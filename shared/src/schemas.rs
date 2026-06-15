@@ -8351,7 +8351,7 @@ pub struct MarketplaceInventoryRecord {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MarketplaceOrderStatus {
     Placed,
@@ -8453,6 +8453,38 @@ pub struct MarketplaceDemandForecastRecord {
     pub uncertainty_band: Option<MarketplaceDemandUncertaintyBand>,
     pub method: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketplaceReportPeriod {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceOrgReportRequest {
+    pub org_id: String,
+    pub period: MarketplaceReportPeriod,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceOrderStatusCount {
+    pub status: MarketplaceOrderStatus,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceOrgReport {
+    pub org_id: String,
+    pub period: MarketplaceReportPeriod,
+    pub sales_total: f64,
+    pub procurement_total: f64,
+    pub order_counts_by_status: Vec<MarketplaceOrderStatusCount>,
+    pub listing_count: u32,
+    pub inventory_on_hand_total: f64,
+    pub inventory_reserved_total: f64,
+    pub source_order_ids: Vec<String>,
+    pub generated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -8668,6 +8700,20 @@ pub enum MarketplaceDemandForecastError {
     InvalidTimestamp { timestamp: String },
     #[error("unsupported marketplace demand forecast status {value}")]
     UnsupportedStatus { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarketplaceReportError {
+    #[error("marketplace report org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("marketplace report period start cannot be empty")]
+    EmptyPeriodStart,
+    #[error("marketplace report period end cannot be empty")]
+    EmptyPeriodEnd,
+    #[error("marketplace report period range is invalid")]
+    InvalidPeriodRange,
+    #[error("marketplace report timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
 }
 
 pub fn build_marketplace_account_record(
@@ -9172,6 +9218,86 @@ pub fn compute_marketplace_demand_forecast(
     })
 }
 
+pub fn assemble_marketplace_org_report(
+    request: MarketplaceOrgReportRequest,
+    orders: &[MarketplaceOrderRecord],
+    listings: &[MarketplaceListingRecord],
+    inventory: &[MarketplaceInventoryRecord],
+    generated_at: String,
+) -> Result<MarketplaceOrgReport, MarketplaceReportError> {
+    let org_id =
+        normalize_marketplace_text(request.org_id).ok_or(MarketplaceReportError::EmptyOrgId)?;
+    let period_from = normalize_marketplace_text(request.period.from)
+        .ok_or(MarketplaceReportError::EmptyPeriodStart)?;
+    let period_to = normalize_marketplace_text(request.period.to)
+        .ok_or(MarketplaceReportError::EmptyPeriodEnd)?;
+    let parsed_from = parse_marketplace_report_timestamp(&period_from)?;
+    let parsed_to = parse_marketplace_report_timestamp(&period_to)?;
+    if parsed_to < parsed_from {
+        return Err(MarketplaceReportError::InvalidPeriodRange);
+    }
+    let generated_at = normalize_marketplace_report_timestamp(generated_at)?;
+
+    let scoped_orders = orders
+        .iter()
+        .filter(|order| order.org_id == org_id)
+        .filter(|order| {
+            parse_marketplace_report_timestamp(&order.created_at)
+                .map(|created_at| created_at >= parsed_from && created_at <= parsed_to)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let mut status_counts = BTreeMap::<MarketplaceOrderStatus, u32>::new();
+    let mut source_order_ids = BTreeSet::<String>::new();
+    let mut sales_total = 0.0;
+    for order in scoped_orders {
+        *status_counts.entry(order.status).or_default() += 1;
+        source_order_ids.insert(order.order_id.clone());
+        if matches!(
+            order.status,
+            MarketplaceOrderStatus::Confirmed
+                | MarketplaceOrderStatus::Fulfilled
+                | MarketplaceOrderStatus::Closed
+        ) {
+            sales_total += order.line_total;
+        }
+    }
+    let order_counts_by_status = status_counts
+        .into_iter()
+        .map(|(status, count)| MarketplaceOrderStatusCount { status, count })
+        .collect::<Vec<_>>();
+    let listing_count = listings
+        .iter()
+        .filter(|listing| listing.org_id == org_id)
+        .count() as u32;
+    let inventory_on_hand_total = inventory
+        .iter()
+        .filter(|record| record.org_id == org_id)
+        .map(|record| record.on_hand)
+        .sum();
+    let inventory_reserved_total = inventory
+        .iter()
+        .filter(|record| record.org_id == org_id)
+        .map(|record| record.reserved)
+        .sum();
+
+    Ok(MarketplaceOrgReport {
+        org_id,
+        period: MarketplaceReportPeriod {
+            from: period_from,
+            to: period_to,
+        },
+        sales_total,
+        procurement_total: sales_total,
+        order_counts_by_status,
+        listing_count,
+        inventory_on_hand_total,
+        inventory_reserved_total,
+        source_order_ids: source_order_ids.into_iter().collect(),
+        generated_at,
+    })
+}
+
 pub fn transition_marketplace_account_status(
     record: &MarketplaceAccountRecord,
     to: MarketplaceAccountStatus,
@@ -9495,6 +9621,27 @@ fn marketplace_demand_no_basis_record(
         method: "agbot_marketplace_demand_v1_no_basis".to_string(),
         created_at,
     }
+}
+
+fn normalize_marketplace_report_timestamp(
+    timestamp: String,
+) -> Result<String, MarketplaceReportError> {
+    let timestamp =
+        normalize_marketplace_text(timestamp).ok_or(MarketplaceReportError::InvalidTimestamp {
+            timestamp: String::new(),
+        })?;
+    parse_marketplace_report_timestamp(&timestamp)?;
+    Ok(timestamp)
+}
+
+fn parse_marketplace_report_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, MarketplaceReportError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|_| MarketplaceReportError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -13308,16 +13455,16 @@ mod tests {
         advise_weather_operational_windows, annotate_weather_record_freshness,
         append_content_version, append_irrigation_history_event, append_weather_history_records,
         apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
-        apply_tractor_implement_command, assemble_drought_report, assert_flight_operation_allowed,
-        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-        build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
-        build_marketplace_account_record, build_marketplace_inventory_record,
-        build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
-        build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
-        close_marketplace_listing_record, compute_drought_baseline_trend, compute_drought_index,
-        compute_drought_risk_score, compute_marketplace_demand_forecast,
-        compute_water_evapotranspiration, compute_weather_growing_degree_day,
-        compute_weather_reference_et, create_versioned_content,
+        apply_tractor_implement_command, assemble_drought_report, assemble_marketplace_org_report,
+        assert_flight_operation_allowed, assert_raster_spatial_ref, bind_fleet_node_identity,
+        bounds_from_points, build_collaboration_channel, build_collaboration_message,
+        build_fleet_version_inventory, build_marketplace_account_record,
+        build_marketplace_inventory_record, build_marketplace_portal_entry,
+        build_soil_moisture_reading, build_sustainability_record, build_tractor_field_ops_replay,
+        build_tractor_field_ops_session_log, close_marketplace_listing_record,
+        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
+        compute_marketplace_demand_forecast, compute_water_evapotranspiration,
+        compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -13372,12 +13519,13 @@ mod tests {
         MarketplaceDemandForecastStatus, MarketplaceInventoryError,
         MarketplaceInventoryUpsertRequest, MarketplaceListingError,
         MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
-        MarketplaceOrderError, MarketplaceOrderStatus, MarketplacePartyType,
-        MarketplacePortalEntryError, MarketplaceUnitOfMeasure, MultispectralImage,
-        OpenDataPublishError, OpenDataPublishRefusalReason, OpenDataPublishRequest,
-        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
-        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
-        RecommendationStatus, RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
+        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceReportPeriod,
+        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
+        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
         RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
         RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
         ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
@@ -15188,6 +15336,59 @@ mod tests {
         assert_eq!(forecast.status, MarketplaceDemandForecastStatus::NoBasis);
         assert_eq!(forecast.value, None);
         assert_eq!(forecast.uncertainty_band, None);
+    }
+
+    #[test]
+    fn marketplace_report_aggregates_orders_inventory_and_sources() {
+        let report = assemble_marketplace_org_report(
+            marketplace_report_request(),
+            &[
+                marketplace_order_fixture(
+                    "order-001",
+                    MarketplaceOrderStatus::Closed,
+                    125.0,
+                    "2026-06-15T09:00:00Z",
+                ),
+                marketplace_order_fixture(
+                    "order-002",
+                    MarketplaceOrderStatus::Placed,
+                    50.0,
+                    "2026-06-16T09:00:00Z",
+                ),
+            ],
+            &[marketplace_listing_fixture()],
+            &[marketplace_inventory_fixture(40.0, 5.0)],
+            "2026-06-20T09:00:00Z".to_string(),
+        )
+        .expect("report should aggregate");
+
+        assert_eq!(report.sales_total, 125.0);
+        assert_eq!(report.procurement_total, 125.0);
+        assert_eq!(report.listing_count, 1);
+        assert_eq!(report.inventory_on_hand_total, 40.0);
+        assert_eq!(report.inventory_reserved_total, 5.0);
+        assert_eq!(report.source_order_ids, vec!["order-001", "order-002"]);
+        assert!(report
+            .order_counts_by_status
+            .iter()
+            .any(|count| count.status == MarketplaceOrderStatus::Closed && count.count == 1));
+    }
+
+    #[test]
+    fn marketplace_report_empty_period_returns_zero_report() {
+        let report = assemble_marketplace_org_report(
+            marketplace_report_request(),
+            &[],
+            &[],
+            &[],
+            "2026-06-20T09:00:00Z".to_string(),
+        )
+        .expect("empty period should still report");
+
+        assert_eq!(report.sales_total, 0.0);
+        assert_eq!(report.procurement_total, 0.0);
+        assert_eq!(report.order_counts_by_status.len(), 0);
+        assert_eq!(report.source_order_ids.len(), 0);
     }
 
     #[test]
@@ -17948,6 +18149,49 @@ mod tests {
             listing_ref: "listing-seed-corn-001".to_string(),
             buyer_account_id: "buyer-001".to_string(),
             qty,
+        }
+    }
+
+    fn marketplace_order_fixture(
+        order_id: &str,
+        status: MarketplaceOrderStatus,
+        line_total: f64,
+        created_at: &str,
+    ) -> super::MarketplaceOrderRecord {
+        super::MarketplaceOrderRecord {
+            order_id: order_id.to_string(),
+            org_id: "org-alpha".to_string(),
+            listing_ref: "listing-seed-corn-001".to_string(),
+            buyer_account_id: "buyer-001".to_string(),
+            qty: 1.0,
+            line_total,
+            status,
+            created_at: created_at.to_string(),
+            updated_at: created_at.to_string(),
+        }
+    }
+
+    fn marketplace_inventory_fixture(
+        on_hand: f64,
+        reserved: f64,
+    ) -> super::MarketplaceInventoryRecord {
+        super::MarketplaceInventoryRecord {
+            inventory_id: "inventory-seed-corn-001".to_string(),
+            item_id: "seed-corn-001".to_string(),
+            org_id: "org-alpha".to_string(),
+            on_hand,
+            reserved,
+            updated_at: "2026-06-15T09:00:00Z".to_string(),
+        }
+    }
+
+    fn marketplace_report_request() -> MarketplaceOrgReportRequest {
+        MarketplaceOrgReportRequest {
+            org_id: "org-alpha".to_string(),
+            period: MarketplaceReportPeriod {
+                from: "2026-06-01T00:00:00Z".to_string(),
+                to: "2026-06-30T23:59:59Z".to_string(),
+            },
         }
     }
 

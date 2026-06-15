@@ -4051,6 +4051,99 @@ async fn marketplace_demand_forecast_returns_no_basis_without_evidence() -> Resu
 }
 
 #[tokio::test]
+async fn marketplace_org_report_aggregates_period_activity() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "fulfilled").await?,
+        StatusCode::OK
+    );
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "closed").await?,
+        StatusCode::OK
+    );
+
+    let report = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/reports/org?org_id=org-alpha&from=2026-01-01T00:00:00Z&to=2026-12-31T23:59:59Z")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(report.status(), StatusCode::OK);
+    let body = to_bytes(report.into_body(), 64 * 1024).await?;
+    let report: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        report.get("sales_total").and_then(|value| value.as_f64()),
+        Some(375.0)
+    );
+    assert_eq!(
+        report
+            .get("source_order_ids")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len()),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .get("order_counts_by_status")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("status"))
+            .and_then(|value| value.as_str()),
+        Some("closed")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_org_report_empty_period_returns_zeroes() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let report = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/reports/org?org_id=org-alpha&from=2026-01-01T00:00:00Z&to=2026-12-31T23:59:59Z")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(report.status(), StatusCode::OK);
+    let body = to_bytes(report.into_body(), 64 * 1024).await?;
+    let report: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        report.get("sales_total").and_then(|value| value.as_f64()),
+        Some(0.0)
+    );
+    assert_eq!(
+        report
+            .get("source_order_ids")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len()),
+        Some(0)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn sustainability_records_create_get_and_list_field_scoped() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -12816,6 +12909,33 @@ async fn marketplace_order_transition(
         .await
         .expect("router should handle request");
     Ok(response.status())
+}
+
+async fn seed_marketplace_order(ctx: &TestContext, order_id: &str, qty: f64) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/orders")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "order_id": order_id,
+                        "org_id": "org-alpha",
+                        "listing_ref": "listing-seed-corn-001",
+                        "buyer_account_id": "buyer-001",
+                        "qty": qty
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
 }
 
 async fn seed_marketplace_demand_field(

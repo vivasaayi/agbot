@@ -84,9 +84,9 @@ use provenance::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
-    append_content_version, assert_raster_spatial_ref, bind_fleet_node_identity,
-    bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
-    build_collaboration_message, build_marketplace_account_record,
+    append_content_version, assemble_marketplace_org_report, assert_raster_spatial_ref,
+    bind_fleet_node_identity, bounds_coverage_fraction, bounds_from_points,
+    build_collaboration_channel, build_collaboration_message, build_marketplace_account_record,
     build_marketplace_catalog_item_record, build_marketplace_inventory_record,
     build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
     build_tractor_record, close_marketplace_listing_record, compute_drought_index,
@@ -119,17 +119,19 @@ use shared::schemas::{
     MarketplaceInventoryRecord, MarketplaceInventoryUpsertRequest, MarketplaceListingError,
     MarketplaceListingPublishRequest, MarketplaceListingRecord, MarketplaceListingStatus,
     MarketplaceOrderAuditRecord, MarketplaceOrderCreateRequest, MarketplaceOrderError,
-    MarketplaceOrderRecord, MarketplaceOrderStatus, MarketplacePartyType, MarketplacePortalEntry,
-    MarketplacePortalEntryError, MultispectralImage, OpenDataPublication, OpenDataPublishError,
-    OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RecommendationPriority,
-    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
-    SoilMoistureReadingError, SoilMoistureReadingRecord, SoilMoistureReadingRequest,
-    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, SustainabilityMetricType,
-    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
-    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
-    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
-    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
-    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
+    MarketplaceOrderRecord, MarketplaceOrderStatus, MarketplaceOrgReport,
+    MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntry,
+    MarketplacePortalEntryError, MarketplaceReportError, MarketplaceReportPeriod,
+    MultispectralImage, OpenDataPublication, OpenDataPublishError, OpenDataPublishRequest,
+    RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
+    RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
+    SoilMoistureReadingRecord, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
+    SoilMoistureRejectionRecord, SustainabilityMetricType, SustainabilityRecord,
+    SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
+    TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
+    TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
+    TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
+    VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
     WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
     WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
@@ -710,6 +712,13 @@ pub struct MarketplaceDemandForecastListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketplaceDemandForecastScopeQuery {
     pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceReportQuery {
+    pub org_id: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3744,6 +3753,39 @@ pub async fn get_marketplace_demand_forecast(
     }
 
     Ok(Json(forecast))
+}
+
+pub async fn get_marketplace_org_report(
+    Query(query): Query<MarketplaceReportQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceOrgReport>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace report".to_string(),
+        )
+    })?;
+    let from = normalize_optional_text(query.from).ok_or_else(|| {
+        AppError::BadRequest("from query parameter is required for marketplace report".to_string())
+    })?;
+    let to = normalize_optional_text(query.to).ok_or_else(|| {
+        AppError::BadRequest("to query parameter is required for marketplace report".to_string())
+    })?;
+    let orders = load_marketplace_orders_for_org_period(&state, &org_id, &from, &to).await?;
+    let listings = load_marketplace_listings_for_org(&state, &org_id).await?;
+    let inventory = load_marketplace_inventory_for_org(&state, &org_id).await?;
+    let report = assemble_marketplace_org_report(
+        MarketplaceOrgReportRequest {
+            org_id,
+            period: MarketplaceReportPeriod { from, to },
+        },
+        &orders,
+        &listings,
+        &inventory,
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_report_error)?;
+
+    Ok(Json(report))
 }
 
 pub async fn create_sustainability_record(
@@ -8894,6 +8936,10 @@ fn marketplace_demand_forecast_error(error: MarketplaceDemandForecastError) -> A
     AppError::BadRequest(error.to_string())
 }
 
+fn marketplace_report_error(error: MarketplaceReportError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn sustainability_record_error(error: SustainabilityRecordError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -12376,6 +12422,80 @@ async fn load_marketplace_demand_forecast(
 
     row.map(|row| decode_marketplace_demand_forecast_record(&row))
         .transpose()
+}
+
+async fn load_marketplace_orders_for_org_period(
+    state: &AppState,
+    org_id: &str,
+    from: &str,
+    to: &str,
+) -> AppResult<Vec<MarketplaceOrderRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT order_id, org_id, listing_ref, buyer_account_id, qty, line_total,
+               status, created_at, updated_at
+        FROM marketplace_orders
+        WHERE org_id = ?1
+          AND created_at >= ?2
+          AND created_at <= ?3
+        ORDER BY created_at ASC, order_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_order_record(&row))
+        .collect()
+}
+
+async fn load_marketplace_listings_for_org(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<MarketplaceListingRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT listing_id, item_id, org_id, price, currency, available_qty,
+               window_from, window_to, status, created_at, updated_at
+        FROM marketplace_listings
+        WHERE org_id = ?1
+        ORDER BY created_at ASC, listing_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_listing_record(&row))
+        .collect()
+}
+
+async fn load_marketplace_inventory_for_org(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<MarketplaceInventoryRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT inventory_id, item_id, org_id, on_hand, reserved, updated_at
+        FROM marketplace_inventory
+        WHERE org_id = ?1
+        ORDER BY item_id ASC, inventory_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_inventory_record(&row))
+        .collect()
 }
 
 async fn marketplace_org_exists(state: &AppState, org_id: &str) -> AppResult<bool> {
