@@ -6,6 +6,7 @@
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/HudTelemetry.hpp"
 #include "agbot_flight_sim/LidarSimulator.hpp"
+#include "agbot_flight_sim/LocationScenario.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/MissionPreview.hpp"
 #include "agbot_flight_sim/MissionValidation.hpp"
@@ -883,6 +884,75 @@ void test_scene_synthesis_marks_missing_source_coverage_unpopulated() {
     assert(manifest.unpopulated_areas[0].reason == "missing_source_coverage");
     assert(manifest.to_json().find("\"status\":\"unpopulated\"") != std::string::npos);
     assert(manifest.to_json().find("missing_source_coverage") != std::string::npos);
+}
+
+void test_location_scenario_loads_flyable_georeferenced_mission() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    agbot::flight_sim::LocationScenarioRequest request;
+    request.center = center;
+    request.area_km2 = 4.0;
+    request.scene_seed = 20260222;
+
+    const auto manifest = agbot::flight_sim::load_location_scenario(request);
+    const auto repeat = agbot::flight_sim::load_location_scenario(request);
+
+    assert(manifest.flyable);
+    assert(manifest.gaps.empty());
+    assert(manifest.contract_version == agbot::flight_sim::kTwinContractVersion);
+    assert(manifest.mission.home_geo.has_value());
+    assert(std::abs(manifest.mission.home_geo->latitude - center.latitude) < 1e-9);
+    assert(std::abs(manifest.mission.home_geo->longitude - center.longitude) < 1e-9);
+    assert(manifest.mission.waypoints.size() >= 5);
+    assert(manifest.mission.waypoints[1].geo.has_value());
+    assert(manifest.terrain_profile.asserted);
+    assert(manifest.terrain_profile.contains(center));
+    assert(!manifest.terrain_tiles.empty());
+    assert(manifest.map_textures.assert_alignment(0.01).ok);
+    assert(manifest.scene.status == agbot::flight_sim::SceneSynthesisStatus::Ready);
+    assert(manifest.scenario_hash == repeat.scenario_hash);
+    assert(manifest.to_json() == repeat.to_json());
+
+    const GeoCoordinate waypoint_geo = manifest.mission.waypoints[1].geo.value();
+    const agbot::flight_sim::Vec3 local = agbot::flight_sim::local_from_geo(waypoint_geo, center);
+    const GeoCoordinate round_tripped = agbot::flight_sim::geo_from_local(local, center);
+    assert(std::abs(round_tripped.latitude - waypoint_geo.latitude) < 1e-7);
+    assert(std::abs(round_tripped.longitude - waypoint_geo.longitude) < 1e-7);
+    assert(manifest.terrain_profile.contains(round_tripped));
+
+    DroneSimulation simulation(manifest.mission);
+    simulation.arm();
+    for (int step = 0; step < 120 && !simulation.is_complete(); ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+    assert(simulation.state().armed);
+    assert(simulation.state().mode != DroneMode::Idle);
+}
+
+void test_location_scenario_reports_partial_gaps_for_unreachable_sources() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    agbot::flight_sim::LocationScenarioRequest request;
+    request.center = center;
+    request.area_km2 = 4.0;
+    request.scene_seed = 20260222;
+    request.mark_tiles_unavailable = true;
+    request.mark_features_unavailable = true;
+
+    const auto manifest = agbot::flight_sim::load_location_scenario(request);
+
+    assert(manifest.flyable);
+    assert(manifest.has_gap("tile_source_unreachable"));
+    assert(manifest.has_gap("feature_source_unreachable"));
+    assert(!manifest.terrain_tiles.empty());
+    assert(manifest.terrain_tiles[0].state == agbot::flight_sim::TerrainTileState::FlatFallback);
+    assert(manifest.map_textures.has_state(agbot::flight_sim::MapTextureTileState::TileUnavailable));
+    assert(manifest.scene.status == agbot::flight_sim::SceneSynthesisStatus::Unpopulated);
+    assert(manifest.scenario_hash.size() == 64);
+
+    const std::string json = manifest.to_json();
+    assert(json.find("\"scenario_hash\":\"") != std::string::npos);
+    assert(json.find("\"gaps\":[\"tile_source_unreachable\",\"feature_source_unreachable\"]") != std::string::npos);
+    assert(json.find("\"state\":\"flat_fallback\"") != std::string::npos);
+    assert(json.find("\"state\":\"tile_unavailable\"") != std::string::npos);
 }
 
 agbot::flight_sim::SceneSynthesisManifest test_scene_manifest_for_camera(
@@ -1943,6 +2013,8 @@ int main() {
     test_missing_map_texture_tile_is_marked_unavailable_fallback();
     test_scene_synthesis_manifest_is_seeded_and_georeferenced();
     test_scene_synthesis_marks_missing_source_coverage_unpopulated();
+    test_location_scenario_loads_flyable_georeferenced_mission();
+    test_location_scenario_reports_partial_gaps_for_unreachable_sources();
     test_ray_traced_camera_projects_scene_object_with_reproducible_depth();
     test_ray_traced_camera_reports_no_scene_coverage_outside_extent();
     test_telemetry_video_stream_sends_decodable_aligned_frames_to_collector();
