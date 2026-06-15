@@ -1,4 +1,7 @@
-use crate::schemas::{FarmFieldRegistry, FarmRecord, FieldRecord, ReportRecord};
+use crate::schemas::{
+    FarmFieldRegistry, FarmRecord, FieldRecord, RecommendationLifecycleRegistry,
+    RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportRecord,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -268,6 +271,16 @@ pub struct GrowerReportInboxPage {
     pub total: usize,
     pub offset: usize,
     pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerRecommendationRow {
+    pub recommendation_id: String,
+    pub field_id: String,
+    pub priority: RecommendationPriority,
+    pub status: RecommendationStatus,
+    pub title: String,
+    pub evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -811,6 +824,91 @@ fn grower_report_row(report: &ReportRecord, field_id: &str) -> GrowerReportInbox
     }
 }
 
+pub fn list_grower_recommendations(
+    scope: &GrowerPortalSessionScope,
+    recommendations: &[RecommendationRecord],
+) -> Vec<GrowerRecommendationRow> {
+    let scoped_field_ids = scope
+        .field_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut rows = recommendations
+        .iter()
+        .filter_map(|recommendation| {
+            let field_id = recommendation.field_id.as_deref()?;
+            scoped_field_ids
+                .contains(field_id)
+                .then(|| grower_recommendation_row(recommendation, field_id))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.recommendation_id.cmp(&right.recommendation_id));
+    rows
+}
+
+pub fn acknowledge_grower_recommendation(
+    scope: &GrowerPortalSessionScope,
+    registry: &mut RecommendationLifecycleRegistry,
+    recommendation_id: &str,
+    at: &str,
+) -> Result<RecommendationRecord, GrowerPortalAccessError> {
+    let org_id = scope.org_id.to_string();
+    let recommendation = registry
+        .recommendations_for_org(&org_id)
+        .into_iter()
+        .find(|recommendation| recommendation.recommendation_id == recommendation_id)
+        .ok_or_else(|| GrowerPortalAccessError::FieldNotFound {
+            field_id: recommendation_id.to_string(),
+        })?;
+    let field_id =
+        recommendation
+            .field_id
+            .clone()
+            .ok_or_else(|| GrowerPortalAccessError::FieldNotFound {
+                field_id: recommendation_id.to_string(),
+            })?;
+    if !scope.field_ids.iter().any(|scoped| scoped == &field_id) {
+        return Err(GrowerPortalAccessError::Forbidden {
+            evidence: GrowerPortalAccessEvidence {
+                grower_id: scope.grower_id,
+                org_id: scope.org_id,
+                role: scope.role,
+                action: ControlPlaneAction::WriteEntity,
+                field_id,
+                target_org_id: Some(recommendation.org_id),
+                decision: AuthorizationDecision::Denied,
+                reason_code: "recommendation_out_of_scope".to_string(),
+            },
+        });
+    }
+
+    registry
+        .transition_recommendation_status(
+            &org_id,
+            recommendation_id,
+            &scope.grower_id.to_string(),
+            at,
+            RecommendationStatus::Reviewed,
+        )
+        .map_err(|_| GrowerPortalAccessError::FieldNotFound {
+            field_id: recommendation_id.to_string(),
+        })
+}
+
+fn grower_recommendation_row(
+    recommendation: &RecommendationRecord,
+    field_id: &str,
+) -> GrowerRecommendationRow {
+    GrowerRecommendationRow {
+        recommendation_id: recommendation.recommendation_id.clone(),
+        field_id: field_id.to_string(),
+        priority: recommendation.priority,
+        status: recommendation.status,
+        title: recommendation.title.clone(),
+        evidence_refs: recommendation.evidence_refs.clone(),
+    }
+}
+
 impl TenantScoped for OrganizationRecord {
     fn tenant_org_id(&self) -> Uuid {
         self.org_id
@@ -1259,7 +1357,9 @@ mod tests {
     use super::*;
     use crate::schemas::{
         FarmFieldEntityStatus, FarmFieldRegistry, FarmRecord, FieldBoundary, FieldRecord,
-        GeoBounds, GeoPoint, ReportFormat, ReportRecord, ReportVisibility,
+        GeoBounds, GeoPoint, RecommendationLifecycleRegistry, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType, ReportFormat,
+        ReportRecord, ReportVisibility,
     };
     use chrono::TimeZone;
 
@@ -1766,6 +1866,107 @@ mod tests {
     }
 
     #[test]
+    fn grower_recommendations_list_scoped_rows_and_acknowledge_with_audit() {
+        let grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let mut registry = RecommendationLifecycleRegistry::default();
+        registry
+            .create_recommendation(recommendation_record(
+                "rec-owned",
+                "field-a",
+                org_id,
+                RecommendationPriority::High,
+            ))
+            .expect("owned recommendation persists");
+        registry
+            .create_recommendation(recommendation_record(
+                "rec-foreign-field",
+                "field-b",
+                org_id,
+                RecommendationPriority::Low,
+            ))
+            .expect("foreign field recommendation persists");
+        let rows = list_grower_recommendations(
+            &scope,
+            &registry.recommendations_for_org(&org_id.to_string()),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].recommendation_id, "rec-owned");
+        assert_eq!(rows[0].field_id, "field-a");
+        assert_eq!(rows[0].status, RecommendationStatus::Open);
+
+        let acknowledged = acknowledge_grower_recommendation(
+            &scope,
+            &mut registry,
+            "rec-owned",
+            "2026-06-15T13:06:00Z",
+        )
+        .expect("owned recommendation acknowledges");
+
+        assert_eq!(acknowledged.status, RecommendationStatus::Reviewed);
+        let history = registry.recommendation_history(&org_id.to_string(), "rec-owned");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].actor_user_id, grower_id.to_string());
+        assert_eq!(history[1].at, "2026-06-15T13:06:00Z");
+        assert_eq!(history[1].before, Some(RecommendationStatus::Open));
+        assert_eq!(history[1].after, RecommendationStatus::Reviewed);
+        assert_eq!(
+            history[1].change_type,
+            RecommendationStatusChangeType::StatusChanged
+        );
+    }
+
+    #[test]
+    fn grower_recommendation_acknowledge_rejects_out_of_scope_recommendation() {
+        let grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let mut registry = RecommendationLifecycleRegistry::default();
+        registry
+            .create_recommendation(recommendation_record(
+                "rec-foreign-field",
+                "field-b",
+                org_id,
+                RecommendationPriority::Low,
+            ))
+            .expect("foreign field recommendation persists");
+
+        let error = acknowledge_grower_recommendation(
+            &scope,
+            &mut registry,
+            "rec-foreign-field",
+            "2026-06-15T13:06:00Z",
+        )
+        .expect_err("out-of-scope recommendation is denied");
+
+        let GrowerPortalAccessError::Forbidden { evidence } = error else {
+            panic!("out-of-scope recommendation returns forbidden evidence");
+        };
+        assert_eq!(evidence.reason_code, "recommendation_out_of_scope");
+        assert_eq!(evidence.field_id, "field-b");
+        let record = registry
+            .recommendations_for_org(&org_id.to_string())
+            .into_iter()
+            .find(|recommendation| recommendation.recommendation_id == "rec-foreign-field")
+            .expect("recommendation remains present");
+        assert_eq!(record.status, RecommendationStatus::Open);
+    }
+
+    #[test]
     fn grower_portal_field_read_denies_cross_tenant_and_audits() {
         let mut control = ControlPlaneRegistry::default();
         let org_a = control
@@ -2138,6 +2339,31 @@ mod tests {
             annotation_count: 0,
             recommendation_count: 1,
             created_at: created_at.to_string(),
+        }
+    }
+
+    fn recommendation_record(
+        recommendation_id: &str,
+        field_id: &str,
+        org_id: Uuid,
+        priority: RecommendationPriority,
+    ) -> RecommendationRecord {
+        RecommendationRecord {
+            recommendation_id: recommendation_id.to_string(),
+            scene_id: format!("scene-{recommendation_id}"),
+            field_id: Some(field_id.to_string()),
+            org_id: org_id.to_string(),
+            author_user_id: "advisor".to_string(),
+            title: format!("Recommendation {recommendation_id}"),
+            note: Some("Scout this area".to_string()),
+            category: Some("scouting".to_string()),
+            action_category: "scouting".to_string(),
+            priority,
+            status: RecommendationStatus::Open,
+            evidence_refs: vec![format!("finding:{recommendation_id}")],
+            annotation_ids: Vec::new(),
+            created_at: "2026-06-15T12:00:00Z".to_string(),
+            updated_at: "2026-06-15T12:00:00Z".to_string(),
         }
     }
 
