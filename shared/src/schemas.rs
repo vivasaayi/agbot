@@ -3023,6 +3023,37 @@ pub struct WeatherRiskAlert {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherGrowingDegreeDayRequest {
+    pub field_ref: String,
+    pub date: String,
+    pub base_temperature_celsius: f64,
+    pub records: Vec<WeatherFreshnessAnnotatedRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherGrowingDegreeDayStatus {
+    Computed,
+    NoData,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherGrowingDegreeDay {
+    pub field_ref: String,
+    pub date: String,
+    pub status: WeatherGrowingDegreeDayStatus,
+    #[serde(default)]
+    pub gdd_celsius_days: Option<f64>,
+    #[serde(default)]
+    pub min_temperature_celsius: Option<f64>,
+    #[serde(default)]
+    pub max_temperature_celsius: Option<f64>,
+    pub base_temperature_celsius: f64,
+    pub method: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
     pub wind_speed_mps: WeatherForecastValue,
@@ -3190,6 +3221,18 @@ pub enum WeatherOperationalWindowError {
 pub enum WeatherRiskAlertError {
     #[error("weather risk alert thresholds are invalid")]
     InvalidThresholds,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherGrowingDegreeDayError {
+    #[error("weather GDD field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("weather GDD date is invalid: {date}")]
+    InvalidDate { date: String },
+    #[error("weather GDD base temperature is invalid")]
+    InvalidBaseTemperature,
+    #[error("weather GDD timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
 }
 
 pub fn normalize_weather_provider_forecast(
@@ -3929,6 +3972,84 @@ fn weather_risk_alert(
         source: record.source.clone(),
         freshness,
     }
+}
+
+pub fn compute_weather_growing_degree_day(
+    request: WeatherGrowingDegreeDayRequest,
+) -> Result<WeatherGrowingDegreeDay, WeatherGrowingDegreeDayError> {
+    let field_ref = normalize_weather_text(request.field_ref)
+        .ok_or(WeatherGrowingDegreeDayError::EmptyFieldRef)?;
+    if !request.base_temperature_celsius.is_finite() {
+        return Err(WeatherGrowingDegreeDayError::InvalidBaseTemperature);
+    }
+    let date = NaiveDate::parse_from_str(&request.date, "%Y-%m-%d").map_err(|_| {
+        WeatherGrowingDegreeDayError::InvalidDate {
+            date: request.date.clone(),
+        }
+    })?;
+
+    let mut temperatures = Vec::new();
+    let mut evidence_refs = Vec::new();
+    for record in request.records {
+        if record.field_ref != field_ref {
+            continue;
+        }
+        let valid_time = parse_weather_gdd_timestamp(&record.valid_time)?;
+        if valid_time.date_naive() != date {
+            continue;
+        }
+        temperatures.push(record.temperature_celsius.value.value);
+        evidence_refs.push(format!(
+            "{}:{}:{}",
+            record.forecast_id, record.valid_time, record.source
+        ));
+    }
+
+    let method = "simple_average_max_min_minus_base_celsius".to_string();
+    if temperatures.is_empty() {
+        return Ok(WeatherGrowingDegreeDay {
+            field_ref,
+            date: request.date,
+            status: WeatherGrowingDegreeDayStatus::NoData,
+            gdd_celsius_days: None,
+            min_temperature_celsius: None,
+            max_temperature_celsius: None,
+            base_temperature_celsius: request.base_temperature_celsius,
+            method,
+            evidence_refs: vec!["temperature:no_data".to_string()],
+        });
+    }
+
+    let min_temperature_celsius = temperatures.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_temperature_celsius = temperatures
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let gdd_celsius_days = (((min_temperature_celsius + max_temperature_celsius) / 2.0)
+        - request.base_temperature_celsius)
+        .max(0.0);
+
+    Ok(WeatherGrowingDegreeDay {
+        field_ref,
+        date: request.date,
+        status: WeatherGrowingDegreeDayStatus::Computed,
+        gdd_celsius_days: Some(gdd_celsius_days),
+        min_temperature_celsius: Some(min_temperature_celsius),
+        max_temperature_celsius: Some(max_temperature_celsius),
+        base_temperature_celsius: request.base_temperature_celsius,
+        method,
+        evidence_refs,
+    })
+}
+
+fn parse_weather_gdd_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, WeatherGrowingDegreeDayError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| WeatherGrowingDegreeDayError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 pub fn weather_fetch_failure_record(
@@ -8442,7 +8563,8 @@ mod tests {
         build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
-        create_versioned_content, deconflict_tractor_swath_reservations, detect_tractor_obstacle,
+        compute_weather_growing_degree_day, create_versioned_content,
+        deconflict_tractor_swath_reservations, detect_tractor_obstacle,
         dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
         evaluate_tractor_motion_gate, evaluate_tractor_weather_window_gate,
         evaluate_weather_risk_alerts, evaluate_weather_value_freshness,
@@ -8490,7 +8612,8 @@ mod tests {
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
         TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
-        WeatherForecastValue, WeatherFreshnessState, WeatherHistoryQuery, WeatherIngestError,
+        WeatherForecastValue, WeatherFreshnessState, WeatherGrowingDegreeDayRequest,
+        WeatherGrowingDegreeDayStatus, WeatherHistoryQuery, WeatherIngestError,
         WeatherOperationalWindowRequest, WeatherOperationalWindowThresholds,
         WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherRiskThresholds,
         WeatherRiskType, WeatherSensorIngestError, WeatherSensorSample,
@@ -10524,6 +10647,47 @@ mod tests {
     }
 
     #[test]
+    fn weather_gdd_computes_known_day_with_method_and_base() {
+        let gdd = compute_weather_growing_degree_day(weather_gdd_request(
+            "2026-06-13",
+            vec![
+                weather_window_record("2026-06-13T06:00:00Z", 3.0, 0.0, 10.0, false),
+                weather_window_record("2026-06-13T15:00:00Z", 3.0, 0.0, 30.0, false),
+            ],
+        ))
+        .expect("GDD should compute");
+
+        assert_eq!(gdd.status, WeatherGrowingDegreeDayStatus::Computed);
+        assert_eq!(gdd.gdd_celsius_days, Some(10.0));
+        assert_eq!(gdd.min_temperature_celsius, Some(10.0));
+        assert_eq!(gdd.max_temperature_celsius, Some(30.0));
+        assert_eq!(gdd.base_temperature_celsius, 10.0);
+        assert_eq!(gdd.method, "simple_average_max_min_minus_base_celsius");
+        assert_eq!(gdd.evidence_refs.len(), 2);
+    }
+
+    #[test]
+    fn weather_gdd_marks_missing_day_no_data() {
+        let gdd = compute_weather_growing_degree_day(weather_gdd_request(
+            "2026-06-14",
+            vec![weather_window_record(
+                "2026-06-13T06:00:00Z",
+                3.0,
+                0.0,
+                10.0,
+                false,
+            )],
+        ))
+        .expect("missing day should evaluate");
+
+        assert_eq!(gdd.status, WeatherGrowingDegreeDayStatus::NoData);
+        assert_eq!(gdd.gdd_celsius_days, None);
+        assert_eq!(gdd.min_temperature_celsius, None);
+        assert_eq!(gdd.max_temperature_celsius, None);
+        assert_eq!(gdd.evidence_refs, vec!["temperature:no_data".to_string()]);
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -11204,6 +11368,18 @@ mod tests {
             heat_temperature_celsius: 35.0,
             wind_speed_mps: 10.0,
             precipitation_mm: 1.0,
+        }
+    }
+
+    fn weather_gdd_request(
+        date: &str,
+        records: Vec<super::WeatherFreshnessAnnotatedRecord>,
+    ) -> WeatherGrowingDegreeDayRequest {
+        WeatherGrowingDegreeDayRequest {
+            field_ref: "field-north".to_string(),
+            date: date.to_string(),
+            base_temperature_celsius: 10.0,
+            records,
         }
     }
 
