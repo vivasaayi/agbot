@@ -394,6 +394,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_biodiversity_proxy),
         )
         .route(
+            "/api/sustainability/soil-carbon-proxies",
+            get(routes::list_soil_carbon_proxies).post(routes::create_soil_carbon_proxy),
+        )
+        .route(
+            "/api/sustainability/soil-carbon-proxies/:proxy_id",
+            get(routes::get_soil_carbon_proxy),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
         )

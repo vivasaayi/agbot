@@ -92,15 +92,16 @@ use shared::schemas::{
     build_soil_moisture_reading, build_sustainability_record, build_tractor_record,
     close_marketplace_listing_record, compare_sustainability_baseline, compute_biodiversity_proxy,
     compute_carbon_footprint, compute_drought_index, compute_marketplace_demand_forecast,
-    create_marketplace_fulfillment_record, create_marketplace_rating_record,
-    create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
-    estimate_biomass, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
+    compute_soil_carbon_proxy, create_marketplace_fulfillment_record,
+    create_marketplace_rating_record, create_sustainability_baseline,
+    create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
+    fulfill_marketplace_inventory, normalize_weather_provider_forecast,
     parse_biodiversity_proxy_status, parse_carbon_footprint_status, parse_content_status,
     parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
     parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
     parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
     parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
-    parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
+    parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
     parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
     parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
@@ -138,19 +139,20 @@ use shared::schemas::{
     MarketplaceReportPeriod, MultispectralImage, OpenDataPublication, OpenDataPublishError,
     OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RecommendationPriority,
     RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
-    SoilMoistureReadingError, SoilMoistureReadingRecord, SoilMoistureReadingRequest,
-    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, SustainabilityBaselineCreateRequest,
-    SustainabilityBaselineError, SustainabilityBaselineRecord, SustainabilityComparisonRequest,
-    SustainabilityComparisonResult, SustainabilityComparisonStatus, SustainabilityMetricType,
-    SustainabilityMrvOutputKind, SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest,
-    SustainabilityMrvTrailError, SustainabilityRecord, SustainabilityRecordCreateRequest,
-    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
-    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
-    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
-    TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
-    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
-    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
-    GEO_EXTENT_ASSERTION_TOLERANCE,
+    SoilCarbonProxyError, SoilCarbonProxyRequest, SoilCarbonProxyResult, SoilCarbonProxyStatus,
+    SoilCarbonUncertaintyBand, SoilMoistureReadingError, SoilMoistureReadingRecord,
+    SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
+    SustainabilityBaselineCreateRequest, SustainabilityBaselineError, SustainabilityBaselineRecord,
+    SustainabilityComparisonRequest, SustainabilityComparisonResult,
+    SustainabilityComparisonStatus, SustainabilityMetricType, SustainabilityMrvOutputKind,
+    SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest, SustainabilityMrvTrailError,
+    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
+    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
+    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
+    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
+    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
+    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -845,6 +847,17 @@ pub struct BiodiversityProxyListQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BiodiversityProxyScopeQuery {
+    pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoilCarbonProxyListQuery {
+    pub field_id: Option<String>,
+    pub status: Option<SoilCarbonProxyStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoilCarbonProxyScopeQuery {
     pub field_id: Option<String>,
 }
 
@@ -4631,6 +4644,70 @@ pub async fn get_biodiversity_proxy(
     let field_id = normalize_optional_text(query.field_id)
         .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
     let proxy = load_biodiversity_proxy_result(&state, &proxy_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if proxy.field_id != field_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(proxy))
+}
+
+pub async fn create_soil_carbon_proxy(
+    State(state): State<AppState>,
+    Json(request): Json<SoilCarbonProxyRequest>,
+) -> AppResult<Json<SoilCarbonProxyResult>> {
+    let result = compute_soil_carbon_proxy(
+        request,
+        format!("soil-carbon-proxy-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(soil_carbon_proxy_error)?;
+    insert_soil_carbon_proxy_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_soil_carbon_proxies(
+    Query(query): Query<SoilCarbonProxyListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SoilCarbonProxyResult>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for soil-carbon proxies".to_string(),
+        )
+    })?;
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT proxy_id, record_id, field_id, proxy_value, uncertainty_low, uncertainty_high,
+               status, evidence_refs_json, method_version, result_hash, computed_at
+        FROM soil_carbon_proxies
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY computed_at ASC, proxy_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_soil_carbon_proxy_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_soil_carbon_proxy(
+    Path(proxy_id): Path<String>,
+    Query(query): Query<SoilCarbonProxyScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SoilCarbonProxyResult>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    let proxy = load_soil_carbon_proxy_result(&state, &proxy_id)
         .await?
         .ok_or(AppError::NotFound)?;
     if proxy.field_id != field_id {
@@ -9747,6 +9824,10 @@ fn biodiversity_proxy_error(error: BiodiversityProxyError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn soil_carbon_proxy_error(error: SoilCarbonProxyError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn content_error(error: ContentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -11594,6 +11675,37 @@ fn decode_biodiversity_proxy_result(
         crs: row.get("crs"),
         extent,
         source_layer_refs,
+        method_version: row.get("method_version"),
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_soil_carbon_proxy_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SoilCarbonProxyResult> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode soil-carbon evidence_refs_json"))
+    })?;
+    let uncertainty_low: Option<f64> = row.get("uncertainty_low");
+    let uncertainty_high: Option<f64> = row.get("uncertainty_high");
+    let uncertainty_band = match (uncertainty_low, uncertainty_high) {
+        (Some(low), Some(high)) => Some(SoilCarbonUncertaintyBand { low, high }),
+        _ => None,
+    };
+
+    Ok(SoilCarbonProxyResult {
+        proxy_id: row.get("proxy_id"),
+        record_id: row.get("record_id"),
+        field_id: row.get("field_id"),
+        proxy_value: row.get("proxy_value"),
+        uncertainty_band,
+        status: parse_soil_carbon_proxy_status(&row.get::<String, _>("status"))
+            .map_err(soil_carbon_proxy_error)?,
+        evidence_refs,
         method_version: row.get("method_version"),
         result_hash: row.get("result_hash"),
         computed_at: row.get("computed_at"),
@@ -14217,6 +14329,60 @@ async fn load_biodiversity_proxy_result(
     .map_err(Error::from)?;
 
     row.map(|row| decode_biodiversity_proxy_result(&row))
+        .transpose()
+}
+
+async fn insert_soil_carbon_proxy_result(
+    state: &AppState,
+    result: &SoilCarbonProxyResult,
+) -> AppResult<()> {
+    let evidence_refs_json =
+        serde_json::to_string(&result.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO soil_carbon_proxies (
+            proxy_id, record_id, field_id, proxy_value, uncertainty_low, uncertainty_high, status,
+            evidence_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&result.proxy_id)
+    .bind(&result.record_id)
+    .bind(&result.field_id)
+    .bind(result.proxy_value)
+    .bind(result.uncertainty_band.as_ref().map(|band| band.low))
+    .bind(result.uncertainty_band.as_ref().map(|band| band.high))
+    .bind(result.status.as_str())
+    .bind(evidence_refs_json)
+    .bind(&result.method_version)
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_soil_carbon_proxy_result(
+    state: &AppState,
+    proxy_id: &str,
+) -> AppResult<Option<SoilCarbonProxyResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT proxy_id, record_id, field_id, proxy_value, uncertainty_low, uncertainty_high,
+               status, evidence_refs_json, method_version, result_hash, computed_at
+        FROM soil_carbon_proxies
+        WHERE proxy_id = ?1
+        "#,
+    )
+    .bind(proxy_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_soil_carbon_proxy_result(&row))
         .transpose()
 }
 

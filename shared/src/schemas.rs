@@ -10451,6 +10451,71 @@ pub struct BiodiversityProxyResult {
     pub computed_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCarbonEvidenceInput {
+    pub evidence_ref: String,
+    pub value: f64,
+    #[serde(default = "default_soil_carbon_weight")]
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCarbonPracticeInput {
+    pub practice_ref: String,
+    pub carbon_delta: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCarbonProxyRequest {
+    #[serde(default)]
+    pub proxy_id: Option<String>,
+    pub record_id: String,
+    pub field_id: String,
+    #[serde(default)]
+    pub index_inputs: Vec<SoilCarbonEvidenceInput>,
+    #[serde(default)]
+    pub biomass_inputs: Vec<SoilCarbonEvidenceInput>,
+    #[serde(default)]
+    pub practice_inputs: Vec<SoilCarbonPracticeInput>,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoilCarbonProxyStatus {
+    Computed,
+    InsufficientEvidence,
+}
+
+impl SoilCarbonProxyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SoilCarbonProxyStatus::Computed => "computed",
+            SoilCarbonProxyStatus::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCarbonUncertaintyBand {
+    pub low: f64,
+    pub high: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCarbonProxyResult {
+    pub proxy_id: String,
+    pub record_id: String,
+    pub field_id: String,
+    pub proxy_value: Option<f64>,
+    pub uncertainty_band: Option<SoilCarbonUncertaintyBand>,
+    pub status: SoilCarbonProxyStatus,
+    pub evidence_refs: Vec<String>,
+    pub method_version: String,
+    pub result_hash: String,
+    pub computed_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SustainabilityRecordError {
     #[error("sustainability record_id cannot be empty")]
@@ -10613,6 +10678,32 @@ pub enum BiodiversityProxyError {
     #[error("biodiversity raster spatial reference invalid: {0}")]
     SpatialRef(#[from] RasterSpatialRefError),
     #[error("unsupported biodiversity proxy status {value}")]
+    UnsupportedStatus { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SoilCarbonProxyError {
+    #[error("soil-carbon proxy_id cannot be empty")]
+    EmptyProxyId,
+    #[error("soil-carbon record_id cannot be empty")]
+    EmptyRecordId,
+    #[error("soil-carbon field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("soil-carbon method_version cannot be empty")]
+    EmptyMethodVersion,
+    #[error("soil-carbon computed_at cannot be empty")]
+    EmptyComputedAt,
+    #[error("soil-carbon evidence_ref cannot be empty")]
+    EmptyEvidenceRef,
+    #[error("soil-carbon practice_ref cannot be empty")]
+    EmptyPracticeRef,
+    #[error("soil-carbon evidence value is invalid")]
+    InvalidEvidenceValue,
+    #[error("soil-carbon evidence weight is invalid")]
+    InvalidEvidenceWeight,
+    #[error("soil-carbon practice delta is invalid")]
+    InvalidPracticeDelta,
+    #[error("unsupported soil-carbon proxy status {value}")]
     UnsupportedStatus { value: String },
 }
 
@@ -11165,6 +11256,89 @@ pub fn compute_biodiversity_proxy(
     })
 }
 
+pub fn compute_soil_carbon_proxy(
+    request: SoilCarbonProxyRequest,
+    generated_proxy_id: String,
+    computed_at: String,
+) -> Result<SoilCarbonProxyResult, SoilCarbonProxyError> {
+    let proxy_id = normalize_sustainability_optional_text(request.proxy_id)
+        .or_else(|| normalize_sustainability_text(generated_proxy_id))
+        .ok_or(SoilCarbonProxyError::EmptyProxyId)?;
+    let record_id = normalize_sustainability_text(request.record_id)
+        .ok_or(SoilCarbonProxyError::EmptyRecordId)?;
+    let field_id = normalize_sustainability_text(request.field_id)
+        .ok_or(SoilCarbonProxyError::EmptyFieldId)?;
+    let method_version = normalize_sustainability_text(request.method_version)
+        .ok_or(SoilCarbonProxyError::EmptyMethodVersion)?;
+    let computed_at =
+        normalize_sustainability_text(computed_at).ok_or(SoilCarbonProxyError::EmptyComputedAt)?;
+    let index_inputs = normalize_soil_carbon_evidence(request.index_inputs)?;
+    let biomass_inputs = normalize_soil_carbon_evidence(request.biomass_inputs)?;
+    let practice_inputs = normalize_soil_carbon_practices(request.practice_inputs)?;
+
+    let mut evidence_refs = BTreeSet::new();
+    evidence_refs.extend(index_inputs.iter().map(|input| input.evidence_ref.clone()));
+    evidence_refs.extend(
+        biomass_inputs
+            .iter()
+            .map(|input| input.evidence_ref.clone()),
+    );
+    evidence_refs.extend(
+        practice_inputs
+            .iter()
+            .map(|input| input.practice_ref.clone()),
+    );
+    let evidence_refs = evidence_refs.into_iter().collect::<Vec<_>>();
+
+    let has_sufficient_evidence =
+        !index_inputs.is_empty() && !biomass_inputs.is_empty() && !practice_inputs.is_empty();
+    let (proxy_value, uncertainty_band, status) = if has_sufficient_evidence {
+        let index_component = weighted_average(&index_inputs);
+        let biomass_component = weighted_average(&biomass_inputs);
+        let practice_component = practice_inputs
+            .iter()
+            .map(|input| input.carbon_delta)
+            .sum::<f64>()
+            / practice_inputs.len() as f64;
+        let proxy_value =
+            (index_component * 0.35) + (biomass_component * 0.50) + practice_component;
+        let evidence_count = index_inputs.len() + biomass_inputs.len() + practice_inputs.len();
+        let half_width = (proxy_value.abs() * 0.20 + 0.5) / (evidence_count as f64).sqrt();
+        (
+            Some(proxy_value),
+            Some(SoilCarbonUncertaintyBand {
+                low: proxy_value - half_width,
+                high: proxy_value + half_width,
+            }),
+            SoilCarbonProxyStatus::Computed,
+        )
+    } else {
+        (None, None, SoilCarbonProxyStatus::InsufficientEvidence)
+    };
+    let result_hash = soil_carbon_proxy_hash(
+        &record_id,
+        &field_id,
+        proxy_value,
+        &uncertainty_band,
+        status,
+        &evidence_refs,
+        &method_version,
+    );
+
+    Ok(SoilCarbonProxyResult {
+        proxy_id,
+        record_id,
+        field_id,
+        proxy_value,
+        uncertainty_band,
+        status,
+        evidence_refs,
+        method_version,
+        result_hash,
+        computed_at,
+    })
+}
+
 pub fn parse_sustainability_metric_type(
     value: &str,
 ) -> Result<SustainabilityMetricType, SustainabilityRecordError> {
@@ -11252,6 +11426,18 @@ pub fn parse_biodiversity_proxy_status(
         "computed" => Ok(BiodiversityProxyStatus::Computed),
         "no_signal" => Ok(BiodiversityProxyStatus::NoSignal),
         _ => Err(BiodiversityProxyError::UnsupportedStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_soil_carbon_proxy_status(
+    value: &str,
+) -> Result<SoilCarbonProxyStatus, SoilCarbonProxyError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "computed" => Ok(SoilCarbonProxyStatus::Computed),
+        "insufficient_evidence" => Ok(SoilCarbonProxyStatus::InsufficientEvidence),
+        _ => Err(SoilCarbonProxyError::UnsupportedStatus {
             value: value.to_string(),
         }),
     }
@@ -11420,6 +11606,86 @@ fn biodiversity_proxy_hash(
     );
     for source_layer_ref in source_layer_refs {
         canonical.push_str(&format!("|source:{source_layer_ref}"));
+    }
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn normalize_soil_carbon_evidence(
+    inputs: Vec<SoilCarbonEvidenceInput>,
+) -> Result<Vec<SoilCarbonEvidenceInput>, SoilCarbonProxyError> {
+    inputs
+        .into_iter()
+        .map(|input| {
+            let evidence_ref = normalize_sustainability_text(input.evidence_ref)
+                .ok_or(SoilCarbonProxyError::EmptyEvidenceRef)?;
+            if !input.value.is_finite() {
+                return Err(SoilCarbonProxyError::InvalidEvidenceValue);
+            }
+            if !(input.weight.is_finite() && input.weight > 0.0) {
+                return Err(SoilCarbonProxyError::InvalidEvidenceWeight);
+            }
+            Ok(SoilCarbonEvidenceInput {
+                evidence_ref,
+                value: input.value,
+                weight: input.weight,
+            })
+        })
+        .collect()
+}
+
+fn normalize_soil_carbon_practices(
+    inputs: Vec<SoilCarbonPracticeInput>,
+) -> Result<Vec<SoilCarbonPracticeInput>, SoilCarbonProxyError> {
+    inputs
+        .into_iter()
+        .map(|input| {
+            let practice_ref = normalize_sustainability_text(input.practice_ref)
+                .ok_or(SoilCarbonProxyError::EmptyPracticeRef)?;
+            if !input.carbon_delta.is_finite() {
+                return Err(SoilCarbonProxyError::InvalidPracticeDelta);
+            }
+            Ok(SoilCarbonPracticeInput {
+                practice_ref,
+                carbon_delta: input.carbon_delta,
+            })
+        })
+        .collect()
+}
+
+fn weighted_average(inputs: &[SoilCarbonEvidenceInput]) -> f64 {
+    let weighted_sum = inputs
+        .iter()
+        .map(|input| input.value * input.weight)
+        .sum::<f64>();
+    let weight_sum = inputs.iter().map(|input| input.weight).sum::<f64>();
+    weighted_sum / weight_sum
+}
+
+fn default_soil_carbon_weight() -> f64 {
+    1.0
+}
+
+fn soil_carbon_proxy_hash(
+    record_id: &str,
+    field_id: &str,
+    proxy_value: Option<f64>,
+    uncertainty_band: &Option<SoilCarbonUncertaintyBand>,
+    status: SoilCarbonProxyStatus,
+    evidence_refs: &[String],
+    method_version: &str,
+) -> String {
+    let mut canonical = format!(
+        "record={record_id}|field={field_id}|proxy={:.6}|low={:.6}|high={:.6}|status={}|method={method_version}",
+        proxy_value.unwrap_or(-1.0),
+        uncertainty_band.as_ref().map(|band| band.low).unwrap_or(-1.0),
+        uncertainty_band
+            .as_ref()
+            .map(|band| band.high)
+            .unwrap_or(-1.0),
+        status.as_str()
+    );
+    for evidence_ref in evidence_refs {
+        canonical.push_str(&format!("|evidence:{evidence_ref}"));
     }
     format!("{:016x}", fnv1a64(canonical.as_bytes()))
 }
@@ -15226,10 +15492,10 @@ mod tests {
         close_marketplace_listing_record, compare_sustainability_baseline,
         compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_baseline_trend,
         compute_drought_index, compute_drought_risk_score, compute_marketplace_demand_forecast,
-        compute_water_evapotranspiration, compute_weather_growing_degree_day,
-        compute_weather_reference_et, create_marketplace_fulfillment_record,
-        create_marketplace_rating_record, create_sustainability_baseline,
-        create_sustainability_mrv_trail, create_versioned_content,
+        compute_soil_carbon_proxy, compute_water_evapotranspiration,
+        compute_weather_growing_degree_day, compute_weather_reference_et,
+        create_marketplace_fulfillment_record, create_marketplace_rating_record,
+        create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -15300,18 +15566,20 @@ mod tests {
         RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
         ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
         SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
-        SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
-        SoilMoistureRejectionReason, SustainabilityBaselineCreateRequest,
-        SustainabilityBaselineRecord, SustainabilityComparisonRequest,
-        SustainabilityComparisonStatus, SustainabilityMetricType, SustainabilityMrvOutputKind,
-        SustainabilityMrvTrailCreateRequest, SustainabilityMrvTrailError,
-        SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
-        SustainabilityTrend, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorDeconflictionDecision, TractorDeconflictionRequest, TractorEstopState,
-        TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
-        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGeofenceDecision,
-        TractorGeofenceError, TractorGeofenceEvaluationRequest, TractorGuidanceConfig,
-        TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
+        SeasonRecord, SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
+        SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
+        SoilMoistureReadingRequest, SoilMoistureRejectionReason,
+        SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
+        SustainabilityComparisonRequest, SustainabilityComparisonStatus, SustainabilityMetricType,
+        SustainabilityMrvOutputKind, SustainabilityMrvTrailCreateRequest,
+        SustainabilityMrvTrailError, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+        SustainabilityRecordLinkage, SustainabilityTrend, TractorCommandAuditDecision,
+        TractorCommandRejectionReason, TractorDeconflictionDecision, TractorDeconflictionRequest,
+        TractorEstopState, TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent,
+        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
+        TractorFieldOpsTelemetrySample, TractorGeofenceDecision, TractorGeofenceError,
+        TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
+        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
         TractorImplementAdapterSpec, TractorImplementCommand, TractorImplementDecision,
         TractorImplementRef, TractorImplementState, TractorLifecycleStatus,
         TractorMotionCommandRequest, TractorMotionGateDecision, TractorObstacleDetection,
@@ -17797,6 +18065,79 @@ mod tests {
     }
 
     #[test]
+    fn soil_carbon_proxy_computes_value_with_uncertainty_band() {
+        let result = compute_soil_carbon_proxy(
+            soil_carbon_proxy_request(true),
+            "generated-soil-carbon".to_string(),
+            "2026-06-19T12:00:00Z".to_string(),
+        )
+        .expect("complete soil-carbon evidence should compute");
+
+        assert_eq!(result.proxy_id, "soil-carbon-001");
+        assert_eq!(result.record_id, "sustain-soil-carbon-001");
+        assert_eq!(result.field_id, "field-soil-carbon");
+        assert_eq!(result.status, SoilCarbonProxyStatus::Computed);
+        assert!(result.proxy_value.is_some_and(|value| value > 0.0));
+        let band = result
+            .uncertainty_band
+            .expect("computed soil-carbon proxy must include a band");
+        let value = result
+            .proxy_value
+            .expect("computed proxy should have value");
+        assert!(band.low < value);
+        assert!(band.high > value);
+        assert!(result
+            .evidence_refs
+            .contains(&"layer:ndvi-soil-carbon".to_string()));
+        assert!(result
+            .evidence_refs
+            .contains(&"biomass:estimate-001".to_string()));
+        assert!(result
+            .evidence_refs
+            .contains(&"practice:cover-crop-2026".to_string()));
+        assert!(!result.result_hash.is_empty());
+    }
+
+    #[test]
+    fn soil_carbon_proxy_same_inputs_reproduce_hash() {
+        let first = compute_soil_carbon_proxy(
+            soil_carbon_proxy_request(true),
+            "generated-soil-carbon-001".to_string(),
+            "2026-06-19T12:00:00Z".to_string(),
+        )
+        .expect("first soil-carbon proxy should compute");
+        let mut request = soil_carbon_proxy_request(true);
+        request.proxy_id = Some("soil-carbon-002".to_string());
+        let second = compute_soil_carbon_proxy(
+            request,
+            "generated-soil-carbon-002".to_string(),
+            "2026-06-20T12:00:00Z".to_string(),
+        )
+        .expect("second soil-carbon proxy should compute");
+
+        assert_eq!(first.proxy_value, second.proxy_value);
+        assert_eq!(first.uncertainty_band, second.uncertainty_band);
+        assert_eq!(first.result_hash, second.result_hash);
+    }
+
+    #[test]
+    fn soil_carbon_proxy_insufficient_evidence_returns_unavailable_without_band() {
+        let result = compute_soil_carbon_proxy(
+            soil_carbon_proxy_request(false),
+            "generated-soil-carbon".to_string(),
+            "2026-06-19T12:00:00Z".to_string(),
+        )
+        .expect("insufficient evidence should be explicit, not fatal");
+
+        assert_eq!(result.status, SoilCarbonProxyStatus::InsufficientEvidence);
+        assert_eq!(result.proxy_value, None);
+        assert_eq!(result.uncertainty_band, None);
+        assert!(result
+            .evidence_refs
+            .contains(&"layer:ndvi-soil-carbon".to_string()));
+    }
+
+    #[test]
     fn versioned_content_create_and_edit_advances_current_version() {
         let (content, first_version) = create_versioned_content(
             ContentCreateRequest {
@@ -17959,6 +18300,34 @@ mod tests {
             method_version: "biodiversity.imagery_proxy.v1".to_string(),
             cover_threshold: 0.3,
         }
+    }
+
+    fn soil_carbon_proxy_request(include_sufficient_evidence: bool) -> SoilCarbonProxyRequest {
+        let mut request = SoilCarbonProxyRequest {
+            proxy_id: Some("soil-carbon-001".to_string()),
+            record_id: "sustain-soil-carbon-001".to_string(),
+            field_id: "field-soil-carbon".to_string(),
+            index_inputs: vec![SoilCarbonEvidenceInput {
+                evidence_ref: "layer:ndvi-soil-carbon".to_string(),
+                value: 3.2,
+                weight: 0.8,
+            }],
+            biomass_inputs: vec![SoilCarbonEvidenceInput {
+                evidence_ref: "biomass:estimate-001".to_string(),
+                value: 5.6,
+                weight: 1.2,
+            }],
+            practice_inputs: vec![SoilCarbonPracticeInput {
+                practice_ref: "practice:cover-crop-2026".to_string(),
+                carbon_delta: 0.7,
+            }],
+            method_version: "soil_carbon.proxy.v1".to_string(),
+        };
+        if !include_sufficient_evidence {
+            request.biomass_inputs.clear();
+            request.practice_inputs.clear();
+        }
+        request
     }
 
     fn sustainability_baseline_record() -> SustainabilityBaselineRecord {

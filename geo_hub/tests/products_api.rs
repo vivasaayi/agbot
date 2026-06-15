@@ -5315,6 +5315,149 @@ async fn biodiversity_proxy_uniform_grid_persists_no_signal_without_score() -> R
 }
 
 #[tokio::test]
+async fn soil_carbon_proxies_compute_get_and_list_with_uncertainty_band() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/soil-carbon-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    soil_carbon_proxy_payload("soil-carbon-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("computed")
+    );
+    let proxy_value = first
+        .get("proxy_value")
+        .and_then(|value| value.as_f64())
+        .expect("computed proxy value should be present");
+    let band = first
+        .get("uncertainty_band")
+        .expect("band should always be present for computed proxy");
+    assert!(band.get("low").and_then(|value| value.as_f64()) < Some(proxy_value));
+    assert!(band.get("high").and_then(|value| value.as_f64()) > Some(proxy_value));
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/soil-carbon-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    soil_carbon_proxy_payload("soil-carbon-002", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/soil-carbon-proxies/soil-carbon-001?field_id=field-soil-carbon")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/soil-carbon-proxies?field_id=field-soil-carbon&status=computed")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let proxies: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(proxies.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn soil_carbon_proxy_insufficient_evidence_persists_unavailable_without_band() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/soil-carbon-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    soil_carbon_proxy_payload("soil-carbon-insufficient", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let proxy: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        proxy.get("status").and_then(|value| value.as_str()),
+        Some("insufficient_evidence")
+    );
+    assert!(proxy
+        .get("proxy_value")
+        .is_some_and(|value| value.is_null()));
+    assert!(proxy
+        .get("uncertainty_band")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM soil_carbon_proxies WHERE status = 'insufficient_evidence' AND proxy_value IS NULL AND uncertainty_low IS NULL AND uncertainty_high IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn content_items_create_edit_get_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -14503,6 +14646,37 @@ fn biodiversity_proxy_payload(proxy_id: &str, values: Vec<f64>) -> serde_json::V
         },
         "method_version": "biodiversity.imagery_proxy.v1",
         "cover_threshold": 0.3
+    })
+}
+
+fn soil_carbon_proxy_payload(proxy_id: &str, include_sufficient: bool) -> serde_json::Value {
+    json!({
+        "proxy_id": proxy_id,
+        "record_id": "sustain-soil-carbon-001",
+        "field_id": "field-soil-carbon",
+        "index_inputs": [{
+            "evidence_ref": "layer:ndvi-soil-carbon",
+            "value": 3.2,
+            "weight": 0.8
+        }],
+        "biomass_inputs": if include_sufficient {
+            json!([{
+                "evidence_ref": "biomass:estimate-001",
+                "value": 5.6,
+                "weight": 1.2
+            }])
+        } else {
+            json!([])
+        },
+        "practice_inputs": if include_sufficient {
+            json!([{
+                "practice_ref": "practice:cover-crop-2026",
+                "carbon_delta": 0.7
+            }])
+        } else {
+            json!([])
+        },
+        "method_version": "soil_carbon.proxy.v1"
     })
 }
 
