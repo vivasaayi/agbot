@@ -5039,6 +5039,137 @@ async fn sustainability_comparison_without_baseline_persists_no_baseline_without
 }
 
 #[tokio::test]
+async fn sustainability_mrv_trails_create_get_and_list_certification_ready() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_biomass_estimate_row(&ctx, "biomass-mrv-001", "sustain-biomass-mrv").await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/mrv-trails")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_mrv_payload("mrv-001", "biomass-mrv-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("output_ref").and_then(|value| value.as_str()),
+        Some("biomass-mrv-001")
+    );
+    assert_eq!(
+        first
+            .get("certification_ready")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    let rederived_hash = first
+        .get("rederived_result_hash")
+        .and_then(|value| value.as_str())
+        .expect("rederived hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/mrv-trails")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_mrv_payload("mrv-002", "biomass-mrv-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second
+            .get("rederived_result_hash")
+            .and_then(|value| value.as_str()),
+        Some(rederived_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/mrv-trails/mrv-001?output_ref=biomass-mrv-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/mrv-trails?output_ref=biomass-mrv-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let trails: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(trails.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_mrv_trail_rejects_incomplete_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_biomass_estimate_row(&ctx, "biomass-mrv-incomplete", "sustain-biomass-mrv").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/mrv-trails")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_mrv_payload("mrv-incomplete", "biomass-mrv-incomplete", false)
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sustainability_mrv_trails")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(stored_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn content_items_create_edit_get_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -14130,6 +14261,76 @@ fn sustainability_comparison_payload(
         "current_value": current_value,
         "current_source_record_id": current_source_record_id,
         "method_version": "sustainability.baseline_compare.v1"
+    })
+}
+
+async fn insert_biomass_estimate_row(
+    ctx: &TestContext,
+    estimate_id: &str,
+    record_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO biomass_estimates (
+            estimate_id, record_id, biomass_value, area, crs, extent_json,
+            resolution_json, source_layer_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(estimate_id)
+    .bind(record_id)
+    .bind(48.0_f64)
+    .bind(200.0_f64)
+    .bind("EPSG:32614")
+    .bind(
+        json!({
+            "min_lon": 0.0,
+            "min_lat": 0.0,
+            "max_lon": 20.0,
+            "max_lat": 20.0
+        })
+        .to_string(),
+    )
+    .bind(json!({ "x": 10.0, "y": 10.0 }).to_string())
+    .bind(json!(["layer:canopy-height-001", "layer:ndvi-001"]).to_string())
+    .bind("biomass.canopy_ndvi.v1")
+    .bind("result-hash-biomass-001")
+    .bind("2026-06-17T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
+}
+
+fn sustainability_mrv_payload(
+    trail_id: &str,
+    output_ref: &str,
+    complete: bool,
+) -> serde_json::Value {
+    json!({
+        "trail_id": trail_id,
+        "output_ref": output_ref,
+        "output_kind": "biomass_estimate",
+        "input_layer_refs": if complete {
+            json!(["layer:canopy-height-001", "layer:ndvi-001"])
+        } else {
+            json!([])
+        },
+        "method": "biomass_canopy_ndvi",
+        "method_version": "biomass.canopy_ndvi.v1",
+        "crs": "EPSG:32614",
+        "extent": {
+            "min_lon": 0.0,
+            "min_lat": 0.0,
+            "max_lon": 20.0,
+            "max_lat": 20.0
+        },
+        "parameters": {
+            "biomass_coefficient": "0.48",
+            "source_record_id": "sustain-biomass-mrv"
+        },
+        "audit_id": "audit-biomass-mrv",
+        "result_hash": "result-hash-biomass-001"
     })
 }
 

@@ -10343,6 +10343,62 @@ pub struct SustainabilityComparisonResult {
     pub compared_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SustainabilityMrvOutputKind {
+    CarbonFootprint,
+    BiomassEstimate,
+    SustainabilityKpi,
+}
+
+impl SustainabilityMrvOutputKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SustainabilityMrvOutputKind::CarbonFootprint => "carbon_footprint",
+            SustainabilityMrvOutputKind::BiomassEstimate => "biomass_estimate",
+            SustainabilityMrvOutputKind::SustainabilityKpi => "sustainability_kpi",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityMrvTrailCreateRequest {
+    #[serde(default)]
+    pub trail_id: Option<String>,
+    pub output_ref: String,
+    pub output_kind: SustainabilityMrvOutputKind,
+    #[serde(default)]
+    pub input_layer_refs: Vec<String>,
+    pub method: String,
+    pub method_version: String,
+    #[serde(default)]
+    pub crs: Option<String>,
+    #[serde(default)]
+    pub extent: Option<GeoBounds>,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
+    pub audit_id: String,
+    pub result_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityMrvTrail {
+    pub trail_id: String,
+    pub output_ref: String,
+    pub output_kind: SustainabilityMrvOutputKind,
+    pub input_layer_refs: Vec<String>,
+    pub method: String,
+    pub method_version: String,
+    pub crs: String,
+    pub extent: GeoBounds,
+    pub parameters: BTreeMap<String, String>,
+    pub audit_id: String,
+    pub result_hash: String,
+    pub rederived_result_hash: String,
+    pub certification_ready: bool,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SustainabilityRecordError {
     #[error("sustainability record_id cannot be empty")]
@@ -10454,6 +10510,34 @@ pub enum SustainabilityBaselineError {
     UnsupportedComparisonStatus { value: String },
     #[error("unsupported sustainability trend {value}")]
     UnsupportedTrend { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SustainabilityMrvTrailError {
+    #[error("MRV trail_id cannot be empty")]
+    EmptyTrailId,
+    #[error("MRV output_ref cannot be empty")]
+    EmptyOutputRef,
+    #[error("MRV input_layer_refs cannot be empty")]
+    EmptyInputLayerRefs,
+    #[error("MRV method cannot be empty")]
+    EmptyMethod,
+    #[error("MRV method_version cannot be empty")]
+    EmptyMethodVersion,
+    #[error("MRV CRS cannot be empty")]
+    EmptyCrs,
+    #[error("MRV extent is required")]
+    MissingExtent,
+    #[error("MRV extent is invalid")]
+    InvalidExtent,
+    #[error("MRV audit_id cannot be empty")]
+    EmptyAuditId,
+    #[error("MRV result_hash cannot be empty")]
+    EmptyResultHash,
+    #[error("MRV created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("unsupported MRV output kind {value}")]
+    UnsupportedOutputKind { value: String },
 }
 
 pub fn build_sustainability_record(
@@ -10836,6 +10920,88 @@ pub fn compare_sustainability_baseline(
     })
 }
 
+pub fn create_sustainability_mrv_trail(
+    request: SustainabilityMrvTrailCreateRequest,
+    generated_trail_id: String,
+    created_at: String,
+) -> Result<SustainabilityMrvTrail, SustainabilityMrvTrailError> {
+    let trail_id = normalize_sustainability_optional_text(request.trail_id)
+        .or_else(|| normalize_sustainability_text(generated_trail_id))
+        .ok_or(SustainabilityMrvTrailError::EmptyTrailId)?;
+    let output_ref = normalize_sustainability_text(request.output_ref)
+        .ok_or(SustainabilityMrvTrailError::EmptyOutputRef)?;
+    let input_layer_refs = request
+        .input_layer_refs
+        .into_iter()
+        .filter_map(normalize_sustainability_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if input_layer_refs.is_empty() {
+        return Err(SustainabilityMrvTrailError::EmptyInputLayerRefs);
+    }
+    let method = normalize_sustainability_text(request.method)
+        .ok_or(SustainabilityMrvTrailError::EmptyMethod)?;
+    let method_version = normalize_sustainability_text(request.method_version)
+        .ok_or(SustainabilityMrvTrailError::EmptyMethodVersion)?;
+    let crs = normalize_sustainability_optional_text(request.crs)
+        .ok_or(SustainabilityMrvTrailError::EmptyCrs)?;
+    let extent = request
+        .extent
+        .ok_or(SustainabilityMrvTrailError::MissingExtent)?;
+    if !sustainability_extent_is_valid(&extent) {
+        return Err(SustainabilityMrvTrailError::InvalidExtent);
+    }
+    let audit_id = normalize_sustainability_text(request.audit_id)
+        .ok_or(SustainabilityMrvTrailError::EmptyAuditId)?;
+    let result_hash = normalize_sustainability_text(request.result_hash)
+        .ok_or(SustainabilityMrvTrailError::EmptyResultHash)?;
+    let created_at = normalize_sustainability_text(created_at)
+        .ok_or(SustainabilityMrvTrailError::EmptyCreatedAt)?;
+    let parameters = request
+        .parameters
+        .into_iter()
+        .filter_map(|(key, value)| {
+            normalize_sustainability_text(key).map(|key| {
+                (
+                    key,
+                    normalize_sustainability_text(value)
+                        .unwrap_or_else(|| "unspecified".to_string()),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let rederived_result_hash = sustainability_mrv_rederived_hash(
+        &output_ref,
+        request.output_kind,
+        &input_layer_refs,
+        &method,
+        &method_version,
+        &crs,
+        &extent,
+        &parameters,
+        &audit_id,
+        &result_hash,
+    );
+
+    Ok(SustainabilityMrvTrail {
+        trail_id,
+        output_ref,
+        output_kind: request.output_kind,
+        input_layer_refs,
+        method,
+        method_version,
+        crs,
+        extent,
+        parameters,
+        audit_id,
+        result_hash,
+        rederived_result_hash,
+        certification_ready: true,
+        created_at,
+    })
+}
+
 pub fn parse_sustainability_metric_type(
     value: &str,
 ) -> Result<SustainabilityMetricType, SustainabilityRecordError> {
@@ -10898,6 +11064,19 @@ pub fn parse_sustainability_trend(
         "unchanged" => Ok(SustainabilityTrend::Unchanged),
         "no_baseline" => Ok(SustainabilityTrend::NoBaseline),
         _ => Err(SustainabilityBaselineError::UnsupportedTrend {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_sustainability_mrv_output_kind(
+    value: &str,
+) -> Result<SustainabilityMrvOutputKind, SustainabilityMrvTrailError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "carbon_footprint" => Ok(SustainabilityMrvOutputKind::CarbonFootprint),
+        "biomass_estimate" => Ok(SustainabilityMrvOutputKind::BiomassEstimate),
+        "sustainability_kpi" => Ok(SustainabilityMrvOutputKind::SustainabilityKpi),
+        _ => Err(SustainabilityMrvTrailError::UnsupportedOutputKind {
             value: value.to_string(),
         }),
     }
@@ -10970,6 +11149,44 @@ fn sustainability_comparison_hash(
         trend.as_str(),
         baseline_source_record_id.as_deref().unwrap_or("none")
     );
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn sustainability_extent_is_valid(extent: &GeoBounds) -> bool {
+    extent.min_lon.is_finite()
+        && extent.min_lat.is_finite()
+        && extent.max_lon.is_finite()
+        && extent.max_lat.is_finite()
+        && extent.min_lon < extent.max_lon
+        && extent.min_lat < extent.max_lat
+}
+
+fn sustainability_mrv_rederived_hash(
+    output_ref: &str,
+    output_kind: SustainabilityMrvOutputKind,
+    input_layer_refs: &[String],
+    method: &str,
+    method_version: &str,
+    crs: &str,
+    extent: &GeoBounds,
+    parameters: &BTreeMap<String, String>,
+    audit_id: &str,
+    result_hash: &str,
+) -> String {
+    let mut canonical = format!(
+        "output={output_ref}|kind={}|method={method}|version={method_version}|crs={crs}|extent={:.9},{:.9},{:.9},{:.9}|audit={audit_id}|result={result_hash}",
+        output_kind.as_str(),
+        extent.min_lon,
+        extent.min_lat,
+        extent.max_lon,
+        extent.max_lat
+    );
+    for input_layer_ref in input_layer_refs {
+        canonical.push_str(&format!("|input:{input_layer_ref}"));
+    }
+    for (key, value) in parameters {
+        canonical.push_str(&format!("|param:{key}={value}"));
+    }
     format!("{:016x}", fnv1a64(canonical.as_bytes()))
 }
 
@@ -14759,6 +14976,8 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
         advise_weather_operational_windows, aggregate_marketplace_ratings,
         annotate_weather_record_freshness, append_content_version, append_irrigation_history_event,
@@ -14775,7 +14994,8 @@ mod tests {
         compute_drought_risk_score, compute_marketplace_demand_forecast,
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
         compute_weather_reference_et, create_marketplace_fulfillment_record,
-        create_marketplace_rating_record, create_sustainability_baseline, create_versioned_content,
+        create_marketplace_rating_record, create_sustainability_baseline,
+        create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -14848,7 +15068,8 @@ mod tests {
         SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
         SoilMoistureRejectionReason, SustainabilityBaselineCreateRequest,
         SustainabilityBaselineRecord, SustainabilityComparisonRequest,
-        SustainabilityComparisonStatus, SustainabilityMetricType,
+        SustainabilityComparisonStatus, SustainabilityMetricType, SustainabilityMrvOutputKind,
+        SustainabilityMrvTrailCreateRequest, SustainabilityMrvTrailError,
         SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
         SustainabilityTrend, TractorCommandAuditDecision, TractorCommandRejectionReason,
         TractorDeconflictionDecision, TractorDeconflictionRequest, TractorEstopState,
@@ -17218,6 +17439,66 @@ mod tests {
     }
 
     #[test]
+    fn sustainability_mrv_trail_requires_complete_certification_fields() {
+        let trail = create_sustainability_mrv_trail(
+            sustainability_mrv_request(),
+            "generated-trail".to_string(),
+            "2026-06-17T12:00:00Z".to_string(),
+        )
+        .expect("complete MRV trail should finalize");
+
+        assert_eq!(trail.trail_id, "mrv-001");
+        assert_eq!(trail.output_ref, "biomass-001");
+        assert_eq!(
+            trail.output_kind,
+            SustainabilityMrvOutputKind::BiomassEstimate
+        );
+        assert_eq!(
+            trail.input_layer_refs,
+            vec!["layer:canopy-height-001", "layer:ndvi-001"]
+        );
+        assert_eq!(trail.method, "biomass_canopy_ndvi");
+        assert_eq!(trail.method_version, "biomass.canopy_ndvi.v1");
+        assert_eq!(trail.crs, "EPSG:32614");
+        assert!(trail.certification_ready);
+        assert!(!trail.rederived_result_hash.is_empty());
+    }
+
+    #[test]
+    fn sustainability_mrv_trail_same_inputs_rederive_same_hash() {
+        let first = create_sustainability_mrv_trail(
+            sustainability_mrv_request(),
+            "generated-trail-001".to_string(),
+            "2026-06-17T12:00:00Z".to_string(),
+        )
+        .expect("first MRV trail should finalize");
+        let mut request = sustainability_mrv_request();
+        request.trail_id = Some("mrv-002".to_string());
+        let second = create_sustainability_mrv_trail(
+            request,
+            "generated-trail-002".to_string(),
+            "2026-06-18T12:00:00Z".to_string(),
+        )
+        .expect("second MRV trail should finalize");
+
+        assert_eq!(first.rederived_result_hash, second.rederived_result_hash);
+    }
+
+    #[test]
+    fn sustainability_mrv_trail_rejects_incomplete_trail() {
+        let mut request = sustainability_mrv_request();
+        request.input_layer_refs.clear();
+        let error = create_sustainability_mrv_trail(
+            request,
+            "generated-trail".to_string(),
+            "2026-06-17T12:00:00Z".to_string(),
+        )
+        .expect_err("missing input layers should reject certification trail");
+
+        assert_eq!(error, SustainabilityMrvTrailError::EmptyInputLayerRefs);
+    }
+
+    #[test]
     fn versioned_content_create_and_edit_advances_current_version() {
         let (content, first_version) = create_versioned_content(
             ContentCreateRequest {
@@ -17322,6 +17603,36 @@ mod tests {
                 version: "agbot-carbon-factors-v1".to_string(),
                 factors,
             },
+        }
+    }
+
+    fn sustainability_mrv_request() -> SustainabilityMrvTrailCreateRequest {
+        SustainabilityMrvTrailCreateRequest {
+            trail_id: Some("mrv-001".to_string()),
+            output_ref: "biomass-001".to_string(),
+            output_kind: SustainabilityMrvOutputKind::BiomassEstimate,
+            input_layer_refs: vec![
+                "layer:ndvi-001".to_string(),
+                "layer:canopy-height-001".to_string(),
+            ],
+            method: "biomass_canopy_ndvi".to_string(),
+            method_version: "biomass.canopy_ndvi.v1".to_string(),
+            crs: Some("EPSG:32614".to_string()),
+            extent: Some(GeoBounds {
+                min_lon: 0.0,
+                min_lat: 0.0,
+                max_lon: 20.0,
+                max_lat: 20.0,
+            }),
+            parameters: BTreeMap::from([
+                ("biomass_coefficient".to_string(), "0.48".to_string()),
+                (
+                    "source_record_id".to_string(),
+                    "sustain-biomass-001".to_string(),
+                ),
+            ]),
+            audit_id: "audit-biomass-001".to_string(),
+            result_hash: "result-hash-biomass-001".to_string(),
         }
     }
 

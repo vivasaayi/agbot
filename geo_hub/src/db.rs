@@ -1192,6 +1192,29 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS sustainability_mrv_trails (
+            trail_id TEXT PRIMARY KEY,
+            output_ref TEXT NOT NULL,
+            output_kind TEXT NOT NULL,
+            input_layer_refs_json TEXT NOT NULL,
+            method TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            crs TEXT NOT NULL,
+            extent_json TEXT NOT NULL,
+            parameters_json TEXT NOT NULL,
+            audit_id TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            rederived_result_hash TEXT NOT NULL,
+            certification_ready INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS cms_contents (
             content_id TEXT PRIMARY KEY,
             content_type TEXT NOT NULL,
@@ -2036,6 +2059,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_sustainability_comparisons_field_status
         ON sustainability_comparisons(field_id, status, compared_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_mrv_trails_output
+        ON sustainability_mrv_trails(output_ref, output_kind, created_at);
         "#,
     )
     .execute(pool)

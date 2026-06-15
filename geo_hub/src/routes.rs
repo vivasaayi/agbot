@@ -93,8 +93,8 @@ use shared::schemas::{
     close_marketplace_listing_record, compare_sustainability_baseline, compute_carbon_footprint,
     compute_drought_index, compute_marketplace_demand_forecast,
     create_marketplace_fulfillment_record, create_marketplace_rating_record,
-    create_sustainability_baseline, create_versioned_content, estimate_biomass,
-    fulfill_marketplace_inventory, normalize_weather_provider_forecast,
+    create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
+    estimate_biomass, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
     parse_carbon_footprint_status, parse_content_status, parse_content_type,
     parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
     parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
@@ -102,27 +102,28 @@ use shared::schemas::{
     parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
-    parse_sustainability_metric_type, parse_sustainability_trend, place_marketplace_order_record,
-    prepare_open_data_publication, publish_marketplace_listing_record,
-    release_marketplace_inventory, reserve_marketplace_inventory,
-    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
-    transition_marketplace_account_status, transition_marketplace_fulfillment_status,
-    transition_marketplace_order_status, validate_field_boundary, weather_fetch_failure_record,
-    AnnotationGeometry, AnnotationRecord, BiomassEstimateError, BiomassEstimateRequest,
-    BiomassEstimateResult, CarbonEmissionFactor, CarbonFootprintComputeRequest,
-    CarbonFootprintError, CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
-    CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
-    CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
-    ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
-    ContentType, ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError,
-    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
-    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
-    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
-    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
-    MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
-    MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
+    parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
+    parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
+    publish_marketplace_listing_record, release_marketplace_inventory,
+    reserve_marketplace_inventory, soil_moisture_rejection_reason_for_error,
+    soil_moisture_rejection_record, transition_marketplace_account_status,
+    transition_marketplace_fulfillment_status, transition_marketplace_order_status,
+    validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
+    BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult, CarbonEmissionFactor,
+    CarbonFootprintComputeRequest, CarbonFootprintError, CarbonFootprintInput,
+    CarbonFootprintResult, CarbonFootprintStatus, CollaborationChannelCreateRequest,
+    CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
+    CollaborationMessageCreateRequest, CollaborationMessageRecord, ContentCreateRequest,
+    ContentEditRequest, ContentError, ContentRecord, ContentStatus, ContentType,
+    ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod,
+    DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus, FarmFieldListPage,
+    FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord, FieldRecord,
+    FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord,
+    FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
+    MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+    MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
+    MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplaceCatalogItemRecord,
+    MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
     MarketplaceDemandForecastRequest, MarketplaceDemandUncertaintyBand,
     MarketplaceFulfillmentAuditRecord, MarketplaceFulfillmentCreateRequest,
     MarketplaceFulfillmentError, MarketplaceFulfillmentRecord, MarketplaceFulfillmentStatus,
@@ -140,13 +141,15 @@ use shared::schemas::{
     SoilMoistureRejectionReason, SoilMoistureRejectionRecord, SustainabilityBaselineCreateRequest,
     SustainabilityBaselineError, SustainabilityBaselineRecord, SustainabilityComparisonRequest,
     SustainabilityComparisonResult, SustainabilityComparisonStatus, SustainabilityMetricType,
-    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
-    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
-    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
-    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
-    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
-    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
-    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
+    SustainabilityMrvOutputKind, SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest,
+    SustainabilityMrvTrailError, SustainabilityRecord, SustainabilityRecordCreateRequest,
+    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
+    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
+    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
+    TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
+    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
+    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
+    GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -820,6 +823,17 @@ pub struct SustainabilityComparisonListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SustainabilityComparisonScopeQuery {
     pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityMrvTrailListQuery {
+    pub output_ref: Option<String>,
+    pub output_kind: Option<SustainabilityMrvOutputKind>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityMrvTrailScopeQuery {
+    pub output_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4485,6 +4499,69 @@ pub async fn get_sustainability_comparison(
     }
 
     Ok(Json(comparison))
+}
+
+pub async fn create_sustainability_mrv_trail_record(
+    State(state): State<AppState>,
+    Json(request): Json<SustainabilityMrvTrailCreateRequest>,
+) -> AppResult<Json<SustainabilityMrvTrail>> {
+    validate_sustainability_mrv_output_ref(&state, request.output_kind, &request.output_ref)
+        .await?;
+    let trail = create_sustainability_mrv_trail(
+        request,
+        format!("sustainability-mrv-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_mrv_trail_error)?;
+    insert_sustainability_mrv_trail(&state, &trail).await?;
+
+    Ok(Json(trail))
+}
+
+pub async fn list_sustainability_mrv_trails(
+    Query(query): Query<SustainabilityMrvTrailListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SustainabilityMrvTrail>>> {
+    let output_ref = normalize_optional_text(query.output_ref);
+    let output_kind = query.output_kind.map(|kind| kind.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT trail_id, output_ref, output_kind, input_layer_refs_json, method,
+               method_version, crs, extent_json, parameters_json, audit_id, result_hash,
+               rederived_result_hash, certification_ready, created_at
+        FROM sustainability_mrv_trails
+        WHERE (?1 IS NULL OR output_ref = ?1)
+          AND (?2 IS NULL OR output_kind = ?2)
+        ORDER BY created_at ASC, trail_id ASC
+        "#,
+    )
+    .bind(output_ref)
+    .bind(output_kind)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_sustainability_mrv_trail(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_sustainability_mrv_trail(
+    Path(trail_id): Path<String>,
+    Query(query): Query<SustainabilityMrvTrailScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SustainabilityMrvTrail>> {
+    let trail = load_sustainability_mrv_trail(&state, &trail_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if let Some(output_ref) = normalize_optional_text(query.output_ref) {
+        if trail.output_ref != output_ref {
+            return Err(AppError::NotFound);
+        }
+    }
+
+    Ok(Json(trail))
 }
 
 pub async fn create_content_item(
@@ -9586,6 +9663,10 @@ fn sustainability_baseline_error(error: SustainabilityBaselineError) -> AppError
     AppError::BadRequest(error.to_string())
 }
 
+fn sustainability_mrv_trail_error(error: SustainabilityMrvTrailError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn content_error(error: ContentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -11365,6 +11446,45 @@ fn decode_sustainability_comparison(
         method_version: row.get("method_version"),
         result_hash: row.get("result_hash"),
         compared_at: row.get("compared_at"),
+    })
+}
+
+fn decode_sustainability_mrv_trail(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityMrvTrail> {
+    let input_layer_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("input_layer_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode MRV input_layer_refs_json"),
+                )
+            })?;
+    let extent =
+        serde_json::from_str::<GeoBounds>(&row.get::<String, _>("extent_json")).map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode MRV extent_json"))
+        })?;
+    let parameters =
+        serde_json::from_str::<BTreeMap<String, String>>(&row.get::<String, _>("parameters_json"))
+            .map_err(|err| {
+                AppError::Anyhow(Error::new(err).context("failed to decode MRV parameters_json"))
+            })?;
+
+    Ok(SustainabilityMrvTrail {
+        trail_id: row.get("trail_id"),
+        output_ref: row.get("output_ref"),
+        output_kind: parse_sustainability_mrv_output_kind(&row.get::<String, _>("output_kind"))
+            .map_err(sustainability_mrv_trail_error)?,
+        input_layer_refs,
+        method: row.get("method"),
+        method_version: row.get("method_version"),
+        crs: row.get("crs"),
+        extent,
+        parameters,
+        audit_id: row.get("audit_id"),
+        result_hash: row.get("result_hash"),
+        rederived_result_hash: row.get("rederived_result_hash"),
+        certification_ready: row.get::<i64, _>("certification_ready") != 0,
+        created_at: row.get("created_at"),
     })
 }
 
@@ -13830,6 +13950,104 @@ async fn load_sustainability_comparison(
     .map_err(Error::from)?;
 
     row.map(|row| decode_sustainability_comparison(&row))
+        .transpose()
+}
+
+async fn validate_sustainability_mrv_output_ref(
+    state: &AppState,
+    output_kind: SustainabilityMrvOutputKind,
+    output_ref: &str,
+) -> AppResult<()> {
+    let exists: i64 = match output_kind {
+        SustainabilityMrvOutputKind::CarbonFootprint => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM carbon_footprints WHERE footprint_id = ?1")
+                .bind(output_ref)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(Error::from)?
+        }
+        SustainabilityMrvOutputKind::BiomassEstimate => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM biomass_estimates WHERE estimate_id = ?1")
+                .bind(output_ref)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(Error::from)?
+        }
+        SustainabilityMrvOutputKind::SustainabilityKpi => 1,
+    };
+    if exists == 0 {
+        return Err(AppError::BadRequest(format!(
+            "MRV output_ref {output_ref} does not exist for {}",
+            output_kind.as_str()
+        )));
+    }
+    Ok(())
+}
+
+async fn insert_sustainability_mrv_trail(
+    state: &AppState,
+    trail: &SustainabilityMrvTrail,
+) -> AppResult<()> {
+    let input_layer_refs_json = serde_json::to_string(&trail.input_layer_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let extent_json =
+        serde_json::to_string(&trail.extent).map_err(|err| AppError::Anyhow(err.into()))?;
+    let parameters_json =
+        serde_json::to_string(&trail.parameters).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_mrv_trails (
+            trail_id, output_ref, output_kind, input_layer_refs_json, method, method_version,
+            crs, extent_json, parameters_json, audit_id, result_hash, rederived_result_hash,
+            certification_ready, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+    )
+    .bind(&trail.trail_id)
+    .bind(&trail.output_ref)
+    .bind(trail.output_kind.as_str())
+    .bind(input_layer_refs_json)
+    .bind(&trail.method)
+    .bind(&trail.method_version)
+    .bind(&trail.crs)
+    .bind(extent_json)
+    .bind(parameters_json)
+    .bind(&trail.audit_id)
+    .bind(&trail.result_hash)
+    .bind(&trail.rederived_result_hash)
+    .bind(if trail.certification_ready {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(&trail.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_mrv_trail(
+    state: &AppState,
+    trail_id: &str,
+) -> AppResult<Option<SustainabilityMrvTrail>> {
+    let row = sqlx::query(
+        r#"
+        SELECT trail_id, output_ref, output_kind, input_layer_refs_json, method,
+               method_version, crs, extent_json, parameters_json, audit_id, result_hash,
+               rederived_result_hash, certification_ready, created_at
+        FROM sustainability_mrv_trails
+        WHERE trail_id = ?1
+        "#,
+    )
+    .bind(trail_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_mrv_trail(&row))
         .transpose()
 }
 

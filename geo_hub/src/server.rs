@@ -377,6 +377,15 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_sustainability_comparison),
         )
         .route(
+            "/api/sustainability/mrv-trails",
+            get(routes::list_sustainability_mrv_trails)
+                .post(routes::create_sustainability_mrv_trail_record),
+        )
+        .route(
+            "/api/sustainability/mrv-trails/:trail_id",
+            get(routes::get_sustainability_mrv_trail),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
         )
