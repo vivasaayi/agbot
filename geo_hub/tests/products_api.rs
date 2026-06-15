@@ -9788,6 +9788,207 @@ async fn empty_recommendation_exports_are_schema_valid() -> Result<()> {
 }
 
 #[tokio::test]
+async fn field_record_bundle_exports_csv_and_geojson() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+    create_acceptance_annotation(&ctx, &fixture.scene_id).await?;
+
+    let recommendation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{}/recommendations", fixture.scene_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recommendation_id": "field-bundle-rec-1",
+                        "title": "Bundle irrigation check",
+                        "category": "irrigation",
+                        "priority": "high",
+                        "status": "open",
+                        "annotation_ids": ["accept-ann-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(recommendation_response.status(), StatusCode::OK);
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fields/{}/exports/records.csv",
+                    fixture.field_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    assert_eq!(
+        csv_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(
+        csv_reader.headers()?.iter().collect::<Vec<_>>(),
+        vec![
+            "record_type",
+            "record_id",
+            "scene_id",
+            "field_id",
+            "crs",
+            "title",
+            "label",
+            "status",
+            "priority",
+            "evidence_refs",
+            "annotation_ids",
+            "geometry_type",
+            "geometry_json",
+            "created_at",
+            "updated_at"
+        ]
+    );
+    let rows = csv_reader.records().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get(0), Some("annotation"));
+    assert_eq!(rows[0].get(1), Some("accept-ann-1"));
+    assert_eq!(rows[0].get(3), Some(fixture.field_id.as_str()));
+    assert_eq!(rows[1].get(0), Some("recommendation"));
+    assert_eq!(rows[1].get(1), Some("field-bundle-rec-1"));
+    assert_eq!(rows[1].get(5), Some("Bundle irrigation check"));
+    assert_eq!(rows[1].get(10), Some("accept-ann-1"));
+
+    let geojson_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fields/{}/exports/records.geojson",
+                    fixture.field_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson
+            .pointer("/crs/properties/name")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    let features = geojson
+        .get("features")
+        .and_then(|value| value.as_array())
+        .expect("features should exist");
+    assert_eq!(features.len(), 3);
+    assert!(features.iter().any(|feature| {
+        feature
+            .pointer("/properties/field_id")
+            .and_then(|value| value.as_str())
+            == Some(fixture.field_id.as_str())
+    }));
+    assert!(features.iter().any(|feature| {
+        feature
+            .pointer("/properties/annotation_id")
+            .and_then(|value| value.as_str())
+            == Some("accept-ann-1")
+    }));
+    assert!(features.iter().any(|feature| {
+        feature
+            .pointer("/properties/recommendation_id")
+            .and_then(|value| value.as_str())
+            == Some("field-bundle-rec-1")
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_field_record_bundle_exports_valid_empty_records() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fields/{}/exports/records.csv",
+                    fixture.field_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(csv_reader.records().count(), 0);
+
+    let geojson_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fields/{}/exports/records.geojson",
+                    fixture.field_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson.get("type").and_then(|value| value.as_str()),
+        Some("FeatureCollection")
+    );
+    assert_eq!(
+        geojson
+            .get("features")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/field_id")
+            .and_then(|value| value.as_str()),
+        Some(fixture.field_id.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn layer_geotiff_export_round_trips_spatial_metadata() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

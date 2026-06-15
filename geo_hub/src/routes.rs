@@ -6007,6 +6007,130 @@ pub async fn export_scene_recommendations_geojson(
     )
 }
 
+pub async fn export_field_records_csv(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let field = load_field(&state, &field_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let annotations = load_field_annotation_records(&state, &field_id).await?;
+    let recommendations = load_field_recommendation_records(&state, &field_id).await?;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer
+        .write_record([
+            "record_type",
+            "record_id",
+            "scene_id",
+            "field_id",
+            "crs",
+            "title",
+            "label",
+            "status",
+            "priority",
+            "evidence_refs",
+            "annotation_ids",
+            "geometry_type",
+            "geometry_json",
+            "created_at",
+            "updated_at",
+        ])
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    for annotation in &annotations {
+        let geometry_type = annotation_geometry_type(&annotation.geometry).to_string();
+        let geometry_json = serde_json::to_string(&annotation.geometry)
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+        writer
+            .write_record(vec![
+                "annotation".to_string(),
+                annotation.annotation_id.clone(),
+                annotation.scene_id.clone(),
+                annotation
+                    .field_id
+                    .clone()
+                    .unwrap_or_else(|| field.field_id.clone()),
+                annotation
+                    .crs
+                    .clone()
+                    .unwrap_or_else(|| field_record_crs(&field)),
+                String::new(),
+                annotation.label.clone(),
+                String::new(),
+                annotation.severity.clone().unwrap_or_default(),
+                String::new(),
+                String::new(),
+                geometry_type,
+                geometry_json,
+                annotation.created_at.clone(),
+                annotation.updated_at.clone(),
+            ])
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+
+    for recommendation in recommendations {
+        writer
+            .write_record(vec![
+                "recommendation".to_string(),
+                recommendation.recommendation_id,
+                recommendation.scene_id,
+                recommendation
+                    .field_id
+                    .unwrap_or_else(|| field.field_id.clone()),
+                field_record_crs(&field),
+                recommendation.title,
+                String::new(),
+                recommendation_status_str(recommendation.status).to_string(),
+                recommendation_priority_str(recommendation.priority).to_string(),
+                recommendation.evidence_refs.join("|"),
+                recommendation.annotation_ids.join("|"),
+                String::new(),
+                String::new(),
+                recommendation.created_at,
+                recommendation.updated_at,
+            ])
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+
+    let csv_bytes = writer
+        .into_inner()
+        .map_err(|err| AppError::Anyhow(err.into_error().into()))?;
+
+    response_with_bytes(csv_bytes, "text/csv; charset=utf-8", "field-records.csv")
+}
+
+pub async fn export_field_records_geojson(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let field = load_field(&state, &field_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let field_crs = field_record_crs(&field);
+    let annotations = load_field_annotation_records(&state, &field_id).await?;
+    assert_field_bundle_annotation_crs(&annotations, &field_crs)?;
+    let recommendations = load_field_recommendation_records(&state, &field_id).await?;
+
+    let mut features = vec![feature_from_field(field.clone())];
+    features.extend(
+        annotations
+            .iter()
+            .map(feature_from_annotation)
+            .collect::<AppResult<Vec<_>>>()?,
+    );
+    for recommendation in &recommendations {
+        features.extend(recommendation_features(recommendation, &annotations)?);
+    }
+
+    let geojson = feature_collection_with_crs(features, &field_crs);
+
+    response_with_bytes(
+        serde_json::to_vec(&geojson).map_err(|err| AppError::Anyhow(err.into()))?,
+        "application/geo+json",
+        "field-records.geojson",
+    )
+}
+
 pub async fn create_field(
     State(state): State<AppState>,
     Json(request): Json<CreateFieldRequest>,
@@ -8779,6 +8903,36 @@ fn collection_crs_from_annotations(annotations: &[AnnotationRecord]) -> AppResul
     }
 
     Ok(collection_crs.unwrap_or_else(|| "EPSG:4326".to_string()))
+}
+
+fn field_record_crs(field: &FieldRecord) -> String {
+    field
+        .boundary
+        .crs
+        .clone()
+        .unwrap_or_else(|| "EPSG:4326".to_string())
+}
+
+fn assert_field_bundle_annotation_crs(
+    annotations: &[AnnotationRecord],
+    field_crs: &str,
+) -> AppResult<()> {
+    let field_crs = normalize_geojson_crs(Some(field_crs.to_string()))?;
+    for annotation in annotations {
+        let annotation_crs = annotation
+            .crs
+            .as_ref()
+            .map(|crs| normalize_geojson_crs(Some(crs.clone())))
+            .transpose()?
+            .unwrap_or_else(|| field_crs.clone());
+        if annotation_crs != field_crs {
+            return Err(AppError::BadRequest(format!(
+                "field export requires annotation {} CRS {} to match field CRS {}",
+                annotation.annotation_id, annotation_crs, field_crs
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn annotation_geometry_type(geometry: &AnnotationGeometry) -> &'static str {
@@ -12866,6 +13020,58 @@ async fn load_scene_recommendation_records(
         "#,
     )
     .bind(scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut recommendations = Vec::with_capacity(rows.len());
+    for row in rows {
+        recommendations.push(decode_recommendation_record(state, &row).await?);
+    }
+
+    Ok(recommendations)
+}
+
+async fn load_field_annotation_records(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<AnnotationRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT annotation_id, scene_id, field_id, author, crs, audit_id, label, note, severity, geometry_json, created_at, updated_at
+        FROM annotations
+        WHERE field_id = ?1
+           OR scene_id IN (SELECT scene_id FROM scenes WHERE field_id = ?1)
+        ORDER BY scene_id ASC, created_at ASC, annotation_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut annotations = Vec::with_capacity(rows.len());
+    for row in rows {
+        annotations.push(decode_annotation_record(&row)?);
+    }
+
+    Ok(annotations)
+}
+
+async fn load_field_recommendation_records(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<RecommendationRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, evidence_refs_json, created_at, updated_at
+        FROM recommendations
+        WHERE field_id = ?1
+           OR scene_id IN (SELECT scene_id FROM scenes WHERE field_id = ?1)
+        ORDER BY scene_id ASC, created_at ASC, recommendation_id ASC
+        "#,
+    )
+    .bind(field_id)
     .fetch_all(&state.pool)
     .await
     .map_err(Error::from)?;

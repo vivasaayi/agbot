@@ -418,6 +418,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::download_shared_report),
         )
         .route(
+            "/api/fields/:field_id/exports/records.csv",
+            get(routes::export_field_records_csv),
+        )
+        .route(
+            "/api/fields/:field_id/exports/records.geojson",
+            get(routes::export_field_records_geojson),
+        )
+        .route(
             "/api/scenes/:scene_id/exports/annotations.csv",
             get(routes::export_scene_annotations_csv),
         )
