@@ -1142,6 +1142,47 @@ pub struct TractorImplementAdapterResult {
     pub log: TractorImplementSetpointLog,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldOperationalWindow {
+    pub field_id: String,
+    pub source: String,
+    pub fetched_at: String,
+    pub valid_from: String,
+    pub valid_until: String,
+    pub allowed: bool,
+    pub reason_code: String,
+    #[serde(default)]
+    pub gating_inputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorWeatherWindowGateRequest {
+    pub field_id: String,
+    pub requested_start_at: String,
+    pub max_window_age_seconds: i64,
+    #[serde(default)]
+    pub window: Option<FieldOperationalWindow>,
+    pub motion_gate: TractorMotionGateEvaluation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorWeatherWindowDecision {
+    Allowed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorWeatherWindowGate {
+    pub field_id: String,
+    pub decision: TractorWeatherWindowDecision,
+    pub reason_code: String,
+    pub requested_start_at: String,
+    #[serde(default)]
+    pub window_source: Option<String>,
+    pub gating_inputs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TractorImplementControlError {
     #[error("tractor implement control implement_id cannot be empty")]
@@ -1153,6 +1194,18 @@ pub enum TractorImplementControlError {
     #[error("tractor implement control timestamp cannot be empty")]
     EmptyTimestamp,
     #[error("tractor implement control timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TractorWeatherWindowGateError {
+    #[error("tractor weather window field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("tractor weather window requested_start_at cannot be empty")]
+    EmptyRequestedStartAt,
+    #[error("tractor weather window max age must be positive")]
+    InvalidMaxWindowAge,
+    #[error("tractor weather window timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
 }
 
@@ -2384,6 +2437,136 @@ fn parse_tractor_implement_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.with_timezone(&chrono::Utc))
         .map_err(|_| TractorImplementControlError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+pub fn evaluate_tractor_weather_window_gate(
+    request: TractorWeatherWindowGateRequest,
+) -> Result<TractorWeatherWindowGate, TractorWeatherWindowGateError> {
+    let field_id = normalize_tractor_text(request.field_id)
+        .ok_or(TractorWeatherWindowGateError::EmptyFieldId)?;
+    let requested_start_at = normalize_tractor_text(request.requested_start_at)
+        .ok_or(TractorWeatherWindowGateError::EmptyRequestedStartAt)?;
+    if request.max_window_age_seconds <= 0 {
+        return Err(TractorWeatherWindowGateError::InvalidMaxWindowAge);
+    }
+    let requested_at = parse_tractor_weather_window_timestamp(&requested_start_at)?;
+
+    if request.motion_gate.decision != TractorMotionGateDecision::Allowed
+        || request.motion_gate.halted
+    {
+        return Ok(tractor_weather_window_gate_result(
+            field_id,
+            TractorWeatherWindowDecision::Blocked,
+            "motion_gate_not_allowed",
+            requested_start_at,
+            None,
+            vec![request.motion_gate.audit.reason_code],
+        ));
+    }
+
+    let Some(window) = request.window else {
+        return Ok(tractor_weather_window_gate_result(
+            field_id,
+            TractorWeatherWindowDecision::Blocked,
+            "weather_window_missing",
+            requested_start_at,
+            None,
+            vec!["window:missing".to_string()],
+        ));
+    };
+
+    let window_field_id = normalize_tractor_text(window.field_id).unwrap_or_default();
+    let source = normalize_tractor_text(window.source).unwrap_or_else(|| "unknown".to_string());
+    let reason_code = normalize_tractor_text(window.reason_code)
+        .unwrap_or_else(|| "window_unspecified".to_string());
+    let fetched_at = parse_tractor_weather_window_timestamp(&window.fetched_at)?;
+    let valid_from = parse_tractor_weather_window_timestamp(&window.valid_from)?;
+    let valid_until = parse_tractor_weather_window_timestamp(&window.valid_until)?;
+    let mut inputs = window.gating_inputs;
+    inputs.push(format!("source:{source}"));
+    inputs.push(format!("fetched_at:{}", window.fetched_at));
+    inputs.push(format!("valid_from:{}", window.valid_from));
+    inputs.push(format!("valid_until:{}", window.valid_until));
+    inputs.push(format!("window_reason:{reason_code}"));
+
+    if window_field_id != field_id {
+        return Ok(tractor_weather_window_gate_result(
+            field_id,
+            TractorWeatherWindowDecision::Blocked,
+            "weather_window_field_mismatch",
+            requested_start_at,
+            Some(source),
+            inputs,
+        ));
+    }
+    let age_seconds = requested_at.signed_duration_since(fetched_at).num_seconds();
+    if age_seconds < 0 || age_seconds > request.max_window_age_seconds {
+        return Ok(tractor_weather_window_gate_result(
+            field_id,
+            TractorWeatherWindowDecision::Blocked,
+            "weather_window_stale",
+            requested_start_at,
+            Some(source),
+            inputs,
+        ));
+    }
+    if requested_at < valid_from || requested_at > valid_until {
+        return Ok(tractor_weather_window_gate_result(
+            field_id,
+            TractorWeatherWindowDecision::Blocked,
+            "outside_weather_window",
+            requested_start_at,
+            Some(source),
+            inputs,
+        ));
+    }
+    if !window.allowed {
+        return Ok(tractor_weather_window_gate_result(
+            field_id,
+            TractorWeatherWindowDecision::Blocked,
+            &reason_code,
+            requested_start_at,
+            Some(source),
+            inputs,
+        ));
+    }
+
+    Ok(tractor_weather_window_gate_result(
+        field_id,
+        TractorWeatherWindowDecision::Allowed,
+        "weather_window_allowed",
+        requested_start_at,
+        Some(source),
+        inputs,
+    ))
+}
+
+fn tractor_weather_window_gate_result(
+    field_id: String,
+    decision: TractorWeatherWindowDecision,
+    reason_code: &str,
+    requested_start_at: String,
+    window_source: Option<String>,
+    gating_inputs: Vec<String>,
+) -> TractorWeatherWindowGate {
+    TractorWeatherWindowGate {
+        field_id,
+        decision,
+        reason_code: reason_code.to_string(),
+        requested_start_at,
+        window_source,
+        gating_inputs,
+    }
+}
+
+fn parse_tractor_weather_window_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, TractorWeatherWindowGateError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| TractorWeatherWindowGateError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -7058,7 +7241,8 @@ mod tests {
         build_soil_moisture_reading, build_sustainability_record, build_tractor_field_ops_replay,
         build_tractor_field_ops_session_log, compute_drought_index, create_versioned_content,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
-        evaluate_tractor_geofence, evaluate_tractor_motion_gate, execute_tractor_prescription,
+        evaluate_tractor_geofence, evaluate_tractor_motion_gate,
+        evaluate_tractor_weather_window_gate, execute_tractor_prescription,
         normalize_weather_provider_forecast, plan_tractor_swath_coverage,
         run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
@@ -7071,8 +7255,8 @@ mod tests {
         ContentType, CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError,
         DroughtIndexPeriod, DroughtIndexType, FarmFieldEntityStatus, FarmFieldError,
         FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldRecord, FleetConfigApplyStatus, FleetConfigBundle,
-        FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
         FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
         FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
         FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
@@ -7099,10 +7283,10 @@ mod tests {
         TractorObstacleDetectionRequest, TractorObstacleEvent, TractorOperatorApproval,
         TractorPrescriptionExecutionError, TractorPrescriptionExecutionRequest,
         TractorPrescriptionZone, TractorRegistrationRequest, TractorRegistry,
-        TractorSwathCoverageRequest, WeatherIngestError, WeatherProviderForecastPoint,
-        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
-        WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry,
-        WorkOrderStatus,
+        TractorSwathCoverageRequest, TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
+        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
+        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
+        WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -8227,6 +8411,69 @@ mod tests {
     }
 
     #[test]
+    fn tractor_weather_window_gate_allows_valid_window() {
+        let gate = evaluate_tractor_weather_window_gate(tractor_weather_window_gate_request(Some(
+            tractor_field_window(
+                true,
+                "2026-06-15T09:55:00Z",
+                "2026-06-15T10:00:00Z",
+                "2026-06-15T11:00:00Z",
+                "safe_field_window",
+            ),
+        )))
+        .expect("valid weather window should evaluate");
+
+        assert_eq!(gate.decision, TractorWeatherWindowDecision::Allowed);
+        assert_eq!(gate.reason_code, "weather_window_allowed");
+        assert_eq!(gate.window_source.as_deref(), Some("domain-15"));
+        assert!(gate.gating_inputs.contains(&"wind_mps:3.2".to_string()));
+    }
+
+    #[test]
+    fn tractor_weather_window_gate_blocks_stale_window() {
+        let gate = evaluate_tractor_weather_window_gate(tractor_weather_window_gate_request(Some(
+            tractor_field_window(
+                true,
+                "2026-06-15T08:30:00Z",
+                "2026-06-15T10:00:00Z",
+                "2026-06-15T11:00:00Z",
+                "safe_field_window",
+            ),
+        )))
+        .expect("stale weather window should evaluate");
+
+        assert_eq!(gate.decision, TractorWeatherWindowDecision::Blocked);
+        assert_eq!(gate.reason_code, "weather_window_stale");
+        assert!(gate
+            .gating_inputs
+            .contains(&"fetched_at:2026-06-15T08:30:00Z".to_string()));
+    }
+
+    #[test]
+    fn tractor_weather_window_gate_blocks_missing_or_outside_window() {
+        let missing =
+            evaluate_tractor_weather_window_gate(tractor_weather_window_gate_request(None))
+                .expect("missing weather window should evaluate");
+
+        assert_eq!(missing.decision, TractorWeatherWindowDecision::Blocked);
+        assert_eq!(missing.reason_code, "weather_window_missing");
+
+        let outside = evaluate_tractor_weather_window_gate(tractor_weather_window_gate_request(
+            Some(tractor_field_window(
+                true,
+                "2026-06-15T09:55:00Z",
+                "2026-06-15T10:30:00Z",
+                "2026-06-15T11:00:00Z",
+                "safe_field_window",
+            )),
+        ))
+        .expect("outside weather window should evaluate");
+
+        assert_eq!(outside.decision, TractorWeatherWindowDecision::Blocked);
+        assert_eq!(outside.reason_code, "outside_weather_window");
+    }
+
+    #[test]
     fn marketplace_account_links_party_to_one_org_and_normalizes_roles() {
         let record = build_marketplace_account_record(
             MarketplaceAccountCreateRequest {
@@ -9100,6 +9347,37 @@ mod tests {
             implement_id: "sprayer-001".to_string(),
             enabled,
             current_rate,
+        }
+    }
+
+    fn tractor_weather_window_gate_request(
+        window: Option<FieldOperationalWindow>,
+    ) -> TractorWeatherWindowGateRequest {
+        TractorWeatherWindowGateRequest {
+            field_id: "field-north".to_string(),
+            requested_start_at: "2026-06-15T10:00:02Z".to_string(),
+            max_window_age_seconds: 900,
+            window,
+            motion_gate: tractor_allowed_motion_gate(),
+        }
+    }
+
+    fn tractor_field_window(
+        allowed: bool,
+        fetched_at: &str,
+        valid_from: &str,
+        valid_until: &str,
+        reason_code: &str,
+    ) -> FieldOperationalWindow {
+        FieldOperationalWindow {
+            field_id: "field-north".to_string(),
+            source: "domain-15".to_string(),
+            fetched_at: fetched_at.to_string(),
+            valid_from: valid_from.to_string(),
+            valid_until: valid_until.to_string(),
+            allowed,
+            reason_code: reason_code.to_string(),
+            gating_inputs: vec!["wind_mps:3.2".to_string(), "precip_mm:0.0".to_string()],
         }
     }
 
