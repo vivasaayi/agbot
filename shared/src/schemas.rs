@@ -5622,6 +5622,66 @@ pub enum WaterUseSavingsReportError {
     EmptyBaselineMethod,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterAlertThresholds {
+    pub low_moisture_water_need_mm: f64,
+    pub over_irrigation_mm: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaterAlertType {
+    LowMoisture,
+    OverIrrigation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterAlert {
+    pub field_ref: String,
+    pub zone_ref: String,
+    pub alert_type: WaterAlertType,
+    pub value: f64,
+    pub threshold: f64,
+    pub evidence_freshness: WeatherFreshnessState,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterAlertRoutingRequest {
+    pub field_ref: String,
+    pub recipient_id: String,
+    pub owned_field_refs: Vec<String>,
+    pub routed_at: String,
+    pub thresholds: WaterAlertThresholds,
+    pub water_needs: Vec<ZoneWaterNeed>,
+    pub savings_reports: Vec<WaterUseSavingsZoneReport>,
+    pub evidence_freshness: WeatherFreshnessState,
+    pub targets: Vec<WeatherAlertRoutingTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterAlertRoutingResult {
+    pub alerts: Vec<WaterAlert>,
+    pub delivered_count: usize,
+    pub queued_count: usize,
+    pub rejected_count: usize,
+    pub audits: Vec<WeatherAlertDeliveryAudit>,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum WaterAlertError {
+    #[error("water alert field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("water alert recipient_id cannot be empty")]
+    EmptyRecipientId,
+    #[error("water alert routed_at cannot be empty")]
+    EmptyRoutedAt,
+    #[error("water alert routed_at is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error("water alert thresholds are invalid")]
+    InvalidThresholds,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SoilMoistureRejectionReason {
@@ -6129,6 +6189,123 @@ fn parse_water_use_report_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.with_timezone(&chrono::Utc))
         .map_err(|_| WaterUseSavingsReportError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+pub fn evaluate_and_route_water_alerts(
+    request: WaterAlertRoutingRequest,
+) -> Result<WaterAlertRoutingResult, WaterAlertError> {
+    let field_ref =
+        normalize_weather_text(request.field_ref).ok_or(WaterAlertError::EmptyFieldRef)?;
+    let recipient_id =
+        normalize_weather_text(request.recipient_id).ok_or(WaterAlertError::EmptyRecipientId)?;
+    let routed_at =
+        normalize_weather_text(request.routed_at).ok_or(WaterAlertError::EmptyRoutedAt)?;
+    parse_water_alert_timestamp(&routed_at)?;
+    if !(request.thresholds.low_moisture_water_need_mm.is_finite()
+        && request.thresholds.low_moisture_water_need_mm >= 0.0
+        && request.thresholds.over_irrigation_mm.is_finite()
+        && request.thresholds.over_irrigation_mm >= 0.0)
+    {
+        return Err(WaterAlertError::InvalidThresholds);
+    }
+
+    let mut alerts = Vec::new();
+    for need in request.water_needs {
+        if need.field_ref == field_ref && need.status == ZoneWaterNeedStatus::Computed {
+            if let Some(water_need_mm) = need.water_need_mm {
+                if water_need_mm >= request.thresholds.low_moisture_water_need_mm {
+                    alerts.push(WaterAlert {
+                        field_ref: field_ref.clone(),
+                        zone_ref: need.zone_ref,
+                        alert_type: WaterAlertType::LowMoisture,
+                        value: water_need_mm,
+                        threshold: request.thresholds.low_moisture_water_need_mm,
+                        evidence_freshness: request.evidence_freshness,
+                        evidence_refs: need.evidence_refs,
+                    });
+                }
+            }
+        }
+    }
+    for report in request.savings_reports {
+        if report.field_id == field_ref && report.status == WaterUseSavingsStatus::Computed {
+            let Some(savings_mm) = report.savings_mm else {
+                continue;
+            };
+            let over_irrigation_mm = (-savings_mm).max(0.0);
+            if over_irrigation_mm >= request.thresholds.over_irrigation_mm {
+                alerts.push(WaterAlert {
+                    field_ref: field_ref.clone(),
+                    zone_ref: report.zone_ref,
+                    alert_type: WaterAlertType::OverIrrigation,
+                    value: over_irrigation_mm,
+                    threshold: request.thresholds.over_irrigation_mm,
+                    evidence_freshness: request.evidence_freshness,
+                    evidence_refs: report.evidence_refs,
+                });
+            }
+        }
+    }
+    alerts.sort_by(|left, right| {
+        left.zone_ref
+            .cmp(&right.zone_ref)
+            .then_with(|| format!("{:?}", left.alert_type).cmp(&format!("{:?}", right.alert_type)))
+    });
+
+    let mut delivered_count = 0;
+    let mut queued_count = 0;
+    let mut rejected_count = 0;
+    let mut audits = Vec::new();
+    for alert in &alerts {
+        for target in &request.targets {
+            let (status, reason_code) = if !request.owned_field_refs.contains(&field_ref) {
+                rejected_count += 1;
+                (
+                    WeatherAlertDeliveryStatus::Rejected,
+                    "field_scope_not_owned",
+                )
+            } else if target.reachable {
+                delivered_count += 1;
+                (WeatherAlertDeliveryStatus::Delivered, "alert_delivered")
+            } else {
+                queued_count += 1;
+                (
+                    WeatherAlertDeliveryStatus::Queued,
+                    "target_unreachable_queued",
+                )
+            };
+            let mut evidence_payload = alert.evidence_refs.clone();
+            evidence_payload.push(format!("freshness:{:?}", alert.evidence_freshness));
+            evidence_payload.push(format!("threshold:{}", alert.threshold));
+            audits.push(WeatherAlertDeliveryAudit {
+                target: target.target,
+                status,
+                reason_code: reason_code.to_string(),
+                recipient_id: recipient_id.clone(),
+                field_ref: field_ref.clone(),
+                routed_at: routed_at.clone(),
+                evidence_payload,
+            });
+        }
+    }
+
+    Ok(WaterAlertRoutingResult {
+        alerts,
+        delivered_count,
+        queued_count,
+        rejected_count,
+        audits,
+    })
+}
+
+fn parse_water_alert_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, WaterAlertError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| WaterAlertError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -10334,8 +10511,8 @@ mod tests {
         compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, detect_tractor_obstacle,
         dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
-        evaluate_access_anomaly_advisories, evaluate_crop_stage_weather_risks,
-        evaluate_tractor_geofence, evaluate_tractor_motion_gate,
+        evaluate_access_anomaly_advisories, evaluate_and_route_water_alerts,
+        evaluate_crop_stage_weather_risks, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_irrigation_valve_plan,
         execute_tractor_prescription, ingest_remote_sensing_moisture_proxy_layer,
@@ -10388,23 +10565,24 @@ mod tests {
         TractorPrescriptionExecutionError, TractorPrescriptionExecutionRequest,
         TractorPrescriptionZone, TractorRegistrationRequest, TractorRegistry,
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
-        TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
-        WaterEvapotranspirationRequest, WaterEvapotranspirationStatus, WaterNeedZone,
-        WaterUseBaseline, WaterUseSavingsReportRequest, WaterUseSavingsStatus,
-        WaterWeatherInputContractRequest, WaterWeatherInputStatus, WeatherAlertDeliveryStatus,
-        WeatherAlertRouteTarget, WeatherAlertRoutingRequest, WeatherAlertRoutingTarget,
-        WeatherCropStageRiskRequest, WeatherCropStageThresholdSet,
-        WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
-        WeatherForecastRecord, WeatherForecastValue, WeatherForecastVerificationRequest,
-        WeatherForecastVerificationStatus, WeatherFreshnessState, WeatherGrowingDegreeDayRequest,
-        WeatherGrowingDegreeDayStatus, WeatherHistoryQuery, WeatherIngestError,
-        WeatherOperationalWindowRequest, WeatherOperationalWindowThresholds,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherReferenceEtInput,
-        WeatherReferenceEtStatus, WeatherRiskThresholds, WeatherRiskType, WeatherSensorIngestError,
-        WeatherSensorSample, WeatherSensorStreamIngestRequest, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
-        WorkOrderRegistry, WorkOrderStatus, ZoneWaterNeed, ZoneWaterNeedError,
-        ZoneWaterNeedRequest, ZoneWaterNeedStatus,
+        TractorWeatherWindowDecision, TractorWeatherWindowGateRequest, WaterAlertRoutingRequest,
+        WaterAlertThresholds, WaterAlertType, WaterEvapotranspirationRequest,
+        WaterEvapotranspirationStatus, WaterNeedZone, WaterUseBaseline,
+        WaterUseSavingsReportRequest, WaterUseSavingsStatus, WaterWeatherInputContractRequest,
+        WaterWeatherInputStatus, WeatherAlertDeliveryStatus, WeatherAlertRouteTarget,
+        WeatherAlertRoutingRequest, WeatherAlertRoutingTarget, WeatherCropStageRiskRequest,
+        WeatherCropStageThresholdSet, WeatherFieldForecastResolutionError,
+        WeatherFieldForecastResolutionRequest, WeatherForecastRecord, WeatherForecastValue,
+        WeatherForecastVerificationRequest, WeatherForecastVerificationStatus,
+        WeatherFreshnessState, WeatherGrowingDegreeDayRequest, WeatherGrowingDegreeDayStatus,
+        WeatherHistoryQuery, WeatherIngestError, WeatherOperationalWindowRequest,
+        WeatherOperationalWindowThresholds, WeatherProviderForecastPoint,
+        WeatherProviderForecastResponse, WeatherReferenceEtInput, WeatherReferenceEtStatus,
+        WeatherRiskThresholds, WeatherRiskType, WeatherSensorIngestError, WeatherSensorSample,
+        WeatherSensorStreamIngestRequest, WorkOrderChangeType, WorkOrderCreateRequest,
+        WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry,
+        WorkOrderStatus, ZoneWaterNeed, ZoneWaterNeedError, ZoneWaterNeedRequest,
+        ZoneWaterNeedStatus,
     };
 
     #[test]
@@ -13174,6 +13352,58 @@ mod tests {
     }
 
     #[test]
+    fn water_alerts_route_low_moisture_and_over_irrigation() {
+        let result = evaluate_and_route_water_alerts(water_alert_routing_request(true, true))
+            .expect("water alerts should evaluate and route");
+
+        assert_eq!(result.alerts.len(), 2);
+        assert!(result.alerts.iter().any(|alert| {
+            alert.alert_type == WaterAlertType::LowMoisture
+                && alert.zone_ref == "zone:north"
+                && alert.evidence_freshness == WeatherFreshnessState::Fresh
+        }));
+        assert!(result.alerts.iter().any(|alert| {
+            alert.alert_type == WaterAlertType::OverIrrigation && alert.zone_ref == "zone:south"
+        }));
+        assert_eq!(result.delivered_count, 4);
+        assert_eq!(result.queued_count, 0);
+        assert_eq!(result.rejected_count, 0);
+        assert!(result.audits.iter().all(|audit| {
+            audit.status == WeatherAlertDeliveryStatus::Delivered
+                && audit.field_ref == "field-north"
+                && audit.reason_code == "alert_delivered"
+                && audit
+                    .evidence_payload
+                    .iter()
+                    .any(|item| item == "freshness:Fresh")
+        }));
+    }
+
+    #[test]
+    fn water_alerts_do_not_raise_false_alarm_within_thresholds() {
+        let result = evaluate_and_route_water_alerts(water_alert_routing_request(false, true))
+            .expect("within-threshold evidence should not alert");
+
+        assert!(result.alerts.is_empty());
+        assert!(result.audits.is_empty());
+        assert_eq!(result.delivered_count, 0);
+    }
+
+    #[test]
+    fn water_alerts_reject_unowned_field_scope() {
+        let result = evaluate_and_route_water_alerts(water_alert_routing_request(true, false))
+            .expect("unowned field should audit rejection");
+
+        assert_eq!(result.alerts.len(), 2);
+        assert_eq!(result.rejected_count, 4);
+        assert!(result
+            .audits
+            .iter()
+            .all(|audit| audit.status == WeatherAlertDeliveryStatus::Rejected
+                && audit.reason_code == "field_scope_not_owned"));
+    }
+
+    #[test]
     fn drought_index_compute_persists_standardized_value_and_input_refs() {
         let record = compute_drought_index(
             DroughtIndexComputeRequest {
@@ -13450,6 +13680,72 @@ mod tests {
             end_time: " 2026-06-13T12:00:00Z ".to_string(),
             events: history,
             baselines,
+        }
+    }
+
+    fn water_alert_routing_request(
+        trigger_alerts: bool,
+        owned_field: bool,
+    ) -> WaterAlertRoutingRequest {
+        let water_needs =
+            map_zone_water_need(zone_water_need_request(false)).expect("water needs should map");
+        let savings_reports = if trigger_alerts {
+            vec![super::WaterUseSavingsZoneReport {
+                field_id: "field-north".to_string(),
+                zone_ref: "zone:south".to_string(),
+                status: WaterUseSavingsStatus::Computed,
+                applied_amount_mm: 12.0,
+                baseline_amount_mm: Some(5.0),
+                savings_mm: Some(-7.0),
+                baseline_method: Some("seasonal_baseline_v1".to_string()),
+                evidence_refs: vec!["irrigation_event:event-over-001".to_string()],
+            }]
+        } else {
+            vec![super::WaterUseSavingsZoneReport {
+                field_id: "field-north".to_string(),
+                zone_ref: "zone:south".to_string(),
+                status: WaterUseSavingsStatus::Computed,
+                applied_amount_mm: 5.0,
+                baseline_amount_mm: Some(12.0),
+                savings_mm: Some(7.0),
+                baseline_method: Some("seasonal_baseline_v1".to_string()),
+                evidence_refs: vec!["irrigation_event:event-safe-001".to_string()],
+            }]
+        };
+
+        WaterAlertRoutingRequest {
+            field_ref: " field-north ".to_string(),
+            recipient_id: " grower-001 ".to_string(),
+            owned_field_refs: if owned_field {
+                vec!["field-north".to_string()]
+            } else {
+                vec!["field-south".to_string()]
+            },
+            routed_at: " 2026-06-13T12:05:00Z ".to_string(),
+            thresholds: if trigger_alerts {
+                WaterAlertThresholds {
+                    low_moisture_water_need_mm: 2.0,
+                    over_irrigation_mm: 5.0,
+                }
+            } else {
+                WaterAlertThresholds {
+                    low_moisture_water_need_mm: 99.0,
+                    over_irrigation_mm: 99.0,
+                }
+            },
+            water_needs,
+            savings_reports,
+            evidence_freshness: WeatherFreshnessState::Fresh,
+            targets: vec![
+                WeatherAlertRoutingTarget {
+                    target: WeatherAlertRouteTarget::OperatorConsole,
+                    reachable: true,
+                },
+                WeatherAlertRoutingTarget {
+                    target: WeatherAlertRouteTarget::FarmersPortal,
+                    reachable: true,
+                },
+            ],
         }
     }
 
