@@ -5557,6 +5557,71 @@ pub enum IrrigationHistoryError {
     InvalidDateRange,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterUseBaseline {
+    pub field_id: String,
+    pub zone_ref: String,
+    pub baseline_amount_mm: f64,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterUseSavingsReportRequest {
+    pub field_id: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub events: Vec<IrrigationEventRecord>,
+    pub baselines: Vec<WaterUseBaseline>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaterUseSavingsStatus {
+    Computed,
+    NoBaseline,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterUseSavingsZoneReport {
+    pub field_id: String,
+    pub zone_ref: String,
+    pub status: WaterUseSavingsStatus,
+    pub applied_amount_mm: f64,
+    #[serde(default)]
+    pub baseline_amount_mm: Option<f64>,
+    #[serde(default)]
+    pub savings_mm: Option<f64>,
+    #[serde(default)]
+    pub baseline_method: Option<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterUseSavingsReport {
+    pub field_id: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub zones: Vec<WaterUseSavingsZoneReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WaterUseSavingsReportError {
+    #[error("water-use report field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("water-use report timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("water-use report timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error("water-use report date range is invalid")]
+    InvalidDateRange,
+    #[error("water-use baseline zone_ref cannot be empty")]
+    EmptyZoneRef,
+    #[error("water-use baseline amount is invalid: {value}")]
+    InvalidBaselineAmount { value: String },
+    #[error("water-use baseline method cannot be empty")]
+    EmptyBaselineMethod,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SoilMoistureRejectionReason {
@@ -5826,6 +5891,108 @@ pub fn query_irrigation_history(
     })
 }
 
+pub fn report_water_use_savings(
+    request: WaterUseSavingsReportRequest,
+) -> Result<WaterUseSavingsReport, WaterUseSavingsReportError> {
+    let field_id = normalize_soil_moisture_text(request.field_id)
+        .ok_or(WaterUseSavingsReportError::EmptyFieldId)?;
+    let start_time = normalize_soil_moisture_text(request.start_time)
+        .ok_or(WaterUseSavingsReportError::EmptyTimestamp)?;
+    let end_time = normalize_soil_moisture_text(request.end_time)
+        .ok_or(WaterUseSavingsReportError::EmptyTimestamp)?;
+    let start = parse_water_use_report_timestamp(&start_time)?;
+    let end = parse_water_use_report_timestamp(&end_time)?;
+    if end < start {
+        return Err(WaterUseSavingsReportError::InvalidDateRange);
+    }
+
+    let baselines = normalize_water_use_baselines(request.baselines, &field_id)?;
+    let mut applied_by_zone: BTreeMap<String, (f64, Vec<String>)> = BTreeMap::new();
+    for event in request.events {
+        if event.field_id != field_id {
+            continue;
+        }
+        let Ok(timestamp) = parse_water_use_report_timestamp(&event.timestamp) else {
+            continue;
+        };
+        if timestamp < start || timestamp > end {
+            continue;
+        }
+        let entry = applied_by_zone
+            .entry(event.zone_ref.clone())
+            .or_insert_with(|| (0.0, Vec::new()));
+        entry.0 += event.applied_amount_mm;
+        entry.1.push(format!("irrigation_event:{}", event.event_id));
+    }
+
+    let mut zones = Vec::new();
+    for (zone_ref, (applied_amount_mm, evidence_refs)) in applied_by_zone {
+        if let Some(baseline) = baselines.get(&zone_ref) {
+            zones.push(WaterUseSavingsZoneReport {
+                field_id: field_id.clone(),
+                zone_ref,
+                status: WaterUseSavingsStatus::Computed,
+                applied_amount_mm,
+                baseline_amount_mm: Some(baseline.baseline_amount_mm),
+                savings_mm: Some(baseline.baseline_amount_mm - applied_amount_mm),
+                baseline_method: Some(baseline.method.clone()),
+                evidence_refs,
+            });
+        } else {
+            zones.push(WaterUseSavingsZoneReport {
+                field_id: field_id.clone(),
+                zone_ref,
+                status: WaterUseSavingsStatus::NoBaseline,
+                applied_amount_mm,
+                baseline_amount_mm: None,
+                savings_mm: None,
+                baseline_method: None,
+                evidence_refs,
+            });
+        }
+    }
+
+    Ok(WaterUseSavingsReport {
+        field_id,
+        start_time,
+        end_time,
+        zones,
+    })
+}
+
+fn normalize_water_use_baselines(
+    baselines: Vec<WaterUseBaseline>,
+    field_id: &str,
+) -> Result<BTreeMap<String, WaterUseBaseline>, WaterUseSavingsReportError> {
+    let mut normalized = BTreeMap::new();
+    for baseline in baselines {
+        let baseline_field_id = normalize_soil_moisture_text(baseline.field_id)
+            .ok_or(WaterUseSavingsReportError::EmptyFieldId)?;
+        if baseline_field_id != field_id {
+            continue;
+        }
+        let zone_ref = normalize_soil_moisture_text(baseline.zone_ref)
+            .ok_or(WaterUseSavingsReportError::EmptyZoneRef)?;
+        if !(baseline.baseline_amount_mm.is_finite() && baseline.baseline_amount_mm >= 0.0) {
+            return Err(WaterUseSavingsReportError::InvalidBaselineAmount {
+                value: baseline.baseline_amount_mm.to_string(),
+            });
+        }
+        let method = normalize_soil_moisture_text(baseline.method)
+            .ok_or(WaterUseSavingsReportError::EmptyBaselineMethod)?;
+        normalized.insert(
+            zone_ref.clone(),
+            WaterUseBaseline {
+                field_id: baseline_field_id,
+                zone_ref,
+                baseline_amount_mm: baseline.baseline_amount_mm,
+                method,
+            },
+        );
+    }
+    Ok(normalized)
+}
+
 pub fn soil_moisture_rejection_record(
     rejection_id: String,
     request: &SoilMoistureReadingRequest,
@@ -5952,6 +6119,16 @@ fn parse_irrigation_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.with_timezone(&chrono::Utc))
         .map_err(|_| IrrigationHistoryError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+fn parse_water_use_report_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, WaterUseSavingsReportError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| WaterUseSavingsReportError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -10164,46 +10341,46 @@ mod tests {
         execute_tractor_prescription, ingest_remote_sensing_moisture_proxy_layer,
         ingest_weather_sensor_stream, map_zone_water_need, normalize_weather_provider_forecast,
         plan_tractor_swath_coverage, query_irrigation_history, query_weather_history,
-        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
-        schedule_irrigation_plan, sign_fleet_config_bundle, soil_moisture_rejection_record,
-        tractor_cross_track_error_m, transition_marketplace_account_status,
-        validate_field_boundary, validate_water_weather_input_contract,
-        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
-        weather_fetch_failure_record, zone_water_need_insufficient, AccessAnomalySignal,
-        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
-        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
-        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
-        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
-        ContentType, CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRequest,
-        IrrigationHistoryQuery, IrrigationScheduleRequest, IrrigationValveActionStatus,
-        IrrigationValveDryRunRequest, IrrigationValveDryRunStatus, IrrigationValveExecuteRequest,
-        IrrigationValveExecutionStatus, IrrigationValveSpec, MarketplaceAccountCreateRequest,
-        MarketplaceAccountError, MarketplaceAccountStatus, MarketplacePartyType,
-        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
-        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
-        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
-        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
-        SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
-        SoilMoistureRejectionReason, SustainabilityMetricType, SustainabilityRecordCreateRequest,
-        SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
-        TractorCommandRejectionReason, TractorDeconflictionDecision, TractorDeconflictionRequest,
-        TractorEstopState, TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent,
-        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
-        TractorFieldOpsTelemetrySample, TractorGeofenceDecision, TractorGeofenceError,
-        TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
-        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
+        report_water_use_savings, resolve_weather_forecast_to_field, route_weather_alert,
+        run_tractor_straight_path_guidance, schedule_irrigation_plan, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, tractor_cross_track_error_m,
+        transition_marketplace_account_status, validate_field_boundary,
+        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
+        verify_weather_forecast_accuracy, weather_fetch_failure_record,
+        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
+        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
+        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
+        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
+        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
+        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
+        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
+        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+        MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, OpenDataPublishError,
+        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
+        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
+        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
+        SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
+        SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+        SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
+        TractorDeconflictionDecision, TractorDeconflictionRequest, TractorEstopState,
+        TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
+        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGeofenceDecision,
+        TractorGeofenceError, TractorGeofenceEvaluationRequest, TractorGuidanceConfig,
+        TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
         TractorImplementAdapterSpec, TractorImplementCommand, TractorImplementDecision,
         TractorImplementRef, TractorImplementState, TractorLifecycleStatus,
         TractorMotionCommandRequest, TractorMotionGateDecision, TractorObstacleDetection,
@@ -10213,6 +10390,7 @@ mod tests {
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
         TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
         WaterEvapotranspirationRequest, WaterEvapotranspirationStatus, WaterNeedZone,
+        WaterUseBaseline, WaterUseSavingsReportRequest, WaterUseSavingsStatus,
         WaterWeatherInputContractRequest, WaterWeatherInputStatus, WeatherAlertDeliveryStatus,
         WeatherAlertRouteTarget, WeatherAlertRoutingRequest, WeatherAlertRoutingTarget,
         WeatherCropStageRiskRequest, WeatherCropStageThresholdSet,
@@ -12954,6 +13132,48 @@ mod tests {
     }
 
     #[test]
+    fn water_use_savings_report_computes_applied_vs_baseline() {
+        let report = report_water_use_savings(water_use_savings_report_request(true))
+            .expect("water-use savings report should compute");
+
+        assert_eq!(report.field_id, "field-north");
+        assert_eq!(report.zones.len(), 2);
+        assert_eq!(report.zones[0].zone_ref, "zone:north");
+        assert_eq!(report.zones[0].status, WaterUseSavingsStatus::Computed);
+        assert_eq!(report.zones[0].applied_amount_mm, 14.0);
+        assert_eq!(report.zones[0].baseline_amount_mm, Some(20.0));
+        assert_eq!(report.zones[0].savings_mm, Some(6.0));
+        assert_eq!(
+            report.zones[0].baseline_method.as_deref(),
+            Some("seasonal_baseline_v1")
+        );
+        assert_eq!(
+            report.zones[0].evidence_refs,
+            vec![
+                "irrigation_event:event-001".to_string(),
+                "irrigation_event:event-002".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn water_use_savings_report_marks_no_baseline_without_zero_assumption() {
+        let report = report_water_use_savings(water_use_savings_report_request(false))
+            .expect("missing baseline should report no-baseline status");
+
+        let missing = report
+            .zones
+            .iter()
+            .find(|zone| zone.zone_ref == "zone:south")
+            .expect("zone without baseline should be present");
+        assert_eq!(missing.status, WaterUseSavingsStatus::NoBaseline);
+        assert_eq!(missing.applied_amount_mm, 5.0);
+        assert_eq!(missing.baseline_amount_mm, None);
+        assert_eq!(missing.savings_mm, None);
+        assert_eq!(missing.baseline_method, None);
+    }
+
+    #[test]
     fn drought_index_compute_persists_standardized_value_and_input_refs() {
         let record = compute_drought_index(
             DroughtIndexComputeRequest {
@@ -13176,6 +13396,60 @@ mod tests {
             source: " valve-controller ".to_string(),
             timestamp: format!(" {timestamp} "),
             actor: " ops@example.com ".to_string(),
+        }
+    }
+
+    fn water_use_savings_report_request(
+        include_south_baseline: bool,
+    ) -> WaterUseSavingsReportRequest {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+        let history = append_irrigation_history_event(
+            Vec::new(),
+            irrigation_event_request("event-001", "2026-06-13T10:00:00Z", 6.0),
+            &field,
+            "generated-event".to_string(),
+        )
+        .expect("first event appends");
+        let mut history = append_irrigation_history_event(
+            history,
+            irrigation_event_request("event-002", "2026-06-13T11:00:00Z", 8.0),
+            &field,
+            "generated-event".to_string(),
+        )
+        .expect("second event appends");
+        history.push(IrrigationEventRecord {
+            event_id: "event-003".to_string(),
+            field_id: "field-north".to_string(),
+            zone_ref: "zone:south".to_string(),
+            applied_amount_mm: 5.0,
+            source: "valve-controller".to_string(),
+            timestamp: "2026-06-13T11:30:00Z".to_string(),
+            actor: "ops@example.com".to_string(),
+        });
+
+        let mut baselines = vec![WaterUseBaseline {
+            field_id: " field-north ".to_string(),
+            zone_ref: " zone:north ".to_string(),
+            baseline_amount_mm: 20.0,
+            method: " seasonal_baseline_v1 ".to_string(),
+        }];
+        if include_south_baseline {
+            baselines.push(WaterUseBaseline {
+                field_id: "field-north".to_string(),
+                zone_ref: "zone:south".to_string(),
+                baseline_amount_mm: 7.0,
+                method: "seasonal_baseline_v1".to_string(),
+            });
+        }
+
+        WaterUseSavingsReportRequest {
+            field_id: " field-north ".to_string(),
+            start_time: " 2026-06-13T09:00:00Z ".to_string(),
+            end_time: " 2026-06-13T12:00:00Z ".to_string(),
+            events: history,
+            baselines,
         }
     }
 
