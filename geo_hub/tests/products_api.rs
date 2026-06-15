@@ -4836,6 +4836,209 @@ async fn biomass_estimate_rejects_mismatched_georeference_without_writing() -> R
 }
 
 #[tokio::test]
+async fn sustainability_baselines_compare_get_and_list_with_stable_hash() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-baseline-2025",
+        "field-baseline",
+        "season-2025",
+        "operation-baseline",
+        "biomass",
+    )
+    .await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-current-2026",
+        "field-baseline",
+        "season-2026",
+        "operation-current",
+        "biomass",
+    )
+    .await?;
+
+    let baseline = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/baselines")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_baseline_payload("baseline-001").to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(baseline.status(), StatusCode::OK);
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/comparisons")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_comparison_payload(
+                        "comparison-001",
+                        "field-baseline",
+                        "sustain-current-2026",
+                        130.0,
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("compared")
+    );
+    assert_eq!(
+        first.get("delta").and_then(|value| value.as_f64()),
+        Some(30.0)
+    );
+    assert_eq!(
+        first.get("trend").and_then(|value| value.as_str()),
+        Some("increased")
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/comparisons")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_comparison_payload(
+                        "comparison-002",
+                        "field-baseline",
+                        "sustain-current-2026",
+                        130.0,
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/comparisons/comparison-001?field_id=field-baseline")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/comparisons?field_id=field-baseline&status=compared")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let comparisons: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(comparisons.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_comparison_without_baseline_persists_no_baseline_without_delta(
+) -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-current-nobaseline",
+        "field-nobaseline",
+        "season-2026",
+        "operation-current",
+        "biomass",
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/comparisons")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_comparison_payload(
+                        "comparison-nobaseline",
+                        "field-nobaseline",
+                        "sustain-current-nobaseline",
+                        130.0,
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let comparison: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        comparison.get("status").and_then(|value| value.as_str()),
+        Some("no_baseline")
+    );
+    assert!(comparison.get("delta").is_some_and(|value| value.is_null()));
+    assert!(comparison
+        .get("baseline_value")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sustainability_comparisons WHERE status = 'no_baseline' AND delta IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn content_items_create_edit_get_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -13866,6 +14069,67 @@ fn biomass_spatial_ref() -> serde_json::Value {
         },
         "geo_transform": [0.0, 10.0, 0.0, 20.0, 0.0, -10.0],
         "resolution": { "x": 10.0, "y": 10.0 }
+    })
+}
+
+async fn insert_sustainability_record_row(
+    ctx: &TestContext,
+    record_id: &str,
+    field_id: &str,
+    season_id: &str,
+    operation_id: &str,
+    metric_type: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_records (
+            record_id, field_id, season_id, operation_id, metric_type, method_version,
+            created_at, audit_id
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(record_id)
+    .bind(field_id)
+    .bind(season_id)
+    .bind(operation_id)
+    .bind(metric_type)
+    .bind("sustainability.fixture.v1")
+    .bind("2026-06-16T00:00:00Z")
+    .bind(format!("audit:{record_id}"))
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
+}
+
+fn sustainability_baseline_payload(baseline_id: &str) -> serde_json::Value {
+    json!({
+        "baseline_id": baseline_id,
+        "field_id": "field-baseline",
+        "season_id": "season-2025",
+        "metric_type": "biomass",
+        "metric_value": 100.0,
+        "source_record_id": "sustain-baseline-2025",
+        "method_version": "sustainability.baseline.v1",
+        "evidence_refs": ["biomass:baseline-2025"]
+    })
+}
+
+fn sustainability_comparison_payload(
+    comparison_id: &str,
+    field_id: &str,
+    current_source_record_id: &str,
+    current_value: f64,
+) -> serde_json::Value {
+    json!({
+        "comparison_id": comparison_id,
+        "field_id": field_id,
+        "baseline_season_id": "season-2025",
+        "current_season_id": "season-2026",
+        "metric_type": "biomass",
+        "current_value": current_value,
+        "current_source_record_id": current_source_record_id,
+        "method_version": "sustainability.baseline_compare.v1"
     })
 }
 

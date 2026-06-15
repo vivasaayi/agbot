@@ -10247,6 +10247,102 @@ pub struct BiomassEstimateResult {
     pub computed_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityBaselineCreateRequest {
+    #[serde(default)]
+    pub baseline_id: Option<String>,
+    pub field_id: String,
+    pub season_id: String,
+    pub metric_type: SustainabilityMetricType,
+    pub metric_value: f64,
+    pub source_record_id: String,
+    pub method_version: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityBaselineRecord {
+    pub baseline_id: String,
+    pub field_id: String,
+    pub season_id: String,
+    pub metric_type: SustainabilityMetricType,
+    pub metric_value: f64,
+    pub source_record_id: String,
+    pub method_version: String,
+    pub evidence_refs: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityComparisonRequest {
+    #[serde(default)]
+    pub comparison_id: Option<String>,
+    pub field_id: String,
+    pub baseline_season_id: String,
+    pub current_season_id: String,
+    pub metric_type: SustainabilityMetricType,
+    pub current_value: f64,
+    pub current_source_record_id: String,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SustainabilityComparisonStatus {
+    Compared,
+    NoBaseline,
+}
+
+impl SustainabilityComparisonStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SustainabilityComparisonStatus::Compared => "compared",
+            SustainabilityComparisonStatus::NoBaseline => "no_baseline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SustainabilityTrend {
+    Increased,
+    Decreased,
+    Unchanged,
+    NoBaseline,
+}
+
+impl SustainabilityTrend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SustainabilityTrend::Increased => "increased",
+            SustainabilityTrend::Decreased => "decreased",
+            SustainabilityTrend::Unchanged => "unchanged",
+            SustainabilityTrend::NoBaseline => "no_baseline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityComparisonResult {
+    pub comparison_id: String,
+    pub field_id: String,
+    pub baseline_season_id: String,
+    pub current_season_id: String,
+    pub metric_type: SustainabilityMetricType,
+    pub baseline_value: Option<f64>,
+    pub current_value: f64,
+    pub delta: Option<f64>,
+    pub trend: SustainabilityTrend,
+    pub status: SustainabilityComparisonStatus,
+    pub baseline_source_record_id: Option<String>,
+    pub current_source_record_id: String,
+    pub evidence_refs: Vec<String>,
+    pub method_version: String,
+    pub result_hash: String,
+    pub compared_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SustainabilityRecordError {
     #[error("sustainability record_id cannot be empty")]
@@ -10332,6 +10428,32 @@ pub enum BiomassEstimateError {
     ResolutionMismatch,
     #[error("biomass dimensions mismatch between canopy and vegetation index")]
     DimensionMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SustainabilityBaselineError {
+    #[error("sustainability baseline_id cannot be empty")]
+    EmptyBaselineId,
+    #[error("sustainability comparison_id cannot be empty")]
+    EmptyComparisonId,
+    #[error("sustainability field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("sustainability baseline season_id cannot be empty")]
+    EmptyBaselineSeasonId,
+    #[error("sustainability current season_id cannot be empty")]
+    EmptyCurrentSeasonId,
+    #[error("sustainability source_record_id cannot be empty")]
+    EmptySourceRecordId,
+    #[error("sustainability method_version cannot be empty")]
+    EmptyMethodVersion,
+    #[error("sustainability timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("sustainability metric value is invalid")]
+    InvalidMetricValue,
+    #[error("unsupported sustainability comparison status {value}")]
+    UnsupportedComparisonStatus { value: String },
+    #[error("unsupported sustainability trend {value}")]
+    UnsupportedTrend { value: String },
 }
 
 pub fn build_sustainability_record(
@@ -10579,6 +10701,141 @@ pub fn estimate_biomass(
     })
 }
 
+pub fn create_sustainability_baseline(
+    request: SustainabilityBaselineCreateRequest,
+    generated_baseline_id: String,
+    created_at: String,
+) -> Result<SustainabilityBaselineRecord, SustainabilityBaselineError> {
+    let baseline_id = normalize_sustainability_optional_text(request.baseline_id)
+        .or_else(|| normalize_sustainability_text(generated_baseline_id))
+        .ok_or(SustainabilityBaselineError::EmptyBaselineId)?;
+    let field_id = normalize_sustainability_text(request.field_id)
+        .ok_or(SustainabilityBaselineError::EmptyFieldId)?;
+    let season_id = normalize_sustainability_text(request.season_id)
+        .ok_or(SustainabilityBaselineError::EmptyBaselineSeasonId)?;
+    let source_record_id = normalize_sustainability_text(request.source_record_id)
+        .ok_or(SustainabilityBaselineError::EmptySourceRecordId)?;
+    let method_version = normalize_sustainability_text(request.method_version)
+        .ok_or(SustainabilityBaselineError::EmptyMethodVersion)?;
+    let created_at = normalize_sustainability_text(created_at)
+        .ok_or(SustainabilityBaselineError::EmptyTimestamp)?;
+    if !request.metric_value.is_finite() {
+        return Err(SustainabilityBaselineError::InvalidMetricValue);
+    }
+    let evidence_refs = normalize_sustainability_refs(
+        request.evidence_refs,
+        [
+            format!("baseline_source:{source_record_id}"),
+            format!("baseline_season:{season_id}"),
+        ],
+    );
+
+    Ok(SustainabilityBaselineRecord {
+        baseline_id,
+        field_id,
+        season_id,
+        metric_type: request.metric_type,
+        metric_value: request.metric_value,
+        source_record_id,
+        method_version,
+        evidence_refs,
+        created_at,
+    })
+}
+
+pub fn compare_sustainability_baseline(
+    baseline: Option<&SustainabilityBaselineRecord>,
+    request: SustainabilityComparisonRequest,
+    generated_comparison_id: String,
+    compared_at: String,
+) -> Result<SustainabilityComparisonResult, SustainabilityBaselineError> {
+    let comparison_id = normalize_sustainability_optional_text(request.comparison_id)
+        .or_else(|| normalize_sustainability_text(generated_comparison_id))
+        .ok_or(SustainabilityBaselineError::EmptyComparisonId)?;
+    let field_id = normalize_sustainability_text(request.field_id)
+        .ok_or(SustainabilityBaselineError::EmptyFieldId)?;
+    let baseline_season_id = normalize_sustainability_text(request.baseline_season_id)
+        .ok_or(SustainabilityBaselineError::EmptyBaselineSeasonId)?;
+    let current_season_id = normalize_sustainability_text(request.current_season_id)
+        .ok_or(SustainabilityBaselineError::EmptyCurrentSeasonId)?;
+    let current_source_record_id = normalize_sustainability_text(request.current_source_record_id)
+        .ok_or(SustainabilityBaselineError::EmptySourceRecordId)?;
+    let method_version = normalize_sustainability_text(request.method_version)
+        .ok_or(SustainabilityBaselineError::EmptyMethodVersion)?;
+    let compared_at = normalize_sustainability_text(compared_at)
+        .ok_or(SustainabilityBaselineError::EmptyTimestamp)?;
+    if !request.current_value.is_finite() {
+        return Err(SustainabilityBaselineError::InvalidMetricValue);
+    }
+
+    let matched_baseline = baseline.filter(|baseline| {
+        baseline.field_id == field_id
+            && baseline.season_id == baseline_season_id
+            && baseline.metric_type == request.metric_type
+    });
+    let baseline_value = matched_baseline.map(|baseline| baseline.metric_value);
+    let delta = baseline_value.map(|baseline_value| request.current_value - baseline_value);
+    let (status, trend) = match delta {
+        Some(delta) if delta > 0.0 => (
+            SustainabilityComparisonStatus::Compared,
+            SustainabilityTrend::Increased,
+        ),
+        Some(delta) if delta < 0.0 => (
+            SustainabilityComparisonStatus::Compared,
+            SustainabilityTrend::Decreased,
+        ),
+        Some(_) => (
+            SustainabilityComparisonStatus::Compared,
+            SustainabilityTrend::Unchanged,
+        ),
+        None => (
+            SustainabilityComparisonStatus::NoBaseline,
+            SustainabilityTrend::NoBaseline,
+        ),
+    };
+    let evidence_refs = sustainability_comparison_refs(
+        matched_baseline,
+        &baseline_season_id,
+        &current_season_id,
+        &current_source_record_id,
+    );
+    let baseline_source_record_id =
+        matched_baseline.map(|baseline| baseline.source_record_id.clone());
+    let result_hash = sustainability_comparison_hash(
+        &field_id,
+        &baseline_season_id,
+        &current_season_id,
+        request.metric_type,
+        baseline_value,
+        request.current_value,
+        delta,
+        status,
+        trend,
+        &baseline_source_record_id,
+        &current_source_record_id,
+        &method_version,
+    );
+
+    Ok(SustainabilityComparisonResult {
+        comparison_id,
+        field_id,
+        baseline_season_id,
+        current_season_id,
+        metric_type: request.metric_type,
+        baseline_value,
+        current_value: request.current_value,
+        delta,
+        trend,
+        status,
+        baseline_source_record_id,
+        current_source_record_id,
+        evidence_refs,
+        method_version,
+        result_hash,
+        compared_at,
+    })
+}
+
 pub fn parse_sustainability_metric_type(
     value: &str,
 ) -> Result<SustainabilityMetricType, SustainabilityRecordError> {
@@ -10620,6 +10877,32 @@ pub fn parse_carbon_footprint_status(
     }
 }
 
+pub fn parse_sustainability_comparison_status(
+    value: &str,
+) -> Result<SustainabilityComparisonStatus, SustainabilityBaselineError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "compared" => Ok(SustainabilityComparisonStatus::Compared),
+        "no_baseline" => Ok(SustainabilityComparisonStatus::NoBaseline),
+        _ => Err(SustainabilityBaselineError::UnsupportedComparisonStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_sustainability_trend(
+    value: &str,
+) -> Result<SustainabilityTrend, SustainabilityBaselineError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "increased" => Ok(SustainabilityTrend::Increased),
+        "decreased" => Ok(SustainabilityTrend::Decreased),
+        "unchanged" => Ok(SustainabilityTrend::Unchanged),
+        "no_baseline" => Ok(SustainabilityTrend::NoBaseline),
+        _ => Err(SustainabilityBaselineError::UnsupportedTrend {
+            value: value.to_string(),
+        }),
+    }
+}
+
 fn normalize_sustainability_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(normalize_sustainability_text)
 }
@@ -10627,6 +10910,67 @@ fn normalize_sustainability_optional_text(value: Option<String>) -> Option<Strin
 fn normalize_sustainability_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_sustainability_refs<const N: usize>(
+    refs: Vec<String>,
+    fallback_refs: [String; N],
+) -> Vec<String> {
+    let mut normalized = refs
+        .into_iter()
+        .filter_map(normalize_sustainability_text)
+        .collect::<BTreeSet<_>>();
+    for fallback_ref in fallback_refs {
+        if let Some(fallback_ref) = normalize_sustainability_text(fallback_ref) {
+            normalized.insert(fallback_ref);
+        }
+    }
+    normalized.into_iter().collect()
+}
+
+fn sustainability_comparison_refs(
+    baseline: Option<&SustainabilityBaselineRecord>,
+    baseline_season_id: &str,
+    current_season_id: &str,
+    current_source_record_id: &str,
+) -> Vec<String> {
+    let mut refs = BTreeSet::from([
+        format!("baseline_season:{baseline_season_id}"),
+        format!("current_season:{current_season_id}"),
+        format!("current_source:{current_source_record_id}"),
+    ]);
+    if let Some(baseline) = baseline {
+        refs.insert(format!("baseline:{}", baseline.baseline_id));
+        refs.insert(format!("baseline_source:{}", baseline.source_record_id));
+        refs.extend(baseline.evidence_refs.iter().cloned());
+    }
+    refs.into_iter().collect()
+}
+
+fn sustainability_comparison_hash(
+    field_id: &str,
+    baseline_season_id: &str,
+    current_season_id: &str,
+    metric_type: SustainabilityMetricType,
+    baseline_value: Option<f64>,
+    current_value: f64,
+    delta: Option<f64>,
+    status: SustainabilityComparisonStatus,
+    trend: SustainabilityTrend,
+    baseline_source_record_id: &Option<String>,
+    current_source_record_id: &str,
+    method_version: &str,
+) -> String {
+    let canonical = format!(
+        "field={field_id}|baseline_season={baseline_season_id}|current_season={current_season_id}|metric={}|baseline={:.6}|current={current_value:.6}|delta={:.6}|status={}|trend={}|baseline_source={}|current_source={current_source_record_id}|method={method_version}",
+        metric_type.as_str(),
+        baseline_value.unwrap_or(-1.0),
+        delta.unwrap_or(0.0),
+        status.as_str(),
+        trend.as_str(),
+        baseline_source_record_id.as_deref().unwrap_or("none")
+    );
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
 }
 
 fn validate_biomass_layer(
@@ -14426,11 +14770,12 @@ mod tests {
         build_marketplace_account_record, build_marketplace_inventory_record,
         build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
-        close_marketplace_listing_record, compute_carbon_footprint, compute_drought_baseline_trend,
-        compute_drought_index, compute_drought_risk_score, compute_marketplace_demand_forecast,
+        close_marketplace_listing_record, compare_sustainability_baseline,
+        compute_carbon_footprint, compute_drought_baseline_trend, compute_drought_index,
+        compute_drought_risk_score, compute_marketplace_demand_forecast,
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
         compute_weather_reference_et, create_marketplace_fulfillment_record,
-        create_marketplace_rating_record, create_versioned_content,
+        create_marketplace_rating_record, create_sustainability_baseline, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -14501,14 +14846,16 @@ mod tests {
         ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
         SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
         SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
-        SoilMoistureRejectionReason, SustainabilityMetricType, SustainabilityRecordCreateRequest,
-        SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
-        TractorCommandRejectionReason, TractorDeconflictionDecision, TractorDeconflictionRequest,
-        TractorEstopState, TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent,
-        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
-        TractorFieldOpsTelemetrySample, TractorGeofenceDecision, TractorGeofenceError,
-        TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
-        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
+        SoilMoistureRejectionReason, SustainabilityBaselineCreateRequest,
+        SustainabilityBaselineRecord, SustainabilityComparisonRequest,
+        SustainabilityComparisonStatus, SustainabilityMetricType,
+        SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
+        SustainabilityTrend, TractorCommandAuditDecision, TractorCommandRejectionReason,
+        TractorDeconflictionDecision, TractorDeconflictionRequest, TractorEstopState,
+        TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
+        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGeofenceDecision,
+        TractorGeofenceError, TractorGeofenceEvaluationRequest, TractorGuidanceConfig,
+        TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
         TractorImplementAdapterSpec, TractorImplementCommand, TractorImplementDecision,
         TractorImplementRef, TractorImplementState, TractorLifecycleStatus,
         TractorMotionCommandRequest, TractorMotionGateDecision, TractorObstacleDetection,
@@ -16798,6 +17145,79 @@ mod tests {
     }
 
     #[test]
+    fn sustainability_baseline_comparison_returns_delta_trend_and_evidence() {
+        let baseline = sustainability_baseline_record();
+        let result = compare_sustainability_baseline(
+            Some(&baseline),
+            sustainability_comparison_request(130.0),
+            "generated-comparison".to_string(),
+            "2026-06-16T12:00:00Z".to_string(),
+        )
+        .expect("stored baseline should compare");
+
+        assert_eq!(result.comparison_id, "comparison-001");
+        assert_eq!(result.baseline_value, Some(100.0));
+        assert_eq!(result.current_value, 130.0);
+        assert_eq!(result.delta, Some(30.0));
+        assert_eq!(result.trend, SustainabilityTrend::Increased);
+        assert_eq!(result.status, SustainabilityComparisonStatus::Compared);
+        assert_eq!(
+            result.baseline_source_record_id.as_deref(),
+            Some("sustain-baseline-2025")
+        );
+        assert!(result
+            .evidence_refs
+            .contains(&"baseline:baseline-001".to_string()));
+        assert!(result
+            .evidence_refs
+            .contains(&"current_source:sustain-current-2026".to_string()));
+    }
+
+    #[test]
+    fn sustainability_baseline_comparison_same_inputs_reproduce_hash() {
+        let baseline = sustainability_baseline_record();
+        let first = compare_sustainability_baseline(
+            Some(&baseline),
+            sustainability_comparison_request(100.0),
+            "generated-comparison-001".to_string(),
+            "2026-06-16T12:00:00Z".to_string(),
+        )
+        .expect("first comparison should compute");
+        let mut request = sustainability_comparison_request(100.0);
+        request.comparison_id = Some("comparison-002".to_string());
+        let second = compare_sustainability_baseline(
+            Some(&baseline),
+            request,
+            "generated-comparison-002".to_string(),
+            "2026-06-17T12:00:00Z".to_string(),
+        )
+        .expect("second comparison should compute");
+
+        assert_eq!(first.delta, Some(0.0));
+        assert_eq!(first.trend, SustainabilityTrend::Unchanged);
+        assert_eq!(first.result_hash, second.result_hash);
+    }
+
+    #[test]
+    fn sustainability_baseline_comparison_without_baseline_fabricates_no_delta() {
+        let result = compare_sustainability_baseline(
+            None,
+            sustainability_comparison_request(130.0),
+            "generated-comparison".to_string(),
+            "2026-06-16T12:00:00Z".to_string(),
+        )
+        .expect("missing baseline should return no_baseline status");
+
+        assert_eq!(result.status, SustainabilityComparisonStatus::NoBaseline);
+        assert_eq!(result.trend, SustainabilityTrend::NoBaseline);
+        assert_eq!(result.baseline_value, None);
+        assert_eq!(result.delta, None);
+        assert!(result
+            .evidence_refs
+            .contains(&"current_source:sustain-current-2026".to_string()));
+    }
+
+    #[test]
     fn versioned_content_create_and_edit_advances_current_version() {
         let (content, first_version) = create_versioned_content(
             ContentCreateRequest {
@@ -16902,6 +17322,37 @@ mod tests {
                 version: "agbot-carbon-factors-v1".to_string(),
                 factors,
             },
+        }
+    }
+
+    fn sustainability_baseline_record() -> SustainabilityBaselineRecord {
+        create_sustainability_baseline(
+            SustainabilityBaselineCreateRequest {
+                baseline_id: Some("baseline-001".to_string()),
+                field_id: "field-sustain".to_string(),
+                season_id: "season-2025".to_string(),
+                metric_type: SustainabilityMetricType::Biomass,
+                metric_value: 100.0,
+                source_record_id: "sustain-baseline-2025".to_string(),
+                method_version: "sustainability.baseline.v1".to_string(),
+                evidence_refs: vec!["biomass:baseline-2025".to_string()],
+            },
+            "generated-baseline".to_string(),
+            "2026-06-16T00:00:00Z".to_string(),
+        )
+        .expect("baseline should normalize")
+    }
+
+    fn sustainability_comparison_request(current_value: f64) -> SustainabilityComparisonRequest {
+        SustainabilityComparisonRequest {
+            comparison_id: Some("comparison-001".to_string()),
+            field_id: "field-sustain".to_string(),
+            baseline_season_id: "season-2025".to_string(),
+            current_season_id: "season-2026".to_string(),
+            metric_type: SustainabilityMetricType::Biomass,
+            current_value,
+            current_source_record_id: "sustain-current-2026".to_string(),
+            method_version: "sustainability.baseline_compare.v1".to_string(),
         }
     }
 

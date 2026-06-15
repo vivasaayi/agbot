@@ -90,9 +90,10 @@ use shared::schemas::{
     build_marketplace_account_record, build_marketplace_catalog_item_record,
     build_marketplace_inventory_record, build_marketplace_portal_entry,
     build_soil_moisture_reading, build_sustainability_record, build_tractor_record,
-    close_marketplace_listing_record, compute_carbon_footprint, compute_drought_index,
-    compute_marketplace_demand_forecast, create_marketplace_fulfillment_record,
-    create_marketplace_rating_record, create_versioned_content, estimate_biomass,
+    close_marketplace_listing_record, compare_sustainability_baseline, compute_carbon_footprint,
+    compute_drought_index, compute_marketplace_demand_forecast,
+    create_marketplace_fulfillment_record, create_marketplace_rating_record,
+    create_sustainability_baseline, create_versioned_content, estimate_biomass,
     fulfill_marketplace_inventory, normalize_weather_provider_forecast,
     parse_carbon_footprint_status, parse_content_status, parse_content_type,
     parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
@@ -100,28 +101,28 @@ use shared::schemas::{
     parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
     parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
-    parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
-    place_marketplace_order_record, prepare_open_data_publication,
-    publish_marketplace_listing_record, release_marketplace_inventory,
-    reserve_marketplace_inventory, soil_moisture_rejection_reason_for_error,
-    soil_moisture_rejection_record, transition_marketplace_account_status,
-    transition_marketplace_fulfillment_status, transition_marketplace_order_status,
-    validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
-    BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult, CarbonEmissionFactor,
-    CarbonFootprintComputeRequest, CarbonFootprintError, CarbonFootprintInput,
-    CarbonFootprintResult, CarbonFootprintStatus, CollaborationChannelCreateRequest,
-    CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
-    CollaborationMessageCreateRequest, CollaborationMessageRecord, ContentCreateRequest,
-    ContentEditRequest, ContentError, ContentRecord, ContentStatus, ContentType,
-    ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod,
-    DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus, FarmFieldListPage,
-    FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord, FieldRecord,
-    FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord,
-    FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
-    MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
-    MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
-    MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplaceCatalogItemRecord,
-    MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
+    parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
+    parse_sustainability_metric_type, parse_sustainability_trend, place_marketplace_order_record,
+    prepare_open_data_publication, publish_marketplace_listing_record,
+    release_marketplace_inventory, reserve_marketplace_inventory,
+    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
+    transition_marketplace_account_status, transition_marketplace_fulfillment_status,
+    transition_marketplace_order_status, validate_field_boundary, weather_fetch_failure_record,
+    AnnotationGeometry, AnnotationRecord, BiomassEstimateError, BiomassEstimateRequest,
+    BiomassEstimateResult, CarbonEmissionFactor, CarbonFootprintComputeRequest,
+    CarbonFootprintError, CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
+    CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
+    CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
+    ContentType, ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError,
+    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
+    MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+    MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
     MarketplaceDemandForecastRequest, MarketplaceDemandUncertaintyBand,
     MarketplaceFulfillmentAuditRecord, MarketplaceFulfillmentCreateRequest,
     MarketplaceFulfillmentError, MarketplaceFulfillmentRecord, MarketplaceFulfillmentStatus,
@@ -136,7 +137,9 @@ use shared::schemas::{
     OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RecommendationPriority,
     RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
     SoilMoistureReadingError, SoilMoistureReadingRecord, SoilMoistureReadingRequest,
-    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, SustainabilityMetricType,
+    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, SustainabilityBaselineCreateRequest,
+    SustainabilityBaselineError, SustainabilityBaselineRecord, SustainabilityComparisonRequest,
+    SustainabilityComparisonResult, SustainabilityComparisonStatus, SustainabilityMetricType,
     SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
     SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
     TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
@@ -800,6 +803,23 @@ pub struct BiomassEstimateListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BiomassEstimateScopeQuery {
     pub record_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityBaselineListQuery {
+    pub field_id: Option<String>,
+    pub metric_type: Option<SustainabilityMetricType>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityComparisonListQuery {
+    pub field_id: Option<String>,
+    pub status: Option<SustainabilityComparisonStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityComparisonScopeQuery {
+    pub field_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4310,6 +4330,161 @@ pub async fn get_biomass_estimate(
     }
 
     Ok(Json(estimate))
+}
+
+pub async fn create_sustainability_baseline_record(
+    State(state): State<AppState>,
+    Json(request): Json<SustainabilityBaselineCreateRequest>,
+) -> AppResult<Json<SustainabilityBaselineRecord>> {
+    let source_record = load_sustainability_record(&state, &request.source_record_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "sustainability record {} is required for baseline",
+                request.source_record_id
+            ))
+        })?;
+    if source_record.field_id != request.field_id
+        || source_record.season_id != request.season_id
+        || source_record.metric_type != request.metric_type
+    {
+        return Err(AppError::BadRequest(
+            "baseline source record does not match requested field, season, and metric".to_string(),
+        ));
+    }
+    let baseline = create_sustainability_baseline(
+        request,
+        format!("sustainability-baseline-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_baseline_error)?;
+    insert_sustainability_baseline(&state, &baseline).await?;
+
+    Ok(Json(baseline))
+}
+
+pub async fn list_sustainability_baselines(
+    Query(query): Query<SustainabilityBaselineListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SustainabilityBaselineRecord>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for sustainability baselines".to_string(),
+        )
+    })?;
+    let metric_type = query
+        .metric_type
+        .map(|metric_type| metric_type.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT baseline_id, field_id, season_id, metric_type, metric_value, source_record_id,
+               method_version, evidence_refs_json, created_at
+        FROM sustainability_baselines
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR metric_type = ?2)
+        ORDER BY season_id ASC, metric_type ASC, baseline_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(metric_type)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_sustainability_baseline(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn create_sustainability_comparison(
+    State(state): State<AppState>,
+    Json(request): Json<SustainabilityComparisonRequest>,
+) -> AppResult<Json<SustainabilityComparisonResult>> {
+    let current_record = load_sustainability_record(&state, &request.current_source_record_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "sustainability record {} is required for comparison",
+                request.current_source_record_id
+            ))
+        })?;
+    if current_record.field_id != request.field_id
+        || current_record.season_id != request.current_season_id
+        || current_record.metric_type != request.metric_type
+    {
+        return Err(AppError::BadRequest(
+            "current source record does not match requested field, season, and metric".to_string(),
+        ));
+    }
+    let baseline = load_sustainability_baseline_for_metric(
+        &state,
+        &request.field_id,
+        &request.baseline_season_id,
+        request.metric_type,
+    )
+    .await?;
+    let result = compare_sustainability_baseline(
+        baseline.as_ref(),
+        request,
+        format!("sustainability-comparison-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_baseline_error)?;
+    insert_sustainability_comparison(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_sustainability_comparisons(
+    Query(query): Query<SustainabilityComparisonListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SustainabilityComparisonResult>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for sustainability comparisons".to_string(),
+        )
+    })?;
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT comparison_id, field_id, baseline_season_id, current_season_id, metric_type,
+               baseline_value, current_value, delta, trend, status, baseline_source_record_id,
+               current_source_record_id, evidence_refs_json, method_version, result_hash,
+               compared_at
+        FROM sustainability_comparisons
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY compared_at ASC, comparison_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_sustainability_comparison(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_sustainability_comparison(
+    Path(comparison_id): Path<String>,
+    Query(query): Query<SustainabilityComparisonScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SustainabilityComparisonResult>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    let comparison = load_sustainability_comparison(&state, &comparison_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if comparison.field_id != field_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(comparison))
 }
 
 pub async fn create_content_item(
@@ -9407,6 +9582,10 @@ fn biomass_estimate_error(error: BiomassEstimateError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn sustainability_baseline_error(error: SustainabilityBaselineError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn content_error(error: ContentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -11124,6 +11303,68 @@ fn decode_biomass_estimate_result(
         method_version: row.get("method_version"),
         result_hash: row.get("result_hash"),
         computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_sustainability_baseline(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityBaselineRecord> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode sustainability baseline evidence_refs_json"),
+        )
+    })?;
+
+    Ok(SustainabilityBaselineRecord {
+        baseline_id: row.get("baseline_id"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        metric_type: parse_sustainability_metric_type(&row.get::<String, _>("metric_type"))
+            .map_err(sustainability_record_error)?,
+        metric_value: row.get("metric_value"),
+        source_record_id: row.get("source_record_id"),
+        method_version: row.get("method_version"),
+        evidence_refs,
+        created_at: row.get("created_at"),
+    })
+}
+
+fn decode_sustainability_comparison(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityComparisonResult> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err)
+                .context("failed to decode sustainability comparison evidence_refs_json"),
+        )
+    })?;
+
+    Ok(SustainabilityComparisonResult {
+        comparison_id: row.get("comparison_id"),
+        field_id: row.get("field_id"),
+        baseline_season_id: row.get("baseline_season_id"),
+        current_season_id: row.get("current_season_id"),
+        metric_type: parse_sustainability_metric_type(&row.get::<String, _>("metric_type"))
+            .map_err(sustainability_record_error)?,
+        baseline_value: row.get("baseline_value"),
+        current_value: row.get("current_value"),
+        delta: row.get("delta"),
+        trend: parse_sustainability_trend(&row.get::<String, _>("trend"))
+            .map_err(sustainability_baseline_error)?,
+        status: parse_sustainability_comparison_status(&row.get::<String, _>("status"))
+            .map_err(sustainability_baseline_error)?,
+        baseline_source_record_id: row.get("baseline_source_record_id"),
+        current_source_record_id: row.get("current_source_record_id"),
+        evidence_refs,
+        method_version: row.get("method_version"),
+        result_hash: row.get("result_hash"),
+        compared_at: row.get("compared_at"),
     })
 }
 
@@ -13466,6 +13707,129 @@ async fn load_biomass_estimate_result(
     .map_err(Error::from)?;
 
     row.map(|row| decode_biomass_estimate_result(&row))
+        .transpose()
+}
+
+async fn insert_sustainability_baseline(
+    state: &AppState,
+    baseline: &SustainabilityBaselineRecord,
+) -> AppResult<()> {
+    let evidence_refs_json = serde_json::to_string(&baseline.evidence_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_baselines (
+            baseline_id, field_id, season_id, metric_type, metric_value, source_record_id,
+            method_version, evidence_refs_json, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&baseline.baseline_id)
+    .bind(&baseline.field_id)
+    .bind(&baseline.season_id)
+    .bind(baseline.metric_type.as_str())
+    .bind(baseline.metric_value)
+    .bind(&baseline.source_record_id)
+    .bind(&baseline.method_version)
+    .bind(evidence_refs_json)
+    .bind(&baseline.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_baseline_for_metric(
+    state: &AppState,
+    field_id: &str,
+    season_id: &str,
+    metric_type: SustainabilityMetricType,
+) -> AppResult<Option<SustainabilityBaselineRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT baseline_id, field_id, season_id, metric_type, metric_value, source_record_id,
+               method_version, evidence_refs_json, created_at
+        FROM sustainability_baselines
+        WHERE field_id = ?1
+          AND season_id = ?2
+          AND metric_type = ?3
+        ORDER BY created_at DESC, baseline_id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .bind(metric_type.as_str())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_baseline(&row))
+        .transpose()
+}
+
+async fn insert_sustainability_comparison(
+    state: &AppState,
+    comparison: &SustainabilityComparisonResult,
+) -> AppResult<()> {
+    let evidence_refs_json = serde_json::to_string(&comparison.evidence_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_comparisons (
+            comparison_id, field_id, baseline_season_id, current_season_id, metric_type,
+            baseline_value, current_value, delta, trend, status, baseline_source_record_id,
+            current_source_record_id, evidence_refs_json, method_version, result_hash,
+            compared_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        "#,
+    )
+    .bind(&comparison.comparison_id)
+    .bind(&comparison.field_id)
+    .bind(&comparison.baseline_season_id)
+    .bind(&comparison.current_season_id)
+    .bind(comparison.metric_type.as_str())
+    .bind(comparison.baseline_value)
+    .bind(comparison.current_value)
+    .bind(comparison.delta)
+    .bind(comparison.trend.as_str())
+    .bind(comparison.status.as_str())
+    .bind(&comparison.baseline_source_record_id)
+    .bind(&comparison.current_source_record_id)
+    .bind(evidence_refs_json)
+    .bind(&comparison.method_version)
+    .bind(&comparison.result_hash)
+    .bind(&comparison.compared_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_comparison(
+    state: &AppState,
+    comparison_id: &str,
+) -> AppResult<Option<SustainabilityComparisonResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT comparison_id, field_id, baseline_season_id, current_season_id, metric_type,
+               baseline_value, current_value, delta, trend, status, baseline_source_record_id,
+               current_source_record_id, evidence_refs_json, method_version, result_hash,
+               compared_at
+        FROM sustainability_comparisons
+        WHERE comparison_id = ?1
+        "#,
+    )
+    .bind(comparison_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_comparison(&row))
         .transpose()
 }
 

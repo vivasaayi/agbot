@@ -363,6 +363,20 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_biomass_estimate),
         )
         .route(
+            "/api/sustainability/baselines",
+            get(routes::list_sustainability_baselines)
+                .post(routes::create_sustainability_baseline_record),
+        )
+        .route(
+            "/api/sustainability/comparisons",
+            get(routes::list_sustainability_comparisons)
+                .post(routes::create_sustainability_comparison),
+        )
+        .route(
+            "/api/sustainability/comparisons/:comparison_id",
+            get(routes::get_sustainability_comparison),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
         )

@@ -1149,6 +1149,49 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS sustainability_baselines (
+            baseline_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            metric_type TEXT NOT NULL,
+            metric_value REAL NOT NULL,
+            source_record_id TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sustainability_comparisons (
+            comparison_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            baseline_season_id TEXT NOT NULL,
+            current_season_id TEXT NOT NULL,
+            metric_type TEXT NOT NULL,
+            baseline_value REAL,
+            current_value REAL NOT NULL,
+            delta REAL,
+            trend TEXT NOT NULL,
+            status TEXT NOT NULL,
+            baseline_source_record_id TEXT,
+            current_source_record_id TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            compared_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS cms_contents (
             content_id TEXT PRIMARY KEY,
             content_type TEXT NOT NULL,
@@ -1975,6 +2018,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_biomass_estimates_record
         ON biomass_estimates(record_id, computed_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_baselines_field_metric
+        ON sustainability_baselines(field_id, season_id, metric_type);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_comparisons_field_status
+        ON sustainability_comparisons(field_id, status, compared_at);
         "#,
     )
     .execute(pool)
