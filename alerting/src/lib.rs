@@ -299,7 +299,7 @@ pub struct AlertDedupResult {
     pub bypassed_alert_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertChannel {
     InApp,
@@ -317,6 +317,21 @@ impl AlertChannel {
             AlertChannel::Sms => "sms",
             AlertChannel::Webhook => "webhook",
             AlertChannel::Push => "push",
+        }
+    }
+}
+
+impl FromStr for AlertChannel {
+    type Err = AlertingError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "in_app" => Ok(AlertChannel::InApp),
+            "email" => Ok(AlertChannel::Email),
+            "sms" => Ok(AlertChannel::Sms),
+            "webhook" => Ok(AlertChannel::Webhook),
+            "push" => Ok(AlertChannel::Push),
+            other => Err(AlertingError::InvalidChannel(other.to_string())),
         }
     }
 }
@@ -451,6 +466,28 @@ pub struct TrackedDelivery {
     pub transitions: Vec<DeliveryStateTransition>,
     pub last_error: Option<String>,
     pub max_attempts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelDeliveryRecord {
+    pub requested_channel: AlertChannel,
+    pub delivery_channel: AlertChannel,
+    pub fallback_used: bool,
+    pub tracked_delivery: TrackedDelivery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnroutableDeliveryOutcome {
+    pub alert_id: String,
+    pub recipient_id: String,
+    pub requested_channel: AlertChannel,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiChannelDeliveryResult {
+    pub deliveries: Vec<ChannelDeliveryRecord>,
+    pub unroutable: Vec<UnroutableDeliveryOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,6 +647,8 @@ pub enum AlertingError {
     InvalidSeverity(String),
     #[error("invalid alert rule status {0}")]
     InvalidRuleStatus(String),
+    #[error("invalid alert channel {0}")]
+    InvalidChannel(String),
 }
 
 pub trait SourceAdapter {
@@ -1348,7 +1387,7 @@ pub fn auto_resolve_alert(
     }
 }
 
-pub fn deliver_alert<A: ChannelAdapter>(
+pub fn deliver_alert<A: ChannelAdapter + ?Sized>(
     adapter: &mut A,
     alert: &FiredAlertRecord,
     recipient: AlertRecipient,
@@ -1358,7 +1397,7 @@ pub fn deliver_alert<A: ChannelAdapter>(
     Ok(adapter.send(&alert, &recipient))
 }
 
-pub fn run_tracked_delivery<A: ChannelAdapter>(
+pub fn run_tracked_delivery<A: ChannelAdapter + ?Sized>(
     adapter: &mut A,
     alert: &FiredAlertRecord,
     recipient: AlertRecipient,
@@ -1442,6 +1481,73 @@ pub fn run_tracked_delivery<A: ChannelAdapter>(
     }
 
     Err(AlertingError::InvalidRetryPolicy)
+}
+
+pub fn alert_channels_from_strings(
+    channels: &[String],
+) -> Result<Vec<AlertChannel>, AlertingError> {
+    channels
+        .iter()
+        .map(|channel| AlertChannel::from_str(channel))
+        .collect()
+}
+
+pub fn deliver_alert_multi_channel(
+    adapters: &mut [&mut dyn ChannelAdapter],
+    alert: &FiredAlertRecord,
+    recipient: AlertRecipient,
+    requested_channels: Vec<AlertChannel>,
+    fallback_channel: Option<AlertChannel>,
+    policy: DeliveryRetryPolicy,
+) -> Result<MultiChannelDeliveryResult, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    let recipient = normalize_alert_recipient(recipient)?;
+    let policy = normalize_retry_policy(policy)?;
+    let mut result = MultiChannelDeliveryResult::default();
+
+    for requested_channel in requested_channels {
+        let (delivery_channel, fallback_used) =
+            if adapter_index_for_channel(adapters, requested_channel).is_some() {
+                (requested_channel, false)
+            } else if let Some(fallback_channel) = fallback_channel {
+                if adapter_index_for_channel(adapters, fallback_channel).is_some() {
+                    (fallback_channel, true)
+                } else {
+                    result.unroutable.push(unroutable_delivery(
+                        &alert,
+                        &recipient,
+                        requested_channel,
+                        "requested and fallback channels are unconfigured",
+                    ));
+                    continue;
+                }
+            } else {
+                result.unroutable.push(unroutable_delivery(
+                    &alert,
+                    &recipient,
+                    requested_channel,
+                    "requested channel is unconfigured",
+                ));
+                continue;
+            };
+
+        let adapter_index = adapter_index_for_channel(adapters, delivery_channel)
+            .expect("adapter availability checked above");
+        let tracked_delivery = run_tracked_delivery(
+            &mut *adapters[adapter_index],
+            &alert,
+            recipient.clone(),
+            policy.clone(),
+        )?;
+        result.deliveries.push(ChannelDeliveryRecord {
+            requested_channel,
+            delivery_channel,
+            fallback_used,
+            tracked_delivery,
+        });
+    }
+
+    Ok(result)
 }
 
 fn normalize_event(event: AlertEvent) -> Result<AlertEvent, AlertingError> {
@@ -1898,6 +2004,29 @@ fn delivery_id(
     )
 }
 
+fn adapter_index_for_channel(
+    adapters: &[&mut dyn ChannelAdapter],
+    channel: AlertChannel,
+) -> Option<usize> {
+    adapters
+        .iter()
+        .position(|adapter| adapter.channel() == channel)
+}
+
+fn unroutable_delivery(
+    alert: &FiredAlertRecord,
+    recipient: &AlertRecipient,
+    requested_channel: AlertChannel,
+    reason: &str,
+) -> UnroutableDeliveryOutcome {
+    UnroutableDeliveryOutcome {
+        alert_id: alert.alert_id.clone(),
+        recipient_id: recipient.recipient_id.clone(),
+        requested_channel,
+        reason: reason.to_string(),
+    }
+}
+
 fn single_alert_summary(
     dedup_key: AlertDedupKey,
     alert: &FiredAlertRecord,
@@ -1993,18 +2122,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        acknowledge_alert, auto_resolve_alert, build_alert_rule_record,
-        build_alert_rule_subscription, classify_alert_severity, compute_alert_dedup_key,
-        deduplicate_alert_stream, deliver_alert, evaluate_alert_rules,
-        evaluate_managed_alert_rules, filter_alert_history, open_alert_lifecycle,
-        render_alert_message_template, resolve_alert, route_alert_to_recipients,
-        run_tracked_delivery, transition_alert_rule_status, version_alert_rule_record,
-        AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone, AlertHistoryQuery,
-        AlertLifecycleRecord, AlertLifecycleState, AlertMessageTemplate, AlertRecipient,
-        AlertRoutingRule, AlertRule, AlertRuleCreateRequest, AlertRuleStatus,
-        AlertRuleStatusUpdateRequest, AlertRuleSubscriptionCreateRequest, AlertRuleUpdateRequest,
-        AlertSeverityEvidence, AlertSeverityHint, AlertingError, DeliveryRetryPolicy,
-        DeliveryState, DeliveryStatus, InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
+        acknowledge_alert, alert_channels_from_strings, auto_resolve_alert,
+        build_alert_rule_record, build_alert_rule_subscription, classify_alert_severity,
+        compute_alert_dedup_key, deduplicate_alert_stream, deliver_alert,
+        deliver_alert_multi_channel, evaluate_alert_rules, evaluate_managed_alert_rules,
+        filter_alert_history, open_alert_lifecycle, render_alert_message_template, resolve_alert,
+        route_alert_to_recipients, run_tracked_delivery, transition_alert_rule_status,
+        version_alert_rule_record, AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone,
+        AlertHistoryQuery, AlertLifecycleRecord, AlertLifecycleState, AlertMessageTemplate,
+        AlertRecipient, AlertRoutingRule, AlertRule, AlertRuleCreateRequest, AlertRuleStatus,
+        AlertRuleStatusUpdateRequest, AlertRuleSubscriptionCreateRequest,
+        AlertRuleSubscriptionRecord, AlertRuleUpdateRequest, AlertSeverityEvidence,
+        AlertSeverityHint, AlertingError, DeliveryRetryPolicy, DeliveryState, DeliveryStatus,
+        InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
     };
 
     #[test]
@@ -2698,6 +2828,114 @@ mod tests {
             DeliveryState::Failed
         );
         assert_eq!(tracked.transitions.last().unwrap().backoff_seconds, None);
+    }
+
+    #[test]
+    fn multi_channel_delivery_fans_out_email_and_sms_from_subscription() {
+        let alert = fired_alert(
+            "alert-multi-channel",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let subscription = AlertRuleSubscriptionRecord {
+            subscription_id: "sub-ag-001".to_string(),
+            rule_id: "rule-sensor-stale-critical".to_string(),
+            recipient_id: "ag-001".to_string(),
+            recipient_role: "agronomist".to_string(),
+            channels: vec!["email".to_string(), "sms".to_string()],
+            created_at: "2026-06-12T09:00:00Z".to_string(),
+        };
+        let requested_channels = alert_channels_from_strings(&subscription.channels)
+            .expect("subscription channels should parse");
+        let mut email = MockChannelAdapter::succeeding(AlertChannel::Email);
+        let mut sms = MockChannelAdapter::succeeding(AlertChannel::Sms);
+        let mut adapters: Vec<&mut dyn super::ChannelAdapter> = vec![&mut email, &mut sms];
+
+        let result = deliver_alert_multi_channel(
+            &mut adapters,
+            &alert,
+            role_recipient(&subscription.recipient_id, &subscription.recipient_role),
+            requested_channels,
+            None,
+            retry_policy(),
+        )
+        .expect("multi-channel delivery should run");
+
+        assert_eq!(result.deliveries.len(), 2);
+        assert!(result.unroutable.is_empty());
+        assert_eq!(result.deliveries[0].requested_channel, AlertChannel::Email);
+        assert_eq!(result.deliveries[0].delivery_channel, AlertChannel::Email);
+        assert_eq!(
+            result.deliveries[0].tracked_delivery.final_state,
+            DeliveryState::Delivered
+        );
+        assert_eq!(result.deliveries[1].requested_channel, AlertChannel::Sms);
+        assert_eq!(result.deliveries[1].delivery_channel, AlertChannel::Sms);
+        assert_eq!(
+            result.deliveries[1].tracked_delivery.final_state,
+            DeliveryState::Delivered
+        );
+        assert_eq!(email.recorded_outcomes().len(), 1);
+        assert_eq!(sms.recorded_outcomes().len(), 1);
+    }
+
+    #[test]
+    fn unconfigured_channel_uses_fallback_or_records_unroutable() {
+        let alert = fired_alert(
+            "alert-unconfigured-channel",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut in_app = InAppChannelAdapter::default();
+        let mut fallback_adapters: Vec<&mut dyn super::ChannelAdapter> = vec![&mut in_app];
+
+        let fallback_result = deliver_alert_multi_channel(
+            &mut fallback_adapters,
+            &alert,
+            alert_recipient("ops-001"),
+            vec![AlertChannel::Webhook],
+            Some(AlertChannel::InApp),
+            retry_policy(),
+        )
+        .expect("fallback delivery should run");
+
+        assert_eq!(fallback_result.deliveries.len(), 1);
+        assert!(fallback_result.unroutable.is_empty());
+        assert_eq!(
+            fallback_result.deliveries[0].requested_channel,
+            AlertChannel::Webhook
+        );
+        assert_eq!(
+            fallback_result.deliveries[0].delivery_channel,
+            AlertChannel::InApp
+        );
+        assert!(fallback_result.deliveries[0].fallback_used);
+        assert_eq!(in_app.feed_for("ops-001").len(), 1);
+
+        let mut no_adapters: Vec<&mut dyn super::ChannelAdapter> = Vec::new();
+        let unroutable_result = deliver_alert_multi_channel(
+            &mut no_adapters,
+            &alert,
+            alert_recipient("ops-001"),
+            vec![AlertChannel::Push],
+            None,
+            retry_policy(),
+        )
+        .expect("unroutable outcome should be recorded");
+
+        assert!(unroutable_result.deliveries.is_empty());
+        assert_eq!(unroutable_result.unroutable.len(), 1);
+        assert_eq!(
+            unroutable_result.unroutable[0].requested_channel,
+            AlertChannel::Push
+        );
+        assert!(unroutable_result.unroutable[0]
+            .reason
+            .contains("unconfigured"));
     }
 
     #[test]
