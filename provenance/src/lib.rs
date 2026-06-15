@@ -297,6 +297,60 @@ pub struct AuditChainVerification {
     pub reason: Option<AuditChainBreachReason>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionDecision {
+    Retain,
+    Archive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRetentionPolicy {
+    pub policy_id: String,
+    pub archive_before: String,
+    #[serde(default)]
+    pub artifact_kind: Option<ArtifactKind>,
+    #[serde(default)]
+    pub field_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRetentionRecord {
+    pub seq: u64,
+    pub action_ref: String,
+    pub artifact_ref: Option<String>,
+    pub decision: RetentionDecision,
+    pub reason: String,
+    pub entry_hash: String,
+    pub prev_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRetentionReport {
+    pub policy_id: String,
+    pub archived: Vec<AuditRetentionRecord>,
+    pub retained: Vec<AuditRetentionRecord>,
+    pub chain_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLedgerExportRequest {
+    pub start_seq: u64,
+    pub end_seq: u64,
+    #[serde(default)]
+    pub include_predecessor_proof: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditLedgerSliceExport {
+    pub start_seq: u64,
+    pub end_seq: u64,
+    pub predecessor_hash: Option<String>,
+    pub first_prev_hash: Option<String>,
+    pub terminal_hash: Option<String>,
+    pub entries: Vec<AuditEntry>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LineageLedger {
     records: BTreeMap<String, LineageRecord>,
@@ -406,6 +460,14 @@ pub enum ProvenanceError {
         action_ref: String,
         attempted_operation: String,
     },
+    #[error("retention policy_id cannot be empty")]
+    EmptyRetentionPolicyId,
+    #[error("retention archive_before cannot be empty for {policy_id}")]
+    EmptyRetentionArchiveBefore { policy_id: String },
+    #[error("audit export range is invalid: start {start_seq}, end {end_seq}")]
+    InvalidAuditExportRange { start_seq: u64, end_seq: u64 },
+    #[error("audit export slice {start_seq}-{end_seq} would break chain continuity")]
+    AuditExportContinuityBreak { start_seq: u64, end_seq: u64 },
     #[error("evidence serialization failed: {details}")]
     EvidenceSerializationFailed { details: String },
     #[error("audit serialization failed: {details}")]
@@ -708,6 +770,104 @@ impl AuditLedger {
         verify_audit_chain(&self.entries)
     }
 
+    pub fn apply_retention_policy(
+        &self,
+        policy: AuditRetentionPolicy,
+    ) -> Result<AuditRetentionReport, ProvenanceError> {
+        let policy = normalize_retention_policy(policy)?;
+        let chain_verified = self.verify_chain().verified;
+        let mut archived = Vec::new();
+        let mut retained = Vec::new();
+
+        for entry in &self.entries {
+            let governed_by_age = entry.ts < policy.archive_before;
+            let governed_by_kind = policy
+                .artifact_kind
+                .map_or(true, |kind| entry_artifact_kind(entry) == Some(kind));
+            let governed_by_field = policy
+                .field_ref
+                .as_deref()
+                .map_or(true, |field_ref| entry_mentions_field(entry, field_ref));
+            let decision = if governed_by_age && governed_by_kind && governed_by_field {
+                RetentionDecision::Archive
+            } else {
+                RetentionDecision::Retain
+            };
+            let record = AuditRetentionRecord {
+                seq: entry.seq,
+                action_ref: entry.action.action_ref.clone(),
+                artifact_ref: entry.action.artifact_ref.clone(),
+                decision,
+                reason: retention_reason(decision, &policy),
+                entry_hash: entry.entry_hash.clone(),
+                prev_hash: entry.prev_hash.clone(),
+            };
+            match decision {
+                RetentionDecision::Archive => archived.push(record),
+                RetentionDecision::Retain => retained.push(record),
+            }
+        }
+
+        Ok(AuditRetentionReport {
+            policy_id: policy.policy_id,
+            archived,
+            retained,
+            chain_verified,
+        })
+    }
+
+    pub fn export_slice(
+        &self,
+        request: AuditLedgerExportRequest,
+    ) -> Result<AuditLedgerSliceExport, ProvenanceError> {
+        let request = normalize_audit_export_request(request)?;
+        let entries = self
+            .entries
+            .iter()
+            .filter(|entry| entry.seq >= request.start_seq && entry.seq <= request.end_seq)
+            .cloned()
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Err(ProvenanceError::InvalidAuditExportRange {
+                start_seq: request.start_seq,
+                end_seq: request.end_seq,
+            });
+        }
+
+        let first_prev_hash = entries.first().and_then(|entry| entry.prev_hash.clone());
+        let predecessor_hash = if request.start_seq == 1 {
+            None
+        } else if request.include_predecessor_proof {
+            self.entries
+                .iter()
+                .find(|entry| entry.seq + 1 == request.start_seq)
+                .map(|entry| entry.entry_hash.clone())
+        } else {
+            return Err(ProvenanceError::AuditExportContinuityBreak {
+                start_seq: request.start_seq,
+                end_seq: request.end_seq,
+            });
+        };
+
+        if first_prev_hash != predecessor_hash {
+            return Err(ProvenanceError::AuditExportContinuityBreak {
+                start_seq: request.start_seq,
+                end_seq: request.end_seq,
+            });
+        }
+
+        let export = AuditLedgerSliceExport {
+            start_seq: request.start_seq,
+            end_seq: request.end_seq,
+            predecessor_hash,
+            first_prev_hash,
+            terminal_hash: entries.last().map(|entry| entry.entry_hash.clone()),
+            entries,
+        };
+        verify_audit_slice_export(&export)?;
+        Ok(export)
+    }
+
     pub fn replace_entry(
         &mut self,
         _seq: u64,
@@ -821,6 +981,87 @@ pub fn verify_audit_chain(entries: &[AuditEntry]) -> AuditChainVerification {
         breach_index: None,
         reason: None,
     }
+}
+
+pub fn verify_audit_slice_export(
+    export: &AuditLedgerSliceExport,
+) -> Result<AuditChainVerification, ProvenanceError> {
+    if export.start_seq == 0 || export.end_seq < export.start_seq || export.entries.is_empty() {
+        return Err(ProvenanceError::InvalidAuditExportRange {
+            start_seq: export.start_seq,
+            end_seq: export.end_seq,
+        });
+    }
+    let first = export.entries.first().expect("empty checked");
+    let last = export.entries.last().expect("empty checked");
+    if first.seq != export.start_seq || last.seq != export.end_seq {
+        return Err(ProvenanceError::InvalidAuditExportRange {
+            start_seq: export.start_seq,
+            end_seq: export.end_seq,
+        });
+    }
+    if first.prev_hash != export.predecessor_hash || export.first_prev_hash != first.prev_hash {
+        return Err(ProvenanceError::AuditExportContinuityBreak {
+            start_seq: export.start_seq,
+            end_seq: export.end_seq,
+        });
+    }
+    if export.terminal_hash != Some(last.entry_hash.clone()) {
+        return Err(ProvenanceError::AuditExportContinuityBreak {
+            start_seq: export.start_seq,
+            end_seq: export.end_seq,
+        });
+    }
+
+    for (offset, entry) in export.entries.iter().enumerate() {
+        let expected_seq = export.start_seq + offset as u64;
+        if entry.seq != expected_seq {
+            return Ok(audit_chain_breach(
+                offset,
+                AuditChainBreachReason::SequenceMismatch,
+            ));
+        }
+        let expected_prev_hash = if offset == 0 {
+            export.predecessor_hash.clone()
+        } else {
+            Some(export.entries[offset - 1].entry_hash.clone())
+        };
+        if entry.prev_hash != expected_prev_hash {
+            return Ok(audit_chain_breach(
+                offset,
+                AuditChainBreachReason::PreviousHashMismatch,
+            ));
+        }
+        let expected_payload_hash = audit_payload_hash(&entry.action)?;
+        if entry.payload_hash != expected_payload_hash {
+            return Ok(audit_chain_breach(
+                offset,
+                AuditChainBreachReason::PayloadHashMismatch,
+            ));
+        }
+        let expected_entry_hash = audit_entry_hash(
+            entry.seq,
+            &entry.prev_hash,
+            &entry.payload_hash,
+            &entry.actor,
+            &entry.ts,
+            entry.outcome,
+            entry.refusal_reason,
+        )?;
+        if entry.entry_hash != expected_entry_hash {
+            return Ok(audit_chain_breach(
+                offset,
+                AuditChainBreachReason::EntryHashMismatch,
+            ));
+        }
+    }
+
+    Ok(AuditChainVerification {
+        verified: true,
+        verified_len: export.entries.len(),
+        breach_index: None,
+        reason: None,
+    })
 }
 
 pub fn build_reproducibility_manifest(
@@ -1178,6 +1419,79 @@ fn normalize_product_lineage_emission_request(
     Ok(request)
 }
 
+fn normalize_retention_policy(
+    mut policy: AuditRetentionPolicy,
+) -> Result<AuditRetentionPolicy, ProvenanceError> {
+    policy.policy_id =
+        normalize_required_text(policy.policy_id, ProvenanceError::EmptyRetentionPolicyId)?;
+    policy.archive_before = normalize_required_text(
+        policy.archive_before,
+        ProvenanceError::EmptyRetentionArchiveBefore {
+            policy_id: policy.policy_id.clone(),
+        },
+    )?;
+    policy.field_ref = policy.field_ref.and_then(normalize_optional_text_owned);
+    Ok(policy)
+}
+
+fn normalize_audit_export_request(
+    request: AuditLedgerExportRequest,
+) -> Result<AuditLedgerExportRequest, ProvenanceError> {
+    if request.start_seq == 0 || request.end_seq < request.start_seq {
+        return Err(ProvenanceError::InvalidAuditExportRange {
+            start_seq: request.start_seq,
+            end_seq: request.end_seq,
+        });
+    }
+    Ok(request)
+}
+
+fn entry_artifact_kind(entry: &AuditEntry) -> Option<ArtifactKind> {
+    let artifact_ref = entry.action.artifact_ref.as_deref()?;
+    if artifact_ref.starts_with("capture:") {
+        Some(ArtifactKind::Capture)
+    } else if artifact_ref.starts_with("scene:") {
+        Some(ArtifactKind::Scene)
+    } else if artifact_ref.starts_with("product:") {
+        Some(ArtifactKind::Product)
+    } else if artifact_ref.starts_with("finding:") {
+        Some(ArtifactKind::Finding)
+    } else if artifact_ref.starts_with("report:") {
+        Some(ArtifactKind::Report)
+    } else if artifact_ref.starts_with("action:") || artifact_ref.starts_with("mission:") {
+        Some(ArtifactKind::Action)
+    } else {
+        None
+    }
+}
+
+fn entry_mentions_field(entry: &AuditEntry, field_ref: &str) -> bool {
+    entry
+        .action
+        .artifact_ref
+        .as_deref()
+        .is_some_and(|artifact_ref| artifact_ref.contains(field_ref))
+        || entry
+            .action
+            .payload
+            .as_json()
+            .to_string()
+            .contains(field_ref)
+}
+
+fn retention_reason(decision: RetentionDecision, policy: &AuditRetentionPolicy) -> String {
+    match decision {
+        RetentionDecision::Archive => format!(
+            "archived by policy {} before {}",
+            policy.policy_id, policy.archive_before
+        ),
+        RetentionDecision::Retain => format!(
+            "retained by policy {} to preserve governed ledger slice",
+            policy.policy_id
+        ),
+    }
+}
+
 fn geospatial_refs_from_parameters(parameters: &serde_json::Value) -> Vec<String> {
     let mut refs = BTreeSet::new();
     collect_geospatial_refs(parameters, &mut refs);
@@ -1469,12 +1783,14 @@ fn normalize_optional_text_owned(value: String) -> Option<String> {
 mod tests {
     use super::{
         build_evidence_pack, build_reproducibility_manifest, emit_product_lineage,
-        output_hash_for_bytes, verify_audit_chain, verify_evidence_pack_schema,
-        verify_reproducible_output, ActionContext, ActorIdentity, ActorKind, ArtifactKind,
-        AuditAction, AuditChainBreachReason, AuditLedger, AuditOutcome, AuditRefusalReason,
+        output_hash_for_bytes, verify_audit_chain, verify_audit_slice_export,
+        verify_evidence_pack_schema, verify_reproducible_output, ActionContext, ActorIdentity,
+        ActorKind, ArtifactKind, AuditAction, AuditChainBreachReason, AuditLedger,
+        AuditLedgerExportRequest, AuditOutcome, AuditRefusalReason, AuditRetentionPolicy,
         EvidenceObject, EvidencePackRequest, EvidenceStore, LineageLedger, LineageRecord,
         ProductLineageEmissionRequest, ProvenanceError, ProvenanceParameters,
         ReproducibilityInputBytes, ReproducibilityManifestStore, ReproducibilityMismatchReason,
+        RetentionDecision,
     };
 
     #[test]
@@ -1768,6 +2084,82 @@ mod tests {
         let reordered_verification = verify_audit_chain(&reordered);
         assert!(!reordered_verification.verified);
         assert_eq!(reordered_verification.breach_index, Some(0));
+    }
+
+    #[test]
+    fn retention_policy_archives_governed_records_without_breaking_chain() {
+        let audit = seeded_audit_ledger();
+
+        let report = audit
+            .apply_retention_policy(AuditRetentionPolicy {
+                policy_id: "policy-field-alpha-retention".to_string(),
+                archive_before: "2026-06-12T13:07:00Z".to_string(),
+                artifact_kind: Some(ArtifactKind::Action),
+                field_ref: Some("field:alpha".to_string()),
+            })
+            .expect("retention policy should evaluate");
+
+        assert!(report.chain_verified);
+        assert_eq!(report.archived.len(), 2);
+        assert_eq!(report.archived[0].decision, RetentionDecision::Archive);
+        assert_eq!(report.archived[0].prev_hash, None);
+        assert_eq!(report.retained.len(), 1);
+        assert_eq!(report.retained[0].seq, 3);
+        assert!(report.archived[0]
+            .reason
+            .contains("policy-field-alpha-retention"));
+    }
+
+    #[test]
+    fn audit_slice_export_carries_independent_chain_proof() {
+        let audit = seeded_audit_ledger();
+
+        let export = audit
+            .export_slice(AuditLedgerExportRequest {
+                start_seq: 2,
+                end_seq: 3,
+                include_predecessor_proof: true,
+            })
+            .expect("slice with predecessor proof should export");
+
+        assert_eq!(export.entries.len(), 2);
+        assert_eq!(export.start_seq, 2);
+        assert_eq!(export.end_seq, 3);
+        assert_eq!(
+            export.predecessor_hash,
+            Some(audit.entries()[0].entry_hash.clone())
+        );
+        assert_eq!(export.first_prev_hash, export.predecessor_hash);
+        assert_eq!(
+            export.terminal_hash,
+            Some(audit.entries()[2].entry_hash.clone())
+        );
+
+        let verification =
+            verify_audit_slice_export(&export).expect("export verification should run");
+        assert!(verification.verified);
+        assert_eq!(verification.verified_len, 2);
+    }
+
+    #[test]
+    fn audit_slice_export_refuses_continuity_breaking_slice() {
+        let audit = seeded_audit_ledger();
+
+        let error = audit
+            .export_slice(AuditLedgerExportRequest {
+                start_seq: 2,
+                end_seq: 3,
+                include_predecessor_proof: false,
+            })
+            .expect_err("slice without predecessor proof should be refused");
+
+        assert_eq!(
+            error,
+            ProvenanceError::AuditExportContinuityBreak {
+                start_seq: 2,
+                end_seq: 3,
+            }
+        );
     }
 
     #[test]
@@ -2540,6 +2932,42 @@ mod tests {
             })),
             occurred_at: "2026-06-12T13:05:00Z".to_string(),
         }
+    }
+
+    fn seeded_audit_ledger() -> AuditLedger {
+        let mut audit = AuditLedger::default();
+        audit
+            .append_action(
+                sample_actor(),
+                sample_audit_action("action:field-alpha:mission:create"),
+            )
+            .expect("first action should append");
+        audit
+            .append_action(
+                sample_actor(),
+                AuditAction {
+                    action_ref: "action:field-alpha:mission:approve".to_string(),
+                    occurred_at: "2026-06-12T13:06:00Z".to_string(),
+                    ..sample_audit_action("action:field-alpha:mission:approve")
+                },
+            )
+            .expect("second action should append");
+        audit
+            .append_action(
+                sample_actor(),
+                AuditAction {
+                    action_ref: "action:field-beta:mission:create".to_string(),
+                    artifact_ref: Some("mission:beta-4".to_string()),
+                    payload: ProvenanceParameters::from_json(serde_json::json!({
+                        "field_id": "field:beta",
+                        "approved": false
+                    })),
+                    occurred_at: "2026-06-12T13:09:00Z".to_string(),
+                    ..sample_audit_action("action:field-beta:mission:create")
+                },
+            )
+            .expect("third action should append");
+        audit
     }
 
     fn audit_action_for_artifact(action_ref: &str, artifact_ref: &str) -> AuditAction {
