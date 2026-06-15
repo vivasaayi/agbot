@@ -1,5 +1,6 @@
 use alerting::{AlertCandidateRecord, AlertEvent, AlertSeverityHint, AlertingError, SourceAdapter};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use timeseries::{SeriesPoint, SeriesValue};
 
@@ -323,6 +324,39 @@ pub struct ValidatedSoilReading {
     pub source_qa_flags: Vec<String>,
     pub qa_flags: Vec<ReadingQaFlag>,
     pub excluded_from_products: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ValidationEvidenceRequest {
+    #[serde(default)]
+    pub readings: Vec<GeolocatedSoilReading>,
+    pub profile: CalibrationProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidationQaEvidenceRecord {
+    pub payload_id: String,
+    pub device_id: String,
+    pub reason_code: ReadingQaReason,
+    pub profile_ref: String,
+    pub method_version: String,
+    pub raw_value: f64,
+    pub calibrated_value: f64,
+    pub valid_min: f64,
+    pub valid_max: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidatedSeriesEvidenceReport {
+    pub profile_ref: String,
+    pub method_version: String,
+    pub output_hash: String,
+    pub reading_count: usize,
+    pub qa_flag_count: usize,
+    #[serde(default)]
+    pub validated_readings: Vec<ValidatedSoilReading>,
+    #[serde(default)]
+    pub qa_evidence: Vec<ValidationQaEvidenceRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -795,6 +829,10 @@ pub enum SoilIotError {
         reading_metric: GatewayReadingMetric,
         profile_metric: GatewayReadingMetric,
     },
+    #[error("validation evidence series cannot be empty")]
+    EmptyValidationEvidenceSeries,
+    #[error("validation evidence hash input could not be serialized")]
+    ValidationEvidenceSerializationFailed,
     #[error("stuck-sensor method_version cannot be empty")]
     EmptyStuckWindowMethodVersion,
     #[error("sensor-health method_version cannot be empty")]
@@ -1171,6 +1209,46 @@ pub fn validate_and_calibrate_reading(
         source_qa_flags: reading.qa_flags,
         qa_flags,
         excluded_from_products,
+    })
+}
+
+pub fn rederive_validated_series_evidence(
+    request: ValidationEvidenceRequest,
+) -> Result<ValidatedSeriesEvidenceReport, SoilIotError> {
+    if request.readings.is_empty() {
+        return Err(SoilIotError::EmptyValidationEvidenceSeries);
+    }
+    let profile = normalize_calibration_profile(request.profile)?;
+    let mut validated_readings = Vec::with_capacity(request.readings.len());
+    let mut qa_evidence = Vec::new();
+
+    for reading in request.readings {
+        let validated = validate_and_calibrate_reading(reading, profile.clone())?;
+        for flag in &validated.qa_flags {
+            qa_evidence.push(ValidationQaEvidenceRecord {
+                payload_id: validated.payload_id.clone(),
+                device_id: validated.device_id.clone(),
+                reason_code: flag.reason_code,
+                profile_ref: flag.profile_ref.clone(),
+                method_version: flag.method_version.clone(),
+                raw_value: flag.raw_value,
+                calibrated_value: flag.calibrated_value,
+                valid_min: flag.valid_min,
+                valid_max: flag.valid_max,
+            });
+        }
+        validated_readings.push(validated);
+    }
+
+    let output_hash = validation_evidence_hash(&validated_readings, &qa_evidence)?;
+    Ok(ValidatedSeriesEvidenceReport {
+        profile_ref: profile.profile_ref,
+        method_version: profile.method_version,
+        output_hash,
+        reading_count: validated_readings.len(),
+        qa_flag_count: qa_evidence.len(),
+        validated_readings,
+        qa_evidence,
     })
 }
 
@@ -1963,6 +2041,35 @@ fn normalize_irrigation_trigger_config(
     })
 }
 
+fn validation_evidence_hash(
+    validated_readings: &[ValidatedSoilReading],
+    qa_evidence: &[ValidationQaEvidenceRecord],
+) -> Result<String, SoilIotError> {
+    #[derive(Serialize)]
+    struct HashInput<'a> {
+        validated_readings: &'a [ValidatedSoilReading],
+        qa_evidence: &'a [ValidationQaEvidenceRecord],
+    }
+
+    let bytes = serde_json::to_vec(&HashInput {
+        validated_readings,
+        qa_evidence,
+    })
+    .map_err(|_| SoilIotError::ValidationEvidenceSerializationFailed)?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{}", to_hex(&digest)))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 fn normalize_text_values(
     values: Vec<String>,
     error: SoilIotError,
@@ -2049,17 +2156,18 @@ mod tests {
         build_zone_soil_product_summary, decode_gateway_payload, detect_stuck_sensor_window,
         emit_sensor_health_alert_events, evaluate_irrigation_trigger,
         evaluate_sensor_health_snapshot, evaluate_soil_capture_freshness_coverage,
-        ingest_gateway_readings, reading_rejection_for_device, transition_soil_config_push_status,
-        transition_soil_device_status, validate_and_calibrate_reading, CalibrationProfile,
-        GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
-        GatewayReadingRecord, GeoPosition, IrrigationTriggerConfig,
-        IrrigationTriggerSuppressionReason, RawGatewayReading, ReadingGeolocationStatus,
-        ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
-        SensorHealthEventKind, SensorHealthLinkStatus, SensorHealthMonitorState,
-        SensorHealthReasonCode, SensorHealthSnapshot, SensorHealthThresholds, SimulatedGateway,
-        SoilCaptureFreshnessConfig, SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus,
-        SoilDeviceConfigPushStatusUpdate, SoilDeviceFreshnessState, SoilDeviceStatus, SoilIotError,
-        SoilSensorType, StuckSensorRail, StuckSensorWindowConfig, ValidatedSoilReading,
+        ingest_gateway_readings, reading_rejection_for_device, rederive_validated_series_evidence,
+        transition_soil_config_push_status, transition_soil_device_status,
+        validate_and_calibrate_reading, CalibrationProfile, GatewayIngestError,
+        GatewayPayloadRejectionReason, GatewayReadingMetric, GatewayReadingRecord, GeoPosition,
+        IrrigationTriggerConfig, IrrigationTriggerSuppressionReason, RawGatewayReading,
+        ReadingGeolocationStatus, ReadingQaFlag, ReadingQaReason, ReadingRejectionReason,
+        RegisterSoilDeviceRequest, SensorHealthEventKind, SensorHealthLinkStatus,
+        SensorHealthMonitorState, SensorHealthReasonCode, SensorHealthSnapshot,
+        SensorHealthThresholds, SimulatedGateway, SoilCaptureFreshnessConfig,
+        SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate,
+        SoilDeviceFreshnessState, SoilDeviceStatus, SoilIotError, SoilSensorType, StuckSensorRail,
+        StuckSensorWindowConfig, ValidatedSoilReading, ValidationEvidenceRequest,
         ZoneSoilMoistureProduct, ZoneSoilProductFreshness, ZoneSoilProductRequest,
     };
     use alerting::{AlertEventBackbone, AlertSeverityHint};
@@ -2433,6 +2541,61 @@ mod tests {
             ReadingQaReason::OutOfRange
         );
         assert_eq!(validated.qa_flags[0].raw_value, 250.0);
+    }
+
+    #[test]
+    fn validation_evidence_rederivation_is_deterministic() {
+        let readings = validation_evidence_fixture_readings();
+        let profile = calibration_profile(
+            GatewayReadingMetric::SoilMoisturePercent,
+            1.0,
+            0.0,
+            0.0,
+            100.0,
+        );
+
+        let first = rederive_validated_series_evidence(ValidationEvidenceRequest {
+            readings: readings.clone(),
+            profile: profile.clone(),
+        })
+        .expect("validation evidence should be derived");
+        let second =
+            rederive_validated_series_evidence(ValidationEvidenceRequest { readings, profile })
+                .expect("same validation evidence should be re-derived");
+
+        assert_eq!(first.output_hash, second.output_hash);
+        assert!(first.output_hash.starts_with("sha256:"));
+        assert_eq!(first.reading_count, 2);
+        assert_eq!(first.qa_flag_count, 1);
+        assert_eq!(first.validated_readings, second.validated_readings);
+        assert_eq!(first.qa_evidence, second.qa_evidence);
+    }
+
+    #[test]
+    fn validation_evidence_retains_qa_rule_thresholds_and_raw_value() {
+        let report = rederive_validated_series_evidence(ValidationEvidenceRequest {
+            readings: validation_evidence_fixture_readings(),
+            profile: calibration_profile(
+                GatewayReadingMetric::SoilMoisturePercent,
+                1.0,
+                0.0,
+                0.0,
+                100.0,
+            ),
+        })
+        .expect("validation evidence should be derived");
+
+        assert_eq!(report.qa_evidence.len(), 1);
+        let flag = &report.qa_evidence[0];
+        assert_eq!(flag.payload_id, "payload-out-of-range");
+        assert_eq!(flag.device_id, "soil-probe-001");
+        assert_eq!(flag.reason_code, ReadingQaReason::OutOfRange);
+        assert_eq!(flag.profile_ref, "calibration:soil-probe-001:v1");
+        assert_eq!(flag.method_version, "linear-v1");
+        assert_eq!(flag.raw_value, 250.0);
+        assert_eq!(flag.calibrated_value, 250.0);
+        assert_eq!(flag.valid_min, 0.0);
+        assert_eq!(flag.valid_max, 100.0);
     }
 
     #[test]
@@ -2990,6 +3153,22 @@ mod tests {
             qa_flags: vec![],
             excluded_from_products: false,
         }
+    }
+
+    fn validation_evidence_fixture_readings() -> Vec<super::GeolocatedSoilReading> {
+        let mut clean_raw = valid_gateway_record();
+        clean_raw.payload_id = "payload-clean".to_string();
+        clean_raw.raw_value = 34.5;
+        let clean = build_geolocated_soil_reading(&valid_device(), clean_raw)
+            .expect("clean reading should geolocate");
+
+        let mut out_of_range_raw = valid_gateway_record();
+        out_of_range_raw.payload_id = "payload-out-of-range".to_string();
+        out_of_range_raw.raw_value = 250.0;
+        let out_of_range = build_geolocated_soil_reading(&valid_device(), out_of_range_raw)
+            .expect("out-of-range reading should still geolocate");
+
+        vec![clean, out_of_range]
     }
 
     fn freshness_config() -> SoilCaptureFreshnessConfig {
