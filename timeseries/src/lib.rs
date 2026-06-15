@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -432,6 +433,48 @@ pub struct ChangeEventDerivationInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeReproducibilityRequest {
+    pub source_pair: ChangeSourcePair,
+    pub alignment_evidence: RasterAlignmentEvidence,
+    pub alignment_proof: AlignmentGuardProof,
+    pub change: RasterChangeResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_change: Option<NormalizedRasterChangeResult>,
+    #[serde(default)]
+    pub events: Vec<ChangeEvent>,
+    pub change_config: RasterChangeConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_config: Option<NormalizedRasterChangeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_config: Option<ChangeEventConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeSourcePair {
+    pub earlier_source_ref: String,
+    pub later_source_ref: String,
+    pub earlier_raster_ref: String,
+    pub later_raster_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeReproducibilityReport {
+    pub schema_version: String,
+    pub source_pair: ChangeSourcePair,
+    pub alignment_ref: String,
+    pub alignment_proof_ref: String,
+    pub change_method_version: String,
+    pub absolute_threshold: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_method_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_magnitude_threshold: Option<f64>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub output_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompareViewFeed {
     pub schema_version: String,
     pub entity_ref: String,
@@ -719,6 +762,12 @@ pub enum TimeSeriesError {
     },
     #[error("change event config must have finite non-negative threshold")]
     InvalidChangeEventConfig,
+    #[error("change reproducibility source product is missing: {source_ref}")]
+    MissingChangeSourceProduct { source_ref: String },
+    #[error("change reproducibility inputs do not match the retained change outputs")]
+    ChangeReproducibilityInputMismatch,
+    #[error("change reproducibility hash input could not be serialized")]
+    ChangeReproducibilitySerializationFailed,
     #[error("export CRS cannot be empty")]
     EmptyExportCrs,
     #[error("change zone export CRS mismatch: expected {expected_crs}, got {actual_crs}")]
@@ -1226,6 +1275,53 @@ pub fn derive_ranked_change_events(
             .then_with(|| left.zone_ref.cmp(&right.zone_ref))
     });
     Ok(events)
+}
+
+pub fn build_change_reproducibility_report(
+    request: ChangeReproducibilityRequest,
+) -> Result<ChangeReproducibilityReport, TimeSeriesError> {
+    let source_pair = normalize_change_source_pair(request.source_pair.clone())?;
+    let change_config = normalize_change_config(request.change_config.clone())?;
+    validate_reproducibility_inputs(&request, &source_pair, &change_config)?;
+
+    let normalized_config = request
+        .normalized_config
+        .clone()
+        .map(normalize_normalized_change_config)
+        .transpose()?;
+    let event_config = request
+        .event_config
+        .map(normalize_change_event_config)
+        .transpose()?;
+    let output_hash = change_reproducibility_hash(&request, &source_pair)?;
+    let mut evidence_refs = BTreeSet::new();
+    evidence_refs.insert(source_pair.earlier_source_ref.clone());
+    evidence_refs.insert(source_pair.later_source_ref.clone());
+    evidence_refs.insert(request.alignment_evidence.alignment_ref.clone());
+    evidence_refs.insert(request.alignment_proof.alignment_proof_ref.clone());
+    evidence_refs.insert(request.change.delta_raster_ref.clone());
+    evidence_refs.insert(request.change.mask_raster_ref.clone());
+    if let Some(normalized) = &request.normalized_change {
+        evidence_refs.insert(normalized.normalized_raster_ref.clone());
+    }
+    for event in &request.events {
+        for evidence_ref in &event.evidence_refs {
+            evidence_refs.insert(evidence_ref.clone());
+        }
+    }
+
+    Ok(ChangeReproducibilityReport {
+        schema_version: "timeseries.change_reproducibility.v1".to_string(),
+        source_pair,
+        alignment_ref: request.alignment_evidence.alignment_ref,
+        alignment_proof_ref: request.alignment_proof.alignment_proof_ref,
+        change_method_version: change_config.method_version,
+        absolute_threshold: change_config.absolute_threshold,
+        normalized_method_version: normalized_config.map(|config| config.method_version),
+        event_magnitude_threshold: event_config.map(|config| config.magnitude_threshold),
+        evidence_refs: evidence_refs.into_iter().collect(),
+        output_hash,
+    })
 }
 
 pub fn evaluate_series_cadence_health(
@@ -1965,6 +2061,35 @@ fn normalize_change_config(
     })
 }
 
+fn normalize_change_source_pair(
+    source_pair: ChangeSourcePair,
+) -> Result<ChangeSourcePair, TimeSeriesError> {
+    let earlier_source_ref = normalize_required_text(
+        source_pair.earlier_source_ref,
+        TimeSeriesError::MissingChangeSourceProduct {
+            source_ref: "earlier_source_ref".to_string(),
+        },
+    )?;
+    let later_source_ref = normalize_required_text(
+        source_pair.later_source_ref,
+        TimeSeriesError::MissingChangeSourceProduct {
+            source_ref: "later_source_ref".to_string(),
+        },
+    )?;
+    Ok(ChangeSourcePair {
+        earlier_source_ref,
+        later_source_ref,
+        earlier_raster_ref: normalize_required_text(
+            source_pair.earlier_raster_ref,
+            TimeSeriesError::EmptyRasterRef,
+        )?,
+        later_raster_ref: normalize_required_text(
+            source_pair.later_raster_ref,
+            TimeSeriesError::EmptyRasterRef,
+        )?,
+    })
+}
+
 fn normalize_normalized_change_config(
     config: NormalizedRasterChangeConfig,
 ) -> Result<NormalizedRasterChangeConfig, TimeSeriesError> {
@@ -2306,6 +2431,93 @@ fn validate_normalized_change_inputs(
     } else {
         Err(TimeSeriesError::NormalizedChangeInputMismatch)
     }
+}
+
+fn validate_reproducibility_inputs(
+    request: &ChangeReproducibilityRequest,
+    source_pair: &ChangeSourcePair,
+    change_config: &RasterChangeConfig,
+) -> Result<(), TimeSeriesError> {
+    validate_raster_change_result(&request.change)?;
+    let aligned = request.alignment_evidence.alignment_ref == request.change.alignment_ref
+        && request.alignment_proof.alignment_proof_ref == request.change.alignment_proof_ref
+        && request.alignment_evidence.entity_ref == request.alignment_proof.entity_ref
+        && request.alignment_evidence.metric == request.alignment_proof.metric
+        && request.alignment_evidence.earlier_t == request.alignment_proof.earlier_t
+        && request.alignment_evidence.later_t == request.alignment_proof.later_t;
+    let source_matches = request.alignment_evidence.earlier_source_ref
+        == source_pair.earlier_source_ref
+        && request.alignment_evidence.later_source_ref == source_pair.later_source_ref
+        && request.alignment_evidence.earlier_raster_ref == source_pair.earlier_raster_ref
+        && request.alignment_evidence.later_raster_ref == source_pair.later_raster_ref
+        && request.alignment_proof.earlier_raster_ref == source_pair.earlier_raster_ref
+        && request.alignment_proof.later_raster_ref == source_pair.later_raster_ref;
+    let change_params_match = request.change.absolute_threshold == change_config.absolute_threshold
+        && request.change.method_version == change_config.method_version;
+    let grid_matches = request.alignment_evidence.target_crs == request.change.crs
+        && request.alignment_evidence.aligned_extent == request.change.extent
+        && request.alignment_evidence.grid_columns == request.change.grid_columns
+        && request.alignment_evidence.grid_rows == request.change.grid_rows;
+
+    if !(aligned && source_matches && change_params_match && grid_matches) {
+        return Err(TimeSeriesError::ChangeReproducibilityInputMismatch);
+    }
+    if let Some(normalized) = &request.normalized_change {
+        if normalized.delta_raster_ref != request.change.delta_raster_ref
+            || normalized.alignment_ref != request.change.alignment_ref
+            || normalized.alignment_proof_ref != request.change.alignment_proof_ref
+            || normalized.crs != request.change.crs
+            || normalized.extent != request.change.extent
+            || normalized.grid_columns != request.change.grid_columns
+            || normalized.grid_rows != request.change.grid_rows
+        {
+            return Err(TimeSeriesError::ChangeReproducibilityInputMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn change_reproducibility_hash(
+    request: &ChangeReproducibilityRequest,
+    source_pair: &ChangeSourcePair,
+) -> Result<String, TimeSeriesError> {
+    #[derive(Serialize)]
+    struct HashInput<'a> {
+        source_pair: &'a ChangeSourcePair,
+        alignment_evidence: &'a RasterAlignmentEvidence,
+        alignment_proof: &'a AlignmentGuardProof,
+        change: &'a RasterChangeResult,
+        normalized_change: &'a Option<NormalizedRasterChangeResult>,
+        events: &'a [ChangeEvent],
+        change_config: &'a RasterChangeConfig,
+        normalized_config: &'a Option<NormalizedRasterChangeConfig>,
+        event_config: &'a Option<ChangeEventConfig>,
+    }
+
+    let bytes = serde_json::to_vec(&HashInput {
+        source_pair,
+        alignment_evidence: &request.alignment_evidence,
+        alignment_proof: &request.alignment_proof,
+        change: &request.change,
+        normalized_change: &request.normalized_change,
+        events: &request.events,
+        change_config: &request.change_config,
+        normalized_config: &request.normalized_config,
+        event_config: &request.event_config,
+    })
+    .map_err(|_| TimeSeriesError::ChangeReproducibilitySerializationFailed)?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{}", to_hex(&digest)))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn validate_compare_view_inputs(
@@ -2685,14 +2897,15 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        align_raster_pair, build_compare_view_feed, compare_view_refusal_from_guard,
-        compute_aligned_raster_change, derive_ranked_change_events, evaluate_series_cadence_health,
-        export_change_mask_geotiff, export_change_zones_geojson, export_series_csv,
-        guard_coregisterable_pair, normalize_raster_change, AlignedRasterGrid,
-        AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason, ChangeEvent,
-        ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection, ChangeEventReasonCode,
-        ChangeZoneExportFeature, ChangeZonePolygon, GeoExtent, MetricDefinition, MetricKind,
-        NormalizedChangeOutcome, NormalizedRasterChangeConfig, RasterAlignmentConfig,
+        align_raster_pair, build_change_reproducibility_report, build_compare_view_feed,
+        compare_view_refusal_from_guard, compute_aligned_raster_change,
+        derive_ranked_change_events, evaluate_series_cadence_health, export_change_mask_geotiff,
+        export_change_zones_geojson, export_series_csv, guard_coregisterable_pair,
+        normalize_raster_change, AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof,
+        AlignmentRefusalReason, ChangeEvent, ChangeEventConfig, ChangeEventDerivationInput,
+        ChangeEventDirection, ChangeEventReasonCode, ChangeReproducibilityRequest,
+        ChangeSourcePair, ChangeZoneExportFeature, ChangeZonePolygon, GeoExtent, MetricDefinition,
+        MetricKind, NormalizedChangeOutcome, NormalizedRasterChangeConfig, RasterAlignmentConfig,
         RasterAlignmentEvidence, RasterChangeConfig, RasterChangeNormalizationMethod,
         RasterChangeResult, RasterResolution, RasterSeriesValue, RollingBaselineConfig,
         SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesCadenceHealthConfig,
@@ -3345,6 +3558,61 @@ mod tests {
         .expect("change event derivation should run");
 
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn change_reproducibility_report_hashes_identical_reruns() {
+        let request = change_reproducibility_request();
+        let first = build_change_reproducibility_report(request.clone())
+            .expect("completed change job should produce reproducibility report");
+        let second = build_change_reproducibility_report(request)
+            .expect("same completed change job should hash identically");
+
+        assert_eq!(first.schema_version, "timeseries.change_reproducibility.v1");
+        assert_eq!(first.output_hash, second.output_hash);
+        assert!(first.output_hash.starts_with("sha256:"));
+        assert_eq!(
+            first.source_pair.earlier_source_ref,
+            "source:field:alpha:ndvi_raster:2026-06-10T10:00:00Z"
+        );
+        assert_eq!(
+            first.source_pair.later_source_ref,
+            "source:field:alpha:ndvi_raster:2026-06-12T10:00:00Z"
+        );
+        assert_eq!(first.alignment_ref, "alignment:field-alpha:ndvi");
+        assert_eq!(
+            first.alignment_proof_ref,
+            "alignment-proof:field-alpha:ndvi"
+        );
+        assert_eq!(first.change_method_version, "delta-mask-v1");
+        assert_eq!(first.absolute_threshold, 0.10);
+        assert_eq!(
+            first.normalized_method_version.as_deref(),
+            Some("normalized-change-v1")
+        );
+        assert_eq!(first.event_magnitude_threshold, Some(0.10));
+        assert!(first
+            .evidence_refs
+            .contains(&"change:field-alpha:delta".to_string()));
+        assert!(first
+            .evidence_refs
+            .contains(&"change:field-alpha:normalized".to_string()));
+    }
+
+    #[test]
+    fn change_reproducibility_report_refuses_missing_source_product() {
+        let mut request = change_reproducibility_request();
+        request.source_pair.earlier_source_ref = " ".to_string();
+
+        let error = build_change_reproducibility_report(request)
+            .expect_err("missing source product should block reproducibility");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::MissingChangeSourceProduct {
+                source_ref: "earlier_source_ref".to_string()
+            }
+        );
     }
 
     #[test]
@@ -4215,6 +4483,85 @@ mod tests {
             "change:field-alpha:mask".to_string(),
         )
         .expect("sample drop should produce change result")
+    }
+
+    fn change_reproducibility_request() -> ChangeReproducibilityRequest {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier = aligned_grid(&evidence, &evidence.aligned_earlier_ref, [0.70; 4]);
+        let later = aligned_grid(
+            &evidence,
+            &evidence.aligned_later_ref,
+            [0.45, 0.48, 0.70, 0.70],
+        );
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier,
+            &later,
+            change_config(0.10),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("sample drop should produce change result");
+        let normalized = normalize_raster_change(
+            &change,
+            &earlier,
+            normalized_change_config(RasterChangeNormalizationMethod::PercentOfEarlier, None),
+            "change:field-alpha:normalized".to_string(),
+        )
+        .expect("sample drop should normalize");
+        let engine = seeded_baseline_engine();
+        let trend = engine
+            .compute_zonal_trend(
+                trend_target_2026(),
+                ZonalTrendConfig {
+                    min_points: 3,
+                    flat_slope_epsilon: 0.001,
+                },
+            )
+            .expect("trend should compute");
+        let baseline = engine
+            .compute_rolling_baseline(
+                trend_target_2026(),
+                RollingBaselineConfig {
+                    window_points: 2,
+                    anomaly_band: 0.10,
+                },
+            )
+            .expect("baseline should compute");
+        let event_config = ChangeEventConfig {
+            magnitude_threshold: 0.10,
+            min_changed_cells: 1,
+        };
+        let events = derive_ranked_change_events(
+            vec![ChangeEventDerivationInput {
+                change: change.clone(),
+                trend,
+                baseline,
+            }],
+            event_config,
+        )
+        .expect("change event derivation should run");
+
+        ChangeReproducibilityRequest {
+            source_pair: ChangeSourcePair {
+                earlier_source_ref: evidence.earlier_source_ref.clone(),
+                later_source_ref: evidence.later_source_ref.clone(),
+                earlier_raster_ref: evidence.earlier_raster_ref.clone(),
+                later_raster_ref: evidence.later_raster_ref.clone(),
+            },
+            alignment_evidence: evidence,
+            alignment_proof: proof,
+            change,
+            normalized_change: Some(normalized),
+            events,
+            change_config: change_config(0.10),
+            normalized_config: Some(normalized_change_config(
+                RasterChangeNormalizationMethod::PercentOfEarlier,
+                None,
+            )),
+            event_config: Some(event_config),
+        }
     }
 
     fn sample_change_event() -> ChangeEvent {
