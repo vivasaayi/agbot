@@ -351,6 +351,50 @@ pub struct GrowerRecommendationHistory {
     pub empty_state: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerFieldSummaryFindingRow {
+    pub field_id: String,
+    pub finding: GrowerFindingSummary,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerFieldSummaryExportRequest {
+    pub field_id: String,
+    pub generated_at: String,
+    pub findings: Vec<GrowerFieldSummaryFindingRow>,
+    pub recommendations: Vec<GrowerRecommendationRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerFieldSummaryExportArtifact {
+    pub export_id: String,
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub field_id: String,
+    pub generated_at: String,
+    pub findings: Vec<GrowerFieldSummaryFindingRow>,
+    pub recommendations: Vec<GrowerRecommendationRow>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerFieldSummaryShareRecord {
+    pub share_id: String,
+    pub export_id: String,
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub field_id: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerFieldSummaryExportStore {
+    exports: HashMap<String, GrowerFieldSummaryExportArtifact>,
+    shares: HashMap<String, GrowerFieldSummaryShareRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GrowerFieldMapError {
     #[error(transparent)]
@@ -378,6 +422,18 @@ pub enum GrowerFieldMapError {
         field_value: f64,
         layer_value: f64,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GrowerFieldSummaryShareError {
+    #[error(transparent)]
+    Access(#[from] GrowerPortalAccessError),
+    #[error("export not found: {export_id}")]
+    ExportNotFound { export_id: String },
+    #[error("share not found: {share_id}")]
+    ShareNotFound { share_id: String },
+    #[error("share revoked: {share_id}")]
+    ShareRevoked { share_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1262,6 +1318,309 @@ fn grower_recommendation_history_row(
         at: change.at,
         change_type: change.change_type,
     }
+}
+
+impl GrowerFieldSummaryExportStore {
+    pub fn export_field_summary(
+        &mut self,
+        control: &mut ControlPlaneRegistry,
+        scope: &GrowerPortalSessionScope,
+        request: GrowerFieldSummaryExportRequest,
+    ) -> Result<GrowerFieldSummaryExportArtifact, GrowerPortalAccessError> {
+        let field_id = request.field_id.trim();
+        if field_id.is_empty() {
+            audit_grower_field_summary_export(
+                control,
+                scope,
+                "",
+                AuthorizationDecision::Denied,
+                "grower_field_summary_export_missing_field",
+            );
+            return Err(GrowerPortalAccessError::FieldNotFound {
+                field_id: String::new(),
+            });
+        }
+        if !scope.field_ids.iter().any(|scoped| scoped == field_id) {
+            return Err(grower_field_summary_export_forbidden(
+                control,
+                scope,
+                field_id,
+                "grower_field_summary_export_field_out_of_scope",
+            ));
+        }
+
+        if let Some(out_of_scope) = request
+            .findings
+            .iter()
+            .map(|finding| finding.field_id.as_str())
+            .chain(
+                request
+                    .recommendations
+                    .iter()
+                    .map(|recommendation| recommendation.field_id.as_str()),
+            )
+            .find(|candidate| {
+                *candidate != field_id || !scope.field_ids.iter().any(|scoped| scoped == *candidate)
+            })
+        {
+            return Err(grower_field_summary_export_forbidden(
+                control,
+                scope,
+                out_of_scope,
+                "grower_field_summary_export_contains_out_of_scope_data",
+            ));
+        }
+
+        let export_id = format!(
+            "grower-export:{}:{}:{}",
+            scope.grower_id, field_id, request.generated_at
+        );
+        let evidence_refs = grower_field_summary_export_evidence_refs(&request);
+        let artifact = GrowerFieldSummaryExportArtifact {
+            export_id: export_id.clone(),
+            grower_id: scope.grower_id,
+            org_id: scope.org_id,
+            field_id: field_id.to_string(),
+            generated_at: request.generated_at,
+            findings: request.findings,
+            recommendations: request.recommendations,
+            evidence_refs,
+        };
+
+        audit_grower_field_summary_export(
+            control,
+            scope,
+            field_id,
+            AuthorizationDecision::Allowed,
+            "grower_field_summary_exported",
+        );
+        self.exports.insert(export_id, artifact.clone());
+        Ok(artifact)
+    }
+
+    pub fn create_share(
+        &mut self,
+        control: &mut ControlPlaneRegistry,
+        scope: &GrowerPortalSessionScope,
+        export_id: &str,
+        created_at: &str,
+    ) -> Result<GrowerFieldSummaryShareRecord, GrowerFieldSummaryShareError> {
+        let artifact = self.exports.get(export_id).ok_or_else(|| {
+            audit_grower_field_summary_export(
+                control,
+                scope,
+                "",
+                AuthorizationDecision::Denied,
+                "grower_field_summary_share_export_not_found",
+            );
+            GrowerFieldSummaryShareError::ExportNotFound {
+                export_id: export_id.to_string(),
+            }
+        })?;
+        ensure_export_visible_to_scope(
+            control,
+            scope,
+            artifact,
+            "grower_field_summary_share_out_of_scope",
+        )?;
+
+        let share_id = format!("grower-share:{}:{}", artifact.export_id, created_at);
+        let share = GrowerFieldSummaryShareRecord {
+            share_id: share_id.clone(),
+            export_id: artifact.export_id.clone(),
+            grower_id: scope.grower_id,
+            org_id: scope.org_id,
+            field_id: artifact.field_id.clone(),
+            created_at: created_at.to_string(),
+            revoked_at: None,
+        };
+        audit_grower_field_summary_export(
+            control,
+            scope,
+            &artifact.field_id,
+            AuthorizationDecision::Allowed,
+            "grower_field_summary_share_created",
+        );
+        self.shares.insert(share_id, share.clone());
+        Ok(share)
+    }
+
+    pub fn revoke_share(
+        &mut self,
+        control: &mut ControlPlaneRegistry,
+        scope: &GrowerPortalSessionScope,
+        share_id: &str,
+        revoked_at: &str,
+    ) -> Result<GrowerFieldSummaryShareRecord, GrowerFieldSummaryShareError> {
+        let share = self.shares.get_mut(share_id).ok_or_else(|| {
+            GrowerFieldSummaryShareError::ShareNotFound {
+                share_id: share_id.to_string(),
+            }
+        })?;
+        if share.org_id != scope.org_id
+            || !scope
+                .field_ids
+                .iter()
+                .any(|field_id| field_id == &share.field_id)
+        {
+            return Err(GrowerFieldSummaryShareError::Access(
+                grower_field_summary_export_forbidden(
+                    control,
+                    scope,
+                    &share.field_id,
+                    "grower_field_summary_share_revoke_out_of_scope",
+                ),
+            ));
+        }
+        share.revoked_at = Some(revoked_at.to_string());
+        audit_grower_field_summary_export(
+            control,
+            scope,
+            &share.field_id,
+            AuthorizationDecision::Allowed,
+            "grower_field_summary_share_revoked",
+        );
+        Ok(share.clone())
+    }
+
+    pub fn read_shared_export(
+        &mut self,
+        control: &mut ControlPlaneRegistry,
+        scope: &GrowerPortalSessionScope,
+        share_id: &str,
+    ) -> Result<GrowerFieldSummaryExportArtifact, GrowerFieldSummaryShareError> {
+        let share = self.shares.get(share_id).ok_or_else(|| {
+            GrowerFieldSummaryShareError::ShareNotFound {
+                share_id: share_id.to_string(),
+            }
+        })?;
+        if let Some(_revoked_at) = &share.revoked_at {
+            audit_grower_field_summary_export(
+                control,
+                scope,
+                &share.field_id,
+                AuthorizationDecision::Denied,
+                "grower_field_summary_share_revoked",
+            );
+            return Err(GrowerFieldSummaryShareError::ShareRevoked {
+                share_id: share_id.to_string(),
+            });
+        }
+        if share.org_id != scope.org_id
+            || !scope
+                .field_ids
+                .iter()
+                .any(|field_id| field_id == &share.field_id)
+        {
+            return Err(GrowerFieldSummaryShareError::Access(
+                grower_field_summary_export_forbidden(
+                    control,
+                    scope,
+                    &share.field_id,
+                    "grower_field_summary_share_read_out_of_scope",
+                ),
+            ));
+        }
+
+        let artifact = self.exports.get(&share.export_id).ok_or_else(|| {
+            GrowerFieldSummaryShareError::ExportNotFound {
+                export_id: share.export_id.clone(),
+            }
+        })?;
+        audit_grower_field_summary_export(
+            control,
+            scope,
+            &artifact.field_id,
+            AuthorizationDecision::Allowed,
+            "grower_field_summary_share_read",
+        );
+        Ok(artifact.clone())
+    }
+}
+
+fn ensure_export_visible_to_scope(
+    control: &mut ControlPlaneRegistry,
+    scope: &GrowerPortalSessionScope,
+    artifact: &GrowerFieldSummaryExportArtifact,
+    reason_code: &str,
+) -> Result<(), GrowerFieldSummaryShareError> {
+    if artifact.org_id == scope.org_id
+        && artifact.grower_id == scope.grower_id
+        && scope
+            .field_ids
+            .iter()
+            .any(|field_id| field_id == &artifact.field_id)
+    {
+        return Ok(());
+    }
+    Err(GrowerFieldSummaryShareError::Access(
+        grower_field_summary_export_forbidden(control, scope, &artifact.field_id, reason_code),
+    ))
+}
+
+fn grower_field_summary_export_evidence_refs(
+    request: &GrowerFieldSummaryExportRequest,
+) -> Vec<String> {
+    let mut refs = Vec::new();
+    for finding in &request.findings {
+        refs.extend(finding.evidence_refs.iter().cloned());
+        refs.push(format!("finding:{}", finding.finding.finding_id));
+    }
+    for recommendation in &request.recommendations {
+        refs.extend(recommendation.evidence_refs.iter().cloned());
+        refs.push(format!(
+            "recommendation:{}",
+            recommendation.recommendation_id
+        ));
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn grower_field_summary_export_forbidden(
+    control: &mut ControlPlaneRegistry,
+    scope: &GrowerPortalSessionScope,
+    field_id: &str,
+    reason_code: &str,
+) -> GrowerPortalAccessError {
+    audit_grower_field_summary_export(
+        control,
+        scope,
+        field_id,
+        AuthorizationDecision::Denied,
+        reason_code,
+    );
+    GrowerPortalAccessError::Forbidden {
+        evidence: GrowerPortalAccessEvidence {
+            grower_id: scope.grower_id,
+            org_id: scope.org_id,
+            role: scope.role,
+            action: ControlPlaneAction::ExportData,
+            field_id: field_id.to_string(),
+            target_org_id: Some(scope.org_id.to_string()),
+            decision: AuthorizationDecision::Denied,
+            reason_code: reason_code.to_string(),
+        },
+    }
+}
+
+fn audit_grower_field_summary_export(
+    control: &mut ControlPlaneRegistry,
+    scope: &GrowerPortalSessionScope,
+    _field_id: &str,
+    decision: AuthorizationDecision,
+    reason_code: &str,
+) {
+    control.append_audit_record(AuditRecordRequest {
+        actor_user_id: scope.grower_id,
+        org_id: scope.org_id,
+        action: ControlPlaneAction::ExportData,
+        target_ref: None,
+        target_org_id: Some(scope.org_id),
+        decision,
+        reason_code: reason_code.to_string(),
+    });
 }
 
 impl TenantScoped for OrganizationRecord {
@@ -2566,6 +2925,199 @@ mod tests {
     }
 
     #[test]
+    fn grower_field_summary_export_scopes_artifact_and_audits() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_id = control
+            .create_organization("Org A".to_string())
+            .expect("org creates")
+            .org_id;
+        let grower = control
+            .create_user_with_role(
+                org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let scope = GrowerPortalSessionScope {
+            grower_id: grower.user.user_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let recommendation = grower_recommendation_row(
+            &recommendation_record("rec-owned", "field-a", org_id, RecommendationPriority::High),
+            "field-a",
+        );
+        let mut store = GrowerFieldSummaryExportStore::default();
+
+        let artifact = store
+            .export_field_summary(
+                &mut control,
+                &scope,
+                grower_field_summary_export_request(
+                    "field-a",
+                    "2026-06-15T14:00:00Z",
+                    vec![grower_field_summary_finding("finding-owned", "field-a")],
+                    vec![recommendation],
+                ),
+            )
+            .expect("owned field summary exports");
+
+        assert_eq!(artifact.field_id, "field-a");
+        assert_eq!(artifact.grower_id, grower.user.user_id);
+        assert_eq!(artifact.org_id, org_id);
+        assert_eq!(artifact.findings.len(), 1);
+        assert_eq!(artifact.recommendations.len(), 1);
+        assert!(artifact
+            .evidence_refs
+            .contains(&"finding:finding-owned".to_string()));
+        assert!(artifact
+            .evidence_refs
+            .contains(&"recommendation:rec-owned".to_string()));
+
+        let records = control.audit_records_for_org(org_id, None, None);
+        assert!(records.iter().any(|record| {
+            record.action == ControlPlaneAction::ExportData
+                && record.decision == AuthorizationDecision::Allowed
+                && record.reason_code == "grower_field_summary_exported"
+        }));
+    }
+
+    #[test]
+    fn grower_field_summary_share_revoke_denies_access() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_id = control
+            .create_organization("Org A".to_string())
+            .expect("org creates")
+            .org_id;
+        let grower = control
+            .create_user_with_role(
+                org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let scope = GrowerPortalSessionScope {
+            grower_id: grower.user.user_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let mut store = GrowerFieldSummaryExportStore::default();
+        let artifact = store
+            .export_field_summary(
+                &mut control,
+                &scope,
+                grower_field_summary_export_request(
+                    "field-a",
+                    "2026-06-15T14:00:00Z",
+                    vec![grower_field_summary_finding("finding-owned", "field-a")],
+                    Vec::new(),
+                ),
+            )
+            .expect("owned field summary exports");
+        let share = store
+            .create_share(
+                &mut control,
+                &scope,
+                &artifact.export_id,
+                "2026-06-15T14:05:00Z",
+            )
+            .expect("share creates");
+
+        let shared = store
+            .read_shared_export(&mut control, &scope, &share.share_id)
+            .expect("active share reads");
+        assert_eq!(shared.export_id, artifact.export_id);
+
+        let revoked = store
+            .revoke_share(
+                &mut control,
+                &scope,
+                &share.share_id,
+                "2026-06-15T14:10:00Z",
+            )
+            .expect("share revokes");
+        assert_eq!(revoked.revoked_at.as_deref(), Some("2026-06-15T14:10:00Z"));
+        let error = store
+            .read_shared_export(&mut control, &scope, &share.share_id)
+            .expect_err("revoked share is denied");
+
+        assert_eq!(
+            error,
+            GrowerFieldSummaryShareError::ShareRevoked {
+                share_id: share.share_id.clone()
+            }
+        );
+        let records = control.audit_records_for_org(org_id, None, None);
+        assert!(records
+            .iter()
+            .any(|record| record.reason_code == "grower_field_summary_share_created"));
+        assert!(records
+            .iter()
+            .any(|record| record.reason_code == "grower_field_summary_share_revoked"));
+        assert!(records.iter().any(|record| {
+            record.reason_code == "grower_field_summary_share_revoked"
+                && record.decision == AuthorizationDecision::Denied
+        }));
+    }
+
+    #[test]
+    fn grower_field_summary_export_refuses_out_of_scope_data() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_id = control
+            .create_organization("Org A".to_string())
+            .expect("org creates")
+            .org_id;
+        let grower = control
+            .create_user_with_role(
+                org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let scope = GrowerPortalSessionScope {
+            grower_id: grower.user.user_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let mut store = GrowerFieldSummaryExportStore::default();
+
+        let error = store
+            .export_field_summary(
+                &mut control,
+                &scope,
+                grower_field_summary_export_request(
+                    "field-a",
+                    "2026-06-15T14:00:00Z",
+                    vec![grower_field_summary_finding("finding-foreign", "field-b")],
+                    Vec::new(),
+                ),
+            )
+            .expect_err("out-of-scope finding is rejected");
+
+        let GrowerPortalAccessError::Forbidden { evidence } = error else {
+            panic!("out-of-scope export returns forbidden evidence");
+        };
+        assert_eq!(evidence.action, ControlPlaneAction::ExportData);
+        assert_eq!(evidence.field_id, "field-b");
+        assert_eq!(
+            evidence.reason_code,
+            "grower_field_summary_export_contains_out_of_scope_data"
+        );
+        let records = control.audit_records_for_org(org_id, None, None);
+        assert!(records.iter().any(|record| {
+            record.action == ControlPlaneAction::ExportData
+                && record.decision == AuthorizationDecision::Denied
+                && record.reason_code == "grower_field_summary_export_contains_out_of_scope_data"
+        }));
+    }
+
+    #[test]
     fn grower_portal_field_read_denies_cross_tenant_and_audits() {
         let mut control = ControlPlaneRegistry::default();
         let org_a = control
@@ -2990,6 +3542,35 @@ mod tests {
             field_id: field_id.to_string(),
             created_at: created_at.to_string(),
             title: format!("Notification {source_ref}"),
+        }
+    }
+
+    fn grower_field_summary_export_request(
+        field_id: &str,
+        generated_at: &str,
+        findings: Vec<GrowerFieldSummaryFindingRow>,
+        recommendations: Vec<GrowerRecommendationRow>,
+    ) -> GrowerFieldSummaryExportRequest {
+        GrowerFieldSummaryExportRequest {
+            field_id: field_id.to_string(),
+            generated_at: generated_at.to_string(),
+            findings,
+            recommendations,
+        }
+    }
+
+    fn grower_field_summary_finding(
+        finding_id: &str,
+        field_id: &str,
+    ) -> GrowerFieldSummaryFindingRow {
+        GrowerFieldSummaryFindingRow {
+            field_id: field_id.to_string(),
+            finding: GrowerFindingSummary {
+                finding_id: finding_id.to_string(),
+                title: format!("Finding {finding_id}"),
+                source_date: "2026-06-15T13:00:00Z".to_string(),
+            },
+            evidence_refs: vec![format!("scene:scene-{finding_id}")],
         }
     }
 
