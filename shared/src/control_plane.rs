@@ -140,6 +140,61 @@ pub struct GrowerPortalHome {
     pub empty_state: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrowerFieldAnalysisStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerLayerSummary {
+    pub layer_id: String,
+    pub product_type: String,
+    pub source_date: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerFindingSummary {
+    pub finding_id: String,
+    pub title: String,
+    pub source_date: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerRecommendationSummary {
+    pub recommendation_id: String,
+    pub title: String,
+    pub source_date: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerFieldAnalysisSource {
+    pub field_id: String,
+    pub scene_id: String,
+    pub captured_at: String,
+    pub status: GrowerFieldAnalysisStatus,
+    pub layers: Vec<GrowerLayerSummary>,
+    pub latest_finding: Option<GrowerFindingSummary>,
+    pub latest_recommendation: Option<GrowerRecommendationSummary>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalFieldOverview {
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub farm_id: String,
+    pub field_id: String,
+    pub field_name: String,
+    pub latest_scene_id: Option<String>,
+    pub latest_scene_date: Option<String>,
+    pub layers: Vec<GrowerLayerSummary>,
+    pub latest_finding: Option<GrowerFindingSummary>,
+    pub latest_recommendation: Option<GrowerRecommendationSummary>,
+    pub no_current_analysis: bool,
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantBoundaryAuditEvent {
     pub actor_user_id: Uuid,
@@ -424,6 +479,87 @@ fn grower_home_farm(
         farm_id: farm.farm_id,
         name: farm.name,
         fields,
+    }
+}
+
+pub fn build_grower_portal_field_overview(
+    scope: &GrowerPortalSessionScope,
+    farm_fields: &FarmFieldRegistry,
+    field_id: &str,
+    analysis_sources: &[GrowerFieldAnalysisSource],
+) -> Result<GrowerPortalFieldOverview, GrowerPortalAccessError> {
+    let field_id = field_id.trim();
+    if !scope.field_ids.iter().any(|id| id == field_id) {
+        return Err(GrowerPortalAccessError::FieldNotFound {
+            field_id: field_id.to_string(),
+        });
+    }
+    let org_key = scope.org_id.to_string();
+    let field = farm_fields
+        .fields_for_org(&org_key)
+        .into_iter()
+        .find(|field| field.field_id == field_id)
+        .ok_or_else(|| GrowerPortalAccessError::FieldNotFound {
+            field_id: field_id.to_string(),
+        })?;
+    let farm_id = field
+        .farm_id
+        .clone()
+        .ok_or_else(|| GrowerPortalAccessError::FieldNotFound {
+            field_id: field_id.to_string(),
+        })?;
+    let latest = analysis_sources
+        .iter()
+        .filter(|source| source.field_id == field_id)
+        .max_by(|left, right| {
+            left.captured_at
+                .cmp(&right.captured_at)
+                .then(left.scene_id.cmp(&right.scene_id))
+        });
+
+    let Some(latest) = latest else {
+        return Ok(empty_field_overview(scope, farm_id, field));
+    };
+    if latest.status == GrowerFieldAnalysisStatus::Failed {
+        let mut overview = empty_field_overview(scope, farm_id, field);
+        overview.evidence_refs = latest.evidence_refs.clone();
+        return Ok(overview);
+    }
+
+    Ok(GrowerPortalFieldOverview {
+        grower_id: scope.grower_id,
+        org_id: scope.org_id,
+        farm_id,
+        field_id: field.field_id,
+        field_name: field.name,
+        latest_scene_id: Some(latest.scene_id.clone()),
+        latest_scene_date: Some(latest.captured_at.clone()),
+        layers: latest.layers.clone(),
+        latest_finding: latest.latest_finding.clone(),
+        latest_recommendation: latest.latest_recommendation.clone(),
+        no_current_analysis: false,
+        evidence_refs: latest.evidence_refs.clone(),
+    })
+}
+
+fn empty_field_overview(
+    scope: &GrowerPortalSessionScope,
+    farm_id: String,
+    field: FieldRecord,
+) -> GrowerPortalFieldOverview {
+    GrowerPortalFieldOverview {
+        grower_id: scope.grower_id,
+        org_id: scope.org_id,
+        farm_id,
+        field_id: field.field_id,
+        field_name: field.name,
+        latest_scene_id: None,
+        latest_scene_date: None,
+        layers: Vec::new(),
+        latest_finding: None,
+        latest_recommendation: None,
+        no_current_analysis: true,
+        evidence_refs: Vec::new(),
     }
 }
 
@@ -1112,6 +1248,113 @@ mod tests {
     }
 
     #[test]
+    fn grower_portal_field_overview_shows_latest_completed_analysis() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_a = control
+            .create_organization("Org A".to_string())
+            .expect("org A creates");
+        let grower = control
+            .create_user_with_role(
+                org_a.org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let mut farm_fields = FarmFieldRegistry::default();
+        insert_test_farm_field_scope(&mut farm_fields, org_a.org_id, "farm-a", "field-a");
+        let scope =
+            resolve_grower_portal_session_scope(&control, &farm_fields, grower.user.user_id)
+                .expect("grower scope resolves");
+
+        let overview = build_grower_portal_field_overview(
+            &scope,
+            &farm_fields,
+            "field-a",
+            &[
+                field_analysis_source(
+                    "field-a",
+                    "scene-old",
+                    "2026-06-01",
+                    GrowerFieldAnalysisStatus::Completed,
+                ),
+                field_analysis_source(
+                    "field-a",
+                    "scene-new",
+                    "2026-06-12",
+                    GrowerFieldAnalysisStatus::Completed,
+                ),
+            ],
+        )
+        .expect("field overview builds");
+
+        assert!(!overview.no_current_analysis);
+        assert_eq!(overview.latest_scene_id.as_deref(), Some("scene-new"));
+        assert_eq!(overview.latest_scene_date.as_deref(), Some("2026-06-12"));
+        assert_eq!(overview.layers[0].product_type, "ndvi");
+        assert_eq!(
+            overview
+                .latest_finding
+                .as_ref()
+                .map(|finding| finding.finding_id.as_str()),
+            Some("finding-scene-new")
+        );
+        assert!(overview
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence == "scene:scene-new"));
+    }
+
+    #[test]
+    fn grower_portal_field_overview_failed_latest_scene_has_no_current_analysis() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_a = control
+            .create_organization("Org A".to_string())
+            .expect("org A creates");
+        let grower = control
+            .create_user_with_role(
+                org_a.org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let mut farm_fields = FarmFieldRegistry::default();
+        insert_test_farm_field_scope(&mut farm_fields, org_a.org_id, "farm-a", "field-a");
+        let scope =
+            resolve_grower_portal_session_scope(&control, &farm_fields, grower.user.user_id)
+                .expect("grower scope resolves");
+
+        let overview = build_grower_portal_field_overview(
+            &scope,
+            &farm_fields,
+            "field-a",
+            &[
+                field_analysis_source(
+                    "field-a",
+                    "scene-old",
+                    "2026-06-01",
+                    GrowerFieldAnalysisStatus::Completed,
+                ),
+                field_analysis_source(
+                    "field-a",
+                    "scene-failed",
+                    "2026-06-12",
+                    GrowerFieldAnalysisStatus::Failed,
+                ),
+            ],
+        )
+        .expect("field overview builds");
+
+        assert!(overview.no_current_analysis);
+        assert_eq!(overview.latest_scene_id, None);
+        assert!(overview.layers.is_empty());
+        assert_eq!(overview.latest_finding, None);
+        assert!(overview
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence == "scene:scene-failed"));
+    }
+
+    #[test]
     fn grower_portal_field_read_denies_cross_tenant_and_audits() {
         let mut control = ControlPlaneRegistry::default();
         let org_a = control
@@ -1421,6 +1664,44 @@ mod tests {
                 updated_at: "2026-04-01T00:00:00Z".to_string(),
             })
             .expect("field persists");
+    }
+
+    fn field_analysis_source(
+        field_id: &str,
+        scene_id: &str,
+        captured_at: &str,
+        status: GrowerFieldAnalysisStatus,
+    ) -> GrowerFieldAnalysisSource {
+        GrowerFieldAnalysisSource {
+            field_id: field_id.to_string(),
+            scene_id: scene_id.to_string(),
+            captured_at: captured_at.to_string(),
+            status,
+            layers: if status == GrowerFieldAnalysisStatus::Completed {
+                vec![GrowerLayerSummary {
+                    layer_id: format!("layer-{scene_id}"),
+                    product_type: "ndvi".to_string(),
+                    source_date: captured_at.to_string(),
+                }]
+            } else {
+                Vec::new()
+            },
+            latest_finding: (status == GrowerFieldAnalysisStatus::Completed).then(|| {
+                GrowerFindingSummary {
+                    finding_id: format!("finding-{scene_id}"),
+                    title: "Low vigor".to_string(),
+                    source_date: captured_at.to_string(),
+                }
+            }),
+            latest_recommendation: (status == GrowerFieldAnalysisStatus::Completed).then(|| {
+                GrowerRecommendationSummary {
+                    recommendation_id: format!("rec-{scene_id}"),
+                    title: "Scout field edge".to_string(),
+                    source_date: captured_at.to_string(),
+                }
+            }),
+            evidence_refs: vec![format!("scene:{scene_id}")],
+        }
     }
 
     fn test_boundary() -> FieldBoundary {
