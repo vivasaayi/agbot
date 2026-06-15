@@ -84,13 +84,14 @@ use provenance::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
-    append_content_version, assemble_marketplace_org_report, assert_raster_spatial_ref,
-    bind_fleet_node_identity, bounds_coverage_fraction, bounds_from_points,
-    build_collaboration_channel, build_collaboration_message, build_marketplace_account_record,
-    build_marketplace_catalog_item_record, build_marketplace_inventory_record,
-    build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
-    build_tractor_record, close_marketplace_listing_record, compute_drought_index,
-    compute_marketplace_demand_forecast, create_marketplace_fulfillment_record,
+    aggregate_marketplace_ratings, append_content_version, assemble_marketplace_org_report,
+    assert_raster_spatial_ref, bind_fleet_node_identity, bounds_coverage_fraction,
+    bounds_from_points, build_collaboration_channel, build_collaboration_message,
+    build_marketplace_account_record, build_marketplace_catalog_item_record,
+    build_marketplace_inventory_record, build_marketplace_portal_entry,
+    build_soil_moisture_reading, build_sustainability_record, build_tractor_record,
+    close_marketplace_listing_record, compute_drought_index, compute_marketplace_demand_forecast,
+    create_marketplace_fulfillment_record, create_marketplace_rating_record,
     create_versioned_content, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
     parse_content_status, parse_content_type, parse_drought_index_type,
     parse_marketplace_account_status, parse_marketplace_catalog_category,
@@ -125,17 +126,18 @@ use shared::schemas::{
     MarketplaceListingStatus, MarketplaceOrderAuditRecord, MarketplaceOrderCreateRequest,
     MarketplaceOrderError, MarketplaceOrderRecord, MarketplaceOrderStatus, MarketplaceOrgReport,
     MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntry,
-    MarketplacePortalEntryError, MarketplaceReportError, MarketplaceReportPeriod,
-    MultispectralImage, OpenDataPublication, OpenDataPublishError, OpenDataPublishRequest,
-    RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
-    RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
-    SoilMoistureReadingRecord, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
-    SoilMoistureRejectionRecord, SustainabilityMetricType, SustainabilityRecord,
-    SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
-    TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
-    TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
-    TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
-    VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
+    MarketplacePortalEntryError, MarketplaceRatingAggregate, MarketplaceRatingCreateRequest,
+    MarketplaceRatingError, MarketplaceRatingRecord, MarketplaceReportError,
+    MarketplaceReportPeriod, MultispectralImage, OpenDataPublication, OpenDataPublishError,
+    OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
+    SoilMoistureReadingError, SoilMoistureReadingRecord, SoilMoistureReadingRequest,
+    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, SustainabilityMetricType,
+    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
+    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
+    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
+    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
     WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
     WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
@@ -724,6 +726,18 @@ pub struct MarketplaceFulfillmentTransitionRequest {
     pub org_id: String,
     pub actor_id: String,
     pub status: MarketplaceFulfillmentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceRatingListQuery {
+    pub org_id: Option<String>,
+    pub order_ref: Option<String>,
+    pub ratee_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceRatingAggregateQuery {
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3856,6 +3870,83 @@ pub async fn list_marketplace_fulfillment_audits(
         .map(|row| decode_marketplace_fulfillment_audit_record(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
+}
+
+pub async fn create_marketplace_rating(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceRatingCreateRequest>,
+) -> AppResult<Json<MarketplaceRatingRecord>> {
+    let order_ref = normalize_optional_text(Some(request.order_ref.clone())).ok_or_else(|| {
+        AppError::BadRequest("marketplace rating order_ref is required".to_string())
+    })?;
+    let order = load_marketplace_order(&state, &order_ref).await?;
+    let participants = if let Some(order) = order.as_ref() {
+        marketplace_order_participants(&state, order).await?
+    } else {
+        Vec::new()
+    };
+    let existing = load_marketplace_ratings_for_order(&state, &order_ref).await?;
+    let record = create_marketplace_rating_record(
+        request,
+        order.as_ref(),
+        &participants,
+        &existing,
+        format!("marketplace-rating-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_rating_error)?;
+    insert_marketplace_rating_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_ratings(
+    Query(query): Query<MarketplaceRatingListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceRatingRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace ratings".to_string(),
+        )
+    })?;
+    let order_ref = normalize_optional_text(query.order_ref);
+    let ratee_account_id = normalize_optional_text(query.ratee_account_id);
+    let rows = sqlx::query(
+        r#"
+        SELECT rating_id, order_ref, rater_account_id, ratee_account_id,
+               score, comment, org_scope, created_at
+        FROM marketplace_ratings
+        WHERE org_scope = ?1
+          AND (?2 IS NULL OR order_ref = ?2)
+          AND (?3 IS NULL OR ratee_account_id = ?3)
+        ORDER BY created_at ASC, rating_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(order_ref)
+    .bind(ratee_account_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_rating_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_rating_aggregate(
+    Path(account_id): Path<String>,
+    Query(query): Query<MarketplaceRatingAggregateQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceRatingAggregate>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let ratings = load_marketplace_ratings_for_ratee(&state, &account_id, &org_id).await?;
+    let aggregate = aggregate_marketplace_ratings(account_id, org_id, &ratings)
+        .map_err(marketplace_rating_error)?;
+
+    Ok(Json(aggregate))
 }
 
 pub async fn create_marketplace_demand_forecast(
@@ -9111,6 +9202,10 @@ fn marketplace_fulfillment_error(error: MarketplaceFulfillmentError) -> AppError
     AppError::BadRequest(error.to_string())
 }
 
+fn marketplace_rating_error(error: MarketplaceRatingError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn marketplace_demand_forecast_error(error: MarketplaceDemandForecastError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -10699,6 +10794,21 @@ fn decode_marketplace_fulfillment_audit_record(
             .map_err(marketplace_fulfillment_error)?,
         actor_id: row.get("actor_id"),
         occurred_at: row.get("occurred_at"),
+    })
+}
+
+fn decode_marketplace_rating_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceRatingRecord> {
+    Ok(MarketplaceRatingRecord {
+        rating_id: row.get("rating_id"),
+        order_ref: row.get("order_ref"),
+        rater_account_id: row.get("rater_account_id"),
+        ratee_account_id: row.get("ratee_account_id"),
+        score: row.get("score"),
+        comment: row.get("comment"),
+        org_scope: row.get("org_scope"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -12643,6 +12753,104 @@ async fn insert_marketplace_fulfillment_audit_record(
     .map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn marketplace_order_participants(
+    state: &AppState,
+    order: &MarketplaceOrderRecord,
+) -> AppResult<Vec<String>> {
+    let listing = load_marketplace_listing(state, &order.listing_ref)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let item = load_marketplace_catalog_item(state, &listing.item_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(vec![order.buyer_account_id.clone(), item.owner_account_id])
+}
+
+async fn insert_marketplace_rating_record(
+    state: &AppState,
+    record: &MarketplaceRatingRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_ratings (
+            rating_id, order_ref, rater_account_id, ratee_account_id,
+            score, comment, org_scope, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&record.rating_id)
+    .bind(&record.order_ref)
+    .bind(&record.rater_account_id)
+    .bind(&record.ratee_account_id)
+    .bind(record.score)
+    .bind(&record.comment)
+    .bind(&record.org_scope)
+    .bind(&record.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(|err| {
+        if err.to_string().contains("UNIQUE constraint failed") {
+            AppError::BadRequest(format!(
+                "marketplace rating already exists for order {} and rater {}",
+                record.order_ref, record.rater_account_id
+            ))
+        } else {
+            AppError::Anyhow(err.into())
+        }
+    })?;
+
+    Ok(())
+}
+
+async fn load_marketplace_ratings_for_order(
+    state: &AppState,
+    order_ref: &str,
+) -> AppResult<Vec<MarketplaceRatingRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT rating_id, order_ref, rater_account_id, ratee_account_id,
+               score, comment, org_scope, created_at
+        FROM marketplace_ratings
+        WHERE order_ref = ?1
+        ORDER BY created_at ASC, rating_id ASC
+        "#,
+    )
+    .bind(order_ref)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_rating_record(&row))
+        .collect()
+}
+
+async fn load_marketplace_ratings_for_ratee(
+    state: &AppState,
+    ratee_account_id: &str,
+    org_scope: &str,
+) -> AppResult<Vec<MarketplaceRatingRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT rating_id, order_ref, rater_account_id, ratee_account_id,
+               score, comment, org_scope, created_at
+        FROM marketplace_ratings
+        WHERE ratee_account_id = ?1 AND org_scope = ?2
+        ORDER BY created_at ASC, rating_id ASC
+        "#,
+    )
+    .bind(ratee_account_id)
+    .bind(org_scope)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_rating_record(&row))
+        .collect()
 }
 
 async fn load_marketplace_demand_evidence_refs(

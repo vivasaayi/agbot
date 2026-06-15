@@ -3997,6 +3997,107 @@ async fn marketplace_fulfillments_reject_missing_order_without_write() -> Result
 }
 
 #[tokio::test]
+async fn marketplace_ratings_persist_and_aggregate_for_participants() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+    let fulfillment =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "order-seed-corn-001", "org-alpha")
+            .await?;
+    assert_eq!(fulfillment.status(), StatusCode::OK);
+
+    let rating = create_marketplace_rating(
+        &ctx,
+        "rating-order-001-buyer",
+        "order-seed-corn-001",
+        "buyer-001",
+        "supplier-001",
+        5.0,
+    )
+    .await?;
+    assert_eq!(rating.status(), StatusCode::OK);
+
+    let aggregate = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/ratings/accounts/supplier-001/aggregate?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(aggregate.status(), StatusCode::OK);
+    let body = to_bytes(aggregate.into_body(), 64 * 1024).await?;
+    let aggregate: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        aggregate
+            .get("rating_count")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        aggregate
+            .get("average_score")
+            .and_then(|value| value.as_f64()),
+        Some(5.0)
+    );
+
+    let duplicate = create_marketplace_rating(
+        &ctx,
+        "rating-order-001-buyer-2",
+        "order-seed-corn-001",
+        "buyer-001",
+        "supplier-001",
+        4.0,
+    )
+    .await?;
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_ratings_reject_non_participant_without_write() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+    let fulfillment =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "order-seed-corn-001", "org-alpha")
+            .await?;
+    assert_eq!(fulfillment.status(), StatusCode::OK);
+
+    let rejected = create_marketplace_rating(
+        &ctx,
+        "rating-order-001-viewer",
+        "order-seed-corn-001",
+        "viewer-001",
+        "supplier-001",
+        4.0,
+    )
+    .await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rating_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_ratings")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(rating_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn marketplace_demand_forecast_uses_field_and_product_evidence() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -13091,6 +13192,41 @@ async fn marketplace_fulfillment_transition(
         .await
         .expect("router should handle request");
     Ok(response.status())
+}
+
+async fn create_marketplace_rating(
+    ctx: &TestContext,
+    rating_id: &str,
+    order_ref: &str,
+    rater_account_id: &str,
+    ratee_account_id: &str,
+    score: f64,
+) -> Result<Response> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/ratings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "rating_id": rating_id,
+                        "order_ref": order_ref,
+                        "rater_account_id": rater_account_id,
+                        "ratee_account_id": ratee_account_id,
+                        "score": score,
+                        "comment": "Reliable counterparty",
+                        "org_scope": "org-alpha"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    Ok(response)
 }
 
 async fn seed_marketplace_demand_field(

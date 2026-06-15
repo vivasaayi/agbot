@@ -8459,6 +8459,38 @@ pub struct MarketplaceFulfillmentAuditRecord {
     pub occurred_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceRatingCreateRequest {
+    #[serde(default)]
+    pub rating_id: Option<String>,
+    pub order_ref: String,
+    pub rater_account_id: String,
+    pub ratee_account_id: String,
+    pub score: f64,
+    pub comment: Option<String>,
+    pub org_scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceRatingRecord {
+    pub rating_id: String,
+    pub order_ref: String,
+    pub rater_account_id: String,
+    pub ratee_account_id: String,
+    pub score: f64,
+    pub comment: Option<String>,
+    pub org_scope: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceRatingAggregate {
+    pub account_id: String,
+    pub org_scope: String,
+    pub rating_count: u32,
+    pub average_score: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MarketplaceDemandForecastStatus {
@@ -8767,6 +8799,49 @@ pub enum MarketplaceFulfillmentError {
     #[error("unsupported marketplace fulfillment status {value}")]
     UnsupportedStatus { value: String },
     #[error("marketplace fulfillment timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarketplaceRatingError {
+    #[error("marketplace rating_id cannot be empty")]
+    EmptyRatingId,
+    #[error("marketplace rating order_ref cannot be empty")]
+    EmptyOrderRef,
+    #[error("marketplace rating rater_account_id cannot be empty")]
+    EmptyRaterAccountId,
+    #[error("marketplace rating ratee_account_id cannot be empty")]
+    EmptyRateeAccountId,
+    #[error("marketplace rating org_scope cannot be empty")]
+    EmptyOrgScope,
+    #[error("marketplace rating order is required")]
+    MissingOrder,
+    #[error("marketplace rating order {order_id} belongs to {order_org_id}, not {org_scope}")]
+    OrderOrgMismatch {
+        order_id: String,
+        order_org_id: String,
+        org_scope: String,
+    },
+    #[error("marketplace rating order {order_id} must be fulfilled or closed")]
+    OrderNotRateable { order_id: String },
+    #[error("marketplace rating rater {rater_account_id} did not participate in order {order_id}")]
+    RaterNotParticipant {
+        order_id: String,
+        rater_account_id: String,
+    },
+    #[error("marketplace rating ratee {ratee_account_id} did not participate in order {order_id}")]
+    RateeNotParticipant {
+        order_id: String,
+        ratee_account_id: String,
+    },
+    #[error("marketplace rating already exists for order {order_id} and rater {rater_account_id}")]
+    DuplicateRaterForOrder {
+        order_id: String,
+        rater_account_id: String,
+    },
+    #[error("marketplace rating score must be finite and between 1 and 5")]
+    InvalidScore,
+    #[error("marketplace rating timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
 }
 
@@ -9290,6 +9365,105 @@ pub fn transition_marketplace_fulfillment_status(
         occurred_at,
     };
     Ok((updated, audit))
+}
+
+pub fn create_marketplace_rating_record(
+    request: MarketplaceRatingCreateRequest,
+    order: Option<&MarketplaceOrderRecord>,
+    participant_account_ids: &[String],
+    existing_ratings: &[MarketplaceRatingRecord],
+    generated_rating_id: String,
+    created_at: String,
+) -> Result<MarketplaceRatingRecord, MarketplaceRatingError> {
+    let rating_id = normalize_marketplace_optional_text(request.rating_id)
+        .or_else(|| normalize_marketplace_text(generated_rating_id))
+        .ok_or(MarketplaceRatingError::EmptyRatingId)?;
+    let order_ref = normalize_marketplace_text(request.order_ref)
+        .ok_or(MarketplaceRatingError::EmptyOrderRef)?;
+    let rater_account_id = normalize_marketplace_text(request.rater_account_id)
+        .ok_or(MarketplaceRatingError::EmptyRaterAccountId)?;
+    let ratee_account_id = normalize_marketplace_text(request.ratee_account_id)
+        .ok_or(MarketplaceRatingError::EmptyRateeAccountId)?;
+    let org_scope = normalize_marketplace_text(request.org_scope)
+        .ok_or(MarketplaceRatingError::EmptyOrgScope)?;
+    if !(request.score.is_finite() && (1.0..=5.0).contains(&request.score)) {
+        return Err(MarketplaceRatingError::InvalidScore);
+    }
+    let order = order.ok_or(MarketplaceRatingError::MissingOrder)?;
+    if order.order_id != order_ref || order.org_id != org_scope {
+        return Err(MarketplaceRatingError::OrderOrgMismatch {
+            order_id: order.order_id.clone(),
+            order_org_id: order.org_id.clone(),
+            org_scope,
+        });
+    }
+    if !matches!(
+        order.status,
+        MarketplaceOrderStatus::Fulfilled | MarketplaceOrderStatus::Closed
+    ) {
+        return Err(MarketplaceRatingError::OrderNotRateable {
+            order_id: order.order_id.clone(),
+        });
+    }
+    let participants = participant_account_ids
+        .iter()
+        .filter_map(|participant| normalize_marketplace_text(participant.clone()))
+        .collect::<BTreeSet<_>>();
+    if !participants.contains(&rater_account_id) {
+        return Err(MarketplaceRatingError::RaterNotParticipant {
+            order_id: order.order_id.clone(),
+            rater_account_id,
+        });
+    }
+    if !participants.contains(&ratee_account_id) || rater_account_id == ratee_account_id {
+        return Err(MarketplaceRatingError::RateeNotParticipant {
+            order_id: order.order_id.clone(),
+            ratee_account_id,
+        });
+    }
+    if existing_ratings.iter().any(|rating| {
+        rating.order_ref == order.order_id && rating.rater_account_id == rater_account_id
+    }) {
+        return Err(MarketplaceRatingError::DuplicateRaterForOrder {
+            order_id: order.order_id.clone(),
+            rater_account_id,
+        });
+    }
+    let created_at = normalize_marketplace_rating_timestamp(created_at)?;
+    Ok(MarketplaceRatingRecord {
+        rating_id,
+        order_ref,
+        rater_account_id,
+        ratee_account_id,
+        score: request.score,
+        comment: request.comment.and_then(normalize_marketplace_text),
+        org_scope: order.org_id.clone(),
+        created_at,
+    })
+}
+
+pub fn aggregate_marketplace_ratings(
+    account_id: String,
+    org_scope: String,
+    ratings: &[MarketplaceRatingRecord],
+) -> Result<MarketplaceRatingAggregate, MarketplaceRatingError> {
+    let account_id = normalize_marketplace_text(account_id)
+        .ok_or(MarketplaceRatingError::EmptyRateeAccountId)?;
+    let org_scope =
+        normalize_marketplace_text(org_scope).ok_or(MarketplaceRatingError::EmptyOrgScope)?;
+    let scoped = ratings
+        .iter()
+        .filter(|rating| rating.ratee_account_id == account_id && rating.org_scope == org_scope)
+        .collect::<Vec<_>>();
+    let rating_count = scoped.len() as u32;
+    let average_score = (rating_count > 0)
+        .then(|| scoped.iter().map(|rating| rating.score).sum::<f64>() / f64::from(rating_count));
+    Ok(MarketplaceRatingAggregate {
+        account_id,
+        org_scope,
+        rating_count,
+        average_score,
+    })
 }
 
 pub fn compute_marketplace_demand_forecast(
@@ -9817,6 +9991,21 @@ fn parse_marketplace_fulfillment_timestamp(
         .map_err(|_| MarketplaceFulfillmentError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
+}
+
+fn normalize_marketplace_rating_timestamp(
+    timestamp: String,
+) -> Result<String, MarketplaceRatingError> {
+    let timestamp =
+        normalize_marketplace_text(timestamp).ok_or(MarketplaceRatingError::InvalidTimestamp {
+            timestamp: String::new(),
+        })?;
+    chrono::DateTime::parse_from_rfc3339(&timestamp).map_err(|_| {
+        MarketplaceRatingError::InvalidTimestamp {
+            timestamp: timestamp.clone(),
+        }
+    })?;
+    Ok(timestamp)
 }
 
 fn normalize_marketplace_demand_timestamp(
@@ -13695,20 +13884,21 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        advise_weather_operational_windows, annotate_weather_record_freshness,
-        append_content_version, append_irrigation_history_event, append_weather_history_records,
-        apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
-        apply_tractor_implement_command, assemble_drought_report, assemble_marketplace_org_report,
-        assert_flight_operation_allowed, assert_raster_spatial_ref, bind_fleet_node_identity,
-        bounds_from_points, build_collaboration_channel, build_collaboration_message,
-        build_fleet_version_inventory, build_marketplace_account_record,
-        build_marketplace_inventory_record, build_marketplace_portal_entry,
-        build_soil_moisture_reading, build_sustainability_record, build_tractor_field_ops_replay,
-        build_tractor_field_ops_session_log, close_marketplace_listing_record,
-        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
-        compute_marketplace_demand_forecast, compute_water_evapotranspiration,
-        compute_weather_growing_degree_day, compute_weather_reference_et,
-        create_marketplace_fulfillment_record, create_versioned_content,
+        advise_weather_operational_windows, aggregate_marketplace_ratings,
+        annotate_weather_record_freshness, append_content_version, append_irrigation_history_event,
+        append_weather_history_records, apply_dry_run_validated_fleet_config_bundle,
+        apply_fleet_node_heartbeat, apply_tractor_implement_command, assemble_drought_report,
+        assemble_marketplace_org_report, assert_flight_operation_allowed,
+        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
+        build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
+        build_marketplace_account_record, build_marketplace_inventory_record,
+        build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
+        build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
+        close_marketplace_listing_record, compute_drought_baseline_trend, compute_drought_index,
+        compute_drought_risk_score, compute_marketplace_demand_forecast,
+        compute_water_evapotranspiration, compute_weather_growing_degree_day,
+        compute_weather_reference_et, create_marketplace_fulfillment_record,
+        create_marketplace_rating_record, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -13766,11 +13956,12 @@ mod tests {
         MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
         MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
         MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
-        MarketplaceReportPeriod, MarketplaceUnitOfMeasure, MultispectralImage,
-        OpenDataPublishError, OpenDataPublishRefusalReason, OpenDataPublishRequest,
-        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
-        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
-        RecommendationStatus, RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        MarketplaceRatingCreateRequest, MarketplaceRatingError, MarketplaceReportPeriod,
+        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
+        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
         RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
         RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
         ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
@@ -15605,6 +15796,102 @@ mod tests {
                 fulfillment_org_id: "org-beta".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn marketplace_rating_persists_for_fulfilled_order_participant() {
+        let order = marketplace_order_fixture(
+            "order-001",
+            MarketplaceOrderStatus::Fulfilled,
+            125.0,
+            "2026-06-15T09:00:00Z",
+        );
+
+        let rating = create_marketplace_rating_record(
+            marketplace_rating_request("order-001", "buyer-001", "supplier-001", 5.0),
+            Some(&order),
+            &marketplace_rating_participants(),
+            &[],
+            "generated-rating".to_string(),
+            "2026-06-17T09:00:00Z".to_string(),
+        )
+        .expect("participant should rate fulfilled order");
+
+        assert_eq!(rating.ratee_account_id, "supplier-001");
+        assert_eq!(rating.score, 5.0);
+    }
+
+    #[test]
+    fn marketplace_rating_rejects_non_participant() {
+        let order = marketplace_order_fixture(
+            "order-001",
+            MarketplaceOrderStatus::Fulfilled,
+            125.0,
+            "2026-06-15T09:00:00Z",
+        );
+
+        let error = create_marketplace_rating_record(
+            marketplace_rating_request("order-001", "viewer-001", "supplier-001", 4.0),
+            Some(&order),
+            &marketplace_rating_participants(),
+            &[],
+            "generated-rating".to_string(),
+            "2026-06-17T09:00:00Z".to_string(),
+        )
+        .expect_err("non-participant should not rate");
+
+        assert_eq!(
+            error,
+            MarketplaceRatingError::RaterNotParticipant {
+                order_id: "order-001".to_string(),
+                rater_account_id: "viewer-001".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn marketplace_rating_aggregate_and_duplicate_gate_are_deterministic() {
+        let order = marketplace_order_fixture(
+            "order-001",
+            MarketplaceOrderStatus::Closed,
+            125.0,
+            "2026-06-15T09:00:00Z",
+        );
+        let first = create_marketplace_rating_record(
+            marketplace_rating_request("order-001", "buyer-001", "supplier-001", 5.0),
+            Some(&order),
+            &marketplace_rating_participants(),
+            &[],
+            "generated-rating".to_string(),
+            "2026-06-17T09:00:00Z".to_string(),
+        )
+        .expect("first rating should persist");
+
+        let duplicate = create_marketplace_rating_record(
+            marketplace_rating_request("order-001", "buyer-001", "supplier-001", 4.0),
+            Some(&order),
+            &marketplace_rating_participants(),
+            std::slice::from_ref(&first),
+            "generated-rating-2".to_string(),
+            "2026-06-18T09:00:00Z".to_string(),
+        )
+        .expect_err("same party should rate order once");
+        assert_eq!(
+            duplicate,
+            MarketplaceRatingError::DuplicateRaterForOrder {
+                order_id: "order-001".to_string(),
+                rater_account_id: "buyer-001".to_string(),
+            }
+        );
+
+        let aggregate = aggregate_marketplace_ratings(
+            "supplier-001".to_string(),
+            "org-alpha".to_string(),
+            std::slice::from_ref(&first),
+        )
+        .expect("aggregate should compute");
+        assert_eq!(aggregate.rating_count, 1);
+        assert_eq!(aggregate.average_score, Some(5.0));
     }
 
     #[test]
@@ -18514,6 +18801,27 @@ mod tests {
             tracking_ref: "tracking:opaque".to_string(),
             actor_id: "ops-001".to_string(),
         }
+    }
+
+    fn marketplace_rating_request(
+        order_ref: &str,
+        rater_account_id: &str,
+        ratee_account_id: &str,
+        score: f64,
+    ) -> MarketplaceRatingCreateRequest {
+        MarketplaceRatingCreateRequest {
+            rating_id: Some(format!("rating-{order_ref}-{rater_account_id}")),
+            order_ref: order_ref.to_string(),
+            rater_account_id: rater_account_id.to_string(),
+            ratee_account_id: ratee_account_id.to_string(),
+            score,
+            comment: Some("Reliable counterparty".to_string()),
+            org_scope: "org-alpha".to_string(),
+        }
+    }
+
+    fn marketplace_rating_participants() -> Vec<String> {
+        vec!["buyer-001".to_string(), "supplier-001".to_string()]
     }
 
     fn marketplace_inventory_fixture(

@@ -318,6 +318,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_marketplace_fulfillment_audits),
         )
         .route(
+            "/api/marketplace/ratings",
+            get(routes::list_marketplace_ratings).post(routes::create_marketplace_rating),
+        )
+        .route(
+            "/api/marketplace/ratings/accounts/:account_id/aggregate",
+            get(routes::get_marketplace_rating_aggregate),
+        )
+        .route(
             "/api/marketplace/demand-forecasts",
             get(routes::list_marketplace_demand_forecasts)
                 .post(routes::create_marketplace_demand_forecast),
