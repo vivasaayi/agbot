@@ -196,6 +196,42 @@ pub struct GrowerPortalFieldOverview {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalPreferenceUpdate {
+    pub default_farm_id: Option<String>,
+    pub default_field_id: Option<String>,
+    pub units: String,
+    pub prefs: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalPreferences {
+    pub grower_id: Uuid,
+    pub default_farm_id: Option<String>,
+    pub default_field_id: Option<String>,
+    pub units: String,
+    pub prefs: HashMap<String, String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrowerPortalOpenView {
+    Home,
+    Field { field_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalOpenViewResolution {
+    pub grower_id: Uuid,
+    pub view: GrowerPortalOpenView,
+    pub notice: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalPreferenceStore {
+    preferences: HashMap<Uuid, GrowerPortalPreferences>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantBoundaryAuditEvent {
     pub actor_user_id: Uuid,
     pub actor_org_id: Uuid,
@@ -560,6 +596,79 @@ fn empty_field_overview(
         latest_recommendation: None,
         no_current_analysis: true,
         evidence_refs: Vec::new(),
+    }
+}
+
+impl GrowerPortalPreferenceStore {
+    pub fn save_preferences(
+        &mut self,
+        scope: &GrowerPortalSessionScope,
+        update: GrowerPortalPreferenceUpdate,
+        updated_at: impl Into<String>,
+    ) -> GrowerPortalPreferences {
+        let default_farm_id = update
+            .default_farm_id
+            .filter(|farm_id| scope.farm_ids.iter().any(|scoped| scoped == farm_id));
+        let default_field_id = update
+            .default_field_id
+            .filter(|field_id| scope.field_ids.iter().any(|scoped| scoped == field_id));
+        let units = if update.units.trim().is_empty() {
+            "metric".to_string()
+        } else {
+            update.units.trim().to_string()
+        };
+        let preferences = GrowerPortalPreferences {
+            grower_id: scope.grower_id,
+            default_farm_id,
+            default_field_id,
+            units,
+            prefs: update.prefs,
+            updated_at: updated_at.into(),
+        };
+        self.preferences
+            .insert(scope.grower_id, preferences.clone());
+        preferences
+    }
+
+    pub fn preferences_for(&self, grower_id: Uuid) -> Option<&GrowerPortalPreferences> {
+        self.preferences.get(&grower_id)
+    }
+
+    pub fn resolve_open_view(
+        &self,
+        scope: &GrowerPortalSessionScope,
+    ) -> GrowerPortalOpenViewResolution {
+        let Some(preferences) = self.preferences.get(&scope.grower_id) else {
+            return GrowerPortalOpenViewResolution {
+                grower_id: scope.grower_id,
+                view: GrowerPortalOpenView::Home,
+                notice: None,
+            };
+        };
+        let Some(field_id) = preferences.default_field_id.as_ref() else {
+            return GrowerPortalOpenViewResolution {
+                grower_id: scope.grower_id,
+                view: GrowerPortalOpenView::Home,
+                notice: None,
+            };
+        };
+        if scope.field_ids.iter().any(|scoped| scoped == field_id) {
+            GrowerPortalOpenViewResolution {
+                grower_id: scope.grower_id,
+                view: GrowerPortalOpenView::Field {
+                    field_id: field_id.clone(),
+                },
+                notice: None,
+            }
+        } else {
+            GrowerPortalOpenViewResolution {
+                grower_id: scope.grower_id,
+                view: GrowerPortalOpenView::Home,
+                notice: Some(format!(
+                    "Default field {field_id} is no longer in scope; opening home"
+                )),
+            }
+        }
     }
 }
 
@@ -1352,6 +1461,83 @@ mod tests {
             .evidence_refs
             .iter()
             .any(|evidence| evidence == "scene:scene-failed"));
+    }
+
+    #[test]
+    fn grower_portal_preferences_save_and_open_default_field_for_same_grower() {
+        let grower_id = Uuid::new_v4();
+        let other_grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let mut store = GrowerPortalPreferenceStore::default();
+        let mut prefs = HashMap::new();
+        prefs.insert("map_style".to_string(), "satellite".to_string());
+
+        let saved = store.save_preferences(
+            &scope,
+            GrowerPortalPreferenceUpdate {
+                default_farm_id: Some("farm-a".to_string()),
+                default_field_id: Some("field-a".to_string()),
+                units: "imperial".to_string(),
+                prefs,
+            },
+            "2026-06-15T13:04:00Z",
+        );
+
+        assert_eq!(saved.grower_id, grower_id);
+        assert_eq!(saved.default_field_id.as_deref(), Some("field-a"));
+        assert_eq!(
+            store.resolve_open_view(&scope).view,
+            GrowerPortalOpenView::Field {
+                field_id: "field-a".to_string()
+            }
+        );
+        assert!(store.preferences_for(other_grower_id).is_none());
+    }
+
+    #[test]
+    fn grower_portal_preferences_fall_back_home_when_default_field_leaves_scope() {
+        let grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let original_scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+        let reduced_scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: Vec::new(),
+        };
+        let mut store = GrowerPortalPreferenceStore::default();
+        store.save_preferences(
+            &original_scope,
+            GrowerPortalPreferenceUpdate {
+                default_farm_id: Some("farm-a".to_string()),
+                default_field_id: Some("field-a".to_string()),
+                units: "metric".to_string(),
+                prefs: HashMap::new(),
+            },
+            "2026-06-15T13:04:00Z",
+        );
+
+        let resolved = store.resolve_open_view(&reduced_scope);
+
+        assert_eq!(resolved.view, GrowerPortalOpenView::Home);
+        assert!(resolved
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("no longer in scope")));
     }
 
     #[test]
