@@ -425,6 +425,59 @@ pub struct ChangeEvent {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeMissionProposalKind {
+    TargetedRefly,
+    Treatment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeMissionDispatchState {
+    PendingApproval,
+    ReadyForDispatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeMissionApproval {
+    pub approved_by: String,
+    pub approved_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosedLoopChangeHookConfig {
+    pub severity_threshold: f64,
+    pub proposal_kind: ChangeMissionProposalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ChangeMissionApproval>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeMissionProposal {
+    pub proposal_ref: String,
+    pub zone_ref: String,
+    pub metric: String,
+    pub proposal_kind: ChangeMissionProposalKind,
+    pub severity_score: f64,
+    pub magnitude: f64,
+    pub approval_required: bool,
+    pub approved: bool,
+    pub dispatch_state: ChangeMissionDispatchState,
+    pub dispatched: bool,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosedLoopChangeHookResult {
+    #[serde(default)]
+    pub proposals: Vec<ChangeMissionProposal>,
+    #[serde(default)]
+    pub dispatched_mission_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangeEventDerivationInput {
     pub change: RasterChangeResult,
@@ -873,6 +926,8 @@ pub enum TimeSeriesError {
     },
     #[error("change event config must have finite non-negative threshold")]
     InvalidChangeEventConfig,
+    #[error("closed-loop change hook config must have a finite non-negative severity threshold")]
+    InvalidClosedLoopChangeHookConfig,
     #[error("change reproducibility source product is missing: {source_ref}")]
     MissingChangeSourceProduct { source_ref: String },
     #[error("change reproducibility inputs do not match the retained change outputs")]
@@ -1402,6 +1457,52 @@ pub fn derive_ranked_change_events(
             .then_with(|| left.zone_ref.cmp(&right.zone_ref))
     });
     Ok(events)
+}
+
+pub fn draft_closed_loop_change_proposals(
+    events: Vec<ChangeEvent>,
+    config: ClosedLoopChangeHookConfig,
+) -> Result<ClosedLoopChangeHookResult, TimeSeriesError> {
+    if !config.severity_threshold.is_finite() || config.severity_threshold < 0.0 {
+        return Err(TimeSeriesError::InvalidClosedLoopChangeHookConfig);
+    }
+
+    let approved = config.approval.is_some();
+    let dispatch_state = if approved {
+        ChangeMissionDispatchState::ReadyForDispatch
+    } else {
+        ChangeMissionDispatchState::PendingApproval
+    };
+
+    let mut proposals = Vec::new();
+    for event in events
+        .into_iter()
+        .filter(|event| event.severity_score >= config.severity_threshold)
+    {
+        let proposal_ref = format!(
+            "proposal:{}:{}:{}",
+            event.zone_ref, event.metric, event.since_date
+        );
+        proposals.push(ChangeMissionProposal {
+            proposal_ref,
+            zone_ref: event.zone_ref.clone(),
+            metric: event.metric.clone(),
+            proposal_kind: config.proposal_kind,
+            severity_score: event.severity_score,
+            magnitude: event.magnitude,
+            approval_required: true,
+            approved,
+            dispatch_state,
+            dispatched: false,
+            evidence_refs: event.evidence_refs.clone(),
+            summary: format!("{}; approval required before dispatch", event.summary),
+        });
+    }
+
+    Ok(ClosedLoopChangeHookResult {
+        proposals,
+        dispatched_mission_refs: Vec::new(),
+    })
 }
 
 pub fn build_change_reproducibility_report(
@@ -3290,22 +3391,24 @@ mod tests {
     use super::{
         align_raster_pair, build_change_reproducibility_report, build_compare_view_feed,
         build_forecast_gap_fill, compare_view_refusal_from_guard, compute_aligned_raster_change,
-        derive_ranked_change_events, evaluate_fleet_carbon_consumers,
-        evaluate_scalar_consumer_series, evaluate_series_cadence_health,
-        export_change_mask_geotiff, export_change_zones_geojson, export_series_csv,
-        guard_coregisterable_pair, normalize_raster_change, AlignedRasterGrid,
+        derive_ranked_change_events, draft_closed_loop_change_proposals,
+        evaluate_fleet_carbon_consumers, evaluate_scalar_consumer_series,
+        evaluate_series_cadence_health, export_change_mask_geotiff, export_change_zones_geojson,
+        export_series_csv, guard_coregisterable_pair, normalize_raster_change, AlignedRasterGrid,
         AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason, ChangeEvent,
         ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection, ChangeEventReasonCode,
+        ChangeMissionApproval, ChangeMissionDispatchState, ChangeMissionProposalKind,
         ChangeReproducibilityRequest, ChangeSourcePair, ChangeZoneExportFeature, ChangeZonePolygon,
-        FleetCarbonConsumerEvaluationRequest, ForecastGapFillRequest, GeoExtent, MetricDefinition,
-        MetricKind, NormalizedChangeOutcome, NormalizedRasterChangeConfig, RasterAlignmentConfig,
-        RasterAlignmentEvidence, RasterChangeConfig, RasterChangeNormalizationMethod,
-        RasterChangeResult, RasterResolution, RasterSeriesValue, RollingBaselineConfig,
-        ScalarConsumerEvaluationRequest, ScalarConsumerMetricRegistration, ScalarConsumerPoint,
-        SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesCadenceHealthConfig,
-        SeriesFreshnessState, SeriesPoint, SeriesProductIngest, SeriesQuery, SeriesValue,
-        SyntheticSeriesMethod, TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
-        TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
+        ClosedLoopChangeHookConfig, FleetCarbonConsumerEvaluationRequest, ForecastGapFillRequest,
+        GeoExtent, MetricDefinition, MetricKind, NormalizedChangeOutcome,
+        NormalizedRasterChangeConfig, RasterAlignmentConfig, RasterAlignmentEvidence,
+        RasterChangeConfig, RasterChangeNormalizationMethod, RasterChangeResult, RasterResolution,
+        RasterSeriesValue, RollingBaselineConfig, ScalarConsumerEvaluationRequest,
+        ScalarConsumerMetricRegistration, ScalarConsumerPoint, SeasonalComparisonConfig,
+        SeasonalComparisonTarget, SeriesCadenceHealthConfig, SeriesFreshnessState, SeriesPoint,
+        SeriesProductIngest, SeriesQuery, SeriesValue, SyntheticSeriesMethod, TimeRange,
+        TimeSeriesEngine, TimeSeriesError, TimeSeriesStore, TrendDirection, ZonalTrendConfig,
+        ZonalTrendTarget,
     };
 
     #[test]
@@ -4363,6 +4466,77 @@ mod tests {
     }
 
     #[test]
+    fn closed_loop_hook_drafts_approval_gated_refly_from_ranked_change_event() {
+        let events = sample_ranked_change_events();
+        let result = draft_closed_loop_change_proposals(
+            events,
+            ClosedLoopChangeHookConfig {
+                severity_threshold: 0.10,
+                proposal_kind: ChangeMissionProposalKind::TargetedRefly,
+                approval: None,
+            },
+        )
+        .expect("proposal hook should run");
+
+        assert_eq!(result.proposals.len(), 1);
+        assert!(result.dispatched_mission_refs.is_empty());
+        let proposal = &result.proposals[0];
+        assert_eq!(proposal.zone_ref, "zone:NE");
+        assert_eq!(proposal.metric, "ndvi_mean");
+        assert_eq!(
+            proposal.proposal_kind,
+            ChangeMissionProposalKind::TargetedRefly
+        );
+        assert!(proposal.approval_required);
+        assert!(!proposal.approved);
+        assert_eq!(
+            proposal.dispatch_state,
+            ChangeMissionDispatchState::PendingApproval
+        );
+        assert!(!proposal.dispatched);
+        assert!(proposal
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == "alignment:field-alpha:ndvi"));
+    }
+
+    #[test]
+    fn closed_loop_hook_never_dispatches_without_or_with_approval() {
+        let without_approval = draft_closed_loop_change_proposals(
+            sample_ranked_change_events(),
+            ClosedLoopChangeHookConfig {
+                severity_threshold: 0.10,
+                proposal_kind: ChangeMissionProposalKind::Treatment,
+                approval: None,
+            },
+        )
+        .expect("proposal hook should run");
+        assert!(without_approval.dispatched_mission_refs.is_empty());
+        assert!(!without_approval.proposals[0].dispatched);
+
+        let with_approval = draft_closed_loop_change_proposals(
+            sample_ranked_change_events(),
+            ClosedLoopChangeHookConfig {
+                severity_threshold: 0.10,
+                proposal_kind: ChangeMissionProposalKind::Treatment,
+                approval: Some(ChangeMissionApproval {
+                    approved_by: "operator:casey".to_string(),
+                    approved_at: "2026-06-15T12:00:00Z".to_string(),
+                }),
+            },
+        )
+        .expect("proposal hook should run");
+
+        assert!(with_approval.dispatched_mission_refs.is_empty());
+        assert!(with_approval.proposals[0].approved);
+        assert_eq!(
+            with_approval.proposals[0].dispatch_state,
+            ChangeMissionDispatchState::ReadyForDispatch
+        );
+        assert!(!with_approval.proposals[0].dispatched);
+    }
+
+    #[test]
     fn change_reproducibility_report_hashes_identical_reruns() {
         let request = change_reproducibility_request();
         let first = build_change_reproducibility_report(request.clone())
@@ -5408,6 +5582,41 @@ mod tests {
             zone_crs: "asset-local".to_string(),
             range: TimeRange::default(),
         }
+    }
+
+    fn sample_ranked_change_events() -> Vec<ChangeEvent> {
+        let engine = seeded_baseline_engine();
+        let trend = engine
+            .compute_zonal_trend(
+                trend_target_2026(),
+                ZonalTrendConfig {
+                    min_points: 3,
+                    flat_slope_epsilon: 0.001,
+                },
+            )
+            .expect("trend should compute");
+        let baseline = engine
+            .compute_rolling_baseline(
+                trend_target_2026(),
+                RollingBaselineConfig {
+                    window_points: 2,
+                    anomaly_band: 0.10,
+                },
+            )
+            .expect("baseline should compute");
+
+        derive_ranked_change_events(
+            vec![ChangeEventDerivationInput {
+                change: sample_drop_change_result(),
+                trend,
+                baseline,
+            }],
+            ChangeEventConfig {
+                magnitude_threshold: 0.10,
+                min_changed_cells: 1,
+            },
+        )
+        .expect("change event derivation should run")
     }
 
     fn consumer_registration(
