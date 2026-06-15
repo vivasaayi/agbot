@@ -248,6 +248,68 @@ pub struct SpectralIndexRaster {
     pub sandbox_outcome: SandboxExecutionOutcome,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginInvocationIdentity {
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub extension_point: ExtensionPointKind,
+    pub invocation_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomProcessorRequest {
+    pub plugin_id: String,
+    pub job_ref: String,
+    pub input_refs: Vec<String>,
+    pub parameters: BTreeMap<String, String>,
+    pub required_capabilities: Vec<String>,
+    pub estimated_runtime_ms: u64,
+    pub estimated_memory_mb: u64,
+    pub result_ref: String,
+    pub result_payload: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomProcessorOutput {
+    pub job_ref: String,
+    pub result_ref: String,
+    pub input_refs: Vec<String>,
+    pub stored_payload: String,
+    pub plugin_identity: PluginInvocationIdentity,
+    pub sandbox_outcome: SandboxExecutionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportTemplateRenderRequest {
+    pub plugin_id: String,
+    pub report_ref: String,
+    pub requested_data_capabilities: Vec<String>,
+    pub required_capabilities: Vec<String>,
+    pub estimated_runtime_ms: u64,
+    pub estimated_memory_mb: u64,
+    pub rendered_body: String,
+    pub fallback_template_id: String,
+    pub fallback_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportTemplateDenial {
+    pub capability: String,
+    pub reason: CapabilityViolationReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportTemplateRenderOutput {
+    pub report_ref: String,
+    pub body: String,
+    pub used_fallback: bool,
+    pub fallback_template_id: Option<String>,
+    pub denial: Option<ReportTemplateDenial>,
+    pub plugin_identity: Option<PluginInvocationIdentity>,
+    pub capability_audit: Vec<CapabilityAuditEntry>,
+    pub sandbox_outcome: Option<SandboxExecutionOutcome>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SpectralIndexInvocationError {
     #[error("unknown plugin: {plugin_id}")]
@@ -264,6 +326,34 @@ pub enum SpectralIndexInvocationError {
     },
     #[error("scene spatial reference rejected: {0}")]
     InvalidSpatialRef(#[from] RasterSpatialRefError),
+    #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
+    SandboxTerminated {
+        plugin_id: String,
+        reason: Option<SandboxTerminationReason>,
+        outcome: SandboxExecutionOutcome,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum CustomProcessorInvocationError {
+    #[error("unknown plugin: {plugin_id}")]
+    UnknownPlugin { plugin_id: String },
+    #[error("plugin {plugin_id} is not a processor extension point")]
+    WrongExtensionPoint { plugin_id: String },
+    #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
+    SandboxTerminated {
+        plugin_id: String,
+        reason: Option<SandboxTerminationReason>,
+        outcome: SandboxExecutionOutcome,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ReportTemplateInvocationError {
+    #[error("unknown plugin: {plugin_id}")]
+    UnknownPlugin { plugin_id: String },
+    #[error("plugin {plugin_id} is not a report-template extension point")]
+    WrongExtensionPoint { plugin_id: String },
     #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
     SandboxTerminated {
         plugin_id: String,
@@ -668,6 +758,151 @@ impl PluginHost {
             sandbox_outcome: outcome,
         })
     }
+
+    pub fn run_custom_processor(
+        &mut self,
+        request: CustomProcessorRequest,
+        limits: PluginExecutionLimits,
+        attempted_at: &str,
+    ) -> Result<CustomProcessorOutput, CustomProcessorInvocationError> {
+        let (plugin_id, plugin_version) = self
+            .plugin_version_for_kind(&request.plugin_id, ExtensionPointKind::Processor)
+            .map_err(|error| match error {
+                PluginKindLookupError::UnknownPlugin { plugin_id } => {
+                    CustomProcessorInvocationError::UnknownPlugin { plugin_id }
+                }
+                PluginKindLookupError::WrongExtensionPoint { plugin_id } => {
+                    CustomProcessorInvocationError::WrongExtensionPoint { plugin_id }
+                }
+            })?;
+
+        let outcome = self.execute_sandboxed(
+            PluginExecutionPlan {
+                plugin_id: plugin_id.clone(),
+                required_capabilities: request.required_capabilities.clone(),
+                estimated_runtime_ms: request.estimated_runtime_ms,
+                estimated_memory_mb: request.estimated_memory_mb,
+                result: request.result_payload.clone(),
+            },
+            limits,
+            attempted_at,
+        );
+        if outcome.status != SandboxExecutionStatus::Completed {
+            return Err(CustomProcessorInvocationError::SandboxTerminated {
+                plugin_id,
+                reason: outcome.termination_reason,
+                outcome,
+            });
+        }
+
+        Ok(CustomProcessorOutput {
+            job_ref: request.job_ref.clone(),
+            result_ref: request.result_ref,
+            input_refs: request.input_refs,
+            stored_payload: request.result_payload,
+            plugin_identity: PluginInvocationIdentity {
+                plugin_id,
+                plugin_version,
+                extension_point: ExtensionPointKind::Processor,
+                invocation_ref: request.job_ref,
+            },
+            sandbox_outcome: outcome,
+        })
+    }
+
+    pub fn render_report_template(
+        &mut self,
+        request: ReportTemplateRenderRequest,
+        limits: PluginExecutionLimits,
+        attempted_at: &str,
+    ) -> Result<ReportTemplateRenderOutput, ReportTemplateInvocationError> {
+        let (plugin_id, plugin_version) = self
+            .plugin_version_for_kind(&request.plugin_id, ExtensionPointKind::ReportTemplate)
+            .map_err(|error| match error {
+                PluginKindLookupError::UnknownPlugin { plugin_id } => {
+                    ReportTemplateInvocationError::UnknownPlugin { plugin_id }
+                }
+                PluginKindLookupError::WrongExtensionPoint { plugin_id } => {
+                    ReportTemplateInvocationError::WrongExtensionPoint { plugin_id }
+                }
+            })?;
+
+        let mut capability_audit = Vec::new();
+        for capability in &request.requested_data_capabilities {
+            let entry = self.check_capability(&plugin_id, capability, attempted_at);
+            if let Some(reason) = entry.reason {
+                let denied_capability = entry.required_capability.clone();
+                capability_audit.push(entry);
+                return Ok(ReportTemplateRenderOutput {
+                    report_ref: request.report_ref,
+                    body: request.fallback_body,
+                    used_fallback: true,
+                    fallback_template_id: Some(request.fallback_template_id),
+                    denial: Some(ReportTemplateDenial {
+                        capability: denied_capability,
+                        reason,
+                    }),
+                    plugin_identity: None,
+                    capability_audit,
+                    sandbox_outcome: None,
+                });
+            }
+            capability_audit.push(entry);
+        }
+
+        let outcome = self.execute_sandboxed(
+            PluginExecutionPlan {
+                plugin_id: plugin_id.clone(),
+                required_capabilities: request.required_capabilities.clone(),
+                estimated_runtime_ms: request.estimated_runtime_ms,
+                estimated_memory_mb: request.estimated_memory_mb,
+                result: request.rendered_body.clone(),
+            },
+            limits,
+            attempted_at,
+        );
+        if outcome.status != SandboxExecutionStatus::Completed {
+            return Err(ReportTemplateInvocationError::SandboxTerminated {
+                plugin_id,
+                reason: outcome.termination_reason,
+                outcome,
+            });
+        }
+
+        capability_audit.extend(outcome.capability_audit.clone());
+        Ok(ReportTemplateRenderOutput {
+            report_ref: request.report_ref.clone(),
+            body: request.rendered_body,
+            used_fallback: false,
+            fallback_template_id: None,
+            denial: None,
+            plugin_identity: Some(PluginInvocationIdentity {
+                plugin_id,
+                plugin_version,
+                extension_point: ExtensionPointKind::ReportTemplate,
+                invocation_ref: request.report_ref,
+            }),
+            capability_audit,
+            sandbox_outcome: Some(outcome),
+        })
+    }
+
+    fn plugin_version_for_kind(
+        &self,
+        plugin_id: &str,
+        expected_kind: ExtensionPointKind,
+    ) -> Result<(String, String), PluginKindLookupError> {
+        let plugin_id = normalize_optional_text(plugin_id.to_string()).unwrap_or_default();
+        let registration = self.registrations.get(&plugin_id).ok_or_else(|| {
+            PluginKindLookupError::UnknownPlugin {
+                plugin_id: plugin_id.clone(),
+            }
+        })?;
+        if registration.kind != expected_kind {
+            return Err(PluginKindLookupError::WrongExtensionPoint { plugin_id });
+        }
+        Ok((plugin_id, registration.version.clone()))
+    }
 }
 
 impl SpectralIndexFormula {
@@ -729,6 +964,12 @@ fn operands_label(operands: &[SpectralBandOperand]) -> String {
         .map(|operand| format!("{}*{}", operand.coefficient, operand.band))
         .collect::<Vec<_>>()
         .join("+")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PluginKindLookupError {
+    UnknownPlugin { plugin_id: String },
+    WrongExtensionPoint { plugin_id: String },
 }
 
 pub fn validate_manifest(
@@ -957,12 +1198,12 @@ fn normalize_optional_text(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityDecision, CapabilityViolationReason, ManifestField, ManifestRejectionReason,
-        PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginLifecycleStatus,
-        PluginLifecycleTransitionRequest, PluginRegistrationError, RawPluginManifest,
-        SandboxExecutionStatus, SandboxTerminationReason, SpectralBandOperand,
-        SpectralIndexFormula, SpectralIndexInvocationError, SpectralIndexPluginSpec,
-        SpectralIndexScene,
+        CapabilityDecision, CapabilityViolationReason, CustomProcessorRequest, ManifestField,
+        ManifestRejectionReason, PluginExecutionLimits, PluginExecutionPlan, PluginHost,
+        PluginLifecycleStatus, PluginLifecycleTransitionRequest, PluginRegistrationError,
+        RawPluginManifest, ReportTemplateRenderRequest, SandboxExecutionStatus,
+        SandboxTerminationReason, SpectralBandOperand, SpectralIndexFormula,
+        SpectralIndexInvocationError, SpectralIndexPluginSpec, SpectralIndexScene,
     };
     use shared::plugin_extensions::ExtensionPointKind;
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
@@ -1373,6 +1614,113 @@ mod tests {
     }
 
     #[test]
+    fn custom_processor_invocation_stores_result_with_plugin_provenance() {
+        let mut host = PluginHost::default();
+        host.register_plugin(custom_processor_manifest())
+            .expect("processor plugin should register");
+        enable_plugin(&mut host, "plugin.zone_scorer");
+
+        let output = host
+            .run_custom_processor(
+                custom_processor_request(),
+                sandbox_limits(),
+                "2026-06-12T12:40:00Z",
+            )
+            .expect("processor plugin should run");
+
+        assert_eq!(output.job_ref, "job:post-process:42");
+        assert_eq!(output.result_ref, "processor-result:zone-score:42");
+        assert_eq!(output.stored_payload, "{\"zone_score\":0.82}");
+        assert_eq!(output.plugin_identity.plugin_id, "plugin.zone_scorer");
+        assert_eq!(output.plugin_identity.plugin_version, "2.0.0");
+        assert_eq!(
+            output.plugin_identity.extension_point,
+            ExtensionPointKind::Processor
+        );
+        assert_eq!(
+            output.sandbox_outcome.status,
+            SandboxExecutionStatus::Completed
+        );
+        assert_eq!(host.capability_audit_entries().len(), 2);
+    }
+
+    #[test]
+    fn report_template_renders_with_plugin_provenance_when_capabilities_match() {
+        let mut host = PluginHost::default();
+        host.register_plugin(report_template_manifest())
+            .expect("template plugin should register");
+        enable_plugin(&mut host, "plugin.grower_template");
+
+        let output = host
+            .render_report_template(
+                report_template_request(vec!["data:yield"], "branded grower report"),
+                sandbox_limits(),
+                "2026-06-12T12:45:00Z",
+            )
+            .expect("template plugin should render");
+
+        assert_eq!(output.body, "branded grower report");
+        assert!(!output.used_fallback);
+        assert_eq!(output.denial, None);
+        assert_eq!(
+            output.plugin_identity.as_ref().map(|identity| (
+                identity.plugin_id.as_str(),
+                identity.plugin_version.as_str(),
+                identity.extension_point,
+            )),
+            Some((
+                "plugin.grower_template",
+                "1.4.0",
+                ExtensionPointKind::ReportTemplate,
+            ))
+        );
+        assert_eq!(
+            output
+                .sandbox_outcome
+                .as_ref()
+                .map(|outcome| outcome.status),
+            Some(SandboxExecutionStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn report_template_overreach_is_denied_and_uses_safe_fallback() {
+        let mut host = PluginHost::default();
+        host.register_plugin(report_template_manifest())
+            .expect("template plugin should register");
+        enable_plugin(&mut host, "plugin.grower_template");
+
+        let output = host
+            .render_report_template(
+                report_template_request(vec!["data:owner"], "unauthorized body"),
+                sandbox_limits(),
+                "2026-06-12T12:46:00Z",
+            )
+            .expect("overreach should fall back without hard failure");
+
+        assert!(output.used_fallback);
+        assert_eq!(output.body, "safe default report");
+        assert_eq!(output.fallback_template_id.as_deref(), Some("safe_default"));
+        assert_eq!(output.plugin_identity, None);
+        assert_eq!(output.sandbox_outcome, None);
+        assert_eq!(
+            output
+                .denial
+                .as_ref()
+                .map(|denial| (denial.capability.as_str(), denial.reason,)),
+            Some((
+                "data:owner",
+                CapabilityViolationReason::UndeclaredCapability
+            ))
+        );
+        assert_eq!(output.capability_audit.len(), 1);
+        assert_eq!(
+            output.capability_audit[0].decision,
+            CapabilityDecision::Denied
+        );
+    }
+
+    #[test]
     fn compatible_host_api_version_registers_within_supported_range() {
         let mut host = PluginHost::with_supported_host_api_range("2026.1", "2026.3")
             .expect("range should be valid");
@@ -1434,6 +1782,30 @@ mod tests {
         }
     }
 
+    fn custom_processor_manifest() -> RawPluginManifest {
+        RawPluginManifest {
+            plugin_id: "plugin.zone_scorer".to_string(),
+            name: "Zone Scorer".to_string(),
+            version: "2.0.0".to_string(),
+            kind: "processor".to_string(),
+            host_api_version: "2026.1".to_string(),
+            capabilities: vec!["read:product".to_string(), "write:finding".to_string()],
+            entrypoint: "zone_scorer::process".to_string(),
+        }
+    }
+
+    fn report_template_manifest() -> RawPluginManifest {
+        RawPluginManifest {
+            plugin_id: "plugin.grower_template".to_string(),
+            name: "Grower Report Template".to_string(),
+            version: "1.4.0".to_string(),
+            kind: "report_template".to_string(),
+            host_api_version: "2026.1".to_string(),
+            capabilities: vec!["data:yield".to_string(), "render:report".to_string()],
+            entrypoint: "grower_template::render".to_string(),
+        }
+    }
+
     fn sandbox_limits() -> PluginExecutionLimits {
         PluginExecutionLimits {
             max_runtime_ms: 100,
@@ -1442,27 +1814,22 @@ mod tests {
     }
 
     fn enable_scene_reader(host: &mut PluginHost) {
+        enable_plugin(host, "plugin.scene_reader");
+    }
+
+    fn enable_custom_index(host: &mut PluginHost) {
+        enable_plugin(host, "plugin.custom_ndvi");
+    }
+
+    fn enable_plugin(host: &mut PluginHost, plugin_id: &str) {
         host.transition_plugin_status(
-            "plugin.scene_reader",
+            plugin_id,
             lifecycle_request(
                 PluginLifecycleStatus::Enabled,
                 "platform-admin-1",
                 "2026-06-12T12:04:00Z",
             ),
-            "plugin-audit-enable-scene-reader".to_string(),
-        )
-        .expect("plugin should enable");
-    }
-
-    fn enable_custom_index(host: &mut PluginHost) {
-        host.transition_plugin_status(
-            "plugin.custom_ndvi",
-            lifecycle_request(
-                PluginLifecycleStatus::Enabled,
-                "platform-admin-1",
-                "2026-06-12T12:29:00Z",
-            ),
-            "plugin-audit-enable-custom-index".to_string(),
+            format!("plugin-audit-enable-{plugin_id}"),
         )
         .expect("plugin should enable");
     }
@@ -1522,6 +1889,42 @@ mod tests {
                 resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
             },
             bands,
+        }
+    }
+
+    fn custom_processor_request() -> CustomProcessorRequest {
+        let mut parameters = BTreeMap::new();
+        parameters.insert("threshold".to_string(), "0.8".to_string());
+        CustomProcessorRequest {
+            plugin_id: "plugin.zone_scorer".to_string(),
+            job_ref: "job:post-process:42".to_string(),
+            input_refs: vec!["index:ndvi:north-field".to_string()],
+            parameters,
+            required_capabilities: vec!["read:product".to_string(), "write:finding".to_string()],
+            estimated_runtime_ms: 30,
+            estimated_memory_mb: 80,
+            result_ref: "processor-result:zone-score:42".to_string(),
+            result_payload: "{\"zone_score\":0.82}".to_string(),
+        }
+    }
+
+    fn report_template_request(
+        requested_data_capabilities: Vec<&str>,
+        rendered_body: &str,
+    ) -> ReportTemplateRenderRequest {
+        ReportTemplateRenderRequest {
+            plugin_id: "plugin.grower_template".to_string(),
+            report_ref: "report:north-field:2026-06-12".to_string(),
+            requested_data_capabilities: requested_data_capabilities
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            required_capabilities: vec!["render:report".to_string()],
+            estimated_runtime_ms: 30,
+            estimated_memory_mb: 96,
+            rendered_body: rendered_body.to_string(),
+            fallback_template_id: "safe_default".to_string(),
+            fallback_body: "safe default report".to_string(),
         }
     }
 
