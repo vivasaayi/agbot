@@ -4631,6 +4631,86 @@ pub struct SoilMoistureReadingRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RemoteSensingMoistureIndex {
+    Ndwi,
+    Ndmi,
+}
+
+impl RemoteSensingMoistureIndex {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteSensingMoistureIndex::Ndwi => "ndwi",
+            RemoteSensingMoistureIndex::Ndmi => "ndmi",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteSensingMoistureZoneValue {
+    pub zone_ref: String,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteSensingMoistureProxyLayer {
+    pub layer_id: String,
+    pub field_id: String,
+    pub index: RemoteSensingMoistureIndex,
+    pub source: String,
+    pub captured_at: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub spatial_ref: Option<RasterSpatialRef>,
+    pub zone_values: Vec<RemoteSensingMoistureZoneValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteSensingMoistureProxyRecord {
+    pub proxy_id: String,
+    pub field_id: String,
+    pub zone_ref: String,
+    pub value: f64,
+    pub index: RemoteSensingMoistureIndex,
+    pub source: String,
+    pub captured_at: String,
+    pub evidence_kind: String,
+    pub crs: String,
+    pub extent: GeoBounds,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum RemoteSensingMoistureProxyError {
+    #[error("remote-sensing moisture proxy layer_id cannot be empty")]
+    EmptyLayerId,
+    #[error("remote-sensing moisture proxy field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("remote-sensing moisture proxy source cannot be empty")]
+    EmptySource,
+    #[error("remote-sensing moisture proxy captured_at cannot be empty")]
+    EmptyCapturedAt,
+    #[error("remote-sensing moisture proxy field mismatch: {field_id}")]
+    FieldMismatch { field_id: String },
+    #[error("remote-sensing moisture proxy CRS mismatch: layer {layer_crs}, field {field_crs}")]
+    CrsMismatch {
+        layer_crs: String,
+        field_crs: String,
+    },
+    #[error("remote-sensing moisture proxy extent mismatch")]
+    ExtentMismatch,
+    #[error("remote-sensing moisture proxy requires at least one zone value")]
+    MissingZoneValues,
+    #[error("remote-sensing moisture proxy zone_ref cannot be empty")]
+    EmptyZoneRef,
+    #[error("remote-sensing moisture proxy value is invalid: {value}")]
+    InvalidValue { value: String },
+    #[error("remote-sensing moisture proxy spatial reference invalid: {0}")]
+    SpatialRef(#[from] RasterSpatialRefError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SoilMoistureRejectionReason {
     MissingFieldLinkage,
     MissingZoneLinkage,
@@ -4738,6 +4818,85 @@ pub fn build_soil_moisture_reading(
     })
 }
 
+pub fn ingest_remote_sensing_moisture_proxy_layer(
+    layer: RemoteSensingMoistureProxyLayer,
+    field: &FieldRecord,
+) -> Result<Vec<RemoteSensingMoistureProxyRecord>, RemoteSensingMoistureProxyError> {
+    let layer_id = normalize_soil_moisture_text(layer.layer_id)
+        .ok_or(RemoteSensingMoistureProxyError::EmptyLayerId)?;
+    let field_id = normalize_soil_moisture_text(layer.field_id)
+        .ok_or(RemoteSensingMoistureProxyError::EmptyFieldId)?;
+    if field.field_id != field_id {
+        return Err(RemoteSensingMoistureProxyError::FieldMismatch { field_id });
+    }
+    let source = normalize_soil_moisture_text(layer.source)
+        .ok_or(RemoteSensingMoistureProxyError::EmptySource)?;
+    let captured_at = normalize_soil_moisture_text(layer.captured_at)
+        .ok_or(RemoteSensingMoistureProxyError::EmptyCapturedAt)?;
+    let spatial_ref =
+        assert_raster_spatial_ref(layer.spatial_ref.as_ref(), layer.width, layer.height)?;
+    let layer_crs = spatial_ref
+        .crs
+        .as_ref()
+        .expect("asserted spatial ref includes CRS")
+        .clone();
+    let field_crs = field
+        .boundary
+        .crs
+        .as_deref()
+        .map(str::trim)
+        .filter(|crs| !crs.is_empty())
+        .unwrap_or("EPSG:4326")
+        .to_string();
+    if layer_crs != field_crs {
+        return Err(RemoteSensingMoistureProxyError::CrsMismatch {
+            layer_crs,
+            field_crs,
+        });
+    }
+    let layer_extent = spatial_ref
+        .bbox
+        .as_ref()
+        .expect("asserted spatial ref includes bbox");
+    if !geo_bounds_match(layer_extent, &field.extent) {
+        return Err(RemoteSensingMoistureProxyError::ExtentMismatch);
+    }
+    if layer.zone_values.is_empty() {
+        return Err(RemoteSensingMoistureProxyError::MissingZoneValues);
+    }
+
+    let mut records = Vec::with_capacity(layer.zone_values.len());
+    for zone_value in layer.zone_values {
+        let zone_ref = normalize_soil_moisture_text(zone_value.zone_ref)
+            .ok_or(RemoteSensingMoistureProxyError::EmptyZoneRef)?;
+        if !(zone_value.value.is_finite() && (-1.0..=1.0).contains(&zone_value.value)) {
+            return Err(RemoteSensingMoistureProxyError::InvalidValue {
+                value: zone_value.value.to_string(),
+            });
+        }
+        records.push(RemoteSensingMoistureProxyRecord {
+            proxy_id: stable_moisture_proxy_id(
+                &field.field_id,
+                &zone_ref,
+                layer.index,
+                &captured_at,
+            ),
+            field_id: field.field_id.clone(),
+            zone_ref,
+            value: zone_value.value,
+            index: layer.index,
+            source: source.clone(),
+            captured_at: captured_at.clone(),
+            evidence_kind: "proxy".to_string(),
+            crs: field_crs.clone(),
+            extent: field.extent.clone(),
+            evidence_refs: vec![format!("layer:{layer_id}")],
+        });
+    }
+
+    Ok(records)
+}
+
 pub fn soil_moisture_rejection_record(
     rejection_id: String,
     request: &SoilMoistureReadingRequest,
@@ -4821,6 +4980,41 @@ fn normalize_soil_moisture_optional_text(value: Option<String>) -> Option<String
 fn normalize_soil_moisture_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn stable_moisture_proxy_id(
+    field_id: &str,
+    zone_ref: &str,
+    index: RemoteSensingMoistureIndex,
+    captured_at: &str,
+) -> String {
+    format!(
+        "moisture-proxy:{}:{}:{}:{}",
+        sanitize_moisture_proxy_id_part(field_id),
+        sanitize_moisture_proxy_id_part(zone_ref),
+        index.as_str(),
+        sanitize_moisture_proxy_id_part(captured_at)
+    )
+}
+
+fn sanitize_moisture_proxy_id_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn geo_bounds_match(left: &GeoBounds, right: &GeoBounds) -> bool {
+    (left.min_lon - right.min_lon).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+        && (left.min_lat - right.min_lat).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+        && (left.max_lon - right.max_lon).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+        && (left.max_lat - right.max_lat).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
 }
 
 pub const DROUGHT_INDEX_METHOD_STANDARDIZED_ANOMALY_V1: &str = "standardized_anomaly_v1";
@@ -9026,10 +9220,10 @@ mod tests {
         evaluate_crop_stage_weather_risks, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_tractor_prescription,
-        ingest_weather_sensor_stream, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, query_weather_history, resolve_weather_forecast_to_field,
-        route_weather_alert, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, tractor_cross_track_error_m,
+        ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
+        normalize_weather_provider_forecast, plan_tractor_swath_coverage, query_weather_history,
+        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
+        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
         weather_fetch_failure_record, AccessAnomalySignal, AccessAnomalyThresholds,
@@ -9050,7 +9244,9 @@ mod tests {
         OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
         RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, ReportDeliverableRegistry, ReportFormat,
+        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
+        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
         ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
         SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
         SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
@@ -11441,6 +11637,54 @@ mod tests {
     }
 
     #[test]
+    fn remote_sensing_moisture_proxy_ingests_zone_values_as_proxy_evidence() {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+
+        let records =
+            ingest_remote_sensing_moisture_proxy_layer(moisture_proxy_layer("EPSG:4326"), &field)
+                .expect("matching NDMI layer should ingest");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].field_id, "field-north");
+        assert_eq!(records[0].zone_ref, "zone:north");
+        assert_eq!(records[0].value, 0.42);
+        assert_eq!(records[0].index, RemoteSensingMoistureIndex::Ndmi);
+        assert_eq!(records[0].source, "imagery_processor");
+        assert_eq!(records[0].captured_at, "2026-06-13T10:00:00Z");
+        assert_eq!(records[0].evidence_kind, "proxy");
+        assert_eq!(records[0].crs, "EPSG:4326");
+        assert_eq!(records[0].extent, field.extent);
+        assert!(records[0]
+            .proxy_id
+            .starts_with("moisture-proxy:field-north:zone-north:ndmi"));
+        assert_eq!(
+            records[0].evidence_refs,
+            vec!["layer:layer-ndmi-field-north".to_string()]
+        );
+    }
+
+    #[test]
+    fn remote_sensing_moisture_proxy_rejects_crs_mismatch_without_records() {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+
+        let error =
+            ingest_remote_sensing_moisture_proxy_layer(moisture_proxy_layer("EPSG:3857"), &field)
+                .expect_err("mismatched CRS should refuse proxy ingest");
+
+        assert_eq!(
+            error,
+            RemoteSensingMoistureProxyError::CrsMismatch {
+                layer_crs: "EPSG:3857".to_string(),
+                field_crs: "EPSG:4326".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn drought_index_compute_persists_standardized_value_and_input_refs() {
         let record = compute_drought_index(
             DroughtIndexComputeRequest {
@@ -11613,6 +11857,40 @@ mod tests {
                 working_width_m: Some(9.1),
             },
             status: None,
+        }
+    }
+
+    fn moisture_proxy_layer(crs: &str) -> RemoteSensingMoistureProxyLayer {
+        RemoteSensingMoistureProxyLayer {
+            layer_id: " layer-ndmi-field-north ".to_string(),
+            field_id: " field-north ".to_string(),
+            index: RemoteSensingMoistureIndex::Ndmi,
+            source: " imagery_processor ".to_string(),
+            captured_at: " 2026-06-13T10:00:00Z ".to_string(),
+            width: 1,
+            height: 1,
+            spatial_ref: Some(RasterSpatialRef {
+                georeferenced: true,
+                crs: Some(crs.to_string()),
+                bbox: Some(GeoBounds {
+                    min_lon: -96.5,
+                    min_lat: 41.2,
+                    max_lon: -96.2,
+                    max_lat: 41.4,
+                }),
+                geo_transform: Some([-96.5, 0.3, 0.0, 41.4, 0.0, -0.2]),
+                resolution: Some(RasterResolution { x: 0.3, y: 0.2 }),
+            }),
+            zone_values: vec![
+                RemoteSensingMoistureZoneValue {
+                    zone_ref: " zone:north ".to_string(),
+                    value: 0.42,
+                },
+                RemoteSensingMoistureZoneValue {
+                    zone_ref: "zone:south".to_string(),
+                    value: 0.21,
+                },
+            ],
         }
     }
 
