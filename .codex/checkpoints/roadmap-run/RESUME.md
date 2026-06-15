@@ -2,18 +2,18 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 0e58457 (`batch-20260616050500`)
-- **Latest checkpoint commit**: this checkpoint commit after 0e58457 (`batch-20260616050500`)
+- **Last implementation commit**: 3e79814 (`batch-20260616052500`)
+- **Latest checkpoint commit**: this checkpoint commit after 3e79814 (`batch-20260616052500`)
 - **Current batch**: none
-- **Completed feature rows**: 385 committed; 1 tests_passed; 2 skipped; 1 blocked; 109 pending in this run.
+- **Completed feature rows**: 386 committed; 1 tests_passed; 2 skipped; 1 blocked; 108 pending in this run.
 - **Blocker**: None
 
 ## Latest verification
 
-- `cargo test -p shared access_anomaly` — pass
-- `cargo check -p shared` — pass
-- `10-22` — committed as anomalous access advisory evaluation
+- `cargo test -p ground_station_ui operator_advisory` — pass
+- `cargo check -p ground_station_ui` — pass
+- `11-15` — committed as operator-assist alerting advisory
 
 ## Next action
 
-- Select and claim the next pending feature (`11-15` is the next P2 item).
+- Select and claim the next pending feature (`11-16` is the next P2 item).
