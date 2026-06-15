@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
-use shared::plugin_extensions::{
-    extension_point_taxonomy, ExtensionPointContract, ExtensionPointKind,
-};
+pub use shared::plugin_extensions::ExtensionPointKind;
+use shared::plugin_extensions::{extension_point_taxonomy, ExtensionPointContract};
 use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef, RasterSpatialRefError};
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -22,6 +21,90 @@ pub struct RawPluginManifest {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub entrypoint: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginManifestBuilder {
+    plugin_id: String,
+    name: String,
+    version: String,
+    kind: String,
+    host_api_version: String,
+    capabilities: Vec<String>,
+    entrypoint: String,
+}
+
+impl PluginManifestBuilder {
+    pub fn new(plugin_id: &str, name: &str, kind: ExtensionPointKind) -> Self {
+        Self {
+            plugin_id: plugin_id.to_string(),
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            kind: kind.as_str().to_string(),
+            host_api_version: HostApiVersionRange::default().supported_max,
+            capabilities: default_capabilities_for_kind(kind),
+            entrypoint: default_entrypoint_for_kind(kind).to_string(),
+        }
+    }
+
+    pub fn version(mut self, version: &str) -> Self {
+        self.version = version.to_string();
+        self
+    }
+
+    pub fn host_api_version(mut self, host_api_version: &str) -> Self {
+        self.host_api_version = host_api_version.to_string();
+        self
+    }
+
+    pub fn capabilities(mut self, capabilities: Vec<&str>) -> Self {
+        self.capabilities = capabilities.into_iter().map(ToString::to_string).collect();
+        self
+    }
+
+    pub fn entrypoint(mut self, entrypoint: &str) -> Self {
+        self.entrypoint = entrypoint.to_string();
+        self
+    }
+
+    pub fn build_raw(self) -> RawPluginManifest {
+        RawPluginManifest {
+            plugin_id: self.plugin_id,
+            name: self.name,
+            version: self.version,
+            kind: self.kind,
+            host_api_version: self.host_api_version,
+            capabilities: self.capabilities,
+            entrypoint: self.entrypoint,
+        }
+    }
+
+    pub fn build(self) -> Result<PluginManifest, PluginRegistrationError> {
+        validate_manifest(self.build_raw())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginScaffoldRequest {
+    pub plugin_id: String,
+    pub name: String,
+    pub kind: String,
+    pub version: String,
+    pub host_api_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaffoldedPlugin {
+    pub manifest: RawPluginManifest,
+    pub files: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PluginScaffoldError {
+    #[error("unknown extension-point kind: {kind}")]
+    InvalidKind { kind: String },
+    #[error("scaffold manifest validation failed")]
+    InvalidManifest { violations: Vec<ManifestViolation> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1333,6 +1416,97 @@ fn operands_label(operands: &[SpectralBandOperand]) -> String {
         .join("+")
 }
 
+fn default_capabilities_for_kind(kind: ExtensionPointKind) -> Vec<String> {
+    match kind {
+        ExtensionPointKind::Index => vec!["read:scene", "write:product"],
+        ExtensionPointKind::Processor => vec!["read:product", "write:finding"],
+        ExtensionPointKind::ReportTemplate => vec!["data:yield", "render:report"],
+        ExtensionPointKind::MapLayer => vec!["read:layer", "render:map"],
+        ExtensionPointKind::AlertRule => vec!["read:finding_input", "emit:finding"],
+        ExtensionPointKind::ImportExportAdapter => vec!["read:payload", "write:layer"],
+    }
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+fn default_entrypoint_for_kind(kind: ExtensionPointKind) -> &'static str {
+    match kind {
+        ExtensionPointKind::Index => "plugin::run_index",
+        ExtensionPointKind::Processor => "plugin::process",
+        ExtensionPointKind::ReportTemplate => "plugin::render_report",
+        ExtensionPointKind::MapLayer => "plugin::render_layer",
+        ExtensionPointKind::AlertRule => "plugin::evaluate_rule",
+        ExtensionPointKind::ImportExportAdapter => "plugin::adapt",
+    }
+}
+
+fn rust_module_name(plugin_id: &str) -> String {
+    plugin_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn scaffold_cargo_toml(plugin_id: &str) -> String {
+    format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n\n[dependencies]\nplugin_sdk = {{ path = \"../plugin_sdk\" }}\n",
+        rust_module_name(plugin_id)
+    )
+}
+
+fn scaffold_lib_rs(kind: ExtensionPointKind, manifest: &RawPluginManifest) -> String {
+    format!(
+        "use plugin_sdk::{{ExtensionPointKind, RawPluginManifest}};\n\npub const PLUGIN_ID: &str = \"{}\";\npub const EXTENSION_POINT: ExtensionPointKind = ExtensionPointKind::{:?};\n\npub fn manifest() -> RawPluginManifest {{\n    RawPluginManifest {{\n        plugin_id: PLUGIN_ID.to_string(),\n        name: \"{}\".to_string(),\n        version: \"{}\".to_string(),\n        kind: \"{}\".to_string(),\n        host_api_version: \"{}\".to_string(),\n        capabilities: vec![{}],\n        entrypoint: \"{}\".to_string(),\n    }}\n}}\n\npub fn run() -> &'static str {{\n    \"sandbox entrypoint placeholder\"\n}}\n",
+        manifest.plugin_id,
+        kind,
+        manifest.name,
+        manifest.version,
+        manifest.kind,
+        manifest.host_api_version,
+        manifest
+            .capabilities
+            .iter()
+            .map(|capability| format!("\"{capability}\".to_string()"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        manifest.entrypoint
+    )
+}
+
+fn scaffold_manifest_toml(manifest: &RawPluginManifest) -> String {
+    format!(
+        "plugin_id = \"{}\"\nname = \"{}\"\nversion = \"{}\"\nkind = \"{}\"\nhost_api_version = \"{}\"\ncapabilities = [{}]\nentrypoint = \"{}\"\n",
+        manifest.plugin_id,
+        manifest.name,
+        manifest.version,
+        manifest.kind,
+        manifest.host_api_version,
+        manifest
+            .capabilities
+            .iter()
+            .map(|capability| format!("\"{capability}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+        manifest.entrypoint
+    )
+}
+
+fn scaffold_readme(manifest: &RawPluginManifest) -> String {
+    format!(
+        "# {}\n\nExtension point: `{}`\n\nRun this plugin only through the AGBot sandbox host so capability checks and provenance recording stay intact.\n",
+        manifest.name, manifest.kind
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PluginKindLookupError {
     UnknownPlugin { plugin_id: String },
@@ -1394,6 +1568,114 @@ pub fn validate_manifest(
         capabilities,
         entrypoint: entrypoint.expect("entrypoint is present after validation"),
     })
+}
+
+pub fn scaffold_plugin(
+    request: PluginScaffoldRequest,
+) -> Result<ScaffoldedPlugin, PluginScaffoldError> {
+    let kind = ExtensionPointKind::from_str(&request.kind).map_err(|_| {
+        PluginScaffoldError::InvalidKind {
+            kind: request.kind.clone(),
+        }
+    })?;
+    let manifest = PluginManifestBuilder::new(&request.plugin_id, &request.name, kind)
+        .version(&request.version)
+        .host_api_version(&request.host_api_version)
+        .entrypoint(&format!("{}::run", rust_module_name(&request.plugin_id)))
+        .build_raw();
+    validate_manifest(manifest.clone()).map_err(|error| match error {
+        PluginRegistrationError::InvalidManifest { violations } => {
+            PluginScaffoldError::InvalidManifest { violations }
+        }
+        _ => PluginScaffoldError::InvalidManifest {
+            violations: Vec::new(),
+        },
+    })?;
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        "Cargo.toml".to_string(),
+        scaffold_cargo_toml(&request.plugin_id),
+    );
+    files.insert("src/lib.rs".to_string(), scaffold_lib_rs(kind, &manifest));
+    files.insert(
+        "agbot-plugin.toml".to_string(),
+        scaffold_manifest_toml(&manifest),
+    );
+    files.insert("README.md".to_string(), scaffold_readme(&manifest));
+    Ok(ScaffoldedPlugin { manifest, files })
+}
+
+pub fn example_custom_vegetation_index_manifest() -> RawPluginManifest {
+    PluginManifestBuilder::new(
+        "example.custom_vegetation_index",
+        "Custom Vegetation Index",
+        ExtensionPointKind::Index,
+    )
+    .version("1.0.0")
+    .capabilities(vec!["read:scene", "write:product"])
+    .entrypoint("custom_vegetation_index::run")
+    .build_raw()
+}
+
+pub fn example_report_template_manifest() -> RawPluginManifest {
+    PluginManifestBuilder::new(
+        "example.grower_report_template",
+        "Grower Report Template",
+        ExtensionPointKind::ReportTemplate,
+    )
+    .version("1.0.0")
+    .capabilities(vec!["data:yield", "render:report"])
+    .entrypoint("grower_report_template::render")
+    .build_raw()
+}
+
+pub fn example_custom_vegetation_index_spec() -> SpectralIndexPluginSpec {
+    SpectralIndexPluginSpec {
+        plugin_id: "example.custom_vegetation_index".to_string(),
+        index_id: "example_cvi".to_string(),
+        required_bands: vec!["B05".to_string(), "B04".to_string()],
+        formula: SpectralIndexFormula {
+            numerator: vec![
+                SpectralBandOperand {
+                    band: "B05".to_string(),
+                    coefficient: 1.0,
+                },
+                SpectralBandOperand {
+                    band: "B04".to_string(),
+                    coefficient: -1.0,
+                },
+            ],
+            denominator: vec![
+                SpectralBandOperand {
+                    band: "B05".to_string(),
+                    coefficient: 1.0,
+                },
+                SpectralBandOperand {
+                    band: "B04".to_string(),
+                    coefficient: 1.0,
+                },
+            ],
+            offset: 0.0,
+        },
+        required_capabilities: vec!["read:scene".to_string(), "write:product".to_string()],
+        estimated_runtime_ms: 20,
+        estimated_memory_mb: 64,
+    }
+}
+
+pub fn example_report_template_request() -> ReportTemplateRenderRequest {
+    ReportTemplateRenderRequest {
+        plugin_id: "example.grower_report_template".to_string(),
+        report_ref: "report:example:north-field".to_string(),
+        requested_data_capabilities: vec!["data:yield".to_string()],
+        required_capabilities: vec!["render:report".to_string()],
+        estimated_runtime_ms: 20,
+        estimated_memory_mb: 64,
+        rendered_body: "Example grower report".to_string(),
+        fallback_template_id: "safe_default".to_string(),
+        fallback_body: "Safe default report".to_string(),
+    }
 }
 
 fn required_field(
@@ -1565,15 +1847,18 @@ fn normalize_optional_text(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterDirection, AlertRuleAction, AlertRuleEvaluationRequest, AlertRuleInvocationError,
-        CapabilityDecision, CapabilityViolationReason, CustomProcessorRequest,
-        ImportExportAdapterInvocationError, ImportExportAdapterRequest, ManifestField,
-        ManifestRejectionReason, MapLayerInvocationError, MapLayerRenderRequest,
+        example_custom_vegetation_index_manifest, example_custom_vegetation_index_spec,
+        example_report_template_manifest, example_report_template_request, scaffold_plugin,
+        validate_manifest, AdapterDirection, AlertRuleAction, AlertRuleEvaluationRequest,
+        AlertRuleInvocationError, CapabilityDecision, CapabilityViolationReason,
+        CustomProcessorRequest, ImportExportAdapterInvocationError, ImportExportAdapterRequest,
+        ManifestField, ManifestRejectionReason, MapLayerInvocationError, MapLayerRenderRequest,
         PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginLifecycleStatus,
-        PluginLifecycleTransitionRequest, PluginRegistrationError, RawPluginManifest,
-        ReportTemplateRenderRequest, SandboxExecutionStatus, SandboxTerminationReason,
-        SpectralBandOperand, SpectralIndexFormula, SpectralIndexInvocationError,
-        SpectralIndexPluginSpec, SpectralIndexScene,
+        PluginLifecycleTransitionRequest, PluginManifestBuilder, PluginRegistrationError,
+        PluginScaffoldError, PluginScaffoldRequest, RawPluginManifest, ReportTemplateRenderRequest,
+        SandboxExecutionStatus, SandboxTerminationReason, SpectralBandOperand,
+        SpectralIndexFormula, SpectralIndexInvocationError, SpectralIndexPluginSpec,
+        SpectralIndexScene,
     };
     use shared::plugin_extensions::ExtensionPointKind;
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError};
@@ -1590,6 +1875,111 @@ mod tests {
         assert!(contracts
             .iter()
             .all(|contract| !contract.contract_signature.trim().is_empty()));
+    }
+
+    #[test]
+    fn manifest_builder_creates_valid_manifest_with_defaults() {
+        let manifest = PluginManifestBuilder::new(
+            "plugin.builder_index",
+            "Builder Index",
+            ExtensionPointKind::Index,
+        )
+        .build()
+        .expect("builder should emit a valid manifest");
+
+        assert_eq!(manifest.plugin_id, "plugin.builder_index");
+        assert_eq!(manifest.kind, ExtensionPointKind::Index);
+        assert_eq!(manifest.host_api_version, "2026.1");
+        assert_eq!(
+            manifest.capabilities,
+            vec!["read:scene".to_string(), "write:product".to_string()]
+        );
+    }
+
+    #[test]
+    fn scaffold_generates_buildable_skeleton_with_valid_manifest() {
+        let scaffold = scaffold_plugin(scaffold_request("plugin.partner_processor", "processor"))
+            .expect("processor scaffold should generate");
+
+        validate_manifest(scaffold.manifest.clone()).expect("scaffold manifest should validate");
+        assert_eq!(scaffold.manifest.kind, "processor");
+        assert!(scaffold.files.contains_key("Cargo.toml"));
+        assert!(scaffold
+            .files
+            .get("src/lib.rs")
+            .expect("skeleton has lib")
+            .contains("pub fn run()"));
+        assert!(scaffold
+            .files
+            .get("agbot-plugin.toml")
+            .expect("skeleton has plugin manifest")
+            .contains("kind = \"processor\""));
+    }
+
+    #[test]
+    fn scaffold_with_invalid_kind_errors_without_files() {
+        let error = scaffold_plugin(scaffold_request("plugin.bad", "telepathy"))
+            .expect_err("invalid kind should not scaffold");
+
+        assert_eq!(
+            error,
+            PluginScaffoldError::InvalidKind {
+                kind: "telepathy".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn example_custom_vegetation_index_registers_and_executes() {
+        let mut host = PluginHost::default();
+        host.register_plugin(example_custom_vegetation_index_manifest())
+            .expect("example index should register");
+        enable_plugin(&mut host, "example.custom_vegetation_index");
+
+        let raster = host
+            .run_custom_spectral_index(
+                example_custom_vegetation_index_spec(),
+                custom_index_scene(),
+                sandbox_limits(),
+                "2026-06-12T13:05:00Z",
+            )
+            .expect("example index should execute");
+
+        assert_eq!(
+            raster.plugin_identity.plugin_id,
+            "example.custom_vegetation_index"
+        );
+        assert_eq!(raster.index_id, "example_cvi");
+        assert_eq!(
+            raster.sandbox_outcome.status,
+            SandboxExecutionStatus::Completed
+        );
+    }
+
+    #[test]
+    fn example_report_template_registers_and_executes() {
+        let mut host = PluginHost::default();
+        host.register_plugin(example_report_template_manifest())
+            .expect("example template should register");
+        enable_plugin(&mut host, "example.grower_report_template");
+
+        let output = host
+            .render_report_template(
+                example_report_template_request(),
+                sandbox_limits(),
+                "2026-06-12T13:06:00Z",
+            )
+            .expect("example template should execute");
+
+        assert_eq!(output.body, "Example grower report");
+        assert!(!output.used_fallback);
+        assert_eq!(
+            output
+                .plugin_identity
+                .as_ref()
+                .map(|identity| identity.plugin_id.as_str()),
+            Some("example.grower_report_template")
+        );
     }
 
     #[test]
@@ -2577,6 +2967,16 @@ mod tests {
             required_capabilities: vec!["read:payload".to_string(), "write:layer".to_string()],
             estimated_runtime_ms: 40,
             estimated_memory_mb: 96,
+        }
+    }
+
+    fn scaffold_request(plugin_id: &str, kind: &str) -> PluginScaffoldRequest {
+        PluginScaffoldRequest {
+            plugin_id: plugin_id.to_string(),
+            name: "Partner Plugin".to_string(),
+            kind: kind.to_string(),
+            version: "0.1.0".to_string(),
+            host_api_version: "2026.1".to_string(),
         }
     }
 
