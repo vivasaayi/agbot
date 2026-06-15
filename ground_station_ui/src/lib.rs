@@ -14,6 +14,7 @@ pub mod link_client;
 pub mod map_state;
 pub mod message_dispatch;
 pub mod operator_actions;
+pub mod operator_advisory;
 pub mod operator_session;
 pub mod web_server;
 
@@ -48,6 +49,10 @@ pub use operator_actions::{
     OperatorActionError, OperatorActionKind, OperatorActionState, OperatorActionSubmission,
     RejectingMissionControlActionClient, SharedMissionControlActionClient,
     SharedOperatorActionAuditLog, SharedOperatorActionState,
+};
+pub use operator_advisory::{
+    evaluate_operator_assist_advisory, GeofenceProximitySignal, OperatorAssistAdvisory,
+    OperatorAssistThresholds,
 };
 pub use operator_session::{
     shared_operator_session_registry, AuthorizedOperatorAction, OperatorCredential,
