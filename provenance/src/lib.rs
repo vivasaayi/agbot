@@ -137,6 +137,12 @@ pub struct BackwardProvenanceTrace {
     pub gaps: Vec<LineageGap>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForwardProvenanceTrace {
+    pub source_artifact_id: String,
+    pub affected_records: Vec<LineageRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageGap {
     pub missing_artifact_id: String,
@@ -433,6 +439,21 @@ impl LineageLedger {
         Ok(trace)
     }
 
+    pub fn trace_forward(
+        &self,
+        artifact_id: &str,
+    ) -> Result<ForwardProvenanceTrace, ProvenanceError> {
+        let source_artifact_id =
+            normalize_required_text(artifact_id.to_string(), ProvenanceError::EmptyArtifactId)?;
+        let mut visited = BTreeSet::new();
+        let mut affected_records = Vec::new();
+        self.collect_forward_lineage(&source_artifact_id, &mut visited, &mut affected_records);
+        Ok(ForwardProvenanceTrace {
+            source_artifact_id,
+            affected_records,
+        })
+    }
+
     fn collect_backward_lineage(
         &self,
         artifact_id: &str,
@@ -460,6 +481,30 @@ impl LineageLedger {
                 visited,
                 trace,
             );
+        }
+    }
+
+    fn collect_forward_lineage(
+        &self,
+        artifact_id: &str,
+        visited: &mut BTreeSet<String>,
+        affected_records: &mut Vec<LineageRecord>,
+    ) {
+        let mut downstream = self
+            .records
+            .values()
+            .filter(|record| record.inputs.iter().any(|input| input == artifact_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        downstream.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+
+        for record in downstream {
+            if !visited.insert(record.artifact_id.clone()) {
+                continue;
+            }
+            let downstream_artifact_id = record.artifact_id.clone();
+            affected_records.push(record);
+            self.collect_forward_lineage(&downstream_artifact_id, visited, affected_records);
         }
     }
 }
@@ -1614,6 +1659,53 @@ mod tests {
     }
 
     #[test]
+    fn forward_provenance_trace_finds_all_downstream_findings_reports_and_actions() {
+        let mut ledger = LineageLedger::default();
+        seed_capture_graph(&mut ledger);
+        seed_downstream_artifacts(&mut ledger);
+
+        let trace = ledger
+            .trace_forward("scene:alpha-2026-06-12")
+            .expect("forward trace should run");
+
+        let artifact_ids = trace
+            .affected_records
+            .iter()
+            .map(|record| record.artifact_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            artifact_ids,
+            vec![
+                "product:ndvi:alpha-2026-06-12",
+                "finding:09:stress-ne-zone",
+                "action:mission:refly-zone-ne",
+                "report:field-alpha:weekly"
+            ]
+        );
+        assert_eq!(trace.source_artifact_id, "scene:alpha-2026-06-12");
+        assert_eq!(trace.affected_records[2].kind, ArtifactKind::Action);
+        assert_eq!(trace.affected_records[3].kind, ArtifactKind::Report);
+    }
+
+    #[test]
+    fn forward_provenance_trace_returns_empty_for_scene_without_downstream() {
+        let mut ledger = LineageLedger::default();
+        ledger
+            .record_lineage(capture_lineage())
+            .expect("capture lineage should record");
+        ledger
+            .record_lineage(scene_lineage_with_capture())
+            .expect("scene lineage should record");
+
+        let trace = ledger
+            .trace_forward("scene:alpha-2026-06-12")
+            .expect("forward trace should run");
+
+        assert_eq!(trace.source_artifact_id, "scene:alpha-2026-06-12");
+        assert!(trace.affected_records.is_empty());
+    }
+
+    #[test]
     fn reproducibility_manifest_lists_input_digests_method_version_and_parameters() {
         let mut evidence_store = EvidenceStore::default();
         let scene_evidence = evidence_store
@@ -2077,6 +2169,15 @@ mod tests {
             .expect("finding lineage should be recorded");
     }
 
+    fn seed_downstream_artifacts(ledger: &mut LineageLedger) {
+        ledger
+            .record_lineage(report_lineage())
+            .expect("report lineage should be recorded");
+        ledger
+            .record_lineage(action_lineage())
+            .expect("action lineage should be recorded");
+    }
+
     fn capture_lineage() -> LineageRecord {
         LineageRecord {
             artifact_id: "capture:alpha-2026-06-12".to_string(),
@@ -2146,6 +2247,38 @@ mod tests {
             operator: "operator:dsp-7".to_string(),
             actor: sample_actor(),
             created_at: "2026-06-12T13:00:00Z".to_string(),
+        }
+    }
+
+    fn report_lineage() -> LineageRecord {
+        LineageRecord {
+            artifact_id: "report:field-alpha:weekly".to_string(),
+            kind: ArtifactKind::Report,
+            inputs: vec!["finding:09:stress-ne-zone".to_string()],
+            method: "18.weekly_field_report".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "report_period": "2026-W24",
+                "field_id": "field:alpha"
+            })),
+            operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
+            created_at: "2026-06-12T13:30:00Z".to_string(),
+        }
+    }
+
+    fn action_lineage() -> LineageRecord {
+        LineageRecord {
+            artifact_id: "action:mission:refly-zone-ne".to_string(),
+            kind: ArtifactKind::Action,
+            inputs: vec!["finding:09:stress-ne-zone".to_string()],
+            method: "01.refly_proposal".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "zone": "NE",
+                "approval_required": true
+            })),
+            operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
+            created_at: "2026-06-12T13:20:00Z".to_string(),
         }
     }
 
