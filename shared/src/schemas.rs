@@ -2995,6 +2995,34 @@ pub struct WeatherOperationalWindowReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherRiskThresholds {
+    pub frost_temperature_celsius: f64,
+    pub heat_temperature_celsius: f64,
+    pub wind_speed_mps: f64,
+    pub precipitation_mm: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherRiskType {
+    Frost,
+    Heat,
+    Wind,
+    Precipitation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherRiskAlert {
+    pub field_ref: String,
+    pub risk_type: WeatherRiskType,
+    pub value: f64,
+    pub threshold: f64,
+    pub valid_time: String,
+    pub source: String,
+    pub freshness: WeatherFreshnessState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
     pub wind_speed_mps: WeatherForecastValue,
@@ -3156,6 +3184,12 @@ pub enum WeatherOperationalWindowError {
     InvalidThresholds,
     #[error("weather operational window timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherRiskAlertError {
+    #[error("weather risk alert thresholds are invalid")]
+    InvalidThresholds,
 }
 
 pub fn normalize_weather_provider_forecast(
@@ -3809,6 +3843,92 @@ fn parse_weather_operational_window_timestamp(
         .map_err(|_| WeatherOperationalWindowError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
+}
+
+pub fn evaluate_weather_risk_alerts(
+    records: &[WeatherFreshnessAnnotatedRecord],
+    thresholds: WeatherRiskThresholds,
+) -> Result<Vec<WeatherRiskAlert>, WeatherRiskAlertError> {
+    validate_weather_risk_thresholds(&thresholds)?;
+    let mut alerts = Vec::new();
+    for record in records {
+        if record.temperature_celsius.value.value <= thresholds.frost_temperature_celsius {
+            alerts.push(weather_risk_alert(
+                record,
+                WeatherRiskType::Frost,
+                record.temperature_celsius.value.value,
+                thresholds.frost_temperature_celsius,
+                record.temperature_celsius.freshness_state,
+            ));
+        }
+        if record.temperature_celsius.value.value >= thresholds.heat_temperature_celsius {
+            alerts.push(weather_risk_alert(
+                record,
+                WeatherRiskType::Heat,
+                record.temperature_celsius.value.value,
+                thresholds.heat_temperature_celsius,
+                record.temperature_celsius.freshness_state,
+            ));
+        }
+        if record.wind_speed_mps.value.value >= thresholds.wind_speed_mps {
+            alerts.push(weather_risk_alert(
+                record,
+                WeatherRiskType::Wind,
+                record.wind_speed_mps.value.value,
+                thresholds.wind_speed_mps,
+                record.wind_speed_mps.freshness_state,
+            ));
+        }
+        if record.precipitation_mm.value.value >= thresholds.precipitation_mm {
+            alerts.push(weather_risk_alert(
+                record,
+                WeatherRiskType::Precipitation,
+                record.precipitation_mm.value.value,
+                thresholds.precipitation_mm,
+                record.precipitation_mm.freshness_state,
+            ));
+        }
+    }
+    alerts.sort_by(|left, right| {
+        left.valid_time
+            .cmp(&right.valid_time)
+            .then_with(|| format!("{:?}", left.risk_type).cmp(&format!("{:?}", right.risk_type)))
+    });
+    Ok(alerts)
+}
+
+fn validate_weather_risk_thresholds(
+    thresholds: &WeatherRiskThresholds,
+) -> Result<(), WeatherRiskAlertError> {
+    if !thresholds.frost_temperature_celsius.is_finite()
+        || !thresholds.heat_temperature_celsius.is_finite()
+        || thresholds.frost_temperature_celsius > thresholds.heat_temperature_celsius
+        || !thresholds.wind_speed_mps.is_finite()
+        || thresholds.wind_speed_mps < 0.0
+        || !thresholds.precipitation_mm.is_finite()
+        || thresholds.precipitation_mm < 0.0
+    {
+        return Err(WeatherRiskAlertError::InvalidThresholds);
+    }
+    Ok(())
+}
+
+fn weather_risk_alert(
+    record: &WeatherFreshnessAnnotatedRecord,
+    risk_type: WeatherRiskType,
+    value: f64,
+    threshold: f64,
+    freshness: WeatherFreshnessState,
+) -> WeatherRiskAlert {
+    WeatherRiskAlert {
+        field_ref: record.field_ref.clone(),
+        risk_type,
+        value,
+        threshold,
+        valid_time: record.valid_time.clone(),
+        source: record.source.clone(),
+        freshness,
+    }
 }
 
 pub fn weather_fetch_failure_record(
@@ -8325,11 +8445,11 @@ mod tests {
         create_versioned_content, deconflict_tractor_swath_reservations, detect_tractor_obstacle,
         dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
         evaluate_tractor_motion_gate, evaluate_tractor_weather_window_gate,
-        evaluate_weather_value_freshness, execute_tractor_prescription,
-        ingest_weather_sensor_stream, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, query_weather_history, resolve_weather_forecast_to_field,
-        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, tractor_cross_track_error_m,
+        evaluate_weather_risk_alerts, evaluate_weather_value_freshness,
+        execute_tractor_prescription, ingest_weather_sensor_stream,
+        normalize_weather_provider_forecast, plan_tractor_swath_coverage, query_weather_history,
+        resolve_weather_forecast_to_field, run_tractor_straight_path_guidance,
+        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
         AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
@@ -8372,10 +8492,11 @@ mod tests {
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
         WeatherForecastValue, WeatherFreshnessState, WeatherHistoryQuery, WeatherIngestError,
         WeatherOperationalWindowRequest, WeatherOperationalWindowThresholds,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherSensorIngestError,
-        WeatherSensorSample, WeatherSensorStreamIngestRequest, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
-        WorkOrderRegistry, WorkOrderStatus,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherRiskThresholds,
+        WeatherRiskType, WeatherSensorIngestError, WeatherSensorSample,
+        WeatherSensorStreamIngestRequest, WorkOrderChangeType, WorkOrderCreateRequest,
+        WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry,
+        WorkOrderStatus,
     };
 
     #[test]
@@ -10354,6 +10475,55 @@ mod tests {
     }
 
     #[test]
+    fn weather_risk_alerts_raise_threshold_breaches_with_evidence() {
+        let alerts = evaluate_weather_risk_alerts(
+            &[
+                weather_window_record("2026-06-13T04:00:00Z", 3.0, 0.0, 0.5, false),
+                weather_window_record("2026-06-13T14:00:00Z", 12.0, 2.0, 36.0, true),
+            ],
+            weather_risk_thresholds(),
+        )
+        .expect("risk alerts should evaluate");
+
+        assert!(alerts
+            .iter()
+            .any(|alert| alert.risk_type == WeatherRiskType::Frost
+                && alert.value == 0.5
+                && alert.threshold == 2.0
+                && alert.source == "NOAA-HRRR"
+                && alert.freshness == WeatherFreshnessState::Fresh));
+        assert!(alerts
+            .iter()
+            .any(|alert| alert.risk_type == WeatherRiskType::Heat
+                && alert.value == 36.0
+                && alert.threshold == 35.0
+                && alert.freshness == WeatherFreshnessState::Stale));
+        assert!(alerts
+            .iter()
+            .any(|alert| alert.risk_type == WeatherRiskType::Wind && alert.value == 12.0));
+        assert!(alerts
+            .iter()
+            .any(|alert| alert.risk_type == WeatherRiskType::Precipitation && alert.value == 2.0));
+    }
+
+    #[test]
+    fn weather_risk_alerts_do_not_raise_false_alarm_within_thresholds() {
+        let alerts = evaluate_weather_risk_alerts(
+            &[weather_window_record(
+                "2026-06-13T10:00:00Z",
+                3.0,
+                0.0,
+                22.0,
+                false,
+            )],
+            weather_risk_thresholds(),
+        )
+        .expect("safe weather should evaluate");
+
+        assert!(alerts.is_empty());
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -11026,6 +11196,15 @@ mod tests {
         .remove(0);
         annotate_weather_record_freshness(record, "2026-06-13T10:00:00Z", 900)
             .expect("weather window fixture should annotate")
+    }
+
+    fn weather_risk_thresholds() -> WeatherRiskThresholds {
+        WeatherRiskThresholds {
+            frost_temperature_celsius: 2.0,
+            heat_temperature_celsius: 35.0,
+            wind_speed_mps: 10.0,
+            precipitation_mm: 1.0,
+        }
     }
 
     fn tractor_prescription_request(
