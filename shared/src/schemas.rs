@@ -3067,6 +3067,50 @@ pub struct WeatherReferenceEtInput {
     pub radiation_w_m2: Option<WeatherFreshnessAnnotatedValue>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterWeatherInputContractRequest {
+    pub field_ref: String,
+    pub date: String,
+    pub records: Vec<WeatherFreshnessAnnotatedRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaterWeatherInputStatus {
+    Valid,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterWeatherInputContract {
+    pub field_ref: String,
+    pub date: String,
+    pub status: WaterWeatherInputStatus,
+    #[serde(default)]
+    pub temperature_celsius: Option<WeatherFreshnessAnnotatedValue>,
+    #[serde(default)]
+    pub humidity_percent: Option<WeatherFreshnessAnnotatedValue>,
+    #[serde(default)]
+    pub wind_speed_mps: Option<WeatherFreshnessAnnotatedValue>,
+    #[serde(default)]
+    pub radiation_w_m2: Option<WeatherFreshnessAnnotatedValue>,
+    #[serde(default)]
+    pub precipitation_mm: Option<WeatherFreshnessAnnotatedValue>,
+    pub et_blocked: bool,
+    pub degradation_reasons: Vec<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WaterWeatherInputContractError {
+    #[error("water weather input field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("water weather input date is invalid: {date}")]
+    InvalidDate { date: String },
+    #[error("water weather input timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WeatherReferenceEtStatus {
@@ -4215,6 +4259,86 @@ fn parse_weather_gdd_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.with_timezone(&chrono::Utc))
         .map_err(|_| WeatherGrowingDegreeDayError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+pub fn validate_water_weather_input_contract(
+    request: WaterWeatherInputContractRequest,
+) -> Result<WaterWeatherInputContract, WaterWeatherInputContractError> {
+    let field_ref = normalize_weather_text(request.field_ref)
+        .ok_or(WaterWeatherInputContractError::EmptyFieldRef)?;
+    let date = NaiveDate::parse_from_str(&request.date, "%Y-%m-%d").map_err(|_| {
+        WaterWeatherInputContractError::InvalidDate {
+            date: request.date.clone(),
+        }
+    })?;
+
+    let mut records = request
+        .records
+        .into_iter()
+        .filter(|record| record.field_ref == field_ref)
+        .map(|record| {
+            parse_water_weather_input_timestamp(&record.valid_time)
+                .map(|timestamp| (timestamp, record))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    records.retain(|(timestamp, _)| timestamp.date_naive() == date);
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let Some((_, record)) = records.into_iter().next() else {
+        return Ok(WaterWeatherInputContract {
+            field_ref,
+            date: date.to_string(),
+            status: WaterWeatherInputStatus::Degraded,
+            temperature_celsius: None,
+            humidity_percent: None,
+            wind_speed_mps: None,
+            radiation_w_m2: None,
+            precipitation_mm: None,
+            et_blocked: true,
+            degradation_reasons: vec!["missing_weather_input".to_string()],
+            evidence_refs: Vec::new(),
+        });
+    };
+
+    let mut degradation_reasons = Vec::new();
+    if record.stale
+        || record.temperature_celsius.stale
+        || record.humidity_percent.stale
+        || record.wind_speed_mps.stale
+        || record.radiation_w_m2.stale
+        || record.precipitation_mm.stale
+    {
+        degradation_reasons.push("stale_weather_input".to_string());
+    }
+    let status = if degradation_reasons.is_empty() {
+        WaterWeatherInputStatus::Valid
+    } else {
+        WaterWeatherInputStatus::Degraded
+    };
+
+    Ok(WaterWeatherInputContract {
+        field_ref,
+        date: date.to_string(),
+        status,
+        temperature_celsius: Some(record.temperature_celsius),
+        humidity_percent: Some(record.humidity_percent),
+        wind_speed_mps: Some(record.wind_speed_mps),
+        radiation_w_m2: Some(record.radiation_w_m2),
+        precipitation_mm: Some(record.precipitation_mm),
+        et_blocked: status == WaterWeatherInputStatus::Degraded,
+        degradation_reasons,
+        evidence_refs: vec![format!("weather_record:{}", record.forecast_id)],
+    })
+}
+
+fn parse_water_weather_input_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, WaterWeatherInputContractError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| WaterWeatherInputContractError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -9225,20 +9349,21 @@ mod tests {
         resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
         sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
-        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
-        weather_fetch_failure_record, AccessAnomalySignal, AccessAnomalyThresholds,
-        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
-        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
+        verify_weather_forecast_accuracy, weather_fetch_failure_record, AccessAnomalySignal,
+        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
+        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
+        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
+        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
+        ContentType, CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
         MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
         MarketplacePartyType, MultispectralImage, OpenDataPublishError,
         OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
@@ -9264,7 +9389,8 @@ mod tests {
         TractorPrescriptionExecutionError, TractorPrescriptionExecutionRequest,
         TractorPrescriptionZone, TractorRegistrationRequest, TractorRegistry,
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
-        TractorWeatherWindowDecision, TractorWeatherWindowGateRequest, WeatherAlertDeliveryStatus,
+        TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
+        WaterWeatherInputContractRequest, WaterWeatherInputStatus, WeatherAlertDeliveryStatus,
         WeatherAlertRouteTarget, WeatherAlertRoutingRequest, WeatherAlertRoutingTarget,
         WeatherCropStageRiskRequest, WeatherCropStageThresholdSet,
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
@@ -11372,6 +11498,75 @@ mod tests {
     }
 
     #[test]
+    fn water_weather_input_contract_validates_complete_fresh_inputs() {
+        let contract =
+            validate_water_weather_input_contract(water_weather_input_contract_request(false))
+                .expect("fresh weather input contract should validate");
+
+        assert_eq!(contract.field_ref, "field-north");
+        assert_eq!(contract.date, "2026-06-13");
+        assert_eq!(contract.status, WaterWeatherInputStatus::Valid);
+        assert!(!contract.et_blocked);
+        assert!(contract.degradation_reasons.is_empty());
+        assert_eq!(
+            contract
+                .temperature_celsius
+                .as_ref()
+                .expect("temperature is present")
+                .value
+                .value,
+            22.0
+        );
+        assert_eq!(
+            contract
+                .precipitation_mm
+                .as_ref()
+                .expect("precipitation is present")
+                .value
+                .value,
+            0.0
+        );
+        assert!(contract
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("weather_record:weather:field-north")));
+    }
+
+    #[test]
+    fn water_weather_input_contract_degrades_stale_inputs() {
+        let contract =
+            validate_water_weather_input_contract(water_weather_input_contract_request(true))
+                .expect("stale weather input contract should degrade");
+
+        assert_eq!(contract.status, WaterWeatherInputStatus::Degraded);
+        assert!(contract.et_blocked);
+        assert_eq!(
+            contract.degradation_reasons,
+            vec!["stale_weather_input".to_string()]
+        );
+        assert!(contract.temperature_celsius.is_some());
+    }
+
+    #[test]
+    fn water_weather_input_contract_degrades_missing_inputs() {
+        let contract = validate_water_weather_input_contract(WaterWeatherInputContractRequest {
+            field_ref: "field-north".to_string(),
+            date: "2026-06-13".to_string(),
+            records: Vec::new(),
+        })
+        .expect("missing weather input should degrade, not error");
+
+        assert_eq!(contract.status, WaterWeatherInputStatus::Degraded);
+        assert!(contract.et_blocked);
+        assert_eq!(
+            contract.degradation_reasons,
+            vec!["missing_weather_input".to_string()]
+        );
+        assert!(contract.temperature_celsius.is_none());
+        assert!(contract.evidence_refs.is_empty());
+    }
+
+    #[test]
     fn weather_alert_routing_delivers_owned_field_to_console_and_portal() {
         let result = route_weather_alert(weather_alert_routing_request(vec![
             WeatherAlertRoutingTarget {
@@ -12302,6 +12497,20 @@ mod tests {
             humidity_percent: Some(record.humidity_percent.clone()),
             wind_speed_mps: Some(record.wind_speed_mps.clone()),
             radiation_w_m2: include_radiation.then_some(record.radiation_w_m2.clone()),
+        }
+    }
+
+    fn water_weather_input_contract_request(stale: bool) -> WaterWeatherInputContractRequest {
+        WaterWeatherInputContractRequest {
+            field_ref: " field-north ".to_string(),
+            date: "2026-06-13".to_string(),
+            records: vec![weather_window_record(
+                "2026-06-13T10:00:00Z",
+                4.2,
+                0.0,
+                22.0,
+                stale,
+            )],
         }
     }
 
