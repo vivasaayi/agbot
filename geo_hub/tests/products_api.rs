@@ -4528,6 +4528,159 @@ async fn sustainability_record_create_rejects_unknown_field_or_season_without_wr
 }
 
 #[tokio::test]
+async fn carbon_footprints_compute_get_and_list_with_stable_hash() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_record(
+        &ctx,
+        "farm-carbon",
+        "field-carbon",
+        "season-2026",
+        "sustain-carbon-001",
+        "operation-carbon-001",
+    )
+    .await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/carbon-footprints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    carbon_footprint_payload("footprint-carbon-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("computed")
+    );
+    assert_eq!(
+        first.get("value_co2e").and_then(|value| value.as_f64()),
+        Some(168.8)
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/carbon-footprints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    carbon_footprint_payload("footprint-carbon-002", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/carbon-footprints/footprint-carbon-001?record_id=sustain-carbon-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/carbon-footprints?record_id=sustain-carbon-001&status=computed")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let footprints: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(footprints.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn carbon_footprint_missing_inputs_persists_insufficient_without_value() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_record(
+        &ctx,
+        "farm-carbon-missing",
+        "field-carbon-missing",
+        "season-2026",
+        "sustain-carbon-missing",
+        "operation-carbon-001",
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/carbon-footprints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    carbon_footprint_payload("footprint-carbon-missing", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let footprint: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        footprint.get("status").and_then(|value| value.as_str()),
+        Some("insufficient_inputs")
+    );
+    assert!(footprint
+        .get("value_co2e")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM carbon_footprints WHERE status = 'insufficient_inputs' AND value_co2e IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn content_items_create_edit_get_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -13377,6 +13530,112 @@ async fn seed_sustainability_field(
         .expect("router should handle request");
     assert_eq!(field_response.status(), StatusCode::OK);
     Ok(())
+}
+
+async fn seed_sustainability_record(
+    ctx: &TestContext,
+    farm_id: &str,
+    field_id: &str,
+    season_id: &str,
+    record_id: &str,
+    operation_id: &str,
+) -> Result<()> {
+    seed_sustainability_field(ctx, farm_id, field_id, season_id).await?;
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "record_id": record_id,
+                        "field_id": field_id,
+                        "season_id": season_id,
+                        "operation_id": operation_id,
+                        "metric_type": "carbon_footprint",
+                        "method_version": "carbon.identity.v1"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+fn carbon_footprint_payload(footprint_id: &str, include_required: bool) -> serde_json::Value {
+    let mut inputs = vec![
+        json!({
+            "kind": "diesel_liters",
+            "quantity": 10.0,
+            "unit": "liters",
+            "evidence_ref": "input:fuel-log-001"
+        }),
+        json!({
+            "kind": "fertilizer_nitrogen_kg",
+            "quantity": 20.0,
+            "unit": "kg_n",
+            "evidence_ref": "input:fertilizer-ticket-001"
+        }),
+        json!({
+            "kind": "electricity_kwh",
+            "quantity": 15.0,
+            "unit": "kwh",
+            "evidence_ref": "input:meter-001"
+        }),
+        json!({
+            "kind": "field_passes",
+            "quantity": 2.0,
+            "unit": "passes",
+            "evidence_ref": "input:coverage-log-001"
+        }),
+    ];
+    let mut factors = vec![
+        json!({
+            "input_kind": "diesel_liters",
+            "factor_kg_co2e_per_unit": 2.68,
+            "factor_ref": "factor:diesel:v1"
+        }),
+        json!({
+            "input_kind": "fertilizer_nitrogen_kg",
+            "factor_kg_co2e_per_unit": 6.3,
+            "factor_ref": "factor:nitrogen:v1"
+        }),
+        json!({
+            "input_kind": "electricity_kwh",
+            "factor_kg_co2e_per_unit": 0.4,
+            "factor_ref": "factor:electricity:v1"
+        }),
+        json!({
+            "input_kind": "field_passes",
+            "factor_kg_co2e_per_unit": 5.0,
+            "factor_ref": "factor:field-pass:v1"
+        }),
+    ];
+    if !include_required {
+        inputs.retain(|input| {
+            input.get("kind").and_then(|kind| kind.as_str()) != Some("field_passes")
+        });
+        factors.retain(|factor| {
+            factor.get("input_kind").and_then(|kind| kind.as_str()) != Some("field_passes")
+        });
+    }
+
+    json!({
+        "footprint_id": footprint_id,
+        "record_id": if include_required { "sustain-carbon-001" } else { "sustain-carbon-missing" },
+        "operation_id": "operation-carbon-001",
+        "inputs": inputs,
+        "factor_set": {
+            "version": "agbot-carbon-factors-v1",
+            "factors": factors
+        }
+    })
 }
 
 async fn register_test_component(

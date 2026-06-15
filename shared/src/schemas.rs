@@ -10129,6 +10129,88 @@ pub struct SustainabilityRecordLinkage {
     pub season_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CarbonFootprintInputKind {
+    DieselLiters,
+    FertilizerNitrogenKg,
+    ElectricityKwh,
+    FieldPasses,
+}
+
+impl CarbonFootprintInputKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CarbonFootprintInputKind::DieselLiters => "diesel_liters",
+            CarbonFootprintInputKind::FertilizerNitrogenKg => "fertilizer_nitrogen_kg",
+            CarbonFootprintInputKind::ElectricityKwh => "electricity_kwh",
+            CarbonFootprintInputKind::FieldPasses => "field_passes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarbonFootprintInput {
+    pub kind: CarbonFootprintInputKind,
+    pub quantity: f64,
+    pub unit: String,
+    pub evidence_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarbonEmissionFactor {
+    pub input_kind: CarbonFootprintInputKind,
+    pub factor_kg_co2e_per_unit: f64,
+    pub factor_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarbonFootprintFactorSet {
+    pub version: String,
+    pub factors: Vec<CarbonEmissionFactor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarbonFootprintComputeRequest {
+    #[serde(default)]
+    pub footprint_id: Option<String>,
+    pub record_id: String,
+    pub operation_id: String,
+    pub inputs: Vec<CarbonFootprintInput>,
+    pub factor_set: CarbonFootprintFactorSet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CarbonFootprintStatus {
+    Computed,
+    InsufficientInputs,
+}
+
+impl CarbonFootprintStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CarbonFootprintStatus::Computed => "computed",
+            CarbonFootprintStatus::InsufficientInputs => "insufficient_inputs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarbonFootprintResult {
+    pub footprint_id: String,
+    pub record_id: String,
+    pub operation_id: String,
+    pub value_co2e: Option<f64>,
+    pub inputs: Vec<CarbonFootprintInput>,
+    pub factor_set_version: String,
+    pub factors: Vec<CarbonEmissionFactor>,
+    pub evidence_refs: Vec<String>,
+    pub status: CarbonFootprintStatus,
+    pub result_hash: String,
+    pub computed_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SustainabilityRecordError {
     #[error("sustainability record_id cannot be empty")]
@@ -10159,6 +10241,28 @@ pub enum SustainabilityRecordError {
     },
     #[error("unsupported sustainability metric type {value}")]
     UnsupportedMetricType { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CarbonFootprintError {
+    #[error("carbon footprint_id cannot be empty")]
+    EmptyFootprintId,
+    #[error("carbon footprint record_id cannot be empty")]
+    EmptyRecordId,
+    #[error("carbon footprint operation_id cannot be empty")]
+    EmptyOperationId,
+    #[error("carbon factor set version cannot be empty")]
+    EmptyFactorSetVersion,
+    #[error("carbon footprint computed_at cannot be empty")]
+    EmptyComputedAt,
+    #[error("carbon footprint input quantity is invalid")]
+    InvalidInputQuantity,
+    #[error("carbon footprint emission factor is invalid")]
+    InvalidEmissionFactor,
+    #[error("unsupported carbon footprint input kind {value}")]
+    UnsupportedInputKind { value: String },
+    #[error("unsupported carbon footprint status {value}")]
+    UnsupportedStatus { value: String },
 }
 
 pub fn build_sustainability_record(
@@ -10223,6 +10327,85 @@ pub fn build_sustainability_record(
     })
 }
 
+pub fn compute_carbon_footprint(
+    request: CarbonFootprintComputeRequest,
+    generated_footprint_id: String,
+    computed_at: String,
+) -> Result<CarbonFootprintResult, CarbonFootprintError> {
+    let footprint_id = normalize_sustainability_optional_text(request.footprint_id)
+        .or_else(|| normalize_sustainability_text(generated_footprint_id))
+        .ok_or(CarbonFootprintError::EmptyFootprintId)?;
+    let record_id = normalize_sustainability_text(request.record_id)
+        .ok_or(CarbonFootprintError::EmptyRecordId)?;
+    let operation_id = normalize_sustainability_text(request.operation_id)
+        .ok_or(CarbonFootprintError::EmptyOperationId)?;
+    let factor_set_version = normalize_sustainability_text(request.factor_set.version)
+        .ok_or(CarbonFootprintError::EmptyFactorSetVersion)?;
+    let computed_at =
+        normalize_sustainability_text(computed_at).ok_or(CarbonFootprintError::EmptyComputedAt)?;
+
+    let inputs = normalize_carbon_inputs(request.inputs)?;
+    let factors = normalize_carbon_factors(request.factor_set.factors)?;
+    let required = [
+        CarbonFootprintInputKind::DieselLiters,
+        CarbonFootprintInputKind::FertilizerNitrogenKg,
+        CarbonFootprintInputKind::ElectricityKwh,
+        CarbonFootprintInputKind::FieldPasses,
+    ];
+    let has_required_inputs = required
+        .iter()
+        .all(|kind| inputs.iter().any(|input| input.kind == *kind));
+    let has_required_factors = required
+        .iter()
+        .all(|kind| factors.iter().any(|factor| factor.input_kind == *kind));
+    let evidence_refs = carbon_footprint_evidence_refs(&inputs, &factors, &factor_set_version);
+
+    let value_co2e = if has_required_inputs && has_required_factors {
+        Some(
+            inputs
+                .iter()
+                .map(|input| {
+                    let factor = factors
+                        .iter()
+                        .find(|factor| factor.input_kind == input.kind)
+                        .expect("required factor checked");
+                    input.quantity * factor.factor_kg_co2e_per_unit
+                })
+                .sum::<f64>(),
+        )
+    } else {
+        None
+    };
+    let status = if value_co2e.is_some() {
+        CarbonFootprintStatus::Computed
+    } else {
+        CarbonFootprintStatus::InsufficientInputs
+    };
+    let result_hash = carbon_footprint_hash(
+        &record_id,
+        &operation_id,
+        value_co2e,
+        &inputs,
+        &factor_set_version,
+        &factors,
+        status,
+    );
+
+    Ok(CarbonFootprintResult {
+        footprint_id,
+        record_id,
+        operation_id,
+        value_co2e,
+        inputs,
+        factor_set_version,
+        factors,
+        evidence_refs,
+        status,
+        result_hash,
+        computed_at,
+    })
+}
+
 pub fn parse_sustainability_metric_type(
     value: &str,
 ) -> Result<SustainabilityMetricType, SustainabilityRecordError> {
@@ -10238,6 +10421,32 @@ pub fn parse_sustainability_metric_type(
     }
 }
 
+pub fn parse_carbon_footprint_input_kind(
+    value: &str,
+) -> Result<CarbonFootprintInputKind, CarbonFootprintError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "diesel_liters" => Ok(CarbonFootprintInputKind::DieselLiters),
+        "fertilizer_nitrogen_kg" => Ok(CarbonFootprintInputKind::FertilizerNitrogenKg),
+        "electricity_kwh" => Ok(CarbonFootprintInputKind::ElectricityKwh),
+        "field_passes" => Ok(CarbonFootprintInputKind::FieldPasses),
+        _ => Err(CarbonFootprintError::UnsupportedInputKind {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_carbon_footprint_status(
+    value: &str,
+) -> Result<CarbonFootprintStatus, CarbonFootprintError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "computed" => Ok(CarbonFootprintStatus::Computed),
+        "insufficient_inputs" => Ok(CarbonFootprintStatus::InsufficientInputs),
+        _ => Err(CarbonFootprintError::UnsupportedStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
 fn normalize_sustainability_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(normalize_sustainability_text)
 }
@@ -10245,6 +10454,94 @@ fn normalize_sustainability_optional_text(value: Option<String>) -> Option<Strin
 fn normalize_sustainability_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_carbon_inputs(
+    inputs: Vec<CarbonFootprintInput>,
+) -> Result<Vec<CarbonFootprintInput>, CarbonFootprintError> {
+    let mut normalized = Vec::new();
+    for input in inputs {
+        if !(input.quantity.is_finite() && input.quantity >= 0.0) {
+            return Err(CarbonFootprintError::InvalidInputQuantity);
+        }
+        normalized.push(CarbonFootprintInput {
+            kind: input.kind,
+            quantity: input.quantity,
+            unit: normalize_sustainability_text(input.unit).unwrap_or_else(|| "unit".to_string()),
+            evidence_ref: normalize_sustainability_text(input.evidence_ref)
+                .unwrap_or_else(|| format!("operation_input:{}", input.kind.as_str())),
+        });
+    }
+    normalized.sort_by_key(|input| input.kind);
+    Ok(normalized)
+}
+
+fn normalize_carbon_factors(
+    factors: Vec<CarbonEmissionFactor>,
+) -> Result<Vec<CarbonEmissionFactor>, CarbonFootprintError> {
+    let mut normalized = Vec::new();
+    for factor in factors {
+        if !(factor.factor_kg_co2e_per_unit.is_finite() && factor.factor_kg_co2e_per_unit >= 0.0) {
+            return Err(CarbonFootprintError::InvalidEmissionFactor);
+        }
+        normalized.push(CarbonEmissionFactor {
+            input_kind: factor.input_kind,
+            factor_kg_co2e_per_unit: factor.factor_kg_co2e_per_unit,
+            factor_ref: normalize_sustainability_text(factor.factor_ref)
+                .unwrap_or_else(|| format!("factor:{}", factor.input_kind.as_str())),
+        });
+    }
+    normalized.sort_by_key(|factor| factor.input_kind);
+    Ok(normalized)
+}
+
+fn carbon_footprint_evidence_refs(
+    inputs: &[CarbonFootprintInput],
+    factors: &[CarbonEmissionFactor],
+    factor_set_version: &str,
+) -> Vec<String> {
+    let mut refs = BTreeSet::from([format!("factor_set:{factor_set_version}")]);
+    for input in inputs {
+        refs.insert(input.evidence_ref.clone());
+    }
+    for factor in factors {
+        refs.insert(factor.factor_ref.clone());
+    }
+    refs.into_iter().collect()
+}
+
+fn carbon_footprint_hash(
+    record_id: &str,
+    operation_id: &str,
+    value_co2e: Option<f64>,
+    inputs: &[CarbonFootprintInput],
+    factor_set_version: &str,
+    factors: &[CarbonEmissionFactor],
+    status: CarbonFootprintStatus,
+) -> String {
+    let mut canonical = format!(
+        "record={record_id}|operation={operation_id}|status={}|value={:.6}|factor_set={factor_set_version}",
+        status.as_str(),
+        value_co2e.unwrap_or(-1.0)
+    );
+    for input in inputs {
+        canonical.push_str(&format!(
+            "|input:{}:{:.6}:{}:{}",
+            input.kind.as_str(),
+            input.quantity,
+            input.unit,
+            input.evidence_ref
+        ));
+    }
+    for factor in factors {
+        canonical.push_str(&format!(
+            "|factor:{}:{:.6}:{}",
+            factor.input_kind.as_str(),
+            factor.factor_kg_co2e_per_unit,
+            factor.factor_ref
+        ));
+    }
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -13894,8 +14191,8 @@ mod tests {
         build_marketplace_account_record, build_marketplace_inventory_record,
         build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
-        close_marketplace_listing_record, compute_drought_baseline_trend, compute_drought_index,
-        compute_drought_risk_score, compute_marketplace_demand_forecast,
+        close_marketplace_listing_record, compute_carbon_footprint, compute_drought_baseline_trend,
+        compute_drought_index, compute_drought_risk_score, compute_marketplace_demand_forecast,
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
         compute_weather_reference_et, create_marketplace_fulfillment_record,
         create_marketplace_rating_record, create_versioned_content,
@@ -13923,6 +14220,8 @@ mod tests {
         zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
         AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
         AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintFactorSet,
+        CarbonFootprintInput, CarbonFootprintInputKind, CarbonFootprintStatus,
         CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
         ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
         DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
@@ -16104,6 +16403,74 @@ mod tests {
     }
 
     #[test]
+    fn carbon_footprint_computes_value_and_retains_evidence() {
+        let result = compute_carbon_footprint(
+            carbon_footprint_request(true),
+            "generated-footprint".to_string(),
+            "2026-06-14T12:00:00Z".to_string(),
+        )
+        .expect("complete carbon inputs should compute");
+
+        assert_eq!(result.footprint_id, "footprint-001");
+        assert_eq!(result.record_id, "sustain-001");
+        assert_eq!(result.operation_id, "operation-planting-001");
+        assert_eq!(result.status, CarbonFootprintStatus::Computed);
+        assert_eq!(result.value_co2e, Some(168.8));
+        assert_eq!(result.factor_set_version, "agbot-carbon-factors-v1");
+        assert!(result
+            .evidence_refs
+            .contains(&"factor_set:agbot-carbon-factors-v1".to_string()));
+        assert!(result
+            .evidence_refs
+            .contains(&"input:fuel-log-001".to_string()));
+        assert!(result
+            .evidence_refs
+            .contains(&"factor:diesel:v1".to_string()));
+        assert!(!result.result_hash.is_empty());
+    }
+
+    #[test]
+    fn carbon_footprint_same_inputs_reproduce_hash() {
+        let first = compute_carbon_footprint(
+            carbon_footprint_request(true),
+            "generated-footprint-001".to_string(),
+            "2026-06-14T12:00:00Z".to_string(),
+        )
+        .expect("first run should compute");
+        let mut request = carbon_footprint_request(true);
+        request.footprint_id = Some("footprint-002".to_string());
+        let second = compute_carbon_footprint(
+            request,
+            "generated-footprint-002".to_string(),
+            "2026-06-15T12:00:00Z".to_string(),
+        )
+        .expect("second run should compute");
+
+        assert_eq!(first.value_co2e, second.value_co2e);
+        assert_eq!(first.result_hash, second.result_hash);
+    }
+
+    #[test]
+    fn carbon_footprint_missing_inputs_returns_insufficient_inputs() {
+        let result = compute_carbon_footprint(
+            carbon_footprint_request(false),
+            "generated-footprint".to_string(),
+            "2026-06-14T12:00:00Z".to_string(),
+        )
+        .expect("missing inputs should be explicit, not fatal");
+
+        assert_eq!(result.status, CarbonFootprintStatus::InsufficientInputs);
+        assert_eq!(result.value_co2e, None);
+        assert!(result
+            .evidence_refs
+            .contains(&"factor_set:agbot-carbon-factors-v1".to_string()));
+        assert!(result
+            .evidence_refs
+            .contains(&"input:fuel-log-001".to_string()));
+        assert!(!result.result_hash.is_empty());
+    }
+
+    #[test]
     fn versioned_content_create_and_edit_advances_current_version() {
         let (content, first_version) = create_versioned_content(
             ContentCreateRequest {
@@ -16143,6 +16510,72 @@ mod tests {
         assert_eq!(updated.updated_at, "2026-06-13T14:00:00Z");
         assert_eq!(second_version.content_id, content.content_id);
         assert_eq!(second_version.body, "Updated body");
+    }
+
+    fn carbon_footprint_request(include_required: bool) -> CarbonFootprintComputeRequest {
+        let mut inputs = vec![
+            CarbonFootprintInput {
+                kind: CarbonFootprintInputKind::DieselLiters,
+                quantity: 10.0,
+                unit: "liters".to_string(),
+                evidence_ref: "input:fuel-log-001".to_string(),
+            },
+            CarbonFootprintInput {
+                kind: CarbonFootprintInputKind::FertilizerNitrogenKg,
+                quantity: 20.0,
+                unit: "kg_n".to_string(),
+                evidence_ref: "input:fertilizer-ticket-001".to_string(),
+            },
+            CarbonFootprintInput {
+                kind: CarbonFootprintInputKind::ElectricityKwh,
+                quantity: 15.0,
+                unit: "kwh".to_string(),
+                evidence_ref: "input:meter-001".to_string(),
+            },
+            CarbonFootprintInput {
+                kind: CarbonFootprintInputKind::FieldPasses,
+                quantity: 2.0,
+                unit: "passes".to_string(),
+                evidence_ref: "input:coverage-log-001".to_string(),
+            },
+        ];
+        let mut factors = vec![
+            CarbonEmissionFactor {
+                input_kind: CarbonFootprintInputKind::DieselLiters,
+                factor_kg_co2e_per_unit: 2.68,
+                factor_ref: "factor:diesel:v1".to_string(),
+            },
+            CarbonEmissionFactor {
+                input_kind: CarbonFootprintInputKind::FertilizerNitrogenKg,
+                factor_kg_co2e_per_unit: 6.3,
+                factor_ref: "factor:nitrogen:v1".to_string(),
+            },
+            CarbonEmissionFactor {
+                input_kind: CarbonFootprintInputKind::ElectricityKwh,
+                factor_kg_co2e_per_unit: 0.4,
+                factor_ref: "factor:electricity:v1".to_string(),
+            },
+            CarbonEmissionFactor {
+                input_kind: CarbonFootprintInputKind::FieldPasses,
+                factor_kg_co2e_per_unit: 5.0,
+                factor_ref: "factor:field-pass:v1".to_string(),
+            },
+        ];
+        if !include_required {
+            inputs.retain(|input| input.kind != CarbonFootprintInputKind::FieldPasses);
+            factors.retain(|factor| factor.input_kind != CarbonFootprintInputKind::FieldPasses);
+        }
+
+        CarbonFootprintComputeRequest {
+            footprint_id: Some("footprint-001".to_string()),
+            record_id: "sustain-001".to_string(),
+            operation_id: "operation-planting-001".to_string(),
+            inputs,
+            factor_set: CarbonFootprintFactorSet {
+                version: "agbot-carbon-factors-v1".to_string(),
+                factors,
+            },
+        }
     }
 
     #[test]

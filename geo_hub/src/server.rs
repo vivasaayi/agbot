@@ -347,6 +347,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_sustainability_record),
         )
         .route(
+            "/api/sustainability/carbon-footprints",
+            get(routes::list_carbon_footprints).post(routes::create_carbon_footprint),
+        )
+        .route(
+            "/api/sustainability/carbon-footprints/:footprint_id",
+            get(routes::get_carbon_footprint),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
         )

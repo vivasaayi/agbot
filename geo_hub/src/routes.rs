@@ -90,14 +90,14 @@ use shared::schemas::{
     build_marketplace_account_record, build_marketplace_catalog_item_record,
     build_marketplace_inventory_record, build_marketplace_portal_entry,
     build_soil_moisture_reading, build_sustainability_record, build_tractor_record,
-    close_marketplace_listing_record, compute_drought_index, compute_marketplace_demand_forecast,
-    create_marketplace_fulfillment_record, create_marketplace_rating_record,
-    create_versioned_content, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
-    parse_content_status, parse_content_type, parse_drought_index_type,
-    parse_marketplace_account_status, parse_marketplace_catalog_category,
-    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
-    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
-    parse_marketplace_order_status, parse_marketplace_party_type,
+    close_marketplace_listing_record, compute_carbon_footprint, compute_drought_index,
+    compute_marketplace_demand_forecast, create_marketplace_fulfillment_record,
+    create_marketplace_rating_record, create_versioned_content, fulfill_marketplace_inventory,
+    normalize_weather_provider_forecast, parse_carbon_footprint_status, parse_content_status,
+    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
+    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
+    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
+    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
     place_marketplace_order_record, prepare_open_data_publication,
@@ -106,6 +106,8 @@ use shared::schemas::{
     soil_moisture_rejection_record, transition_marketplace_account_status,
     transition_marketplace_fulfillment_status, transition_marketplace_order_status,
     validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
+    CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintError,
+    CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
     CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
     CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
     ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
@@ -774,6 +776,18 @@ pub struct SustainabilityRecordListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SustainabilityRecordScopeQuery {
     pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CarbonFootprintListQuery {
+    pub record_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub status: Option<CarbonFootprintStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CarbonFootprintScopeQuery {
+    pub record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4129,6 +4143,91 @@ pub async fn get_sustainability_record(
     }
 
     Ok(Json(record))
+}
+
+pub async fn create_carbon_footprint(
+    State(state): State<AppState>,
+    Json(request): Json<CarbonFootprintComputeRequest>,
+) -> AppResult<Json<CarbonFootprintResult>> {
+    let requested_record_id =
+        normalize_optional_text(Some(request.record_id.clone())).ok_or_else(|| {
+            AppError::BadRequest("carbon footprint record_id is required".to_string())
+        })?;
+    let record = load_sustainability_record(&state, &requested_record_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "sustainability record {requested_record_id} is required for carbon footprint"
+            ))
+        })?;
+    let result = compute_carbon_footprint(
+        request,
+        format!("carbon-footprint-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(carbon_footprint_error)?;
+    if result.operation_id != record.operation_id {
+        return Err(AppError::BadRequest(format!(
+            "carbon footprint operation_id {} does not match sustainability record operation_id {}",
+            result.operation_id, record.operation_id
+        )));
+    }
+    insert_carbon_footprint_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_carbon_footprints(
+    Query(query): Query<CarbonFootprintListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CarbonFootprintResult>>> {
+    let record_id = normalize_optional_text(query.record_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "record_id query parameter is required for carbon footprints".to_string(),
+        )
+    })?;
+    let operation_id = normalize_optional_text(query.operation_id);
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT footprint_id, record_id, operation_id, value_co2e, inputs_json,
+               factor_set_version, factors_json, evidence_refs_json, status, result_hash,
+               computed_at
+        FROM carbon_footprints
+        WHERE record_id = ?1
+          AND (?2 IS NULL OR operation_id = ?2)
+          AND (?3 IS NULL OR status = ?3)
+        ORDER BY computed_at ASC, footprint_id ASC
+        "#,
+    )
+    .bind(record_id)
+    .bind(operation_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_carbon_footprint_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_carbon_footprint(
+    Path(footprint_id): Path<String>,
+    Query(query): Query<CarbonFootprintScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CarbonFootprintResult>> {
+    let record_id = normalize_optional_text(query.record_id)
+        .ok_or_else(|| AppError::BadRequest("record_id query parameter is required".to_string()))?;
+    let footprint = load_carbon_footprint_result(&state, &footprint_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if footprint.record_id != record_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(footprint))
 }
 
 pub async fn create_content_item(
@@ -9218,6 +9317,10 @@ fn sustainability_record_error(error: SustainabilityRecordError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn carbon_footprint_error(error: CarbonFootprintError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn content_error(error: ContentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -10856,6 +10959,48 @@ fn decode_sustainability_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Sust
         method_version: row.get("method_version"),
         created_at: row.get("created_at"),
         audit_id: row.get("audit_id"),
+    })
+}
+
+fn decode_carbon_footprint_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CarbonFootprintResult> {
+    let inputs =
+        serde_json::from_str::<Vec<CarbonFootprintInput>>(&row.get::<String, _>("inputs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode carbon footprint inputs_json"),
+                )
+            })?;
+    let factors =
+        serde_json::from_str::<Vec<CarbonEmissionFactor>>(&row.get::<String, _>("factors_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode carbon footprint factors_json"),
+                )
+            })?;
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode carbon footprint evidence_refs_json"),
+        )
+    })?;
+
+    Ok(CarbonFootprintResult {
+        footprint_id: row.get("footprint_id"),
+        record_id: row.get("record_id"),
+        operation_id: row.get("operation_id"),
+        value_co2e: row.get("value_co2e"),
+        inputs,
+        factor_set_version: row.get("factor_set_version"),
+        factors,
+        evidence_refs,
+        status: parse_carbon_footprint_status(&row.get::<String, _>("status"))
+            .map_err(carbon_footprint_error)?,
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
     })
 }
 
@@ -13080,6 +13225,66 @@ async fn load_sustainability_record(
     .map_err(Error::from)?;
 
     row.map(|row| decode_sustainability_record(&row))
+        .transpose()
+}
+
+async fn insert_carbon_footprint_result(
+    state: &AppState,
+    result: &CarbonFootprintResult,
+) -> AppResult<()> {
+    let inputs_json =
+        serde_json::to_string(&result.inputs).map_err(|err| AppError::Anyhow(err.into()))?;
+    let factors_json =
+        serde_json::to_string(&result.factors).map_err(|err| AppError::Anyhow(err.into()))?;
+    let evidence_refs_json =
+        serde_json::to_string(&result.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO carbon_footprints (
+            footprint_id, record_id, operation_id, value_co2e, inputs_json,
+            factor_set_version, factors_json, evidence_refs_json, status, result_hash,
+            computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&result.footprint_id)
+    .bind(&result.record_id)
+    .bind(&result.operation_id)
+    .bind(result.value_co2e)
+    .bind(inputs_json)
+    .bind(&result.factor_set_version)
+    .bind(factors_json)
+    .bind(evidence_refs_json)
+    .bind(result.status.as_str())
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_carbon_footprint_result(
+    state: &AppState,
+    footprint_id: &str,
+) -> AppResult<Option<CarbonFootprintResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT footprint_id, record_id, operation_id, value_co2e, inputs_json,
+               factor_set_version, factors_json, evidence_refs_json, status, result_hash,
+               computed_at
+        FROM carbon_footprints
+        WHERE footprint_id = ?1
+        "#,
+    )
+    .bind(footprint_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_carbon_footprint_result(&row))
         .transpose()
 }
 
