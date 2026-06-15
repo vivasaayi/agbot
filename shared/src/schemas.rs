@@ -3054,6 +3054,39 @@ pub struct WeatherGrowingDegreeDay {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherReferenceEtInput {
+    pub field_ref: String,
+    pub date: String,
+    #[serde(default)]
+    pub temperature_celsius: Option<WeatherFreshnessAnnotatedValue>,
+    #[serde(default)]
+    pub humidity_percent: Option<WeatherFreshnessAnnotatedValue>,
+    #[serde(default)]
+    pub wind_speed_mps: Option<WeatherFreshnessAnnotatedValue>,
+    #[serde(default)]
+    pub radiation_w_m2: Option<WeatherFreshnessAnnotatedValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherReferenceEtStatus {
+    Computed,
+    InsufficientInputs,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherReferenceEt {
+    pub field_ref: String,
+    pub date: String,
+    pub status: WeatherReferenceEtStatus,
+    #[serde(default)]
+    pub reference_et_mm_day: Option<f64>,
+    pub method: String,
+    pub input_refs: Vec<String>,
+    pub freshness: Vec<WeatherFreshnessState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
     pub wind_speed_mps: WeatherForecastValue,
@@ -3233,6 +3266,14 @@ pub enum WeatherGrowingDegreeDayError {
     InvalidBaseTemperature,
     #[error("weather GDD timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherReferenceEtError {
+    #[error("weather ET field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("weather ET date is invalid: {date}")]
+    InvalidDate { date: String },
 }
 
 pub fn normalize_weather_provider_forecast(
@@ -4050,6 +4091,95 @@ fn parse_weather_gdd_timestamp(
         .map_err(|_| WeatherGrowingDegreeDayError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
+}
+
+pub fn compute_weather_reference_et(
+    input: WeatherReferenceEtInput,
+) -> Result<WeatherReferenceEt, WeatherReferenceEtError> {
+    let field_ref =
+        normalize_weather_text(input.field_ref).ok_or(WeatherReferenceEtError::EmptyFieldRef)?;
+    let date = NaiveDate::parse_from_str(&input.date, "%Y-%m-%d").map_err(|_| {
+        WeatherReferenceEtError::InvalidDate {
+            date: input.date.clone(),
+        }
+    })?;
+    let method = "agbot_reference_et_v1_radiation_temperature_humidity_wind".to_string();
+
+    let Some(temperature) = input.temperature_celsius else {
+        return Ok(weather_reference_et_insufficient(
+            field_ref,
+            input.date,
+            method,
+            "temperature_celsius",
+        ));
+    };
+    let Some(humidity) = input.humidity_percent else {
+        return Ok(weather_reference_et_insufficient(
+            field_ref,
+            input.date,
+            method,
+            "humidity_percent",
+        ));
+    };
+    let Some(wind) = input.wind_speed_mps else {
+        return Ok(weather_reference_et_insufficient(
+            field_ref,
+            input.date,
+            method,
+            "wind_speed_mps",
+        ));
+    };
+    let Some(radiation) = input.radiation_w_m2 else {
+        return Ok(weather_reference_et_insufficient(
+            field_ref,
+            input.date,
+            method,
+            "radiation_w_m2",
+        ));
+    };
+
+    let radiation_mj_m2_day = radiation.value.value * 0.0864;
+    let reference_et_mm_day =
+        (radiation_mj_m2_day * 0.12 + temperature.value.value * 0.03 + wind.value.value * 0.15
+            - humidity.value.value * 0.02)
+            .max(0.0);
+
+    Ok(WeatherReferenceEt {
+        field_ref,
+        date: date.to_string(),
+        status: WeatherReferenceEtStatus::Computed,
+        reference_et_mm_day: Some(reference_et_mm_day),
+        method,
+        input_refs: vec![
+            format!("temperature_celsius:{}", temperature.value.valid_time),
+            format!("humidity_percent:{}", humidity.value.valid_time),
+            format!("wind_speed_mps:{}", wind.value.valid_time),
+            format!("radiation_w_m2:{}", radiation.value.valid_time),
+        ],
+        freshness: vec![
+            temperature.freshness_state,
+            humidity.freshness_state,
+            wind.freshness_state,
+            radiation.freshness_state,
+        ],
+    })
+}
+
+fn weather_reference_et_insufficient(
+    field_ref: String,
+    date: String,
+    method: String,
+    missing_input: &str,
+) -> WeatherReferenceEt {
+    WeatherReferenceEt {
+        field_ref,
+        date,
+        status: WeatherReferenceEtStatus::InsufficientInputs,
+        reference_et_mm_day: None,
+        method,
+        input_refs: vec![format!("missing:{missing_input}")],
+        freshness: Vec::new(),
+    }
 }
 
 pub fn weather_fetch_failure_record(
@@ -8563,7 +8693,7 @@ mod tests {
         build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
-        compute_weather_growing_degree_day, create_versioned_content,
+        compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, detect_tractor_obstacle,
         dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
         evaluate_tractor_motion_gate, evaluate_tractor_weather_window_gate,
@@ -8615,11 +8745,11 @@ mod tests {
         WeatherForecastValue, WeatherFreshnessState, WeatherGrowingDegreeDayRequest,
         WeatherGrowingDegreeDayStatus, WeatherHistoryQuery, WeatherIngestError,
         WeatherOperationalWindowRequest, WeatherOperationalWindowThresholds,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherRiskThresholds,
-        WeatherRiskType, WeatherSensorIngestError, WeatherSensorSample,
-        WeatherSensorStreamIngestRequest, WorkOrderChangeType, WorkOrderCreateRequest,
-        WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry,
-        WorkOrderStatus,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherReferenceEtInput,
+        WeatherReferenceEtStatus, WeatherRiskThresholds, WeatherRiskType, WeatherSensorIngestError,
+        WeatherSensorSample, WeatherSensorStreamIngestRequest, WorkOrderChangeType,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
+        WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -10688,6 +10818,33 @@ mod tests {
     }
 
     #[test]
+    fn weather_reference_et_computes_known_case_with_method_and_inputs() {
+        let et = compute_weather_reference_et(weather_reference_et_input(true))
+            .expect("complete ET inputs should compute");
+
+        assert_eq!(et.status, WeatherReferenceEtStatus::Computed);
+        assert_eq!(et.reference_et_mm_day, Some(7.47496));
+        assert_eq!(
+            et.method,
+            "agbot_reference_et_v1_radiation_temperature_humidity_wind"
+        );
+        assert!(et
+            .input_refs
+            .contains(&"temperature_celsius:2026-06-13T10:00:00Z".to_string()));
+        assert_eq!(et.freshness.len(), 4);
+    }
+
+    #[test]
+    fn weather_reference_et_reports_insufficient_inputs() {
+        let et = compute_weather_reference_et(weather_reference_et_input(false))
+            .expect("missing ET inputs should produce insufficient-input result");
+
+        assert_eq!(et.status, WeatherReferenceEtStatus::InsufficientInputs);
+        assert_eq!(et.reference_et_mm_day, None);
+        assert_eq!(et.input_refs, vec!["missing:radiation_w_m2".to_string()]);
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -11380,6 +11537,18 @@ mod tests {
             date: date.to_string(),
             base_temperature_celsius: 10.0,
             records,
+        }
+    }
+
+    fn weather_reference_et_input(include_radiation: bool) -> WeatherReferenceEtInput {
+        let record = weather_window_record("2026-06-13T10:00:00Z", 4.2, 0.0, 22.0, false);
+        WeatherReferenceEtInput {
+            field_ref: "field-north".to_string(),
+            date: "2026-06-13".to_string(),
+            temperature_celsius: Some(record.temperature_celsius.clone()),
+            humidity_percent: Some(record.humidity_percent.clone()),
+            wind_speed_mps: Some(record.wind_speed_mps.clone()),
+            radiation_w_m2: include_radiation.then_some(record.radiation_w_m2.clone()),
         }
     }
 
