@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 2cafbab (`batch-20260615170500`)
-- **Latest checkpoint commit**: 2cafbab (`batch-20260615170500`)
-- **Current batch**: `batch-20260615173500` (`32-05`, tests_passed)
-- **Completed feature rows**: 368 committed; 2 tests_passed; 1 skipped; 1 blocked; 126 pending in this run.
+- **Last implementation commit**: 8b963b5 (`batch-20260615173500`)
+- **Latest checkpoint commit**: 8b963b5 (`batch-20260615173500`)
+- **Current batch**: none
+- **Completed feature rows**: 369 committed; 1 tests_passed; 1 skipped; 1 blocked; 126 pending in this run.
 - **Blocker**: None
 
 ## Latest verification
@@ -18,4 +18,4 @@
 
 ## Next action
 
-- Commit verified `32-05` report-generator export consolidation, then update checkpoint to select `32-06`.
+- Select and claim the next pending feature (`32-06` is the next P1 item).
