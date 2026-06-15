@@ -77,8 +77,9 @@ use plugin_sdk::{
     SandboxExecutionStatus, SandboxTerminationReason,
 };
 use provenance::{
-    ActorIdentity, ActorKind, AuditAction, AuditEntry, AuditLedger, AuditRefusalReason,
-    LineageRecord, ProvenanceParameters,
+    ActorIdentity, ActorKind, ArtifactKind, AuditAction, AuditEntry, AuditLedger,
+    AuditRefusalReason, BackwardProvenanceTrace, LineageLedger, LineageRecord,
+    ProvenanceParameters,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::plugin_extensions::ExtensionPointKind;
@@ -5710,6 +5711,27 @@ pub async fn download_scene_report(
         .await?
         .ok_or(AppError::NotFound)?;
     report_file_response(&report).await
+}
+
+pub async fn get_scene_report_lineage(
+    Path((scene_id, report_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<Json<BackwardProvenanceTrace>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let report = load_report(&state, &scene_id, &report_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let records = build_report_lineage_records(&state, &report).await?;
+    let ledger = LineageLedger::from_persisted_records(records)
+        .map_err(|err| AppError::Anyhow(Error::new(err)))?;
+    let trace = ledger
+        .trace_backward(&report_artifact_ref(&report.report_id))
+        .map_err(|err| AppError::Anyhow(Error::new(err)))?;
+
+    Ok(Json(trace))
 }
 
 pub async fn create_report_share(
@@ -12513,6 +12535,190 @@ async fn load_report(
     .map_err(Error::from)?;
 
     row.map(|row| decode_report_record(&row)).transpose()
+}
+
+async fn build_report_lineage_records(
+    state: &AppState,
+    report: &ReportRecord,
+) -> AppResult<Vec<LineageRecord>> {
+    let mut records = load_all_provenance_lineage_records(state).await?;
+    let mut seen = records
+        .iter()
+        .map(|record| record.artifact_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    push_lineage_record_if_absent(
+        &mut records,
+        &mut seen,
+        LineageRecord {
+            artifact_id: scene_artifact_ref(&report.scene_id),
+            kind: ArtifactKind::Scene,
+            inputs: Vec::new(),
+            method: "10.scene_registry".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "scene_id": &report.scene_id,
+                "field_id": &report.field_id,
+            })),
+            operator: report.generated_by.clone(),
+            actor: ActorIdentity::system("geo_hub"),
+            created_at: report.created_at.clone(),
+        },
+    );
+
+    let annotations = load_scene_annotation_records(state, &report.scene_id).await?;
+    for annotation in &annotations {
+        push_lineage_record_if_absent(
+            &mut records,
+            &mut seen,
+            LineageRecord {
+                artifact_id: annotation_artifact_ref(&annotation.annotation_id),
+                kind: ArtifactKind::Annotation,
+                inputs: vec![scene_artifact_ref(&annotation.scene_id)],
+                method: "10.annotation_persistence".to_string(),
+                parameters: ProvenanceParameters::from_json(serde_json::json!({
+                    "field_id": &annotation.field_id,
+                    "label": &annotation.label,
+                    "severity": &annotation.severity,
+                    "crs": &annotation.crs,
+                    "audit_id": &annotation.audit_id,
+                })),
+                operator: annotation
+                    .author
+                    .clone()
+                    .unwrap_or_else(|| report.generated_by.clone()),
+                actor: ActorIdentity::system("geo_hub"),
+                created_at: annotation.created_at.clone(),
+            },
+        );
+    }
+
+    let recommendations = load_scene_recommendation_records(state, &report.scene_id).await?;
+    for recommendation in &recommendations {
+        let annotation_inputs =
+            load_recommendation_annotation_ids(state, &recommendation.recommendation_id)
+                .await?
+                .into_iter()
+                .map(|annotation_id| annotation_artifact_ref(&annotation_id));
+        let inputs = unique_lineage_inputs(
+            annotation_inputs
+                .chain(recommendation.evidence_refs.iter().cloned())
+                .collect::<Vec<_>>(),
+        );
+        push_lineage_record_if_absent(
+            &mut records,
+            &mut seen,
+            LineageRecord {
+                artifact_id: recommendation_artifact_ref(&recommendation.recommendation_id),
+                kind: ArtifactKind::Recommendation,
+                inputs,
+                method: "10.recommendation_lifecycle".to_string(),
+                parameters: ProvenanceParameters::from_json(serde_json::json!({
+                    "field_id": &recommendation.field_id,
+                    "title": &recommendation.title,
+                    "category": &recommendation.category,
+                    "priority": recommendation.priority,
+                    "status": recommendation.status,
+                })),
+                operator: recommendation.author_user_id.clone(),
+                actor: ActorIdentity::system("geo_hub"),
+                created_at: recommendation.created_at.clone(),
+            },
+        );
+    }
+
+    let report_inputs = unique_lineage_inputs(
+        std::iter::once(scene_artifact_ref(&report.scene_id))
+            .chain(
+                annotations
+                    .iter()
+                    .map(|annotation| annotation_artifact_ref(&annotation.annotation_id)),
+            )
+            .chain(recommendations.iter().map(|recommendation| {
+                recommendation_artifact_ref(&recommendation.recommendation_id)
+            }))
+            .chain(report.source_refs.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+    push_lineage_record_if_absent(
+        &mut records,
+        &mut seen,
+        LineageRecord {
+            artifact_id: report_artifact_ref(&report.report_id),
+            kind: ArtifactKind::Report,
+            inputs: report_inputs,
+            method: "10.report_deliverable".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "scene_id": &report.scene_id,
+                "field_id": &report.field_id,
+                "season_id": &report.season_id,
+                "title": &report.title,
+                "artifact_uri": &report.artifact_uri,
+                "annotation_count": report.annotation_count,
+                "recommendation_count": report.recommendation_count,
+            })),
+            operator: report.generated_by.clone(),
+            actor: ActorIdentity::system("geo_hub"),
+            created_at: report.created_at.clone(),
+        },
+    );
+
+    Ok(records)
+}
+
+async fn load_all_provenance_lineage_records(state: &AppState) -> AppResult<Vec<LineageRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT artifact_id, kind, inputs_json, method, parameters_json, operator, actor_id,
+               actor_kind, created_at
+        FROM provenance_lineage_records
+        ORDER BY created_at ASC, artifact_id ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_lineage_record(&row))
+        .collect()
+}
+
+fn push_lineage_record_if_absent(
+    records: &mut Vec<LineageRecord>,
+    seen: &mut BTreeSet<String>,
+    record: LineageRecord,
+) {
+    if seen.insert(record.artifact_id.clone()) {
+        records.push(record);
+    }
+}
+
+fn unique_lineage_inputs(inputs: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    inputs
+        .into_iter()
+        .filter_map(|input| {
+            let input = input.trim();
+            (!input.is_empty()).then(|| input.to_string())
+        })
+        .filter(|input| seen.insert(input.clone()))
+        .collect()
+}
+
+fn scene_artifact_ref(scene_id: &str) -> String {
+    format!("scene:{scene_id}")
+}
+
+fn annotation_artifact_ref(annotation_id: &str) -> String {
+    format!("annotation:{annotation_id}")
+}
+
+fn recommendation_artifact_ref(recommendation_id: &str) -> String {
+    format!("recommendation:{recommendation_id}")
+}
+
+fn report_artifact_ref(report_id: &str) -> String {
+    format!("report:{report_id}")
 }
 
 async fn load_report_share(

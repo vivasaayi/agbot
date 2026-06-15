@@ -398,6 +398,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_scene_reports).post(routes::generate_scene_report),
         )
         .route(
+            "/api/scenes/:scene_id/reports/:report_id/lineage",
+            get(routes::get_scene_report_lineage),
+        )
+        .route(
             "/api/scenes/:scene_id/reports/:report_id",
             get(routes::download_scene_report),
         )

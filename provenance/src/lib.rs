@@ -13,6 +13,8 @@ pub enum ArtifactKind {
     Scene,
     Product,
     Finding,
+    Annotation,
+    Recommendation,
     Report,
     Action,
 }
@@ -475,6 +477,20 @@ pub enum ProvenanceError {
 }
 
 impl LineageLedger {
+    pub fn from_persisted_records(records: Vec<LineageRecord>) -> Result<Self, ProvenanceError> {
+        let mut ledger = Self::default();
+        for record in records {
+            let record = normalize_lineage_record(record)?;
+            if ledger.records.contains_key(&record.artifact_id) {
+                return Err(ProvenanceError::DuplicateArtifactId {
+                    artifact_id: record.artifact_id,
+                });
+            }
+            ledger.records.insert(record.artifact_id.clone(), record);
+        }
+        Ok(ledger)
+    }
+
     pub fn record_lineage(
         &mut self,
         record: LineageRecord,
@@ -1456,6 +1472,10 @@ fn entry_artifact_kind(entry: &AuditEntry) -> Option<ArtifactKind> {
         Some(ArtifactKind::Product)
     } else if artifact_ref.starts_with("finding:") {
         Some(ArtifactKind::Finding)
+    } else if artifact_ref.starts_with("annotation:") {
+        Some(ArtifactKind::Annotation)
+    } else if artifact_ref.starts_with("recommendation:") {
+        Some(ArtifactKind::Recommendation)
     } else if artifact_ref.starts_with("report:") {
         Some(ArtifactKind::Report)
     } else if artifact_ref.starts_with("action:") || artifact_ref.starts_with("mission:") {
@@ -2269,6 +2289,52 @@ mod tests {
         assert_eq!(
             trace.gaps[0].referenced_by,
             Some("finding:09:stress-ne-zone".to_string())
+        );
+    }
+
+    #[test]
+    fn persisted_lineage_records_preserve_retracted_source_gaps() {
+        let report = LineageRecord {
+            artifact_id: "report:field-alpha:weekly".to_string(),
+            kind: ArtifactKind::Report,
+            inputs: vec![
+                "scene:alpha-2026-06-12".to_string(),
+                "annotation:stress-zone".to_string(),
+                "recommendation:refly-zone-ne".to_string(),
+            ],
+            method: "10.report_deliverable".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "field_id": "field-alpha"
+            })),
+            operator: "operator:dsp-7".to_string(),
+            actor: ActorIdentity::system("geo_hub"),
+            created_at: "2026-06-12T11:00:00Z".to_string(),
+        };
+        let scene = LineageRecord {
+            artifact_id: "scene:alpha-2026-06-12".to_string(),
+            kind: ArtifactKind::Scene,
+            inputs: Vec::new(),
+            method: "07.scene_registry".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({})),
+            operator: "operator:dsp-7".to_string(),
+            actor: ActorIdentity::system("geo_hub"),
+            created_at: "2026-06-12T09:00:00Z".to_string(),
+        };
+
+        let ledger = LineageLedger::from_persisted_records(vec![report, scene])
+            .expect("persisted records should allow gaps during reconstruction");
+        let trace = ledger
+            .trace_backward("report:field-alpha:weekly")
+            .expect("trace should resolve present records and gaps");
+
+        assert_eq!(trace.records.len(), 2);
+        assert_eq!(
+            trace
+                .gaps
+                .iter()
+                .map(|gap| gap.missing_artifact_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["annotation:stress-zone", "recommendation:refly-zone-ne"]
         );
     }
 

@@ -8307,6 +8307,7 @@ async fn acceptance_generate_and_retrieve_report() -> Result<()> {
                         "category": "irrigation",
                         "priority": "medium",
                         "status": "open",
+                        "evidence_refs": ["finding:09:retracted-zone"],
                         "annotation_ids": ["accept-ann-1"]
                     })
                     .to_string(),
@@ -8345,6 +8346,7 @@ async fn acceptance_generate_and_retrieve_report() -> Result<()> {
 
     let download_response = ctx
         .app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -8358,6 +8360,47 @@ async fn acceptance_generate_and_retrieve_report() -> Result<()> {
         .await
         .expect("router should handle request");
     assert_eq!(download_response.status(), StatusCode::OK);
+
+    let lineage_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{}/reports/{}/lineage",
+                    fixture.scene_id, report_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(lineage_response.status(), StatusCode::OK);
+    let body = to_bytes(lineage_response.into_body(), 128 * 1024).await?;
+    let lineage_json: serde_json::Value = serde_json::from_slice(&body)?;
+    let artifact_ids = lineage_json
+        .get("records")
+        .and_then(|value| value.as_array())
+        .expect("lineage records should exist")
+        .iter()
+        .filter_map(|record| record.get("artifact_id").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    assert!(artifact_ids
+        .iter()
+        .any(|artifact_id| *artifact_id == format!("report:{report_id}")));
+    assert!(artifact_ids
+        .iter()
+        .any(|artifact_id| artifact_id.starts_with("scene:")));
+    assert!(artifact_ids.contains(&"annotation:accept-ann-1"));
+    assert!(artifact_ids
+        .iter()
+        .any(|artifact_id| artifact_id.starts_with("recommendation:")));
+    assert_eq!(
+        lineage_json
+            .pointer("/gaps/0/missing_artifact_id")
+            .and_then(|value| value.as_str()),
+        Some("finding:09:retracted-zone")
+    );
 
     Ok(())
 }
