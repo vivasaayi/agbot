@@ -4833,6 +4833,68 @@ pub enum RemoteSensingMoistureProxyError {
     SpatialRef(#[from] RasterSpatialRefError),
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationEventRequest {
+    #[serde(default)]
+    pub event_id: Option<String>,
+    pub field_id: String,
+    pub zone_ref: String,
+    pub applied_amount_mm: f64,
+    pub source: String,
+    pub timestamp: String,
+    pub actor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationEventRecord {
+    pub event_id: String,
+    pub field_id: String,
+    pub zone_ref: String,
+    pub applied_amount_mm: f64,
+    pub source: String,
+    pub timestamp: String,
+    pub actor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrrigationHistoryQuery {
+    pub field_id: String,
+    pub start_time: String,
+    pub end_time: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationHistoryQueryResult {
+    pub field_id: String,
+    pub total_count: usize,
+    pub empty: bool,
+    pub events: Vec<IrrigationEventRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IrrigationHistoryError {
+    #[error("irrigation event_id cannot be empty")]
+    EmptyEventId,
+    #[error("irrigation field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("irrigation zone_ref cannot be empty")]
+    EmptyZoneRef,
+    #[error("irrigation field not found: {field_id}")]
+    FieldNotFound { field_id: String },
+    #[error("irrigation applied amount is invalid: {value}")]
+    InvalidAppliedAmount { value: String },
+    #[error("irrigation source cannot be empty")]
+    EmptySource,
+    #[error("irrigation timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("irrigation actor cannot be empty")]
+    EmptyActor,
+    #[error("irrigation timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error("irrigation history date range is invalid")]
+    InvalidDateRange,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SoilMoistureRejectionReason {
@@ -5021,6 +5083,87 @@ pub fn ingest_remote_sensing_moisture_proxy_layer(
     Ok(records)
 }
 
+pub fn append_irrigation_history_event(
+    mut existing: Vec<IrrigationEventRecord>,
+    request: IrrigationEventRequest,
+    field: &FieldRecord,
+    generated_event_id: String,
+) -> Result<Vec<IrrigationEventRecord>, IrrigationHistoryError> {
+    let event_id = normalize_soil_moisture_optional_text(request.event_id)
+        .or_else(|| normalize_soil_moisture_text(generated_event_id))
+        .ok_or(IrrigationHistoryError::EmptyEventId)?;
+    let field_id = normalize_soil_moisture_text(request.field_id)
+        .ok_or(IrrigationHistoryError::EmptyFieldId)?;
+    if field.field_id != field_id {
+        return Err(IrrigationHistoryError::FieldNotFound { field_id });
+    }
+    let zone_ref = normalize_soil_moisture_text(request.zone_ref)
+        .ok_or(IrrigationHistoryError::EmptyZoneRef)?;
+    if !(request.applied_amount_mm.is_finite() && request.applied_amount_mm >= 0.0) {
+        return Err(IrrigationHistoryError::InvalidAppliedAmount {
+            value: request.applied_amount_mm.to_string(),
+        });
+    }
+    let source =
+        normalize_soil_moisture_text(request.source).ok_or(IrrigationHistoryError::EmptySource)?;
+    let timestamp = normalize_soil_moisture_text(request.timestamp)
+        .ok_or(IrrigationHistoryError::EmptyTimestamp)?;
+    parse_irrigation_timestamp(&timestamp)?;
+    let actor =
+        normalize_soil_moisture_text(request.actor).ok_or(IrrigationHistoryError::EmptyActor)?;
+
+    existing.push(IrrigationEventRecord {
+        event_id,
+        field_id,
+        zone_ref,
+        applied_amount_mm: request.applied_amount_mm,
+        source,
+        timestamp,
+        actor,
+    });
+    Ok(existing)
+}
+
+pub fn query_irrigation_history(
+    events: &[IrrigationEventRecord],
+    query: IrrigationHistoryQuery,
+) -> Result<IrrigationHistoryQueryResult, IrrigationHistoryError> {
+    let field_id =
+        normalize_soil_moisture_text(query.field_id).ok_or(IrrigationHistoryError::EmptyFieldId)?;
+    let start_time = normalize_soil_moisture_text(query.start_time)
+        .ok_or(IrrigationHistoryError::EmptyTimestamp)?;
+    let end_time = normalize_soil_moisture_text(query.end_time)
+        .ok_or(IrrigationHistoryError::EmptyTimestamp)?;
+    let start = parse_irrigation_timestamp(&start_time)?;
+    let end = parse_irrigation_timestamp(&end_time)?;
+    if end < start {
+        return Err(IrrigationHistoryError::InvalidDateRange);
+    }
+
+    let mut matching = events
+        .iter()
+        .filter(|event| event.field_id == field_id)
+        .filter_map(|event| {
+            parse_irrigation_timestamp(&event.timestamp)
+                .ok()
+                .filter(|timestamp| *timestamp >= start && *timestamp <= end)
+                .map(|_| event.clone())
+        })
+        .collect::<Vec<_>>();
+    matching.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then(left.event_id.cmp(&right.event_id))
+    });
+
+    Ok(IrrigationHistoryQueryResult {
+        field_id,
+        total_count: matching.len(),
+        empty: matching.is_empty(),
+        events: matching,
+    })
+}
+
 pub fn soil_moisture_rejection_record(
     rejection_id: String,
     request: &SoilMoistureReadingRequest,
@@ -5139,6 +5282,16 @@ fn geo_bounds_match(left: &GeoBounds, right: &GeoBounds) -> bool {
         && (left.min_lat - right.min_lat).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
         && (left.max_lon - right.max_lon).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
         && (left.max_lat - right.max_lat).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE
+}
+
+fn parse_irrigation_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, IrrigationHistoryError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| IrrigationHistoryError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 pub const DROUGHT_INDEX_METHOD_STANDARDIZED_ANOMALY_V1: &str = "standardized_anomaly_v1";
@@ -9331,7 +9484,7 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 mod tests {
     use super::{
         advise_weather_operational_windows, annotate_weather_record_freshness,
-        append_content_version, append_weather_history_records,
+        append_content_version, append_irrigation_history_event, append_weather_history_records,
         apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
         apply_tractor_implement_command, assert_flight_operation_allowed,
         assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
@@ -9345,9 +9498,10 @@ mod tests {
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_tractor_prescription,
         ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
-        normalize_weather_provider_forecast, plan_tractor_swath_coverage, query_weather_history,
-        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
-        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
+        normalize_weather_provider_forecast, plan_tractor_swath_coverage, query_irrigation_history,
+        query_weather_history, resolve_weather_forecast_to_field, route_weather_alert,
+        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
         verify_weather_forecast_accuracy, weather_fetch_failure_record, AccessAnomalySignal,
@@ -9363,9 +9517,9 @@ mod tests {
         FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
         FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
         FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
-        MarketplacePartyType, MultispectralImage, OpenDataPublishError,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRequest,
+        IrrigationHistoryQuery, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+        MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, OpenDataPublishError,
         OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
         RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus,
@@ -11880,6 +12034,64 @@ mod tests {
     }
 
     #[test]
+    fn irrigation_history_query_returns_field_range_in_timestamp_order() {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+        let history = append_irrigation_history_event(
+            Vec::new(),
+            irrigation_event_request("event-002", "2026-06-13T11:00:00Z", 8.0),
+            &field,
+            "generated-event".to_string(),
+        )
+        .expect("first irrigation event appends");
+        let history = append_irrigation_history_event(
+            history,
+            irrigation_event_request("event-001", "2026-06-13T10:00:00Z", 6.0),
+            &field,
+            "generated-event".to_string(),
+        )
+        .expect("second irrigation event appends");
+
+        let result = query_irrigation_history(
+            &history,
+            IrrigationHistoryQuery {
+                field_id: " field-north ".to_string(),
+                start_time: "2026-06-13T09:00:00Z".to_string(),
+                end_time: "2026-06-13T12:00:00Z".to_string(),
+            },
+        )
+        .expect("history query should succeed");
+
+        assert!(!result.empty);
+        assert_eq!(result.total_count, 2);
+        assert_eq!(result.events[0].event_id, "event-001");
+        assert_eq!(result.events[0].zone_ref, "zone:north");
+        assert_eq!(result.events[0].applied_amount_mm, 6.0);
+        assert_eq!(result.events[0].source, "valve-controller");
+        assert_eq!(result.events[0].actor, "ops@example.com");
+        assert_eq!(result.events[1].event_id, "event-002");
+    }
+
+    #[test]
+    fn irrigation_history_query_returns_explicit_empty_result() {
+        let result = query_irrigation_history(
+            &[],
+            IrrigationHistoryQuery {
+                field_id: "field-north".to_string(),
+                start_time: "2026-06-13T09:00:00Z".to_string(),
+                end_time: "2026-06-13T12:00:00Z".to_string(),
+            },
+        )
+        .expect("empty irrigation history is valid");
+
+        assert_eq!(result.field_id, "field-north");
+        assert_eq!(result.total_count, 0);
+        assert!(result.empty);
+        assert!(result.events.is_empty());
+    }
+
+    #[test]
     fn drought_index_compute_persists_standardized_value_and_input_refs() {
         let record = compute_drought_index(
             DroughtIndexComputeRequest {
@@ -12086,6 +12298,22 @@ mod tests {
                     value: 0.21,
                 },
             ],
+        }
+    }
+
+    fn irrigation_event_request(
+        event_id: &str,
+        timestamp: &str,
+        applied_amount_mm: f64,
+    ) -> IrrigationEventRequest {
+        IrrigationEventRequest {
+            event_id: Some(format!(" {event_id} ")),
+            field_id: " field-north ".to_string(),
+            zone_ref: " zone:north ".to_string(),
+            applied_amount_mm,
+            source: " valve-controller ".to_string(),
+            timestamp: format!(" {timestamp} "),
+            actor: " ops@example.com ".to_string(),
         }
     }
 
