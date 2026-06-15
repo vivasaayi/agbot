@@ -474,6 +474,47 @@ pub struct ChangeReproducibilityReport {
     pub output_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScalarConsumerMetricRegistration {
+    pub consumer_domain: String,
+    pub metric: String,
+    pub unit: String,
+    pub expected_cadence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalarConsumerPoint {
+    pub consumer_domain: String,
+    pub entity_ref: String,
+    pub metric: String,
+    pub unit: String,
+    pub t: String,
+    pub value: f64,
+    pub source_ref: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalarConsumerEvaluationRequest {
+    #[serde(default)]
+    pub registrations: Vec<ScalarConsumerMetricRegistration>,
+    #[serde(default)]
+    pub points: Vec<ScalarConsumerPoint>,
+    pub target: ZonalTrendTarget,
+    pub trend_config: ZonalTrendConfig,
+    pub baseline_config: RollingBaselineConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalarConsumerEvaluation {
+    pub registered_metric_count: usize,
+    pub appended_point_count: usize,
+    pub trend: ZonalTrendResult,
+    pub baseline: RollingBaselineResult,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompareViewFeed {
     pub schema_version: String,
@@ -768,6 +809,12 @@ pub enum TimeSeriesError {
     ChangeReproducibilityInputMismatch,
     #[error("change reproducibility hash input could not be serialized")]
     ChangeReproducibilitySerializationFailed,
+    #[error("consumer_domain cannot be empty")]
+    EmptyConsumerDomain,
+    #[error("scalar consumer evaluation requires at least one metric registration")]
+    EmptyScalarConsumerRegistrations,
+    #[error("scalar consumer evaluation requires at least one point")]
+    EmptyScalarConsumerPoints,
     #[error("export CRS cannot be empty")]
     EmptyExportCrs,
     #[error("change zone export CRS mismatch: expected {expected_crs}, got {actual_crs}")]
@@ -1321,6 +1368,59 @@ pub fn build_change_reproducibility_report(
         event_magnitude_threshold: event_config.map(|config| config.magnitude_threshold),
         evidence_refs: evidence_refs.into_iter().collect(),
         output_hash,
+    })
+}
+
+pub fn evaluate_scalar_consumer_series(
+    request: ScalarConsumerEvaluationRequest,
+) -> Result<ScalarConsumerEvaluation, TimeSeriesError> {
+    if request.registrations.is_empty() {
+        return Err(TimeSeriesError::EmptyScalarConsumerRegistrations);
+    }
+    if request.points.is_empty() {
+        return Err(TimeSeriesError::EmptyScalarConsumerPoints);
+    }
+
+    let mut engine = TimeSeriesEngine::default();
+    let registered_metric_count = request.registrations.len();
+    for registration in request.registrations {
+        let registration = normalize_scalar_consumer_registration(registration)?;
+        engine.register_metric(MetricDefinition {
+            metric: registration.metric,
+            unit: registration.unit,
+            kind: MetricKind::Scalar,
+            expected_cadence: registration.expected_cadence,
+        })?;
+    }
+
+    let mut appended_point_count = 0;
+    for point in request.points {
+        let point = normalize_scalar_consumer_point(point)?;
+        engine.append(SeriesPoint {
+            entity_ref: point.entity_ref,
+            metric: point.metric,
+            unit: point.unit,
+            t: point.t,
+            value: SeriesValue::Scalar { value: point.value },
+            source_ref: point.source_ref,
+            created_at: point.created_at,
+        })?;
+        appended_point_count += 1;
+    }
+
+    let trend = engine.compute_zonal_trend(request.target.clone(), request.trend_config)?;
+    let baseline = engine.compute_rolling_baseline(request.target, request.baseline_config)?;
+    let mut evidence_refs = Vec::new();
+    for reference in trend.evidence_refs.iter().chain(&baseline.evidence_refs) {
+        push_unique(&mut evidence_refs, reference.clone());
+    }
+
+    Ok(ScalarConsumerEvaluation {
+        registered_metric_count,
+        appended_point_count,
+        trend,
+        baseline,
+        evidence_refs,
     })
 }
 
@@ -2134,6 +2234,47 @@ fn normalize_metric_definition(
     Ok(definition)
 }
 
+fn normalize_scalar_consumer_registration(
+    registration: ScalarConsumerMetricRegistration,
+) -> Result<ScalarConsumerMetricRegistration, TimeSeriesError> {
+    Ok(ScalarConsumerMetricRegistration {
+        consumer_domain: normalize_required_text(
+            registration.consumer_domain,
+            TimeSeriesError::EmptyConsumerDomain,
+        )?,
+        metric: normalize_required_text(registration.metric, TimeSeriesError::EmptyMetric)?,
+        unit: normalize_required_text(registration.unit, TimeSeriesError::EmptyUnit)?,
+        expected_cadence: normalize_required_text(
+            registration.expected_cadence,
+            TimeSeriesError::EmptyExpectedCadence {
+                metric: "scalar_consumer".to_string(),
+            },
+        )?,
+    })
+}
+
+fn normalize_scalar_consumer_point(
+    point: ScalarConsumerPoint,
+) -> Result<ScalarConsumerPoint, TimeSeriesError> {
+    if !point.value.is_finite() {
+        return Err(TimeSeriesError::InvalidScalarValue);
+    }
+
+    Ok(ScalarConsumerPoint {
+        consumer_domain: normalize_required_text(
+            point.consumer_domain,
+            TimeSeriesError::EmptyConsumerDomain,
+        )?,
+        entity_ref: normalize_required_text(point.entity_ref, TimeSeriesError::EmptyEntityRef)?,
+        metric: normalize_required_text(point.metric, TimeSeriesError::EmptyMetric)?,
+        unit: normalize_required_text(point.unit, TimeSeriesError::EmptyUnit)?,
+        t: normalize_required_text(point.t, TimeSeriesError::EmptyTimestamp)?,
+        value: point.value,
+        source_ref: normalize_required_text(point.source_ref, TimeSeriesError::EmptySourceRef)?,
+        created_at: normalize_required_text(point.created_at, TimeSeriesError::EmptyCreatedAt)?,
+    })
+}
+
 fn normalize_product_ingest(
     mut ingest: SeriesProductIngest,
 ) -> Result<SeriesProductIngest, TimeSeriesError> {
@@ -2899,19 +3040,20 @@ mod tests {
     use super::{
         align_raster_pair, build_change_reproducibility_report, build_compare_view_feed,
         compare_view_refusal_from_guard, compute_aligned_raster_change,
-        derive_ranked_change_events, evaluate_series_cadence_health, export_change_mask_geotiff,
-        export_change_zones_geojson, export_series_csv, guard_coregisterable_pair,
-        normalize_raster_change, AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof,
-        AlignmentRefusalReason, ChangeEvent, ChangeEventConfig, ChangeEventDerivationInput,
-        ChangeEventDirection, ChangeEventReasonCode, ChangeReproducibilityRequest,
-        ChangeSourcePair, ChangeZoneExportFeature, ChangeZonePolygon, GeoExtent, MetricDefinition,
-        MetricKind, NormalizedChangeOutcome, NormalizedRasterChangeConfig, RasterAlignmentConfig,
-        RasterAlignmentEvidence, RasterChangeConfig, RasterChangeNormalizationMethod,
-        RasterChangeResult, RasterResolution, RasterSeriesValue, RollingBaselineConfig,
-        SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesCadenceHealthConfig,
-        SeriesFreshnessState, SeriesPoint, SeriesProductIngest, SeriesQuery, SeriesValue,
-        TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore, TrendDirection,
-        ZonalTrendConfig, ZonalTrendTarget,
+        derive_ranked_change_events, evaluate_scalar_consumer_series,
+        evaluate_series_cadence_health, export_change_mask_geotiff, export_change_zones_geojson,
+        export_series_csv, guard_coregisterable_pair, normalize_raster_change, AlignedRasterGrid,
+        AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason, ChangeEvent,
+        ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection, ChangeEventReasonCode,
+        ChangeReproducibilityRequest, ChangeSourcePair, ChangeZoneExportFeature, ChangeZonePolygon,
+        GeoExtent, MetricDefinition, MetricKind, NormalizedChangeOutcome,
+        NormalizedRasterChangeConfig, RasterAlignmentConfig, RasterAlignmentEvidence,
+        RasterChangeConfig, RasterChangeNormalizationMethod, RasterChangeResult, RasterResolution,
+        RasterSeriesValue, RollingBaselineConfig, ScalarConsumerEvaluationRequest,
+        ScalarConsumerMetricRegistration, ScalarConsumerPoint, SeasonalComparisonConfig,
+        SeasonalComparisonTarget, SeriesCadenceHealthConfig, SeriesFreshnessState, SeriesPoint,
+        SeriesProductIngest, SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine,
+        TimeSeriesError, TimeSeriesStore, TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
     };
 
     #[test]
@@ -3160,6 +3302,148 @@ mod tests {
         assert!(page.no_series);
         assert!(page.points.is_empty());
         assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn scalar_consumer_integrations_trend_weather_water_drought_and_soil_points() {
+        let evaluation = evaluate_scalar_consumer_series(ScalarConsumerEvaluationRequest {
+            registrations: scalar_consumer_registrations(),
+            points: vec![
+                consumer_point(
+                    "weather",
+                    "field:alpha",
+                    "weather_temperature_c",
+                    "celsius",
+                    "2026-06-10T10:00:00Z",
+                    23.0,
+                ),
+                consumer_point(
+                    "water",
+                    "field:alpha",
+                    "water_balance_mm",
+                    "millimeter",
+                    "2026-06-10T10:00:00Z",
+                    -12.0,
+                ),
+                consumer_point(
+                    "drought",
+                    "field:alpha",
+                    "drought_spi",
+                    "index",
+                    "2026-06-10T10:00:00Z",
+                    -0.7,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-01T10:00:00Z",
+                    32.0,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-08T10:00:00Z",
+                    28.0,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-15T10:00:00Z",
+                    21.0,
+                ),
+            ],
+            target: ZonalTrendTarget {
+                entity_ref: "field:alpha:zone:NE".to_string(),
+                metric: "soil_moisture_percent".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32614".to_string(),
+                range: TimeRange::default(),
+            },
+            trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            baseline_config: RollingBaselineConfig {
+                window_points: 2,
+                anomaly_band: 5.0,
+            },
+        })
+        .expect("scalar consumers should evaluate on shared engine");
+
+        assert_eq!(evaluation.registered_metric_count, 4);
+        assert_eq!(evaluation.appended_point_count, 6);
+        assert_eq!(evaluation.trend.direction, TrendDirection::Decreasing);
+        assert!(evaluation.trend.slope_per_day < 0.0);
+        assert_eq!(evaluation.baseline.zone_ref, "zone:NE");
+        assert!(evaluation.baseline.anomaly);
+        assert!((evaluation.baseline.delta_from_baseline - -9.0).abs() < 0.000001);
+        assert!(evaluation
+            .evidence_refs
+            .contains(&"soil_iot:soil_moisture_percent:2026-06-15T10:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn scalar_consumer_incompatible_unit_is_refused() {
+        let error = evaluate_scalar_consumer_series(ScalarConsumerEvaluationRequest {
+            registrations: scalar_consumer_registrations(),
+            points: vec![
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "fraction",
+                    "2026-06-01T10:00:00Z",
+                    0.32,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-08T10:00:00Z",
+                    28.0,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-15T10:00:00Z",
+                    21.0,
+                ),
+            ],
+            target: ZonalTrendTarget {
+                entity_ref: "field:alpha:zone:NE".to_string(),
+                metric: "soil_moisture_percent".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32614".to_string(),
+                range: TimeRange::default(),
+            },
+            trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            baseline_config: RollingBaselineConfig {
+                window_points: 2,
+                anomaly_band: 5.0,
+            },
+        })
+        .expect_err("unit mismatch should be refused");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::MetricUnitMismatch {
+                metric: "soil_moisture_percent".to_string(),
+                expected_unit: "percent".to_string(),
+                actual_unit: "fraction".to_string()
+            }
+        );
     }
 
     #[test]
@@ -4579,6 +4863,48 @@ mod tests {
                 "change:field-alpha:mask".to_string(),
             ],
             summary: "ndvi_mean dropped 0.18 in zone-ne since 2026-06-01T10:00:00Z".to_string(),
+        }
+    }
+
+    fn scalar_consumer_registrations() -> Vec<ScalarConsumerMetricRegistration> {
+        vec![
+            consumer_registration("weather", "weather_temperature_c", "celsius"),
+            consumer_registration("water", "water_balance_mm", "millimeter"),
+            consumer_registration("drought", "drought_spi", "index"),
+            consumer_registration("soil_iot", "soil_moisture_percent", "percent"),
+        ]
+    }
+
+    fn consumer_registration(
+        consumer_domain: &str,
+        metric: &str,
+        unit: &str,
+    ) -> ScalarConsumerMetricRegistration {
+        ScalarConsumerMetricRegistration {
+            consumer_domain: consumer_domain.to_string(),
+            metric: metric.to_string(),
+            unit: unit.to_string(),
+            expected_cadence: "per_observation".to_string(),
+        }
+    }
+
+    fn consumer_point(
+        consumer_domain: &str,
+        entity_ref: &str,
+        metric: &str,
+        unit: &str,
+        t: &str,
+        value: f64,
+    ) -> ScalarConsumerPoint {
+        ScalarConsumerPoint {
+            consumer_domain: consumer_domain.to_string(),
+            entity_ref: entity_ref.to_string(),
+            metric: metric.to_string(),
+            unit: unit.to_string(),
+            t: t.to_string(),
+            value,
+            source_ref: format!("{consumer_domain}:{metric}:{t}"),
+            created_at: t.to_string(),
         }
     }
 
