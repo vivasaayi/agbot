@@ -652,6 +652,82 @@ pub struct ZoneSoilProductSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AerialIndexZoneProduct {
+    pub product_id: String,
+    pub field_id: String,
+    pub zone_id: String,
+    pub index_name: String,
+    pub mean_value: f64,
+    pub captured_at: String,
+    pub crs: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SoilAerialFusionRequest {
+    pub soil_product: ZoneSoilProductSummary,
+    pub soil_crs: String,
+    pub aerial_product: AerialIndexZoneProduct,
+    pub max_temporal_gap_seconds: u64,
+    pub max_agreement_delta: f64,
+    #[serde(default)]
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoilAerialFusionOutcome {
+    Agreement,
+    Divergence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoilAerialFusionRefusalReason {
+    FieldMismatch,
+    ZoneMismatch,
+    CrsMismatch,
+    TemporalMismatch,
+    UnsupportedSoilMetric,
+    UnsupportedAerialIndex,
+    MissingSoilValue,
+    MissingEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilAerialFusionSummary {
+    pub field_id: String,
+    pub zone_id: String,
+    pub soil_product_id: String,
+    pub aerial_product_id: String,
+    pub soil_metric: GatewayReadingMetric,
+    pub soil_value: f64,
+    pub soil_crs: String,
+    pub soil_generated_at: String,
+    pub aerial_index: String,
+    pub aerial_mean_value: f64,
+    pub aerial_crs: String,
+    pub aerial_captured_at: String,
+    pub temporal_gap_seconds: u64,
+    pub normalized_delta: f64,
+    pub outcome: SoilAerialFusionOutcome,
+    pub method_version: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilAerialFusionEvaluation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SoilAerialFusionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_reason: Option<SoilAerialFusionRefusalReason>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IrrigationTriggerConfig {
     pub low_moisture_threshold: f64,
     pub max_freshness_age_seconds: u64,
@@ -862,6 +938,20 @@ pub enum SoilIotError {
         expected_field_id: String,
         expected_zone_id: String,
     },
+    #[error("aerial index product_id cannot be empty")]
+    EmptyAerialIndexProductId,
+    #[error("aerial index name cannot be empty")]
+    EmptyAerialIndexName,
+    #[error("aerial index captured_at cannot be empty")]
+    EmptyAerialIndexCapturedAt,
+    #[error("aerial index CRS cannot be empty")]
+    EmptyAerialIndexCrs,
+    #[error("soil-aerial fusion method_version cannot be empty")]
+    EmptySoilAerialFusionMethodVersion,
+    #[error("soil-aerial fusion config must have max_temporal_gap_seconds > 0 and finite max_agreement_delta >= 0")]
+    InvalidSoilAerialFusionConfig,
+    #[error("soil-aerial fusion evidence_refs cannot contain empty values")]
+    EmptySoilAerialFusionEvidenceRef,
     #[error("irrigation trigger method_version cannot be empty")]
     EmptyIrrigationTriggerMethodVersion,
     #[error("irrigation trigger evidence_refs cannot contain empty values")]
@@ -1639,6 +1729,105 @@ pub fn build_zone_soil_product_summary(
     })
 }
 
+pub fn evaluate_soil_aerial_fusion(
+    request: SoilAerialFusionRequest,
+) -> Result<SoilAerialFusionEvaluation, SoilIotError> {
+    let method_version = normalize_required_text(
+        request.method_version,
+        SoilIotError::EmptySoilAerialFusionMethodVersion,
+    )?;
+    if request.max_temporal_gap_seconds == 0
+        || !request.max_agreement_delta.is_finite()
+        || request.max_agreement_delta < 0.0
+    {
+        return Err(SoilIotError::InvalidSoilAerialFusionConfig);
+    }
+
+    let soil = request.soil_product;
+    let soil_product_id =
+        normalize_required_text(soil.product_id, SoilIotError::EmptyZoneSoilProductId)?;
+    let soil_field_id = normalize_required_text(soil.field_id, SoilIotError::EmptyFieldId)?;
+    let soil_zone_id = normalize_required_text(soil.zone_id, SoilIotError::EmptyZoneId)?;
+    let soil_generated_at =
+        normalize_required_text(soil.generated_at, SoilIotError::EmptyZoneSoilGeneratedAt)?;
+    let soil_crs = normalize_required_text(request.soil_crs, SoilIotError::EmptyCrs)?;
+    let aerial = normalize_aerial_index_zone_product(request.aerial_product)?;
+    let evidence_refs = soil_aerial_evidence_refs(
+        &soil_product_id,
+        &soil.evidence_refs,
+        &aerial.product_id,
+        &aerial.evidence_refs,
+    )?;
+
+    let soil_dt = parse_freshness_ts(&soil_generated_at)?;
+    let aerial_dt = parse_freshness_ts(&aerial.captured_at)?;
+    let temporal_gap_seconds = soil_dt
+        .signed_duration_since(aerial_dt)
+        .num_seconds()
+        .unsigned_abs();
+
+    let refused_reason = if soil_field_id != aerial.field_id {
+        Some(SoilAerialFusionRefusalReason::FieldMismatch)
+    } else if soil_zone_id != aerial.zone_id {
+        Some(SoilAerialFusionRefusalReason::ZoneMismatch)
+    } else if soil_crs != aerial.crs {
+        Some(SoilAerialFusionRefusalReason::CrsMismatch)
+    } else if temporal_gap_seconds > request.max_temporal_gap_seconds {
+        Some(SoilAerialFusionRefusalReason::TemporalMismatch)
+    } else if soil.metric != GatewayReadingMetric::SoilMoisturePercent {
+        Some(SoilAerialFusionRefusalReason::UnsupportedSoilMetric)
+    } else if !aerial.index_name.eq_ignore_ascii_case("ndvi") {
+        Some(SoilAerialFusionRefusalReason::UnsupportedAerialIndex)
+    } else if soil.mean_value.is_none() {
+        Some(SoilAerialFusionRefusalReason::MissingSoilValue)
+    } else if evidence_refs.is_empty() {
+        Some(SoilAerialFusionRefusalReason::MissingEvidence)
+    } else {
+        None
+    };
+
+    if let Some(reason) = refused_reason {
+        return Ok(SoilAerialFusionEvaluation {
+            summary: None,
+            refused_reason: Some(reason),
+            evidence_refs,
+        });
+    }
+
+    let soil_value = soil.mean_value.expect("checked above");
+    let normalized_soil_moisture = (soil_value / 100.0).clamp(0.0, 1.0);
+    let normalized_delta = normalized_soil_moisture - aerial.mean_value;
+    let outcome = if normalized_delta.abs() <= request.max_agreement_delta {
+        SoilAerialFusionOutcome::Agreement
+    } else {
+        SoilAerialFusionOutcome::Divergence
+    };
+
+    Ok(SoilAerialFusionEvaluation {
+        summary: Some(SoilAerialFusionSummary {
+            field_id: soil_field_id,
+            zone_id: soil_zone_id,
+            soil_product_id,
+            aerial_product_id: aerial.product_id,
+            soil_metric: soil.metric,
+            soil_value,
+            soil_crs,
+            soil_generated_at,
+            aerial_index: aerial.index_name,
+            aerial_mean_value: aerial.mean_value,
+            aerial_crs: aerial.crs,
+            aerial_captured_at: aerial.captured_at,
+            temporal_gap_seconds,
+            normalized_delta,
+            outcome,
+            method_version,
+            evidence_refs: evidence_refs.clone(),
+        }),
+        refused_reason: None,
+        evidence_refs,
+    })
+}
+
 pub fn evaluate_irrigation_trigger(
     product: ZoneSoilMoistureProduct,
     config: IrrigationTriggerConfig,
@@ -2023,6 +2212,55 @@ fn normalize_zone_soil_moisture_product(
     })
 }
 
+fn normalize_aerial_index_zone_product(
+    product: AerialIndexZoneProduct,
+) -> Result<AerialIndexZoneProduct, SoilIotError> {
+    if !product.mean_value.is_finite() {
+        return Err(SoilIotError::InvalidReadingValue);
+    }
+
+    Ok(AerialIndexZoneProduct {
+        product_id: normalize_required_text(
+            product.product_id,
+            SoilIotError::EmptyAerialIndexProductId,
+        )?,
+        field_id: normalize_required_text(product.field_id, SoilIotError::EmptyFieldId)?,
+        zone_id: normalize_required_text(product.zone_id, SoilIotError::EmptyZoneId)?,
+        index_name: normalize_required_text(
+            product.index_name,
+            SoilIotError::EmptyAerialIndexName,
+        )?,
+        mean_value: product.mean_value,
+        captured_at: normalize_required_text(
+            product.captured_at,
+            SoilIotError::EmptyAerialIndexCapturedAt,
+        )?,
+        crs: normalize_required_text(product.crs, SoilIotError::EmptyAerialIndexCrs)?,
+        evidence_refs: normalize_text_values(
+            product.evidence_refs,
+            SoilIotError::EmptySoilAerialFusionEvidenceRef,
+        )?,
+    })
+}
+
+fn soil_aerial_evidence_refs(
+    soil_product_id: &str,
+    soil_refs: &[String],
+    aerial_product_id: &str,
+    aerial_refs: &[String],
+) -> Result<Vec<String>, SoilIotError> {
+    let mut refs = BTreeSet::new();
+    refs.insert(format!("soil-product:{soil_product_id}"));
+    refs.insert(format!("aerial-index:{aerial_product_id}"));
+    for evidence_ref in soil_refs.iter().chain(aerial_refs.iter()) {
+        refs.insert(normalize_required_text(
+            evidence_ref.clone(),
+            SoilIotError::EmptySoilAerialFusionEvidenceRef,
+        )?);
+    }
+    Ok(refs.into_iter().collect())
+}
+
 fn normalize_irrigation_trigger_config(
     config: IrrigationTriggerConfig,
 ) -> Result<IrrigationTriggerConfig, SoilIotError> {
@@ -2155,20 +2393,23 @@ mod tests {
         build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
         build_zone_soil_product_summary, decode_gateway_payload, detect_stuck_sensor_window,
         emit_sensor_health_alert_events, evaluate_irrigation_trigger,
-        evaluate_sensor_health_snapshot, evaluate_soil_capture_freshness_coverage,
-        ingest_gateway_readings, reading_rejection_for_device, rederive_validated_series_evidence,
+        evaluate_sensor_health_snapshot, evaluate_soil_aerial_fusion,
+        evaluate_soil_capture_freshness_coverage, ingest_gateway_readings,
+        reading_rejection_for_device, rederive_validated_series_evidence,
         transition_soil_config_push_status, transition_soil_device_status,
-        validate_and_calibrate_reading, CalibrationProfile, GatewayIngestError,
-        GatewayPayloadRejectionReason, GatewayReadingMetric, GatewayReadingRecord, GeoPosition,
-        IrrigationTriggerConfig, IrrigationTriggerSuppressionReason, RawGatewayReading,
-        ReadingGeolocationStatus, ReadingQaFlag, ReadingQaReason, ReadingRejectionReason,
-        RegisterSoilDeviceRequest, SensorHealthEventKind, SensorHealthLinkStatus,
-        SensorHealthMonitorState, SensorHealthReasonCode, SensorHealthSnapshot,
-        SensorHealthThresholds, SimulatedGateway, SoilCaptureFreshnessConfig,
-        SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate,
-        SoilDeviceFreshnessState, SoilDeviceStatus, SoilIotError, SoilSensorType, StuckSensorRail,
-        StuckSensorWindowConfig, ValidatedSoilReading, ValidationEvidenceRequest,
-        ZoneSoilMoistureProduct, ZoneSoilProductFreshness, ZoneSoilProductRequest,
+        validate_and_calibrate_reading, AerialIndexZoneProduct, CalibrationProfile,
+        GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
+        GatewayReadingRecord, GeoPosition, IrrigationTriggerConfig,
+        IrrigationTriggerSuppressionReason, RawGatewayReading, ReadingGeolocationStatus,
+        ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
+        SensorHealthEventKind, SensorHealthLinkStatus, SensorHealthMonitorState,
+        SensorHealthReasonCode, SensorHealthSnapshot, SensorHealthThresholds, SimulatedGateway,
+        SoilAerialFusionOutcome, SoilAerialFusionRefusalReason, SoilAerialFusionRequest,
+        SoilCaptureFreshnessConfig, SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus,
+        SoilDeviceConfigPushStatusUpdate, SoilDeviceFreshnessState, SoilDeviceStatus, SoilIotError,
+        SoilSensorType, StuckSensorRail, StuckSensorWindowConfig, ValidatedSoilReading,
+        ValidationEvidenceRequest, ZoneSoilMoistureProduct, ZoneSoilProductFreshness,
+        ZoneSoilProductRequest, ZoneSoilProductSummary,
     };
     use alerting::{AlertEventBackbone, AlertSeverityHint};
     use timeseries::SeriesValue;
@@ -3037,6 +3278,101 @@ mod tests {
     }
 
     #[test]
+    fn soil_aerial_fusion_reports_cited_divergence_for_aligned_ndvi() {
+        let evaluation = evaluate_soil_aerial_fusion(fusion_request(
+            zone_soil_product_summary(Some(18.0), ZoneSoilProductFreshness::Fresh),
+            "EPSG:4326",
+            aerial_ndvi_product(
+                "field-001",
+                "zone-ne",
+                "EPSG:4326",
+                "2026-06-12T11:55:00Z",
+                0.72,
+            ),
+        ))
+        .expect("aligned soil and NDVI products should evaluate");
+
+        assert!(evaluation.refused_reason.is_none());
+        let summary = evaluation.summary.expect("aligned products should fuse");
+        assert_eq!(summary.field_id, "field-001");
+        assert_eq!(summary.zone_id, "zone-ne");
+        assert_eq!(
+            summary.soil_metric,
+            GatewayReadingMetric::SoilMoisturePercent
+        );
+        assert_eq!(summary.soil_value, 18.0);
+        assert_eq!(summary.soil_crs, "EPSG:4326");
+        assert_eq!(summary.aerial_index, "ndvi");
+        assert_eq!(summary.aerial_mean_value, 0.72);
+        assert_eq!(summary.aerial_crs, "EPSG:4326");
+        assert_eq!(summary.temporal_gap_seconds, 300);
+        assert!((summary.normalized_delta - -0.54).abs() < 1e-9);
+        assert_eq!(summary.outcome, SoilAerialFusionOutcome::Divergence);
+        assert!(summary
+            .evidence_refs
+            .contains(&"soil-product:zone-soil-001".to_string()));
+        assert!(summary
+            .evidence_refs
+            .contains(&"aerial-index:ndvi-zone-001".to_string()));
+        assert!(summary
+            .evidence_refs
+            .contains(&"soil-iot:payload-moisture-001".to_string()));
+        assert!(summary
+            .evidence_refs
+            .contains(&"imagery:ndvi-zone-001".to_string()));
+    }
+
+    #[test]
+    fn soil_aerial_fusion_refuses_crs_mismatch() {
+        let evaluation = evaluate_soil_aerial_fusion(fusion_request(
+            zone_soil_product_summary(Some(42.0), ZoneSoilProductFreshness::Fresh),
+            "EPSG:4326",
+            aerial_ndvi_product(
+                "field-001",
+                "zone-ne",
+                "EPSG:32614",
+                "2026-06-12T11:55:00Z",
+                0.4,
+            ),
+        ))
+        .expect("CRS mismatch should be a refusal, not a blind fusion");
+
+        assert!(evaluation.summary.is_none());
+        assert_eq!(
+            evaluation.refused_reason,
+            Some(SoilAerialFusionRefusalReason::CrsMismatch)
+        );
+        assert!(evaluation
+            .evidence_refs
+            .contains(&"aerial-index:ndvi-zone-001".to_string()));
+    }
+
+    #[test]
+    fn soil_aerial_fusion_refuses_temporal_mismatch() {
+        let evaluation = evaluate_soil_aerial_fusion(fusion_request(
+            zone_soil_product_summary(Some(42.0), ZoneSoilProductFreshness::Fresh),
+            "EPSG:4326",
+            aerial_ndvi_product(
+                "field-001",
+                "zone-ne",
+                "EPSG:4326",
+                "2026-06-12T10:30:00Z",
+                0.4,
+            ),
+        ))
+        .expect("temporal mismatch should be a refusal");
+
+        assert!(evaluation.summary.is_none());
+        assert_eq!(
+            evaluation.refused_reason,
+            Some(SoilAerialFusionRefusalReason::TemporalMismatch)
+        );
+        assert!(evaluation
+            .evidence_refs
+            .contains(&"soil-product:zone-soil-001".to_string()));
+    }
+
+    #[test]
     fn irrigation_trigger_emits_domain16_payload_for_fresh_low_moisture() {
         let evaluation = evaluate_irrigation_trigger(
             zone_moisture_product(21.4, 120, vec![], vec!["soil-iot:reading-001"]),
@@ -3290,6 +3626,62 @@ mod tests {
             max_freshness_age_seconds: 300,
             generated_at: "2026-06-12T12:00:00Z".to_string(),
             method_version: "soil-zone-product-v1".to_string(),
+        }
+    }
+
+    fn zone_soil_product_summary(
+        mean_value: Option<f64>,
+        freshness: ZoneSoilProductFreshness,
+    ) -> ZoneSoilProductSummary {
+        ZoneSoilProductSummary {
+            product_id: "zone-soil-001".to_string(),
+            field_id: "field-001".to_string(),
+            zone_id: "zone-ne".to_string(),
+            metric: GatewayReadingMetric::SoilMoisturePercent,
+            mean_value,
+            min_value: mean_value,
+            max_value: mean_value,
+            sample_count: usize::from(mean_value.is_some()),
+            freshness,
+            freshness_age_seconds: 120,
+            method_version: "soil-zone-product-v1".to_string(),
+            evidence_refs: vec!["soil-iot:payload-moisture-001".to_string()],
+            excluded_payload_ids: Vec::new(),
+            generated_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn aerial_ndvi_product(
+        field_id: &str,
+        zone_id: &str,
+        crs: &str,
+        captured_at: &str,
+        mean_value: f64,
+    ) -> AerialIndexZoneProduct {
+        AerialIndexZoneProduct {
+            product_id: "ndvi-zone-001".to_string(),
+            field_id: field_id.to_string(),
+            zone_id: zone_id.to_string(),
+            index_name: "ndvi".to_string(),
+            mean_value,
+            captured_at: captured_at.to_string(),
+            crs: crs.to_string(),
+            evidence_refs: vec!["imagery:ndvi-zone-001".to_string()],
+        }
+    }
+
+    fn fusion_request(
+        soil_product: ZoneSoilProductSummary,
+        soil_crs: &str,
+        aerial_product: AerialIndexZoneProduct,
+    ) -> SoilAerialFusionRequest {
+        SoilAerialFusionRequest {
+            soil_product,
+            soil_crs: soil_crs.to_string(),
+            aerial_product,
+            max_temporal_gap_seconds: 900,
+            max_agreement_delta: 0.15,
+            method_version: "soil-aerial-fusion-v1".to_string(),
         }
     }
 
