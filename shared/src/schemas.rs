@@ -6685,6 +6685,47 @@ pub struct DroughtMitigationRecommendation {
     pub reason_code: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtReportRequest {
+    pub report_id: String,
+    pub generated_at: String,
+    pub index_record: DroughtIndexRecord,
+    pub baseline: DroughtBaselineTrendRecord,
+    pub risk_score: DroughtRiskScoreRecord,
+    #[serde(default)]
+    pub forecast: Option<DroughtForecastRecord>,
+    #[serde(default)]
+    pub mitigation: Option<DroughtMitigationRecommendation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtReportSectionKind {
+    Index,
+    BaselineTrend,
+    RiskScore,
+    Forecast,
+    Mitigation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtReportSection {
+    pub kind: DroughtReportSectionKind,
+    pub title: String,
+    pub summary: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtReportRecord {
+    pub report_id: String,
+    pub field_or_region_ref: String,
+    pub generated_at: String,
+    pub sections: Vec<DroughtReportSection>,
+    pub evidence_refs: Vec<String>,
+    pub freshness_assertions: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DroughtStressEvidenceError {
     #[error("drought stress evidence_id cannot be empty")]
@@ -6790,6 +6831,24 @@ pub enum DroughtMitigationError {
     InvalidMinRiskValue,
     #[error("drought mitigation timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DroughtReportError {
+    #[error("drought report report_id cannot be empty")]
+    EmptyReportId,
+    #[error("drought report generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("drought report timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error("drought report baseline is missing or not computed")]
+    MissingBaseline,
+    #[error("drought report risk score is missing or not computed")]
+    MissingRiskScore,
+    #[error("drought report field/region mismatch for {input}")]
+    FieldOrRegionMismatch { input: String },
+    #[error("drought report section {section} must cite evidence")]
+    MissingSectionEvidence { section: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -7533,6 +7592,155 @@ pub fn derive_drought_mitigation_recommendation(
     })
 }
 
+pub fn assemble_drought_report(
+    request: DroughtReportRequest,
+) -> Result<DroughtReportRecord, DroughtReportError> {
+    let report_id =
+        normalize_drought_text(request.report_id).ok_or(DroughtReportError::EmptyReportId)?;
+    let generated_at =
+        normalize_drought_text(request.generated_at).ok_or(DroughtReportError::EmptyGeneratedAt)?;
+    parse_drought_report_timestamp(&generated_at)?;
+    let field_or_region_ref = request.index_record.field_or_region_ref.clone();
+
+    if request.baseline.field_or_region_ref != field_or_region_ref {
+        return Err(DroughtReportError::FieldOrRegionMismatch {
+            input: "baseline".to_string(),
+        });
+    }
+    if request.baseline.status != DroughtBaselineTrendStatus::Computed {
+        return Err(DroughtReportError::MissingBaseline);
+    }
+    if request.risk_score.field_or_region_ref != field_or_region_ref {
+        return Err(DroughtReportError::FieldOrRegionMismatch {
+            input: "risk_score".to_string(),
+        });
+    }
+    if request.risk_score.status != DroughtRiskScoreStatus::Computed {
+        return Err(DroughtReportError::MissingRiskScore);
+    }
+    if let Some(forecast) = request.forecast.as_ref() {
+        if forecast.field_or_region_ref != field_or_region_ref {
+            return Err(DroughtReportError::FieldOrRegionMismatch {
+                input: "forecast".to_string(),
+            });
+        }
+    }
+    if let Some(mitigation) = request.mitigation.as_ref() {
+        if mitigation.field_or_region_ref != field_or_region_ref {
+            return Err(DroughtReportError::FieldOrRegionMismatch {
+                input: "mitigation".to_string(),
+            });
+        }
+    }
+
+    let mut sections = Vec::new();
+    sections.push(DroughtReportSection {
+        kind: DroughtReportSectionKind::Index,
+        title: "Drought index".to_string(),
+        summary: format!(
+            "{} value {:.3} for {}..{}",
+            request.index_record.index_type.as_str(),
+            request.index_record.value,
+            request.index_record.period.start,
+            request.index_record.period.end
+        ),
+        evidence_refs: drought_report_index_evidence(&request.index_record),
+    });
+    sections.push(DroughtReportSection {
+        kind: DroughtReportSectionKind::BaselineTrend,
+        title: "Historical baseline and trend".to_string(),
+        summary: format!(
+            "baseline {:.3}, trend {:?}, samples {}",
+            request
+                .baseline
+                .baseline_value
+                .expect("computed baseline includes value"),
+            request
+                .baseline
+                .trend_direction
+                .expect("computed baseline includes trend"),
+            request.baseline.sample_count
+        ),
+        evidence_refs: request.baseline.evidence_refs.clone(),
+    });
+    sections.push(DroughtReportSection {
+        kind: DroughtReportSectionKind::RiskScore,
+        title: "Deterministic drought risk".to_string(),
+        summary: format!(
+            "risk {:.3}, band {:?}",
+            request
+                .risk_score
+                .value
+                .expect("computed risk includes value"),
+            request
+                .risk_score
+                .band
+                .expect("computed risk includes band")
+        ),
+        evidence_refs: request.risk_score.evidence_refs.clone(),
+    });
+    if let Some(forecast) = request.forecast {
+        if forecast.status == DroughtForecastStatus::Forecast {
+            sections.push(DroughtReportSection {
+                kind: DroughtReportSectionKind::Forecast,
+                title: "Gated forecast".to_string(),
+                summary: format!(
+                    "forecast {:?} over {} days with {:?} uncertainty",
+                    forecast.predicted_band.expect("forecast includes band"),
+                    forecast.horizon_days,
+                    forecast.uncertainty.expect("forecast includes uncertainty")
+                ),
+                evidence_refs: forecast.evidence_refs,
+            });
+        }
+    }
+    if let Some(mitigation) = request.mitigation {
+        if mitigation.status == DroughtMitigationStatus::Recommended {
+            sections.push(DroughtReportSection {
+                kind: DroughtReportSectionKind::Mitigation,
+                title: "Mitigation recommendation".to_string(),
+                summary: format!(
+                    "{:?}: {}",
+                    mitigation
+                        .action_target
+                        .expect("recommended mitigation includes target"),
+                    mitigation
+                        .recommendation
+                        .clone()
+                        .expect("recommended mitigation includes recommendation")
+                ),
+                evidence_refs: mitigation.evidence_refs,
+            });
+        }
+    }
+
+    for section in &sections {
+        if section.evidence_refs.is_empty() {
+            return Err(DroughtReportError::MissingSectionEvidence {
+                section: section.title.clone(),
+            });
+        }
+    }
+    let evidence_refs = sections
+        .iter()
+        .flat_map(|section| section.evidence_refs.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    Ok(DroughtReportRecord {
+        report_id,
+        field_or_region_ref,
+        generated_at,
+        sections,
+        evidence_refs,
+        freshness_assertions: vec![
+            "deterministic_sections_first".to_string(),
+            "required_evidence_present".to_string(),
+        ],
+    })
+}
+
 pub fn parse_drought_index_type(value: &str) -> Result<DroughtIndexType, DroughtIndexError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "spi" => Ok(DroughtIndexType::Spi),
@@ -7676,6 +7884,24 @@ fn parse_drought_mitigation_timestamp(
         .map_err(|_| DroughtMitigationError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
+}
+
+fn parse_drought_report_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, DroughtReportError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|_| DroughtReportError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+fn drought_report_index_evidence(record: &DroughtIndexRecord) -> Vec<String> {
+    let mut evidence_refs = vec![format!("drought_index:{}", record.index_id)];
+    evidence_refs.extend(record.input_refs.iter().cloned());
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    evidence_refs
 }
 
 fn valid_drought_risk_thresholds(thresholds: &DroughtRiskThresholds) -> bool {
@@ -11724,7 +11950,7 @@ mod tests {
         advise_weather_operational_windows, annotate_weather_record_freshness,
         append_content_version, append_irrigation_history_event, append_weather_history_records,
         apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
-        apply_tractor_implement_command, assert_flight_operation_allowed,
+        apply_tractor_implement_command, assemble_drought_report, assert_flight_operation_allowed,
         assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
         build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
@@ -11759,7 +11985,8 @@ mod tests {
         DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus, DroughtForecastRequest,
         DroughtForecastStatus, DroughtForecastUncertaintyBand, DroughtIndexComputeRequest,
         DroughtIndexError, DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
-        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus, DroughtRiskBand,
+        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
+        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
         DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
         DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
         DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
@@ -15244,6 +15471,68 @@ mod tests {
         assert_eq!(error, DroughtMitigationError::InvalidMinRiskValue);
     }
 
+    #[test]
+    fn drought_report_assembles_ordered_sections_with_evidence() {
+        let report = assemble_drought_report(drought_report_request(true, true, true))
+            .expect("complete deterministic drought evidence should assemble");
+
+        assert_eq!(report.report_id, "drought-report-field-north");
+        assert_eq!(report.field_or_region_ref, "field-north");
+        assert_eq!(
+            report
+                .sections
+                .iter()
+                .map(|section| section.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                DroughtReportSectionKind::Index,
+                DroughtReportSectionKind::BaselineTrend,
+                DroughtReportSectionKind::RiskScore,
+                DroughtReportSectionKind::Forecast,
+                DroughtReportSectionKind::Mitigation
+            ]
+        );
+        assert!(report
+            .sections
+            .iter()
+            .all(|section| !section.evidence_refs.is_empty()));
+        assert!(report
+            .evidence_refs
+            .iter()
+            .any(|item| item == "drought_index:spi-current"));
+        assert!(report
+            .freshness_assertions
+            .iter()
+            .any(|item| item == "deterministic_sections_first"));
+    }
+
+    #[test]
+    fn drought_report_can_omit_optional_forecast_and_mitigation() {
+        let report = assemble_drought_report(drought_report_request(true, false, false))
+            .expect("required deterministic evidence should be enough for report");
+
+        assert_eq!(
+            report
+                .sections
+                .iter()
+                .map(|section| section.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                DroughtReportSectionKind::Index,
+                DroughtReportSectionKind::BaselineTrend,
+                DroughtReportSectionKind::RiskScore
+            ]
+        );
+    }
+
+    #[test]
+    fn drought_report_rejects_missing_required_evidence() {
+        let error = assemble_drought_report(drought_report_request(false, false, false))
+            .expect_err("missing computed baseline should reject report");
+
+        assert_eq!(error, DroughtReportError::MissingBaseline);
+    }
+
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
         FleetNodeRecord {
             node_id: "node-001".to_string(),
@@ -15520,6 +15809,50 @@ mod tests {
             risk_score,
             generated_at: " 2026-06-14T10:10:00Z ".to_string(),
             min_risk_value,
+        }
+    }
+
+    fn drought_report_request(
+        include_required_baseline: bool,
+        include_forecast: bool,
+        include_mitigation: bool,
+    ) -> DroughtReportRequest {
+        let index_record = drought_index_record(
+            "spi-current",
+            "field-north",
+            DroughtIndexType::Spi,
+            -1.2,
+            "2026-06-13",
+        );
+        let mut baseline = drought_baseline_record();
+        if !include_required_baseline {
+            baseline.status = DroughtBaselineTrendStatus::InsufficientBaseline;
+            baseline.baseline_value = None;
+            baseline.trend_slope_per_day = None;
+            baseline.trend_direction = None;
+        }
+        let risk_score = compute_drought_risk_score(drought_risk_score_request(true))
+            .expect("risk score fixture should compute");
+        let forecast = include_forecast.then(|| {
+            forecast_drought_risk(drought_forecast_request(true, true, "2026-06-14T10:00:00Z"))
+                .expect("forecast fixture should compute")
+        });
+        let mitigation = include_mitigation.then(|| {
+            derive_drought_mitigation_recommendation(drought_mitigation_request(
+                0.6,
+                Some((0.72, DroughtRiskBand::High)),
+            ))
+            .expect("mitigation fixture should recommend")
+        });
+
+        DroughtReportRequest {
+            report_id: " drought-report-field-north ".to_string(),
+            generated_at: " 2026-06-14T10:30:00Z ".to_string(),
+            index_record,
+            baseline,
+            risk_score,
+            forecast,
+            mitigation,
         }
     }
 
