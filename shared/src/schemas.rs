@@ -2888,6 +2888,50 @@ pub struct WeatherFreshnessAnnotatedRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherSensorSample {
+    pub observed_at: String,
+    pub temperature_celsius: f64,
+    pub wind_speed_mps: f64,
+    pub precipitation_mm: f64,
+    pub humidity_percent: f64,
+    pub radiation_w_m2: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherSensorStreamIngestRequest {
+    pub sensor_id: String,
+    pub field_ref: String,
+    pub fetched_at: String,
+    pub evaluated_at: String,
+    pub stale_after_seconds: i64,
+    pub max_gap_seconds: i64,
+    pub samples: Vec<WeatherSensorSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeatherSensorGapEvent {
+    pub sensor_id: String,
+    pub field_ref: String,
+    pub from: String,
+    pub to: String,
+    pub gap_seconds: i64,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherSensorStreamIngest {
+    pub sensor_id: String,
+    pub field_ref: String,
+    pub source: String,
+    pub fetched_at: String,
+    pub records: Vec<WeatherForecastRecord>,
+    pub freshness: Vec<WeatherFreshnessAnnotatedRecord>,
+    pub gap_events: Vec<WeatherSensorGapEvent>,
+    pub sample_count: usize,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
     pub wind_speed_mps: WeatherForecastValue,
@@ -3003,6 +3047,30 @@ pub enum WeatherFreshnessError {
     InvalidMaxAge,
     #[error("weather freshness timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherSensorIngestError {
+    #[error("weather sensor_id cannot be empty")]
+    EmptySensorId,
+    #[error("weather sensor field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("weather sensor fetched_at cannot be empty")]
+    EmptyFetchedAt,
+    #[error("weather sensor evaluated_at cannot be empty")]
+    EmptyEvaluatedAt,
+    #[error("weather sensor stream contains no samples")]
+    EmptySamples,
+    #[error("weather sensor stale threshold must be positive")]
+    InvalidStaleThreshold,
+    #[error("weather sensor gap threshold must be positive")]
+    InvalidGapThreshold,
+    #[error("weather sensor sample timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error(transparent)]
+    Weather(#[from] WeatherIngestError),
+    #[error(transparent)]
+    Freshness(#[from] WeatherFreshnessError),
 }
 
 pub fn normalize_weather_provider_forecast(
@@ -3237,6 +3305,162 @@ fn parse_weather_freshness_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.with_timezone(&chrono::Utc))
         .map_err(|_| WeatherFreshnessError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+pub fn ingest_weather_sensor_stream(
+    request: WeatherSensorStreamIngestRequest,
+) -> Result<WeatherSensorStreamIngest, WeatherSensorIngestError> {
+    let sensor_id =
+        normalize_weather_text(request.sensor_id).ok_or(WeatherSensorIngestError::EmptySensorId)?;
+    let field_ref =
+        normalize_weather_text(request.field_ref).ok_or(WeatherSensorIngestError::EmptyFieldRef)?;
+    let fetched_at = normalize_weather_text(request.fetched_at)
+        .ok_or(WeatherSensorIngestError::EmptyFetchedAt)?;
+    let evaluated_at = normalize_weather_text(request.evaluated_at)
+        .ok_or(WeatherSensorIngestError::EmptyEvaluatedAt)?;
+    if request.stale_after_seconds <= 0 {
+        return Err(WeatherSensorIngestError::InvalidStaleThreshold);
+    }
+    if request.max_gap_seconds <= 0 {
+        return Err(WeatherSensorIngestError::InvalidGapThreshold);
+    }
+    if request.samples.is_empty() {
+        return Err(WeatherSensorIngestError::EmptySamples);
+    }
+    parse_weather_sensor_timestamp(&fetched_at)?;
+    parse_weather_sensor_timestamp(&evaluated_at)?;
+
+    let mut samples = Vec::new();
+    for sample in request.samples {
+        let observed_at = normalize_weather_text(sample.observed_at.clone()).ok_or(
+            WeatherSensorIngestError::InvalidTimestamp {
+                timestamp: String::new(),
+            },
+        )?;
+        let parsed_observed_at = parse_weather_sensor_timestamp(&observed_at)?;
+        samples.push((sample, observed_at, parsed_observed_at));
+    }
+    samples.sort_by(|left, right| left.2.cmp(&right.2));
+
+    let mut records = Vec::new();
+    for (sample, observed_at, _) in &samples {
+        let vars = WeatherForecastVariables {
+            temperature_celsius: weather_value(
+                "temperature_celsius",
+                sample.temperature_celsius,
+                "deg_c",
+                "sensor",
+                &fetched_at,
+                observed_at,
+                f64::is_finite,
+            )?,
+            wind_speed_mps: weather_value(
+                "wind_speed_mps",
+                sample.wind_speed_mps,
+                "m/s",
+                "sensor",
+                &fetched_at,
+                observed_at,
+                |value| value.is_finite() && value >= 0.0,
+            )?,
+            precipitation_mm: weather_value(
+                "precipitation_mm",
+                sample.precipitation_mm,
+                "mm",
+                "sensor",
+                &fetched_at,
+                observed_at,
+                |value| value.is_finite() && value >= 0.0,
+            )?,
+            humidity_percent: weather_value(
+                "humidity_percent",
+                sample.humidity_percent,
+                "percent",
+                "sensor",
+                &fetched_at,
+                observed_at,
+                |value| value.is_finite() && (0.0..=100.0).contains(&value),
+            )?,
+            radiation_w_m2: weather_value(
+                "radiation_w_m2",
+                sample.radiation_w_m2,
+                "W/m^2",
+                "sensor",
+                &fetched_at,
+                observed_at,
+                |value| value.is_finite() && value >= 0.0,
+            )?,
+        };
+        records.push(WeatherForecastRecord {
+            forecast_id: stable_weather_forecast_id(
+                &field_ref,
+                &format!("sensor-{sensor_id}"),
+                observed_at,
+            ),
+            field_ref: field_ref.clone(),
+            valid_time: observed_at.clone(),
+            vars,
+            source: "sensor".to_string(),
+            fetched_at: fetched_at.clone(),
+        });
+    }
+
+    let freshness = records
+        .iter()
+        .cloned()
+        .map(|record| {
+            annotate_weather_record_freshness(record, &evaluated_at, request.stale_after_seconds)
+                .map_err(WeatherSensorIngestError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let gap_events =
+        weather_sensor_gap_events(&sensor_id, &field_ref, &samples, request.max_gap_seconds);
+    let stale = freshness.iter().any(|record| record.stale) || !gap_events.is_empty();
+
+    Ok(WeatherSensorStreamIngest {
+        sensor_id,
+        field_ref,
+        source: "sensor".to_string(),
+        fetched_at,
+        sample_count: records.len(),
+        records,
+        freshness,
+        gap_events,
+        stale,
+    })
+}
+
+fn weather_sensor_gap_events(
+    sensor_id: &str,
+    field_ref: &str,
+    samples: &[(WeatherSensorSample, String, chrono::DateTime<chrono::Utc>)],
+    max_gap_seconds: i64,
+) -> Vec<WeatherSensorGapEvent> {
+    let mut events = Vec::new();
+    for window in samples.windows(2) {
+        let gap_seconds = window[1].2.signed_duration_since(window[0].2).num_seconds();
+        if gap_seconds > max_gap_seconds {
+            events.push(WeatherSensorGapEvent {
+                sensor_id: sensor_id.to_string(),
+                field_ref: field_ref.to_string(),
+                from: window[0].1.clone(),
+                to: window[1].1.clone(),
+                gap_seconds,
+                reason_code: "sensor_stream_gap".to_string(),
+            });
+        }
+    }
+    events
+}
+
+fn parse_weather_sensor_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, WeatherSensorIngestError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| WeatherSensorIngestError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -7755,9 +7979,10 @@ mod tests {
         dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
         evaluate_tractor_motion_gate, evaluate_tractor_weather_window_gate,
         evaluate_weather_value_freshness, execute_tractor_prescription,
-        normalize_weather_provider_forecast, plan_tractor_swath_coverage,
-        resolve_weather_forecast_to_field, run_tractor_straight_path_guidance,
-        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
+        ingest_weather_sensor_stream, normalize_weather_provider_forecast,
+        plan_tractor_swath_coverage, resolve_weather_forecast_to_field,
+        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
         AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
@@ -7799,7 +8024,8 @@ mod tests {
         TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
         WeatherForecastValue, WeatherFreshnessState, WeatherIngestError,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherSensorIngestError,
+        WeatherSensorSample, WeatherSensorStreamIngestRequest, WorkOrderChangeType,
         WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
         WorkOrderRegistry, WorkOrderStatus,
     };
@@ -9595,6 +9821,66 @@ mod tests {
     }
 
     #[test]
+    fn weather_sensor_stream_ingests_samples_with_provenance_and_freshness() {
+        let ingest = ingest_weather_sensor_stream(weather_sensor_stream_request(vec![
+            weather_sensor_sample("2026-06-13T10:00:00Z", 22.5),
+            weather_sensor_sample("2026-06-13T10:05:00Z", 23.0),
+        ]))
+        .expect("sensor stream should ingest");
+
+        assert_eq!(ingest.sensor_id, "sensor-north-001");
+        assert_eq!(ingest.field_ref, "field-north");
+        assert_eq!(ingest.source, "sensor");
+        assert_eq!(ingest.sample_count, 2);
+        assert!(ingest.gap_events.is_empty());
+        assert!(!ingest.stale);
+        assert_eq!(ingest.records[0].source, "sensor");
+        assert_eq!(ingest.records[0].vars.temperature_celsius.source, "sensor");
+        assert_eq!(
+            ingest.freshness[0].temperature_celsius.freshness_state,
+            WeatherFreshnessState::Fresh
+        );
+    }
+
+    #[test]
+    fn weather_sensor_stream_records_gap_and_stale_state() {
+        let ingest = ingest_weather_sensor_stream(weather_sensor_stream_request(vec![
+            weather_sensor_sample("2026-06-13T10:00:00Z", 22.5),
+            weather_sensor_sample("2026-06-13T10:30:00Z", 23.0),
+        ]))
+        .expect("sensor gap should ingest with event");
+
+        assert!(ingest.stale);
+        assert_eq!(ingest.gap_events.len(), 1);
+        assert_eq!(ingest.gap_events[0].reason_code, "sensor_stream_gap");
+        assert_eq!(ingest.gap_events[0].gap_seconds, 1800);
+    }
+
+    #[test]
+    fn weather_sensor_stream_rejects_invalid_sample_without_partial_ingest() {
+        let error = ingest_weather_sensor_stream(weather_sensor_stream_request(vec![
+            weather_sensor_sample("2026-06-13T10:00:00Z", 22.5),
+            WeatherSensorSample {
+                observed_at: "2026-06-13T10:05:00Z".to_string(),
+                temperature_celsius: 23.0,
+                wind_speed_mps: -1.0,
+                precipitation_mm: 0.0,
+                humidity_percent: 64.0,
+                radiation_w_m2: 720.0,
+            },
+        ]))
+        .expect_err("invalid sample should reject stream");
+
+        assert_eq!(
+            error,
+            WeatherSensorIngestError::Weather(WeatherIngestError::InvalidValue {
+                variable: "wind_speed_mps".to_string(),
+                value: "-1".to_string()
+            })
+        );
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -10179,6 +10465,31 @@ mod tests {
             source: "NOAA-HRRR".to_string(),
             fetched_at: fetched_at.to_string(),
             valid_time: valid_time.to_string(),
+        }
+    }
+
+    fn weather_sensor_stream_request(
+        samples: Vec<WeatherSensorSample>,
+    ) -> WeatherSensorStreamIngestRequest {
+        WeatherSensorStreamIngestRequest {
+            sensor_id: "sensor-north-001".to_string(),
+            field_ref: "field-north".to_string(),
+            fetched_at: "2026-06-13T10:10:00Z".to_string(),
+            evaluated_at: "2026-06-13T10:10:00Z".to_string(),
+            stale_after_seconds: 900,
+            max_gap_seconds: 600,
+            samples,
+        }
+    }
+
+    fn weather_sensor_sample(observed_at: &str, temperature_celsius: f64) -> WeatherSensorSample {
+        WeatherSensorSample {
+            observed_at: observed_at.to_string(),
+            temperature_celsius,
+            wind_speed_mps: 4.2,
+            precipitation_mm: 0.0,
+            humidity_percent: 64.0,
+            radiation_w_m2: 720.0,
         }
     }
 
