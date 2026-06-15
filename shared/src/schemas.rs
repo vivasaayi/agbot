@@ -942,6 +942,61 @@ pub enum TractorGeofenceError {
     InvalidPosition,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorOperatorApproval {
+    pub approval_id: String,
+    pub tractor_id: String,
+    pub approved_by: String,
+    pub approved_at: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorEstopState {
+    pub tractor_id: String,
+    pub active: bool,
+    pub triggered_by: Option<String>,
+    pub triggered_at: Option<String>,
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorMotionGateDecision {
+    Allowed,
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorMotionGateAudit {
+    pub tractor_id: String,
+    pub command_id: Option<String>,
+    pub decision: TractorMotionGateDecision,
+    pub reason_code: String,
+    pub actor: Option<String>,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TractorMotionGateEvaluation {
+    pub tractor_id: String,
+    pub command_id: Option<String>,
+    pub decision: TractorMotionGateDecision,
+    pub halted: bool,
+    pub approval_id: Option<String>,
+    pub audit: TractorMotionGateAudit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TractorMotionGateError {
+    #[error("tractor motion gate tractor_id cannot be empty")]
+    EmptyTractorId,
+    #[error("tractor motion gate timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("tractor motion gate approval timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
 impl TractorCommandRejection {
     pub fn status_code(&self) -> u16 {
         match self.reason {
@@ -1759,6 +1814,115 @@ fn tractor_point_inside_polygon(point: &GeoPoint, ring: &[GeoPoint]) -> bool {
 fn tractor_motion_crosses_boundary(start: &GeoPoint, end: &GeoPoint, ring: &[GeoPoint]) -> bool {
     ring.windows(2)
         .any(|edge| segments_intersect(start, end, &edge[0], &edge[1]))
+}
+
+pub fn evaluate_tractor_motion_gate(
+    request: &TractorMotionCommandRequest,
+    estop: Option<&TractorEstopState>,
+    approval: Option<&TractorOperatorApproval>,
+    at: &str,
+) -> Result<TractorMotionGateEvaluation, TractorMotionGateError> {
+    let tractor_id = normalize_tractor_text(request.tractor_id.clone())
+        .ok_or(TractorMotionGateError::EmptyTractorId)?;
+    let at =
+        normalize_tractor_text(at.to_string()).ok_or(TractorMotionGateError::EmptyTimestamp)?;
+    parse_tractor_motion_gate_timestamp(&at)?;
+    let command_id = request.command_id.clone().and_then(normalize_tractor_text);
+
+    if estop
+        .filter(|state| state.tractor_id.trim() == tractor_id && state.active)
+        .is_some()
+    {
+        return Ok(tractor_motion_gate_result(
+            tractor_id,
+            command_id,
+            TractorMotionGateDecision::Refused,
+            true,
+            None,
+            request.requested_by.clone(),
+            at,
+            "estop_active",
+        ));
+    }
+
+    let approval = approval.filter(|approval| approval.tractor_id.trim() == tractor_id);
+    let Some(approval) = approval else {
+        return Ok(tractor_motion_gate_result(
+            tractor_id,
+            command_id,
+            TractorMotionGateDecision::Refused,
+            false,
+            None,
+            request.requested_by.clone(),
+            at,
+            "operator_approval_required",
+        ));
+    };
+    parse_tractor_motion_gate_timestamp(&approval.approved_at)?;
+    if let Some(expires_at) = &approval.expires_at {
+        let expires = parse_tractor_motion_gate_timestamp(expires_at)?;
+        let requested_at = parse_tractor_motion_gate_timestamp(&at)?;
+        if requested_at > expires {
+            return Ok(tractor_motion_gate_result(
+                tractor_id,
+                command_id,
+                TractorMotionGateDecision::Refused,
+                false,
+                None,
+                request.requested_by.clone(),
+                at,
+                "operator_approval_expired",
+            ));
+        }
+    }
+
+    Ok(tractor_motion_gate_result(
+        tractor_id,
+        command_id,
+        TractorMotionGateDecision::Allowed,
+        false,
+        Some(approval.approval_id.clone()),
+        request.requested_by.clone(),
+        at,
+        "operator_approved",
+    ))
+}
+
+fn tractor_motion_gate_result(
+    tractor_id: String,
+    command_id: Option<String>,
+    decision: TractorMotionGateDecision,
+    halted: bool,
+    approval_id: Option<String>,
+    actor: Option<String>,
+    at: String,
+    reason_code: &str,
+) -> TractorMotionGateEvaluation {
+    TractorMotionGateEvaluation {
+        tractor_id: tractor_id.clone(),
+        command_id: command_id.clone(),
+        decision,
+        halted,
+        approval_id,
+        audit: TractorMotionGateAudit {
+            tractor_id,
+            command_id,
+            decision,
+            reason_code: reason_code.to_string(),
+            actor: actor.and_then(normalize_tractor_text),
+            at,
+        },
+    }
+}
+
+fn parse_tractor_motion_gate_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, TractorMotionGateError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| TractorMotionGateError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6423,8 +6587,9 @@ mod tests {
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
         create_versioned_content, dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
-        evaluate_tractor_geofence, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        evaluate_tractor_geofence, evaluate_tractor_motion_gate,
+        normalize_weather_provider_forecast, plan_tractor_swath_coverage,
+        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
@@ -6452,15 +6617,17 @@ mod tests {
         SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
         SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
-        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGeofenceDecision,
-        TractorGeofenceError, TractorGeofenceEvaluationRequest, TractorGuidanceConfig,
-        TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
-        TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
-        TractorRegistrationRequest, TractorRegistry, TractorSwathCoverageRequest,
-        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
-        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
-        WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry, WorkOrderStatus,
+        TractorEstopState, TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent,
+        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
+        TractorFieldOpsTelemetrySample, TractorGeofenceDecision, TractorGeofenceError,
+        TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
+        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint, TractorImplementRef,
+        TractorLifecycleStatus, TractorMotionCommandRequest, TractorMotionGateDecision,
+        TractorOperatorApproval, TractorRegistrationRequest, TractorRegistry,
+        TractorSwathCoverageRequest, WeatherIngestError, WeatherProviderForecastPoint,
+        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
+        WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry,
+        WorkOrderStatus,
     };
 
     #[test]
@@ -7356,6 +7523,61 @@ mod tests {
     }
 
     #[test]
+    fn tractor_motion_gate_estop_preempts_approval() {
+        let evaluation = evaluate_tractor_motion_gate(
+            &tractor_motion_gate_command(),
+            Some(&TractorEstopState {
+                tractor_id: "tractor-001".to_string(),
+                active: true,
+                triggered_by: Some("ops@example.com".to_string()),
+                triggered_at: Some("2026-06-15T10:00:00Z".to_string()),
+                reason_code: Some("operator_estop".to_string()),
+            }),
+            Some(&tractor_operator_approval()),
+            "2026-06-15T10:00:02Z",
+        )
+        .expect("motion gate evaluates");
+
+        assert_eq!(evaluation.decision, TractorMotionGateDecision::Refused);
+        assert!(evaluation.halted);
+        assert_eq!(evaluation.approval_id, None);
+        assert_eq!(evaluation.audit.reason_code, "estop_active");
+    }
+
+    #[test]
+    fn tractor_motion_gate_allows_approved_motion() {
+        let evaluation = evaluate_tractor_motion_gate(
+            &tractor_motion_gate_command(),
+            None,
+            Some(&tractor_operator_approval()),
+            "2026-06-15T10:00:02Z",
+        )
+        .expect("motion gate evaluates");
+
+        assert_eq!(evaluation.decision, TractorMotionGateDecision::Allowed);
+        assert!(!evaluation.halted);
+        assert_eq!(evaluation.approval_id.as_deref(), Some("approval-001"));
+        assert_eq!(evaluation.audit.reason_code, "operator_approved");
+        assert_eq!(evaluation.audit.actor.as_deref(), Some("ops@example.com"));
+    }
+
+    #[test]
+    fn tractor_motion_gate_refuses_unapproved_motion() {
+        let evaluation = evaluate_tractor_motion_gate(
+            &tractor_motion_gate_command(),
+            None,
+            None,
+            "2026-06-15T10:00:02Z",
+        )
+        .expect("motion gate evaluates");
+
+        assert_eq!(evaluation.decision, TractorMotionGateDecision::Refused);
+        assert!(!evaluation.halted);
+        assert_eq!(evaluation.approval_id, None);
+        assert_eq!(evaluation.audit.reason_code, "operator_approval_required");
+    }
+
+    #[test]
     fn marketplace_account_links_party_to_one_org_and_normalizes_roles() {
         let record = build_marketplace_account_record(
             MarketplaceAccountCreateRequest {
@@ -8166,6 +8388,25 @@ mod tests {
             current_position,
             predicted_position,
             position_crs: position_crs.to_string(),
+        }
+    }
+
+    fn tractor_motion_gate_command() -> TractorMotionCommandRequest {
+        TractorMotionCommandRequest {
+            command_id: Some("cmd-001".to_string()),
+            tractor_id: "tractor-001".to_string(),
+            command_type: "move".to_string(),
+            requested_by: Some("ops@example.com".to_string()),
+        }
+    }
+
+    fn tractor_operator_approval() -> TractorOperatorApproval {
+        TractorOperatorApproval {
+            approval_id: "approval-001".to_string(),
+            tractor_id: "tractor-001".to_string(),
+            approved_by: "ops@example.com".to_string(),
+            approved_at: "2026-06-15T09:59:00Z".to_string(),
+            expires_at: Some("2026-06-15T10:05:00Z".to_string()),
         }
     }
 
