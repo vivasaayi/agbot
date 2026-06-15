@@ -6364,6 +6364,80 @@ pub struct DroughtIndexRecord {
     pub computed_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtStressIndex {
+    Ndvi,
+    Ndmi,
+}
+
+impl DroughtStressIndex {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DroughtStressIndex::Ndvi => "ndvi",
+            DroughtStressIndex::Ndmi => "ndmi",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtStressEvidenceLayer {
+    #[serde(default)]
+    pub evidence_id: Option<String>,
+    pub field_or_region_ref: String,
+    pub source_scene_ref: String,
+    pub index: DroughtStressIndex,
+    pub value: f64,
+    pub source: String,
+    pub captured_at: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub spatial_ref: Option<RasterSpatialRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtStressEvidenceRecord {
+    pub evidence_id: String,
+    pub field_or_region_ref: String,
+    pub source_scene_ref: String,
+    pub index: DroughtStressIndex,
+    pub value: f64,
+    pub source: String,
+    pub captured_at: String,
+    pub evidence_kind: String,
+    pub crs: String,
+    pub extent: GeoBounds,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DroughtStressEvidenceError {
+    #[error("drought stress evidence_id cannot be empty")]
+    EmptyEvidenceId,
+    #[error("drought stress field_or_region_ref cannot be empty")]
+    EmptyFieldOrRegionRef,
+    #[error("drought stress source_scene_ref cannot be empty")]
+    EmptySourceSceneRef,
+    #[error("drought stress source cannot be empty")]
+    EmptySource,
+    #[error("drought stress captured_at cannot be empty")]
+    EmptyCapturedAt,
+    #[error("drought stress field/region mismatch: {field_or_region_ref}")]
+    FieldOrRegionMismatch { field_or_region_ref: String },
+    #[error("drought stress value is invalid: {value}")]
+    InvalidValue { value: String },
+    #[error("drought stress CRS mismatch: layer {layer_crs}, field {field_crs}")]
+    CrsMismatch {
+        layer_crs: String,
+        field_crs: String,
+    },
+    #[error("drought stress extent mismatch")]
+    ExtentMismatch,
+    #[error("drought stress spatial reference invalid: {0}")]
+    SpatialRef(#[from] RasterSpatialRefError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DroughtIndexError {
     #[error("drought index_id cannot be empty")]
@@ -6430,6 +6504,82 @@ pub fn compute_drought_index(
     })
 }
 
+pub fn ingest_drought_stress_evidence(
+    layer: DroughtStressEvidenceLayer,
+    field: &FieldRecord,
+) -> Result<DroughtStressEvidenceRecord, DroughtStressEvidenceError> {
+    let field_or_region_ref = normalize_drought_text(layer.field_or_region_ref)
+        .ok_or(DroughtStressEvidenceError::EmptyFieldOrRegionRef)?;
+    if field.field_id != field_or_region_ref {
+        return Err(DroughtStressEvidenceError::FieldOrRegionMismatch {
+            field_or_region_ref,
+        });
+    }
+    let source_scene_ref = normalize_drought_text(layer.source_scene_ref)
+        .ok_or(DroughtStressEvidenceError::EmptySourceSceneRef)?;
+    let source =
+        normalize_drought_text(layer.source).ok_or(DroughtStressEvidenceError::EmptySource)?;
+    let captured_at = normalize_drought_text(layer.captured_at)
+        .ok_or(DroughtStressEvidenceError::EmptyCapturedAt)?;
+    let evidence_id = normalize_drought_optional_text(layer.evidence_id)
+        .or_else(|| {
+            Some(stable_drought_stress_evidence_id(
+                &field_or_region_ref,
+                layer.index,
+                &captured_at,
+            ))
+        })
+        .and_then(normalize_drought_text)
+        .ok_or(DroughtStressEvidenceError::EmptyEvidenceId)?;
+    if !(layer.value.is_finite() && (-1.0..=1.0).contains(&layer.value)) {
+        return Err(DroughtStressEvidenceError::InvalidValue {
+            value: layer.value.to_string(),
+        });
+    }
+    let spatial_ref =
+        assert_raster_spatial_ref(layer.spatial_ref.as_ref(), layer.width, layer.height)?;
+    let layer_crs = spatial_ref
+        .crs
+        .as_ref()
+        .expect("asserted spatial ref includes CRS")
+        .clone();
+    let field_crs = field
+        .boundary
+        .crs
+        .as_deref()
+        .map(str::trim)
+        .filter(|crs| !crs.is_empty())
+        .unwrap_or("EPSG:4326")
+        .to_string();
+    if layer_crs != field_crs {
+        return Err(DroughtStressEvidenceError::CrsMismatch {
+            layer_crs,
+            field_crs,
+        });
+    }
+    let layer_extent = spatial_ref
+        .bbox
+        .as_ref()
+        .expect("asserted spatial ref includes bbox");
+    if !geo_bounds_match(layer_extent, &field.extent) {
+        return Err(DroughtStressEvidenceError::ExtentMismatch);
+    }
+
+    Ok(DroughtStressEvidenceRecord {
+        evidence_id,
+        field_or_region_ref: field.field_id.clone(),
+        source_scene_ref: source_scene_ref.clone(),
+        index: layer.index,
+        value: layer.value,
+        source,
+        captured_at,
+        evidence_kind: "observed".to_string(),
+        crs: field_crs,
+        extent: field.extent.clone(),
+        evidence_refs: vec![format!("scene:{source_scene_ref}")],
+    })
+}
+
 pub fn parse_drought_index_type(value: &str) -> Result<DroughtIndexType, DroughtIndexError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "spi" => Ok(DroughtIndexType::Spi),
@@ -6471,6 +6621,19 @@ fn normalize_drought_input_refs(input_refs: Vec<String>) -> Result<Vec<String>, 
     } else {
         Ok(input_refs)
     }
+}
+
+fn stable_drought_stress_evidence_id(
+    field_or_region_ref: &str,
+    index: DroughtStressIndex,
+    captured_at: &str,
+) -> String {
+    format!(
+        "drought-stress:{}:{}:{}",
+        sanitize_moisture_proxy_id_part(field_or_region_ref),
+        index.as_str(),
+        sanitize_moisture_proxy_id_part(captured_at)
+    )
 }
 
 fn normalize_drought_optional_text(value: Option<String>) -> Option<String> {
@@ -10515,33 +10678,35 @@ mod tests {
         evaluate_crop_stage_weather_risks, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_irrigation_valve_plan,
-        execute_tractor_prescription, ingest_remote_sensing_moisture_proxy_layer,
-        ingest_weather_sensor_stream, map_zone_water_need, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, query_irrigation_history, query_weather_history,
-        report_water_use_savings, resolve_weather_forecast_to_field, route_weather_alert,
-        run_tractor_straight_path_guidance, schedule_irrigation_plan, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, tractor_cross_track_error_m,
-        transition_marketplace_account_status, validate_field_boundary,
-        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
-        verify_weather_forecast_accuracy, weather_fetch_failure_record,
-        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
-        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
-        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
-        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
-        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
-        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, OpenDataPublishError,
+        execute_tractor_prescription, ingest_drought_stress_evidence,
+        ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
+        map_zone_water_need, normalize_weather_provider_forecast, plan_tractor_swath_coverage,
+        query_irrigation_history, query_weather_history, report_water_use_savings,
+        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
+        schedule_irrigation_plan, sign_fleet_config_bundle, soil_moisture_rejection_record,
+        tractor_cross_track_error_m, transition_marketplace_account_status,
+        validate_field_boundary, validate_water_weather_input_contract,
+        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
+        weather_fetch_failure_record, zone_water_need_insufficient, AccessAnomalySignal,
+        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
+        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
+        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
+        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
+        ContentType, CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, DroughtStressEvidenceError,
+        DroughtStressEvidenceLayer, DroughtStressIndex, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
+        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
+        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
+        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
+        MarketplacePartyType, MultispectralImage, OpenDataPublishError,
         OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
         RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus,
@@ -13499,6 +13664,49 @@ mod tests {
         assert_eq!(error, DroughtIndexError::InvalidBaselineStdDev);
     }
 
+    #[test]
+    fn drought_stress_evidence_ingests_georeferenced_scene_layer() {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+
+        let record = ingest_drought_stress_evidence(drought_stress_layer("EPSG:4326"), &field)
+            .expect("matching drought stress layer should ingest");
+
+        assert_eq!(record.field_or_region_ref, "field-north");
+        assert_eq!(record.source_scene_ref, "scene-landsat-001");
+        assert_eq!(record.index, DroughtStressIndex::Ndvi);
+        assert_eq!(record.value, -0.18);
+        assert_eq!(record.evidence_kind, "observed");
+        assert_eq!(record.crs, "EPSG:4326");
+        assert_eq!(record.extent, field.extent);
+        assert_eq!(
+            record.evidence_refs,
+            vec!["scene:scene-landsat-001".to_string()]
+        );
+        assert!(record
+            .evidence_id
+            .starts_with("drought-stress:field-north:ndvi"));
+    }
+
+    #[test]
+    fn drought_stress_evidence_rejects_crs_mismatch() {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+
+        let error = ingest_drought_stress_evidence(drought_stress_layer("EPSG:3857"), &field)
+            .expect_err("mismatched CRS should refuse stress evidence");
+
+        assert_eq!(
+            error,
+            DroughtStressEvidenceError::CrsMismatch {
+                layer_crs: "EPSG:3857".to_string(),
+                field_crs: "EPSG:4326".to_string()
+            }
+        );
+    }
+
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
         FleetNodeRecord {
             node_id: "node-001".to_string(),
@@ -13610,6 +13818,32 @@ mod tests {
                     value: 0.21,
                 },
             ],
+        }
+    }
+
+    fn drought_stress_layer(crs: &str) -> DroughtStressEvidenceLayer {
+        DroughtStressEvidenceLayer {
+            evidence_id: None,
+            field_or_region_ref: " field-north ".to_string(),
+            source_scene_ref: " scene-landsat-001 ".to_string(),
+            index: DroughtStressIndex::Ndvi,
+            value: -0.18,
+            source: " imagery_processor ".to_string(),
+            captured_at: " 2026-06-13T10:00:00Z ".to_string(),
+            width: 1,
+            height: 1,
+            spatial_ref: Some(RasterSpatialRef {
+                georeferenced: true,
+                crs: Some(crs.to_string()),
+                bbox: Some(GeoBounds {
+                    min_lon: -96.5,
+                    min_lat: 41.2,
+                    max_lon: -96.2,
+                    max_lat: 41.4,
+                }),
+                geo_transform: Some([-96.5, 0.3, 0.0, 41.4, 0.0, -0.2]),
+                resolution: Some(RasterResolution { x: 0.3, y: 0.2 }),
+            }),
         }
     }
 
