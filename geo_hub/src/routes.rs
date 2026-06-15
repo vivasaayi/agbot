@@ -94,12 +94,14 @@ use shared::schemas::{
     parse_content_status, parse_content_type, parse_drought_index_type,
     parse_marketplace_account_status, parse_marketplace_catalog_category,
     parse_marketplace_catalog_item_kind, parse_marketplace_listing_status,
-    parse_marketplace_party_type, parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
+    parse_marketplace_order_status, parse_marketplace_party_type,
+    parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
-    prepare_open_data_publication, publish_marketplace_listing_record,
-    release_marketplace_inventory, reserve_marketplace_inventory,
-    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
-    transition_marketplace_account_status, validate_field_boundary, weather_fetch_failure_record,
+    place_marketplace_order_record, prepare_open_data_publication,
+    publish_marketplace_listing_record, release_marketplace_inventory,
+    reserve_marketplace_inventory, soil_moisture_rejection_reason_for_error,
+    soil_moisture_rejection_record, transition_marketplace_account_status,
+    transition_marketplace_order_status, validate_field_boundary, weather_fetch_failure_record,
     AnnotationGeometry, AnnotationRecord, CollaborationChannelCreateRequest,
     CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
     CollaborationMessageCreateRequest, CollaborationMessageRecord, ContentCreateRequest,
@@ -114,19 +116,21 @@ use shared::schemas::{
     MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplaceCatalogItemRecord,
     MarketplaceInventoryError, MarketplaceInventoryRecord, MarketplaceInventoryUpsertRequest,
     MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingRecord,
-    MarketplaceListingStatus, MarketplacePartyType, MarketplacePortalEntry,
-    MarketplacePortalEntryError, MultispectralImage, OpenDataPublication, OpenDataPublishError,
-    OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RecommendationPriority,
-    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
-    SoilMoistureReadingError, SoilMoistureReadingRecord, SoilMoistureReadingRequest,
-    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, SustainabilityMetricType,
-    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
-    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
-    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
-    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
-    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
-    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
-    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
+    MarketplaceListingStatus, MarketplaceOrderAuditRecord, MarketplaceOrderCreateRequest,
+    MarketplaceOrderError, MarketplaceOrderRecord, MarketplaceOrderStatus, MarketplacePartyType,
+    MarketplacePortalEntry, MarketplacePortalEntryError, MultispectralImage, OpenDataPublication,
+    OpenDataPublishError, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+    RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
+    ReportVisibility, SoilMoistureReadingError, SoilMoistureReadingRecord,
+    SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
+    SustainabilityMetricType, SustainabilityRecord, SustainabilityRecordCreateRequest,
+    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
+    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
+    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
+    TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
+    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
+    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
+    GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -676,6 +680,24 @@ pub struct MarketplaceInventoryScopeQuery {
 pub struct MarketplaceInventoryAdjustmentRequest {
     pub org_id: String,
     pub qty: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceOrderListQuery {
+    pub org_id: Option<String>,
+    pub status: Option<MarketplaceOrderStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceOrderScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceOrderTransitionRequest {
+    pub org_id: String,
+    pub actor_id: String,
+    pub status: MarketplaceOrderStatus,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3467,6 +3489,176 @@ pub async fn release_marketplace_inventory_endpoint(
     load_marketplace_inventory(&state, &inventory_id)
         .await?
         .ok_or(AppError::NotFound)
+        .map(Json)
+}
+
+pub async fn place_marketplace_order(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceOrderCreateRequest>,
+) -> AppResult<Json<MarketplaceOrderRecord>> {
+    let listing_ref = normalize_optional_text(Some(request.listing_ref.clone()))
+        .ok_or_else(|| AppError::BadRequest("marketplace listing_ref is required".to_string()))?;
+    let buyer_account_id = normalize_optional_text(Some(request.buyer_account_id.clone()))
+        .ok_or_else(|| {
+            AppError::BadRequest("marketplace buyer_account_id is required".to_string())
+        })?;
+    let listing = load_marketplace_listing(&state, &listing_ref).await?;
+    let buyer_account = load_marketplace_account(&state, &buyer_account_id).await?;
+    let (order, audit) = place_marketplace_order_record(
+        request,
+        listing.as_ref(),
+        buyer_account.as_ref(),
+        format!("marketplace-order-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_order_error)?;
+    let listing = listing.ok_or(AppError::NotFound)?;
+    let inventory = load_marketplace_inventory_by_item(&state, &listing.item_id, &order.org_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("marketplace inventory is required".to_string()))?;
+    reserve_marketplace_inventory(&inventory, order.qty, current_record_timestamp())
+        .map_err(marketplace_inventory_error)?;
+    update_marketplace_inventory_reserve(&state, &inventory.inventory_id, &order.org_id, order.qty)
+        .await?;
+    insert_marketplace_order_record(&state, &order).await?;
+    insert_marketplace_order_audit_record(&state, &audit).await?;
+
+    Ok(Json(order))
+}
+
+pub async fn list_marketplace_orders(
+    Query(query): Query<MarketplaceOrderListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceOrderRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace orders".to_string(),
+        )
+    })?;
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT order_id, org_id, listing_ref, buyer_account_id, qty, line_total,
+               status, created_at, updated_at
+        FROM marketplace_orders
+        WHERE org_id = ?1
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY created_at ASC, order_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_order_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_order(
+    Path(order_id): Path<String>,
+    Query(query): Query<MarketplaceOrderScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceOrderRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let order = load_marketplace_order(&state, &order_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if order.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(order))
+}
+
+pub async fn transition_marketplace_order(
+    Path(order_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceOrderTransitionRequest>,
+) -> AppResult<Json<MarketplaceOrderRecord>> {
+    let org_id = normalize_optional_text(Some(request.org_id))
+        .ok_or_else(|| AppError::BadRequest("marketplace org_id is required".to_string()))?;
+    let order = load_marketplace_order(&state, &order_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if order.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let (updated, audit) = transition_marketplace_order_status(
+        &order,
+        request.status,
+        request.actor_id,
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_order_error)?;
+    if updated.status == MarketplaceOrderStatus::Fulfilled {
+        let listing = load_marketplace_listing(&state, &order.listing_ref)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let inventory = load_marketplace_inventory_by_item(&state, &listing.item_id, &order.org_id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest("marketplace inventory is required".to_string()))?;
+        update_marketplace_inventory_fulfill(
+            &state,
+            &inventory.inventory_id,
+            &order.org_id,
+            order.qty,
+        )
+        .await?;
+    } else if updated.status == MarketplaceOrderStatus::Cancelled {
+        let listing = load_marketplace_listing(&state, &order.listing_ref)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let inventory = load_marketplace_inventory_by_item(&state, &listing.item_id, &order.org_id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest("marketplace inventory is required".to_string()))?;
+        update_marketplace_inventory_release(
+            &state,
+            &inventory.inventory_id,
+            &order.org_id,
+            order.qty,
+        )
+        .await?;
+    }
+    update_marketplace_order_record(&state, &updated).await?;
+    insert_marketplace_order_audit_record(&state, &audit).await?;
+
+    Ok(Json(updated))
+}
+
+pub async fn list_marketplace_order_audits(
+    Path(order_id): Path<String>,
+    Query(query): Query<MarketplaceOrderScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceOrderAuditRecord>>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let order = load_marketplace_order(&state, &order_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if order.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT audit_id, order_id, from_status, to_status, actor_id, occurred_at
+        FROM marketplace_order_audits
+        WHERE order_id = ?1
+        ORDER BY occurred_at ASC, audit_id ASC
+        "#,
+    )
+    .bind(order_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_order_audit_record(&row))
+        .collect::<AppResult<Vec<_>>>()
         .map(Json)
 }
 
@@ -8610,6 +8802,10 @@ fn marketplace_inventory_error(error: MarketplaceInventoryError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn marketplace_order_error(error: MarketplaceOrderError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn sustainability_record_error(error: SustainabilityRecordError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -10121,6 +10317,41 @@ fn decode_marketplace_inventory_record(
         on_hand: row.get("on_hand"),
         reserved: row.get("reserved"),
         updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_marketplace_order_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceOrderRecord> {
+    Ok(MarketplaceOrderRecord {
+        order_id: row.get("order_id"),
+        org_id: row.get("org_id"),
+        listing_ref: row.get("listing_ref"),
+        buyer_account_id: row.get("buyer_account_id"),
+        qty: row.get("qty"),
+        line_total: row.get("line_total"),
+        status: parse_marketplace_order_status(&row.get::<String, _>("status"))
+            .map_err(marketplace_order_error)?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_marketplace_order_audit_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceOrderAuditRecord> {
+    let from_status = row
+        .get::<Option<String>, _>("from_status")
+        .map(|status| parse_marketplace_order_status(&status).map_err(marketplace_order_error))
+        .transpose()?;
+    Ok(MarketplaceOrderAuditRecord {
+        audit_id: row.get("audit_id"),
+        order_id: row.get("order_id"),
+        from_status,
+        to_status: parse_marketplace_order_status(&row.get::<String, _>("to_status"))
+            .map_err(marketplace_order_error)?,
+        actor_id: row.get("actor_id"),
+        occurred_at: row.get("occurred_at"),
     })
 }
 
@@ -11729,6 +11960,30 @@ async fn load_marketplace_inventory(
         .transpose()
 }
 
+async fn load_marketplace_inventory_by_item(
+    state: &AppState,
+    item_id: &str,
+    org_id: &str,
+) -> AppResult<Option<MarketplaceInventoryRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT inventory_id, item_id, org_id, on_hand, reserved, updated_at
+        FROM marketplace_inventory
+        WHERE item_id = ?1 AND org_id = ?2
+        ORDER BY inventory_id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(item_id)
+    .bind(org_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_inventory_record(&row))
+        .transpose()
+}
+
 async fn update_marketplace_inventory_reserve(
     state: &AppState,
     inventory_id: &str,
@@ -11816,6 +12071,102 @@ async fn update_marketplace_inventory_release(
             MarketplaceInventoryError::InsufficientReservedQuantity,
         ));
     }
+    Ok(())
+}
+
+async fn insert_marketplace_order_record(
+    state: &AppState,
+    record: &MarketplaceOrderRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_orders (
+            order_id, org_id, listing_ref, buyer_account_id, qty, line_total,
+            status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&record.order_id)
+    .bind(&record.org_id)
+    .bind(&record.listing_ref)
+    .bind(&record.buyer_account_id)
+    .bind(record.qty)
+    .bind(record.line_total)
+    .bind(record.status.as_str())
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn update_marketplace_order_record(
+    state: &AppState,
+    record: &MarketplaceOrderRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE marketplace_orders
+        SET status = ?2, updated_at = ?3
+        WHERE order_id = ?1
+        "#,
+    )
+    .bind(&record.order_id)
+    .bind(record.status.as_str())
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_marketplace_order(
+    state: &AppState,
+    order_id: &str,
+) -> AppResult<Option<MarketplaceOrderRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT order_id, org_id, listing_ref, buyer_account_id, qty, line_total,
+               status, created_at, updated_at
+        FROM marketplace_orders
+        WHERE order_id = ?1
+        "#,
+    )
+    .bind(order_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_order_record(&row))
+        .transpose()
+}
+
+async fn insert_marketplace_order_audit_record(
+    state: &AppState,
+    record: &MarketplaceOrderAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_order_audits (
+            audit_id, order_id, from_status, to_status, actor_id, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&record.audit_id)
+    .bind(&record.order_id)
+    .bind(record.from_status.map(|status| status.as_str().to_string()))
+    .bind(record.to_status.as_str())
+    .bind(&record.actor_id)
+    .bind(&record.occurred_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
     Ok(())
 }
 

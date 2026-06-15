@@ -286,6 +286,22 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::release_marketplace_inventory_endpoint),
         )
         .route(
+            "/api/marketplace/orders",
+            get(routes::list_marketplace_orders).post(routes::place_marketplace_order),
+        )
+        .route(
+            "/api/marketplace/orders/:order_id",
+            get(routes::get_marketplace_order),
+        )
+        .route(
+            "/api/marketplace/orders/:order_id/transition",
+            post(routes::transition_marketplace_order),
+        )
+        .route(
+            "/api/marketplace/orders/:order_id/audits",
+            get(routes::list_marketplace_order_audits),
+        )
+        .route(
             "/api/sustainability/records",
             get(routes::list_sustainability_records).post(routes::create_sustainability_record),
         )
