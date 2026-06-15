@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use shared::plugin_extensions::{
     extension_point_taxonomy, ExtensionPointContract, ExtensionPointKind,
 };
+use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef, RasterSpatialRefError};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -190,6 +191,85 @@ pub struct SandboxExecutionOutcome {
     pub estimated_runtime_ms: u64,
     pub estimated_memory_mb: u64,
     pub capability_audit: Vec<CapabilityAuditEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpectralBandOperand {
+    pub band: String,
+    pub coefficient: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpectralIndexFormula {
+    pub numerator: Vec<SpectralBandOperand>,
+    pub denominator: Vec<SpectralBandOperand>,
+    #[serde(default)]
+    pub offset: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpectralIndexPluginSpec {
+    pub plugin_id: String,
+    pub index_id: String,
+    pub required_bands: Vec<String>,
+    pub formula: SpectralIndexFormula,
+    pub required_capabilities: Vec<String>,
+    pub estimated_runtime_ms: u64,
+    pub estimated_memory_mb: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpectralIndexScene {
+    pub scene_ref: String,
+    pub width: u32,
+    pub height: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub bands: BTreeMap<String, Vec<f32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginProvenanceIdentity {
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub extension_point: ExtensionPointKind,
+    pub formula: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpectralIndexRaster {
+    pub artifact_id: String,
+    pub scene_ref: String,
+    pub index_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<f32>,
+    pub spatial_ref: RasterSpatialRef,
+    pub plugin_identity: PluginProvenanceIdentity,
+    pub sandbox_outcome: SandboxExecutionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SpectralIndexInvocationError {
+    #[error("unknown plugin: {plugin_id}")]
+    UnknownPlugin { plugin_id: String },
+    #[error("plugin {plugin_id} is not an index extension point")]
+    WrongExtensionPoint { plugin_id: String },
+    #[error("plugin {plugin_id} is missing required band {band}")]
+    MissingBand { plugin_id: String, band: String },
+    #[error("scene band {band} has {actual_len} pixels, expected {expected_len}")]
+    BandLengthMismatch {
+        band: String,
+        expected_len: usize,
+        actual_len: usize,
+    },
+    #[error("scene spatial reference rejected: {0}")]
+    InvalidSpatialRef(#[from] RasterSpatialRefError),
+    #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
+    SandboxTerminated {
+        plugin_id: String,
+        reason: Option<SandboxTerminationReason>,
+        outcome: SandboxExecutionOutcome,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,6 +580,155 @@ impl PluginHost {
             capability_audit,
         }
     }
+
+    pub fn run_custom_spectral_index(
+        &mut self,
+        spec: SpectralIndexPluginSpec,
+        scene: SpectralIndexScene,
+        limits: PluginExecutionLimits,
+        attempted_at: &str,
+    ) -> Result<SpectralIndexRaster, SpectralIndexInvocationError> {
+        let plugin_id = normalize_optional_text(spec.plugin_id.clone()).unwrap_or_default();
+        let registration = self.registrations.get(&plugin_id).ok_or_else(|| {
+            SpectralIndexInvocationError::UnknownPlugin {
+                plugin_id: plugin_id.clone(),
+            }
+        })?;
+        if registration.kind != ExtensionPointKind::Index {
+            return Err(SpectralIndexInvocationError::WrongExtensionPoint { plugin_id });
+        }
+        let plugin_version = registration.version.clone();
+
+        for band in &spec.required_bands {
+            let band = normalize_optional_text(band.clone()).unwrap_or_default();
+            if !scene.bands.contains_key(&band) {
+                return Err(SpectralIndexInvocationError::MissingBand { plugin_id, band });
+            }
+        }
+
+        let expected_len = (scene.width as usize) * (scene.height as usize);
+        for band in &spec.required_bands {
+            let band = normalize_optional_text(band.clone()).unwrap_or_default();
+            let actual_len = scene.bands.get(&band).map_or(0, Vec::len);
+            if actual_len != expected_len {
+                return Err(SpectralIndexInvocationError::BandLengthMismatch {
+                    band,
+                    expected_len,
+                    actual_len,
+                });
+            }
+        }
+
+        let spatial_ref =
+            assert_raster_spatial_ref(Some(&scene.spatial_ref), scene.width, scene.height)?;
+        let formula_label = spec.formula.label();
+        let outcome = self.execute_sandboxed(
+            PluginExecutionPlan {
+                plugin_id: plugin_id.clone(),
+                required_capabilities: spec.required_capabilities.clone(),
+                estimated_runtime_ms: spec.estimated_runtime_ms,
+                estimated_memory_mb: spec.estimated_memory_mb,
+                result: format!(
+                    "custom spectral index {index_id} over {scene_ref}",
+                    index_id = spec.index_id,
+                    scene_ref = scene.scene_ref
+                ),
+            },
+            limits,
+            attempted_at,
+        );
+        if outcome.status != SandboxExecutionStatus::Completed {
+            return Err(SpectralIndexInvocationError::SandboxTerminated {
+                plugin_id,
+                reason: outcome.termination_reason,
+                outcome,
+            });
+        }
+
+        let pixels = spec.formula.evaluate(&scene.bands, expected_len);
+        Ok(SpectralIndexRaster {
+            artifact_id: format!(
+                "index:{scene_ref}:{index_id}:{plugin_id}",
+                scene_ref = scene.scene_ref,
+                index_id = spec.index_id,
+                plugin_id = plugin_id
+            ),
+            scene_ref: scene.scene_ref,
+            index_id: spec.index_id,
+            width: scene.width,
+            height: scene.height,
+            pixels,
+            spatial_ref,
+            plugin_identity: PluginProvenanceIdentity {
+                plugin_id,
+                plugin_version,
+                extension_point: ExtensionPointKind::Index,
+                formula: formula_label,
+            },
+            sandbox_outcome: outcome,
+        })
+    }
+}
+
+impl SpectralIndexFormula {
+    fn evaluate(&self, bands: &BTreeMap<String, Vec<f32>>, pixel_count: usize) -> Vec<f32> {
+        (0..pixel_count)
+            .map(|index| {
+                let numerator = weighted_sum(&self.numerator, bands, index) + self.offset;
+                if self.denominator.is_empty() {
+                    numerator
+                } else {
+                    let denominator = weighted_sum(&self.denominator, bands, index);
+                    if denominator == 0.0 {
+                        f32::NAN
+                    } else {
+                        numerator / denominator
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn label(&self) -> String {
+        let numerator = operands_label(&self.numerator);
+        if self.denominator.is_empty() {
+            if self.offset == 0.0 {
+                numerator
+            } else {
+                format!("{numerator}+{}", self.offset)
+            }
+        } else {
+            format!(
+                "({numerator}+{})/({})",
+                self.offset,
+                operands_label(&self.denominator)
+            )
+        }
+    }
+}
+
+fn weighted_sum(
+    operands: &[SpectralBandOperand],
+    bands: &BTreeMap<String, Vec<f32>>,
+    index: usize,
+) -> f32 {
+    operands
+        .iter()
+        .filter_map(|operand| {
+            bands
+                .get(&operand.band)
+                .and_then(|values| values.get(index))
+                .map(|value| operand.coefficient * *value)
+        })
+        .sum()
+}
+
+fn operands_label(operands: &[SpectralBandOperand]) -> String {
+    operands
+        .iter()
+        .map(|operand| format!("{}*{}", operand.coefficient, operand.band))
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 pub fn validate_manifest(
@@ -731,9 +960,13 @@ mod tests {
         CapabilityDecision, CapabilityViolationReason, ManifestField, ManifestRejectionReason,
         PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginLifecycleStatus,
         PluginLifecycleTransitionRequest, PluginRegistrationError, RawPluginManifest,
-        SandboxExecutionStatus, SandboxTerminationReason,
+        SandboxExecutionStatus, SandboxTerminationReason, SpectralBandOperand,
+        SpectralIndexFormula, SpectralIndexInvocationError, SpectralIndexPluginSpec,
+        SpectralIndexScene,
     };
     use shared::plugin_extensions::ExtensionPointKind;
+    use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
+    use std::collections::BTreeMap;
 
     #[test]
     fn host_lists_exact_extension_point_taxonomy() {
@@ -1046,6 +1279,100 @@ mod tests {
     }
 
     #[test]
+    fn custom_spectral_index_invocation_produces_raster_with_plugin_identity() {
+        let mut host = PluginHost::default();
+        host.register_plugin(custom_index_manifest())
+            .expect("index plugin should register");
+        enable_custom_index(&mut host);
+
+        let raster = host
+            .run_custom_spectral_index(
+                custom_ratio_spec(),
+                custom_index_scene(),
+                sandbox_limits(),
+                "2026-06-12T12:30:00Z",
+            )
+            .expect("index plugin should run");
+
+        assert_eq!(
+            raster.artifact_id,
+            "index:scene:alpha-2026-06-12:custom_chlorophyll:plugin.custom_ndvi"
+        );
+        assert_eq!(raster.width, 2);
+        assert_eq!(raster.height, 1);
+        assert_float_eq(raster.pixels[0], 0.5);
+        assert_float_eq(raster.pixels[1], 0.25);
+        assert_eq!(raster.plugin_identity.plugin_id, "plugin.custom_ndvi");
+        assert_eq!(raster.plugin_identity.plugin_version, "1.2.3");
+        assert_eq!(
+            raster.plugin_identity.extension_point,
+            ExtensionPointKind::Index
+        );
+        assert_eq!(
+            raster.sandbox_outcome.status,
+            SandboxExecutionStatus::Completed
+        );
+        assert_eq!(
+            raster.sandbox_outcome.capability_audit[0].decision,
+            CapabilityDecision::Permitted
+        );
+    }
+
+    #[test]
+    fn custom_spectral_index_preserves_source_spatial_reference() {
+        let mut host = PluginHost::default();
+        host.register_plugin(custom_index_manifest())
+            .expect("index plugin should register");
+        enable_custom_index(&mut host);
+        let scene = custom_index_scene();
+        let source_spatial_ref = scene.spatial_ref.clone();
+
+        let raster = host
+            .run_custom_spectral_index(
+                custom_ratio_spec(),
+                scene,
+                sandbox_limits(),
+                "2026-06-12T12:31:00Z",
+            )
+            .expect("index plugin should run");
+
+        assert_eq!(raster.spatial_ref, source_spatial_ref);
+        assert_eq!(raster.spatial_ref.crs.as_deref(), Some("EPSG:32614"));
+        assert_eq!(
+            raster.spatial_ref.resolution,
+            Some(RasterResolution { x: 10.0, y: 10.0 })
+        );
+    }
+
+    #[test]
+    fn custom_spectral_index_refuses_missing_required_band() {
+        let mut host = PluginHost::default();
+        host.register_plugin(custom_index_manifest())
+            .expect("index plugin should register");
+        enable_custom_index(&mut host);
+        let mut scene = custom_index_scene();
+        scene.bands.remove("B05");
+
+        let error = host
+            .run_custom_spectral_index(
+                custom_ratio_spec(),
+                scene,
+                sandbox_limits(),
+                "2026-06-12T12:32:00Z",
+            )
+            .expect_err("missing required band should refuse invocation");
+
+        assert_eq!(
+            error,
+            SpectralIndexInvocationError::MissingBand {
+                plugin_id: "plugin.custom_ndvi".to_string(),
+                band: "B05".to_string(),
+            }
+        );
+        assert!(host.capability_audit_entries().is_empty());
+    }
+
+    #[test]
     fn compatible_host_api_version_registers_within_supported_range() {
         let mut host = PluginHost::with_supported_host_api_range("2026.1", "2026.3")
             .expect("range should be valid");
@@ -1127,6 +1454,77 @@ mod tests {
         .expect("plugin should enable");
     }
 
+    fn enable_custom_index(host: &mut PluginHost) {
+        host.transition_plugin_status(
+            "plugin.custom_ndvi",
+            lifecycle_request(
+                PluginLifecycleStatus::Enabled,
+                "platform-admin-1",
+                "2026-06-12T12:29:00Z",
+            ),
+            "plugin-audit-enable-custom-index".to_string(),
+        )
+        .expect("plugin should enable");
+    }
+
+    fn custom_ratio_spec() -> SpectralIndexPluginSpec {
+        SpectralIndexPluginSpec {
+            plugin_id: "plugin.custom_ndvi".to_string(),
+            index_id: "custom_chlorophyll".to_string(),
+            required_bands: vec!["B05".to_string(), "B04".to_string()],
+            formula: SpectralIndexFormula {
+                numerator: vec![
+                    SpectralBandOperand {
+                        band: "B05".to_string(),
+                        coefficient: 1.0,
+                    },
+                    SpectralBandOperand {
+                        band: "B04".to_string(),
+                        coefficient: -1.0,
+                    },
+                ],
+                denominator: vec![
+                    SpectralBandOperand {
+                        band: "B05".to_string(),
+                        coefficient: 1.0,
+                    },
+                    SpectralBandOperand {
+                        band: "B04".to_string(),
+                        coefficient: 1.0,
+                    },
+                ],
+                offset: 0.0,
+            },
+            required_capabilities: vec!["read:scene".to_string(), "write:product".to_string()],
+            estimated_runtime_ms: 20,
+            estimated_memory_mb: 64,
+        }
+    }
+
+    fn custom_index_scene() -> SpectralIndexScene {
+        let mut bands = BTreeMap::new();
+        bands.insert("B05".to_string(), vec![0.9, 0.5]);
+        bands.insert("B04".to_string(), vec![0.3, 0.3]);
+        SpectralIndexScene {
+            scene_ref: "scene:alpha-2026-06-12".to_string(),
+            width: 2,
+            height: 1,
+            spatial_ref: RasterSpatialRef {
+                georeferenced: true,
+                crs: Some("EPSG:32614".to_string()),
+                bbox: Some(GeoBounds {
+                    min_lon: 500_000.0,
+                    min_lat: 4_100_000.0,
+                    max_lon: 500_020.0,
+                    max_lat: 4_100_010.0,
+                }),
+                geo_transform: Some([500_000.0, 10.0, 0.0, 4_100_010.0, 0.0, -10.0]),
+                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+            },
+            bands,
+        }
+    }
+
     fn lifecycle_request(
         status: PluginLifecycleStatus,
         actor_id: &str,
@@ -1155,5 +1553,12 @@ mod tests {
             estimated_memory_mb,
             result: "scene stats complete".to_string(),
         }
+    }
+
+    fn assert_float_eq(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1.0e-6,
+            "expected {expected}, got {actual}"
+        );
     }
 }
