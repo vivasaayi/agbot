@@ -156,6 +156,38 @@ pub struct FieldBoundaryImportReport {
     pub feature_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BulkFieldBoundaryImportRequest {
+    pub rows: Vec<FieldBoundaryImportRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BulkImportRowStatus {
+    Imported,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BulkFieldBoundaryImportRowReport {
+    pub row: usize,
+    pub status: BulkImportRowStatus,
+    pub field_id: Option<String>,
+    pub source_filename: Option<String>,
+    pub source_crs: Option<String>,
+    pub target_crs: Option<String>,
+    pub feature_count: Option<usize>,
+    pub reason_code: Option<InteropRejectionReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BulkFieldBoundaryImportReport {
+    pub rows: Vec<BulkFieldBoundaryImportRowReport>,
+    pub imported: Vec<FieldBoundaryImportReport>,
+    pub success_count: usize,
+    pub failure_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportLineageEmissionRequest {
     pub import_artifact_id: String,
@@ -909,6 +941,54 @@ pub fn import_field_boundary(
         target_crs: imported.target_crs,
         feature_count: imported.feature_count,
     })
+}
+
+pub fn bulk_import_field_boundaries(
+    request: BulkFieldBoundaryImportRequest,
+) -> BulkFieldBoundaryImportReport {
+    let mut rows = Vec::with_capacity(request.rows.len());
+    let mut imported = Vec::new();
+    for (index, row_request) in request.rows.into_iter().enumerate() {
+        let row = index + 1;
+        let requested_field_id = row_request.field_id.clone();
+        let requested_target_crs = normalize_crs(&row_request.target_crs)
+            .or_else(|| normalize_optional_text(&row_request.target_crs));
+        match import_field_boundary(row_request) {
+            Ok(report) => {
+                rows.push(BulkFieldBoundaryImportRowReport {
+                    row,
+                    status: BulkImportRowStatus::Imported,
+                    field_id: Some(report.field.field_id.clone()),
+                    source_filename: Some(report.source_filename.clone()),
+                    source_crs: Some(report.source_crs.clone()),
+                    target_crs: Some(report.target_crs.clone()),
+                    feature_count: Some(report.feature_count),
+                    reason_code: None,
+                });
+                imported.push(report);
+            }
+            Err(InteropError::Rejected { filename, reason }) => {
+                rows.push(BulkFieldBoundaryImportRowReport {
+                    row,
+                    status: BulkImportRowStatus::Failed,
+                    field_id: normalize_optional_text(&requested_field_id),
+                    source_filename: Some(filename),
+                    source_crs: None,
+                    target_crs: requested_target_crs,
+                    feature_count: None,
+                    reason_code: Some(reason),
+                });
+            }
+        }
+    }
+    let success_count = imported.len();
+    let failure_count = rows.len().saturating_sub(success_count);
+    BulkFieldBoundaryImportReport {
+        rows,
+        imported,
+        success_count,
+        failure_count,
+    }
 }
 
 pub fn emit_import_lineage(
@@ -3039,7 +3119,8 @@ mod tests {
         import_field_boundary, pull_john_deere_boundaries, push_climate_fieldview_prescription,
         push_john_deere_prescription, record_import_rejection, reopen_raster_geotiff,
         round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
-        validate_taskdata_xml, ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
+        validate_taskdata_xml, BulkFieldBoundaryImportRequest, BulkImportRowStatus,
+        ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
         ClimateFieldViewEndpointError, ClimateFieldViewPrescriptionPushRequest,
         ClimateFieldViewRemoteReceipt, ClimateFieldViewRetryPolicy, ClimateFieldViewUploadPayload,
         CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason,
@@ -3433,6 +3514,81 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn bulk_boundary_import_reports_each_row_and_keeps_valid_imports() {
+        let report = super::bulk_import_field_boundaries(BulkFieldBoundaryImportRequest {
+            rows: vec![
+                field_boundary_import_request(
+                    "field-alpha",
+                    "field-alpha-boundary.geojson",
+                    valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                ),
+                field_boundary_import_request(
+                    "field-broken",
+                    "field-broken.geojson",
+                    b"{not-json".to_vec(),
+                ),
+                field_boundary_import_request(
+                    "field-beta",
+                    "field-beta-boundary.geojson",
+                    valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                ),
+            ],
+        });
+
+        assert_eq!(report.success_count, 2);
+        assert_eq!(report.failure_count, 1);
+        assert_eq!(report.imported.len(), 2);
+        assert_eq!(report.rows.len(), 3);
+        assert_eq!(report.rows[0].row, 1);
+        assert_eq!(report.rows[0].status, BulkImportRowStatus::Imported);
+        assert_eq!(report.rows[0].field_id.as_deref(), Some("field-alpha"));
+        assert_eq!(
+            report.rows[0].source_filename.as_deref(),
+            Some("field-alpha-boundary.geojson")
+        );
+        assert_eq!(report.rows[1].row, 2);
+        assert_eq!(report.rows[1].status, BulkImportRowStatus::Failed);
+        assert_eq!(report.rows[1].field_id.as_deref(), Some("field-broken"));
+        assert_eq!(
+            report.rows[1].reason_code,
+            Some(InteropRejectionReason::ParseError)
+        );
+        assert_eq!(report.rows[2].row, 3);
+        assert_eq!(report.rows[2].status, BulkImportRowStatus::Imported);
+        assert_eq!(report.imported[1].field.field_id, "field-beta");
+    }
+
+    #[test]
+    fn bulk_boundary_import_continues_after_reason_coded_boundary_failure() {
+        let report = super::bulk_import_field_boundaries(BulkFieldBoundaryImportRequest {
+            rows: vec![
+                field_boundary_import_request(
+                    "field-bowtie",
+                    "bowtie-boundary.geojson",
+                    bowtie_geojson("EPSG:4326").as_bytes().to_vec(),
+                ),
+                field_boundary_import_request(
+                    "field-alpha",
+                    "field-alpha-boundary.geojson",
+                    valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                ),
+            ],
+        });
+
+        assert_eq!(report.success_count, 1);
+        assert_eq!(report.failure_count, 1);
+        assert_eq!(report.rows[0].status, BulkImportRowStatus::Failed);
+        assert_eq!(
+            report.rows[0].reason_code,
+            Some(InteropRejectionReason::InvalidFieldBoundary {
+                reason: FieldBoundaryRejectionReason::SelfIntersection
+            })
+        );
+        assert_eq!(report.rows[1].status, BulkImportRowStatus::Imported);
+        assert_eq!(report.imported[0].field.field_id, "field-alpha");
     }
 
     #[test]
@@ -4372,6 +4528,27 @@ mod tests {
                 }}]
             }}"#
         )
+    }
+
+    fn field_boundary_import_request(
+        field_id: &str,
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> FieldBoundaryImportRequest {
+        FieldBoundaryImportRequest {
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: filename.to_string(),
+                bytes,
+            },
+            target_crs: "EPSG:4326".to_string(),
+            field_id: field_id.to_string(),
+            farm_id: Some("farm-alpha".to_string()),
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            name: field_id.to_string(),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        }
     }
 
     fn ops_actor() -> ActorIdentity {
