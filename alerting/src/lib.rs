@@ -375,6 +375,36 @@ pub struct AlertRoutingOutcome {
     pub default_operator_used: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertQuietHours {
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertUserPreference {
+    pub recipient_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiet_hours: Option<AlertQuietHours>,
+    #[serde(default)]
+    pub channel_preferences: Vec<AlertChannel>,
+    pub min_severity: AlertSeverityHint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertPreferenceDecision {
+    pub alert_id: String,
+    pub recipient_id: String,
+    pub deliver_immediately: bool,
+    pub deferred: bool,
+    pub suppressed: bool,
+    pub quiet_hours_active: bool,
+    pub quiet_hours_overridden: bool,
+    #[serde(default)]
+    pub selected_channels: Vec<AlertChannel>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertLifecycleState {
@@ -683,6 +713,8 @@ pub enum AlertingError {
     InvalidRuleStatus(String),
     #[error("invalid alert channel {0}")]
     InvalidChannel(String),
+    #[error("quiet hours must use HH:MM start/end values")]
+    InvalidQuietHours,
 }
 
 pub trait SourceAdapter {
@@ -1332,6 +1364,79 @@ pub fn route_alert_to_recipients(
     })
 }
 
+pub fn evaluate_alert_preference(
+    alert: &FiredAlertRecord,
+    preference: AlertUserPreference,
+    evaluated_at: String,
+) -> Result<AlertPreferenceDecision, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    let preference = normalize_user_preference(preference)?;
+    let evaluated_minute = minute_of_day_from_timestamp(&evaluated_at)?;
+    let alert_channels = alert_channels_from_strings(&alert.channels)?;
+    let selected_channels = if preference.channel_preferences.is_empty() {
+        alert_channels
+    } else {
+        alert_channels
+            .into_iter()
+            .filter(|channel| preference.channel_preferences.contains(channel))
+            .collect::<Vec<_>>()
+    };
+
+    if severity_rank(alert.severity) < severity_rank(preference.min_severity) {
+        return Ok(AlertPreferenceDecision {
+            alert_id: alert.alert_id,
+            recipient_id: preference.recipient_id,
+            deliver_immediately: false,
+            deferred: false,
+            suppressed: true,
+            quiet_hours_active: false,
+            quiet_hours_overridden: false,
+            selected_channels,
+            reason: "alert severity is below recipient minimum severity".to_string(),
+        });
+    }
+
+    let quiet_hours_active = preference
+        .quiet_hours
+        .as_ref()
+        .map(|quiet_hours| quiet_hours_contains(quiet_hours, evaluated_minute))
+        .transpose()?
+        .unwrap_or(false);
+    let overrides_quiet_hours = matches!(
+        alert.severity,
+        AlertSeverityHint::Critical | AlertSeverityHint::Emergency
+    );
+    if quiet_hours_active && !overrides_quiet_hours {
+        return Ok(AlertPreferenceDecision {
+            alert_id: alert.alert_id,
+            recipient_id: preference.recipient_id,
+            deliver_immediately: false,
+            deferred: true,
+            suppressed: false,
+            quiet_hours_active: true,
+            quiet_hours_overridden: false,
+            selected_channels,
+            reason: "quiet hours active for non-critical alert".to_string(),
+        });
+    }
+
+    Ok(AlertPreferenceDecision {
+        alert_id: alert.alert_id,
+        recipient_id: preference.recipient_id,
+        deliver_immediately: true,
+        deferred: false,
+        suppressed: false,
+        quiet_hours_active,
+        quiet_hours_overridden: quiet_hours_active && overrides_quiet_hours,
+        selected_channels,
+        reason: if quiet_hours_active && overrides_quiet_hours {
+            "critical or emergency alert overrides quiet hours".to_string()
+        } else {
+            "recipient preference allows immediate delivery".to_string()
+        },
+    })
+}
+
 pub fn open_alert_lifecycle(
     alert: &FiredAlertRecord,
 ) -> Result<AlertLifecycleRecord, AlertingError> {
@@ -1833,6 +1938,65 @@ fn normalize_retry_policy(
     Ok(policy)
 }
 
+fn normalize_user_preference(
+    preference: AlertUserPreference,
+) -> Result<AlertUserPreference, AlertingError> {
+    Ok(AlertUserPreference {
+        recipient_id: normalize_required_text(
+            preference.recipient_id,
+            AlertingError::EmptyRecipientId,
+        )?,
+        quiet_hours: preference.quiet_hours,
+        channel_preferences: preference.channel_preferences,
+        min_severity: preference.min_severity,
+    })
+}
+
+fn severity_rank(severity: AlertSeverityHint) -> u8 {
+    match severity {
+        AlertSeverityHint::Info => 0,
+        AlertSeverityHint::Warning => 1,
+        AlertSeverityHint::Critical => 2,
+        AlertSeverityHint::Emergency => 3,
+    }
+}
+
+fn quiet_hours_contains(
+    quiet_hours: &AlertQuietHours,
+    evaluated_minute: u32,
+) -> Result<bool, AlertingError> {
+    let start = quiet_hour_minute(&quiet_hours.start)?;
+    let end = quiet_hour_minute(&quiet_hours.end)?;
+    Ok(if start <= end {
+        evaluated_minute >= start && evaluated_minute < end
+    } else {
+        evaluated_minute >= start || evaluated_minute < end
+    })
+}
+
+fn minute_of_day_from_timestamp(timestamp: &str) -> Result<u32, AlertingError> {
+    let time = timestamp
+        .get(11..16)
+        .ok_or(AlertingError::InvalidQuietHours)?;
+    quiet_hour_minute(time)
+}
+
+fn quiet_hour_minute(value: &str) -> Result<u32, AlertingError> {
+    if value.len() != 5 || value.as_bytes().get(2) != Some(&b':') {
+        return Err(AlertingError::InvalidQuietHours);
+    }
+    let hour = value[0..2]
+        .parse::<u32>()
+        .map_err(|_| AlertingError::InvalidQuietHours)?;
+    let minute = value[3..5]
+        .parse::<u32>()
+        .map_err(|_| AlertingError::InvalidQuietHours)?;
+    if hour > 23 || minute > 59 {
+        return Err(AlertingError::InvalidQuietHours);
+    }
+    Ok(hour * 60 + minute)
+}
+
 fn normalize_escalation_policy(
     policy: AlertEscalationPolicy,
 ) -> Result<AlertEscalationPolicy, AlertingError> {
@@ -2309,17 +2473,18 @@ mod tests {
         acknowledge_alert, alert_channels_from_strings, auto_resolve_alert,
         build_alert_rule_record, build_alert_rule_subscription, classify_alert_severity,
         compute_alert_dedup_key, deduplicate_alert_stream, deliver_alert,
-        deliver_alert_multi_channel, evaluate_alert_rules, evaluate_managed_alert_rules,
-        evaluate_no_ack_escalation, filter_alert_history, open_alert_lifecycle,
-        render_alert_message_template, resolve_alert, route_alert_to_recipients,
-        run_tracked_delivery, transition_alert_rule_status, version_alert_rule_record,
-        AlertChannel, AlertDedupWindow, AlertEscalationPolicy, AlertEvent, AlertEventBackbone,
-        AlertHistoryQuery, AlertLifecycleRecord, AlertLifecycleState, AlertMessageTemplate,
-        AlertRecipient, AlertRoutingRule, AlertRule, AlertRuleCreateRequest, AlertRuleStatus,
+        deliver_alert_multi_channel, evaluate_alert_preference, evaluate_alert_rules,
+        evaluate_managed_alert_rules, evaluate_no_ack_escalation, filter_alert_history,
+        open_alert_lifecycle, render_alert_message_template, resolve_alert,
+        route_alert_to_recipients, run_tracked_delivery, transition_alert_rule_status,
+        version_alert_rule_record, AlertChannel, AlertDedupWindow, AlertEscalationPolicy,
+        AlertEvent, AlertEventBackbone, AlertHistoryQuery, AlertLifecycleRecord,
+        AlertLifecycleState, AlertMessageTemplate, AlertQuietHours, AlertRecipient,
+        AlertRoutingRule, AlertRule, AlertRuleCreateRequest, AlertRuleStatus,
         AlertRuleStatusUpdateRequest, AlertRuleSubscriptionCreateRequest,
         AlertRuleSubscriptionRecord, AlertRuleUpdateRequest, AlertSeverityEvidence,
-        AlertSeverityHint, AlertingError, DeliveryRetryPolicy, DeliveryState, DeliveryStatus,
-        InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
+        AlertSeverityHint, AlertUserPreference, AlertingError, DeliveryRetryPolicy, DeliveryState,
+        DeliveryStatus, InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
     };
 
     #[test]
@@ -3284,6 +3449,57 @@ mod tests {
     }
 
     #[test]
+    fn quiet_hours_defer_warning_alert_and_record_decision() {
+        let alert = fired_alert(
+            "alert-quiet-warning",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T22:15:00Z",
+        );
+
+        let decision = evaluate_alert_preference(
+            &alert,
+            quiet_hours_preference(AlertSeverityHint::Info),
+            "2026-06-12T22:15:00Z".to_string(),
+        )
+        .expect("quiet-hours preference should evaluate");
+
+        assert!(!decision.deliver_immediately);
+        assert!(decision.deferred);
+        assert!(!decision.suppressed);
+        assert!(decision.quiet_hours_active);
+        assert!(!decision.quiet_hours_overridden);
+        assert_eq!(decision.selected_channels, vec![AlertChannel::InApp]);
+        assert!(decision.reason.contains("quiet hours"));
+    }
+
+    #[test]
+    fn emergency_alert_overrides_quiet_hours_for_immediate_delivery() {
+        let alert = fired_alert(
+            "alert-quiet-emergency",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Emergency,
+            "2026-06-12T22:15:00Z",
+        );
+
+        let decision = evaluate_alert_preference(
+            &alert,
+            quiet_hours_preference(AlertSeverityHint::Info),
+            "2026-06-12T22:15:00Z".to_string(),
+        )
+        .expect("emergency preference should evaluate");
+
+        assert!(decision.deliver_immediately);
+        assert!(!decision.deferred);
+        assert!(!decision.suppressed);
+        assert!(decision.quiet_hours_active);
+        assert!(decision.quiet_hours_overridden);
+        assert!(decision.reason.contains("overrides quiet hours"));
+    }
+
+    #[test]
     fn lifecycle_records_acknowledgement_and_resolution_with_actor_timestamp() {
         let alert = fired_alert(
             "alert-lifecycle",
@@ -3681,6 +3897,18 @@ mod tests {
                 role_recipient("ops-001", "operator"),
                 role_recipient("ops-lead", "operator"),
             ],
+        }
+    }
+
+    fn quiet_hours_preference(min_severity: AlertSeverityHint) -> AlertUserPreference {
+        AlertUserPreference {
+            recipient_id: "ops-001".to_string(),
+            quiet_hours: Some(AlertQuietHours {
+                start: "22:00".to_string(),
+                end: "06:00".to_string(),
+            }),
+            channel_preferences: vec![AlertChannel::InApp],
+            min_severity,
         }
     }
 }

@@ -4,16 +4,16 @@
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
 - **Last implementation commit**: 82cad6a (`batch-20260615125000`)
 - **Latest checkpoint commit**: 82cad6a (`batch-20260615125000`)
-- **Current batch**: none
-- **Completed feature rows**: 357 committed; 1 tests_passed; 1 skipped; 1 blocked; 138 pending in this run.
+- **Current batch**: batch-20260615131000 (`29-15`)
+- **Completed feature rows**: 357 committed; 2 tests_passed; 1 skipped; 1 blocked; 137 pending in this run.
 - **Blocker**: None
 
 ## Latest verification
 
-- `cargo test -p alerting escalation` — pass (2 tests)
+- `cargo test -p alerting quiet_hours` — pass (2 tests)
 - `cargo fmt --all --check` — pass
-- `cargo test -p alerting` — pass (36 tests; doc-tests pass)
+- `cargo test -p alerting` — pass (38 tests; doc-tests pass)
 
 ## Next action
 
-- Select and claim the next pending feature (`29-15` is the next P1 item).
+- Commit `29-15` quiet hours and per-user preferences, then update checkpoint commit metadata.
