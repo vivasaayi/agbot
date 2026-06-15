@@ -3086,6 +3086,55 @@ pub struct WeatherReferenceEt {
     pub freshness: Vec<WeatherFreshnessState>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherAlertRouteTarget {
+    OperatorConsole,
+    FarmersPortal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeatherAlertRoutingTarget {
+    pub target: WeatherAlertRouteTarget,
+    pub reachable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherAlertRoutingRequest {
+    pub alert: WeatherRiskAlert,
+    pub recipient_id: String,
+    pub owned_field_refs: Vec<String>,
+    pub targets: Vec<WeatherAlertRoutingTarget>,
+    pub routed_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherAlertDeliveryStatus {
+    Delivered,
+    Queued,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherAlertDeliveryAudit {
+    pub target: WeatherAlertRouteTarget,
+    pub status: WeatherAlertDeliveryStatus,
+    pub reason_code: String,
+    pub recipient_id: String,
+    pub field_ref: String,
+    pub routed_at: String,
+    pub evidence_payload: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherAlertRoutingResult {
+    pub delivered_count: usize,
+    pub queued_count: usize,
+    pub rejected_count: usize,
+    pub audits: Vec<WeatherAlertDeliveryAudit>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
@@ -3274,6 +3323,18 @@ pub enum WeatherReferenceEtError {
     EmptyFieldRef,
     #[error("weather ET date is invalid: {date}")]
     InvalidDate { date: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherAlertRoutingError {
+    #[error("weather alert routing recipient_id cannot be empty")]
+    EmptyRecipientId,
+    #[error("weather alert routing routed_at cannot be empty")]
+    EmptyRoutedAt,
+    #[error("weather alert routing requires at least one target")]
+    EmptyTargets,
+    #[error("weather alert routing timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
 }
 
 pub fn normalize_weather_provider_forecast(
@@ -4180,6 +4241,87 @@ fn weather_reference_et_insufficient(
         input_refs: vec![format!("missing:{missing_input}")],
         freshness: Vec::new(),
     }
+}
+
+pub fn route_weather_alert(
+    request: WeatherAlertRoutingRequest,
+) -> Result<WeatherAlertRoutingResult, WeatherAlertRoutingError> {
+    let recipient_id = normalize_weather_text(request.recipient_id)
+        .ok_or(WeatherAlertRoutingError::EmptyRecipientId)?;
+    let routed_at =
+        normalize_weather_text(request.routed_at).ok_or(WeatherAlertRoutingError::EmptyRoutedAt)?;
+    parse_weather_alert_routing_timestamp(&routed_at)?;
+    if request.targets.is_empty() {
+        return Err(WeatherAlertRoutingError::EmptyTargets);
+    }
+    let field_owned = request
+        .owned_field_refs
+        .iter()
+        .filter_map(|field_ref| normalize_weather_text(field_ref.clone()))
+        .any(|field_ref| field_ref == request.alert.field_ref);
+
+    let mut audits = Vec::new();
+    for target in request.targets {
+        let (status, reason_code) = if !field_owned {
+            (
+                WeatherAlertDeliveryStatus::Rejected,
+                "field_scope_not_owned",
+            )
+        } else if target.reachable {
+            (WeatherAlertDeliveryStatus::Delivered, "alert_delivered")
+        } else {
+            (
+                WeatherAlertDeliveryStatus::Queued,
+                "target_unreachable_queued",
+            )
+        };
+        audits.push(WeatherAlertDeliveryAudit {
+            target: target.target,
+            status,
+            reason_code: reason_code.to_string(),
+            recipient_id: recipient_id.clone(),
+            field_ref: request.alert.field_ref.clone(),
+            routed_at: routed_at.clone(),
+            evidence_payload: weather_alert_evidence_payload(&request.alert),
+        });
+    }
+
+    Ok(WeatherAlertRoutingResult {
+        delivered_count: audits
+            .iter()
+            .filter(|audit| audit.status == WeatherAlertDeliveryStatus::Delivered)
+            .count(),
+        queued_count: audits
+            .iter()
+            .filter(|audit| audit.status == WeatherAlertDeliveryStatus::Queued)
+            .count(),
+        rejected_count: audits
+            .iter()
+            .filter(|audit| audit.status == WeatherAlertDeliveryStatus::Rejected)
+            .count(),
+        audits,
+    })
+}
+
+fn weather_alert_evidence_payload(alert: &WeatherRiskAlert) -> Vec<String> {
+    vec![
+        format!("risk_type:{:?}", alert.risk_type),
+        format!("value:{}", alert.value),
+        format!("threshold:{}", alert.threshold),
+        format!("valid_time:{}", alert.valid_time),
+        format!("source:{}", alert.source),
+        format!("freshness:{:?}", alert.freshness),
+    ]
+}
+
+fn parse_weather_alert_routing_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, WeatherAlertRoutingError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| WeatherAlertRoutingError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 pub fn weather_fetch_failure_record(
@@ -8700,7 +8842,7 @@ mod tests {
         evaluate_weather_risk_alerts, evaluate_weather_value_freshness,
         execute_tractor_prescription, ingest_weather_sensor_stream,
         normalize_weather_provider_forecast, plan_tractor_swath_coverage, query_weather_history,
-        resolve_weather_forecast_to_field, run_tractor_straight_path_guidance,
+        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
         sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
@@ -8740,7 +8882,8 @@ mod tests {
         TractorPrescriptionExecutionError, TractorPrescriptionExecutionRequest,
         TractorPrescriptionZone, TractorRegistrationRequest, TractorRegistry,
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
-        TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
+        TractorWeatherWindowDecision, TractorWeatherWindowGateRequest, WeatherAlertDeliveryStatus,
+        WeatherAlertRouteTarget, WeatherAlertRoutingRequest, WeatherAlertRoutingTarget,
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
         WeatherForecastValue, WeatherFreshnessState, WeatherGrowingDegreeDayRequest,
         WeatherGrowingDegreeDayStatus, WeatherHistoryQuery, WeatherIngestError,
@@ -10845,6 +10988,65 @@ mod tests {
     }
 
     #[test]
+    fn weather_alert_routing_delivers_owned_field_to_console_and_portal() {
+        let result = route_weather_alert(weather_alert_routing_request(vec![
+            WeatherAlertRoutingTarget {
+                target: WeatherAlertRouteTarget::OperatorConsole,
+                reachable: true,
+            },
+            WeatherAlertRoutingTarget {
+                target: WeatherAlertRouteTarget::FarmersPortal,
+                reachable: true,
+            },
+        ]))
+        .expect("owned alert should route");
+
+        assert_eq!(result.delivered_count, 2);
+        assert_eq!(result.queued_count, 0);
+        assert!(result.audits.iter().all(|audit| {
+            audit.status == WeatherAlertDeliveryStatus::Delivered
+                && audit.reason_code == "alert_delivered"
+                && audit.field_ref == "field-north"
+                && audit.evidence_payload.contains(&"threshold:10".to_string())
+        }));
+    }
+
+    #[test]
+    fn weather_alert_routing_queues_unreachable_target() {
+        let result = route_weather_alert(weather_alert_routing_request(vec![
+            WeatherAlertRoutingTarget {
+                target: WeatherAlertRouteTarget::OperatorConsole,
+                reachable: false,
+            },
+        ]))
+        .expect("unreachable target should queue");
+
+        assert_eq!(result.delivered_count, 0);
+        assert_eq!(result.queued_count, 1);
+        assert_eq!(result.audits[0].status, WeatherAlertDeliveryStatus::Queued);
+        assert_eq!(result.audits[0].reason_code, "target_unreachable_queued");
+    }
+
+    #[test]
+    fn weather_alert_routing_rejects_unowned_field_scope() {
+        let mut request = weather_alert_routing_request(vec![WeatherAlertRoutingTarget {
+            target: WeatherAlertRouteTarget::FarmersPortal,
+            reachable: true,
+        }]);
+        request.owned_field_refs = vec!["field-south".to_string()];
+
+        let result = route_weather_alert(request).expect("unowned field should audit rejection");
+
+        assert_eq!(result.delivered_count, 0);
+        assert_eq!(result.rejected_count, 1);
+        assert_eq!(
+            result.audits[0].status,
+            WeatherAlertDeliveryStatus::Rejected
+        );
+        assert_eq!(result.audits[0].reason_code, "field_scope_not_owned");
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -11549,6 +11751,33 @@ mod tests {
             humidity_percent: Some(record.humidity_percent.clone()),
             wind_speed_mps: Some(record.wind_speed_mps.clone()),
             radiation_w_m2: include_radiation.then_some(record.radiation_w_m2.clone()),
+        }
+    }
+
+    fn weather_alert_routing_request(
+        targets: Vec<WeatherAlertRoutingTarget>,
+    ) -> WeatherAlertRoutingRequest {
+        let alert = evaluate_weather_risk_alerts(
+            &[weather_window_record(
+                "2026-06-13T10:00:00Z",
+                12.0,
+                0.0,
+                22.0,
+                false,
+            )],
+            weather_risk_thresholds(),
+        )
+        .expect("alert fixture should evaluate")
+        .into_iter()
+        .find(|alert| alert.risk_type == WeatherRiskType::Wind)
+        .expect("wind alert should be present");
+
+        WeatherAlertRoutingRequest {
+            alert,
+            recipient_id: "grower-001".to_string(),
+            owned_field_refs: vec!["field-north".to_string()],
+            targets,
+            routed_at: "2026-06-13T10:01:00Z".to_string(),
         }
     }
 
