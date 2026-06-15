@@ -2,6 +2,7 @@ use anyhow::Result;
 use axum::{
     body::{to_bytes, Body},
     http::{header, Request, StatusCode},
+    response::Response,
 };
 use geo_hub::state::AppState;
 use geo_hub::{db, server, HubConfig};
@@ -3581,6 +3582,178 @@ async fn marketplace_listing_rejects_inverted_window_without_writing() -> Result
         .fetch_one(&ctx.pool)
         .await?;
     assert_eq!(listing_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_inventory_create_list_reserve_fulfill_and_release() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+    seed_marketplace_catalog_item(&ctx, "seed-corn-001", "org-alpha", "supplier-001").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/inventory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "inventory_id": "inventory-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "on_hand": 40.0,
+                        "reserved": 0.0
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let reserve = marketplace_inventory_adjust(
+        &ctx,
+        "inventory-seed-corn-001",
+        "reserve",
+        "org-alpha",
+        25.0,
+    )
+    .await?;
+    assert_eq!(reserve.status(), StatusCode::OK);
+    let body = to_bytes(reserve.into_body(), 64 * 1024).await?;
+    let reserved: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        reserved.get("reserved").and_then(|value| value.as_f64()),
+        Some(25.0)
+    );
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/inventory?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let inventory: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(inventory.len(), 1);
+
+    let fulfill = marketplace_inventory_adjust(
+        &ctx,
+        "inventory-seed-corn-001",
+        "fulfill",
+        "org-alpha",
+        10.0,
+    )
+    .await?;
+    assert_eq!(fulfill.status(), StatusCode::OK);
+    let body = to_bytes(fulfill.into_body(), 64 * 1024).await?;
+    let fulfilled: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        fulfilled.get("on_hand").and_then(|value| value.as_f64()),
+        Some(30.0)
+    );
+    assert_eq!(
+        fulfilled.get("reserved").and_then(|value| value.as_f64()),
+        Some(15.0)
+    );
+
+    let release = marketplace_inventory_adjust(
+        &ctx,
+        "inventory-seed-corn-001",
+        "release",
+        "org-alpha",
+        15.0,
+    )
+    .await?;
+    assert_eq!(release.status(), StatusCode::OK);
+    let body = to_bytes(release.into_body(), 64 * 1024).await?;
+    let released: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        released.get("on_hand").and_then(|value| value.as_f64()),
+        Some(30.0)
+    );
+    assert_eq!(
+        released.get("reserved").and_then(|value| value.as_f64()),
+        Some(0.0)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_inventory_rejects_parallel_over_reserve_without_oversell() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+    seed_marketplace_catalog_item(&ctx, "seed-corn-001", "org-alpha", "supplier-001").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/inventory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "inventory_id": "inventory-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "on_hand": 40.0,
+                        "reserved": 0.0
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (first, second) = tokio::join!(
+        marketplace_inventory_adjust(
+            &ctx,
+            "inventory-seed-corn-001",
+            "reserve",
+            "org-alpha",
+            30.0,
+        ),
+        marketplace_inventory_adjust(
+            &ctx,
+            "inventory-seed-corn-001",
+            "reserve",
+            "org-alpha",
+            30.0,
+        )
+    );
+    let statuses = [first?.status(), second?.status()];
+    assert!(statuses.contains(&StatusCode::OK));
+    assert!(statuses.contains(&StatusCode::BAD_REQUEST));
+
+    let row: (f64, f64) = sqlx::query_as(
+        "SELECT on_hand, reserved FROM marketplace_inventory WHERE inventory_id = ?1",
+    )
+    .bind("inventory-seed-corn-001")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.0, 40.0);
+    assert_eq!(row.1, 30.0);
 
     Ok(())
 }
@@ -12223,6 +12396,37 @@ async fn seed_marketplace_catalog_item(
         .expect("router should handle request");
     assert_eq!(response.status(), StatusCode::OK);
     Ok(())
+}
+
+async fn marketplace_inventory_adjust(
+    ctx: &TestContext,
+    inventory_id: &str,
+    action: &str,
+    org_id: &str,
+    qty: f64,
+) -> Result<Response> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/marketplace/inventory/{inventory_id}/{action}"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "org_id": org_id,
+                        "qty": qty
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    Ok(response)
 }
 
 async fn seed_sustainability_field(

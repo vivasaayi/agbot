@@ -266,6 +266,26 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::close_marketplace_listing),
         )
         .route(
+            "/api/marketplace/inventory",
+            get(routes::list_marketplace_inventory).post(routes::upsert_marketplace_inventory),
+        )
+        .route(
+            "/api/marketplace/inventory/:inventory_id",
+            get(routes::get_marketplace_inventory),
+        )
+        .route(
+            "/api/marketplace/inventory/:inventory_id/reserve",
+            post(routes::reserve_marketplace_inventory_endpoint),
+        )
+        .route(
+            "/api/marketplace/inventory/:inventory_id/fulfill",
+            post(routes::fulfill_marketplace_inventory_endpoint),
+        )
+        .route(
+            "/api/marketplace/inventory/:inventory_id/release",
+            post(routes::release_marketplace_inventory_endpoint),
+        )
+        .route(
             "/api/sustainability/records",
             get(routes::list_sustainability_records).post(routes::create_sustainability_record),
         )

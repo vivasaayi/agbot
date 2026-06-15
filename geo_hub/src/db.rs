@@ -973,6 +973,21 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS marketplace_inventory (
+            inventory_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            on_hand REAL NOT NULL,
+            reserved REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS sustainability_records (
             record_id TEXT PRIMARY KEY,
             field_id TEXT NOT NULL,
@@ -1726,6 +1741,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_marketplace_listings_org_status
         ON marketplace_listings(org_id, status, item_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_inventory_org_item
+        ON marketplace_inventory(org_id, item_id);
         "#,
     )
     .execute(pool)

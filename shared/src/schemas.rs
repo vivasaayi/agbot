@@ -8330,6 +8330,27 @@ pub struct MarketplaceListingRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceInventoryUpsertRequest {
+    #[serde(default)]
+    pub inventory_id: Option<String>,
+    pub item_id: String,
+    pub org_id: String,
+    pub on_hand: f64,
+    #[serde(default)]
+    pub reserved: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceInventoryRecord {
+    pub inventory_id: String,
+    pub item_id: String,
+    pub org_id: String,
+    pub on_hand: f64,
+    pub reserved: f64,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarketplaceAccountError {
     #[error("marketplace account_id cannot be empty")]
@@ -8442,6 +8463,36 @@ pub enum MarketplaceListingError {
     InvalidTimestamp { timestamp: String },
     #[error("unsupported marketplace listing status {value}")]
     UnsupportedStatus { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarketplaceInventoryError {
+    #[error("marketplace inventory_id cannot be empty")]
+    EmptyInventoryId,
+    #[error("marketplace inventory item_id cannot be empty")]
+    EmptyItemId,
+    #[error("marketplace inventory org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("marketplace inventory catalog item is required")]
+    MissingCatalogItem,
+    #[error(
+        "marketplace inventory catalog item {item_id} belongs to {item_org_id}, not {inventory_org_id}"
+    )]
+    CatalogOrgMismatch {
+        item_id: String,
+        item_org_id: String,
+        inventory_org_id: String,
+    },
+    #[error("marketplace inventory quantity must be finite and non-negative")]
+    InvalidQuantity,
+    #[error("marketplace inventory reserved quantity cannot exceed on-hand quantity")]
+    ReservedExceedsOnHand,
+    #[error("marketplace inventory has insufficient available quantity")]
+    InsufficientAvailableQuantity,
+    #[error("marketplace inventory has insufficient reserved quantity")]
+    InsufficientReservedQuantity,
+    #[error("marketplace inventory timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
 }
 
 pub fn build_marketplace_account_record(
@@ -8642,6 +8693,99 @@ pub fn close_marketplace_listing_record(
     Ok(updated)
 }
 
+pub fn build_marketplace_inventory_record(
+    request: MarketplaceInventoryUpsertRequest,
+    catalog_item: Option<&MarketplaceCatalogItemRecord>,
+    generated_inventory_id: String,
+    updated_at: String,
+) -> Result<MarketplaceInventoryRecord, MarketplaceInventoryError> {
+    let inventory_id = normalize_marketplace_optional_text(request.inventory_id)
+        .or_else(|| normalize_marketplace_text(generated_inventory_id))
+        .ok_or(MarketplaceInventoryError::EmptyInventoryId)?;
+    let item_id = normalize_marketplace_text(request.item_id)
+        .ok_or(MarketplaceInventoryError::EmptyItemId)?;
+    let org_id =
+        normalize_marketplace_text(request.org_id).ok_or(MarketplaceInventoryError::EmptyOrgId)?;
+    let reserved = request.reserved.unwrap_or(0.0);
+    validate_marketplace_inventory_quantities(request.on_hand, reserved)?;
+    let catalog_item = catalog_item.ok_or(MarketplaceInventoryError::MissingCatalogItem)?;
+    if catalog_item.item_id != item_id || catalog_item.org_id != org_id {
+        return Err(MarketplaceInventoryError::CatalogOrgMismatch {
+            item_id: catalog_item.item_id.clone(),
+            item_org_id: catalog_item.org_id.clone(),
+            inventory_org_id: org_id,
+        });
+    }
+    let updated_at = normalize_marketplace_text(updated_at).ok_or(
+        MarketplaceInventoryError::InvalidTimestamp {
+            timestamp: String::new(),
+        },
+    )?;
+    parse_marketplace_inventory_timestamp(&updated_at)?;
+
+    Ok(MarketplaceInventoryRecord {
+        inventory_id,
+        item_id,
+        org_id,
+        on_hand: request.on_hand,
+        reserved,
+        updated_at,
+    })
+}
+
+pub fn reserve_marketplace_inventory(
+    record: &MarketplaceInventoryRecord,
+    qty: f64,
+    updated_at: String,
+) -> Result<MarketplaceInventoryRecord, MarketplaceInventoryError> {
+    validate_marketplace_inventory_delta(qty)?;
+    if qty > marketplace_inventory_available(record) {
+        return Err(MarketplaceInventoryError::InsufficientAvailableQuantity);
+    }
+    let mut updated = record.clone();
+    updated.reserved += qty;
+    updated.updated_at = normalize_marketplace_inventory_timestamp(updated_at)?;
+    validate_marketplace_inventory_quantities(updated.on_hand, updated.reserved)?;
+    Ok(updated)
+}
+
+pub fn fulfill_marketplace_inventory(
+    record: &MarketplaceInventoryRecord,
+    qty: f64,
+    updated_at: String,
+) -> Result<MarketplaceInventoryRecord, MarketplaceInventoryError> {
+    validate_marketplace_inventory_delta(qty)?;
+    if qty > record.reserved {
+        return Err(MarketplaceInventoryError::InsufficientReservedQuantity);
+    }
+    let mut updated = record.clone();
+    updated.on_hand -= qty;
+    updated.reserved -= qty;
+    updated.updated_at = normalize_marketplace_inventory_timestamp(updated_at)?;
+    validate_marketplace_inventory_quantities(updated.on_hand, updated.reserved)?;
+    Ok(updated)
+}
+
+pub fn release_marketplace_inventory(
+    record: &MarketplaceInventoryRecord,
+    qty: f64,
+    updated_at: String,
+) -> Result<MarketplaceInventoryRecord, MarketplaceInventoryError> {
+    validate_marketplace_inventory_delta(qty)?;
+    if qty > record.reserved {
+        return Err(MarketplaceInventoryError::InsufficientReservedQuantity);
+    }
+    let mut updated = record.clone();
+    updated.reserved -= qty;
+    updated.updated_at = normalize_marketplace_inventory_timestamp(updated_at)?;
+    validate_marketplace_inventory_quantities(updated.on_hand, updated.reserved)?;
+    Ok(updated)
+}
+
+pub fn marketplace_inventory_available(record: &MarketplaceInventoryRecord) -> f64 {
+    record.on_hand - record.reserved
+}
+
 pub fn transition_marketplace_account_status(
     record: &MarketplaceAccountRecord,
     to: MarketplaceAccountStatus,
@@ -8794,6 +8938,48 @@ fn parse_marketplace_listing_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
         .map_err(|_| MarketplaceListingError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+fn validate_marketplace_inventory_quantities(
+    on_hand: f64,
+    reserved: f64,
+) -> Result<(), MarketplaceInventoryError> {
+    if !(on_hand.is_finite() && on_hand >= 0.0 && reserved.is_finite() && reserved >= 0.0) {
+        return Err(MarketplaceInventoryError::InvalidQuantity);
+    }
+    if reserved > on_hand {
+        return Err(MarketplaceInventoryError::ReservedExceedsOnHand);
+    }
+    Ok(())
+}
+
+fn validate_marketplace_inventory_delta(qty: f64) -> Result<(), MarketplaceInventoryError> {
+    if !(qty.is_finite() && qty > 0.0) {
+        return Err(MarketplaceInventoryError::InvalidQuantity);
+    }
+    Ok(())
+}
+
+fn normalize_marketplace_inventory_timestamp(
+    timestamp: String,
+) -> Result<String, MarketplaceInventoryError> {
+    let timestamp = normalize_marketplace_text(timestamp).ok_or(
+        MarketplaceInventoryError::InvalidTimestamp {
+            timestamp: String::new(),
+        },
+    )?;
+    parse_marketplace_inventory_timestamp(&timestamp)?;
+    Ok(timestamp)
+}
+
+fn parse_marketplace_inventory_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, MarketplaceInventoryError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|_| MarketplaceInventoryError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -12612,12 +12798,12 @@ mod tests {
         apply_tractor_implement_command, assemble_drought_report, assert_flight_operation_allowed,
         assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
         build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
-        build_marketplace_account_record, build_marketplace_portal_entry,
-        build_soil_moisture_reading, build_sustainability_record, build_tractor_field_ops_replay,
-        build_tractor_field_ops_session_log, close_marketplace_listing_record,
-        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
-        compute_water_evapotranspiration, compute_weather_growing_degree_day,
-        compute_weather_reference_et, create_versioned_content,
+        build_marketplace_account_record, build_marketplace_inventory_record,
+        build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
+        build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
+        close_marketplace_listing_record, compute_drought_baseline_trend, compute_drought_index,
+        compute_drought_risk_score, compute_water_evapotranspiration,
+        compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -12625,53 +12811,55 @@ mod tests {
         evaluate_drought_advisory_loop, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_irrigation_valve_plan,
-        execute_tractor_prescription, forecast_drought_risk, fuse_drought_evidence,
-        ingest_drought_stress_evidence, ingest_remote_sensing_moisture_proxy_layer,
-        ingest_weather_sensor_stream, map_zone_water_need, normalize_weather_provider_forecast,
+        execute_tractor_prescription, forecast_drought_risk, fulfill_marketplace_inventory,
+        fuse_drought_evidence, ingest_drought_stress_evidence,
+        ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
+        map_zone_water_need, marketplace_inventory_available, normalize_weather_provider_forecast,
         plan_tractor_swath_coverage, publish_marketplace_listing_record, query_drought_history,
-        query_irrigation_history, query_weather_history, report_water_use_savings,
-        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
-        schedule_irrigation_plan, sign_fleet_config_bundle, soil_moisture_rejection_record,
-        tractor_cross_track_error_m, transition_marketplace_account_status,
-        validate_field_boundary, validate_water_weather_input_contract,
-        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
-        weather_fetch_failure_record, zone_water_need_insufficient, AccessAnomalySignal,
-        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
-        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
-        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
-        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
-        ContentType, CropPlanRecord, DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus,
-        DroughtAlertRoutingRequest, DroughtBaselineTrendError, DroughtBaselineTrendRequest,
-        DroughtBaselineTrendStatus, DroughtEvidenceFusionError, DroughtEvidenceFusionRequest,
-        DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus, DroughtForecastRequest,
-        DroughtForecastStatus, DroughtForecastUncertaintyBand, DroughtHistoryEntry,
-        DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
-        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
-        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
-        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
-        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
-        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
-        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
-        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
-        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
-        MarketplaceCatalogItemKind, MarketplaceListingError, MarketplaceListingPublishRequest,
-        MarketplaceListingStatus, MarketplacePartyType, MarketplacePortalEntryError,
-        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
-        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        query_irrigation_history, query_weather_history, release_marketplace_inventory,
+        report_water_use_savings, reserve_marketplace_inventory, resolve_weather_forecast_to_field,
+        route_weather_alert, run_tractor_straight_path_guidance, schedule_irrigation_plan,
+        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
+        transition_marketplace_account_status, validate_field_boundary,
+        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
+        verify_weather_forecast_accuracy, weather_fetch_failure_record,
+        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
+        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
+        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
+        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
+        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
+        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
+        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
+        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
+        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
+        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
+        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
+        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
+        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
+        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
+        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
+        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
+        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
+        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+        MarketplaceInventoryError, MarketplaceInventoryUpsertRequest, MarketplaceListingError,
+        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplacePartyType,
+        MarketplacePortalEntryError, MarketplaceUnitOfMeasure, MultispectralImage,
+        OpenDataPublishError, OpenDataPublishRefusalReason, OpenDataPublishRequest,
+        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
+        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
+        RecommendationStatus, RecommendationStatusChangeType, RemoteSensingMoistureIndex,
         RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
         RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
         ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
@@ -14240,6 +14428,71 @@ mod tests {
         .expect_err("inverted availability window should reject");
 
         assert_eq!(error, MarketplaceListingError::InvalidWindowRange);
+    }
+
+    #[test]
+    fn marketplace_inventory_reserves_available_stock() {
+        let item = marketplace_catalog_item_fixture("seed-corn-001", "org-alpha");
+        let inventory = build_marketplace_inventory_record(
+            marketplace_inventory_request(40.0, Some(0.0)),
+            Some(&item),
+            "generated-inventory".to_string(),
+            "2026-06-14T08:00:00Z".to_string(),
+        )
+        .expect("valid inventory should build");
+
+        let reserved =
+            reserve_marketplace_inventory(&inventory, 25.0, "2026-06-14T09:00:00Z".to_string())
+                .expect("available stock should reserve");
+
+        assert_eq!(reserved.on_hand, 40.0);
+        assert_eq!(reserved.reserved, 25.0);
+        assert_eq!(marketplace_inventory_available(&reserved), 15.0);
+    }
+
+    #[test]
+    fn marketplace_inventory_rejects_over_reserve() {
+        let item = marketplace_catalog_item_fixture("seed-corn-001", "org-alpha");
+        let inventory = build_marketplace_inventory_record(
+            marketplace_inventory_request(40.0, Some(10.0)),
+            Some(&item),
+            "generated-inventory".to_string(),
+            "2026-06-14T08:00:00Z".to_string(),
+        )
+        .expect("valid inventory should build");
+
+        let error =
+            reserve_marketplace_inventory(&inventory, 31.0, "2026-06-14T09:00:00Z".to_string())
+                .expect_err("reservation should not exceed available stock");
+
+        assert_eq!(
+            error,
+            MarketplaceInventoryError::InsufficientAvailableQuantity
+        );
+    }
+
+    #[test]
+    fn marketplace_inventory_fulfills_and_releases_reserved_stock() {
+        let item = marketplace_catalog_item_fixture("seed-corn-001", "org-alpha");
+        let inventory = build_marketplace_inventory_record(
+            marketplace_inventory_request(40.0, Some(20.0)),
+            Some(&item),
+            "generated-inventory".to_string(),
+            "2026-06-14T08:00:00Z".to_string(),
+        )
+        .expect("valid inventory should build");
+
+        let fulfilled =
+            fulfill_marketplace_inventory(&inventory, 12.0, "2026-06-14T10:00:00Z".to_string())
+                .expect("reserved stock should fulfill");
+        assert_eq!(fulfilled.on_hand, 28.0);
+        assert_eq!(fulfilled.reserved, 8.0);
+
+        let released =
+            release_marketplace_inventory(&fulfilled, 8.0, "2026-06-14T11:00:00Z".to_string())
+                .expect("remaining reserved stock should release");
+        assert_eq!(released.on_hand, 28.0);
+        assert_eq!(released.reserved, 0.0);
     }
 
     #[test]
@@ -16959,6 +17212,19 @@ mod tests {
                 from: window_from.to_string(),
                 to: window_to.to_string(),
             },
+        }
+    }
+
+    fn marketplace_inventory_request(
+        on_hand: f64,
+        reserved: Option<f64>,
+    ) -> MarketplaceInventoryUpsertRequest {
+        MarketplaceInventoryUpsertRequest {
+            inventory_id: Some("inventory-seed-corn-001".to_string()),
+            item_id: "seed-corn-001".to_string(),
+            org_id: "org-alpha".to_string(),
+            on_hand,
+            reserved,
         }
     }
 
