@@ -6649,6 +6649,42 @@ pub struct DroughtAlertRoutingResult {
     pub audits: Vec<DroughtAlertDeliveryAudit>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtMitigationRequest {
+    pub risk_score: DroughtRiskScoreRecord,
+    pub generated_at: String,
+    pub min_risk_value: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtMitigationStatus {
+    Recommended,
+    NotQualified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtMitigationActionTarget {
+    Irrigation16,
+    Advisor09,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtMitigationRecommendation {
+    pub field_or_region_ref: String,
+    pub status: DroughtMitigationStatus,
+    pub generated_at: String,
+    #[serde(default)]
+    pub risk_ref: Option<String>,
+    #[serde(default)]
+    pub action_target: Option<DroughtMitigationActionTarget>,
+    #[serde(default)]
+    pub recommendation: Option<String>,
+    pub evidence_refs: Vec<String>,
+    pub reason_code: String,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DroughtStressEvidenceError {
     #[error("drought stress evidence_id cannot be empty")]
@@ -6743,6 +6779,16 @@ pub enum DroughtAlertRoutingError {
     #[error("drought alert routing warning_threshold must be finite within 0..=1")]
     InvalidThreshold,
     #[error("drought alert routing timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DroughtMitigationError {
+    #[error("drought mitigation generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("drought mitigation min_risk_value must be finite within 0..=1")]
+    InvalidMinRiskValue,
+    #[error("drought mitigation timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
 }
 
@@ -7425,6 +7471,68 @@ pub fn evaluate_and_route_drought_alerts(
     })
 }
 
+pub fn derive_drought_mitigation_recommendation(
+    request: DroughtMitigationRequest,
+) -> Result<DroughtMitigationRecommendation, DroughtMitigationError> {
+    let generated_at = normalize_drought_text(request.generated_at)
+        .ok_or(DroughtMitigationError::EmptyGeneratedAt)?;
+    parse_drought_mitigation_timestamp(&generated_at)?;
+    if !(request.min_risk_value.is_finite() && (0.0..=1.0).contains(&request.min_risk_value)) {
+        return Err(DroughtMitigationError::InvalidMinRiskValue);
+    }
+
+    let value = request.risk_score.value.unwrap_or_default();
+    let band = request.risk_score.band.unwrap_or(DroughtRiskBand::Low);
+    let risk_ref = format!(
+        "drought_risk_score:{}:{}",
+        request.risk_score.field_or_region_ref,
+        band.as_forecast_ref()
+    );
+    if request.risk_score.status != DroughtRiskScoreStatus::Computed
+        || value < request.min_risk_value
+    {
+        return Ok(DroughtMitigationRecommendation {
+            field_or_region_ref: request.risk_score.field_or_region_ref,
+            status: DroughtMitigationStatus::NotQualified,
+            generated_at,
+            risk_ref: None,
+            action_target: None,
+            recommendation: None,
+            evidence_refs: request.risk_score.evidence_refs,
+            reason_code: "risk_below_mitigation_threshold".to_string(),
+        });
+    }
+
+    let action_target = if matches!(band, DroughtRiskBand::High | DroughtRiskBand::Severe) {
+        DroughtMitigationActionTarget::Irrigation16
+    } else {
+        DroughtMitigationActionTarget::Advisor09
+    };
+    let recommendation = match action_target {
+        DroughtMitigationActionTarget::Irrigation16 => {
+            "review_irrigation_schedule_for_drought_stress".to_string()
+        }
+        DroughtMitigationActionTarget::Advisor09 => {
+            "review_crop_advisor_drought_mitigation_plan".to_string()
+        }
+    };
+    let mut evidence_refs = request.risk_score.evidence_refs;
+    evidence_refs.push(risk_ref.clone());
+    evidence_refs.sort();
+    evidence_refs.dedup();
+
+    Ok(DroughtMitigationRecommendation {
+        field_or_region_ref: request.risk_score.field_or_region_ref,
+        status: DroughtMitigationStatus::Recommended,
+        generated_at,
+        risk_ref: Some(risk_ref),
+        action_target: Some(action_target),
+        recommendation: Some(recommendation),
+        evidence_refs,
+        reason_code: "risk_qualifies_for_mitigation".to_string(),
+    })
+}
+
 pub fn parse_drought_index_type(value: &str) -> Result<DroughtIndexType, DroughtIndexError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "spi" => Ok(DroughtIndexType::Spi),
@@ -7556,6 +7664,16 @@ fn parse_drought_alert_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
         .map_err(|_| DroughtAlertRoutingError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+fn parse_drought_mitigation_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, DroughtMitigationError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|_| DroughtMitigationError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -11614,8 +11732,8 @@ mod tests {
         compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
         compute_weather_reference_et, create_versioned_content,
-        deconflict_tractor_swath_reservations, detect_tractor_obstacle,
-        dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
+        deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
+        detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
         evaluate_and_route_water_alerts, evaluate_crop_stage_weather_risks,
         evaluate_tractor_geofence, evaluate_tractor_motion_gate,
@@ -11640,7 +11758,8 @@ mod tests {
         DroughtBaselineTrendStatus, DroughtEvidenceFusionError, DroughtEvidenceFusionRequest,
         DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus, DroughtForecastRequest,
         DroughtForecastStatus, DroughtForecastUncertaintyBand, DroughtIndexComputeRequest,
-        DroughtIndexError, DroughtIndexPeriod, DroughtIndexType, DroughtRiskBand,
+        DroughtIndexError, DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
+        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus, DroughtRiskBand,
         DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
         DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
         DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
@@ -15077,6 +15196,54 @@ mod tests {
                 && audit.reason_code == "field_scope_not_owned"));
     }
 
+    #[test]
+    fn drought_mitigation_recommends_irrigation_for_high_risk() {
+        let record = derive_drought_mitigation_recommendation(drought_mitigation_request(
+            0.6,
+            Some((0.72, DroughtRiskBand::High)),
+        ))
+        .expect("high risk should produce mitigation recommendation");
+
+        assert_eq!(record.status, DroughtMitigationStatus::Recommended);
+        assert_eq!(
+            record.action_target,
+            Some(DroughtMitigationActionTarget::Irrigation16)
+        );
+        assert_eq!(
+            record.recommendation,
+            Some("review_irrigation_schedule_for_drought_stress".to_string())
+        );
+        assert_eq!(
+            record.risk_ref,
+            Some("drought_risk_score:field-north:high".to_string())
+        );
+        assert!(record
+            .evidence_refs
+            .iter()
+            .any(|item| item == "drought_risk_score:field-north:high"));
+    }
+
+    #[test]
+    fn drought_mitigation_returns_no_recommendation_without_qualifying_risk() {
+        let record =
+            derive_drought_mitigation_recommendation(drought_mitigation_request(0.9, None))
+                .expect("below-threshold risk should be a no-op");
+
+        assert_eq!(record.status, DroughtMitigationStatus::NotQualified);
+        assert_eq!(record.action_target, None);
+        assert_eq!(record.recommendation, None);
+        assert_eq!(record.risk_ref, None);
+        assert_eq!(record.reason_code, "risk_below_mitigation_threshold");
+    }
+
+    #[test]
+    fn drought_mitigation_rejects_invalid_threshold() {
+        let error = derive_drought_mitigation_recommendation(drought_mitigation_request(1.2, None))
+            .expect_err("invalid mitigation threshold should reject");
+
+        assert_eq!(error, DroughtMitigationError::InvalidMinRiskValue);
+    }
+
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
         FleetNodeRecord {
             node_id: "node-001".to_string(),
@@ -15336,6 +15503,23 @@ mod tests {
             ],
             routed_at: " 2026-06-14T10:05:00Z ".to_string(),
             freshness: WeatherFreshnessState::Fresh,
+        }
+    }
+
+    fn drought_mitigation_request(
+        min_risk_value: f64,
+        override_score: Option<(f64, DroughtRiskBand)>,
+    ) -> DroughtMitigationRequest {
+        let mut risk_score = compute_drought_risk_score(drought_risk_score_request(true))
+            .expect("risk score fixture should compute");
+        if let Some((value, band)) = override_score {
+            risk_score.value = Some(value);
+            risk_score.band = Some(band);
+        }
+        DroughtMitigationRequest {
+            risk_score,
+            generated_at: " 2026-06-14T10:10:00Z ".to_string(),
+            min_risk_value,
         }
     }
 
