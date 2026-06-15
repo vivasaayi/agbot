@@ -3136,6 +3136,31 @@ pub struct WeatherAlertRoutingResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherCropStageThresholdSet {
+    pub crop_stage: String,
+    pub threshold_set_name: String,
+    pub thresholds: WeatherRiskThresholds,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherCropStageRiskRequest {
+    pub field_ref: String,
+    #[serde(default)]
+    pub crop_stage: Option<String>,
+    pub default_thresholds: WeatherRiskThresholds,
+    pub stage_thresholds: Vec<WeatherCropStageThresholdSet>,
+    pub records: Vec<WeatherFreshnessAnnotatedRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherCropStageRiskAlert {
+    pub alert: WeatherRiskAlert,
+    pub crop_stage: String,
+    pub threshold_set_name: String,
+    pub fallback_applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
     pub wind_speed_mps: WeatherForecastValue,
@@ -3335,6 +3360,14 @@ pub enum WeatherAlertRoutingError {
     EmptyTargets,
     #[error("weather alert routing timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherCropStageRiskError {
+    #[error("weather crop-stage risk field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error(transparent)]
+    Risk(#[from] WeatherRiskAlertError),
 }
 
 pub fn normalize_weather_provider_forecast(
@@ -4322,6 +4355,53 @@ fn parse_weather_alert_routing_timestamp(
         .map_err(|_| WeatherAlertRoutingError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
+}
+
+pub fn evaluate_crop_stage_weather_risks(
+    request: WeatherCropStageRiskRequest,
+) -> Result<Vec<WeatherCropStageRiskAlert>, WeatherCropStageRiskError> {
+    let field_ref = normalize_weather_text(request.field_ref)
+        .ok_or(WeatherCropStageRiskError::EmptyFieldRef)?;
+    let requested_stage = request
+        .crop_stage
+        .and_then(normalize_weather_text)
+        .unwrap_or_else(|| "unknown".to_string());
+    let selected = request
+        .stage_thresholds
+        .iter()
+        .find(|thresholds| thresholds.crop_stage == requested_stage);
+    let (thresholds, threshold_set_name, crop_stage, fallback_applied) =
+        if let Some(selected) = selected {
+            (
+                selected.thresholds.clone(),
+                selected.threshold_set_name.clone(),
+                selected.crop_stage.clone(),
+                false,
+            )
+        } else {
+            (
+                request.default_thresholds,
+                "default_thresholds".to_string(),
+                requested_stage,
+                true,
+            )
+        };
+    let records = request
+        .records
+        .into_iter()
+        .filter(|record| record.field_ref == field_ref)
+        .collect::<Vec<_>>();
+    let alerts = evaluate_weather_risk_alerts(&records, thresholds)?;
+
+    Ok(alerts
+        .into_iter()
+        .map(|alert| WeatherCropStageRiskAlert {
+            alert,
+            crop_stage: crop_stage.clone(),
+            threshold_set_name: threshold_set_name.clone(),
+            fallback_applied,
+        })
+        .collect())
 }
 
 pub fn weather_fetch_failure_record(
@@ -8837,13 +8917,14 @@ mod tests {
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
         compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, detect_tractor_obstacle,
-        dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
-        evaluate_tractor_motion_gate, evaluate_tractor_weather_window_gate,
-        evaluate_weather_risk_alerts, evaluate_weather_value_freshness,
-        execute_tractor_prescription, ingest_weather_sensor_stream,
-        normalize_weather_provider_forecast, plan_tractor_swath_coverage, query_weather_history,
-        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
-        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
+        dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
+        evaluate_crop_stage_weather_risks, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
+        evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
+        evaluate_weather_value_freshness, execute_tractor_prescription,
+        ingest_weather_sensor_stream, normalize_weather_provider_forecast,
+        plan_tractor_swath_coverage, query_weather_history, resolve_weather_forecast_to_field,
+        route_weather_alert, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
         AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
@@ -8884,6 +8965,7 @@ mod tests {
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
         TractorWeatherWindowDecision, TractorWeatherWindowGateRequest, WeatherAlertDeliveryStatus,
         WeatherAlertRouteTarget, WeatherAlertRoutingRequest, WeatherAlertRoutingTarget,
+        WeatherCropStageRiskRequest, WeatherCropStageThresholdSet,
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
         WeatherForecastValue, WeatherFreshnessState, WeatherGrowingDegreeDayRequest,
         WeatherGrowingDegreeDayStatus, WeatherHistoryQuery, WeatherIngestError,
@@ -11047,6 +11129,40 @@ mod tests {
     }
 
     #[test]
+    fn weather_crop_stage_risk_applies_sensitive_stage_threshold() {
+        let alerts =
+            evaluate_crop_stage_weather_risks(weather_crop_stage_request(Some("flowering")))
+                .expect("stage-aware alert should evaluate");
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].crop_stage, "flowering");
+        assert_eq!(alerts[0].threshold_set_name, "flowering_frost_sensitive");
+        assert!(!alerts[0].fallback_applied);
+        assert_eq!(alerts[0].alert.risk_type, WeatherRiskType::Frost);
+        assert_eq!(alerts[0].alert.threshold, 5.0);
+    }
+
+    #[test]
+    fn weather_crop_stage_risk_unknown_stage_uses_default_thresholds() {
+        let mut request = weather_crop_stage_request(Some("unknown-stage"));
+        request.records = vec![weather_window_record(
+            "2026-06-13T04:00:00Z",
+            3.0,
+            0.0,
+            1.0,
+            false,
+        )];
+        let alerts = evaluate_crop_stage_weather_risks(request)
+            .expect("unknown stage should evaluate with fallback");
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].crop_stage, "unknown-stage");
+        assert_eq!(alerts[0].threshold_set_name, "default_thresholds");
+        assert!(alerts[0].fallback_applied);
+        assert_eq!(alerts[0].alert.threshold, 2.0);
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -11778,6 +11894,31 @@ mod tests {
             owned_field_refs: vec!["field-north".to_string()],
             targets,
             routed_at: "2026-06-13T10:01:00Z".to_string(),
+        }
+    }
+
+    fn weather_crop_stage_request(crop_stage: Option<&str>) -> WeatherCropStageRiskRequest {
+        WeatherCropStageRiskRequest {
+            field_ref: "field-north".to_string(),
+            crop_stage: crop_stage.map(str::to_string),
+            default_thresholds: weather_risk_thresholds(),
+            stage_thresholds: vec![WeatherCropStageThresholdSet {
+                crop_stage: "flowering".to_string(),
+                threshold_set_name: "flowering_frost_sensitive".to_string(),
+                thresholds: WeatherRiskThresholds {
+                    frost_temperature_celsius: 5.0,
+                    heat_temperature_celsius: 35.0,
+                    wind_speed_mps: 10.0,
+                    precipitation_mm: 1.0,
+                },
+            }],
+            records: vec![weather_window_record(
+                "2026-06-13T04:00:00Z",
+                3.0,
+                0.0,
+                4.0,
+                false,
+            )],
         }
     }
 
