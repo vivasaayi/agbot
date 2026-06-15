@@ -5,6 +5,7 @@
 #include "agbot_flight_sim/FaultInjection.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/HudTelemetry.hpp"
+#include "agbot_flight_sim/LabeledSyntheticDataset.hpp"
 #include "agbot_flight_sim/LidarSimulator.hpp"
 #include "agbot_flight_sim/LocationScenario.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
@@ -29,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -1026,6 +1028,104 @@ void test_ray_traced_camera_reports_no_scene_coverage_outside_extent() {
     assert(frame.to_json().find("\"status\":\"no_scene_coverage\"") != std::string::npos);
 }
 
+void test_labeled_synthetic_dataset_exports_masks_from_scene_geometry() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    const auto profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 16);
+    const auto scene = test_scene_manifest_for_camera(profile);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {0.0, 30.0, 0.0};
+    state.mission_time_s = 12.5;
+    agbot::flight_sim::RayTracedCameraConfig config;
+    config.width = 5;
+    config.height = 5;
+    config.horizontal_fov_deg = 20.0;
+    config.vertical_fov_deg = 20.0;
+    const auto frame = agbot::flight_sim::raytrace_camera_frame(state, profile, scene, config);
+    const auto manifest = agbot::flight_sim::export_labeled_synthetic_dataset(
+        {frame},
+        scene,
+        "scenario-02-23",
+        20260223);
+    const auto repeat = agbot::flight_sim::export_labeled_synthetic_dataset(
+        {frame},
+        scene,
+        "scenario-02-23",
+        20260223);
+
+    assert(manifest.exported_frame_count() == 1);
+    assert(manifest.excluded_frame_count() == 0);
+    assert(manifest.dataset_id == repeat.dataset_id);
+    assert(manifest.to_json() == repeat.to_json());
+    assert(manifest.class_id_for("equipment_shed") != std::numeric_limits<std::uint16_t>::max());
+    assert(manifest.class_id_for("terrain") == 0);
+    assert(manifest.object_poses.size() == scene.objects.size());
+    assert(manifest.object_poses[0].object_id == scene.objects[0].object_id);
+
+    const auto& labeled_frame = manifest.frames.front();
+    assert(labeled_frame.scenario_hash == "scenario-02-23");
+    assert(labeled_frame.scene_hash == scene.scene_hash);
+    assert(labeled_frame.camera_pose_m.x == state.position.x);
+    assert(labeled_frame.class_mask.size() == frame.pixels.size());
+    assert(labeled_frame.depth_m.size() == frame.pixels.size());
+    assert(labeled_frame.label_hash.size() == 64);
+
+    for (std::size_t index = 0; index < frame.pixels.size(); ++index) {
+        const auto& pixel = frame.pixels[index];
+        assert(labeled_frame.class_mask[index] == manifest.class_id_for(pixel.class_name));
+        assert(std::abs(labeled_frame.depth_m[index] - pixel.depth_m) < 1e-9);
+        assert(labeled_frame.object_ids[index] == pixel.object_id);
+        if (!pixel.object_id.empty()) {
+            const auto found = std::find_if(scene.objects.begin(), scene.objects.end(), [&](const auto& object) {
+                return object.object_id == pixel.object_id;
+            });
+            assert(found != scene.objects.end());
+            assert(found->class_name == pixel.class_name);
+            assert(found->placement_seed == pixel.object_seed);
+        }
+    }
+
+    const std::string json = manifest.to_json();
+    assert(json.find("\"dataset_id\":\"") != std::string::npos);
+    assert(json.find("\"class_mask\":[") != std::string::npos);
+    assert(json.find("\"depth_m\":[") != std::string::npos);
+    assert(json.find("\"object_poses\":[") != std::string::npos);
+}
+
+void test_labeled_synthetic_dataset_excludes_unlinked_frames() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    const auto profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 16);
+    const auto scene = test_scene_manifest_for_camera(profile);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {0.0, 30.0, 0.0};
+    agbot::flight_sim::RayTracedCameraConfig config;
+    config.width = 3;
+    config.height = 3;
+    auto valid = agbot::flight_sim::raytrace_camera_frame(state, profile, scene, config);
+    auto missing_scene = valid;
+    missing_scene.scene_hash.clear();
+    auto missing_pose = valid;
+    missing_pose.pose.x = std::numeric_limits<double>::quiet_NaN();
+
+    const auto manifest = agbot::flight_sim::export_labeled_synthetic_dataset(
+        {valid, missing_scene, missing_pose},
+        scene,
+        "scenario-02-23",
+        20260223);
+
+    assert(manifest.exported_frame_count() == 1);
+    assert(manifest.excluded_frame_count() == 2);
+    assert(manifest.exclusions[0].frame_index == 1);
+    assert(manifest.exclusions[0].reason == "missing_scene_linkage");
+    assert(manifest.exclusions[1].frame_index == 2);
+    assert(manifest.exclusions[1].reason == "missing_pose");
+    assert(manifest.to_json().find("\"reason\":\"missing_scene_linkage\"") != std::string::npos);
+    assert(manifest.to_json().find("\"reason\":\"missing_pose\"") != std::string::npos);
+}
+
 std::vector<agbot::flight_sim::RayTracedFrame> test_stream_frames(
     const agbot::flight_sim::TerrainProfile& profile,
     const agbot::flight_sim::SceneSynthesisManifest& scene) {
@@ -2017,6 +2117,8 @@ int main() {
     test_location_scenario_reports_partial_gaps_for_unreachable_sources();
     test_ray_traced_camera_projects_scene_object_with_reproducible_depth();
     test_ray_traced_camera_reports_no_scene_coverage_outside_extent();
+    test_labeled_synthetic_dataset_exports_masks_from_scene_geometry();
+    test_labeled_synthetic_dataset_excludes_unlinked_frames();
     test_telemetry_video_stream_sends_decodable_aligned_frames_to_collector();
     test_telemetry_video_stream_buffers_when_collector_unreachable();
     test_builds_terrain_mesh_from_heightmap();
