@@ -310,6 +310,34 @@ pub struct ReportTemplateRenderOutput {
     pub sandbox_outcome: Option<SandboxExecutionOutcome>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MapLayerRenderRequest {
+    pub plugin_id: String,
+    pub layer_id: String,
+    pub source_ref: String,
+    pub title: String,
+    pub style: BTreeMap<String, String>,
+    pub width: u32,
+    pub height: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub required_capabilities: Vec<String>,
+    pub estimated_runtime_ms: u64,
+    pub estimated_memory_mb: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MapLayerDescriptor {
+    pub layer_id: String,
+    pub source_ref: String,
+    pub title: String,
+    pub style: BTreeMap<String, String>,
+    pub width: u32,
+    pub height: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub plugin_identity: PluginInvocationIdentity,
+    pub sandbox_outcome: SandboxExecutionOutcome,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SpectralIndexInvocationError {
     #[error("unknown plugin: {plugin_id}")]
@@ -326,6 +354,25 @@ pub enum SpectralIndexInvocationError {
     },
     #[error("scene spatial reference rejected: {0}")]
     InvalidSpatialRef(#[from] RasterSpatialRefError),
+    #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
+    SandboxTerminated {
+        plugin_id: String,
+        reason: Option<SandboxTerminationReason>,
+        outcome: SandboxExecutionOutcome,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum MapLayerInvocationError {
+    #[error("unknown plugin: {plugin_id}")]
+    UnknownPlugin { plugin_id: String },
+    #[error("plugin {plugin_id} is not a map-layer extension point")]
+    WrongExtensionPoint { plugin_id: String },
+    #[error("map layer {layer_id} has unprovable spatial reference: {source}")]
+    UnprovableSpatialRef {
+        layer_id: String,
+        source: RasterSpatialRefError,
+    },
     #[error("sandbox terminated for plugin {plugin_id}: {reason:?}")]
     SandboxTerminated {
         plugin_id: String,
@@ -887,6 +934,70 @@ impl PluginHost {
         })
     }
 
+    pub fn render_map_layer(
+        &mut self,
+        request: MapLayerRenderRequest,
+        limits: PluginExecutionLimits,
+        attempted_at: &str,
+    ) -> Result<MapLayerDescriptor, MapLayerInvocationError> {
+        let (plugin_id, plugin_version) = self
+            .plugin_version_for_kind(&request.plugin_id, ExtensionPointKind::MapLayer)
+            .map_err(|error| match error {
+                PluginKindLookupError::UnknownPlugin { plugin_id } => {
+                    MapLayerInvocationError::UnknownPlugin { plugin_id }
+                }
+                PluginKindLookupError::WrongExtensionPoint { plugin_id } => {
+                    MapLayerInvocationError::WrongExtensionPoint { plugin_id }
+                }
+            })?;
+
+        let spatial_ref =
+            assert_raster_spatial_ref(Some(&request.spatial_ref), request.width, request.height)
+                .map_err(|source| MapLayerInvocationError::UnprovableSpatialRef {
+                    layer_id: request.layer_id.clone(),
+                    source,
+                })?;
+        let outcome = self.execute_sandboxed(
+            PluginExecutionPlan {
+                plugin_id: plugin_id.clone(),
+                required_capabilities: request.required_capabilities.clone(),
+                estimated_runtime_ms: request.estimated_runtime_ms,
+                estimated_memory_mb: request.estimated_memory_mb,
+                result: format!(
+                    "map layer {layer_id} over {source_ref}",
+                    layer_id = request.layer_id,
+                    source_ref = request.source_ref
+                ),
+            },
+            limits,
+            attempted_at,
+        );
+        if outcome.status != SandboxExecutionStatus::Completed {
+            return Err(MapLayerInvocationError::SandboxTerminated {
+                plugin_id,
+                reason: outcome.termination_reason,
+                outcome,
+            });
+        }
+
+        Ok(MapLayerDescriptor {
+            layer_id: request.layer_id.clone(),
+            source_ref: request.source_ref,
+            title: request.title,
+            style: request.style,
+            width: request.width,
+            height: request.height,
+            spatial_ref,
+            plugin_identity: PluginInvocationIdentity {
+                plugin_id,
+                plugin_version,
+                extension_point: ExtensionPointKind::MapLayer,
+                invocation_ref: request.layer_id,
+            },
+            sandbox_outcome: outcome,
+        })
+    }
+
     fn plugin_version_for_kind(
         &self,
         plugin_id: &str,
@@ -1199,14 +1310,15 @@ fn normalize_optional_text(value: String) -> Option<String> {
 mod tests {
     use super::{
         CapabilityDecision, CapabilityViolationReason, CustomProcessorRequest, ManifestField,
-        ManifestRejectionReason, PluginExecutionLimits, PluginExecutionPlan, PluginHost,
-        PluginLifecycleStatus, PluginLifecycleTransitionRequest, PluginRegistrationError,
-        RawPluginManifest, ReportTemplateRenderRequest, SandboxExecutionStatus,
-        SandboxTerminationReason, SpectralBandOperand, SpectralIndexFormula,
-        SpectralIndexInvocationError, SpectralIndexPluginSpec, SpectralIndexScene,
+        ManifestRejectionReason, MapLayerInvocationError, MapLayerRenderRequest,
+        PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginLifecycleStatus,
+        PluginLifecycleTransitionRequest, PluginRegistrationError, RawPluginManifest,
+        ReportTemplateRenderRequest, SandboxExecutionStatus, SandboxTerminationReason,
+        SpectralBandOperand, SpectralIndexFormula, SpectralIndexInvocationError,
+        SpectralIndexPluginSpec, SpectralIndexScene,
     };
     use shared::plugin_extensions::ExtensionPointKind;
-    use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
+    use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError};
     use std::collections::BTreeMap;
 
     #[test]
@@ -1721,6 +1833,70 @@ mod tests {
     }
 
     #[test]
+    fn custom_map_layer_renders_with_asserted_crs_and_extent() {
+        let mut host = PluginHost::default();
+        host.register_plugin(map_layer_manifest())
+            .expect("map-layer plugin should register");
+        enable_plugin(&mut host, "plugin.map_overlay");
+
+        let descriptor = host
+            .render_map_layer(
+                map_layer_request(spatial_ref()),
+                sandbox_limits(),
+                "2026-06-12T12:50:00Z",
+            )
+            .expect("map layer should render");
+
+        assert_eq!(descriptor.layer_id, "layer:custom:vigor");
+        assert_eq!(descriptor.source_ref, "index:custom:vigor");
+        assert_eq!(descriptor.spatial_ref.crs.as_deref(), Some("EPSG:32614"));
+        assert_eq!(
+            descriptor
+                .spatial_ref
+                .bbox
+                .as_ref()
+                .map(|bbox| (bbox.min_lon, bbox.max_lon)),
+            Some((500_000.0, 500_020.0))
+        );
+        assert_eq!(descriptor.plugin_identity.plugin_id, "plugin.map_overlay");
+        assert_eq!(
+            descriptor.plugin_identity.extension_point,
+            ExtensionPointKind::MapLayer
+        );
+        assert_eq!(
+            descriptor.sandbox_outcome.status,
+            SandboxExecutionStatus::Completed
+        );
+    }
+
+    #[test]
+    fn custom_map_layer_with_unprovable_crs_is_not_rendered() {
+        let mut host = PluginHost::default();
+        host.register_plugin(map_layer_manifest())
+            .expect("map-layer plugin should register");
+        enable_plugin(&mut host, "plugin.map_overlay");
+        let mut unprovable = spatial_ref();
+        unprovable.crs = Some(" ".to_string());
+
+        let error = host
+            .render_map_layer(
+                map_layer_request(unprovable),
+                sandbox_limits(),
+                "2026-06-12T12:51:00Z",
+            )
+            .expect_err("missing CRS should refuse rendering");
+
+        assert_eq!(
+            error,
+            MapLayerInvocationError::UnprovableSpatialRef {
+                layer_id: "layer:custom:vigor".to_string(),
+                source: RasterSpatialRefError::MissingCrs,
+            }
+        );
+        assert!(host.capability_audit_entries().is_empty());
+    }
+
+    #[test]
     fn compatible_host_api_version_registers_within_supported_range() {
         let mut host = PluginHost::with_supported_host_api_range("2026.1", "2026.3")
             .expect("range should be valid");
@@ -1806,6 +1982,18 @@ mod tests {
         }
     }
 
+    fn map_layer_manifest() -> RawPluginManifest {
+        RawPluginManifest {
+            plugin_id: "plugin.map_overlay".to_string(),
+            name: "Vigor Map Overlay".to_string(),
+            version: "0.9.0".to_string(),
+            kind: "map_layer".to_string(),
+            host_api_version: "2026.1".to_string(),
+            capabilities: vec!["read:layer".to_string(), "render:map".to_string()],
+            entrypoint: "map_overlay::layer".to_string(),
+        }
+    }
+
     fn sandbox_limits() -> PluginExecutionLimits {
         PluginExecutionLimits {
             max_runtime_ms: 100,
@@ -1876,19 +2064,23 @@ mod tests {
             scene_ref: "scene:alpha-2026-06-12".to_string(),
             width: 2,
             height: 1,
-            spatial_ref: RasterSpatialRef {
-                georeferenced: true,
-                crs: Some("EPSG:32614".to_string()),
-                bbox: Some(GeoBounds {
-                    min_lon: 500_000.0,
-                    min_lat: 4_100_000.0,
-                    max_lon: 500_020.0,
-                    max_lat: 4_100_010.0,
-                }),
-                geo_transform: Some([500_000.0, 10.0, 0.0, 4_100_010.0, 0.0, -10.0]),
-                resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
-            },
+            spatial_ref: spatial_ref(),
             bands,
+        }
+    }
+
+    fn spatial_ref() -> RasterSpatialRef {
+        RasterSpatialRef {
+            georeferenced: true,
+            crs: Some("EPSG:32614".to_string()),
+            bbox: Some(GeoBounds {
+                min_lon: 500_000.0,
+                min_lat: 4_100_000.0,
+                max_lon: 500_020.0,
+                max_lat: 4_100_010.0,
+            }),
+            geo_transform: Some([500_000.0, 10.0, 0.0, 4_100_010.0, 0.0, -10.0]),
+            resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
         }
     }
 
@@ -1925,6 +2117,25 @@ mod tests {
             rendered_body: rendered_body.to_string(),
             fallback_template_id: "safe_default".to_string(),
             fallback_body: "safe default report".to_string(),
+        }
+    }
+
+    fn map_layer_request(spatial_ref: RasterSpatialRef) -> MapLayerRenderRequest {
+        let mut style = BTreeMap::new();
+        style.insert("palette".to_string(), "vigor".to_string());
+        style.insert("opacity".to_string(), "0.72".to_string());
+        MapLayerRenderRequest {
+            plugin_id: "plugin.map_overlay".to_string(),
+            layer_id: "layer:custom:vigor".to_string(),
+            source_ref: "index:custom:vigor".to_string(),
+            title: "Custom Vigor".to_string(),
+            style,
+            width: 2,
+            height: 1,
+            spatial_ref,
+            required_capabilities: vec!["read:layer".to_string(), "render:map".to_string()],
+            estimated_runtime_ms: 20,
+            estimated_memory_mb: 64,
         }
     }
 
