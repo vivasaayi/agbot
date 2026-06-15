@@ -15,6 +15,7 @@ pub mod flight_path;
 pub mod guarded_dispatch;
 pub mod mavlink_integration;
 pub mod mission_audit;
+pub mod mission_export;
 pub mod mission_optimizer;
 pub mod preflight_checklist;
 pub mod survey_template;
@@ -56,6 +57,11 @@ pub use mission_audit::{
     MissionAuditTimeline, MissionAuditValidationReport, MissionReplay, MissionReplayCommand,
     MissionReplayCommandStatus, MissionReplayError, MissionReplayErrorCode, MissionReplayEvent,
     MissionReplayEventKind,
+};
+pub use mission_export::{
+    export_mission_plan_and_telemetry, validate_mission_export_schema, MissionExport,
+    MissionExportError, MissionExportErrorCode, MissionExportExtent, MissionExportRequest,
+    MissionExportValidation,
 };
 pub use mission_optimizer::{
     assert_mission_budget_allows_arming, evaluate_mission_budget, MissionBudgetConfig,
