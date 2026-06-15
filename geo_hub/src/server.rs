@@ -386,6 +386,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_sustainability_mrv_trail),
         )
         .route(
+            "/api/sustainability/biodiversity-proxies",
+            get(routes::list_biodiversity_proxies).post(routes::create_biodiversity_proxy),
+        )
+        .route(
+            "/api/sustainability/biodiversity-proxies/:proxy_id",
+            get(routes::get_biodiversity_proxy),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
         )

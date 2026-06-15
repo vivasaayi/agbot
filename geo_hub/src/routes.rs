@@ -90,16 +90,16 @@ use shared::schemas::{
     build_marketplace_account_record, build_marketplace_catalog_item_record,
     build_marketplace_inventory_record, build_marketplace_portal_entry,
     build_soil_moisture_reading, build_sustainability_record, build_tractor_record,
-    close_marketplace_listing_record, compare_sustainability_baseline, compute_carbon_footprint,
-    compute_drought_index, compute_marketplace_demand_forecast,
+    close_marketplace_listing_record, compare_sustainability_baseline, compute_biodiversity_proxy,
+    compute_carbon_footprint, compute_drought_index, compute_marketplace_demand_forecast,
     create_marketplace_fulfillment_record, create_marketplace_rating_record,
     create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
     estimate_biomass, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
-    parse_carbon_footprint_status, parse_content_status, parse_content_type,
-    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
-    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
-    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
-    parse_marketplace_order_status, parse_marketplace_party_type,
+    parse_biodiversity_proxy_status, parse_carbon_footprint_status, parse_content_status,
+    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
+    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
+    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
+    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
     parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
@@ -109,21 +109,22 @@ use shared::schemas::{
     soil_moisture_rejection_record, transition_marketplace_account_status,
     transition_marketplace_fulfillment_status, transition_marketplace_order_status,
     validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
-    BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult, CarbonEmissionFactor,
-    CarbonFootprintComputeRequest, CarbonFootprintError, CarbonFootprintInput,
-    CarbonFootprintResult, CarbonFootprintStatus, CollaborationChannelCreateRequest,
-    CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
-    CollaborationMessageCreateRequest, CollaborationMessageRecord, ContentCreateRequest,
-    ContentEditRequest, ContentError, ContentRecord, ContentStatus, ContentType,
-    ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod,
-    DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus, FarmFieldListPage,
-    FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord, FieldRecord,
-    FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord,
-    FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
-    MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
-    MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
-    MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplaceCatalogItemRecord,
-    MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
+    BiodiversityProxyError, BiodiversityProxyRequest, BiodiversityProxyResult,
+    BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult,
+    CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintError,
+    CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
+    CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
+    CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
+    ContentType, ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError,
+    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
+    MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+    MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
     MarketplaceDemandForecastRequest, MarketplaceDemandUncertaintyBand,
     MarketplaceFulfillmentAuditRecord, MarketplaceFulfillmentCreateRequest,
     MarketplaceFulfillmentError, MarketplaceFulfillmentRecord, MarketplaceFulfillmentStatus,
@@ -834,6 +835,17 @@ pub struct SustainabilityMrvTrailListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SustainabilityMrvTrailScopeQuery {
     pub output_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiodiversityProxyListQuery {
+    pub field_id: Option<String>,
+    pub status: Option<BiodiversityProxyStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiodiversityProxyScopeQuery {
+    pub field_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4562,6 +4574,70 @@ pub async fn get_sustainability_mrv_trail(
     }
 
     Ok(Json(trail))
+}
+
+pub async fn create_biodiversity_proxy(
+    State(state): State<AppState>,
+    Json(request): Json<BiodiversityProxyRequest>,
+) -> AppResult<Json<BiodiversityProxyResult>> {
+    let result = compute_biodiversity_proxy(
+        request,
+        format!("biodiversity-proxy-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(biodiversity_proxy_error)?;
+    insert_biodiversity_proxy_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_biodiversity_proxies(
+    Query(query): Query<BiodiversityProxyListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<BiodiversityProxyResult>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for biodiversity proxies".to_string(),
+        )
+    })?;
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT proxy_id, field_id, heterogeneity_score, cover_fraction, uncertainty, status,
+               crs, extent_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biodiversity_proxies
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY computed_at ASC, proxy_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_biodiversity_proxy_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_biodiversity_proxy(
+    Path(proxy_id): Path<String>,
+    Query(query): Query<BiodiversityProxyScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<BiodiversityProxyResult>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    let proxy = load_biodiversity_proxy_result(&state, &proxy_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if proxy.field_id != field_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(proxy))
 }
 
 pub async fn create_content_item(
@@ -9667,6 +9743,10 @@ fn sustainability_mrv_trail_error(error: SustainabilityMrvTrailError) -> AppErro
     AppError::BadRequest(error.to_string())
 }
 
+fn biodiversity_proxy_error(error: BiodiversityProxyError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn content_error(error: ContentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -11485,6 +11565,38 @@ fn decode_sustainability_mrv_trail(
         rederived_result_hash: row.get("rederived_result_hash"),
         certification_ready: row.get::<i64, _>("certification_ready") != 0,
         created_at: row.get("created_at"),
+    })
+}
+
+fn decode_biodiversity_proxy_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<BiodiversityProxyResult> {
+    let extent =
+        serde_json::from_str::<GeoBounds>(&row.get::<String, _>("extent_json")).map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode biodiversity extent_json"))
+        })?;
+    let source_layer_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("source_layer_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode biodiversity source_layer_refs_json"),
+                )
+            })?;
+
+    Ok(BiodiversityProxyResult {
+        proxy_id: row.get("proxy_id"),
+        field_id: row.get("field_id"),
+        heterogeneity_score: row.get("heterogeneity_score"),
+        cover_fraction: row.get("cover_fraction"),
+        uncertainty: row.get("uncertainty"),
+        status: parse_biodiversity_proxy_status(&row.get::<String, _>("status"))
+            .map_err(biodiversity_proxy_error)?,
+        crs: row.get("crs"),
+        extent,
+        source_layer_refs,
+        method_version: row.get("method_version"),
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
     })
 }
 
@@ -14048,6 +14160,63 @@ async fn load_sustainability_mrv_trail(
     .map_err(Error::from)?;
 
     row.map(|row| decode_sustainability_mrv_trail(&row))
+        .transpose()
+}
+
+async fn insert_biodiversity_proxy_result(
+    state: &AppState,
+    result: &BiodiversityProxyResult,
+) -> AppResult<()> {
+    let extent_json =
+        serde_json::to_string(&result.extent).map_err(|err| AppError::Anyhow(err.into()))?;
+    let source_layer_refs_json = serde_json::to_string(&result.source_layer_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO biodiversity_proxies (
+            proxy_id, field_id, heterogeneity_score, cover_fraction, uncertainty, status,
+            crs, extent_json, source_layer_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&result.proxy_id)
+    .bind(&result.field_id)
+    .bind(result.heterogeneity_score)
+    .bind(result.cover_fraction)
+    .bind(result.uncertainty)
+    .bind(result.status.as_str())
+    .bind(&result.crs)
+    .bind(extent_json)
+    .bind(source_layer_refs_json)
+    .bind(&result.method_version)
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_biodiversity_proxy_result(
+    state: &AppState,
+    proxy_id: &str,
+) -> AppResult<Option<BiodiversityProxyResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT proxy_id, field_id, heterogeneity_score, cover_fraction, uncertainty, status,
+               crs, extent_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biodiversity_proxies
+        WHERE proxy_id = ?1
+        "#,
+    )
+    .bind(proxy_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_biodiversity_proxy_result(&row))
         .transpose()
 }
 

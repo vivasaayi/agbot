@@ -1215,6 +1215,27 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS biodiversity_proxies (
+            proxy_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            heterogeneity_score REAL,
+            cover_fraction REAL,
+            uncertainty REAL NOT NULL,
+            status TEXT NOT NULL,
+            crs TEXT NOT NULL,
+            extent_json TEXT NOT NULL,
+            source_layer_refs_json TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS cms_contents (
             content_id TEXT PRIMARY KEY,
             content_type TEXT NOT NULL,
@@ -2068,6 +2089,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_sustainability_mrv_trails_output
         ON sustainability_mrv_trails(output_ref, output_kind, created_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_biodiversity_proxies_field_status
+        ON biodiversity_proxies(field_id, status, computed_at);
         "#,
     )
     .execute(pool)

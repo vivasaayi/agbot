@@ -10399,6 +10399,58 @@ pub struct SustainabilityMrvTrail {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BiodiversityImageryLayer {
+    pub layer_ref: String,
+    pub width: u32,
+    pub height: u32,
+    pub values: Vec<f64>,
+    pub spatial_ref: RasterSpatialRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BiodiversityProxyRequest {
+    #[serde(default)]
+    pub proxy_id: Option<String>,
+    pub field_id: String,
+    pub layer: BiodiversityImageryLayer,
+    pub method_version: String,
+    #[serde(default = "default_biodiversity_cover_threshold")]
+    pub cover_threshold: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BiodiversityProxyStatus {
+    Computed,
+    NoSignal,
+}
+
+impl BiodiversityProxyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BiodiversityProxyStatus::Computed => "computed",
+            BiodiversityProxyStatus::NoSignal => "no_signal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BiodiversityProxyResult {
+    pub proxy_id: String,
+    pub field_id: String,
+    pub heterogeneity_score: Option<f64>,
+    pub cover_fraction: Option<f64>,
+    pub uncertainty: f64,
+    pub status: BiodiversityProxyStatus,
+    pub crs: String,
+    pub extent: GeoBounds,
+    pub source_layer_refs: Vec<String>,
+    pub method_version: String,
+    pub result_hash: String,
+    pub computed_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SustainabilityRecordError {
     #[error("sustainability record_id cannot be empty")]
@@ -10538,6 +10590,30 @@ pub enum SustainabilityMrvTrailError {
     EmptyCreatedAt,
     #[error("unsupported MRV output kind {value}")]
     UnsupportedOutputKind { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum BiodiversityProxyError {
+    #[error("biodiversity proxy_id cannot be empty")]
+    EmptyProxyId,
+    #[error("biodiversity field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("biodiversity layer_ref cannot be empty")]
+    EmptyLayerRef,
+    #[error("biodiversity method_version cannot be empty")]
+    EmptyMethodVersion,
+    #[error("biodiversity computed_at cannot be empty")]
+    EmptyComputedAt,
+    #[error("biodiversity grid values length does not match width * height for {layer_ref}")]
+    GridSizeMismatch { layer_ref: String },
+    #[error("biodiversity grid value is invalid for {layer_ref}")]
+    InvalidGridValue { layer_ref: String },
+    #[error("biodiversity cover threshold is invalid")]
+    InvalidCoverThreshold,
+    #[error("biodiversity raster spatial reference invalid: {0}")]
+    SpatialRef(#[from] RasterSpatialRefError),
+    #[error("unsupported biodiversity proxy status {value}")]
+    UnsupportedStatus { value: String },
 }
 
 pub fn build_sustainability_record(
@@ -11002,6 +11078,93 @@ pub fn create_sustainability_mrv_trail(
     })
 }
 
+pub fn compute_biodiversity_proxy(
+    request: BiodiversityProxyRequest,
+    generated_proxy_id: String,
+    computed_at: String,
+) -> Result<BiodiversityProxyResult, BiodiversityProxyError> {
+    let proxy_id = normalize_sustainability_optional_text(request.proxy_id)
+        .or_else(|| normalize_sustainability_text(generated_proxy_id))
+        .ok_or(BiodiversityProxyError::EmptyProxyId)?;
+    let field_id = normalize_sustainability_text(request.field_id)
+        .ok_or(BiodiversityProxyError::EmptyFieldId)?;
+    let method_version = normalize_sustainability_text(request.method_version)
+        .ok_or(BiodiversityProxyError::EmptyMethodVersion)?;
+    let computed_at = normalize_sustainability_text(computed_at)
+        .ok_or(BiodiversityProxyError::EmptyComputedAt)?;
+    if !(request.cover_threshold.is_finite() && (-1.0..=1.0).contains(&request.cover_threshold)) {
+        return Err(BiodiversityProxyError::InvalidCoverThreshold);
+    }
+    let layer = validate_biodiversity_layer(request.layer)?;
+    let crs = layer
+        .spatial_ref
+        .crs
+        .clone()
+        .ok_or(RasterSpatialRefError::MissingCrs)?;
+    let extent = layer
+        .spatial_ref
+        .bbox
+        .clone()
+        .ok_or(RasterSpatialRefError::MissingBbox)?;
+    let values = layer
+        .values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    let status = if values.len() < 2 || biodiversity_uniform(&values) {
+        BiodiversityProxyStatus::NoSignal
+    } else {
+        BiodiversityProxyStatus::Computed
+    };
+    let (heterogeneity_score, cover_fraction, uncertainty) =
+        if status == BiodiversityProxyStatus::Computed {
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / values.len() as f64;
+            let cover_fraction = values
+                .iter()
+                .filter(|value| **value >= request.cover_threshold)
+                .count() as f64
+                / values.len() as f64;
+            let heterogeneity_score = (variance.sqrt() * cover_fraction).clamp(0.0, 1.0);
+            let uncertainty = (1.0 - cover_fraction).clamp(0.0, 1.0);
+            (Some(heterogeneity_score), Some(cover_fraction), uncertainty)
+        } else {
+            (None, None, 1.0)
+        };
+    let source_layer_refs = vec![layer.layer_ref.clone()];
+    let result_hash = biodiversity_proxy_hash(
+        &field_id,
+        heterogeneity_score,
+        cover_fraction,
+        uncertainty,
+        status,
+        &crs,
+        &extent,
+        &source_layer_refs,
+        &method_version,
+    );
+
+    Ok(BiodiversityProxyResult {
+        proxy_id,
+        field_id,
+        heterogeneity_score,
+        cover_fraction,
+        uncertainty,
+        status,
+        crs,
+        extent,
+        source_layer_refs,
+        method_version,
+        result_hash,
+        computed_at,
+    })
+}
+
 pub fn parse_sustainability_metric_type(
     value: &str,
 ) -> Result<SustainabilityMetricType, SustainabilityRecordError> {
@@ -11077,6 +11240,18 @@ pub fn parse_sustainability_mrv_output_kind(
         "biomass_estimate" => Ok(SustainabilityMrvOutputKind::BiomassEstimate),
         "sustainability_kpi" => Ok(SustainabilityMrvOutputKind::SustainabilityKpi),
         _ => Err(SustainabilityMrvTrailError::UnsupportedOutputKind {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_biodiversity_proxy_status(
+    value: &str,
+) -> Result<BiodiversityProxyStatus, BiodiversityProxyError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "computed" => Ok(BiodiversityProxyStatus::Computed),
+        "no_signal" => Ok(BiodiversityProxyStatus::NoSignal),
+        _ => Err(BiodiversityProxyError::UnsupportedStatus {
             value: value.to_string(),
         }),
     }
@@ -11186,6 +11361,65 @@ fn sustainability_mrv_rederived_hash(
     }
     for (key, value) in parameters {
         canonical.push_str(&format!("|param:{key}={value}"));
+    }
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn validate_biodiversity_layer(
+    mut layer: BiodiversityImageryLayer,
+) -> Result<BiodiversityImageryLayer, BiodiversityProxyError> {
+    layer.layer_ref = normalize_sustainability_text(layer.layer_ref)
+        .ok_or(BiodiversityProxyError::EmptyLayerRef)?;
+    let expected_len = layer.width as usize * layer.height as usize;
+    if expected_len != layer.values.len() {
+        return Err(BiodiversityProxyError::GridSizeMismatch {
+            layer_ref: layer.layer_ref,
+        });
+    }
+    if layer.values.iter().any(|value| !value.is_finite()) {
+        return Err(BiodiversityProxyError::InvalidGridValue {
+            layer_ref: layer.layer_ref,
+        });
+    }
+    layer.spatial_ref =
+        assert_raster_spatial_ref(Some(&layer.spatial_ref), layer.width, layer.height)?;
+    Ok(layer)
+}
+
+fn biodiversity_uniform(values: &[f64]) -> bool {
+    let first = values.first().copied().unwrap_or_default();
+    values
+        .iter()
+        .all(|value| (*value - first).abs() <= GEO_EXTENT_ASSERTION_TOLERANCE)
+}
+
+fn default_biodiversity_cover_threshold() -> f64 {
+    0.3
+}
+
+fn biodiversity_proxy_hash(
+    field_id: &str,
+    heterogeneity_score: Option<f64>,
+    cover_fraction: Option<f64>,
+    uncertainty: f64,
+    status: BiodiversityProxyStatus,
+    crs: &str,
+    extent: &GeoBounds,
+    source_layer_refs: &[String],
+    method_version: &str,
+) -> String {
+    let mut canonical = format!(
+        "field={field_id}|heterogeneity={:.6}|cover={:.6}|uncertainty={uncertainty:.6}|status={}|crs={crs}|extent={:.9},{:.9},{:.9},{:.9}|method={method_version}",
+        heterogeneity_score.unwrap_or(-1.0),
+        cover_fraction.unwrap_or(-1.0),
+        status.as_str(),
+        extent.min_lon,
+        extent.min_lat,
+        extent.max_lon,
+        extent.max_lat
+    );
+    for source_layer_ref in source_layer_refs {
+        canonical.push_str(&format!("|source:{source_layer_ref}"));
     }
     format!("{:016x}", fnv1a64(canonical.as_bytes()))
 }
@@ -14990,8 +15224,8 @@ mod tests {
         build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
         close_marketplace_listing_record, compare_sustainability_baseline,
-        compute_carbon_footprint, compute_drought_baseline_trend, compute_drought_index,
-        compute_drought_risk_score, compute_marketplace_demand_forecast,
+        compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_baseline_trend,
+        compute_drought_index, compute_drought_risk_score, compute_marketplace_demand_forecast,
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
         compute_weather_reference_et, create_marketplace_fulfillment_record,
         create_marketplace_rating_record, create_sustainability_baseline,
@@ -15020,6 +15254,7 @@ mod tests {
         zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
         AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
         AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        BiodiversityImageryLayer, BiodiversityProxyRequest, BiodiversityProxyStatus,
         BiomassEstimateError, BiomassEstimateRequest, BiomassLayerInput, CarbonEmissionFactor,
         CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
         CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
@@ -17499,6 +17734,69 @@ mod tests {
     }
 
     #[test]
+    fn biodiversity_proxy_computes_heterogeneity_and_cover() {
+        let result = compute_biodiversity_proxy(
+            biodiversity_proxy_request(vec![0.1, 0.4, 0.6, 0.9]),
+            "generated-proxy".to_string(),
+            "2026-06-18T12:00:00Z".to_string(),
+        )
+        .expect("varied georeferenced imagery should compute");
+
+        assert_eq!(result.proxy_id, "biodiversity-001");
+        assert_eq!(result.field_id, "field-biodiversity");
+        assert_eq!(result.status, BiodiversityProxyStatus::Computed);
+        assert_eq!(result.cover_fraction, Some(0.75));
+        assert!(result.heterogeneity_score.is_some_and(|score| score > 0.0));
+        assert_eq!(result.crs, "EPSG:32614");
+        assert_eq!(
+            result.extent,
+            GeoBounds {
+                min_lon: 0.0,
+                min_lat: 0.0,
+                max_lon: 20.0,
+                max_lat: 20.0,
+            }
+        );
+        assert_eq!(result.source_layer_refs, vec!["layer:ndvi-biodiversity"]);
+        assert!(!result.result_hash.is_empty());
+    }
+
+    #[test]
+    fn biodiversity_proxy_same_inputs_reproduce_hash() {
+        let first = compute_biodiversity_proxy(
+            biodiversity_proxy_request(vec![0.1, 0.4, 0.6, 0.9]),
+            "generated-proxy-001".to_string(),
+            "2026-06-18T12:00:00Z".to_string(),
+        )
+        .expect("first biodiversity proxy should compute");
+        let mut request = biodiversity_proxy_request(vec![0.1, 0.4, 0.6, 0.9]);
+        request.proxy_id = Some("biodiversity-002".to_string());
+        let second = compute_biodiversity_proxy(
+            request,
+            "generated-proxy-002".to_string(),
+            "2026-06-19T12:00:00Z".to_string(),
+        )
+        .expect("second biodiversity proxy should compute");
+
+        assert_eq!(first.result_hash, second.result_hash);
+    }
+
+    #[test]
+    fn biodiversity_proxy_uniform_grid_returns_no_signal() {
+        let result = compute_biodiversity_proxy(
+            biodiversity_proxy_request(vec![0.4, 0.4, 0.4, 0.4]),
+            "generated-proxy".to_string(),
+            "2026-06-18T12:00:00Z".to_string(),
+        )
+        .expect("uniform imagery should return no_signal");
+
+        assert_eq!(result.status, BiodiversityProxyStatus::NoSignal);
+        assert_eq!(result.heterogeneity_score, None);
+        assert_eq!(result.cover_fraction, None);
+        assert_eq!(result.uncertainty, 1.0);
+    }
+
+    #[test]
     fn versioned_content_create_and_edit_advances_current_version() {
         let (content, first_version) = create_versioned_content(
             ContentCreateRequest {
@@ -17633,6 +17931,33 @@ mod tests {
             ]),
             audit_id: "audit-biomass-001".to_string(),
             result_hash: "result-hash-biomass-001".to_string(),
+        }
+    }
+
+    fn biodiversity_proxy_request(values: Vec<f64>) -> BiodiversityProxyRequest {
+        BiodiversityProxyRequest {
+            proxy_id: Some("biodiversity-001".to_string()),
+            field_id: "field-biodiversity".to_string(),
+            layer: BiodiversityImageryLayer {
+                layer_ref: "layer:ndvi-biodiversity".to_string(),
+                width: 2,
+                height: 2,
+                values,
+                spatial_ref: RasterSpatialRef {
+                    georeferenced: true,
+                    crs: Some("EPSG:32614".to_string()),
+                    bbox: Some(GeoBounds {
+                        min_lon: 0.0,
+                        min_lat: 0.0,
+                        max_lon: 20.0,
+                        max_lat: 20.0,
+                    }),
+                    geo_transform: Some([0.0, 10.0, 0.0, 20.0, 0.0, -10.0]),
+                    resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
+                },
+            },
+            method_version: "biodiversity.imagery_proxy.v1".to_string(),
+            cover_threshold: 0.3,
         }
     }
 

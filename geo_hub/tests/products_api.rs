@@ -5170,6 +5170,151 @@ async fn sustainability_mrv_trail_rejects_incomplete_without_writing() -> Result
 }
 
 #[tokio::test]
+async fn biodiversity_proxies_compute_get_and_list_georeferenced_metrics() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biodiversity-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biodiversity_proxy_payload("biodiversity-001", vec![0.1, 0.4, 0.6, 0.9])
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("computed")
+    );
+    assert_eq!(
+        first.get("cover_fraction").and_then(|value| value.as_f64()),
+        Some(0.75)
+    );
+    assert_eq!(
+        first.get("crs").and_then(|value| value.as_str()),
+        Some("EPSG:32614")
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biodiversity-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biodiversity_proxy_payload("biodiversity-002", vec![0.1, 0.4, 0.6, 0.9])
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/biodiversity-proxies/biodiversity-001?field_id=field-biodiversity")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/biodiversity-proxies?field_id=field-biodiversity&status=computed")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let proxies: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(proxies.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn biodiversity_proxy_uniform_grid_persists_no_signal_without_score() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biodiversity-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biodiversity_proxy_payload("biodiversity-nosignal", vec![0.4, 0.4, 0.4, 0.4])
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let proxy: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        proxy.get("status").and_then(|value| value.as_str()),
+        Some("no_signal")
+    );
+    assert!(proxy
+        .get("heterogeneity_score")
+        .is_some_and(|value| value.is_null()));
+    assert!(proxy
+        .get("cover_fraction")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM biodiversity_proxies WHERE status = 'no_signal' AND heterogeneity_score IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn content_items_create_edit_get_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -14331,6 +14476,33 @@ fn sustainability_mrv_payload(
         },
         "audit_id": "audit-biomass-mrv",
         "result_hash": "result-hash-biomass-001"
+    })
+}
+
+fn biodiversity_proxy_payload(proxy_id: &str, values: Vec<f64>) -> serde_json::Value {
+    json!({
+        "proxy_id": proxy_id,
+        "field_id": "field-biodiversity",
+        "layer": {
+            "layer_ref": "layer:ndvi-biodiversity",
+            "width": 2,
+            "height": 2,
+            "values": values,
+            "spatial_ref": {
+                "georeferenced": true,
+                "crs": "EPSG:32614",
+                "bbox": {
+                    "min_lon": 0.0,
+                    "min_lat": 0.0,
+                    "max_lon": 20.0,
+                    "max_lat": 20.0
+                },
+                "geo_transform": [0.0, 10.0, 0.0, 20.0, 0.0, -10.0],
+                "resolution": { "x": 10.0, "y": 10.0 }
+            }
+        },
+        "method_version": "biodiversity.imagery_proxy.v1",
+        "cover_threshold": 0.3
     })
 }
 
