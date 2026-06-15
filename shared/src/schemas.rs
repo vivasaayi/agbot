@@ -785,6 +785,82 @@ pub enum TractorSwathPlanningError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorFieldOpsTelemetrySample {
+    pub timestamp: String,
+    pub position: TractorGuidancePoint,
+    pub speed_mps: f64,
+    pub implement_enabled: bool,
+    pub implement_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorFieldOpsCoverageTally {
+    pub distance_m: f64,
+    pub covered_area_m2: f64,
+    pub coverage_fraction: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorFieldOpsSafetyEventType {
+    TelemetryDropout,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorFieldOpsSafetyEvent {
+    pub event_type: TractorFieldOpsSafetyEventType,
+    pub at: String,
+    pub reason_code: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorFieldOpsSessionLog {
+    pub session_id: String,
+    pub tractor_id: String,
+    pub field_id: String,
+    pub started_at: String,
+    pub telemetry: Vec<TractorFieldOpsTelemetrySample>,
+    pub coverage: TractorFieldOpsCoverageTally,
+    pub safety_events: Vec<TractorFieldOpsSafetyEvent>,
+    pub telemetry_gap_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorFieldOpsSessionRequest {
+    pub session_id: String,
+    pub tractor_id: String,
+    pub field_id: String,
+    pub started_at: String,
+    pub telemetry: Vec<TractorFieldOpsTelemetrySample>,
+    pub implement_width_m: f64,
+    pub planned_area_m2: f64,
+    pub max_telemetry_gap_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TractorFieldOpsSessionError {
+    #[error("tractor field-ops session_id cannot be empty")]
+    EmptySessionId,
+    #[error("tractor field-ops tractor_id cannot be empty")]
+    EmptyTractorId,
+    #[error("tractor field-ops field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("tractor field-ops started_at cannot be empty")]
+    EmptyStartedAt,
+    #[error("tractor field-ops requires at least one telemetry sample")]
+    EmptyTelemetry,
+    #[error("tractor field-ops implement width must be positive")]
+    InvalidImplementWidth,
+    #[error("tractor field-ops planned area must be positive")]
+    InvalidPlannedArea,
+    #[error("tractor field-ops telemetry gap threshold must be positive")]
+    InvalidTelemetryGapThreshold,
+    #[error("tractor field-ops timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+}
+
 impl TractorCommandRejection {
     pub fn status_code(&self) -> u16 {
         match self.reason {
@@ -1342,6 +1418,108 @@ fn tractor_swath_intersects_bounds(swath: &TractorSwathSegment, bounds: &GeoBoun
         && swath.start.latitude <= bounds.max_lat
         && swath.start.longitude < bounds.max_lon
         && swath.end.longitude > bounds.min_lon
+}
+
+pub fn build_tractor_field_ops_session_log(
+    request: TractorFieldOpsSessionRequest,
+) -> Result<TractorFieldOpsSessionLog, TractorFieldOpsSessionError> {
+    let session_id = normalize_tractor_text(request.session_id)
+        .ok_or(TractorFieldOpsSessionError::EmptySessionId)?;
+    let tractor_id = normalize_tractor_text(request.tractor_id)
+        .ok_or(TractorFieldOpsSessionError::EmptyTractorId)?;
+    let field_id = normalize_tractor_text(request.field_id)
+        .ok_or(TractorFieldOpsSessionError::EmptyFieldId)?;
+    let started_at = normalize_tractor_text(request.started_at)
+        .ok_or(TractorFieldOpsSessionError::EmptyStartedAt)?;
+    if request.telemetry.is_empty() {
+        return Err(TractorFieldOpsSessionError::EmptyTelemetry);
+    }
+    if !request.implement_width_m.is_finite() || request.implement_width_m <= 0.0 {
+        return Err(TractorFieldOpsSessionError::InvalidImplementWidth);
+    }
+    if !request.planned_area_m2.is_finite() || request.planned_area_m2 <= 0.0 {
+        return Err(TractorFieldOpsSessionError::InvalidPlannedArea);
+    }
+    if request.max_telemetry_gap_seconds <= 0 {
+        return Err(TractorFieldOpsSessionError::InvalidTelemetryGapThreshold);
+    }
+
+    let mut telemetry = request.telemetry;
+    for sample in &mut telemetry {
+        sample.timestamp = normalize_tractor_text(sample.timestamp.clone()).ok_or_else(|| {
+            TractorFieldOpsSessionError::InvalidTimestamp {
+                timestamp: sample.timestamp.clone(),
+            }
+        })?;
+        parse_tractor_field_ops_timestamp(&sample.timestamp)?;
+    }
+    telemetry.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+
+    let distance_m = tractor_field_ops_distance_m(&telemetry);
+    let covered_area_m2 = distance_m * request.implement_width_m;
+    let coverage_fraction = (covered_area_m2 / request.planned_area_m2).clamp(0.0, 1.0);
+    let safety_events =
+        tractor_field_ops_gap_events(&telemetry, request.max_telemetry_gap_seconds)?;
+
+    Ok(TractorFieldOpsSessionLog {
+        session_id,
+        tractor_id,
+        field_id,
+        started_at,
+        telemetry,
+        coverage: TractorFieldOpsCoverageTally {
+            distance_m,
+            covered_area_m2,
+            coverage_fraction,
+        },
+        telemetry_gap_count: safety_events.len(),
+        safety_events,
+    })
+}
+
+fn tractor_field_ops_distance_m(samples: &[TractorFieldOpsTelemetrySample]) -> f64 {
+    samples
+        .windows(2)
+        .map(|window| {
+            let dx = window[1].position.x_m - window[0].position.x_m;
+            let dy = window[1].position.y_m - window[0].position.y_m;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .sum()
+}
+
+fn tractor_field_ops_gap_events(
+    samples: &[TractorFieldOpsTelemetrySample],
+    max_gap_seconds: i64,
+) -> Result<Vec<TractorFieldOpsSafetyEvent>, TractorFieldOpsSessionError> {
+    let mut events = Vec::new();
+    for window in samples.windows(2) {
+        let previous = parse_tractor_field_ops_timestamp(&window[0].timestamp)?;
+        let current = parse_tractor_field_ops_timestamp(&window[1].timestamp)?;
+        let gap_seconds = current.signed_duration_since(previous).num_seconds();
+        if gap_seconds > max_gap_seconds {
+            events.push(TractorFieldOpsSafetyEvent {
+                event_type: TractorFieldOpsSafetyEventType::TelemetryDropout,
+                at: window[1].timestamp.clone(),
+                reason_code: "telemetry_dropout".to_string(),
+                details: format!(
+                    "telemetry gap {}s exceeded threshold {}s after {}",
+                    gap_seconds, max_gap_seconds, window[0].timestamp
+                ),
+            });
+        }
+    }
+    Ok(events)
+}
+
+fn parse_tractor_field_ops_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, TractorFieldOpsSessionError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| TractorFieldOpsSessionError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6004,9 +6182,10 @@ mod tests {
         bind_fleet_node_identity, bounds_from_points, build_collaboration_channel,
         build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
-        compute_drought_index, create_versioned_content, dry_run_fleet_config_bundle,
-        evaluate_access_anomaly_advisories, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        build_tractor_field_ops_session_log, compute_drought_index, create_versioned_content,
+        dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
+        normalize_weather_provider_forecast, plan_tractor_swath_coverage,
+        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
@@ -6034,13 +6213,14 @@ mod tests {
         SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
         SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorGuidanceConfig, TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath,
-        TractorGuidancePoint, TractorImplementRef, TractorLifecycleStatus,
-        TractorMotionCommandRequest, TractorRegistrationRequest, TractorRegistry,
-        TractorSwathCoverageRequest, WeatherIngestError, WeatherProviderForecastPoint,
-        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
-        WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry,
-        WorkOrderStatus,
+        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
+        TractorFieldOpsTelemetrySample, TractorGuidanceConfig, TractorGuidanceError,
+        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint, TractorImplementRef,
+        TractorLifecycleStatus, TractorMotionCommandRequest, TractorRegistrationRequest,
+        TractorRegistry, TractorSwathCoverageRequest, WeatherIngestError,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
+        WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -6739,6 +6919,65 @@ mod tests {
             .swaths
             .iter()
             .all(|swath| swath.end.longitude <= 4.0 || swath.start.longitude >= 6.0));
+    }
+
+    #[test]
+    fn tractor_field_ops_session_persists_telemetry_and_coverage() {
+        let session = build_tractor_field_ops_session_log(TractorFieldOpsSessionRequest {
+            session_id: " session-001 ".to_string(),
+            tractor_id: " tractor-001 ".to_string(),
+            field_id: " field-north ".to_string(),
+            started_at: " 2026-06-15T10:00:00Z ".to_string(),
+            telemetry: vec![
+                tractor_field_ops_sample("2026-06-15T10:00:02Z", 6.0, 0.0, 2.0, true),
+                tractor_field_ops_sample("2026-06-15T10:00:00Z", 0.0, 0.0, 2.0, true),
+                tractor_field_ops_sample("2026-06-15T10:00:01Z", 3.0, 0.0, 2.0, true),
+            ],
+            implement_width_m: 2.0,
+            planned_area_m2: 24.0,
+            max_telemetry_gap_seconds: 2,
+        })
+        .expect("field ops session should persist");
+
+        assert_eq!(session.session_id, "session-001");
+        assert_eq!(session.tractor_id, "tractor-001");
+        assert_eq!(session.field_id, "field-north");
+        assert_eq!(session.telemetry.len(), 3);
+        assert_eq!(session.telemetry[0].timestamp, "2026-06-15T10:00:00Z");
+        assert_eq!(session.telemetry[2].position.x_m, 6.0);
+        assert_eq!(session.coverage.distance_m, 6.0);
+        assert_eq!(session.coverage.covered_area_m2, 12.0);
+        assert_eq!(session.coverage.coverage_fraction, 0.5);
+        assert!(session.safety_events.is_empty());
+        assert_eq!(session.telemetry_gap_count, 0);
+    }
+
+    #[test]
+    fn tractor_field_ops_session_flags_telemetry_dropout() {
+        let session = build_tractor_field_ops_session_log(TractorFieldOpsSessionRequest {
+            session_id: "session-gap".to_string(),
+            tractor_id: "tractor-001".to_string(),
+            field_id: "field-north".to_string(),
+            started_at: "2026-06-15T10:00:00Z".to_string(),
+            telemetry: vec![
+                tractor_field_ops_sample("2026-06-15T10:00:00Z", 0.0, 0.0, 2.0, true),
+                tractor_field_ops_sample("2026-06-15T10:00:10Z", 2.0, 0.0, 2.0, true),
+            ],
+            implement_width_m: 2.0,
+            planned_area_m2: 10.0,
+            max_telemetry_gap_seconds: 3,
+        })
+        .expect("field ops session with gap should persist");
+
+        assert_eq!(session.telemetry_gap_count, 1);
+        assert_eq!(session.safety_events.len(), 1);
+        assert_eq!(
+            session.safety_events[0].event_type,
+            TractorFieldOpsSafetyEventType::TelemetryDropout
+        );
+        assert_eq!(session.safety_events[0].reason_code, "telemetry_dropout");
+        assert!(session.safety_events[0].details.contains("10s"));
+        assert_eq!(session.coverage.distance_m, 2.0);
     }
 
     #[test]
@@ -7503,6 +7742,22 @@ mod tests {
                 },
             ],
             crs: Some(crs.to_string()),
+        }
+    }
+
+    fn tractor_field_ops_sample(
+        timestamp: &str,
+        x_m: f64,
+        y_m: f64,
+        speed_mps: f64,
+        implement_enabled: bool,
+    ) -> TractorFieldOpsTelemetrySample {
+        TractorFieldOpsTelemetrySample {
+            timestamp: timestamp.to_string(),
+            position: TractorGuidancePoint { x_m, y_m },
+            speed_mps,
+            implement_enabled,
+            implement_rate: Some(1.0),
         }
     }
 
