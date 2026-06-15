@@ -21,7 +21,10 @@ pub mod web_server;
 pub use cli_interface::{
     cli_status_snapshot, submit_cli_operator_action, CliCommandOutcome, CliStatusSnapshot,
 };
-pub use fleet_operations::{summarize_fleet_operations_feed, FleetOperationsConsoleSummary};
+pub use fleet_operations::{
+    build_fleet_status_overview, summarize_fleet_operations_feed, FleetOperationsConsoleSummary,
+    FleetOverviewAircraftStatus, FleetOverviewLinkState, FleetStatusOverview,
+};
 pub use link_client::{
     run_websocket_client_until, run_websocket_client_with_dispatch_until,
     run_websocket_client_with_handler_until, shared_link_state, ConnectionState, LinkStateMachine,
