@@ -6607,6 +6607,48 @@ pub struct DroughtForecastRecord {
     pub unavailable_reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtAlertRoutingRequest {
+    pub risk_score: DroughtRiskScoreRecord,
+    pub warning_threshold: f64,
+    pub recipient_id: String,
+    pub owned_field_refs: Vec<String>,
+    pub targets: Vec<WeatherAlertRoutingTarget>,
+    pub routed_at: String,
+    pub freshness: WeatherFreshnessState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtRiskAlert {
+    pub field_or_region_ref: String,
+    pub value: f64,
+    pub band: DroughtRiskBand,
+    pub warning_threshold: f64,
+    pub routed_at: String,
+    pub freshness: WeatherFreshnessState,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtAlertDeliveryAudit {
+    pub target: WeatherAlertRouteTarget,
+    pub status: WeatherAlertDeliveryStatus,
+    pub reason_code: String,
+    pub recipient_id: String,
+    pub field_or_region_ref: String,
+    pub routed_at: String,
+    pub evidence_payload: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtAlertRoutingResult {
+    pub alerts: Vec<DroughtRiskAlert>,
+    pub delivered_count: usize,
+    pub queued_count: usize,
+    pub rejected_count: usize,
+    pub audits: Vec<DroughtAlertDeliveryAudit>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DroughtStressEvidenceError {
     #[error("drought stress evidence_id cannot be empty")]
@@ -6688,6 +6730,20 @@ pub enum DroughtForecastError {
     InvalidHorizon,
     #[error("drought forecast max_score_age_days must be positive")]
     InvalidMaxScoreAge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DroughtAlertRoutingError {
+    #[error("drought alert routing recipient_id cannot be empty")]
+    EmptyRecipientId,
+    #[error("drought alert routing routed_at cannot be empty")]
+    EmptyRoutedAt,
+    #[error("drought alert routing requires at least one target")]
+    EmptyTargets,
+    #[error("drought alert routing warning_threshold must be finite within 0..=1")]
+    InvalidThreshold,
+    #[error("drought alert routing timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -7273,6 +7329,102 @@ pub fn forecast_drought_risk(
     })
 }
 
+pub fn evaluate_and_route_drought_alerts(
+    request: DroughtAlertRoutingRequest,
+) -> Result<DroughtAlertRoutingResult, DroughtAlertRoutingError> {
+    let recipient_id = normalize_drought_text(request.recipient_id)
+        .ok_or(DroughtAlertRoutingError::EmptyRecipientId)?;
+    let routed_at =
+        normalize_drought_text(request.routed_at).ok_or(DroughtAlertRoutingError::EmptyRoutedAt)?;
+    parse_drought_alert_timestamp(&routed_at)?;
+    if request.targets.is_empty() {
+        return Err(DroughtAlertRoutingError::EmptyTargets);
+    }
+    if !(request.warning_threshold.is_finite() && (0.0..=1.0).contains(&request.warning_threshold))
+    {
+        return Err(DroughtAlertRoutingError::InvalidThreshold);
+    }
+
+    let risk_value = request.risk_score.value.unwrap_or_default();
+    let risk_band = request.risk_score.band.unwrap_or(DroughtRiskBand::Low);
+    if request.risk_score.status != DroughtRiskScoreStatus::Computed
+        || risk_value < request.warning_threshold
+    {
+        return Ok(DroughtAlertRoutingResult {
+            alerts: Vec::new(),
+            delivered_count: 0,
+            queued_count: 0,
+            rejected_count: 0,
+            audits: Vec::new(),
+        });
+    }
+
+    let owned_field_refs = request
+        .owned_field_refs
+        .into_iter()
+        .filter_map(normalize_drought_text)
+        .collect::<BTreeSet<_>>();
+    let field_owned = owned_field_refs.contains(&request.risk_score.field_or_region_ref);
+    let mut evidence_refs = request.risk_score.evidence_refs.clone();
+    evidence_refs.push(format!(
+        "drought_risk_score:{}:{}",
+        request.risk_score.field_or_region_ref,
+        risk_band.as_forecast_ref()
+    ));
+    evidence_refs.push(format!("freshness:{:?}", request.freshness));
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let alert = DroughtRiskAlert {
+        field_or_region_ref: request.risk_score.field_or_region_ref.clone(),
+        value: risk_value,
+        band: risk_band,
+        warning_threshold: request.warning_threshold,
+        routed_at: routed_at.clone(),
+        freshness: request.freshness,
+        evidence_refs: evidence_refs.clone(),
+    };
+
+    let mut delivered_count = 0;
+    let mut queued_count = 0;
+    let mut rejected_count = 0;
+    let audits = request
+        .targets
+        .into_iter()
+        .map(|target| {
+            let (status, reason_code) = if !field_owned {
+                rejected_count += 1;
+                (
+                    WeatherAlertDeliveryStatus::Rejected,
+                    "field_scope_not_owned",
+                )
+            } else if target.reachable {
+                delivered_count += 1;
+                (WeatherAlertDeliveryStatus::Delivered, "delivered")
+            } else {
+                queued_count += 1;
+                (WeatherAlertDeliveryStatus::Queued, "target_unreachable")
+            };
+            DroughtAlertDeliveryAudit {
+                target: target.target,
+                status,
+                reason_code: reason_code.to_string(),
+                recipient_id: recipient_id.clone(),
+                field_or_region_ref: request.risk_score.field_or_region_ref.clone(),
+                routed_at: routed_at.clone(),
+                evidence_payload: evidence_refs.clone(),
+            }
+        })
+        .collect();
+
+    Ok(DroughtAlertRoutingResult {
+        alerts: vec![alert],
+        delivered_count,
+        queued_count,
+        rejected_count,
+        audits,
+    })
+}
+
 pub fn parse_drought_index_type(value: &str) -> Result<DroughtIndexType, DroughtIndexError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "spi" => Ok(DroughtIndexType::Spi),
@@ -7394,6 +7546,16 @@ fn parse_drought_forecast_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
         .map_err(|_| DroughtForecastError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+fn parse_drought_alert_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, DroughtAlertRoutingError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|_| DroughtAlertRoutingError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -11454,8 +11616,9 @@ mod tests {
         compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, detect_tractor_obstacle,
         dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
-        evaluate_access_anomaly_advisories, evaluate_and_route_water_alerts,
-        evaluate_crop_stage_weather_risks, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
+        evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
+        evaluate_and_route_water_alerts, evaluate_crop_stage_weather_risks,
+        evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_irrigation_valve_plan,
         execute_tractor_prescription, forecast_drought_risk, fuse_drought_evidence,
@@ -11473,17 +11636,17 @@ mod tests {
         AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
         CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
         ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
-        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
-        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
-        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
-        DroughtForecastUncertaintyBand, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, DroughtRiskBand, DroughtRiskScoreError,
-        DroughtRiskScoreRequest, DroughtRiskScoreStatus, DroughtRiskThresholds,
-        DroughtStressEvidenceError, DroughtStressEvidenceLayer, DroughtStressIndex,
-        DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery,
-        FarmFieldRegistry, FarmRecord, FieldBoundary, FieldBoundaryValidationError,
-        FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus, FleetConfigBundle,
-        FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        DroughtAlertRoutingRequest, DroughtBaselineTrendError, DroughtBaselineTrendRequest,
+        DroughtBaselineTrendStatus, DroughtEvidenceFusionError, DroughtEvidenceFusionRequest,
+        DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus, DroughtForecastRequest,
+        DroughtForecastStatus, DroughtForecastUncertaintyBand, DroughtIndexComputeRequest,
+        DroughtIndexError, DroughtIndexPeriod, DroughtIndexType, DroughtRiskBand,
+        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
+        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
+        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
         FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
         FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
         FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
@@ -14866,6 +15029,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn drought_alerts_route_threshold_crossing_to_operator_and_portal() {
+        let result = evaluate_and_route_drought_alerts(drought_alert_routing_request(0.3, true))
+            .expect("threshold-crossing drought risk should route");
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(result.delivered_count, 2);
+        assert_eq!(result.queued_count, 0);
+        assert_eq!(result.rejected_count, 0);
+        assert_eq!(result.audits.len(), 2);
+        assert!(result.alerts[0]
+            .evidence_refs
+            .iter()
+            .any(|item| item == "drought_risk_score:field-north:moderate"));
+        assert!(result.audits.iter().all(|audit| {
+            audit.status == WeatherAlertDeliveryStatus::Delivered
+                && audit.reason_code == "delivered"
+                && audit
+                    .evidence_payload
+                    .iter()
+                    .any(|item| item == "freshness:Fresh")
+        }));
+    }
+
+    #[test]
+    fn drought_alerts_do_not_fire_below_threshold() {
+        let result = evaluate_and_route_drought_alerts(drought_alert_routing_request(0.9, true))
+            .expect("below-threshold drought risk should not alert");
+
+        assert!(result.alerts.is_empty());
+        assert!(result.audits.is_empty());
+        assert_eq!(result.delivered_count, 0);
+    }
+
+    #[test]
+    fn drought_alerts_reject_unowned_field_scope() {
+        let result = evaluate_and_route_drought_alerts(drought_alert_routing_request(0.3, false))
+            .expect("unowned field should audit rejection");
+
+        assert_eq!(result.alerts.len(), 1);
+        assert_eq!(result.rejected_count, 2);
+        assert!(result
+            .audits
+            .iter()
+            .all(|audit| audit.status == WeatherAlertDeliveryStatus::Rejected
+                && audit.reason_code == "field_scope_not_owned"));
+    }
+
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
         FleetNodeRecord {
             node_id: "node-001".to_string(),
@@ -15096,6 +15307,35 @@ mod tests {
                 compute_drought_risk_score(drought_risk_score_request(true))
                     .expect("risk score fixture should compute")
             }),
+        }
+    }
+
+    fn drought_alert_routing_request(
+        warning_threshold: f64,
+        owned_field: bool,
+    ) -> DroughtAlertRoutingRequest {
+        DroughtAlertRoutingRequest {
+            risk_score: compute_drought_risk_score(drought_risk_score_request(true))
+                .expect("risk score fixture should compute"),
+            warning_threshold,
+            recipient_id: " grower-001 ".to_string(),
+            owned_field_refs: if owned_field {
+                vec!["field-north".to_string()]
+            } else {
+                vec!["field-south".to_string()]
+            },
+            targets: vec![
+                WeatherAlertRoutingTarget {
+                    target: WeatherAlertRouteTarget::OperatorConsole,
+                    reachable: true,
+                },
+                WeatherAlertRoutingTarget {
+                    target: WeatherAlertRouteTarget::FarmersPortal,
+                    reachable: true,
+                },
+            ],
+            routed_at: " 2026-06-14T10:05:00Z ".to_string(),
+            freshness: WeatherFreshnessState::Fresh,
         }
     }
 
