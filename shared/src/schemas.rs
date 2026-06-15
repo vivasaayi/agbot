@@ -6411,6 +6411,57 @@ pub struct DroughtStressEvidenceRecord {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtEvidenceFusionRequest {
+    pub field_or_region_ref: String,
+    pub period: DroughtIndexPeriod,
+    pub crs: String,
+    pub extent: GeoBounds,
+    #[serde(default)]
+    pub stress_evidence: Option<DroughtStressEvidenceRecord>,
+    #[serde(default)]
+    pub weather_records: Vec<WeatherFreshnessAnnotatedRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtEvidenceFusionStatus {
+    Complete,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroughtEvidenceInputStatus {
+    Present,
+    Missing,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtEvidenceInputSummary {
+    pub input: String,
+    pub status: DroughtEvidenceInputStatus,
+    pub freshness: WeatherFreshnessState,
+    pub coverage_fraction: f64,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroughtEvidenceFusionRecord {
+    pub field_or_region_ref: String,
+    pub period: DroughtIndexPeriod,
+    pub status: DroughtEvidenceFusionStatus,
+    pub crs: String,
+    pub extent: GeoBounds,
+    #[serde(default)]
+    pub stress_evidence: Option<DroughtStressEvidenceRecord>,
+    pub weather_records: Vec<WeatherFreshnessAnnotatedRecord>,
+    pub inputs: Vec<DroughtEvidenceInputSummary>,
+    pub evidence_refs: Vec<String>,
+    pub degradation_reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DroughtStressEvidenceError {
     #[error("drought stress evidence_id cannot be empty")]
@@ -6436,6 +6487,30 @@ pub enum DroughtStressEvidenceError {
     ExtentMismatch,
     #[error("drought stress spatial reference invalid: {0}")]
     SpatialRef(#[from] RasterSpatialRefError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DroughtEvidenceFusionError {
+    #[error("drought evidence fusion field_or_region_ref cannot be empty")]
+    EmptyFieldOrRegionRef,
+    #[error("drought evidence fusion period start cannot be empty")]
+    EmptyPeriodStart,
+    #[error("drought evidence fusion period end cannot be empty")]
+    EmptyPeriodEnd,
+    #[error("drought evidence fusion period range is invalid: {start}..{end}")]
+    InvalidPeriodRange { start: String, end: String },
+    #[error("drought evidence fusion CRS cannot be empty")]
+    EmptyCrs,
+    #[error("drought evidence fusion CRS mismatch for {input}: input {input_crs}, request {request_crs}")]
+    CrsMismatch {
+        input: String,
+        input_crs: String,
+        request_crs: String,
+    },
+    #[error("drought evidence fusion extent mismatch for {input}")]
+    ExtentMismatch { input: String },
+    #[error("drought evidence fusion timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -6580,6 +6655,151 @@ pub fn ingest_drought_stress_evidence(
     })
 }
 
+pub fn fuse_drought_evidence(
+    request: DroughtEvidenceFusionRequest,
+) -> Result<DroughtEvidenceFusionRecord, DroughtEvidenceFusionError> {
+    let field_or_region_ref = normalize_drought_text(request.field_or_region_ref)
+        .ok_or(DroughtEvidenceFusionError::EmptyFieldOrRegionRef)?;
+    let period = normalize_drought_fusion_period(request.period)?;
+    let period_start = parse_drought_fusion_timestamp(&period.start)?;
+    let period_end = parse_drought_fusion_timestamp(&period.end)?;
+    let crs = normalize_drought_text(request.crs).ok_or(DroughtEvidenceFusionError::EmptyCrs)?;
+
+    let mut inputs = Vec::new();
+    let mut evidence_refs = BTreeSet::new();
+    let mut degradation_reasons = Vec::new();
+
+    let stress_evidence = match request.stress_evidence {
+        Some(record) => {
+            if record.crs != crs {
+                return Err(DroughtEvidenceFusionError::CrsMismatch {
+                    input: "stress_evidence".to_string(),
+                    input_crs: record.crs,
+                    request_crs: crs,
+                });
+            }
+            if !geo_bounds_match(&record.extent, &request.extent) {
+                return Err(DroughtEvidenceFusionError::ExtentMismatch {
+                    input: "stress_evidence".to_string(),
+                });
+            }
+            let captured_at = parse_drought_fusion_timestamp(&record.captured_at)?;
+            let present = record.field_or_region_ref == field_or_region_ref
+                && captured_at >= period_start
+                && captured_at <= period_end;
+            if present {
+                evidence_refs.insert(format!("drought_stress:{}", record.evidence_id));
+                evidence_refs.extend(record.evidence_refs.iter().cloned());
+                inputs.push(DroughtEvidenceInputSummary {
+                    input: "stress_evidence".to_string(),
+                    status: DroughtEvidenceInputStatus::Present,
+                    freshness: WeatherFreshnessState::Fresh,
+                    coverage_fraction: 1.0,
+                    evidence_refs: vec![format!("drought_stress:{}", record.evidence_id)],
+                });
+            } else {
+                degradation_reasons.push("missing_stress_evidence".to_string());
+                inputs.push(DroughtEvidenceInputSummary {
+                    input: "stress_evidence".to_string(),
+                    status: DroughtEvidenceInputStatus::Missing,
+                    freshness: WeatherFreshnessState::Stale,
+                    coverage_fraction: 0.0,
+                    evidence_refs: Vec::new(),
+                });
+            }
+            Some(record)
+        }
+        None => {
+            degradation_reasons.push("missing_stress_evidence".to_string());
+            inputs.push(DroughtEvidenceInputSummary {
+                input: "stress_evidence".to_string(),
+                status: DroughtEvidenceInputStatus::Missing,
+                freshness: WeatherFreshnessState::Stale,
+                coverage_fraction: 0.0,
+                evidence_refs: Vec::new(),
+            });
+            None
+        }
+    };
+
+    let mut weather_records = request
+        .weather_records
+        .into_iter()
+        .filter_map(|record| {
+            if record.field_ref != field_or_region_ref {
+                return None;
+            }
+            match parse_drought_fusion_timestamp(&record.valid_time) {
+                Ok(valid_time) if valid_time >= period_start && valid_time <= period_end => {
+                    Some(Ok(record))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    weather_records.sort_by(|left, right| left.valid_time.cmp(&right.valid_time));
+
+    if weather_records.is_empty() {
+        degradation_reasons.push("missing_weather_input".to_string());
+        inputs.push(DroughtEvidenceInputSummary {
+            input: "weather".to_string(),
+            status: DroughtEvidenceInputStatus::Missing,
+            freshness: WeatherFreshnessState::Stale,
+            coverage_fraction: 0.0,
+            evidence_refs: Vec::new(),
+        });
+    } else {
+        let fresh_count = weather_records
+            .iter()
+            .filter(|record| !record.stale)
+            .count();
+        let weather_stale = fresh_count != weather_records.len();
+        if weather_stale {
+            degradation_reasons.push("stale_weather_input".to_string());
+        }
+        let weather_refs = weather_records
+            .iter()
+            .map(|record| format!("weather_forecast:{}", record.forecast_id))
+            .collect::<Vec<_>>();
+        evidence_refs.extend(weather_refs.iter().cloned());
+        inputs.push(DroughtEvidenceInputSummary {
+            input: "weather".to_string(),
+            status: if weather_stale {
+                DroughtEvidenceInputStatus::Stale
+            } else {
+                DroughtEvidenceInputStatus::Present
+            },
+            freshness: if weather_stale {
+                WeatherFreshnessState::Stale
+            } else {
+                WeatherFreshnessState::Fresh
+            },
+            coverage_fraction: fresh_count as f64 / weather_records.len() as f64,
+            evidence_refs: weather_refs,
+        });
+    }
+
+    let status = if degradation_reasons.is_empty() {
+        DroughtEvidenceFusionStatus::Complete
+    } else {
+        DroughtEvidenceFusionStatus::Degraded
+    };
+
+    Ok(DroughtEvidenceFusionRecord {
+        field_or_region_ref,
+        period,
+        status,
+        crs,
+        extent: request.extent,
+        stress_evidence,
+        weather_records,
+        inputs,
+        evidence_refs: evidence_refs.into_iter().collect(),
+        degradation_reasons,
+    })
+}
+
 pub fn parse_drought_index_type(value: &str) -> Result<DroughtIndexType, DroughtIndexError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "spi" => Ok(DroughtIndexType::Spi),
@@ -6600,6 +6820,26 @@ fn normalize_drought_period(
     }
     if period.accumulation_days == Some(0) {
         return Err(DroughtIndexError::InvalidAccumulationDays);
+    }
+
+    Ok(DroughtIndexPeriod {
+        start,
+        end,
+        accumulation_days: period.accumulation_days,
+    })
+}
+
+fn normalize_drought_fusion_period(
+    period: DroughtIndexPeriod,
+) -> Result<DroughtIndexPeriod, DroughtEvidenceFusionError> {
+    let start =
+        normalize_drought_text(period.start).ok_or(DroughtEvidenceFusionError::EmptyPeriodStart)?;
+    let end =
+        normalize_drought_text(period.end).ok_or(DroughtEvidenceFusionError::EmptyPeriodEnd)?;
+    let parsed_start = parse_drought_fusion_timestamp(&start)?;
+    let parsed_end = parse_drought_fusion_timestamp(&end)?;
+    if parsed_start > parsed_end {
+        return Err(DroughtEvidenceFusionError::InvalidPeriodRange { start, end });
     }
 
     Ok(DroughtIndexPeriod {
@@ -6643,6 +6883,16 @@ fn normalize_drought_optional_text(value: Option<String>) -> Option<String> {
 fn normalize_drought_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_drought_fusion_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::FixedOffset>, DroughtEvidenceFusionError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|_| {
+        DroughtEvidenceFusionError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -10678,7 +10928,7 @@ mod tests {
         evaluate_crop_stage_weather_risks, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_irrigation_valve_plan,
-        execute_tractor_prescription, ingest_drought_stress_evidence,
+        execute_tractor_prescription, fuse_drought_evidence, ingest_drought_stress_evidence,
         ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
         map_zone_water_need, normalize_weather_provider_forecast, plan_tractor_swath_coverage,
         query_irrigation_history, query_weather_history, report_water_use_savings,
@@ -10692,8 +10942,9 @@ mod tests {
         AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
         AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
         CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
-        ContentType, CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, DroughtStressEvidenceError,
+        ContentType, CropPlanRecord, DroughtEvidenceFusionError, DroughtEvidenceFusionRequest,
+        DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus, DroughtIndexComputeRequest,
+        DroughtIndexError, DroughtIndexPeriod, DroughtIndexType, DroughtStressEvidenceError,
         DroughtStressEvidenceLayer, DroughtStressIndex, FarmFieldEntityStatus, FarmFieldError,
         FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
         FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
@@ -13707,6 +13958,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn drought_evidence_fusion_joins_stress_and_weather_inputs() {
+        let record = fuse_drought_evidence(drought_evidence_fusion_request(
+            Some(drought_stress_record("EPSG:4326")),
+            vec![weather_window_record(
+                "2026-06-13T10:00:00Z",
+                4.2,
+                0.0,
+                22.0,
+                false,
+            )],
+            "EPSG:4326",
+        ))
+        .expect("fresh stress and weather evidence should fuse");
+
+        assert_eq!(record.field_or_region_ref, "field-north");
+        assert_eq!(record.status, DroughtEvidenceFusionStatus::Complete);
+        assert_eq!(record.crs, "EPSG:4326");
+        assert_eq!(record.weather_records.len(), 1);
+        assert!(record.stress_evidence.is_some());
+        assert!(record.degradation_reasons.is_empty());
+        assert!(record
+            .evidence_refs
+            .iter()
+            .any(|item| item.starts_with("drought_stress:drought-stress:field-north:ndvi")));
+        assert!(record
+            .evidence_refs
+            .iter()
+            .any(|item| item.starts_with("weather_forecast:weather:field-north")));
+        let stress = record
+            .inputs
+            .iter()
+            .find(|input| input.input == "stress_evidence")
+            .expect("stress input summary exists");
+        assert_eq!(stress.status, DroughtEvidenceInputStatus::Present);
+        assert_eq!(stress.coverage_fraction, 1.0);
+        let weather = record
+            .inputs
+            .iter()
+            .find(|input| input.input == "weather")
+            .expect("weather input summary exists");
+        assert_eq!(weather.status, DroughtEvidenceInputStatus::Present);
+        assert_eq!(weather.freshness, WeatherFreshnessState::Fresh);
+        assert_eq!(weather.coverage_fraction, 1.0);
+    }
+
+    #[test]
+    fn drought_evidence_fusion_marks_missing_weather_degraded() {
+        let record = fuse_drought_evidence(drought_evidence_fusion_request(
+            Some(drought_stress_record("EPSG:4326")),
+            Vec::new(),
+            "EPSG:4326",
+        ))
+        .expect("missing weather should degrade without failing");
+
+        assert_eq!(record.status, DroughtEvidenceFusionStatus::Degraded);
+        assert_eq!(record.weather_records.len(), 0);
+        assert_eq!(
+            record.degradation_reasons,
+            vec!["missing_weather_input".to_string()]
+        );
+        let weather = record
+            .inputs
+            .iter()
+            .find(|input| input.input == "weather")
+            .expect("weather input summary exists");
+        assert_eq!(weather.status, DroughtEvidenceInputStatus::Missing);
+        assert_eq!(weather.coverage_fraction, 0.0);
+    }
+
+    #[test]
+    fn drought_evidence_fusion_marks_stale_weather_degraded() {
+        let record = fuse_drought_evidence(drought_evidence_fusion_request(
+            Some(drought_stress_record("EPSG:4326")),
+            vec![weather_window_record(
+                "2026-06-13T10:00:00Z",
+                4.2,
+                0.0,
+                22.0,
+                true,
+            )],
+            "EPSG:4326",
+        ))
+        .expect("stale weather should degrade without failing");
+
+        assert_eq!(record.status, DroughtEvidenceFusionStatus::Degraded);
+        assert_eq!(
+            record.degradation_reasons,
+            vec!["stale_weather_input".to_string()]
+        );
+        let weather = record
+            .inputs
+            .iter()
+            .find(|input| input.input == "weather")
+            .expect("weather input summary exists");
+        assert_eq!(weather.status, DroughtEvidenceInputStatus::Stale);
+        assert_eq!(weather.freshness, WeatherFreshnessState::Stale);
+        assert_eq!(weather.coverage_fraction, 0.0);
+    }
+
+    #[test]
+    fn drought_evidence_fusion_rejects_crs_mismatch() {
+        let error = fuse_drought_evidence(drought_evidence_fusion_request(
+            Some(drought_stress_record("EPSG:4326")),
+            vec![weather_window_record(
+                "2026-06-13T10:00:00Z",
+                4.2,
+                0.0,
+                22.0,
+                false,
+            )],
+            "EPSG:3857",
+        ))
+        .expect_err("mismatched fusion CRS should fail");
+
+        assert_eq!(
+            error,
+            DroughtEvidenceFusionError::CrsMismatch {
+                input: "stress_evidence".to_string(),
+                input_crs: "EPSG:4326".to_string(),
+                request_crs: "EPSG:3857".to_string()
+            }
+        );
+    }
+
     fn sample_fleet_node(runtime_mode: FleetNodeRuntimeMode) -> FleetNodeRecord {
         FleetNodeRecord {
             node_id: "node-001".to_string(),
@@ -13844,6 +14220,36 @@ mod tests {
                 geo_transform: Some([-96.5, 0.3, 0.0, 41.4, 0.0, -0.2]),
                 resolution: Some(RasterResolution { x: 0.3, y: 0.2 }),
             }),
+        }
+    }
+
+    fn drought_stress_record(crs: &str) -> super::DroughtStressEvidenceRecord {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+        ingest_drought_stress_evidence(drought_stress_layer(crs), &field)
+            .expect("stress fixture should ingest")
+    }
+
+    fn drought_evidence_fusion_request(
+        stress_evidence: Option<super::DroughtStressEvidenceRecord>,
+        weather_records: Vec<super::WeatherFreshnessAnnotatedRecord>,
+        crs: &str,
+    ) -> DroughtEvidenceFusionRequest {
+        let field = tractor_test_farm_fields()
+            .field_by_id("field-north")
+            .expect("test field exists");
+        DroughtEvidenceFusionRequest {
+            field_or_region_ref: " field-north ".to_string(),
+            period: DroughtIndexPeriod {
+                start: " 2026-06-13T09:00:00Z ".to_string(),
+                end: " 2026-06-13T12:00:00Z ".to_string(),
+                accumulation_days: None,
+            },
+            crs: crs.to_string(),
+            extent: field.extent,
+            stress_evidence,
+            weather_records,
         }
     }
 
