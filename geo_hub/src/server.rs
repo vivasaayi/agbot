@@ -302,6 +302,15 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_marketplace_order_audits),
         )
         .route(
+            "/api/marketplace/demand-forecasts",
+            get(routes::list_marketplace_demand_forecasts)
+                .post(routes::create_marketplace_demand_forecast),
+        )
+        .route(
+            "/api/marketplace/demand-forecasts/:forecast_id",
+            get(routes::get_marketplace_demand_forecast),
+        )
+        .route(
             "/api/sustainability/records",
             get(routes::list_sustainability_records).post(routes::create_sustainability_record),
         )

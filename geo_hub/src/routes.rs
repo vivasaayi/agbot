@@ -90,11 +90,11 @@ use shared::schemas::{
     build_marketplace_catalog_item_record, build_marketplace_inventory_record,
     build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
     build_tractor_record, close_marketplace_listing_record, compute_drought_index,
-    create_versioned_content, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
-    parse_content_status, parse_content_type, parse_drought_index_type,
-    parse_marketplace_account_status, parse_marketplace_catalog_category,
-    parse_marketplace_catalog_item_kind, parse_marketplace_listing_status,
-    parse_marketplace_order_status, parse_marketplace_party_type,
+    compute_marketplace_demand_forecast, create_versioned_content, fulfill_marketplace_inventory,
+    normalize_weather_provider_forecast, parse_content_status, parse_content_type,
+    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
+    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
+    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
     place_marketplace_order_record, prepare_open_data_publication,
@@ -114,23 +114,24 @@ use shared::schemas::{
     MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
     MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
     MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplaceCatalogItemRecord,
-    MarketplaceInventoryError, MarketplaceInventoryRecord, MarketplaceInventoryUpsertRequest,
-    MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingRecord,
-    MarketplaceListingStatus, MarketplaceOrderAuditRecord, MarketplaceOrderCreateRequest,
-    MarketplaceOrderError, MarketplaceOrderRecord, MarketplaceOrderStatus, MarketplacePartyType,
-    MarketplacePortalEntry, MarketplacePortalEntryError, MultispectralImage, OpenDataPublication,
-    OpenDataPublishError, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-    RecommendationPriority, RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord,
-    ReportVisibility, SoilMoistureReadingError, SoilMoistureReadingRecord,
-    SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
-    SustainabilityMetricType, SustainabilityRecord, SustainabilityRecordCreateRequest,
-    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
-    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
-    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
-    TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
-    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
-    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
-    GEO_EXTENT_ASSERTION_TOLERANCE,
+    MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
+    MarketplaceDemandForecastRequest, MarketplaceDemandUncertaintyBand, MarketplaceInventoryError,
+    MarketplaceInventoryRecord, MarketplaceInventoryUpsertRequest, MarketplaceListingError,
+    MarketplaceListingPublishRequest, MarketplaceListingRecord, MarketplaceListingStatus,
+    MarketplaceOrderAuditRecord, MarketplaceOrderCreateRequest, MarketplaceOrderError,
+    MarketplaceOrderRecord, MarketplaceOrderStatus, MarketplacePartyType, MarketplacePortalEntry,
+    MarketplacePortalEntryError, MultispectralImage, OpenDataPublication, OpenDataPublishError,
+    OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
+    SoilMoistureReadingError, SoilMoistureReadingRecord, SoilMoistureReadingRequest,
+    SoilMoistureRejectionReason, SoilMoistureRejectionRecord, SustainabilityMetricType,
+    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
+    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
+    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
+    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
+    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
+    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -698,6 +699,17 @@ pub struct MarketplaceOrderTransitionRequest {
     pub org_id: String,
     pub actor_id: String,
     pub status: MarketplaceOrderStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceDemandForecastListQuery {
+    pub org_id: Option<String>,
+    pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceDemandForecastScopeQuery {
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3660,6 +3672,78 @@ pub async fn list_marketplace_order_audits(
         .map(|row| decode_marketplace_order_audit_record(&row))
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
+}
+
+pub async fn create_marketplace_demand_forecast(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceDemandForecastRequest>,
+) -> AppResult<Json<MarketplaceDemandForecastRecord>> {
+    let field_id = normalize_optional_text(Some(request.field_id.clone())).ok_or_else(|| {
+        AppError::BadRequest("marketplace demand field_id is required".to_string())
+    })?;
+    let field = load_field(&state, &field_id).await?;
+    let evidence_refs = load_marketplace_demand_evidence_refs(&state, &field_id).await?;
+    let record = compute_marketplace_demand_forecast(
+        request,
+        field.as_ref(),
+        evidence_refs,
+        format!("marketplace-demand-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_demand_forecast_error)?;
+    insert_marketplace_demand_forecast_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_demand_forecasts(
+    Query(query): Query<MarketplaceDemandForecastListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceDemandForecastRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace demand forecasts".to_string(),
+        )
+    })?;
+    let field_id = normalize_optional_text(query.field_id);
+    let rows = sqlx::query(
+        r#"
+        SELECT forecast_id, org_id, field_id, item_kind, horizon, value,
+               evidence_refs_json, status, uncertainty_low, uncertainty_high,
+               method, created_at
+        FROM marketplace_demand_forecasts
+        WHERE org_id = ?1
+          AND (?2 IS NULL OR field_id = ?2)
+        ORDER BY created_at ASC, forecast_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_demand_forecast_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_demand_forecast(
+    Path(forecast_id): Path<String>,
+    Query(query): Query<MarketplaceDemandForecastScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceDemandForecastRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let forecast = load_marketplace_demand_forecast(&state, &forecast_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if forecast.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(forecast))
 }
 
 pub async fn create_sustainability_record(
@@ -8806,6 +8890,10 @@ fn marketplace_order_error(error: MarketplaceOrderError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn marketplace_demand_forecast_error(error: MarketplaceDemandForecastError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn sustainability_record_error(error: SustainabilityRecordError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -9778,11 +9866,9 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
     let boundary = serde_json::from_str::<FieldBoundary>(&boundary_json).map_err(|err| {
         AppError::Anyhow(anyhow::Error::new(err).context("failed to decode field boundary_json"))
     })?;
-    let extent = bounds_from_points(&boundary.coordinates).ok_or_else(|| {
-        AppError::Anyhow(anyhow::anyhow!(
-            "field boundary does not contain any coordinates"
-        ))
-    })?;
+    let validated_boundary =
+        validate_field_boundary(&boundary).map_err(|err| AppError::Anyhow(Error::new(err)))?;
+    let extent = validated_boundary.extent;
 
     Ok(FieldRecord {
         farm_id: row.get("farm_id"),
@@ -9790,7 +9876,7 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
         org_id: row.get("owner"),
         owner: row.get("owner"),
         name: row.get("name"),
-        area_ha: None,
+        area_ha: Some(validated_boundary.area_ha),
         crop: row.get("crop"),
         season: row.get("season"),
         notes: row.get("notes"),
@@ -10352,6 +10438,39 @@ fn decode_marketplace_order_audit_record(
             .map_err(marketplace_order_error)?,
         actor_id: row.get("actor_id"),
         occurred_at: row.get("occurred_at"),
+    })
+}
+
+fn decode_marketplace_demand_forecast_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceDemandForecastRecord> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode demand forecast evidence_refs_json"),
+        )
+    })?;
+    let uncertainty_low: Option<f64> = row.get("uncertainty_low");
+    let uncertainty_high: Option<f64> = row.get("uncertainty_high");
+    let uncertainty_band = uncertainty_low
+        .zip(uncertainty_high)
+        .map(|(low, high)| MarketplaceDemandUncertaintyBand { low, high });
+    Ok(MarketplaceDemandForecastRecord {
+        forecast_id: row.get("forecast_id"),
+        org_id: row.get("org_id"),
+        field_id: row.get("field_id"),
+        item_kind: parse_marketplace_catalog_item_kind(&row.get::<String, _>("item_kind"))
+            .map_err(marketplace_catalog_error)?,
+        horizon: row.get("horizon"),
+        value: row.get("value"),
+        evidence_refs,
+        status: parse_marketplace_demand_forecast_status(&row.get::<String, _>("status"))
+            .map_err(marketplace_demand_forecast_error)?,
+        uncertainty_band,
+        method: row.get("method"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -12168,6 +12287,95 @@ async fn insert_marketplace_order_audit_record(
     .map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn load_marketplace_demand_evidence_refs(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT product_id, scene_id, kind
+        FROM products
+        WHERE field_id = ?1
+          AND kind IN ('yield', 'yield_map', 'health', 'ndvi', 'biomass')
+        ORDER BY scene_id ASC, kind ASC, COALESCE(product_id, '') ASC
+        "#,
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let product_id: Option<String> = row.get("product_id");
+            let scene_id: String = row.get("scene_id");
+            let kind: String = row.get("kind");
+            product_id
+                .filter(|id| !id.trim().is_empty())
+                .map(|id| format!("product:{id}"))
+                .unwrap_or_else(|| format!("product:{scene_id}:{kind}"))
+        })
+        .collect())
+}
+
+async fn insert_marketplace_demand_forecast_record(
+    state: &AppState,
+    record: &MarketplaceDemandForecastRecord,
+) -> AppResult<()> {
+    let evidence_refs_json =
+        serde_json::to_string(&record.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_demand_forecasts (
+            forecast_id, org_id, field_id, item_kind, horizon, value,
+            evidence_refs_json, status, uncertainty_low, uncertainty_high,
+            method, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&record.forecast_id)
+    .bind(&record.org_id)
+    .bind(&record.field_id)
+    .bind(record.item_kind.as_str())
+    .bind(&record.horizon)
+    .bind(record.value)
+    .bind(evidence_refs_json)
+    .bind(record.status.as_str())
+    .bind(record.uncertainty_band.as_ref().map(|band| band.low))
+    .bind(record.uncertainty_band.as_ref().map(|band| band.high))
+    .bind(&record.method)
+    .bind(&record.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_marketplace_demand_forecast(
+    state: &AppState,
+    forecast_id: &str,
+) -> AppResult<Option<MarketplaceDemandForecastRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT forecast_id, org_id, field_id, item_kind, horizon, value,
+               evidence_refs_json, status, uncertainty_low, uncertainty_high,
+               method, created_at
+        FROM marketplace_demand_forecasts
+        WHERE forecast_id = ?1
+        "#,
+    )
+    .bind(forecast_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_demand_forecast_record(&row))
+        .transpose()
 }
 
 async fn marketplace_org_exists(state: &AppState, org_id: &str) -> AppResult<bool> {

@@ -8406,6 +8406,55 @@ pub struct MarketplaceOrderAuditRecord {
     pub occurred_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceDemandForecastStatus {
+    Ready,
+    NoBasis,
+}
+
+impl MarketplaceDemandForecastStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketplaceDemandForecastStatus::Ready => "ready",
+            MarketplaceDemandForecastStatus::NoBasis => "no_basis",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceDemandForecastRequest {
+    #[serde(default)]
+    pub forecast_id: Option<String>,
+    pub org_id: String,
+    pub field_id: String,
+    pub item_kind: MarketplaceCatalogItemKind,
+    pub horizon: String,
+    #[serde(default)]
+    pub ai_assisted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceDemandUncertaintyBand {
+    pub low: f64,
+    pub high: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceDemandForecastRecord {
+    pub forecast_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub item_kind: MarketplaceCatalogItemKind,
+    pub horizon: String,
+    pub value: Option<f64>,
+    pub evidence_refs: Vec<String>,
+    pub status: MarketplaceDemandForecastStatus,
+    pub uncertainty_band: Option<MarketplaceDemandUncertaintyBand>,
+    pub method: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarketplaceAccountError {
     #[error("marketplace account_id cannot be empty")]
@@ -8598,6 +8647,27 @@ pub enum MarketplaceOrderError {
     UnsupportedStatus { value: String },
     #[error("marketplace order timestamp is invalid: {timestamp}")]
     InvalidTimestamp { timestamp: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarketplaceDemandForecastError {
+    #[error("marketplace demand forecast_id cannot be empty")]
+    EmptyForecastId,
+    #[error("marketplace demand org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("marketplace demand field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("marketplace demand horizon cannot be empty")]
+    EmptyHorizon,
+    #[error("marketplace demand field belongs to {field_org_id}, not {forecast_org_id}")]
+    FieldOrgMismatch {
+        field_org_id: String,
+        forecast_org_id: String,
+    },
+    #[error("marketplace demand timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error("unsupported marketplace demand forecast status {value}")]
+    UnsupportedStatus { value: String },
 }
 
 pub fn build_marketplace_account_record(
@@ -8991,6 +9061,117 @@ pub fn transition_marketplace_order_status(
     Ok((updated, audit))
 }
 
+pub fn compute_marketplace_demand_forecast(
+    request: MarketplaceDemandForecastRequest,
+    field: Option<&FieldRecord>,
+    product_evidence_refs: Vec<String>,
+    generated_forecast_id: String,
+    created_at: String,
+) -> Result<MarketplaceDemandForecastRecord, MarketplaceDemandForecastError> {
+    let forecast_id = normalize_marketplace_optional_text(request.forecast_id)
+        .or_else(|| normalize_marketplace_text(generated_forecast_id))
+        .ok_or(MarketplaceDemandForecastError::EmptyForecastId)?;
+    let org_id = normalize_marketplace_text(request.org_id)
+        .ok_or(MarketplaceDemandForecastError::EmptyOrgId)?;
+    let field_id = normalize_marketplace_text(request.field_id)
+        .ok_or(MarketplaceDemandForecastError::EmptyFieldId)?;
+    let horizon = normalize_marketplace_text(request.horizon)
+        .ok_or(MarketplaceDemandForecastError::EmptyHorizon)?;
+    let created_at = normalize_marketplace_demand_timestamp(created_at)?;
+    let mut evidence_refs = product_evidence_refs
+        .into_iter()
+        .filter_map(normalize_marketplace_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let field = field.filter(|field| field.field_id == field_id && field.org_id == org_id);
+    let Some(field) = field else {
+        return Ok(marketplace_demand_no_basis_record(
+            forecast_id,
+            org_id,
+            field_id,
+            request.item_kind,
+            horizon,
+            evidence_refs,
+            created_at,
+        ));
+    };
+    evidence_refs.push(format!(
+        "field:{}:area_ha:{:.4}",
+        field.field_id,
+        field.area_ha.unwrap_or_default()
+    ));
+    if let Some(crop) = field
+        .crop
+        .as_ref()
+        .and_then(|crop| normalize_marketplace_text(crop.clone()))
+    {
+        evidence_refs.push(format!("field:{}:crop:{crop}", field.field_id));
+    }
+    if let Some(season) = field
+        .season
+        .as_ref()
+        .and_then(|season| normalize_marketplace_text(season.clone()))
+    {
+        evidence_refs.push(format!("field:{}:season:{season}", field.field_id));
+    }
+    evidence_refs.sort();
+    evidence_refs.dedup();
+
+    let area_ha = field.area_ha.filter(|area| area.is_finite() && *area > 0.0);
+    let has_product_evidence = evidence_refs
+        .iter()
+        .any(|evidence_ref| evidence_ref.starts_with("product:"));
+    let Some(area_ha) = area_ha else {
+        return Ok(marketplace_demand_no_basis_record(
+            forecast_id,
+            org_id,
+            field_id,
+            request.item_kind,
+            horizon,
+            evidence_refs,
+            created_at,
+        ));
+    };
+    if !has_product_evidence {
+        return Ok(marketplace_demand_no_basis_record(
+            forecast_id,
+            org_id,
+            field_id,
+            request.item_kind,
+            horizon,
+            evidence_refs,
+            created_at,
+        ));
+    }
+
+    let value = marketplace_demand_rate_per_ha(request.item_kind) * area_ha;
+    let uncertainty_band = request
+        .ai_assisted
+        .then(|| MarketplaceDemandUncertaintyBand {
+            low: value * 0.85,
+            high: value * 1.15,
+        });
+    Ok(MarketplaceDemandForecastRecord {
+        forecast_id,
+        org_id,
+        field_id,
+        item_kind: request.item_kind,
+        horizon,
+        value: Some(value),
+        evidence_refs,
+        status: MarketplaceDemandForecastStatus::Ready,
+        uncertainty_band,
+        method: if request.ai_assisted {
+            "agbot_marketplace_demand_v1_ai_assisted_baseline".to_string()
+        } else {
+            "agbot_marketplace_demand_v1_deterministic_baseline".to_string()
+        },
+        created_at,
+    })
+}
+
 pub fn transition_marketplace_account_status(
     record: &MarketplaceAccountRecord,
     to: MarketplaceAccountStatus,
@@ -9105,6 +9286,18 @@ pub fn parse_marketplace_order_status(
         "closed" => Ok(MarketplaceOrderStatus::Closed),
         "cancelled" => Ok(MarketplaceOrderStatus::Cancelled),
         _ => Err(MarketplaceOrderError::UnsupportedStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_marketplace_demand_forecast_status(
+    value: &str,
+) -> Result<MarketplaceDemandForecastStatus, MarketplaceDemandForecastError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ready" => Ok(MarketplaceDemandForecastStatus::Ready),
+        "no_basis" => Ok(MarketplaceDemandForecastStatus::NoBasis),
+        _ => Err(MarketplaceDemandForecastError::UnsupportedStatus {
             value: value.to_string(),
         }),
     }
@@ -9255,6 +9448,53 @@ fn parse_marketplace_order_timestamp(
         .map_err(|_| MarketplaceOrderError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
+}
+
+fn normalize_marketplace_demand_timestamp(
+    timestamp: String,
+) -> Result<String, MarketplaceDemandForecastError> {
+    let timestamp = normalize_marketplace_text(timestamp).ok_or(
+        MarketplaceDemandForecastError::InvalidTimestamp {
+            timestamp: String::new(),
+        },
+    )?;
+    chrono::DateTime::parse_from_rfc3339(&timestamp).map_err(|_| {
+        MarketplaceDemandForecastError::InvalidTimestamp {
+            timestamp: timestamp.clone(),
+        }
+    })?;
+    Ok(timestamp)
+}
+
+fn marketplace_demand_rate_per_ha(item_kind: MarketplaceCatalogItemKind) -> f64 {
+    match item_kind {
+        MarketplaceCatalogItemKind::Input => 1.0,
+        MarketplaceCatalogItemKind::Produce => 7.5,
+    }
+}
+
+fn marketplace_demand_no_basis_record(
+    forecast_id: String,
+    org_id: String,
+    field_id: String,
+    item_kind: MarketplaceCatalogItemKind,
+    horizon: String,
+    evidence_refs: Vec<String>,
+    created_at: String,
+) -> MarketplaceDemandForecastRecord {
+    MarketplaceDemandForecastRecord {
+        forecast_id,
+        org_id,
+        field_id,
+        item_kind,
+        horizon,
+        value: None,
+        evidence_refs,
+        status: MarketplaceDemandForecastStatus::NoBasis,
+        uncertainty_band: None,
+        method: "agbot_marketplace_demand_v1_no_basis".to_string(),
+        created_at,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -13075,8 +13315,9 @@ mod tests {
         build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
         close_marketplace_listing_record, compute_drought_baseline_trend, compute_drought_index,
-        compute_drought_risk_score, compute_water_evapotranspiration,
-        compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
+        compute_drought_risk_score, compute_marketplace_demand_forecast,
+        compute_water_evapotranspiration, compute_weather_growing_degree_day,
+        compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -13127,27 +13368,28 @@ mod tests {
         IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
         MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
         MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
-        MarketplaceCatalogItemKind, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
-        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
-        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
-        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceUnitOfMeasure,
-        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
-        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
-        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
-        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
-        SeasonRecord, SoilMoistureQaFlag, SoilMoistureReadingError, SoilMoistureReadingRequest,
-        SoilMoistureRejectionReason, SustainabilityMetricType, SustainabilityRecordCreateRequest,
-        SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
-        TractorCommandRejectionReason, TractorDeconflictionDecision, TractorDeconflictionRequest,
-        TractorEstopState, TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent,
-        TractorFieldOpsSafetyEventType, TractorFieldOpsSessionRequest,
-        TractorFieldOpsTelemetrySample, TractorGeofenceDecision, TractorGeofenceError,
-        TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
-        TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
+        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
+        MarketplaceDemandForecastStatus, MarketplaceInventoryError,
+        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
+        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
+        MarketplaceOrderError, MarketplaceOrderStatus, MarketplacePartyType,
+        MarketplacePortalEntryError, MarketplaceUnitOfMeasure, MultispectralImage,
+        OpenDataPublishError, OpenDataPublishRefusalReason, OpenDataPublishRequest,
+        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
+        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
+        RecommendationStatus, RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
+        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
+        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord, SoilMoistureQaFlag,
+        SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
+        SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+        SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
+        TractorDeconflictionDecision, TractorDeconflictionRequest, TractorEstopState,
+        TractorFieldOpsReplayFrameType, TractorFieldOpsSafetyEvent, TractorFieldOpsSafetyEventType,
+        TractorFieldOpsSessionRequest, TractorFieldOpsTelemetrySample, TractorGeofenceDecision,
+        TractorGeofenceError, TractorGeofenceEvaluationRequest, TractorGuidanceConfig,
+        TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint,
         TractorImplementAdapterSpec, TractorImplementCommand, TractorImplementDecision,
         TractorImplementRef, TractorImplementState, TractorLifecycleStatus,
         TractorMotionCommandRequest, TractorMotionGateDecision, TractorObstacleDetection,
@@ -14884,6 +15126,68 @@ mod tests {
                 to: MarketplaceOrderStatus::Confirmed,
             }
         );
+    }
+
+    #[test]
+    fn marketplace_demand_forecast_uses_area_and_product_evidence() {
+        let forecast = compute_marketplace_demand_forecast(
+            marketplace_demand_request(MarketplaceCatalogItemKind::Input, false),
+            Some(&marketplace_demand_field_fixture(Some(20.0))),
+            vec!["product:yield-map-001".to_string()],
+            "generated-forecast".to_string(),
+            "2026-06-15T09:00:00Z".to_string(),
+        )
+        .expect("forecast should compute");
+
+        assert_eq!(forecast.status, MarketplaceDemandForecastStatus::Ready);
+        assert_eq!(forecast.value, Some(20.0));
+        assert!(forecast
+            .evidence_refs
+            .contains(&"product:yield-map-001".to_string()));
+        assert!(forecast
+            .evidence_refs
+            .contains(&"field:field-alpha:area_ha:20.0000".to_string()));
+    }
+
+    #[test]
+    fn marketplace_demand_forecast_ai_includes_uncertainty_and_evidence() {
+        let forecast = compute_marketplace_demand_forecast(
+            marketplace_demand_request(MarketplaceCatalogItemKind::Produce, true),
+            Some(&marketplace_demand_field_fixture(Some(10.0))),
+            vec![
+                "product:yield-map-001".to_string(),
+                "product:health-ndvi-001".to_string(),
+            ],
+            "generated-forecast".to_string(),
+            "2026-06-15T09:00:00Z".to_string(),
+        )
+        .expect("ai-assisted forecast should compute");
+
+        assert_eq!(forecast.value, Some(75.0));
+        assert_eq!(
+            forecast.uncertainty_band.as_ref().map(|band| band.low),
+            Some(63.75)
+        );
+        assert!(forecast
+            .evidence_refs
+            .iter()
+            .any(|evidence_ref| evidence_ref == "product:health-ndvi-001"));
+    }
+
+    #[test]
+    fn marketplace_demand_forecast_returns_no_basis_without_evidence() {
+        let forecast = compute_marketplace_demand_forecast(
+            marketplace_demand_request(MarketplaceCatalogItemKind::Input, false),
+            Some(&marketplace_demand_field_fixture(None)),
+            Vec::new(),
+            "generated-forecast".to_string(),
+            "2026-06-15T09:00:00Z".to_string(),
+        )
+        .expect("no-basis forecast should be valid");
+
+        assert_eq!(forecast.status, MarketplaceDemandForecastStatus::NoBasis);
+        assert_eq!(forecast.value, None);
+        assert_eq!(forecast.uncertainty_band, None);
     }
 
     #[test]
@@ -17644,6 +17948,64 @@ mod tests {
             listing_ref: "listing-seed-corn-001".to_string(),
             buyer_account_id: "buyer-001".to_string(),
             qty,
+        }
+    }
+
+    fn marketplace_demand_request(
+        item_kind: MarketplaceCatalogItemKind,
+        ai_assisted: bool,
+    ) -> MarketplaceDemandForecastRequest {
+        MarketplaceDemandForecastRequest {
+            forecast_id: Some("forecast-seed-corn-001".to_string()),
+            org_id: "org-alpha".to_string(),
+            field_id: "field-alpha".to_string(),
+            item_kind,
+            horizon: "2026-season".to_string(),
+            ai_assisted,
+        }
+    }
+
+    fn marketplace_demand_field_fixture(area_ha: Option<f64>) -> FieldRecord {
+        FieldRecord {
+            farm_id: Some("farm-alpha".to_string()),
+            field_id: "field-alpha".to_string(),
+            org_id: "org-alpha".to_string(),
+            owner: "org-alpha".to_string(),
+            name: "Alpha Field".to_string(),
+            area_ha,
+            crop: Some("corn".to_string()),
+            season: Some("2026".to_string()),
+            notes: None,
+            boundary: FieldBoundary {
+                crs: Some("EPSG:4326".to_string()),
+                coordinates: vec![
+                    GeoPoint {
+                        longitude: -96.7,
+                        latitude: 41.1,
+                    },
+                    GeoPoint {
+                        longitude: -96.2,
+                        latitude: 41.1,
+                    },
+                    GeoPoint {
+                        longitude: -96.2,
+                        latitude: 41.4,
+                    },
+                    GeoPoint {
+                        longitude: -96.7,
+                        latitude: 41.1,
+                    },
+                ],
+            },
+            extent: GeoBounds {
+                min_lon: -96.7,
+                min_lat: 41.1,
+                max_lon: -96.2,
+                max_lat: 41.4,
+            },
+            status: FarmFieldEntityStatus::Active,
+            created_at: "2026-06-15T09:00:00Z".to_string(),
+            updated_at: "2026-06-15T09:00:00Z".to_string(),
         }
     }
 

@@ -3904,6 +3904,153 @@ async fn marketplace_orders_reject_illegal_transition_without_state_change() -> 
 }
 
 #[tokio::test]
+async fn marketplace_demand_forecast_uses_field_and_product_evidence() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_demand_field(&ctx, "field-alpha", "org-alpha").await?;
+    seed_marketplace_demand_product(&ctx, "yield-map-001", "field-alpha", "yield_map").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/demand-forecasts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "forecast_id": "forecast-seed-001",
+                        "org_id": "org-alpha",
+                        "field_id": "field-alpha",
+                        "item_kind": "input",
+                        "horizon": "2026-season"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let forecast: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        forecast.get("status").and_then(|value| value.as_str()),
+        Some("ready")
+    );
+    assert!(forecast
+        .get("value")
+        .and_then(|value| value.as_f64())
+        .is_some_and(|value| value > 0.0));
+    assert!(forecast
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|refs| refs.iter().any(|value| value == "product:yield-map-001")));
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/demand-forecasts?org_id=org-alpha&field_id=field-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let forecasts: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(forecasts.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_demand_forecast_ai_includes_uncertainty() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_demand_field(&ctx, "field-alpha", "org-alpha").await?;
+    seed_marketplace_demand_product(&ctx, "health-ndvi-001", "field-alpha", "ndvi").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/demand-forecasts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "forecast_id": "forecast-produce-001",
+                        "org_id": "org-alpha",
+                        "field_id": "field-alpha",
+                        "item_kind": "produce",
+                        "horizon": "2026-season",
+                        "ai_assisted": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let forecast: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(forecast.get("uncertainty_band").is_some());
+    assert!(forecast
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|refs| refs.iter().any(|value| value == "product:health-ndvi-001")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_demand_forecast_returns_no_basis_without_evidence() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_demand_field(&ctx, "field-alpha", "org-alpha").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/demand-forecasts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "forecast_id": "forecast-empty-001",
+                        "org_id": "org-alpha",
+                        "field_id": "field-alpha",
+                        "item_kind": "input",
+                        "horizon": "2026-season"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let forecast: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        forecast.get("status").and_then(|value| value.as_str()),
+        Some("no_basis")
+    );
+    assert_eq!(forecast.get("value"), Some(&serde_json::Value::Null));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn sustainability_records_create_get_and_list_field_scoped() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -12669,6 +12816,94 @@ async fn marketplace_order_transition(
         .await
         .expect("router should handle request");
     Ok(response.status())
+}
+
+async fn seed_marketplace_demand_field(
+    ctx: &TestContext,
+    field_id: &str,
+    org_id: &str,
+) -> Result<()> {
+    seed_marketplace_org(ctx, "farm-market-alpha", org_id).await?;
+    let field = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "field_id": field_id,
+                        "farm_id": "farm-market-alpha",
+                        "owner": org_id,
+                        "name": "Demand Field",
+                        "crop": "corn",
+                        "season": "2026",
+                        "boundary": {
+                            "crs": "EPSG:4326",
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 },
+                                { "longitude": -96.7, "latitude": 41.1 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(field.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_marketplace_demand_product(
+    ctx: &TestContext,
+    product_id: &str,
+    field_id: &str,
+    kind: &str,
+) -> Result<()> {
+    let scene_id = format!("scene-{product_id}");
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (
+            scene_id, owner, sensor, acquired_at, data_path, metadata_json,
+            cloud_cover, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&scene_id)
+    .bind("org-alpha")
+    .bind("multispectral")
+    .bind("2026-06-15T09:00:00Z")
+    .bind(format!("/tmp/{scene_id}"))
+    .bind("{}")
+    .bind(0.0_f64)
+    .bind("2026-06-15T09:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO products (
+            product_id, scene_id, field_id, season_id, kind, path, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(product_id)
+    .bind(scene_id)
+    .bind(field_id)
+    .bind("2026")
+    .bind(kind)
+    .bind(format!("/tmp/{product_id}.tif"))
+    .bind("2026-06-15T09:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
 }
 
 async fn seed_sustainability_field(
