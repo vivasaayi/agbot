@@ -685,6 +685,69 @@ pub struct TractorCommandRejection {
     pub audit: TractorCommandAuditRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TractorGuidancePoint {
+    pub x_m: f64,
+    pub y_m: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TractorGuidancePath {
+    pub start: TractorGuidancePoint,
+    pub end: TractorGuidancePoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorGuidanceConfig {
+    pub runtime_mode: String,
+    pub max_cross_track_error_m: f64,
+    pub correction_gain: f64,
+    pub advance_m_per_tick: f64,
+    pub max_ticks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorGuidanceTelemetry {
+    pub tick: usize,
+    pub position: TractorGuidancePoint,
+    pub cross_track_error_m: f64,
+    pub halted: bool,
+    #[serde(default)]
+    pub fault: Option<TractorGuidanceFault>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorGuidanceRunResult {
+    pub runtime_mode: String,
+    pub halted: bool,
+    #[serde(default)]
+    pub fault: Option<TractorGuidanceFault>,
+    pub max_observed_cross_track_error_m: f64,
+    pub telemetry: Vec<TractorGuidanceTelemetry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TractorGuidanceFault {
+    CrossTrackErrorExceeded,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum TractorGuidanceError {
+    #[error("tractor guidance only runs in simulation mode")]
+    RuntimeModeNotSimulation { runtime_mode: String },
+    #[error("tractor guidance path length must be positive")]
+    InvalidPath,
+    #[error("tractor guidance max cross-track error must be positive")]
+    InvalidCrossTrackBound,
+    #[error("tractor guidance correction gain must be finite and between 0 and 1")]
+    InvalidCorrectionGain,
+    #[error("tractor guidance tick advance must be positive")]
+    InvalidTickAdvance,
+    #[error("tractor guidance max_ticks must be positive")]
+    InvalidMaxTicks,
+}
+
 impl TractorCommandRejection {
     pub fn status_code(&self) -> u16 {
         match self.reason {
@@ -1010,6 +1073,113 @@ fn normalize_tractor_capabilities(
 fn normalize_tractor_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+pub fn tractor_cross_track_error_m(
+    path: TractorGuidancePath,
+    point: TractorGuidancePoint,
+) -> Result<f64, TractorGuidanceError> {
+    let (unit_x, unit_y, _length) = tractor_guidance_unit_vector(path)?;
+    let dx = point.x_m - path.start.x_m;
+    let dy = point.y_m - path.start.y_m;
+    Ok(dx * unit_y - dy * unit_x)
+}
+
+pub fn run_tractor_straight_path_guidance(
+    path: TractorGuidancePath,
+    initial_position: TractorGuidancePoint,
+    disturbances: &[TractorGuidancePoint],
+    config: TractorGuidanceConfig,
+) -> Result<TractorGuidanceRunResult, TractorGuidanceError> {
+    validate_tractor_guidance_config(&config)?;
+    let (unit_x, unit_y, path_length) = tractor_guidance_unit_vector(path)?;
+    let normal_x = -unit_y;
+    let normal_y = unit_x;
+    let mut position = initial_position;
+    let mut telemetry = Vec::new();
+    let mut max_observed_cross_track_error_m = 0.0_f64;
+    let mut halted = false;
+    let mut fault = None;
+
+    for tick in 0..config.max_ticks {
+        position.x_m += unit_x * config.advance_m_per_tick;
+        position.y_m += unit_y * config.advance_m_per_tick;
+        if let Some(disturbance) = disturbances.get(tick) {
+            position.x_m += disturbance.x_m;
+            position.y_m += disturbance.y_m;
+        }
+
+        let error = tractor_cross_track_error_m(path, position)?;
+        position.x_m += normal_x * error * config.correction_gain;
+        position.y_m += normal_y * error * config.correction_gain;
+        let corrected_error = tractor_cross_track_error_m(path, position)?;
+        let abs_error = corrected_error.abs();
+        max_observed_cross_track_error_m = max_observed_cross_track_error_m.max(abs_error);
+        if abs_error > config.max_cross_track_error_m {
+            halted = true;
+            fault = Some(TractorGuidanceFault::CrossTrackErrorExceeded);
+        }
+
+        telemetry.push(TractorGuidanceTelemetry {
+            tick,
+            position,
+            cross_track_error_m: corrected_error,
+            halted,
+            fault,
+        });
+
+        let along_track_m =
+            (position.x_m - path.start.x_m) * unit_x + (position.y_m - path.start.y_m) * unit_y;
+        if halted || along_track_m >= path_length {
+            break;
+        }
+    }
+
+    Ok(TractorGuidanceRunResult {
+        runtime_mode: "simulation".to_string(),
+        halted,
+        fault,
+        max_observed_cross_track_error_m,
+        telemetry,
+    })
+}
+
+fn validate_tractor_guidance_config(
+    config: &TractorGuidanceConfig,
+) -> Result<(), TractorGuidanceError> {
+    if !config.runtime_mode.eq_ignore_ascii_case("simulation") {
+        return Err(TractorGuidanceError::RuntimeModeNotSimulation {
+            runtime_mode: config.runtime_mode.clone(),
+        });
+    }
+    if !config.max_cross_track_error_m.is_finite() || config.max_cross_track_error_m <= 0.0 {
+        return Err(TractorGuidanceError::InvalidCrossTrackBound);
+    }
+    if !config.correction_gain.is_finite()
+        || config.correction_gain < 0.0
+        || config.correction_gain > 1.0
+    {
+        return Err(TractorGuidanceError::InvalidCorrectionGain);
+    }
+    if !config.advance_m_per_tick.is_finite() || config.advance_m_per_tick <= 0.0 {
+        return Err(TractorGuidanceError::InvalidTickAdvance);
+    }
+    if config.max_ticks == 0 {
+        return Err(TractorGuidanceError::InvalidMaxTicks);
+    }
+    Ok(())
+}
+
+fn tractor_guidance_unit_vector(
+    path: TractorGuidancePath,
+) -> Result<(f64, f64, f64), TractorGuidanceError> {
+    let dx = path.end.x_m - path.start.x_m;
+    let dy = path.end.y_m - path.start.y_m;
+    let length = (dx * dx + dy * dy).sqrt();
+    if !length.is_finite() || length <= 0.0 {
+        return Err(TractorGuidanceError::InvalidPath);
+    }
+    Ok((dx / length, dy / length, length))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5674,7 +5844,8 @@ mod tests {
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         compute_drought_index, create_versioned_content, dry_run_fleet_config_bundle,
         evaluate_access_anomaly_advisories, normalize_weather_provider_forecast,
-        sign_fleet_config_bundle, soil_moisture_rejection_record,
+        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
         AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
@@ -5701,11 +5872,12 @@ mod tests {
         SoilMoistureReadingError, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityMetricType, SustainabilityRecordCreateRequest, SustainabilityRecordError,
         SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandRejectionReason,
-        TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest,
-        TractorRegistrationRequest, TractorRegistry, WeatherIngestError,
-        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
-        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
-        WorkOrderRegistry, WorkOrderStatus,
+        TractorGuidanceConfig, TractorGuidanceError, TractorGuidanceFault, TractorGuidancePath,
+        TractorGuidancePoint, TractorImplementRef, TractorLifecycleStatus,
+        TractorMotionCommandRequest, TractorRegistrationRequest, TractorRegistry,
+        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
+        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
+        WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -6263,6 +6435,108 @@ mod tests {
         );
         assert_eq!(unknown.status_code(), 404);
         assert_eq!(registry.command_audits().len(), 2);
+    }
+
+    #[test]
+    fn tractor_cross_track_error_math_is_signed_and_deterministic() {
+        let path = TractorGuidancePath {
+            start: TractorGuidancePoint { x_m: 0.0, y_m: 0.0 },
+            end: TractorGuidancePoint {
+                x_m: 10.0,
+                y_m: 0.0,
+            },
+        };
+
+        let left_error =
+            tractor_cross_track_error_m(path, TractorGuidancePoint { x_m: 5.0, y_m: 3.0 })
+                .expect("straight path has a valid cross-track error");
+        let right_error = tractor_cross_track_error_m(
+            path,
+            TractorGuidancePoint {
+                x_m: 5.0,
+                y_m: -2.0,
+            },
+        )
+        .expect("straight path has a valid cross-track error");
+
+        assert_eq!(left_error, -3.0);
+        assert_eq!(right_error, 2.0);
+    }
+
+    #[test]
+    fn tractor_guidance_simulation_keeps_error_within_bound() {
+        let result = run_tractor_straight_path_guidance(
+            tractor_guidance_test_path(),
+            TractorGuidancePoint {
+                x_m: 0.0,
+                y_m: 0.75,
+            },
+            &[
+                TractorGuidancePoint {
+                    x_m: 0.0,
+                    y_m: 0.25,
+                },
+                TractorGuidancePoint {
+                    x_m: 0.0,
+                    y_m: -0.25,
+                },
+            ],
+            tractor_guidance_test_config(1.0, 1.0),
+        )
+        .expect("simulation guidance should run");
+
+        assert!(!result.halted);
+        assert_eq!(result.fault, None);
+        assert!(!result.telemetry.is_empty());
+        assert!(result
+            .telemetry
+            .iter()
+            .all(|tick| tick.cross_track_error_m.abs() <= 1.0));
+    }
+
+    #[test]
+    fn tractor_guidance_unrecoverable_disturbance_halts_with_fault() {
+        let result = run_tractor_straight_path_guidance(
+            tractor_guidance_test_path(),
+            TractorGuidancePoint { x_m: 0.0, y_m: 0.0 },
+            &[TractorGuidancePoint { x_m: 0.0, y_m: 5.0 }],
+            tractor_guidance_test_config(1.0, 0.25),
+        )
+        .expect("simulation guidance should run");
+
+        assert!(result.halted);
+        assert_eq!(
+            result.fault,
+            Some(TractorGuidanceFault::CrossTrackErrorExceeded)
+        );
+        let last = result.telemetry.last().expect("halt tick is recorded");
+        assert!(last.halted);
+        assert_eq!(
+            last.fault,
+            Some(TractorGuidanceFault::CrossTrackErrorExceeded)
+        );
+        assert!(result.max_observed_cross_track_error_m > 1.0);
+    }
+
+    #[test]
+    fn tractor_guidance_rejects_non_simulation_runtime() {
+        let error = run_tractor_straight_path_guidance(
+            tractor_guidance_test_path(),
+            TractorGuidancePoint { x_m: 0.0, y_m: 0.0 },
+            &[],
+            TractorGuidanceConfig {
+                runtime_mode: "production".to_string(),
+                ..tractor_guidance_test_config(1.0, 1.0)
+            },
+        )
+        .expect_err("real motion is hard-disabled for 14-02");
+
+        assert_eq!(
+            error,
+            TractorGuidanceError::RuntimeModeNotSimulation {
+                runtime_mode: "production".to_string()
+            }
+        );
     }
 
     #[test]
@@ -6970,6 +7244,29 @@ mod tests {
                 working_width_m: Some(9.1),
             },
             status: None,
+        }
+    }
+
+    fn tractor_guidance_test_path() -> TractorGuidancePath {
+        TractorGuidancePath {
+            start: TractorGuidancePoint { x_m: 0.0, y_m: 0.0 },
+            end: TractorGuidancePoint {
+                x_m: 20.0,
+                y_m: 0.0,
+            },
+        }
+    }
+
+    fn tractor_guidance_test_config(
+        max_cross_track_error_m: f64,
+        correction_gain: f64,
+    ) -> TractorGuidanceConfig {
+        TractorGuidanceConfig {
+            runtime_mode: "simulation".to_string(),
+            max_cross_track_error_m,
+            correction_gain,
+            advance_m_per_tick: 2.0,
+            max_ticks: 10,
         }
     }
 
