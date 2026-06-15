@@ -3201,6 +3201,53 @@ pub enum ZoneWaterNeedError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationScheduleRequest {
+    pub field_ref: String,
+    pub generated_at: String,
+    pub scheduled_start: String,
+    pub application_rate_mm_per_hour: f64,
+    pub water_needs: Vec<ZoneWaterNeed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationScheduleEntry {
+    pub zone_ref: String,
+    pub amount_mm: f64,
+    pub start_time: String,
+    pub duration_minutes: u32,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrrigationScheduleExclusion {
+    pub zone_ref: String,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrrigationSchedule {
+    pub field_ref: String,
+    pub generated_at: String,
+    pub entries: Vec<IrrigationScheduleEntry>,
+    pub exclusions: Vec<IrrigationScheduleExclusion>,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IrrigationScheduleError {
+    #[error("irrigation schedule field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("irrigation schedule generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("irrigation schedule start cannot be empty")]
+    EmptyScheduledStart,
+    #[error("irrigation schedule timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error("irrigation schedule application rate must be positive")]
+    InvalidApplicationRate,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WeatherReferenceEtStatus {
@@ -4610,6 +4657,77 @@ fn zone_water_need_insufficient(
         evidence_refs: Vec::new(),
         reason_code: reason_code.to_string(),
     }
+}
+
+pub fn schedule_irrigation_plan(
+    request: IrrigationScheduleRequest,
+) -> Result<IrrigationSchedule, IrrigationScheduleError> {
+    let field_ref =
+        normalize_weather_text(request.field_ref).ok_or(IrrigationScheduleError::EmptyFieldRef)?;
+    let generated_at = normalize_weather_text(request.generated_at)
+        .ok_or(IrrigationScheduleError::EmptyGeneratedAt)?;
+    parse_irrigation_schedule_timestamp(&generated_at)?;
+    let scheduled_start = normalize_weather_text(request.scheduled_start)
+        .ok_or(IrrigationScheduleError::EmptyScheduledStart)?;
+    let mut next_start = parse_irrigation_schedule_timestamp(&scheduled_start)?;
+    if !(request.application_rate_mm_per_hour.is_finite()
+        && request.application_rate_mm_per_hour > 0.0)
+    {
+        return Err(IrrigationScheduleError::InvalidApplicationRate);
+    }
+
+    let mut needs = request.water_needs;
+    needs.sort_by(|left, right| left.zone_ref.cmp(&right.zone_ref));
+    let mut entries = Vec::new();
+    let mut exclusions = Vec::new();
+    for need in needs {
+        if need.status != ZoneWaterNeedStatus::Computed {
+            exclusions.push(IrrigationScheduleExclusion {
+                zone_ref: need.zone_ref,
+                reason_code: need.reason_code,
+            });
+            continue;
+        }
+        let Some(amount_mm) = need
+            .water_need_mm
+            .filter(|value| value.is_finite() && *value > 0.0)
+        else {
+            exclusions.push(IrrigationScheduleExclusion {
+                zone_ref: need.zone_ref,
+                reason_code: "non_positive_water_need".to_string(),
+            });
+            continue;
+        };
+        let duration_minutes =
+            ((amount_mm / request.application_rate_mm_per_hour) * 60.0).ceil() as u32;
+        let start_time = next_start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        next_start += chrono::Duration::minutes(duration_minutes as i64);
+        entries.push(IrrigationScheduleEntry {
+            zone_ref: need.zone_ref,
+            amount_mm,
+            start_time,
+            duration_minutes,
+            evidence_refs: need.evidence_refs,
+        });
+    }
+
+    Ok(IrrigationSchedule {
+        field_ref,
+        generated_at,
+        entries,
+        exclusions,
+        method: "agbot_irrigation_schedule_v1_sequential_zone_water_need".to_string(),
+    })
+}
+
+fn parse_irrigation_schedule_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, IrrigationScheduleError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| IrrigationScheduleError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 pub fn compute_weather_reference_et(
@@ -9770,26 +9888,27 @@ mod tests {
         ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
         map_zone_water_need, normalize_weather_provider_forecast, plan_tractor_swath_coverage,
         query_irrigation_history, query_weather_history, resolve_weather_forecast_to_field,
-        route_weather_alert, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, tractor_cross_track_error_m,
+        route_weather_alert, run_tractor_straight_path_guidance, schedule_irrigation_plan,
+        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
-        verify_weather_forecast_accuracy, weather_fetch_failure_record, AccessAnomalySignal,
-        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
-        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
-        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
-        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
-        ContentType, CropPlanRecord, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRequest,
-        IrrigationHistoryQuery, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, OpenDataPublishError,
+        verify_weather_forecast_accuracy, weather_fetch_failure_record,
+        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
+        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
+        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
+        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
+        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
+        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
+        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
+        MarketplacePartyType, MultispectralImage, OpenDataPublishError,
         OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
         RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus,
@@ -9827,8 +9946,8 @@ mod tests {
         WeatherReferenceEtStatus, WeatherRiskThresholds, WeatherRiskType, WeatherSensorIngestError,
         WeatherSensorSample, WeatherSensorStreamIngestRequest, WorkOrderChangeType,
         WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
-        WorkOrderRegistry, WorkOrderStatus, ZoneWaterNeedError, ZoneWaterNeedRequest,
-        ZoneWaterNeedStatus,
+        WorkOrderRegistry, WorkOrderStatus, ZoneWaterNeed, ZoneWaterNeedError,
+        ZoneWaterNeedRequest, ZoneWaterNeedStatus,
     };
 
     #[test]
@@ -12081,6 +12200,54 @@ mod tests {
     }
 
     #[test]
+    fn irrigation_schedule_generates_sequential_plan_from_water_need() {
+        let needs = map_zone_water_need(zone_water_need_request(false))
+            .expect("zone water need should map");
+
+        let schedule = schedule_irrigation_plan(irrigation_schedule_request(needs))
+            .expect("computed water needs should schedule");
+
+        assert_eq!(schedule.field_ref, "field-north");
+        assert_eq!(
+            schedule.method,
+            "agbot_irrigation_schedule_v1_sequential_zone_water_need"
+        );
+        assert_eq!(schedule.entries.len(), 1);
+        assert_eq!(schedule.entries[0].zone_ref, "zone:north");
+        assert!((schedule.entries[0].amount_mm - 2.49289916).abs() < 1e-6);
+        assert_eq!(schedule.entries[0].start_time, "2026-06-13T12:00:00Z");
+        assert_eq!(schedule.entries[0].duration_minutes, 30);
+        assert!(schedule.entries[0]
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("moisture_proxy:")));
+        assert_eq!(schedule.exclusions.len(), 1);
+        assert_eq!(schedule.exclusions[0].zone_ref, "zone:missing");
+        assert_eq!(
+            schedule.exclusions[0].reason_code,
+            "missing_moisture_evidence"
+        );
+    }
+
+    #[test]
+    fn irrigation_schedule_excludes_insufficient_evidence_zones() {
+        let schedule = schedule_irrigation_plan(irrigation_schedule_request(vec![
+            zone_water_need_insufficient(
+                "field-north",
+                "zone:dry-run-blocked",
+                "EPSG:4326",
+                "missing_et_evidence",
+            ),
+        ]))
+        .expect("insufficient evidence zones should be excluded");
+
+        assert!(schedule.entries.is_empty());
+        assert_eq!(schedule.exclusions.len(), 1);
+        assert_eq!(schedule.exclusions[0].zone_ref, "zone:dry-run-blocked");
+        assert_eq!(schedule.exclusions[0].reason_code, "missing_et_evidence");
+    }
+
+    #[test]
     fn weather_alert_routing_delivers_owned_field_to_console_and_portal() {
         let result = route_weather_alert(weather_alert_routing_request(vec![
             WeatherAlertRoutingTarget {
@@ -13138,6 +13305,16 @@ mod tests {
             soil_readings: Vec::new(),
             moisture_proxies,
             evapotranspiration,
+        }
+    }
+
+    fn irrigation_schedule_request(water_needs: Vec<ZoneWaterNeed>) -> IrrigationScheduleRequest {
+        IrrigationScheduleRequest {
+            field_ref: " field-north ".to_string(),
+            generated_at: " 2026-06-13T11:55:00Z ".to_string(),
+            scheduled_start: " 2026-06-13T12:00:00Z ".to_string(),
+            application_rate_mm_per_hour: 5.0,
+            water_needs,
         }
     }
 
