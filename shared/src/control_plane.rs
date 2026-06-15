@@ -1,8 +1,8 @@
 use crate::schemas::{
-    FarmFieldRegistry, FarmRecord, FieldRecord, GeoBounds, RecommendationLifecycleRegistry,
-    RecommendationPriority, RecommendationRecord, RecommendationStatus,
-    RecommendationStatusChangeRecord, RecommendationStatusChangeType, ReportRecord,
-    SceneLayerRecord,
+    FarmFieldRegistry, FarmRecord, FieldRecord, GeoBounds, MarketplaceAccountRecord,
+    MarketplaceAccountStatus, RecommendationLifecycleRegistry, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, RecommendationStatusChangeRecord,
+    RecommendationStatusChangeType, ReportRecord, SceneLayerRecord,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -413,6 +413,22 @@ pub struct GrowerMobileAppShell {
     pub loaded_at: String,
     pub rendered_at: String,
     pub freshness_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerMarketplaceEntry {
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub account_id: String,
+    pub href: String,
+    pub identity_context: HashMap<String, String>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerMarketplaceEntryResolution {
+    pub entry: Option<GrowerMarketplaceEntry>,
+    pub hidden_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1688,6 +1704,59 @@ pub fn build_grower_mobile_offline_shell(
     shell.rendered_at = opened_at.to_string();
     shell.freshness_label = Some(format!("offline / as of {}", cached.loaded_at));
     shell
+}
+
+pub fn resolve_grower_marketplace_entry(
+    scope: &GrowerPortalSessionScope,
+    marketplace_accounts: &[MarketplaceAccountRecord],
+    marketplace_base_url: &str,
+) -> GrowerMarketplaceEntryResolution {
+    let org_id = scope.org_id.to_string();
+    let account = marketplace_accounts
+        .iter()
+        .filter(|account| account.org_id == org_id)
+        .filter(|account| account.status == MarketplaceAccountStatus::Active)
+        .filter(|account| {
+            account
+                .role_refs
+                .iter()
+                .any(|role_ref| role_ref.starts_with("marketplace:"))
+        })
+        .min_by(|left, right| left.account_id.cmp(&right.account_id));
+
+    let Some(account) = account else {
+        return GrowerMarketplaceEntryResolution {
+            entry: None,
+            hidden_reason: Some("marketplace_disabled".to_string()),
+        };
+    };
+
+    let mut identity_context = HashMap::new();
+    identity_context.insert("grower_id".to_string(), scope.grower_id.to_string());
+    identity_context.insert("org_id".to_string(), scope.org_id.to_string());
+    identity_context.insert("account_id".to_string(), account.account_id.clone());
+    let href = format!(
+        "{}/orgs/{}/marketplace?grower_id={}&account_id={}",
+        marketplace_base_url.trim_end_matches('/'),
+        scope.org_id,
+        scope.grower_id,
+        account.account_id
+    );
+
+    GrowerMarketplaceEntryResolution {
+        entry: Some(GrowerMarketplaceEntry {
+            grower_id: scope.grower_id,
+            org_id: scope.org_id,
+            account_id: account.account_id.clone(),
+            href,
+            identity_context,
+            evidence_refs: vec![
+                format!("marketplace-account:{}", account.account_id),
+                format!("org:{}", scope.org_id),
+            ],
+        }),
+        hidden_reason: None,
+    }
 }
 
 impl TenantScoped for OrganizationRecord {
@@ -3290,6 +3359,88 @@ mod tests {
     }
 
     #[test]
+    fn grower_marketplace_entry_renders_scoped_identity_link() {
+        let org_id = Uuid::new_v4();
+        let grower_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+
+        let resolution = resolve_grower_marketplace_entry(
+            &scope,
+            &[marketplace_account(
+                "market-account-a",
+                org_id,
+                MarketplaceAccountStatus::Active,
+            )],
+            "https://agbot.example",
+        );
+
+        let entry = resolution.entry.expect("marketplace entry renders");
+        assert_eq!(resolution.hidden_reason, None);
+        assert_eq!(entry.grower_id, grower_id);
+        assert_eq!(entry.org_id, org_id);
+        assert_eq!(entry.account_id, "market-account-a");
+        assert_eq!(
+            entry.href,
+            format!(
+                "https://agbot.example/orgs/{org_id}/marketplace?grower_id={grower_id}&account_id=market-account-a"
+            )
+        );
+        assert_eq!(
+            entry.identity_context.get("grower_id"),
+            Some(&grower_id.to_string())
+        );
+        assert_eq!(
+            entry.identity_context.get("org_id"),
+            Some(&org_id.to_string())
+        );
+        assert!(entry
+            .evidence_refs
+            .contains(&"marketplace-account:market-account-a".to_string()));
+    }
+
+    #[test]
+    fn grower_marketplace_entry_hides_when_org_disabled() {
+        let org_id = Uuid::new_v4();
+        let other_org = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id: Uuid::new_v4(),
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+
+        let resolution = resolve_grower_marketplace_entry(
+            &scope,
+            &[
+                marketplace_account(
+                    "market-account-pending",
+                    org_id,
+                    MarketplaceAccountStatus::Pending,
+                ),
+                marketplace_account(
+                    "market-account-other",
+                    other_org,
+                    MarketplaceAccountStatus::Active,
+                ),
+            ],
+            "https://agbot.example",
+        );
+
+        assert_eq!(resolution.entry, None);
+        assert_eq!(
+            resolution.hidden_reason.as_deref(),
+            Some("marketplace_disabled")
+        );
+    }
+
+    #[test]
     fn grower_portal_field_read_denies_cross_tenant_and_audits() {
         let mut control = ControlPlaneRegistry::default();
         let org_a = control
@@ -3743,6 +3894,22 @@ mod tests {
                 source_date: "2026-06-15T13:00:00Z".to_string(),
             },
             evidence_refs: vec![format!("scene:scene-{finding_id}")],
+        }
+    }
+
+    fn marketplace_account(
+        account_id: &str,
+        org_id: Uuid,
+        status: MarketplaceAccountStatus,
+    ) -> MarketplaceAccountRecord {
+        MarketplaceAccountRecord {
+            account_id: account_id.to_string(),
+            org_id: org_id.to_string(),
+            party_type: crate::schemas::MarketplacePartyType::Grower,
+            role_refs: vec!["marketplace:grower".to_string()],
+            status,
+            created_at: "2026-06-15T13:00:00Z".to_string(),
+            updated_at: "2026-06-15T13:00:00Z".to_string(),
         }
     }
 
