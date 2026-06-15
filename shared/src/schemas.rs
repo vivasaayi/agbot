@@ -3111,6 +3111,43 @@ pub enum WaterWeatherInputContractError {
     InvalidTimestamp { timestamp: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterEvapotranspirationRequest {
+    pub weather: WaterWeatherInputContract,
+    #[serde(default)]
+    pub crop_coefficient: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaterEvapotranspirationStatus {
+    Computed,
+    InsufficientInputs,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterEvapotranspiration {
+    pub field_ref: String,
+    pub date: String,
+    pub status: WaterEvapotranspirationStatus,
+    #[serde(default)]
+    pub reference_et_mm_day: Option<f64>,
+    #[serde(default)]
+    pub crop_et_mm_day: Option<f64>,
+    pub crop_coefficient: f64,
+    pub method: String,
+    pub input_refs: Vec<String>,
+    pub degradation_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum WaterEvapotranspirationError {
+    #[error("water ET crop coefficient is invalid: {value}")]
+    InvalidCropCoefficient { value: String },
+    #[error("water ET weather reference calculation failed: {0}")]
+    Weather(#[from] WeatherReferenceEtError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WeatherReferenceEtStatus {
@@ -4341,6 +4378,77 @@ fn parse_water_weather_input_timestamp(
         .map_err(|_| WaterWeatherInputContractError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
+}
+
+pub fn compute_water_evapotranspiration(
+    request: WaterEvapotranspirationRequest,
+) -> Result<WaterEvapotranspiration, WaterEvapotranspirationError> {
+    let crop_coefficient = request.crop_coefficient.unwrap_or(1.0);
+    if !(crop_coefficient.is_finite() && crop_coefficient >= 0.0) {
+        return Err(WaterEvapotranspirationError::InvalidCropCoefficient {
+            value: crop_coefficient.to_string(),
+        });
+    }
+    let method = "agbot_water_et_v1_reference_et_crop_coefficient".to_string();
+    if request.weather.et_blocked || request.weather.status == WaterWeatherInputStatus::Degraded {
+        return Ok(water_et_insufficient(
+            request.weather.field_ref,
+            request.weather.date,
+            crop_coefficient,
+            method,
+            request.weather.degradation_reasons,
+        ));
+    }
+
+    let reference = compute_weather_reference_et(WeatherReferenceEtInput {
+        field_ref: request.weather.field_ref.clone(),
+        date: request.weather.date.clone(),
+        temperature_celsius: request.weather.temperature_celsius,
+        humidity_percent: request.weather.humidity_percent,
+        wind_speed_mps: request.weather.wind_speed_mps,
+        radiation_w_m2: request.weather.radiation_w_m2,
+    })?;
+    let Some(reference_et_mm_day) = reference.reference_et_mm_day else {
+        return Ok(water_et_insufficient(
+            request.weather.field_ref,
+            request.weather.date,
+            crop_coefficient,
+            method,
+            reference.input_refs,
+        ));
+    };
+
+    Ok(WaterEvapotranspiration {
+        field_ref: reference.field_ref,
+        date: reference.date,
+        status: WaterEvapotranspirationStatus::Computed,
+        reference_et_mm_day: Some(reference_et_mm_day),
+        crop_et_mm_day: Some(reference_et_mm_day * crop_coefficient),
+        crop_coefficient,
+        method,
+        input_refs: reference.input_refs,
+        degradation_reasons: Vec::new(),
+    })
+}
+
+fn water_et_insufficient(
+    field_ref: String,
+    date: String,
+    crop_coefficient: f64,
+    method: String,
+    degradation_reasons: Vec<String>,
+) -> WaterEvapotranspiration {
+    WaterEvapotranspiration {
+        field_ref,
+        date,
+        status: WaterEvapotranspirationStatus::InsufficientInputs,
+        reference_et_mm_day: None,
+        crop_et_mm_day: None,
+        crop_coefficient,
+        method,
+        input_refs: Vec::new(),
+        degradation_reasons,
+    }
 }
 
 pub fn compute_weather_reference_et(
@@ -9491,7 +9599,8 @@ mod tests {
         build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
-        compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
+        compute_water_evapotranspiration, compute_weather_growing_degree_day,
+        compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, detect_tractor_obstacle,
         dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
         evaluate_crop_stage_weather_risks, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
@@ -9544,6 +9653,7 @@ mod tests {
         TractorPrescriptionZone, TractorRegistrationRequest, TractorRegistry,
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
         TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
+        WaterEvapotranspirationRequest, WaterEvapotranspirationStatus,
         WaterWeatherInputContractRequest, WaterWeatherInputStatus, WeatherAlertDeliveryStatus,
         WeatherAlertRouteTarget, WeatherAlertRoutingRequest, WeatherAlertRoutingTarget,
         WeatherCropStageRiskRequest, WeatherCropStageThresholdSet,
@@ -11718,6 +11828,54 @@ mod tests {
         );
         assert!(contract.temperature_celsius.is_none());
         assert!(contract.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn water_evapotranspiration_computes_reference_and_crop_et() {
+        let weather =
+            validate_water_weather_input_contract(water_weather_input_contract_request(false))
+                .expect("fresh weather input contract should validate");
+
+        let et = compute_water_evapotranspiration(WaterEvapotranspirationRequest {
+            weather,
+            crop_coefficient: Some(1.15),
+        })
+        .expect("water ET should compute");
+
+        assert_eq!(et.status, WaterEvapotranspirationStatus::Computed);
+        assert_eq!(et.reference_et_mm_day, Some(7.47496));
+        assert_eq!(et.crop_et_mm_day, Some(8.596204));
+        assert_eq!(et.crop_coefficient, 1.15);
+        assert_eq!(et.method, "agbot_water_et_v1_reference_et_crop_coefficient");
+        assert!(et
+            .input_refs
+            .contains(&"temperature_celsius:2026-06-13T10:00:00Z".to_string()));
+        assert!(et.degradation_reasons.is_empty());
+    }
+
+    #[test]
+    fn water_evapotranspiration_reports_insufficient_inputs() {
+        let weather = validate_water_weather_input_contract(WaterWeatherInputContractRequest {
+            field_ref: "field-north".to_string(),
+            date: "2026-06-13".to_string(),
+            records: Vec::new(),
+        })
+        .expect("missing weather input should degrade");
+
+        let et = compute_water_evapotranspiration(WaterEvapotranspirationRequest {
+            weather,
+            crop_coefficient: None,
+        })
+        .expect("insufficient weather input should not error");
+
+        assert_eq!(et.status, WaterEvapotranspirationStatus::InsufficientInputs);
+        assert_eq!(et.reference_et_mm_day, None);
+        assert_eq!(et.crop_et_mm_day, None);
+        assert_eq!(et.crop_coefficient, 1.0);
+        assert_eq!(
+            et.degradation_reasons,
+            vec!["missing_weather_input".to_string()]
+        );
     }
 
     #[test]
