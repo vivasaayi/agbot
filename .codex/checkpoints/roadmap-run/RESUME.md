@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 1749029 (`batch-20260615155000`)
-- **Latest checkpoint commit**: 1749029 (`batch-20260615155000`)
-- **Current batch**: `batch-20260615161500` (`31-11`, tests_passed)
-- **Completed feature rows**: 365 committed; 2 tests_passed; 1 skipped; 1 blocked; 129 pending in this run.
+- **Last implementation commit**: 964d31e (`batch-20260615161500`)
+- **Latest checkpoint commit**: 964d31e (`batch-20260615161500`)
+- **Current batch**: none
+- **Completed feature rows**: 366 committed; 1 tests_passed; 1 skipped; 1 blocked; 129 pending in this run.
 - **Blocker**: None
 
 ## Latest verification
@@ -16,4 +16,4 @@
 
 ## Next action
 
-- Commit verified `31-11` custom import/export adapter extension point, then update checkpoint to select `31-12`.
+- Select and claim the next pending feature (`31-12` is the next P1 item).
