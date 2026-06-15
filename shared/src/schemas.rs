@@ -997,6 +997,42 @@ pub enum TractorMotionGateError {
     InvalidTimestamp { timestamp: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorObstacleDetectionRequest {
+    pub tractor_id: String,
+    pub path: TractorGuidancePath,
+    pub current_position: TractorGuidancePoint,
+    pub obstacles: Vec<TractorGuidancePoint>,
+    pub path_width_m: f64,
+    pub stopping_distance_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorObstacleEvent {
+    pub distance_m: f64,
+    pub position: TractorGuidancePoint,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TractorObstacleDetection {
+    pub tractor_id: String,
+    pub halted: bool,
+    pub event: Option<TractorObstacleEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum TractorObstacleDetectionError {
+    #[error("tractor obstacle detector tractor_id cannot be empty")]
+    EmptyTractorId,
+    #[error("tractor obstacle path width must be positive")]
+    InvalidPathWidth,
+    #[error("tractor obstacle stopping distance must be positive")]
+    InvalidStoppingDistance,
+    #[error(transparent)]
+    Guidance(#[from] TractorGuidanceError),
+}
+
 impl TractorCommandRejection {
     pub fn status_code(&self) -> u16 {
         match self.reason {
@@ -1923,6 +1959,75 @@ fn parse_tractor_motion_gate_timestamp(
         .map_err(|_| TractorMotionGateError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
+}
+
+pub fn detect_tractor_obstacle(
+    request: TractorObstacleDetectionRequest,
+) -> Result<TractorObstacleDetection, TractorObstacleDetectionError> {
+    let tractor_id = normalize_tractor_text(request.tractor_id)
+        .ok_or(TractorObstacleDetectionError::EmptyTractorId)?;
+    if !request.path_width_m.is_finite() || request.path_width_m <= 0.0 {
+        return Err(TractorObstacleDetectionError::InvalidPathWidth);
+    }
+    if !request.stopping_distance_m.is_finite() || request.stopping_distance_m <= 0.0 {
+        return Err(TractorObstacleDetectionError::InvalidStoppingDistance);
+    }
+    let (unit_x, unit_y, path_length) = tractor_guidance_unit_vector(request.path)?;
+    let current_along =
+        tractor_path_along_track_m(request.path, request.current_position, unit_x, unit_y);
+    let half_width = request.path_width_m / 2.0;
+    let mut nearest_event = None;
+
+    for obstacle in request.obstacles {
+        let along = tractor_path_along_track_m(request.path, obstacle, unit_x, unit_y);
+        let lateral = tractor_path_lateral_error_m(request.path, obstacle, unit_x, unit_y).abs();
+        let distance_ahead = along - current_along;
+        if along < 0.0
+            || along > path_length
+            || lateral > half_width
+            || distance_ahead < 0.0
+            || distance_ahead > request.stopping_distance_m
+        {
+            continue;
+        }
+        let event = TractorObstacleEvent {
+            distance_m: distance_ahead,
+            position: obstacle,
+            reason_code: "obstacle_in_path".to_string(),
+        };
+        if nearest_event
+            .as_ref()
+            .is_none_or(|existing: &TractorObstacleEvent| event.distance_m < existing.distance_m)
+        {
+            nearest_event = Some(event);
+        }
+    }
+
+    Ok(TractorObstacleDetection {
+        tractor_id,
+        halted: nearest_event.is_some(),
+        event: nearest_event,
+    })
+}
+
+fn tractor_path_along_track_m(
+    path: TractorGuidancePath,
+    point: TractorGuidancePoint,
+    unit_x: f64,
+    unit_y: f64,
+) -> f64 {
+    (point.x_m - path.start.x_m) * unit_x + (point.y_m - path.start.y_m) * unit_y
+}
+
+fn tractor_path_lateral_error_m(
+    path: TractorGuidancePath,
+    point: TractorGuidancePoint,
+    unit_x: f64,
+    unit_y: f64,
+) -> f64 {
+    let dx = point.x_m - path.start.x_m;
+    let dy = point.y_m - path.start.y_m;
+    dx * unit_y - dy * unit_x
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6586,10 +6691,10 @@ mod tests {
         build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
-        create_versioned_content, dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories,
-        evaluate_tractor_geofence, evaluate_tractor_motion_gate,
-        normalize_weather_provider_forecast, plan_tractor_swath_coverage,
-        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
+        create_versioned_content, detect_tractor_obstacle, dry_run_fleet_config_bundle,
+        evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
+        evaluate_tractor_motion_gate, normalize_weather_provider_forecast,
+        plan_tractor_swath_coverage, run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
@@ -6623,11 +6728,11 @@ mod tests {
         TractorGeofenceEvaluationRequest, TractorGuidanceConfig, TractorGuidanceError,
         TractorGuidanceFault, TractorGuidancePath, TractorGuidancePoint, TractorImplementRef,
         TractorLifecycleStatus, TractorMotionCommandRequest, TractorMotionGateDecision,
-        TractorOperatorApproval, TractorRegistrationRequest, TractorRegistry,
-        TractorSwathCoverageRequest, WeatherIngestError, WeatherProviderForecastPoint,
-        WeatherProviderForecastResponse, WorkOrderChangeType, WorkOrderCreateRequest,
-        WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry,
-        WorkOrderStatus,
+        TractorObstacleDetectionRequest, TractorOperatorApproval, TractorRegistrationRequest,
+        TractorRegistry, TractorSwathCoverageRequest, WeatherIngestError,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
+        WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -7575,6 +7680,53 @@ mod tests {
         assert!(!evaluation.halted);
         assert_eq!(evaluation.approval_id, None);
         assert_eq!(evaluation.audit.reason_code, "operator_approval_required");
+    }
+
+    #[test]
+    fn tractor_obstacle_detector_does_not_false_halt_clear_path() {
+        let detection = detect_tractor_obstacle(TractorObstacleDetectionRequest {
+            tractor_id: "tractor-001".to_string(),
+            path: tractor_guidance_test_path(),
+            current_position: TractorGuidancePoint { x_m: 0.0, y_m: 0.0 },
+            obstacles: vec![
+                TractorGuidancePoint { x_m: 5.0, y_m: 5.0 },
+                TractorGuidancePoint {
+                    x_m: 30.0,
+                    y_m: 0.0,
+                },
+            ],
+            path_width_m: 2.0,
+            stopping_distance_m: 10.0,
+        })
+        .expect("obstacle detector evaluates");
+
+        assert!(!detection.halted);
+        assert_eq!(detection.event, None);
+    }
+
+    #[test]
+    fn tractor_obstacle_detector_halts_for_obstacle_in_path() {
+        let detection = detect_tractor_obstacle(TractorObstacleDetectionRequest {
+            tractor_id: "tractor-001".to_string(),
+            path: tractor_guidance_test_path(),
+            current_position: TractorGuidancePoint { x_m: 0.0, y_m: 0.0 },
+            obstacles: vec![
+                TractorGuidancePoint { x_m: 8.0, y_m: 0.5 },
+                TractorGuidancePoint {
+                    x_m: 4.0,
+                    y_m: 0.25,
+                },
+            ],
+            path_width_m: 2.0,
+            stopping_distance_m: 10.0,
+        })
+        .expect("obstacle detector evaluates");
+
+        let event = detection.event.expect("obstacle event records");
+        assert!(detection.halted);
+        assert_eq!(event.reason_code, "obstacle_in_path");
+        assert_eq!(event.distance_m, 4.0);
+        assert_eq!(event.position.x_m, 4.0);
     }
 
     #[test]
