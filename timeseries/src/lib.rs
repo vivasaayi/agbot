@@ -222,6 +222,51 @@ pub struct RasterChangeResult {
     pub changed_cell_count: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RasterChangeNormalizationMethod {
+    PercentOfEarlier,
+    ZScore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizedChangeOutcome {
+    ValidChange,
+    NoValidChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedRasterChangeConfig {
+    pub method: RasterChangeNormalizationMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variance: Option<f64>,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedRasterChangeResult {
+    pub normalized_raster_ref: String,
+    pub delta_raster_ref: String,
+    pub alignment_ref: String,
+    pub alignment_proof_ref: String,
+    pub crs: String,
+    pub extent: GeoExtent,
+    pub resolution: RasterResolution,
+    pub grid_columns: u32,
+    pub grid_rows: u32,
+    pub method: RasterChangeNormalizationMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variance: Option<f64>,
+    pub method_version: String,
+    pub normalized_values: Vec<Option<f64>>,
+    pub valid_cell_count: u32,
+    pub excluded_cell_count: u32,
+    pub outcome: NormalizedChangeOutcome,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeriesProductIngest {
     pub entity_ref: String,
@@ -626,6 +671,14 @@ pub enum TimeSeriesError {
     InvalidChangeConfig,
     #[error("raster change inputs must match alignment evidence and proof")]
     ChangeAlignmentMismatch,
+    #[error("normalized_raster_ref cannot be empty")]
+    EmptyNormalizedRasterRef,
+    #[error("normalized change method_version cannot be empty")]
+    EmptyNormalizedChangeMethodVersion,
+    #[error("normalized change config is invalid for the selected method")]
+    InvalidNormalizedChangeConfig,
+    #[error("normalized change input grid must match the raster change result")]
+    NormalizedChangeInputMismatch,
     #[error("aligned raster grid cell count does not match dimensions")]
     InvalidRasterCellCount,
     #[error("aligned raster grid values must be finite when present")]
@@ -1733,6 +1786,86 @@ pub fn compute_aligned_raster_change(
     })
 }
 
+pub fn normalize_raster_change(
+    change: &RasterChangeResult,
+    earlier: &AlignedRasterGrid,
+    config: NormalizedRasterChangeConfig,
+    generated_normalized_raster_ref: String,
+) -> Result<NormalizedRasterChangeResult, TimeSeriesError> {
+    let normalized_raster_ref = normalize_required_text(
+        generated_normalized_raster_ref,
+        TimeSeriesError::EmptyNormalizedRasterRef,
+    )?;
+    let config = normalize_normalized_change_config(config)?;
+    validate_raster_change_result(change)?;
+    validate_aligned_grid(earlier)?;
+    validate_normalized_change_inputs(change, earlier)?;
+
+    let denominator = match config.method {
+        RasterChangeNormalizationMethod::PercentOfEarlier => None,
+        RasterChangeNormalizationMethod::ZScore => config.variance.map(f64::sqrt),
+    };
+    let mut normalized_values = Vec::with_capacity(change.delta_values.len());
+    let mut valid_cell_count = 0_u32;
+    let mut excluded_cell_count = 0_u32;
+
+    for (delta, earlier_value) in change.delta_values.iter().zip(&earlier.values) {
+        let normalized = match (delta, earlier_value) {
+            (Some(delta), Some(earlier_value)) => {
+                let denominator = denominator.unwrap_or(*earlier_value);
+                if denominator == 0.0 {
+                    None
+                } else {
+                    let value = delta / denominator;
+                    if value.is_finite() {
+                        Some(value)
+                    } else {
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        if normalized.is_some() {
+            valid_cell_count += 1;
+        } else {
+            excluded_cell_count += 1;
+        }
+        normalized_values.push(normalized);
+    }
+
+    let outcome = if valid_cell_count == 0 {
+        NormalizedChangeOutcome::NoValidChange
+    } else {
+        NormalizedChangeOutcome::ValidChange
+    };
+
+    Ok(NormalizedRasterChangeResult {
+        normalized_raster_ref,
+        delta_raster_ref: change.delta_raster_ref.clone(),
+        alignment_ref: change.alignment_ref.clone(),
+        alignment_proof_ref: change.alignment_proof_ref.clone(),
+        crs: change.crs.clone(),
+        extent: change.extent,
+        resolution: change.resolution,
+        grid_columns: change.grid_columns,
+        grid_rows: change.grid_rows,
+        method: config.method,
+        variance: config.variance,
+        method_version: config.method_version,
+        normalized_values,
+        valid_cell_count,
+        excluded_cell_count,
+        outcome,
+        evidence_refs: vec![
+            change.delta_raster_ref.clone(),
+            change.alignment_ref.clone(),
+            change.alignment_proof_ref.clone(),
+        ],
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SeriesKey {
     entity_ref: String,
@@ -1828,6 +1961,36 @@ fn normalize_change_config(
 
     Ok(RasterChangeConfig {
         absolute_threshold: config.absolute_threshold,
+        method_version,
+    })
+}
+
+fn normalize_normalized_change_config(
+    config: NormalizedRasterChangeConfig,
+) -> Result<NormalizedRasterChangeConfig, TimeSeriesError> {
+    let method_version = normalize_required_text(
+        config.method_version,
+        TimeSeriesError::EmptyNormalizedChangeMethodVersion,
+    )?;
+    match config.method {
+        RasterChangeNormalizationMethod::PercentOfEarlier => {
+            if config.variance.is_some() {
+                return Err(TimeSeriesError::InvalidNormalizedChangeConfig);
+            }
+        }
+        RasterChangeNormalizationMethod::ZScore => {
+            let Some(variance) = config.variance else {
+                return Err(TimeSeriesError::InvalidNormalizedChangeConfig);
+            };
+            if !variance.is_finite() || variance <= 0.0 {
+                return Err(TimeSeriesError::InvalidNormalizedChangeConfig);
+            }
+        }
+    }
+
+    Ok(NormalizedRasterChangeConfig {
+        method: config.method,
+        variance: config.variance,
         method_version,
     })
 }
@@ -2124,6 +2287,25 @@ fn validate_raster_change_result(change: &RasterChangeResult) -> Result<(), Time
         return Err(TimeSeriesError::InvalidRasterCellValue);
     }
     Ok(())
+}
+
+fn validate_normalized_change_inputs(
+    change: &RasterChangeResult,
+    earlier: &AlignedRasterGrid,
+) -> Result<(), TimeSeriesError> {
+    let matches = earlier.alignment_ref == change.alignment_ref
+        && earlier.crs == change.crs
+        && earlier.extent == change.extent
+        && earlier.resolution == change.resolution
+        && earlier.grid_columns == change.grid_columns
+        && earlier.grid_rows == change.grid_rows
+        && earlier.values.len() == change.delta_values.len();
+
+    if matches {
+        Ok(())
+    } else {
+        Err(TimeSeriesError::NormalizedChangeInputMismatch)
+    }
 }
 
 fn validate_compare_view_inputs(
@@ -2506,15 +2688,17 @@ mod tests {
         align_raster_pair, build_compare_view_feed, compare_view_refusal_from_guard,
         compute_aligned_raster_change, derive_ranked_change_events, evaluate_series_cadence_health,
         export_change_mask_geotiff, export_change_zones_geojson, export_series_csv,
-        guard_coregisterable_pair, AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof,
-        AlignmentRefusalReason, ChangeEvent, ChangeEventConfig, ChangeEventDerivationInput,
-        ChangeEventDirection, ChangeEventReasonCode, ChangeZoneExportFeature, ChangeZonePolygon,
-        GeoExtent, MetricDefinition, MetricKind, RasterAlignmentConfig, RasterAlignmentEvidence,
-        RasterChangeConfig, RasterChangeResult, RasterResolution, RasterSeriesValue,
-        RollingBaselineConfig, SeasonalComparisonConfig, SeasonalComparisonTarget,
-        SeriesCadenceHealthConfig, SeriesFreshnessState, SeriesPoint, SeriesProductIngest,
-        SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
-        TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
+        guard_coregisterable_pair, normalize_raster_change, AlignedRasterGrid,
+        AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason, ChangeEvent,
+        ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection, ChangeEventReasonCode,
+        ChangeZoneExportFeature, ChangeZonePolygon, GeoExtent, MetricDefinition, MetricKind,
+        NormalizedChangeOutcome, NormalizedRasterChangeConfig, RasterAlignmentConfig,
+        RasterAlignmentEvidence, RasterChangeConfig, RasterChangeNormalizationMethod,
+        RasterChangeResult, RasterResolution, RasterSeriesValue, RollingBaselineConfig,
+        SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesCadenceHealthConfig,
+        SeriesFreshnessState, SeriesPoint, SeriesProductIngest, SeriesQuery, SeriesValue,
+        TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore, TrendDirection,
+        ZonalTrendConfig, ZonalTrendTarget,
     };
 
     #[test]
@@ -3637,6 +3821,129 @@ mod tests {
     }
 
     #[test]
+    fn normalized_change_percent_excludes_nodata_and_zero_denominators() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier_grid = aligned_grid_values(
+            &evidence,
+            &evidence.aligned_earlier_ref,
+            vec![Some(0.25), Some(0.0), Some(0.75), Some(1.0)],
+        );
+        let later_grid = aligned_grid_values(
+            &evidence,
+            &evidence.aligned_later_ref,
+            vec![Some(0.50), Some(0.10), None, Some(0.50)],
+        );
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier_grid,
+            &later_grid,
+            change_config(0.10),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("aligned rasters should produce change outputs");
+
+        let normalized = normalize_raster_change(
+            &change,
+            &earlier_grid,
+            normalized_change_config(RasterChangeNormalizationMethod::PercentOfEarlier, None),
+            "change:field-alpha:normalized".to_string(),
+        )
+        .expect("percent normalization should run");
+
+        assert_eq!(
+            normalized.method,
+            RasterChangeNormalizationMethod::PercentOfEarlier
+        );
+        assert_eq!(normalized.outcome, NormalizedChangeOutcome::ValidChange);
+        assert_eq!(normalized.valid_cell_count, 2);
+        assert_eq!(normalized.excluded_cell_count, 2);
+        assert_eq!(
+            normalized.normalized_values,
+            vec![Some(1.0), None, None, Some(-0.5)]
+        );
+        assert_eq!(normalized.crs, change.crs);
+        assert_eq!(normalized.extent, change.extent);
+        assert!(normalized
+            .evidence_refs
+            .contains(&"change:field-alpha:delta".to_string()));
+    }
+
+    #[test]
+    fn normalized_change_zscore_records_variance_method() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier_grid = aligned_grid(&evidence, &evidence.aligned_earlier_ref, [0.70; 4]);
+        let later_grid = aligned_grid(
+            &evidence,
+            &evidence.aligned_later_ref,
+            [0.45, 0.48, 0.70, 0.70],
+        );
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier_grid,
+            &later_grid,
+            change_config(0.10),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("aligned rasters should produce change outputs");
+
+        let normalized = normalize_raster_change(
+            &change,
+            &earlier_grid,
+            normalized_change_config(RasterChangeNormalizationMethod::ZScore, Some(0.04)),
+            "change:field-alpha:zscore".to_string(),
+        )
+        .expect("z-score normalization should run");
+
+        assert_eq!(normalized.method, RasterChangeNormalizationMethod::ZScore);
+        assert_eq!(normalized.variance, Some(0.04));
+        assert_eq!(normalized.valid_cell_count, 4);
+        assert!((normalized.normalized_values[0].unwrap() + 1.25).abs() < 0.000001);
+        assert!((normalized.normalized_values[1].unwrap() + 1.10).abs() < 0.000001);
+    }
+
+    #[test]
+    fn normalized_change_all_nodata_returns_no_valid_change() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier_grid = aligned_grid_values(
+            &evidence,
+            &evidence.aligned_earlier_ref,
+            vec![None, None, None, None],
+        );
+        let later_grid = aligned_grid_values(
+            &evidence,
+            &evidence.aligned_later_ref,
+            vec![None, None, None, None],
+        );
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier_grid,
+            &later_grid,
+            change_config(0.10),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("all-nodata aligned rasters should produce empty change outputs");
+
+        let normalized = normalize_raster_change(
+            &change,
+            &earlier_grid,
+            normalized_change_config(RasterChangeNormalizationMethod::PercentOfEarlier, None),
+            "change:field-alpha:normalized".to_string(),
+        )
+        .expect("all-nodata normalization should return an explicit outcome");
+
+        assert_eq!(normalized.outcome, NormalizedChangeOutcome::NoValidChange);
+        assert_eq!(normalized.valid_cell_count, 0);
+        assert_eq!(normalized.excluded_cell_count, 4);
+        assert_eq!(normalized.normalized_values, vec![None, None, None, None]);
+    }
+
+    #[test]
     fn series_csv_export_carries_entity_metric_time_value_and_empty_header() {
         let export = export_series_csv(&[
             scalar_point("field:alpha", "ndvi_mean", "2026-06-10T10:00:00Z", 0.68),
@@ -4039,6 +4346,14 @@ mod tests {
         raster_ref: &str,
         values: [f64; 4],
     ) -> AlignedRasterGrid {
+        aligned_grid_values(evidence, raster_ref, values.into_iter().map(Some).collect())
+    }
+
+    fn aligned_grid_values(
+        evidence: &RasterAlignmentEvidence,
+        raster_ref: &str,
+        values: Vec<Option<f64>>,
+    ) -> AlignedRasterGrid {
         AlignedRasterGrid {
             raster_ref: raster_ref.to_string(),
             alignment_ref: evidence.alignment_ref.clone(),
@@ -4047,7 +4362,7 @@ mod tests {
             resolution: RasterResolution { x: 1.0, y: 1.0 },
             grid_columns: evidence.grid_columns,
             grid_rows: evidence.grid_rows,
-            values: values.into_iter().map(Some).collect(),
+            values,
         }
     }
 
@@ -4055,6 +4370,17 @@ mod tests {
         RasterChangeConfig {
             absolute_threshold,
             method_version: "delta-mask-v1".to_string(),
+        }
+    }
+
+    fn normalized_change_config(
+        method: RasterChangeNormalizationMethod,
+        variance: Option<f64>,
+    ) -> NormalizedRasterChangeConfig {
+        NormalizedRasterChangeConfig {
+            method,
+            variance,
+            method_version: "normalized-change-v1".to_string(),
         }
     }
 }
