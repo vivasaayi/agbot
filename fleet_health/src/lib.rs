@@ -414,6 +414,63 @@ pub struct HealthDegradationDetectionReport {
     pub event: Option<HealthDegradationEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeMetricTrendSample {
+    pub node_id: String,
+    pub metric_name: String,
+    pub value: f64,
+    pub ts: String,
+    pub source_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PredictiveMaintenanceAdvisoryRequest {
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub evaluated_at: String,
+    #[serde(default)]
+    pub method_version: String,
+    #[serde(default)]
+    pub metric_name: String,
+    #[serde(default)]
+    pub samples: Vec<NodeMetricTrendSample>,
+    pub config: HealthDegradationDetectionConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveMaintenanceAdvisoryStatus {
+    Raised,
+    NotRaised,
+    InsufficientHistory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveMaintenanceAdvisoryReason {
+    UpwardMetricTrend,
+    StableMetricTrend,
+    InsufficientHistory,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictiveMaintenanceAdvisory {
+    pub node_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub metric_name: String,
+    pub status: PredictiveMaintenanceAdvisoryStatus,
+    pub reason_code: PredictiveMaintenanceAdvisoryReason,
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+    pub slope_per_day: Option<f64>,
+    pub delta: Option<f64>,
+    pub evidence_refs: Vec<String>,
+    pub requires_approval: bool,
+    pub auto_action_taken: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RemainingUsefulLifeRequest {
     #[serde(default)]
@@ -1529,6 +1586,134 @@ pub fn detect_health_indicator_degradation(
         delta: Some(delta),
         evidence_refs,
         event,
+    })
+}
+
+pub fn evaluate_predictive_maintenance_advisory(
+    request: PredictiveMaintenanceAdvisoryRequest,
+) -> Result<PredictiveMaintenanceAdvisory, FleetHealthError> {
+    let node_id = normalize_required_text(request.node_id, FleetHealthError::EmptyFleetNodeId)?;
+    let evaluated_at =
+        normalize_required_text(request.evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    let method_version = normalize_required_text(
+        request.method_version,
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    let metric_name = normalize_required_text(
+        request.metric_name,
+        FleetHealthError::EmptyHealthEvidenceRefKind,
+    )?;
+    validate_degradation_config(request.config)?;
+
+    let mut normalized = Vec::new();
+    for sample in request.samples {
+        let sample_node_id =
+            normalize_required_text(sample.node_id, FleetHealthError::EmptyFleetNodeId)?;
+        if sample_node_id != node_id {
+            continue;
+        }
+        let sample_metric = normalize_required_text(
+            sample.metric_name,
+            FleetHealthError::EmptyHealthEvidenceRefKind,
+        )?;
+        if sample_metric != metric_name {
+            continue;
+        }
+        validate_finite(sample.value)?;
+        let sample_ts =
+            normalize_required_text(sample.ts, FleetHealthError::EmptyTelemetryTimestamp)?;
+        let parsed_ts = parse_health_sample_timestamp(&sample_ts)?;
+        let source_ref =
+            normalize_required_text(sample.source_ref, FleetHealthError::EmptySourceRef)?;
+        normalized.push(ParsedNodeMetricSample {
+            sample: NodeMetricTrendSample {
+                node_id: sample_node_id,
+                metric_name: sample_metric,
+                value: sample.value,
+                ts: sample_ts,
+                source_ref,
+            },
+            parsed_ts,
+        });
+    }
+    normalized.sort_by(|left, right| {
+        left.parsed_ts
+            .cmp(&right.parsed_ts)
+            .then_with(|| left.sample.source_ref.cmp(&right.sample.source_ref))
+    });
+
+    if normalized.len() < request.config.min_history_points {
+        return Ok(PredictiveMaintenanceAdvisory {
+            node_id,
+            evaluated_at,
+            method_version,
+            metric_name,
+            status: PredictiveMaintenanceAdvisoryStatus::InsufficientHistory,
+            reason_code: PredictiveMaintenanceAdvisoryReason::InsufficientHistory,
+            window_start: None,
+            window_end: None,
+            slope_per_day: None,
+            delta: None,
+            evidence_refs: Vec::new(),
+            requires_approval: true,
+            auto_action_taken: false,
+        });
+    }
+
+    let window_len = request
+        .config
+        .recent_window_points
+        .min(normalized.len())
+        .max(2);
+    let window = &normalized[normalized.len() - window_len..];
+    let first = &window[0];
+    let last = &window[window.len() - 1];
+    let elapsed_days = last
+        .parsed_ts
+        .signed_duration_since(first.parsed_ts)
+        .num_seconds()
+        .max(1) as f64
+        / 86_400.0;
+    let delta = last.sample.value - first.sample.value;
+    let slope_per_day = delta / elapsed_days;
+    let trend_detected = slope_per_day >= request.config.min_adverse_slope_per_day
+        && delta >= request.config.min_adverse_delta;
+    let evidence_refs = window
+        .iter()
+        .map(|sample| {
+            format!(
+                "metric:{}:{}:{}:{}:{:.6}",
+                node_id,
+                metric_name,
+                sample.sample.ts,
+                sample.sample.source_ref,
+                sample.sample.value
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Ok(PredictiveMaintenanceAdvisory {
+        node_id,
+        evaluated_at,
+        method_version,
+        metric_name,
+        status: if trend_detected {
+            PredictiveMaintenanceAdvisoryStatus::Raised
+        } else {
+            PredictiveMaintenanceAdvisoryStatus::NotRaised
+        },
+        reason_code: if trend_detected {
+            PredictiveMaintenanceAdvisoryReason::UpwardMetricTrend
+        } else {
+            PredictiveMaintenanceAdvisoryReason::StableMetricTrend
+        },
+        window_start: Some(first.sample.ts.clone()),
+        window_end: Some(last.sample.ts.clone()),
+        slope_per_day: Some(slope_per_day),
+        delta: Some(delta),
+        evidence_refs,
+        requires_approval: true,
+        auto_action_taken: false,
     })
 }
 
@@ -2719,6 +2904,11 @@ struct ParsedHealthIndicatorSample {
     parsed_ts: chrono::DateTime<chrono::Utc>,
 }
 
+struct ParsedNodeMetricSample {
+    sample: NodeMetricTrendSample,
+    parsed_ts: chrono::DateTime<chrono::Utc>,
+}
+
 fn validate_degradation_config(
     config: HealthDegradationDetectionConfig,
 ) -> Result<(), FleetHealthError> {
@@ -3151,8 +3341,9 @@ mod tests {
         detect_health_indicator_degradation, estimate_remaining_useful_life,
         evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
         evaluate_fleet_readiness_with_work_orders, evaluate_ota_rollout,
-        fleet_operations_source_current, fleet_operations_source_unavailable, install_component,
-        open_maintenance_work_order, refuse_health_evidence_overwrite, BatteryHealthTrendConfig,
+        evaluate_predictive_maintenance_advisory, fleet_operations_source_current,
+        fleet_operations_source_unavailable, install_component, open_maintenance_work_order,
+        refuse_health_evidence_overwrite, BatteryHealthTrendConfig,
         CloseMaintenanceWorkOrderRequest, ComponentHealthVerdict, ComponentHealthVerdictRequest,
         ComponentHealthVerdictStatus, ComponentServiceLimit, DutyAccrualRequest,
         FleetComponentRecord, FleetComponentType, FleetHealthDashboardAircraftStatus,
@@ -3165,9 +3356,11 @@ mod tests {
         HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
         HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
         InstallComponentRequest, MaintenancePartUsage, MaintenanceWorkOrderSeverity,
-        MaintenanceWorkOrderStatus, OpenMaintenanceWorkOrderRequest, OtaArtifactVersion,
-        OtaNodeHealthReport, OtaRolloutDecisionReason, OtaRolloutDecisionStatus, OtaRolloutNode,
-        OtaRolloutRequest, OtaRolloutStage, RegisterComponentRequest,
+        MaintenanceWorkOrderStatus, NodeMetricTrendSample, OpenMaintenanceWorkOrderRequest,
+        OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
+        OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
+        PredictiveMaintenanceAdvisoryReason, PredictiveMaintenanceAdvisoryRequest,
+        PredictiveMaintenanceAdvisoryStatus, RegisterComponentRequest,
         RemainingUsefulLifeReasonCode, RemainingUsefulLifeRequest, RemainingUsefulLifeStatus,
         RolloutControlAction, RolloutControlReason, RolloutControlRequest, RolloutControlStatus,
         ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
@@ -3683,6 +3876,128 @@ mod tests {
         assert!(report.event.is_none());
         assert!(report.slope_per_day.is_none());
         assert!(report.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn predictive_maintenance_advisory_flags_node_and_cites_metric_trend() {
+        let advisory = evaluate_predictive_maintenance_advisory(predictive_advisory_request(vec![
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.01,
+                "2026-06-01T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.04,
+                "2026-06-08T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.09,
+                "2026-06-15T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.16,
+                "2026-06-22T00:00:00Z",
+            ),
+        ]))
+        .expect("advisory should evaluate");
+
+        assert_eq!(advisory.status, PredictiveMaintenanceAdvisoryStatus::Raised);
+        assert_eq!(
+            advisory.reason_code,
+            PredictiveMaintenanceAdvisoryReason::UpwardMetricTrend
+        );
+        assert_eq!(advisory.node_id, "edge-1");
+        assert_eq!(advisory.metric_name, "heartbeat_error_rate");
+        assert!(advisory.slope_per_day.expect("slope should be present") > 0.006);
+        assert!(advisory.delta.expect("delta should be present") >= 0.15);
+        assert_eq!(advisory.evidence_refs.len(), 4);
+        assert!(advisory
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("metric:edge-1:heartbeat_error_rate")));
+    }
+
+    #[test]
+    fn predictive_maintenance_advisory_does_not_flag_stable_metrics() {
+        let advisory = evaluate_predictive_maintenance_advisory(predictive_advisory_request(vec![
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.020,
+                "2026-06-01T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.021,
+                "2026-06-08T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.019,
+                "2026-06-15T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.020,
+                "2026-06-22T00:00:00Z",
+            ),
+        ]))
+        .expect("stable advisory should evaluate");
+
+        assert_eq!(
+            advisory.status,
+            PredictiveMaintenanceAdvisoryStatus::NotRaised
+        );
+        assert_eq!(
+            advisory.reason_code,
+            PredictiveMaintenanceAdvisoryReason::StableMetricTrend
+        );
+        assert!(!advisory.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn predictive_maintenance_advisory_is_advisory_only_without_auto_action() {
+        let advisory = evaluate_predictive_maintenance_advisory(predictive_advisory_request(vec![
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.01,
+                "2026-06-01T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.05,
+                "2026-06-08T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.11,
+                "2026-06-15T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.20,
+                "2026-06-22T00:00:00Z",
+            ),
+        ]))
+        .expect("advisory should evaluate");
+
+        assert_eq!(advisory.status, PredictiveMaintenanceAdvisoryStatus::Raised);
+        assert!(advisory.requires_approval);
+        assert!(!advisory.auto_action_taken);
     }
 
     #[test]
@@ -4812,6 +5127,39 @@ mod tests {
                 recent_window_points: 4,
                 min_adverse_slope_per_day: 0.02,
                 min_adverse_delta: 0.30,
+            },
+        }
+    }
+
+    fn node_metric_sample_at(
+        node_id: &str,
+        metric_name: &str,
+        value: f64,
+        ts: &str,
+    ) -> NodeMetricTrendSample {
+        NodeMetricTrendSample {
+            node_id: node_id.to_string(),
+            metric_name: metric_name.to_string(),
+            value,
+            ts: ts.to_string(),
+            source_ref: format!("heartbeat:{node_id}:{ts}"),
+        }
+    }
+
+    fn predictive_advisory_request(
+        samples: Vec<NodeMetricTrendSample>,
+    ) -> PredictiveMaintenanceAdvisoryRequest {
+        PredictiveMaintenanceAdvisoryRequest {
+            node_id: "edge-1".to_string(),
+            evaluated_at: "2026-06-22T12:35:00Z".to_string(),
+            method_version: "fleet-node-maintenance-advisory-v1".to_string(),
+            metric_name: "heartbeat_error_rate".to_string(),
+            samples,
+            config: HealthDegradationDetectionConfig {
+                min_history_points: 4,
+                recent_window_points: 4,
+                min_adverse_slope_per_day: 0.006,
+                min_adverse_delta: 0.10,
             },
         }
     }
