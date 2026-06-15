@@ -298,6 +298,40 @@ pub struct GrowerFieldMapOverlay {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrowerNotificationEventType {
+    ReportPublished,
+    RecommendationCreated,
+    RiskAlert,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerNotificationSourceEvent {
+    pub event_type: GrowerNotificationEventType,
+    pub source_ref: String,
+    pub field_id: String,
+    pub created_at: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerNotificationFeedItem {
+    pub notification_id: String,
+    pub event_type: GrowerNotificationEventType,
+    pub source_ref: String,
+    pub field_id: String,
+    pub created_at: String,
+    pub title: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerNotificationFeed {
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub items: Vec<GrowerNotificationFeedItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GrowerFieldMapError {
     #[error(transparent)]
@@ -1084,6 +1118,52 @@ fn assert_overlay_extent_edge(
             field_value,
             layer_value,
         })
+    }
+}
+
+pub fn build_grower_notification_feed(
+    scope: &GrowerPortalSessionScope,
+    events: &[GrowerNotificationSourceEvent],
+) -> GrowerNotificationFeed {
+    let scoped_field_ids = scope
+        .field_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut items = events
+        .iter()
+        .filter(|event| scoped_field_ids.contains(event.field_id.as_str()))
+        .map(grower_notification_item)
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then(left.notification_id.cmp(&right.notification_id))
+    });
+
+    GrowerNotificationFeed {
+        grower_id: scope.grower_id,
+        org_id: scope.org_id,
+        items,
+    }
+}
+
+fn grower_notification_item(event: &GrowerNotificationSourceEvent) -> GrowerNotificationFeedItem {
+    GrowerNotificationFeedItem {
+        notification_id: format!(
+            "notification:{}:{}:{}",
+            event.field_id, event.source_ref, event.created_at
+        ),
+        event_type: event.event_type,
+        source_ref: event.source_ref.clone(),
+        field_id: event.field_id.clone(),
+        created_at: event.created_at.clone(),
+        title: event.title.clone(),
+        evidence_refs: vec![format!(
+            "event:{:?}:{}:{}",
+            event.event_type, event.source_ref, event.created_at
+        )],
     }
 }
 
@@ -2247,6 +2327,84 @@ mod tests {
     }
 
     #[test]
+    fn grower_notification_feed_delivers_owned_report_event_with_evidence() {
+        let grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+
+        let feed = build_grower_notification_feed(
+            &scope,
+            &[
+                notification_event(
+                    GrowerNotificationEventType::ReportPublished,
+                    "report:report-a",
+                    "field-a",
+                    "2026-06-15T13:08:00Z",
+                ),
+                notification_event(
+                    GrowerNotificationEventType::RecommendationCreated,
+                    "recommendation:rec-a",
+                    "field-a",
+                    "2026-06-15T13:09:00Z",
+                ),
+            ],
+        );
+
+        assert_eq!(feed.items.len(), 2);
+        assert_eq!(feed.items[0].source_ref, "recommendation:rec-a");
+        assert_eq!(feed.items[1].source_ref, "report:report-a");
+        assert_eq!(feed.items[1].field_id, "field-a");
+        assert!(feed.items[1]
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("report:report-a")));
+    }
+
+    #[test]
+    fn grower_notification_feed_suppresses_out_of_scope_events() {
+        let grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: vec!["farm-a".to_string()],
+            field_ids: vec!["field-a".to_string()],
+        };
+
+        let feed = build_grower_notification_feed(
+            &scope,
+            &[
+                notification_event(
+                    GrowerNotificationEventType::ReportPublished,
+                    "report:owned",
+                    "field-a",
+                    "2026-06-15T13:08:00Z",
+                ),
+                notification_event(
+                    GrowerNotificationEventType::ReportPublished,
+                    "report:foreign",
+                    "field-b",
+                    "2026-06-15T13:09:00Z",
+                ),
+            ],
+        );
+
+        assert_eq!(feed.items.len(), 1);
+        assert_eq!(feed.items[0].source_ref, "report:owned");
+        assert!(feed
+            .items
+            .iter()
+            .all(|item| item.field_id.as_str() == "field-a"));
+    }
+
+    #[test]
     fn grower_portal_field_read_denies_cross_tenant_and_audits() {
         let mut control = ControlPlaneRegistry::default();
         let org_a = control
@@ -2656,6 +2814,21 @@ mod tests {
             extent,
             resolution: None,
             uri: format!("file:///layers/{layer_id}.tif"),
+        }
+    }
+
+    fn notification_event(
+        event_type: GrowerNotificationEventType,
+        source_ref: &str,
+        field_id: &str,
+        created_at: &str,
+    ) -> GrowerNotificationSourceEvent {
+        GrowerNotificationSourceEvent {
+            event_type,
+            source_ref: source_ref.to_string(),
+            field_id: field_id.to_string(),
+            created_at: created_at.to_string(),
+            title: format!("Notification {source_ref}"),
         }
     }
 
