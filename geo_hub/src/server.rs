@@ -356,9 +356,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/scenes", get(routes::list_scenes))
         .route("/api/layers", get(routes::list_layers))
+        .route("/api/open-data/layers", get(routes::list_open_data_layers))
         .route(
             "/api/layers/:scene_id/:kind",
             get(routes::get_layer_metadata),
+        )
+        .route(
+            "/api/layers/:scene_id/:kind/open-data",
+            post(routes::publish_open_data_layer),
         )
         .route(
             "/api/layers/:scene_id/:kind/export/geotiff",

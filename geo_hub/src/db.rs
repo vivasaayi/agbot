@@ -256,6 +256,11 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             qa_report_ref TEXT,
             provenance_hash TEXT,
             downstream_consumers_json TEXT,
+            open_data_license TEXT,
+            open_data_attribution TEXT,
+            open_data_anonymized INTEGER,
+            open_data_refusal_reason TEXT,
+            open_data_published_at TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(scene_id) REFERENCES scenes(scene_id) ON DELETE CASCADE,
             UNIQUE(scene_id, kind)
@@ -366,6 +371,46 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         "products",
         "downstream_consumers_json",
         "ALTER TABLE products ADD COLUMN downstream_consumers_json TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_license",
+        "ALTER TABLE products ADD COLUMN open_data_license TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_attribution",
+        "ALTER TABLE products ADD COLUMN open_data_attribution TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_anonymized",
+        "ALTER TABLE products ADD COLUMN open_data_anonymized INTEGER",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_refusal_reason",
+        "ALTER TABLE products ADD COLUMN open_data_refusal_reason TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_published_at",
+        "ALTER TABLE products ADD COLUMN open_data_published_at TEXT",
     )
     .await?;
 

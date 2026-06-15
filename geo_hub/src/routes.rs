@@ -91,19 +91,20 @@ use shared::schemas::{
     parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
     parse_marketplace_party_type, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_metric_type,
-    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
-    transition_marketplace_account_status, validate_field_boundary, weather_fetch_failure_record,
-    AnnotationGeometry, AnnotationRecord, CollaborationChannelCreateRequest,
-    CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
-    CollaborationMessageCreateRequest, CollaborationMessageRecord, ContentCreateRequest,
-    ContentEditRequest, ContentError, ContentRecord, ContentStatus, ContentType,
-    ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod,
-    DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus, FarmFieldListPage,
-    FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord, FieldRecord,
-    FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord,
-    FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
-    MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
-    MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage, RasterResolution,
+    prepare_open_data_publication, soil_moisture_rejection_reason_for_error,
+    soil_moisture_rejection_record, transition_marketplace_account_status, validate_field_boundary,
+    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
+    CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
+    CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
+    ContentType, ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError,
+    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage,
+    OpenDataPublication, OpenDataPublishError, OpenDataPublishRequest, RasterResolution,
     RasterSpatialRef, RecommendationPriority, RecommendationRecord, RecommendationStatus,
     ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
     SoilMoistureReadingRecord, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
@@ -268,6 +269,34 @@ pub struct LayerFreshness {
     pub stale: bool,
     pub field_coverage_fraction: Option<f64>,
     pub field_coverage_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenDataLayerPublishRequest {
+    pub license: String,
+    pub attribution: String,
+    #[serde(default)]
+    pub owner_identifier: Option<String>,
+    #[serde(default)]
+    pub field_identifier: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenDataCatalogResponse {
+    pub layers: Vec<OpenDataLayerCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenDataLayerCatalogEntry {
+    pub open_data_id: String,
+    pub product_kind: String,
+    pub license: String,
+    pub attribution: String,
+    pub anonymized: bool,
+    pub spatial_ref: RasterSpatialRef,
+    pub url_path: String,
+    pub tile_url_template: String,
+    pub published_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6348,6 +6377,87 @@ pub async fn get_layer_metadata(
     Ok(Json(layer))
 }
 
+pub async fn publish_open_data_layer(
+    Path((scene_id, kind)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<OpenDataLayerPublishRequest>,
+) -> AppResult<Json<OpenDataLayerCatalogEntry>> {
+    let row = load_layer_row(&state, &scene_id, &kind)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let layer = layer_from_row(&row, true, DEFAULT_LAYER_STALE_AFTER_DAYS)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let source_layer_ref = layer.layer_id.clone();
+    let generated_open_data_id = format!("open-data:{}:{}", layer.scene_id, layer.product_kind);
+    let publication = prepare_open_data_publication(
+        OpenDataPublishRequest {
+            source_layer_ref,
+            license: request.license,
+            attribution: request.attribution,
+            owner_identifier: request.owner_identifier,
+            field_identifier: request.field_identifier,
+        },
+        generated_open_data_id,
+    )
+    .map_err(open_data_publish_error)?;
+
+    sqlx::query(
+        r#"
+        UPDATE products
+        SET open_data_license = ?3,
+            open_data_attribution = ?4,
+            open_data_anonymized = 1,
+            open_data_refusal_reason = NULL,
+            open_data_published_at = datetime('now')
+        WHERE scene_id = ?1 AND lower(kind) = lower(?2)
+        "#,
+    )
+    .bind(&scene_id)
+    .bind(&kind)
+    .bind(&publication.license)
+    .bind(&publication.attribution)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(open_data_catalog_entry_from_layer(
+        &layer,
+        &publication,
+        None,
+    )))
+}
+
+pub async fn list_open_data_layers(
+    State(state): State<AppState>,
+) -> AppResult<Json<OpenDataCatalogResponse>> {
+    let rows = load_layer_rows(&state).await?;
+    let mut layers = Vec::new();
+    for row in rows {
+        if let Some(layer) = layer_from_row(&row, false, DEFAULT_LAYER_STALE_AFTER_DAYS).await? {
+            let license = row.get::<Option<String>, _>("open_data_license");
+            let attribution = row.get::<Option<String>, _>("open_data_attribution");
+            let anonymized = row.get::<Option<i64>, _>("open_data_anonymized") == Some(1);
+            if let (Some(license), Some(attribution), true) = (license, attribution, anonymized) {
+                let publication = OpenDataPublication {
+                    open_data_id: format!("open-data:{}:{}", layer.scene_id, layer.product_kind),
+                    source_layer_ref: layer.layer_id.clone(),
+                    license,
+                    attribution,
+                    anonymized,
+                };
+                layers.push(open_data_catalog_entry_from_layer(
+                    &layer,
+                    &publication,
+                    row.get("open_data_published_at"),
+                ));
+            }
+        }
+    }
+
+    Ok(Json(OpenDataCatalogResponse { layers }))
+}
+
 pub async fn get_scene_audit(
     Path(scene_id): Path<String>,
     State(state): State<AppState>,
@@ -6769,6 +6879,11 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
             p.qa_report_ref,
             p.provenance_hash,
             p.downstream_consumers_json,
+            p.open_data_license,
+            p.open_data_attribution,
+            p.open_data_anonymized,
+            p.open_data_refusal_reason,
+            p.open_data_published_at,
             s.scene_id,
             s.sensor,
             s.acquired_at,
@@ -6817,6 +6932,11 @@ async fn load_layer_row(
             p.qa_report_ref,
             p.provenance_hash,
             p.downstream_consumers_json,
+            p.open_data_license,
+            p.open_data_attribution,
+            p.open_data_anonymized,
+            p.open_data_refusal_reason,
+            p.open_data_published_at,
             s.scene_id,
             s.sensor,
             s.acquired_at,
@@ -6888,6 +7008,32 @@ fn optional_filter_matches(row_value: Option<String>, filter: Option<&String>) -
         return true;
     }
     row_value.as_deref() == Some(filter)
+}
+
+fn open_data_publish_error(error: OpenDataPublishError) -> AppError {
+    match error {
+        OpenDataPublishError::Refused { reason } => {
+            AppError::BadRequest(format!("open_data_refused:{reason:?}").to_ascii_lowercase())
+        }
+    }
+}
+
+fn open_data_catalog_entry_from_layer(
+    layer: &LayerMetadata,
+    publication: &OpenDataPublication,
+    published_at: Option<String>,
+) -> OpenDataLayerCatalogEntry {
+    OpenDataLayerCatalogEntry {
+        open_data_id: publication.open_data_id.clone(),
+        product_kind: layer.product_kind.clone(),
+        license: publication.license.clone(),
+        attribution: publication.attribution.clone(),
+        anonymized: publication.anonymized,
+        spatial_ref: layer.spatial_ref.clone(),
+        url_path: layer.url_path.clone(),
+        tile_url_template: layer.tile_url_template.clone(),
+        published_at,
+    }
 }
 
 async fn layer_from_row(

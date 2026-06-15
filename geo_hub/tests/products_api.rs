@@ -10383,6 +10383,182 @@ async fn layer_metadata_endpoint_returns_asserted_spatial_ref() -> Result<()> {
 }
 
 #[tokio::test]
+async fn open_data_publish_lists_anonymized_layer_with_license_and_extent() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "open-data-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    });
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref).await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let publish = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/layers/{scene_id}/ndvi/open-data"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "license": "CC-BY-4.0",
+                        "attribution": "AGBot open data"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(publish.status(), StatusCode::OK);
+    let publish_body = to_bytes(publish.into_body(), 64 * 1024).await?;
+    let published: serde_json::Value = serde_json::from_slice(&publish_body)?;
+    assert_eq!(
+        published.get("license").and_then(|value| value.as_str()),
+        Some("CC-BY-4.0")
+    );
+    assert_eq!(
+        published
+            .pointer("/spatial_ref/bbox/min_lon")
+            .and_then(|value| value.as_f64()),
+        Some(-96.7)
+    );
+    assert!(published.get("field_id").is_none());
+    assert!(published.get("owner").is_none());
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/open-data/layers")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let catalog: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        catalog
+            .pointer("/layers/0/open_data_id")
+            .and_then(|value| value.as_str()),
+        Some("open-data:open-data-scene:ndvi")
+    );
+    assert_eq!(
+        catalog
+            .pointer("/layers/0/license")
+            .and_then(|value| value.as_str()),
+        Some("CC-BY-4.0")
+    );
+    assert_eq!(
+        catalog
+            .pointer("/layers/0/spatial_ref/crs")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert!(
+        catalog.pointer("/layers/0/field_id").is_none(),
+        "catalog must not expose field identifiers"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_data_publish_refuses_missing_license() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "open-data-missing-license";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, layer_spatial_ref_json()).await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/layers/{scene_id}/ndvi/open-data"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "license": " ",
+                        "attribution": "AGBot open data"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("missinglicense"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_data_publish_refuses_deanonymizing_field_identifier() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "open-data-field-ref";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, layer_spatial_ref_json()).await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/layers/{scene_id}/ndvi/open-data"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "license": "CC-BY-4.0",
+                        "attribution": "AGBot open data",
+                        "field_identifier": "field-alpha"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("fieldidentifierpresent"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_layers_excludes_spatial_ref_integrity_mismatch() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -11879,6 +12055,24 @@ async fn post_orthomosaic_publish_gate(
 }
 
 fn orthomosaic_tile_spatial_ref_json() -> serde_json::Value {
+    json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    })
+}
+
+fn layer_spatial_ref_json() -> serde_json::Value {
     json!({
         "georeferenced": true,
         "crs": "EPSG:4326",

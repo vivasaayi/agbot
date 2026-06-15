@@ -5088,6 +5088,87 @@ pub fn assert_raster_spatial_ref(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenDataPublishRequest {
+    pub source_layer_ref: String,
+    pub license: String,
+    pub attribution: String,
+    #[serde(default)]
+    pub owner_identifier: Option<String>,
+    #[serde(default)]
+    pub field_identifier: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenDataPublication {
+    pub open_data_id: String,
+    pub source_layer_ref: String,
+    pub license: String,
+    pub attribution: String,
+    pub anonymized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenDataPublishRefusalReason {
+    MissingLicense,
+    MissingAttribution,
+    OwnerIdentifierPresent,
+    FieldIdentifierPresent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OpenDataPublishError {
+    #[error("open-data publication refused: {reason:?}")]
+    Refused {
+        reason: OpenDataPublishRefusalReason,
+    },
+}
+
+pub fn prepare_open_data_publication(
+    request: OpenDataPublishRequest,
+    generated_open_data_id: String,
+) -> Result<OpenDataPublication, OpenDataPublishError> {
+    let license = request.license.trim().to_string();
+    if license.is_empty() {
+        return Err(OpenDataPublishError::Refused {
+            reason: OpenDataPublishRefusalReason::MissingLicense,
+        });
+    }
+    let attribution = request.attribution.trim().to_string();
+    if attribution.is_empty() {
+        return Err(OpenDataPublishError::Refused {
+            reason: OpenDataPublishRefusalReason::MissingAttribution,
+        });
+    }
+    if request
+        .owner_identifier
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(OpenDataPublishError::Refused {
+            reason: OpenDataPublishRefusalReason::OwnerIdentifierPresent,
+        });
+    }
+    if request
+        .field_identifier
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(OpenDataPublishError::Refused {
+            reason: OpenDataPublishRefusalReason::FieldIdentifierPresent,
+        });
+    }
+
+    Ok(OpenDataPublication {
+        open_data_id: generated_open_data_id.trim().to_string(),
+        source_layer_ref: request.source_layer_ref.trim().to_string(),
+        license,
+        attribution,
+        anonymized: true,
+    })
+}
+
 fn transform_resolution(transform: &[f64; 6]) -> Result<RasterResolution, RasterSpatialRefError> {
     let resolution = RasterResolution {
         x: transform[1].hypot(transform[4]),
@@ -5347,7 +5428,8 @@ mod tests {
         FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
         FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
         MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountStatus,
-        MarketplacePartyType, MultispectralImage, RasterResolution, RasterSpatialRef,
+        MarketplacePartyType, MultispectralImage, OpenDataPublishError,
+        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
         RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
         RecommendationPriority, RecommendationRecord, RecommendationStatus,
         RecommendationStatusChangeType, ReportDeliverableRegistry, ReportFormat,
@@ -6769,6 +6851,71 @@ mod tests {
         let error = assert_raster_spatial_ref(Some(&spatial_ref), 1, 1).unwrap_err();
 
         assert_eq!(error, RasterSpatialRefError::NonPositiveResolution);
+    }
+
+    #[test]
+    fn open_data_publication_accepts_license_attribution_and_anonymizes() {
+        let publication = super::prepare_open_data_publication(
+            OpenDataPublishRequest {
+                source_layer_ref: "scene-alpha:ndvi".to_string(),
+                license: " CC-BY-4.0 ".to_string(),
+                attribution: " AGBot demo ".to_string(),
+                owner_identifier: None,
+                field_identifier: None,
+            },
+            "open-data:scene-alpha:ndvi".to_string(),
+        )
+        .expect("publication should pass");
+
+        assert_eq!(publication.open_data_id, "open-data:scene-alpha:ndvi");
+        assert_eq!(publication.source_layer_ref, "scene-alpha:ndvi");
+        assert_eq!(publication.license, "CC-BY-4.0");
+        assert_eq!(publication.attribution, "AGBot demo");
+        assert!(publication.anonymized);
+    }
+
+    #[test]
+    fn open_data_publication_rejects_missing_license() {
+        let error = super::prepare_open_data_publication(
+            OpenDataPublishRequest {
+                source_layer_ref: "scene-alpha:ndvi".to_string(),
+                license: " ".to_string(),
+                attribution: "AGBot demo".to_string(),
+                owner_identifier: None,
+                field_identifier: None,
+            },
+            "open-data:scene-alpha:ndvi".to_string(),
+        )
+        .expect_err("missing license should reject");
+
+        assert_eq!(
+            error,
+            OpenDataPublishError::Refused {
+                reason: OpenDataPublishRefusalReason::MissingLicense,
+            }
+        );
+    }
+
+    #[test]
+    fn open_data_publication_rejects_deanonymizing_field_identifier() {
+        let error = super::prepare_open_data_publication(
+            OpenDataPublishRequest {
+                source_layer_ref: "scene-alpha:ndvi".to_string(),
+                license: "CC-BY-4.0".to_string(),
+                attribution: "AGBot demo".to_string(),
+                owner_identifier: None,
+                field_identifier: Some("field-alpha".to_string()),
+            },
+            "open-data:scene-alpha:ndvi".to_string(),
+        )
+        .expect_err("field identifier should reject");
+
+        assert_eq!(
+            error,
+            OpenDataPublishError::Refused {
+                reason: OpenDataPublishRefusalReason::FieldIdentifierPresent,
+            }
+        );
     }
 
     #[test]
