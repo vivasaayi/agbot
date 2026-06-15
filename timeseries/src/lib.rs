@@ -539,6 +539,52 @@ pub struct FleetCarbonConsumerEvaluation {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntheticSeriesMethod {
+    TrendProjection,
+    LinearInterpolation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForecastGapFillRequest {
+    pub metric: MetricDefinition,
+    #[serde(default)]
+    pub observed_points: Vec<SeriesPoint>,
+    pub target: ZonalTrendTarget,
+    pub trend_config: ZonalTrendConfig,
+    #[serde(default)]
+    pub forecast_timestamps: Vec<String>,
+    #[serde(default)]
+    pub gap_fill_timestamps: Vec<String>,
+    pub uncertainty_band: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyntheticSeriesPoint {
+    pub entity_ref: String,
+    pub metric: String,
+    pub unit: String,
+    pub t: String,
+    pub value: f64,
+    pub uncertainty_band: f64,
+    pub synthetic: bool,
+    pub method: SyntheticSeriesMethod,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForecastGapFillResult {
+    pub trend: ZonalTrendResult,
+    #[serde(default)]
+    pub forecast_points: Vec<SyntheticSeriesPoint>,
+    #[serde(default)]
+    pub gap_fill_points: Vec<SyntheticSeriesPoint>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompareViewFeed {
     pub schema_version: String,
@@ -839,6 +885,16 @@ pub enum TimeSeriesError {
     EmptyScalarConsumerRegistrations,
     #[error("scalar consumer evaluation requires at least one point")]
     EmptyScalarConsumerPoints,
+    #[error("synthetic series request requires at least one forecast or gap-fill timestamp")]
+    EmptySyntheticSeriesTargets,
+    #[error("synthetic series uncertainty_band must be finite and non-negative")]
+    InvalidSyntheticSeriesConfig,
+    #[error("gap-fill for {entity_ref}/{metric} at {timestamp} requires bounding real points")]
+    GapFillRequiresBoundingPoints {
+        entity_ref: String,
+        metric: String,
+        timestamp: String,
+    },
     #[error("export CRS cannot be empty")]
     EmptyExportCrs,
     #[error("change zone export CRS mismatch: expected {expected_crs}, got {actual_crs}")]
@@ -1446,6 +1502,82 @@ pub fn evaluate_fleet_carbon_consumers(
         fleet_rul_trend,
         fleet_anomaly,
         carbon_seasonal_change,
+        evidence_refs,
+    })
+}
+
+pub fn build_forecast_gap_fill(
+    request: ForecastGapFillRequest,
+) -> Result<ForecastGapFillResult, TimeSeriesError> {
+    if request.forecast_timestamps.is_empty() && request.gap_fill_timestamps.is_empty() {
+        return Err(TimeSeriesError::EmptySyntheticSeriesTargets);
+    }
+    if !request.uncertainty_band.is_finite() || request.uncertainty_band < 0.0 {
+        return Err(TimeSeriesError::InvalidSyntheticSeriesConfig);
+    }
+
+    let mut engine = TimeSeriesEngine::default();
+    engine.register_metric(request.metric)?;
+    for point in request.observed_points {
+        engine.append(point)?;
+    }
+
+    let trend = engine.compute_zonal_trend(request.target.clone(), request.trend_config)?;
+    let unit = trend.unit.clone();
+    let first_day = timestamp_day_index(&trend.points_used[0].t)?;
+    let mut forecast_points = Vec::new();
+    for timestamp in request.forecast_timestamps {
+        let timestamp = normalize_required_text(timestamp, TimeSeriesError::EmptyTimestamp)?;
+        let day_offset = (timestamp_day_index(&timestamp)? - first_day) as f64;
+        forecast_points.push(SyntheticSeriesPoint {
+            entity_ref: trend.entity_ref.clone(),
+            metric: trend.metric.clone(),
+            unit: unit.clone(),
+            t: timestamp,
+            value: trend.intercept + trend.slope_per_day * day_offset,
+            uncertainty_band: request.uncertainty_band,
+            synthetic: true,
+            method: SyntheticSeriesMethod::TrendProjection,
+            evidence_refs: trend.evidence_refs.clone(),
+        });
+    }
+
+    let mut gap_fill_points = Vec::new();
+    for timestamp in request.gap_fill_timestamps {
+        let timestamp = normalize_required_text(timestamp, TimeSeriesError::EmptyTimestamp)?;
+        let (value, evidence_refs) = interpolate_gap_value(
+            &trend.points_used,
+            &trend.entity_ref,
+            &trend.metric,
+            &timestamp,
+        )?;
+        gap_fill_points.push(SyntheticSeriesPoint {
+            entity_ref: trend.entity_ref.clone(),
+            metric: trend.metric.clone(),
+            unit: unit.clone(),
+            t: timestamp,
+            value,
+            uncertainty_band: request.uncertainty_band,
+            synthetic: true,
+            method: SyntheticSeriesMethod::LinearInterpolation,
+            evidence_refs,
+        });
+    }
+
+    let mut evidence_refs = Vec::new();
+    for reference in &trend.evidence_refs {
+        push_unique(&mut evidence_refs, reference.clone());
+    }
+    for point in forecast_points.iter().chain(&gap_fill_points) {
+        for reference in &point.evidence_refs {
+            push_unique(&mut evidence_refs, reference.clone());
+        }
+    }
+
+    Ok(ForecastGapFillResult {
+        trend,
+        forecast_points,
+        gap_fill_points,
         evidence_refs,
     })
 }
@@ -2438,6 +2570,57 @@ fn metric_kind_for_value(value: &SeriesValue) -> MetricKind {
     }
 }
 
+fn interpolate_gap_value(
+    points: &[SeriesPoint],
+    entity_ref: &str,
+    metric: &str,
+    timestamp: &str,
+) -> Result<(f64, Vec<String>), TimeSeriesError> {
+    let target_day = timestamp_day_index(timestamp)?;
+    let mut samples = Vec::with_capacity(points.len());
+    for point in points {
+        samples.push((
+            timestamp_day_index(&point.t)?,
+            point,
+            scalar_value_from_point(point)?,
+        ));
+    }
+    samples.sort_by_key(|(day, _, _)| *day);
+
+    let previous = samples
+        .iter()
+        .rev()
+        .find(|(day, _, _)| *day < target_day)
+        .copied();
+    let next = samples
+        .iter()
+        .find(|(day, _, _)| *day > target_day)
+        .copied();
+    let (
+        Some((previous_day, previous_point, previous_value)),
+        Some((next_day, next_point, next_value)),
+    ) = (previous, next)
+    else {
+        return Err(TimeSeriesError::GapFillRequiresBoundingPoints {
+            entity_ref: entity_ref.to_string(),
+            metric: metric.to_string(),
+            timestamp: timestamp.to_string(),
+        });
+    };
+
+    let span = (next_day - previous_day) as f64;
+    let offset = (target_day - previous_day) as f64;
+    let ratio = offset / span;
+    let value = previous_value + (next_value - previous_value) * ratio;
+    Ok((
+        value,
+        vec![
+            previous_point.source_ref.clone(),
+            next_point.source_ref.clone(),
+        ],
+    ))
+}
+
 fn timestamp_day_index(timestamp: &str) -> Result<i64, TimeSeriesError> {
     let (year, month, day) = date_parts(timestamp)?;
     Ok(days_from_civil(year, month, day))
@@ -3106,7 +3289,7 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::{
         align_raster_pair, build_change_reproducibility_report, build_compare_view_feed,
-        compare_view_refusal_from_guard, compute_aligned_raster_change,
+        build_forecast_gap_fill, compare_view_refusal_from_guard, compute_aligned_raster_change,
         derive_ranked_change_events, evaluate_fleet_carbon_consumers,
         evaluate_scalar_consumer_series, evaluate_series_cadence_health,
         export_change_mask_geotiff, export_change_zones_geojson, export_series_csv,
@@ -3114,15 +3297,15 @@ mod tests {
         AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason, ChangeEvent,
         ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection, ChangeEventReasonCode,
         ChangeReproducibilityRequest, ChangeSourcePair, ChangeZoneExportFeature, ChangeZonePolygon,
-        FleetCarbonConsumerEvaluationRequest, GeoExtent, MetricDefinition, MetricKind,
-        NormalizedChangeOutcome, NormalizedRasterChangeConfig, RasterAlignmentConfig,
+        FleetCarbonConsumerEvaluationRequest, ForecastGapFillRequest, GeoExtent, MetricDefinition,
+        MetricKind, NormalizedChangeOutcome, NormalizedRasterChangeConfig, RasterAlignmentConfig,
         RasterAlignmentEvidence, RasterChangeConfig, RasterChangeNormalizationMethod,
         RasterChangeResult, RasterResolution, RasterSeriesValue, RollingBaselineConfig,
         ScalarConsumerEvaluationRequest, ScalarConsumerMetricRegistration, ScalarConsumerPoint,
         SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesCadenceHealthConfig,
         SeriesFreshnessState, SeriesPoint, SeriesProductIngest, SeriesQuery, SeriesValue,
-        TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore, TrendDirection,
-        ZonalTrendConfig, ZonalTrendTarget,
+        SyntheticSeriesMethod, TimeRange, TimeSeriesEngine, TimeSeriesError, TimeSeriesStore,
+        TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
     };
 
     #[test]
@@ -3960,6 +4143,113 @@ mod tests {
                 current_t: "2026-06-14T10:00:00Z".to_string(),
                 observed_points: 0,
                 required_points: 1
+            }
+        );
+    }
+
+    #[test]
+    fn forecast_and_gap_fill_return_synthetic_points_with_uncertainty() {
+        let result = build_forecast_gap_fill(ForecastGapFillRequest {
+            metric: metric_definition("ndvi_mean", "index", MetricKind::Scalar),
+            observed_points: vec![
+                scalar_point_with_unit(
+                    "field:alpha",
+                    "ndvi_mean",
+                    "index",
+                    "2026-06-10T10:00:00Z",
+                    0.60,
+                ),
+                scalar_point_with_unit(
+                    "field:alpha",
+                    "ndvi_mean",
+                    "index",
+                    "2026-06-12T10:00:00Z",
+                    0.70,
+                ),
+                scalar_point_with_unit(
+                    "field:alpha",
+                    "ndvi_mean",
+                    "index",
+                    "2026-06-14T10:00:00Z",
+                    0.80,
+                ),
+            ],
+            target: ZonalTrendTarget {
+                entity_ref: "field:alpha".to_string(),
+                metric: "ndvi_mean".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32610".to_string(),
+                range: TimeRange::default(),
+            },
+            trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            forecast_timestamps: vec!["2026-06-16T10:00:00Z".to_string()],
+            gap_fill_timestamps: vec!["2026-06-11T10:00:00Z".to_string()],
+            uncertainty_band: 0.08,
+        })
+        .expect("enough observations should produce synthetic outputs");
+
+        assert_eq!(result.trend.direction, TrendDirection::Increasing);
+        assert_eq!(result.forecast_points.len(), 1);
+        let forecast = &result.forecast_points[0];
+        assert!(forecast.synthetic);
+        assert_eq!(forecast.method, SyntheticSeriesMethod::TrendProjection);
+        assert_eq!(forecast.uncertainty_band, 0.08);
+        assert!((forecast.value - 0.90).abs() < 0.000001);
+        assert_eq!(forecast.evidence_refs.len(), 3);
+
+        assert_eq!(result.gap_fill_points.len(), 1);
+        let gap_fill = &result.gap_fill_points[0];
+        assert!(gap_fill.synthetic);
+        assert_eq!(gap_fill.method, SyntheticSeriesMethod::LinearInterpolation);
+        assert_eq!(gap_fill.uncertainty_band, 0.08);
+        assert!((gap_fill.value - 0.65).abs() < 0.000001);
+        assert_eq!(
+            gap_fill.evidence_refs,
+            vec![
+                "source:field:alpha:ndvi_mean:2026-06-10T10:00:00Z",
+                "source:field:alpha:ndvi_mean:2026-06-12T10:00:00Z"
+            ]
+        );
+    }
+
+    #[test]
+    fn forecast_refuses_insufficient_history_without_synthetic_points() {
+        let error = build_forecast_gap_fill(ForecastGapFillRequest {
+            metric: metric_definition("ndvi_mean", "index", MetricKind::Scalar),
+            observed_points: vec![scalar_point_with_unit(
+                "field:alpha",
+                "ndvi_mean",
+                "index",
+                "2026-06-10T10:00:00Z",
+                0.60,
+            )],
+            target: ZonalTrendTarget {
+                entity_ref: "field:alpha".to_string(),
+                metric: "ndvi_mean".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32610".to_string(),
+                range: TimeRange::default(),
+            },
+            trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            forecast_timestamps: vec!["2026-06-16T10:00:00Z".to_string()],
+            gap_fill_timestamps: Vec::new(),
+            uncertainty_band: 0.08,
+        })
+        .expect_err("one observation cannot produce a forecast");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::InsufficientTrendHistory {
+                entity_ref: "field:alpha".to_string(),
+                metric: "ndvi_mean".to_string(),
+                observed_points: 1,
+                required_points: 3
             }
         );
     }
