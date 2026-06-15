@@ -2856,6 +2856,37 @@ pub struct WeatherForecastValue {
     pub valid_time: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherFreshnessState {
+    Fresh,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherFreshnessAnnotatedValue {
+    pub value: WeatherForecastValue,
+    pub freshness_state: WeatherFreshnessState,
+    pub age_seconds: i64,
+    pub stale_after_seconds: i64,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherFreshnessAnnotatedRecord {
+    pub forecast_id: String,
+    pub field_ref: String,
+    pub valid_time: String,
+    pub source: String,
+    pub fetched_at: String,
+    pub temperature_celsius: WeatherFreshnessAnnotatedValue,
+    pub wind_speed_mps: WeatherFreshnessAnnotatedValue,
+    pub precipitation_mm: WeatherFreshnessAnnotatedValue,
+    pub humidity_percent: WeatherFreshnessAnnotatedValue,
+    pub radiation_w_m2: WeatherFreshnessAnnotatedValue,
+    pub stale: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
@@ -2962,6 +2993,16 @@ pub enum WeatherFieldForecastResolutionError {
     ForecastOutsideField,
     #[error(transparent)]
     InvalidBoundary(#[from] FieldBoundaryValidationError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherFreshnessError {
+    #[error("weather freshness observed_at cannot be empty")]
+    EmptyObservedAt,
+    #[error("weather freshness max age must be positive")]
+    InvalidMaxAge,
+    #[error("weather freshness timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
 }
 
 pub fn normalize_weather_provider_forecast(
@@ -3105,6 +3146,99 @@ pub fn resolve_weather_forecast_to_field(
             "forecast_location:inside_field".to_string(),
         ],
     })
+}
+
+pub fn evaluate_weather_value_freshness(
+    value: WeatherForecastValue,
+    observed_at: &str,
+    stale_after_seconds: i64,
+) -> Result<WeatherFreshnessAnnotatedValue, WeatherFreshnessError> {
+    if stale_after_seconds <= 0 {
+        return Err(WeatherFreshnessError::InvalidMaxAge);
+    }
+    let observed_at = normalize_weather_text(observed_at.to_string())
+        .ok_or(WeatherFreshnessError::EmptyObservedAt)?;
+    let observed_at = parse_weather_freshness_timestamp(&observed_at)?;
+    let fetched_at = parse_weather_freshness_timestamp(&value.fetched_at)?;
+    parse_weather_freshness_timestamp(&value.valid_time)?;
+    let age_seconds = observed_at.signed_duration_since(fetched_at).num_seconds();
+    let stale = age_seconds < 0 || age_seconds > stale_after_seconds;
+    Ok(WeatherFreshnessAnnotatedValue {
+        value,
+        freshness_state: if stale {
+            WeatherFreshnessState::Stale
+        } else {
+            WeatherFreshnessState::Fresh
+        },
+        age_seconds,
+        stale_after_seconds,
+        stale,
+    })
+}
+
+pub fn annotate_weather_record_freshness(
+    record: WeatherForecastRecord,
+    observed_at: &str,
+    stale_after_seconds: i64,
+) -> Result<WeatherFreshnessAnnotatedRecord, WeatherFreshnessError> {
+    let temperature_celsius = evaluate_weather_value_freshness(
+        record.vars.temperature_celsius,
+        observed_at,
+        stale_after_seconds,
+    )?;
+    let wind_speed_mps = evaluate_weather_value_freshness(
+        record.vars.wind_speed_mps,
+        observed_at,
+        stale_after_seconds,
+    )?;
+    let precipitation_mm = evaluate_weather_value_freshness(
+        record.vars.precipitation_mm,
+        observed_at,
+        stale_after_seconds,
+    )?;
+    let humidity_percent = evaluate_weather_value_freshness(
+        record.vars.humidity_percent,
+        observed_at,
+        stale_after_seconds,
+    )?;
+    let radiation_w_m2 = evaluate_weather_value_freshness(
+        record.vars.radiation_w_m2,
+        observed_at,
+        stale_after_seconds,
+    )?;
+    let stale = [
+        &temperature_celsius,
+        &wind_speed_mps,
+        &precipitation_mm,
+        &humidity_percent,
+        &radiation_w_m2,
+    ]
+    .iter()
+    .any(|value| value.stale);
+
+    Ok(WeatherFreshnessAnnotatedRecord {
+        forecast_id: record.forecast_id,
+        field_ref: record.field_ref,
+        valid_time: record.valid_time,
+        source: record.source,
+        fetched_at: record.fetched_at,
+        temperature_celsius,
+        wind_speed_mps,
+        precipitation_mm,
+        humidity_percent,
+        radiation_w_m2,
+        stale,
+    })
+}
+
+fn parse_weather_freshness_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, WeatherFreshnessError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| WeatherFreshnessError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 pub fn weather_fetch_failure_record(
@@ -7610,20 +7744,20 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_content_version, apply_dry_run_validated_fleet_config_bundle,
-        apply_fleet_node_heartbeat, apply_tractor_implement_command,
-        assert_flight_operation_allowed, assert_raster_spatial_ref, bind_fleet_node_identity,
-        bounds_from_points, build_collaboration_channel, build_collaboration_message,
-        build_fleet_version_inventory, build_marketplace_account_record,
-        build_soil_moisture_reading, build_sustainability_record, build_tractor_field_ops_replay,
-        build_tractor_field_ops_session_log, compute_drought_index, create_versioned_content,
-        deconflict_tractor_swath_reservations, detect_tractor_obstacle,
+        annotate_weather_record_freshness, append_content_version,
+        apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
+        apply_tractor_implement_command, assert_flight_operation_allowed,
+        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
+        build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
+        build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
+        build_tractor_field_ops_replay, build_tractor_field_ops_session_log, compute_drought_index,
+        create_versioned_content, deconflict_tractor_swath_reservations, detect_tractor_obstacle,
         dry_run_fleet_config_bundle, evaluate_access_anomaly_advisories, evaluate_tractor_geofence,
         evaluate_tractor_motion_gate, evaluate_tractor_weather_window_gate,
-        execute_tractor_prescription, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, resolve_weather_forecast_to_field,
-        run_tractor_straight_path_guidance, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, tractor_cross_track_error_m,
+        evaluate_weather_value_freshness, execute_tractor_prescription,
+        normalize_weather_provider_forecast, plan_tractor_swath_coverage,
+        resolve_weather_forecast_to_field, run_tractor_straight_path_guidance,
+        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
         verify_and_apply_fleet_config_bundle, weather_fetch_failure_record, AccessAnomalySignal,
         AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
@@ -7664,9 +7798,10 @@ mod tests {
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
         TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
-        WeatherIngestError, WeatherProviderForecastPoint, WeatherProviderForecastResponse,
-        WorkOrderChangeType, WorkOrderCreateRequest, WorkOrderPersistenceError,
-        WorkOrderQueueQuery, WorkOrderRecord, WorkOrderRegistry, WorkOrderStatus,
+        WeatherForecastValue, WeatherFreshnessState, WeatherIngestError,
+        WeatherProviderForecastPoint, WeatherProviderForecastResponse, WorkOrderChangeType,
+        WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
+        WorkOrderRegistry, WorkOrderStatus,
     };
 
     #[test]
@@ -9406,6 +9541,60 @@ mod tests {
     }
 
     #[test]
+    fn weather_freshness_marks_recent_value_fresh_with_age() {
+        let annotated = evaluate_weather_value_freshness(
+            weather_forecast_value("2026-06-13T10:00:00Z", "2026-06-13T11:00:00Z"),
+            "2026-06-13T10:10:00Z",
+            900,
+        )
+        .expect("fresh weather value should annotate");
+
+        assert_eq!(annotated.freshness_state, WeatherFreshnessState::Fresh);
+        assert_eq!(annotated.age_seconds, 600);
+        assert_eq!(annotated.value.source, "NOAA-HRRR");
+        assert!(!annotated.stale);
+    }
+
+    #[test]
+    fn weather_freshness_marks_aged_value_stale() {
+        let annotated = evaluate_weather_value_freshness(
+            weather_forecast_value("2026-06-13T10:00:00Z", "2026-06-13T11:00:00Z"),
+            "2026-06-13T10:30:01Z",
+            1800,
+        )
+        .expect("stale weather value should annotate");
+
+        assert_eq!(annotated.freshness_state, WeatherFreshnessState::Stale);
+        assert_eq!(annotated.age_seconds, 1801);
+        assert_eq!(annotated.stale_after_seconds, 1800);
+        assert!(annotated.stale);
+    }
+
+    #[test]
+    fn weather_record_freshness_propagates_stale_flag_downstream() {
+        let mut request = weather_field_resolution_request(Some((
+            tractor_swath_rectangle(0.0, 0.0, 10.0, 10.0, "EPSG:4326"),
+            GeoPoint {
+                longitude: 5.0,
+                latitude: 5.0,
+            },
+            "EPSG:4326",
+        )));
+        let record = request.records.remove(0);
+
+        let annotated = annotate_weather_record_freshness(record, "2026-06-13T10:30:01Z", 1800)
+            .expect("weather record should annotate freshness");
+
+        assert!(annotated.stale);
+        assert_eq!(
+            annotated.wind_speed_mps.freshness_state,
+            WeatherFreshnessState::Stale
+        );
+        assert_eq!(annotated.wind_speed_mps.value.value, 4.2);
+        assert_eq!(annotated.source, "NOAA-HRRR");
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -9980,6 +10169,16 @@ mod tests {
                 },
             )
             .expect("weather fixture should normalize"),
+        }
+    }
+
+    fn weather_forecast_value(fetched_at: &str, valid_time: &str) -> WeatherForecastValue {
+        WeatherForecastValue {
+            value: 22.5,
+            unit: "deg_c".to_string(),
+            source: "NOAA-HRRR".to_string(),
+            fetched_at: fetched_at.to_string(),
+            valid_time: valid_time.to_string(),
         }
     }
 
