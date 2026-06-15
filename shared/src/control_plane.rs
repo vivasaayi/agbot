@@ -1,4 +1,4 @@
-use crate::schemas::{FarmFieldRegistry, FieldRecord};
+use crate::schemas::{FarmFieldRegistry, FarmRecord, FieldRecord};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -105,6 +105,39 @@ pub struct GrowerPortalAccessEvidence {
     pub target_org_id: Option<String>,
     pub decision: AuthorizationDecision,
     pub reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerFieldActivitySummary {
+    pub field_id: String,
+    pub last_scene_date: Option<String>,
+    pub open_recommendation_count: usize,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalHomeField {
+    pub field_id: String,
+    pub farm_id: String,
+    pub name: String,
+    pub last_scene_date: Option<String>,
+    pub open_recommendation_count: usize,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalHomeFarm {
+    pub farm_id: String,
+    pub name: String,
+    pub fields: Vec<GrowerPortalHomeField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrowerPortalHome {
+    pub grower_id: Uuid,
+    pub org_id: Uuid,
+    pub farms: Vec<GrowerPortalHomeFarm>,
+    pub empty_state: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +341,90 @@ pub fn resolve_grower_portal_session_scope(
         farm_ids,
         field_ids,
     })
+}
+
+pub fn build_grower_portal_home(
+    scope: &GrowerPortalSessionScope,
+    farm_fields: &FarmFieldRegistry,
+    activity: &[GrowerFieldActivitySummary],
+) -> GrowerPortalHome {
+    let org_key = scope.org_id.to_string();
+    let activity_by_field = activity
+        .iter()
+        .map(|summary| (summary.field_id.as_str(), summary))
+        .collect::<HashMap<_, _>>();
+    let scoped_farm_ids = scope
+        .farm_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let scoped_field_ids = scope
+        .field_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let fields = farm_fields
+        .fields_for_org(&org_key)
+        .into_iter()
+        .filter(|field| scoped_field_ids.contains(field.field_id.as_str()))
+        .collect::<Vec<_>>();
+    let mut farms = farm_fields
+        .farms_for_org(&org_key)
+        .into_iter()
+        .filter(|farm| scoped_farm_ids.contains(farm.farm_id.as_str()))
+        .map(|farm| {
+            let farm_fields = fields
+                .iter()
+                .filter(|field| field.farm_id.as_deref() == Some(farm.farm_id.as_str()))
+                .cloned()
+                .collect();
+            grower_home_farm(farm, farm_fields, &activity_by_field)
+        })
+        .collect::<Vec<_>>();
+    farms.retain(|farm| !farm.fields.is_empty() || scoped_field_ids.is_empty());
+
+    GrowerPortalHome {
+        grower_id: scope.grower_id,
+        org_id: scope.org_id,
+        empty_state: fields.is_empty(),
+        farms,
+    }
+}
+
+fn grower_home_farm(
+    farm: FarmRecord,
+    mut fields: Vec<FieldRecord>,
+    activity_by_field: &HashMap<&str, &GrowerFieldActivitySummary>,
+) -> GrowerPortalHomeFarm {
+    fields.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.field_id.cmp(&right.field_id))
+    });
+    let fields = fields
+        .into_iter()
+        .map(|field| {
+            let activity = activity_by_field.get(field.field_id.as_str()).copied();
+            GrowerPortalHomeField {
+                field_id: field.field_id.clone(),
+                farm_id: field.farm_id.unwrap_or_else(|| farm.farm_id.clone()),
+                name: field.name,
+                last_scene_date: activity.and_then(|summary| summary.last_scene_date.clone()),
+                open_recommendation_count: activity
+                    .map(|summary| summary.open_recommendation_count)
+                    .unwrap_or(0),
+                evidence_refs: activity
+                    .map(|summary| summary.evidence_refs.clone())
+                    .unwrap_or_else(|| vec![format!("field:{}:no_activity", field.field_id)]),
+            }
+        })
+        .collect();
+
+    GrowerPortalHomeFarm {
+        farm_id: farm.farm_id,
+        name: farm.name,
+        fields,
+    }
 }
 
 impl TenantScoped for OrganizationRecord {
@@ -898,6 +1015,100 @@ mod tests {
         assert_eq!(scope.role, MembershipRole::Viewer);
         assert_eq!(scope.farm_ids, vec!["farm-a".to_string()]);
         assert_eq!(scope.field_ids, vec!["field-a".to_string()]);
+    }
+
+    #[test]
+    fn grower_portal_home_renders_scoped_farms_fields_and_activity() {
+        let mut control = ControlPlaneRegistry::default();
+        let org_a = control
+            .create_organization("Org A".to_string())
+            .expect("org A creates");
+        let org_b = control
+            .create_organization("Org B".to_string())
+            .expect("org B creates");
+        let grower = control
+            .create_user_with_role(
+                org_a.org_id,
+                "grower@example.com".to_string(),
+                MembershipRole::Viewer,
+            )
+            .expect("grower creates");
+        let mut farm_fields = FarmFieldRegistry::default();
+        insert_test_farm_field_scope(&mut farm_fields, org_a.org_id, "farm-a", "field-a");
+        insert_test_farm_field_scope(&mut farm_fields, org_a.org_id, "farm-c", "field-c");
+        insert_test_farm_field_scope(&mut farm_fields, org_b.org_id, "farm-b", "field-b");
+        let scope =
+            resolve_grower_portal_session_scope(&control, &farm_fields, grower.user.user_id)
+                .expect("grower scope resolves");
+
+        let home = build_grower_portal_home(
+            &scope,
+            &farm_fields,
+            &[
+                GrowerFieldActivitySummary {
+                    field_id: "field-a".to_string(),
+                    last_scene_date: Some("2026-06-12".to_string()),
+                    open_recommendation_count: 2,
+                    evidence_refs: vec![
+                        "scene:scene-a:captured_at:2026-06-12".to_string(),
+                        "recommendation:field-a:open_count:2".to_string(),
+                    ],
+                },
+                GrowerFieldActivitySummary {
+                    field_id: "field-c".to_string(),
+                    last_scene_date: None,
+                    open_recommendation_count: 0,
+                    evidence_refs: vec!["field:field-c:no_scene".to_string()],
+                },
+                GrowerFieldActivitySummary {
+                    field_id: "field-b".to_string(),
+                    last_scene_date: Some("2026-06-13".to_string()),
+                    open_recommendation_count: 9,
+                    evidence_refs: vec!["field:field-b:foreign".to_string()],
+                },
+            ],
+        );
+
+        assert!(!home.empty_state);
+        assert_eq!(home.org_id, org_a.org_id);
+        assert_eq!(
+            home.farms
+                .iter()
+                .map(|farm| farm.farm_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["farm-a", "farm-c"]
+        );
+        assert_eq!(home.farms[0].fields[0].field_id, "field-a");
+        assert_eq!(
+            home.farms[0].fields[0].last_scene_date.as_deref(),
+            Some("2026-06-12")
+        );
+        assert_eq!(home.farms[0].fields[0].open_recommendation_count, 2);
+        assert!(home
+            .farms
+            .iter()
+            .flat_map(|farm| farm.fields.iter())
+            .all(|field| field.field_id != "field-b"));
+    }
+
+    #[test]
+    fn grower_portal_home_renders_empty_state_for_empty_portfolio() {
+        let grower_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let scope = GrowerPortalSessionScope {
+            grower_id,
+            org_id,
+            role: MembershipRole::Viewer,
+            farm_ids: Vec::new(),
+            field_ids: Vec::new(),
+        };
+        let farm_fields = FarmFieldRegistry::default();
+
+        let home = build_grower_portal_home(&scope, &farm_fields, &[]);
+
+        assert!(home.empty_state);
+        assert_eq!(home.grower_id, grower_id);
+        assert!(home.farms.is_empty());
     }
 
     #[test]
