@@ -352,6 +352,66 @@ pub struct JohnDeerePrescriptionPushReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClimateFieldViewPrescriptionPushRequest {
+    pub remote_field_id: String,
+    pub prescription: PrescriptionShapefileRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClimateFieldViewRetryPolicy {
+    pub max_attempts: usize,
+    #[serde(default)]
+    pub backoff_millis: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClimateFieldViewUploadPayload {
+    pub remote_field_id: String,
+    pub prescription_id: String,
+    pub crs: String,
+    pub unit_code: String,
+    pub zone_count: usize,
+    pub rates: Vec<f64>,
+    pub files: PrescriptionShapefileFiles,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClimateFieldViewRemoteReceipt {
+    pub remote_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClimateFieldViewEndpointError {
+    pub message: String,
+}
+
+impl ClimateFieldViewEndpointError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub trait ClimateFieldViewConnectorEndpoint {
+    fn push_prescription(
+        &mut self,
+        payload: ClimateFieldViewUploadPayload,
+    ) -> Result<ClimateFieldViewRemoteReceipt, ClimateFieldViewEndpointError>;
+
+    fn wait_backoff(&mut self, _millis: u64) {}
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClimateFieldViewPrescriptionPushReport {
+    pub remote_id: String,
+    pub attempts: usize,
+    pub backoff_millis: Vec<u64>,
+    pub zone_count: usize,
+    pub unit_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JohnDeereBoundary {
     pub remote_field_id: String,
     pub name: String,
@@ -473,6 +533,27 @@ pub enum JohnDeereConnectorError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ClimateFieldViewConnectorError {
+    EmptyRemoteFieldId,
+    EmptyRemoteId,
+    EndpointFailed {
+        attempts: usize,
+        message: String,
+    },
+    UnsupportedPrescriptionCrs {
+        crs: String,
+    },
+    UnsupportedUnit {
+        unit: String,
+    },
+    MixedUnits {
+        expected_unit: String,
+        actual_unit: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InteropRejectionReason {
     ParseError,
     MissingCrs,
@@ -500,6 +581,9 @@ pub enum InteropRejectionReason {
     },
     JohnDeereConnector {
         reason: JohnDeereConnectorError,
+    },
+    ClimateFieldViewConnector {
+        reason: ClimateFieldViewConnectorError,
     },
 }
 
@@ -1152,6 +1236,78 @@ pub fn push_john_deere_prescription(
     ))
 }
 
+pub fn push_climate_fieldview_prescription(
+    endpoint: &mut impl ClimateFieldViewConnectorEndpoint,
+    request: ClimateFieldViewPrescriptionPushRequest,
+    retry_policy: ClimateFieldViewRetryPolicy,
+) -> Result<ClimateFieldViewPrescriptionPushReport, InteropError> {
+    let remote_field_id =
+        normalize_prescription_text(&request.remote_field_id).ok_or_else(|| {
+            climate_fieldview_rejected(ClimateFieldViewConnectorError::EmptyRemoteFieldId)
+        })?;
+    let prescription = normalize_prescription_request(request.prescription)?;
+    validate_climate_fieldview_prescription_crs(&prescription.field_crs)?;
+    let unit_code = climate_fieldview_unit_code(&prescription)?;
+    let rates = prescription
+        .zones
+        .iter()
+        .map(|zone| zone.rate)
+        .collect::<Vec<_>>();
+    let files = write_prescription_shapefile_bundle(
+        &prescription.field_crs,
+        prescription.field_extent,
+        &prescription.zones,
+    );
+    let payload = ClimateFieldViewUploadPayload {
+        remote_field_id,
+        prescription_id: prescription.prescription_id,
+        crs: prescription.field_crs,
+        unit_code: unit_code.clone(),
+        zone_count: prescription.zones.len(),
+        rates,
+        files,
+    };
+    let max_attempts = retry_policy.max_attempts.max(1);
+    let mut backoff_millis = Vec::new();
+    let mut last_error = None::<ClimateFieldViewEndpointError>;
+
+    for attempt in 1..=max_attempts {
+        match endpoint.push_prescription(payload.clone()) {
+            Ok(receipt) => {
+                let remote_id =
+                    normalize_prescription_text(&receipt.remote_id).ok_or_else(|| {
+                        climate_fieldview_rejected(ClimateFieldViewConnectorError::EmptyRemoteId)
+                    })?;
+                return Ok(ClimateFieldViewPrescriptionPushReport {
+                    remote_id,
+                    attempts: attempt,
+                    backoff_millis,
+                    zone_count: payload.zone_count,
+                    unit_code,
+                });
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < max_attempts {
+                    let backoff = fieldview_backoff_for_attempt(&retry_policy, attempt);
+                    endpoint.wait_backoff(backoff);
+                    backoff_millis.push(backoff);
+                }
+            }
+        }
+    }
+
+    let message = last_error
+        .map(|error| error.message)
+        .unwrap_or_else(|| "endpoint failed".to_string());
+    Err(climate_fieldview_rejected(
+        ClimateFieldViewConnectorError::EndpointFailed {
+            attempts: max_attempts,
+            message,
+        },
+    ))
+}
+
 pub fn pull_john_deere_boundaries(
     endpoint: &mut impl JohnDeereConnectorEndpoint,
 ) -> Result<JohnDeereBoundaryPullReport, InteropError> {
@@ -1494,6 +1650,15 @@ fn backoff_for_attempt(policy: &JohnDeereRetryPolicy, attempt: usize) -> u64 {
         .unwrap_or(0)
 }
 
+fn fieldview_backoff_for_attempt(policy: &ClimateFieldViewRetryPolicy, attempt: usize) -> u64 {
+    policy
+        .backoff_millis
+        .get(attempt.saturating_sub(1))
+        .copied()
+        .or_else(|| policy.backoff_millis.last().copied())
+        .unwrap_or(0)
+}
+
 fn validate_john_deere_prescription_crs(crs: &str) -> Result<(), InteropError> {
     if matches!(crs, WGS84 | WEB_MERCATOR) {
         return Ok(());
@@ -1503,6 +1668,46 @@ fn validate_john_deere_prescription_crs(crs: &str) -> Result<(), InteropError> {
             crs: crs.to_string(),
         },
     ))
+}
+
+fn validate_climate_fieldview_prescription_crs(crs: &str) -> Result<(), InteropError> {
+    if crs == WGS84 {
+        return Ok(());
+    }
+    Err(climate_fieldview_rejected(
+        ClimateFieldViewConnectorError::UnsupportedPrescriptionCrs {
+            crs: crs.to_string(),
+        },
+    ))
+}
+
+fn climate_fieldview_unit_code(
+    prescription: &NormalizedPrescription,
+) -> Result<String, InteropError> {
+    let first_unit = prescription
+        .zones
+        .first()
+        .map(|zone| zone.unit.as_str())
+        .unwrap_or("");
+    for zone in &prescription.zones {
+        if zone.unit != first_unit {
+            return Err(climate_fieldview_rejected(
+                ClimateFieldViewConnectorError::MixedUnits {
+                    expected_unit: first_unit.to_string(),
+                    actual_unit: zone.unit.clone(),
+                },
+            ));
+        }
+    }
+    match first_unit {
+        "kg_ha" => Ok("KG_HA".to_string()),
+        "l_ha" => Ok("L_HA".to_string()),
+        other => Err(climate_fieldview_rejected(
+            ClimateFieldViewConnectorError::UnsupportedUnit {
+                unit: other.to_string(),
+            },
+        )),
+    }
 }
 
 fn map_john_deere_boundary(
@@ -2508,6 +2713,13 @@ fn john_deere_rejected(reason: JohnDeereConnectorError) -> InteropError {
     )
 }
 
+fn climate_fieldview_rejected(reason: ClimateFieldViewConnectorError) -> InteropError {
+    rejected(
+        "climate-fieldview",
+        InteropRejectionReason::ClimateFieldViewConnector { reason },
+    )
+}
+
 fn parse_geojson_and_reproject(
     filename: &str,
     bytes: &[u8],
@@ -2824,9 +3036,12 @@ mod tests {
     use super::{
         emit_import_lineage, export_findings_geojson, export_findings_shapefile,
         export_prescription_shapefile, export_prescription_taskdata, export_raster_geotiff,
-        import_field_boundary, pull_john_deere_boundaries, push_john_deere_prescription,
-        record_import_rejection, reopen_raster_geotiff, round_trip_vector_layer,
-        validate_and_reproject_import, validate_geopackage_layers, validate_taskdata_xml,
+        import_field_boundary, pull_john_deere_boundaries, push_climate_fieldview_prescription,
+        push_john_deere_prescription, record_import_rejection, reopen_raster_geotiff,
+        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
+        validate_taskdata_xml, ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
+        ClimateFieldViewEndpointError, ClimateFieldViewPrescriptionPushRequest,
+        ClimateFieldViewRemoteReceipt, ClimateFieldViewRetryPolicy, ClimateFieldViewUploadPayload,
         CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason,
         FindingsExportFeature, FindingsExportRequest, ImportFormat, ImportLineageEmissionRequest,
         ImportPayload, ImportRejectionAuditRequest, InteropCoordinate, InteropError, InteropExtent,
@@ -3747,6 +3962,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn climate_fieldview_connector_pushes_prescription_with_mapping() {
+        let mut endpoint = FakeClimateFieldViewEndpoint::new().with_push_success("cfv-rx-001");
+
+        let report = push_climate_fieldview_prescription(
+            &mut endpoint,
+            ClimateFieldViewPrescriptionPushRequest {
+                remote_field_id: "cfv-field-alpha".to_string(),
+                prescription: john_deere_prescription_request(),
+            },
+            ClimateFieldViewRetryPolicy {
+                max_attempts: 1,
+                backoff_millis: Vec::new(),
+            },
+        )
+        .expect("FieldView connector should upload");
+
+        assert_eq!(report.remote_id, "cfv-rx-001");
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.unit_code, "KG_HA");
+        assert_eq!(endpoint.uploads.len(), 1);
+        let payload = endpoint.uploads.last().expect("payload should be sent");
+        assert_eq!(payload.remote_field_id, "cfv-field-alpha");
+        assert_eq!(payload.prescription_id, "rx-alpha-2026");
+        assert_eq!(payload.crs, "EPSG:4326");
+        assert_eq!(payload.zone_count, 2);
+        assert_eq!(payload.rates, vec![32.5, 12.25]);
+        assert!(!payload.files.shp.is_empty());
+        assert!(!payload.files.dbf.is_empty());
+        assert!(String::from_utf8(payload.files.prj.clone())
+            .expect("prj should be utf8")
+            .contains("WGS_1984"));
+    }
+
+    #[test]
+    fn climate_fieldview_connector_refuses_unsupported_crs_before_upload() {
+        let mut endpoint = FakeClimateFieldViewEndpoint::new().with_push_success("cfv-rx-001");
+
+        let error = push_climate_fieldview_prescription(
+            &mut endpoint,
+            ClimateFieldViewPrescriptionPushRequest {
+                remote_field_id: "cfv-field-alpha".to_string(),
+                prescription: prescription_request(),
+            },
+            ClimateFieldViewRetryPolicy {
+                max_attempts: 1,
+                backoff_millis: Vec::new(),
+            },
+        )
+        .expect_err("unsupported FieldView CRS should refuse before upload");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "climate-fieldview".to_string(),
+                reason: InteropRejectionReason::ClimateFieldViewConnector {
+                    reason: ClimateFieldViewConnectorError::UnsupportedPrescriptionCrs {
+                        crs: "EPSG:32614".to_string(),
+                    }
+                }
+            }
+        );
+        assert!(endpoint.uploads.is_empty());
+    }
+
     #[derive(Default)]
     struct FakeJohnDeereEndpoint {
         push_results: Vec<Result<RemotePrescriptionReceipt, JohnDeereEndpointError>>,
@@ -3793,6 +4073,45 @@ mod tests {
 
         fn pull_boundaries(&mut self) -> Result<Vec<JohnDeereBoundary>, JohnDeereEndpointError> {
             Ok(self.boundaries.clone())
+        }
+
+        fn wait_backoff(&mut self, millis: u64) {
+            self.backoffs.push(millis);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeClimateFieldViewEndpoint {
+        push_results: Vec<Result<ClimateFieldViewRemoteReceipt, ClimateFieldViewEndpointError>>,
+        uploads: Vec<ClimateFieldViewUploadPayload>,
+        backoffs: Vec<u64>,
+    }
+
+    impl FakeClimateFieldViewEndpoint {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_push_success(mut self, remote_id: &str) -> Self {
+            self.push_results.push(Ok(ClimateFieldViewRemoteReceipt {
+                remote_id: remote_id.to_string(),
+            }));
+            self
+        }
+    }
+
+    impl ClimateFieldViewConnectorEndpoint for FakeClimateFieldViewEndpoint {
+        fn push_prescription(
+            &mut self,
+            payload: ClimateFieldViewUploadPayload,
+        ) -> Result<ClimateFieldViewRemoteReceipt, ClimateFieldViewEndpointError> {
+            self.uploads.push(payload);
+            if self.push_results.is_empty() {
+                return Err(ClimateFieldViewEndpointError::new(
+                    "no fake response configured",
+                ));
+            }
+            self.push_results.remove(0)
         }
 
         fn wait_backoff(&mut self, millis: u64) {
