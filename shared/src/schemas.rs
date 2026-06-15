@@ -8280,6 +8280,56 @@ pub struct MarketplacePortalEntry {
     pub visible: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceListingStatus {
+    Draft,
+    Published,
+    Closed,
+}
+
+impl MarketplaceListingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketplaceListingStatus::Draft => "draft",
+            MarketplaceListingStatus::Published => "published",
+            MarketplaceListingStatus::Closed => "closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketplaceAvailabilityWindow {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceListingPublishRequest {
+    #[serde(default)]
+    pub listing_id: Option<String>,
+    pub item_id: String,
+    pub org_id: String,
+    pub price: f64,
+    pub currency: String,
+    pub available_qty: f64,
+    pub window: MarketplaceAvailabilityWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceListingRecord {
+    pub listing_id: String,
+    pub item_id: String,
+    pub org_id: String,
+    pub price: f64,
+    pub currency: String,
+    pub available_qty: f64,
+    pub window: MarketplaceAvailabilityWindow,
+    pub status: MarketplaceListingStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarketplaceAccountError {
     #[error("marketplace account_id cannot be empty")]
@@ -8356,6 +8406,42 @@ pub enum MarketplacePortalEntryError {
     AccountNotActive { account_id: String },
     #[error("marketplace portal account {account_id} has no marketplace access role")]
     MissingMarketplaceRole { account_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarketplaceListingError {
+    #[error("marketplace listing_id cannot be empty")]
+    EmptyListingId,
+    #[error("marketplace listing item_id cannot be empty")]
+    EmptyItemId,
+    #[error("marketplace listing org_id cannot be empty")]
+    EmptyOrgId,
+    #[error("marketplace listing currency cannot be empty")]
+    EmptyCurrency,
+    #[error("marketplace listing window start cannot be empty")]
+    EmptyWindowStart,
+    #[error("marketplace listing window end cannot be empty")]
+    EmptyWindowEnd,
+    #[error("marketplace listing catalog item is required")]
+    MissingCatalogItem,
+    #[error(
+        "marketplace listing catalog item {item_id} belongs to {item_org_id}, not {listing_org_id}"
+    )]
+    CatalogOrgMismatch {
+        item_id: String,
+        item_org_id: String,
+        listing_org_id: String,
+    },
+    #[error("marketplace listing price must be finite and positive")]
+    InvalidPrice,
+    #[error("marketplace listing quantity must be finite and positive")]
+    InvalidQuantity,
+    #[error("marketplace listing window range is invalid")]
+    InvalidWindowRange,
+    #[error("marketplace listing timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
+    #[error("unsupported marketplace listing status {value}")]
+    UnsupportedStatus { value: String },
 }
 
 pub fn build_marketplace_account_record(
@@ -8478,6 +8564,84 @@ pub fn build_marketplace_catalog_item_record(
     })
 }
 
+pub fn publish_marketplace_listing_record(
+    request: MarketplaceListingPublishRequest,
+    catalog_item: Option<&MarketplaceCatalogItemRecord>,
+    generated_listing_id: String,
+    created_at: String,
+) -> Result<MarketplaceListingRecord, MarketplaceListingError> {
+    let listing_id = normalize_marketplace_optional_text(request.listing_id)
+        .or_else(|| normalize_marketplace_text(generated_listing_id))
+        .ok_or(MarketplaceListingError::EmptyListingId)?;
+    let item_id =
+        normalize_marketplace_text(request.item_id).ok_or(MarketplaceListingError::EmptyItemId)?;
+    let org_id =
+        normalize_marketplace_text(request.org_id).ok_or(MarketplaceListingError::EmptyOrgId)?;
+    let currency = normalize_marketplace_text(request.currency)
+        .ok_or(MarketplaceListingError::EmptyCurrency)?;
+    let window_from = normalize_marketplace_text(request.window.from)
+        .ok_or(MarketplaceListingError::EmptyWindowStart)?;
+    let window_to = normalize_marketplace_text(request.window.to)
+        .ok_or(MarketplaceListingError::EmptyWindowEnd)?;
+    let parsed_from = parse_marketplace_listing_timestamp(&window_from)?;
+    let parsed_to = parse_marketplace_listing_timestamp(&window_to)?;
+    if parsed_to < parsed_from {
+        return Err(MarketplaceListingError::InvalidWindowRange);
+    }
+    if !(request.price.is_finite() && request.price > 0.0) {
+        return Err(MarketplaceListingError::InvalidPrice);
+    }
+    if !(request.available_qty.is_finite() && request.available_qty > 0.0) {
+        return Err(MarketplaceListingError::InvalidQuantity);
+    }
+    let catalog_item = catalog_item.ok_or(MarketplaceListingError::MissingCatalogItem)?;
+    if catalog_item.item_id != item_id || catalog_item.org_id != org_id {
+        return Err(MarketplaceListingError::CatalogOrgMismatch {
+            item_id: catalog_item.item_id.clone(),
+            item_org_id: catalog_item.org_id.clone(),
+            listing_org_id: org_id,
+        });
+    }
+    let created_at = normalize_marketplace_text(created_at).ok_or(
+        MarketplaceListingError::InvalidTimestamp {
+            timestamp: String::new(),
+        },
+    )?;
+    parse_marketplace_listing_timestamp(&created_at)?;
+
+    Ok(MarketplaceListingRecord {
+        listing_id,
+        item_id,
+        org_id,
+        price: request.price,
+        currency,
+        available_qty: request.available_qty,
+        window: MarketplaceAvailabilityWindow {
+            from: window_from,
+            to: window_to,
+        },
+        status: MarketplaceListingStatus::Published,
+        created_at: created_at.clone(),
+        updated_at: created_at,
+    })
+}
+
+pub fn close_marketplace_listing_record(
+    record: &MarketplaceListingRecord,
+    updated_at: String,
+) -> Result<MarketplaceListingRecord, MarketplaceListingError> {
+    let updated_at = normalize_marketplace_text(updated_at).ok_or(
+        MarketplaceListingError::InvalidTimestamp {
+            timestamp: String::new(),
+        },
+    )?;
+    parse_marketplace_listing_timestamp(&updated_at)?;
+    let mut updated = record.clone();
+    updated.status = MarketplaceListingStatus::Closed;
+    updated.updated_at = updated_at;
+    Ok(updated)
+}
+
 pub fn transition_marketplace_account_status(
     record: &MarketplaceAccountRecord,
     to: MarketplaceAccountStatus,
@@ -8569,6 +8733,19 @@ pub fn parse_marketplace_account_status(
     }
 }
 
+pub fn parse_marketplace_listing_status(
+    value: &str,
+) -> Result<MarketplaceListingStatus, MarketplaceListingError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "draft" => Ok(MarketplaceListingStatus::Draft),
+        "published" => Ok(MarketplaceListingStatus::Published),
+        "closed" => Ok(MarketplaceListingStatus::Closed),
+        _ => Err(MarketplaceListingError::UnsupportedStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
 fn valid_marketplace_account_transition(
     from: MarketplaceAccountStatus,
     to: MarketplaceAccountStatus,
@@ -8609,6 +8786,16 @@ fn normalize_marketplace_optional_text(value: Option<String>) -> Option<String> 
 fn normalize_marketplace_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_marketplace_listing_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, MarketplaceListingError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|_| MarketplaceListingError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -12427,9 +12614,10 @@ mod tests {
         build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_marketplace_portal_entry,
         build_soil_moisture_reading, build_sustainability_record, build_tractor_field_ops_replay,
-        build_tractor_field_ops_session_log, compute_drought_baseline_trend, compute_drought_index,
-        compute_drought_risk_score, compute_water_evapotranspiration,
-        compute_weather_growing_degree_day, compute_weather_reference_et, create_versioned_content,
+        build_tractor_field_ops_session_log, close_marketplace_listing_record,
+        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
+        compute_water_evapotranspiration, compute_weather_growing_degree_day,
+        compute_weather_reference_et, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -12440,48 +12628,50 @@ mod tests {
         execute_tractor_prescription, forecast_drought_risk, fuse_drought_evidence,
         ingest_drought_stress_evidence, ingest_remote_sensing_moisture_proxy_layer,
         ingest_weather_sensor_stream, map_zone_water_need, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, query_drought_history, query_irrigation_history,
-        query_weather_history, report_water_use_savings, resolve_weather_forecast_to_field,
-        route_weather_alert, run_tractor_straight_path_guidance, schedule_irrigation_plan,
-        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
-        transition_marketplace_account_status, validate_field_boundary,
-        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
-        verify_weather_forecast_accuracy, weather_fetch_failure_record,
-        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
-        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
-        ContentCreateRequest, ContentError, ContentStatus, ContentType, CropPlanRecord,
-        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
-        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
-        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
-        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
-        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
-        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
-        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
-        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
-        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
-        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
-        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
-        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
-        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
-        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
-        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
-        MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
-        MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplacePartyType,
-        MarketplacePortalEntryError, MarketplaceUnitOfMeasure, MultispectralImage,
-        OpenDataPublishError, OpenDataPublishRefusalReason, OpenDataPublishRequest,
-        RasterResolution, RasterSpatialRef, RasterSpatialRefError, RecommendationLifecycleRegistry,
-        RecommendationPersistenceError, RecommendationPriority, RecommendationRecord,
-        RecommendationStatus, RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        plan_tractor_swath_coverage, publish_marketplace_listing_record, query_drought_history,
+        query_irrigation_history, query_weather_history, report_water_use_savings,
+        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
+        schedule_irrigation_plan, sign_fleet_config_bundle, soil_moisture_rejection_record,
+        tractor_cross_track_error_m, transition_marketplace_account_status,
+        validate_field_boundary, validate_water_weather_input_contract,
+        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
+        weather_fetch_failure_record, zone_water_need_insufficient, AccessAnomalySignal,
+        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
+        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
+        AuditedAnnotationRecord, CollaborationChannelCreateRequest, CollaborationError,
+        CollaborationMessageCreateRequest, ContentCreateRequest, ContentError, ContentStatus,
+        ContentType, CropPlanRecord, DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus,
+        DroughtAlertRoutingRequest, DroughtBaselineTrendError, DroughtBaselineTrendRequest,
+        DroughtBaselineTrendStatus, DroughtEvidenceFusionError, DroughtEvidenceFusionRequest,
+        DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus, DroughtForecastRequest,
+        DroughtForecastStatus, DroughtForecastUncertaintyBand, DroughtHistoryEntry,
+        DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
+        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
+        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
+        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
+        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
+        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
+        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
+        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
+        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
+        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
+        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
+        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
+        MarketplaceCatalogItemKind, MarketplaceListingError, MarketplaceListingPublishRequest,
+        MarketplaceListingStatus, MarketplacePartyType, MarketplacePortalEntryError,
+        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
+        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
         RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
         RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
         ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
@@ -13995,6 +14185,61 @@ mod tests {
                 account_id: "grower-001".to_string()
             }
         );
+    }
+
+    #[test]
+    fn marketplace_listing_publishes_from_catalog_item() {
+        let item = marketplace_catalog_item_fixture("seed-corn-001", "org-alpha");
+
+        let listing = publish_marketplace_listing_record(
+            marketplace_listing_request("2026-06-14T09:00:00Z", "2026-07-14T09:00:00Z"),
+            Some(&item),
+            "generated-listing".to_string(),
+            "2026-06-14T08:00:00Z".to_string(),
+        )
+        .expect("valid listing should publish");
+
+        assert_eq!(listing.listing_id, "listing-seed-corn-001");
+        assert_eq!(listing.item_id, "seed-corn-001");
+        assert_eq!(listing.org_id, "org-alpha");
+        assert_eq!(listing.price, 125.0);
+        assert_eq!(listing.currency, "USD");
+        assert_eq!(listing.available_qty, 40.0);
+        assert_eq!(listing.status, MarketplaceListingStatus::Published);
+    }
+
+    #[test]
+    fn marketplace_listing_close_updates_status() {
+        let item = marketplace_catalog_item_fixture("seed-corn-001", "org-alpha");
+        let listing = publish_marketplace_listing_record(
+            marketplace_listing_request("2026-06-14T09:00:00Z", "2026-07-14T09:00:00Z"),
+            Some(&item),
+            "generated-listing".to_string(),
+            "2026-06-14T08:00:00Z".to_string(),
+        )
+        .expect("valid listing should publish");
+
+        let closed = close_marketplace_listing_record(&listing, "2026-06-15T08:00:00Z".to_string())
+            .expect("listing should close");
+
+        assert_eq!(closed.status, MarketplaceListingStatus::Closed);
+        assert_eq!(closed.updated_at, "2026-06-15T08:00:00Z");
+        assert_eq!(closed.created_at, listing.created_at);
+    }
+
+    #[test]
+    fn marketplace_listing_rejects_inverted_window() {
+        let item = marketplace_catalog_item_fixture("seed-corn-001", "org-alpha");
+
+        let error = publish_marketplace_listing_record(
+            marketplace_listing_request("2026-07-14T09:00:00Z", "2026-06-14T09:00:00Z"),
+            Some(&item),
+            "generated-listing".to_string(),
+            "2026-06-14T08:00:00Z".to_string(),
+        )
+        .expect_err("inverted availability window should reject");
+
+        assert_eq!(error, MarketplaceListingError::InvalidWindowRange);
     }
 
     #[test]
@@ -16680,6 +16925,40 @@ mod tests {
             name: "Hybrid corn seed".to_string(),
             unit_of_measure,
             owner_account_id: "supplier-001".to_string(),
+        }
+    }
+
+    fn marketplace_catalog_item_fixture(
+        item_id: &str,
+        org_id: &str,
+    ) -> super::MarketplaceCatalogItemRecord {
+        super::MarketplaceCatalogItemRecord {
+            item_id: item_id.to_string(),
+            org_id: org_id.to_string(),
+            kind: MarketplaceCatalogItemKind::Input,
+            category: MarketplaceCatalogCategory::Seed,
+            name: "Hybrid corn seed".to_string(),
+            unit_of_measure: MarketplaceUnitOfMeasure::Bag,
+            owner_account_id: "supplier-001".to_string(),
+            created_at: "2026-06-14T08:00:00Z".to_string(),
+        }
+    }
+
+    fn marketplace_listing_request(
+        window_from: &str,
+        window_to: &str,
+    ) -> MarketplaceListingPublishRequest {
+        MarketplaceListingPublishRequest {
+            listing_id: Some("listing-seed-corn-001".to_string()),
+            item_id: "seed-corn-001".to_string(),
+            org_id: "org-alpha".to_string(),
+            price: 125.0,
+            currency: "USD".to_string(),
+            available_qty: 40.0,
+            window: MarketplaceAvailabilityWindow {
+                from: window_from.to_string(),
+                to: window_to.to_string(),
+            },
         }
     }
 

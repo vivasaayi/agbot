@@ -3443,6 +3443,149 @@ async fn marketplace_portal_entry_is_visible_only_with_access_role() -> Result<(
 }
 
 #[tokio::test]
+async fn marketplace_listings_publish_get_list_and_close() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+    seed_marketplace_catalog_item(&ctx, "seed-corn-001", "org-alpha", "supplier-001").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/listings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "listing_id": "listing-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "price": 125.0,
+                        "currency": "USD",
+                        "available_qty": 40.0,
+                        "window": {
+                            "from": "2026-06-14T09:00:00Z",
+                            "to": "2026-07-14T09:00:00Z"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let listing: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        listing.get("status").and_then(|value| value.as_str()),
+        Some("published")
+    );
+
+    let fetched = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/listings/listing-seed-corn-001?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(fetched.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/listings?org_id=org-alpha&status=published")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let listings: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listings.len(), 1);
+
+    let close = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/listings/listing-seed-corn-001/close")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "org_id": "org-alpha" }).to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(close.status(), StatusCode::OK);
+    let body = to_bytes(close.into_body(), 64 * 1024).await?;
+    let closed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        closed.get("status").and_then(|value| value.as_str()),
+        Some("closed")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_listing_rejects_inverted_window_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+    seed_marketplace_catalog_item(&ctx, "seed-corn-001", "org-alpha", "supplier-001").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/listings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "listing_id": "listing-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "price": 125.0,
+                        "currency": "USD",
+                        "available_qty": 40.0,
+                        "window": {
+                            "from": "2026-07-14T09:00:00Z",
+                            "to": "2026-06-14T09:00:00Z"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let listing_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_listings")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(listing_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn sustainability_records_create_get_and_list_field_scoped() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -12037,6 +12180,40 @@ async fn seed_marketplace_account_with_roles(
                         "org_id": org_id,
                         "party_type": party_type,
                         "role_refs": role_refs
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_marketplace_catalog_item(
+    ctx: &TestContext,
+    item_id: &str,
+    org_id: &str,
+    owner_account_id: &str,
+) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/catalog/items")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "item_id": item_id,
+                        "org_id": org_id,
+                        "kind": "input",
+                        "category": "seed",
+                        "name": "Hybrid corn seed",
+                        "unit_of_measure": "bag",
+                        "owner_account_id": owner_account_id
                     })
                     .to_string(),
                 ))

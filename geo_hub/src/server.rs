@@ -254,6 +254,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_marketplace_portal_entry),
         )
         .route(
+            "/api/marketplace/listings",
+            get(routes::list_marketplace_listings).post(routes::publish_marketplace_listing),
+        )
+        .route(
+            "/api/marketplace/listings/:listing_id",
+            get(routes::get_marketplace_listing),
+        )
+        .route(
+            "/api/marketplace/listings/:listing_id/close",
+            post(routes::close_marketplace_listing),
+        )
+        .route(
             "/api/sustainability/records",
             get(routes::list_sustainability_records).post(routes::create_sustainability_record),
         )
