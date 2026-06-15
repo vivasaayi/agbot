@@ -2932,6 +2932,31 @@ pub struct WeatherSensorStreamIngest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherHistoryEntry {
+    pub sequence: usize,
+    pub record: WeatherFreshnessAnnotatedRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeatherHistoryQuery {
+    pub field_ref: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherHistoryQueryResult {
+    pub field_ref: String,
+    pub total_count: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub empty: bool,
+    pub records: Vec<WeatherHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherForecastVariables {
     pub temperature_celsius: WeatherForecastValue,
     pub wind_speed_mps: WeatherForecastValue,
@@ -3071,6 +3096,18 @@ pub enum WeatherSensorIngestError {
     Weather(#[from] WeatherIngestError),
     #[error(transparent)]
     Freshness(#[from] WeatherFreshnessError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeatherHistoryError {
+    #[error("weather history field_ref cannot be empty")]
+    EmptyFieldRef,
+    #[error("weather history limit must be positive")]
+    InvalidLimit,
+    #[error("weather history date range is invalid")]
+    InvalidDateRange,
+    #[error("weather history timestamp is invalid: {timestamp}")]
+    InvalidTimestamp { timestamp: String },
 }
 
 pub fn normalize_weather_provider_forecast(
@@ -3461,6 +3498,84 @@ fn parse_weather_sensor_timestamp(
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.with_timezone(&chrono::Utc))
         .map_err(|_| WeatherSensorIngestError::InvalidTimestamp {
+            timestamp: timestamp.to_string(),
+        })
+}
+
+pub fn append_weather_history_records(
+    mut existing: Vec<WeatherHistoryEntry>,
+    records: Vec<WeatherFreshnessAnnotatedRecord>,
+) -> Vec<WeatherHistoryEntry> {
+    let mut next_sequence = existing
+        .iter()
+        .map(|entry| entry.sequence)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    for record in records {
+        existing.push(WeatherHistoryEntry {
+            sequence: next_sequence,
+            record,
+        });
+        next_sequence += 1;
+    }
+    existing
+}
+
+pub fn query_weather_history(
+    entries: &[WeatherHistoryEntry],
+    query: WeatherHistoryQuery,
+) -> Result<WeatherHistoryQueryResult, WeatherHistoryError> {
+    let field_ref =
+        normalize_weather_text(query.field_ref).ok_or(WeatherHistoryError::EmptyFieldRef)?;
+    if query.limit == 0 {
+        return Err(WeatherHistoryError::InvalidLimit);
+    }
+    let start_time = parse_weather_history_timestamp(&query.start_time)?;
+    let end_time = parse_weather_history_timestamp(&query.end_time)?;
+    if end_time < start_time {
+        return Err(WeatherHistoryError::InvalidDateRange);
+    }
+
+    let mut matching = entries
+        .iter()
+        .filter(|entry| entry.record.field_ref == field_ref)
+        .filter_map(|entry| {
+            parse_weather_history_timestamp(&entry.record.valid_time)
+                .ok()
+                .filter(|valid_time| *valid_time >= start_time && *valid_time <= end_time)
+                .map(|_| entry.clone())
+        })
+        .collect::<Vec<_>>();
+    matching.sort_by(|left, right| {
+        left.record
+            .valid_time
+            .cmp(&right.record.valid_time)
+            .then_with(|| left.sequence.cmp(&right.sequence))
+    });
+    let total_count = matching.len();
+    let records = matching
+        .into_iter()
+        .skip(query.offset)
+        .take(query.limit)
+        .collect::<Vec<_>>();
+
+    Ok(WeatherHistoryQueryResult {
+        field_ref,
+        total_count,
+        offset: query.offset,
+        limit: query.limit,
+        empty: total_count == 0,
+        records,
+    })
+}
+
+fn parse_weather_history_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, WeatherHistoryError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| WeatherHistoryError::InvalidTimestamp {
             timestamp: timestamp.to_string(),
         })
 }
@@ -7968,7 +8083,7 @@ pub fn bounds_from_points(points: &[GeoPoint]) -> Option<GeoBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        annotate_weather_record_freshness, append_content_version,
+        annotate_weather_record_freshness, append_content_version, append_weather_history_records,
         apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
         apply_tractor_implement_command, assert_flight_operation_allowed,
         assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
@@ -7980,7 +8095,7 @@ mod tests {
         evaluate_tractor_motion_gate, evaluate_tractor_weather_window_gate,
         evaluate_weather_value_freshness, execute_tractor_prescription,
         ingest_weather_sensor_stream, normalize_weather_provider_forecast,
-        plan_tractor_swath_coverage, resolve_weather_forecast_to_field,
+        plan_tractor_swath_coverage, query_weather_history, resolve_weather_forecast_to_field,
         run_tractor_straight_path_guidance, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m,
         transition_marketplace_account_status, validate_field_boundary,
@@ -8023,7 +8138,7 @@ mod tests {
         TractorSwathCoverageRequest, TractorSwathReservation, TractorSwathSegment,
         TractorWeatherWindowDecision, TractorWeatherWindowGateRequest,
         WeatherFieldForecastResolutionError, WeatherFieldForecastResolutionRequest,
-        WeatherForecastValue, WeatherFreshnessState, WeatherIngestError,
+        WeatherForecastValue, WeatherFreshnessState, WeatherHistoryQuery, WeatherIngestError,
         WeatherProviderForecastPoint, WeatherProviderForecastResponse, WeatherSensorIngestError,
         WeatherSensorSample, WeatherSensorStreamIngestRequest, WorkOrderChangeType,
         WorkOrderCreateRequest, WorkOrderPersistenceError, WorkOrderQueueQuery, WorkOrderRecord,
@@ -9881,6 +9996,76 @@ mod tests {
     }
 
     #[test]
+    fn weather_history_query_returns_field_range_with_freshness() {
+        let ingest = ingest_weather_sensor_stream(weather_sensor_stream_request(vec![
+            weather_sensor_sample("2026-06-13T10:00:00Z", 22.5),
+            weather_sensor_sample("2026-06-13T10:05:00Z", 23.0),
+        ]))
+        .expect("history fixture should ingest");
+        let history = append_weather_history_records(Vec::new(), ingest.freshness);
+
+        let result = query_weather_history(
+            &history,
+            weather_history_query(
+                "field-north",
+                "2026-06-13T09:59:00Z",
+                "2026-06-13T10:06:00Z",
+            ),
+        )
+        .expect("history query should succeed");
+
+        assert!(!result.empty);
+        assert_eq!(result.total_count, 2);
+        assert_eq!(result.records[0].sequence, 1);
+        assert_eq!(result.records[0].record.source, "sensor");
+        assert_eq!(
+            result.records[0].record.temperature_celsius.freshness_state,
+            WeatherFreshnessState::Fresh
+        );
+    }
+
+    #[test]
+    fn weather_history_query_paginates_append_only_order() {
+        let ingest = ingest_weather_sensor_stream(weather_sensor_stream_request(vec![
+            weather_sensor_sample("2026-06-13T10:00:00Z", 22.5),
+            weather_sensor_sample("2026-06-13T10:05:00Z", 23.0),
+        ]))
+        .expect("history fixture should ingest");
+        let history = append_weather_history_records(Vec::new(), ingest.freshness);
+        let mut query = weather_history_query(
+            "field-north",
+            "2026-06-13T09:59:00Z",
+            "2026-06-13T10:06:00Z",
+        );
+        query.offset = 1;
+        query.limit = 1;
+
+        let result = query_weather_history(&history, query).expect("paginated history query works");
+
+        assert_eq!(result.total_count, 2);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].sequence, 2);
+        assert_eq!(result.records[0].record.valid_time, "2026-06-13T10:05:00Z");
+    }
+
+    #[test]
+    fn weather_history_query_empty_field_returns_empty_result() {
+        let result = query_weather_history(
+            &[],
+            weather_history_query(
+                "field-north",
+                "2026-06-13T09:59:00Z",
+                "2026-06-13T10:06:00Z",
+            ),
+        )
+        .expect("empty history is a valid result");
+
+        assert!(result.empty);
+        assert_eq!(result.total_count, 0);
+        assert!(result.records.is_empty());
+    }
+
+    #[test]
     fn weather_fetch_failure_record_captures_provider_reason() {
         let failure = weather_fetch_failure_record(
             " failure-001 ".to_string(),
@@ -10490,6 +10675,20 @@ mod tests {
             precipitation_mm: 0.0,
             humidity_percent: 64.0,
             radiation_w_m2: 720.0,
+        }
+    }
+
+    fn weather_history_query(
+        field_ref: &str,
+        start_time: &str,
+        end_time: &str,
+    ) -> WeatherHistoryQuery {
+        WeatherHistoryQuery {
+            field_ref: field_ref.to_string(),
+            start_time: start_time.to_string(),
+            end_time: end_time.to_string(),
+            offset: 0,
+            limit: 50,
         }
     }
 
