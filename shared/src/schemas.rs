@@ -10345,6 +10345,77 @@ pub struct SustainabilityComparisonResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SustainabilityKpiDirection {
+    HigherIsBetter,
+    LowerIsBetter,
+}
+
+impl SustainabilityKpiDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SustainabilityKpiDirection::HigherIsBetter => "higher_is_better",
+            SustainabilityKpiDirection::LowerIsBetter => "lower_is_better",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityKpiTrackingRequest {
+    #[serde(default)]
+    pub kpi_id: Option<String>,
+    pub field_id: String,
+    pub season_id: String,
+    pub metric_ref: String,
+    #[serde(default)]
+    pub current_value: Option<f64>,
+    pub target_value: f64,
+    pub direction: SustainabilityKpiDirection,
+    #[serde(default = "default_sustainability_kpi_at_risk_fraction")]
+    pub at_risk_fraction: f64,
+    pub method_version: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SustainabilityKpiStatus {
+    OnTrack,
+    AtRisk,
+    Met,
+    NoData,
+}
+
+impl SustainabilityKpiStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SustainabilityKpiStatus::OnTrack => "on_track",
+            SustainabilityKpiStatus::AtRisk => "at_risk",
+            SustainabilityKpiStatus::Met => "met",
+            SustainabilityKpiStatus::NoData => "no_data",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityKpiTrackingResult {
+    pub kpi_id: String,
+    pub field_id: String,
+    pub season_id: String,
+    pub metric_ref: String,
+    pub current_value: Option<f64>,
+    pub target_value: f64,
+    pub direction: SustainabilityKpiDirection,
+    pub at_risk_fraction: f64,
+    pub status: SustainabilityKpiStatus,
+    pub evidence_refs: Vec<String>,
+    pub method_version: String,
+    pub result_hash: String,
+    pub computed_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SustainabilityMrvOutputKind {
     CarbonFootprint,
     BiomassEstimate,
@@ -10627,6 +10698,32 @@ pub enum SustainabilityBaselineError {
     UnsupportedComparisonStatus { value: String },
     #[error("unsupported sustainability trend {value}")]
     UnsupportedTrend { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SustainabilityKpiError {
+    #[error("sustainability KPI kpi_id cannot be empty")]
+    EmptyKpiId,
+    #[error("sustainability KPI field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("sustainability KPI season_id cannot be empty")]
+    EmptySeasonId,
+    #[error("sustainability KPI metric_ref cannot be empty")]
+    EmptyMetricRef,
+    #[error("sustainability KPI method_version cannot be empty")]
+    EmptyMethodVersion,
+    #[error("sustainability KPI computed_at cannot be empty")]
+    EmptyComputedAt,
+    #[error("sustainability KPI current_value is invalid")]
+    InvalidCurrentValue,
+    #[error("sustainability KPI target_value is invalid")]
+    InvalidTargetValue,
+    #[error("sustainability KPI at_risk_fraction is invalid")]
+    InvalidAtRiskFraction,
+    #[error("unsupported sustainability KPI direction {value}")]
+    UnsupportedDirection { value: String },
+    #[error("unsupported sustainability KPI status {value}")]
+    UnsupportedStatus { value: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -11087,6 +11184,84 @@ pub fn compare_sustainability_baseline(
     })
 }
 
+pub fn compute_sustainability_kpi(
+    request: SustainabilityKpiTrackingRequest,
+    generated_kpi_id: String,
+    computed_at: String,
+) -> Result<SustainabilityKpiTrackingResult, SustainabilityKpiError> {
+    let kpi_id = normalize_sustainability_optional_text(request.kpi_id)
+        .or_else(|| normalize_sustainability_text(generated_kpi_id))
+        .ok_or(SustainabilityKpiError::EmptyKpiId)?;
+    let field_id = normalize_sustainability_text(request.field_id)
+        .ok_or(SustainabilityKpiError::EmptyFieldId)?;
+    let season_id = normalize_sustainability_text(request.season_id)
+        .ok_or(SustainabilityKpiError::EmptySeasonId)?;
+    let metric_ref = normalize_sustainability_text(request.metric_ref)
+        .ok_or(SustainabilityKpiError::EmptyMetricRef)?;
+    let method_version = normalize_sustainability_text(request.method_version)
+        .ok_or(SustainabilityKpiError::EmptyMethodVersion)?;
+    let computed_at = normalize_sustainability_text(computed_at)
+        .ok_or(SustainabilityKpiError::EmptyComputedAt)?;
+    if !request.target_value.is_finite() {
+        return Err(SustainabilityKpiError::InvalidTargetValue);
+    }
+    if !(request.at_risk_fraction.is_finite()
+        && request.at_risk_fraction >= 0.0
+        && request.at_risk_fraction <= 1.0)
+    {
+        return Err(SustainabilityKpiError::InvalidAtRiskFraction);
+    }
+    if request
+        .current_value
+        .is_some_and(|current_value| !current_value.is_finite())
+    {
+        return Err(SustainabilityKpiError::InvalidCurrentValue);
+    }
+
+    let evidence_refs = normalize_sustainability_refs(
+        request.evidence_refs,
+        [
+            format!("metric:{metric_ref}"),
+            format!("field:{field_id}"),
+            format!("season:{season_id}"),
+        ],
+    );
+    let status = sustainability_kpi_status(
+        request.current_value,
+        request.target_value,
+        request.direction,
+        request.at_risk_fraction,
+    );
+    let result_hash = sustainability_kpi_hash(
+        &field_id,
+        &season_id,
+        &metric_ref,
+        request.current_value,
+        request.target_value,
+        request.direction,
+        request.at_risk_fraction,
+        status,
+        &evidence_refs,
+        &method_version,
+    );
+
+    Ok(SustainabilityKpiTrackingResult {
+        kpi_id,
+        field_id,
+        season_id,
+        metric_ref,
+        current_value: request.current_value,
+        target_value: request.target_value,
+        direction: request.direction,
+        at_risk_fraction: request.at_risk_fraction,
+        status,
+        evidence_refs,
+        method_version,
+        result_hash,
+        computed_at,
+    })
+}
+
 pub fn create_sustainability_mrv_trail(
     request: SustainabilityMrvTrailCreateRequest,
     generated_trail_id: String,
@@ -11406,6 +11581,32 @@ pub fn parse_sustainability_trend(
     }
 }
 
+pub fn parse_sustainability_kpi_direction(
+    value: &str,
+) -> Result<SustainabilityKpiDirection, SustainabilityKpiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "higher_is_better" => Ok(SustainabilityKpiDirection::HigherIsBetter),
+        "lower_is_better" => Ok(SustainabilityKpiDirection::LowerIsBetter),
+        _ => Err(SustainabilityKpiError::UnsupportedDirection {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_sustainability_kpi_status(
+    value: &str,
+) -> Result<SustainabilityKpiStatus, SustainabilityKpiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on_track" => Ok(SustainabilityKpiStatus::OnTrack),
+        "at_risk" => Ok(SustainabilityKpiStatus::AtRisk),
+        "met" => Ok(SustainabilityKpiStatus::Met),
+        "no_data" => Ok(SustainabilityKpiStatus::NoData),
+        _ => Err(SustainabilityKpiError::UnsupportedStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
 pub fn parse_sustainability_mrv_output_kind(
     value: &str,
 ) -> Result<SustainabilityMrvOutputKind, SustainabilityMrvTrailError> {
@@ -11510,6 +11711,65 @@ fn sustainability_comparison_hash(
         trend.as_str(),
         baseline_source_record_id.as_deref().unwrap_or("none")
     );
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn sustainability_kpi_status(
+    current_value: Option<f64>,
+    target_value: f64,
+    direction: SustainabilityKpiDirection,
+    at_risk_fraction: f64,
+) -> SustainabilityKpiStatus {
+    let Some(current_value) = current_value else {
+        return SustainabilityKpiStatus::NoData;
+    };
+    match direction {
+        SustainabilityKpiDirection::HigherIsBetter if current_value >= target_value => {
+            SustainabilityKpiStatus::Met
+        }
+        SustainabilityKpiDirection::HigherIsBetter
+            if current_value >= target_value * at_risk_fraction =>
+        {
+            SustainabilityKpiStatus::OnTrack
+        }
+        SustainabilityKpiDirection::HigherIsBetter => SustainabilityKpiStatus::AtRisk,
+        SustainabilityKpiDirection::LowerIsBetter if current_value <= target_value => {
+            SustainabilityKpiStatus::Met
+        }
+        SustainabilityKpiDirection::LowerIsBetter
+            if at_risk_fraction == 0.0 || current_value <= target_value / at_risk_fraction =>
+        {
+            SustainabilityKpiStatus::OnTrack
+        }
+        SustainabilityKpiDirection::LowerIsBetter => SustainabilityKpiStatus::AtRisk,
+    }
+}
+
+fn default_sustainability_kpi_at_risk_fraction() -> f64 {
+    0.9
+}
+
+fn sustainability_kpi_hash(
+    field_id: &str,
+    season_id: &str,
+    metric_ref: &str,
+    current_value: Option<f64>,
+    target_value: f64,
+    direction: SustainabilityKpiDirection,
+    at_risk_fraction: f64,
+    status: SustainabilityKpiStatus,
+    evidence_refs: &[String],
+    method_version: &str,
+) -> String {
+    let mut canonical = format!(
+        "field={field_id}|season={season_id}|metric={metric_ref}|current={:.6}|target={target_value:.6}|direction={}|risk_fraction={at_risk_fraction:.6}|status={}|method={method_version}",
+        current_value.unwrap_or(-1.0),
+        direction.as_str(),
+        status.as_str()
+    );
+    for evidence_ref in evidence_refs {
+        canonical.push_str(&format!("|evidence:{evidence_ref}"));
+    }
     format!("{:016x}", fnv1a64(canonical.as_bytes()))
 }
 
@@ -15492,7 +15752,7 @@ mod tests {
         close_marketplace_listing_record, compare_sustainability_baseline,
         compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_baseline_trend,
         compute_drought_index, compute_drought_risk_score, compute_marketplace_demand_forecast,
-        compute_soil_carbon_proxy, compute_water_evapotranspiration,
+        compute_soil_carbon_proxy, compute_sustainability_kpi, compute_water_evapotranspiration,
         compute_weather_growing_degree_day, compute_weather_reference_et,
         create_marketplace_fulfillment_record, create_marketplace_rating_record,
         create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
@@ -15570,8 +15830,9 @@ mod tests {
         SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
         SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
-        SustainabilityComparisonRequest, SustainabilityComparisonStatus, SustainabilityMetricType,
-        SustainabilityMrvOutputKind, SustainabilityMrvTrailCreateRequest,
+        SustainabilityComparisonRequest, SustainabilityComparisonStatus,
+        SustainabilityKpiDirection, SustainabilityKpiStatus, SustainabilityKpiTrackingRequest,
+        SustainabilityMetricType, SustainabilityMrvOutputKind, SustainabilityMrvTrailCreateRequest,
         SustainabilityMrvTrailError, SustainabilityRecordCreateRequest, SustainabilityRecordError,
         SustainabilityRecordLinkage, SustainabilityTrend, TractorCommandAuditDecision,
         TractorCommandRejectionReason, TractorDeconflictionDecision, TractorDeconflictionRequest,
@@ -17942,6 +18203,67 @@ mod tests {
     }
 
     #[test]
+    fn sustainability_kpi_thresholds_return_met_on_track_and_at_risk() {
+        let met = compute_sustainability_kpi(
+            sustainability_kpi_request(Some(102.0), SustainabilityKpiDirection::HigherIsBetter),
+            "generated-kpi".to_string(),
+            "2026-06-17T12:00:00Z".to_string(),
+        )
+        .expect("KPI with current value should compute");
+        assert_eq!(met.status, SustainabilityKpiStatus::Met);
+        assert_eq!(met.metric_ref, "water_use_efficiency");
+        assert_eq!(met.current_value, Some(102.0));
+        assert_eq!(met.target_value, 100.0);
+        assert!(met
+            .evidence_refs
+            .contains(&"metric:water_use_efficiency".to_string()));
+        assert!(met
+            .evidence_refs
+            .contains(&"sensor:water-meter-001".to_string()));
+
+        let on_track = compute_sustainability_kpi(
+            sustainability_kpi_request(Some(95.0), SustainabilityKpiDirection::HigherIsBetter),
+            "generated-kpi".to_string(),
+            "2026-06-17T12:00:00Z".to_string(),
+        )
+        .expect("KPI inside threshold band should compute");
+        assert_eq!(on_track.status, SustainabilityKpiStatus::OnTrack);
+
+        let at_risk = compute_sustainability_kpi(
+            sustainability_kpi_request(Some(85.0), SustainabilityKpiDirection::HigherIsBetter),
+            "generated-kpi".to_string(),
+            "2026-06-17T12:00:00Z".to_string(),
+        )
+        .expect("KPI below threshold band should compute");
+        assert_eq!(at_risk.status, SustainabilityKpiStatus::AtRisk);
+        assert_ne!(on_track.result_hash, at_risk.result_hash);
+    }
+
+    #[test]
+    fn sustainability_kpi_missing_current_value_returns_no_data_with_evidence() {
+        let result = compute_sustainability_kpi(
+            sustainability_kpi_request(None, SustainabilityKpiDirection::LowerIsBetter),
+            "generated-kpi".to_string(),
+            "2026-06-17T12:00:00Z".to_string(),
+        )
+        .expect("missing KPI current value should return no_data");
+
+        assert_eq!(result.status, SustainabilityKpiStatus::NoData);
+        assert_eq!(result.current_value, None);
+        assert_eq!(result.direction, SustainabilityKpiDirection::LowerIsBetter);
+        assert!(result
+            .evidence_refs
+            .contains(&"field:field-sustain".to_string()));
+        assert!(result
+            .evidence_refs
+            .contains(&"season:season-2026".to_string()));
+        assert!(result
+            .evidence_refs
+            .contains(&"sensor:water-meter-001".to_string()));
+        assert!(!result.result_hash.is_empty());
+    }
+
+    #[test]
     fn sustainability_mrv_trail_requires_complete_certification_fields() {
         let trail = create_sustainability_mrv_trail(
             sustainability_mrv_request(),
@@ -18358,6 +18680,27 @@ mod tests {
             current_value,
             current_source_record_id: "sustain-current-2026".to_string(),
             method_version: "sustainability.baseline_compare.v1".to_string(),
+        }
+    }
+
+    fn sustainability_kpi_request(
+        current_value: Option<f64>,
+        direction: SustainabilityKpiDirection,
+    ) -> SustainabilityKpiTrackingRequest {
+        SustainabilityKpiTrackingRequest {
+            kpi_id: Some("kpi-001".to_string()),
+            field_id: "field-sustain".to_string(),
+            season_id: "season-2026".to_string(),
+            metric_ref: "water_use_efficiency".to_string(),
+            current_value,
+            target_value: 100.0,
+            direction,
+            at_risk_fraction: 0.9,
+            method_version: "sustainability.kpi.v1".to_string(),
+            evidence_refs: vec![
+                "sensor:water-meter-001".to_string(),
+                " metric:water_use_efficiency ".to_string(),
+            ],
         }
     }
 

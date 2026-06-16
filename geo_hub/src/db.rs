@@ -1256,6 +1256,28 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS sustainability_kpis (
+            kpi_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            metric_ref TEXT NOT NULL,
+            current_value REAL,
+            target_value REAL NOT NULL,
+            direction TEXT NOT NULL,
+            at_risk_fraction REAL NOT NULL,
+            status TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS cms_contents (
             content_id TEXT PRIMARY KEY,
             content_type TEXT NOT NULL,
@@ -2127,6 +2149,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_soil_carbon_proxies_field_status
         ON soil_carbon_proxies(field_id, status, computed_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_kpis_field_status
+        ON sustainability_kpis(field_id, season_id, status, computed_at);
         "#,
     )
     .execute(pool)

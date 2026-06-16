@@ -92,7 +92,7 @@ use shared::schemas::{
     build_soil_moisture_reading, build_sustainability_record, build_tractor_record,
     close_marketplace_listing_record, compare_sustainability_baseline, compute_biodiversity_proxy,
     compute_carbon_footprint, compute_drought_index, compute_marketplace_demand_forecast,
-    compute_soil_carbon_proxy, create_marketplace_fulfillment_record,
+    compute_soil_carbon_proxy, compute_sustainability_kpi, create_marketplace_fulfillment_record,
     create_marketplace_rating_record, create_sustainability_baseline,
     create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
     fulfill_marketplace_inventory, normalize_weather_provider_forecast,
@@ -103,6 +103,7 @@ use shared::schemas::{
     parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
+    parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
     parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
     parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
     publish_marketplace_listing_record, release_marketplace_inventory,
@@ -144,15 +145,17 @@ use shared::schemas::{
     SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
     SustainabilityBaselineCreateRequest, SustainabilityBaselineError, SustainabilityBaselineRecord,
     SustainabilityComparisonRequest, SustainabilityComparisonResult,
-    SustainabilityComparisonStatus, SustainabilityMetricType, SustainabilityMrvOutputKind,
-    SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest, SustainabilityMrvTrailError,
-    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
-    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
-    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
-    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
-    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
-    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
-    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
+    SustainabilityComparisonStatus, SustainabilityKpiError, SustainabilityKpiStatus,
+    SustainabilityKpiTrackingRequest, SustainabilityKpiTrackingResult, SustainabilityMetricType,
+    SustainabilityMrvOutputKind, SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest,
+    SustainabilityMrvTrailError, SustainabilityRecord, SustainabilityRecordCreateRequest,
+    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
+    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
+    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
+    TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
+    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
+    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
+    GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -858,6 +861,18 @@ pub struct SoilCarbonProxyListQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SoilCarbonProxyScopeQuery {
+    pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityKpiListQuery {
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub status: Option<SustainabilityKpiStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityKpiScopeQuery {
     pub field_id: Option<String>,
 }
 
@@ -4715,6 +4730,74 @@ pub async fn get_soil_carbon_proxy(
     }
 
     Ok(Json(proxy))
+}
+
+pub async fn create_sustainability_kpi(
+    State(state): State<AppState>,
+    Json(request): Json<SustainabilityKpiTrackingRequest>,
+) -> AppResult<Json<SustainabilityKpiTrackingResult>> {
+    let result = compute_sustainability_kpi(
+        request,
+        format!("sustainability-kpi-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_kpi_error)?;
+    insert_sustainability_kpi_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_sustainability_kpis(
+    Query(query): Query<SustainabilityKpiListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SustainabilityKpiTrackingResult>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for sustainability KPIs".to_string(),
+        )
+    })?;
+    let season_id = normalize_optional_text(query.season_id);
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT kpi_id, field_id, season_id, metric_ref, current_value, target_value,
+               direction, at_risk_fraction, status, evidence_refs_json, method_version,
+               result_hash, computed_at
+        FROM sustainability_kpis
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR season_id = ?2)
+          AND (?3 IS NULL OR status = ?3)
+        ORDER BY computed_at ASC, kpi_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_sustainability_kpi_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_sustainability_kpi(
+    Path(kpi_id): Path<String>,
+    Query(query): Query<SustainabilityKpiScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SustainabilityKpiTrackingResult>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    let kpi = load_sustainability_kpi_result(&state, &kpi_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if kpi.field_id != field_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(kpi))
 }
 
 pub async fn create_content_item(
@@ -9828,6 +9911,10 @@ fn soil_carbon_proxy_error(error: SoilCarbonProxyError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn sustainability_kpi_error(error: SustainabilityKpiError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn content_error(error: ContentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -11705,6 +11792,37 @@ fn decode_soil_carbon_proxy_result(
         uncertainty_band,
         status: parse_soil_carbon_proxy_status(&row.get::<String, _>("status"))
             .map_err(soil_carbon_proxy_error)?,
+        evidence_refs,
+        method_version: row.get("method_version"),
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_sustainability_kpi_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityKpiTrackingResult> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode sustainability KPI evidence_refs_json"),
+        )
+    })?;
+
+    Ok(SustainabilityKpiTrackingResult {
+        kpi_id: row.get("kpi_id"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        metric_ref: row.get("metric_ref"),
+        current_value: row.get("current_value"),
+        target_value: row.get("target_value"),
+        direction: parse_sustainability_kpi_direction(&row.get::<String, _>("direction"))
+            .map_err(sustainability_kpi_error)?,
+        at_risk_fraction: row.get("at_risk_fraction"),
+        status: parse_sustainability_kpi_status(&row.get::<String, _>("status"))
+            .map_err(sustainability_kpi_error)?,
         evidence_refs,
         method_version: row.get("method_version"),
         result_hash: row.get("result_hash"),
@@ -14197,7 +14315,13 @@ async fn validate_sustainability_mrv_output_ref(
                 .await
                 .map_err(Error::from)?
         }
-        SustainabilityMrvOutputKind::SustainabilityKpi => 1,
+        SustainabilityMrvOutputKind::SustainabilityKpi => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM sustainability_kpis WHERE kpi_id = ?1")
+                .bind(output_ref)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(Error::from)?
+        }
     };
     if exists == 0 {
         return Err(AppError::BadRequest(format!(
@@ -14383,6 +14507,63 @@ async fn load_soil_carbon_proxy_result(
     .map_err(Error::from)?;
 
     row.map(|row| decode_soil_carbon_proxy_result(&row))
+        .transpose()
+}
+
+async fn insert_sustainability_kpi_result(
+    state: &AppState,
+    result: &SustainabilityKpiTrackingResult,
+) -> AppResult<()> {
+    let evidence_refs_json =
+        serde_json::to_string(&result.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_kpis (
+            kpi_id, field_id, season_id, metric_ref, current_value, target_value, direction,
+            at_risk_fraction, status, evidence_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+    )
+    .bind(&result.kpi_id)
+    .bind(&result.field_id)
+    .bind(&result.season_id)
+    .bind(&result.metric_ref)
+    .bind(result.current_value)
+    .bind(result.target_value)
+    .bind(result.direction.as_str())
+    .bind(result.at_risk_fraction)
+    .bind(result.status.as_str())
+    .bind(evidence_refs_json)
+    .bind(&result.method_version)
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_kpi_result(
+    state: &AppState,
+    kpi_id: &str,
+) -> AppResult<Option<SustainabilityKpiTrackingResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT kpi_id, field_id, season_id, metric_ref, current_value, target_value,
+               direction, at_risk_fraction, status, evidence_refs_json, method_version,
+               result_hash, computed_at
+        FROM sustainability_kpis
+        WHERE kpi_id = ?1
+        "#,
+    )
+    .bind(kpi_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_kpi_result(&row))
         .transpose()
 }
 

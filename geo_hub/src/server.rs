@@ -402,6 +402,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_soil_carbon_proxy),
         )
         .route(
+            "/api/sustainability/kpis",
+            get(routes::list_sustainability_kpis).post(routes::create_sustainability_kpi),
+        )
+        .route(
+            "/api/sustainability/kpis/:kpi_id",
+            get(routes::get_sustainability_kpi),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
         )

@@ -5458,6 +5458,141 @@ async fn soil_carbon_proxy_insufficient_evidence_persists_unavailable_without_ba
 }
 
 #[tokio::test]
+async fn sustainability_kpis_compute_get_and_list_with_stable_hash() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/kpis")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_kpi_payload("kpi-cover-001", Some(0.72)).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("on_track")
+    );
+    assert_eq!(
+        first.get("metric_ref").and_then(|value| value.as_str()),
+        Some("biodiversity:biodiversity-001")
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/kpis")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_kpi_payload("kpi-cover-002", Some(0.72)).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/kpis/kpi-cover-001?field_id=field-sustainability-kpi")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/kpis?field_id=field-sustainability-kpi&season_id=season-2026&status=on_track")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let kpis: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(kpis.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_kpi_no_data_persists_without_current_value() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/kpis")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_kpi_payload("kpi-cover-nodata", None).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let kpi: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        kpi.get("status").and_then(|value| value.as_str()),
+        Some("no_data")
+    );
+    assert!(kpi
+        .get("current_value")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sustainability_kpis WHERE status = 'no_data' AND current_value IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn content_items_create_edit_get_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -14677,6 +14812,21 @@ fn soil_carbon_proxy_payload(proxy_id: &str, include_sufficient: bool) -> serde_
             json!([])
         },
         "method_version": "soil_carbon.proxy.v1"
+    })
+}
+
+fn sustainability_kpi_payload(kpi_id: &str, current_value: Option<f64>) -> serde_json::Value {
+    json!({
+        "kpi_id": kpi_id,
+        "field_id": "field-sustainability-kpi",
+        "season_id": "season-2026",
+        "metric_ref": "biodiversity:biodiversity-001",
+        "current_value": current_value,
+        "target_value": 0.8,
+        "direction": "higher_is_better",
+        "at_risk_fraction": 0.8,
+        "method_version": "sustainability.kpi.v1",
+        "evidence_refs": ["biodiversity:biodiversity-001", "target:cover-2026"]
     })
 }
 
