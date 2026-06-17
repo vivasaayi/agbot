@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 0d8435a (`HEAD` before local 19-09 test edits)
-- **Latest checkpoint commit**: pending commit for `batch-20260616000200`
-- **Current batch**: `batch-20260616000200` — `19-09` certification evidence packs, verified and ready to commit
-- **Completed feature rows**: 458 committed; 2 tests_passed; 2 skipped; 2 blocked; 34 pending in this run.
+- **Last implementation commit**: 5a46408 (`batch-20260616000200`)
+- **Latest checkpoint commit**: this checkpoint commit after 5a46408 (`batch-20260616000200`)
+- **Current batch**: none
+- **Completed feature rows**: 459 committed; 1 tests_passed; 2 skipped; 2 blocked; 34 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval.
 
 ## Latest verification
@@ -31,4 +31,4 @@
 
 ## Next action
 
-- Commit verified `19-09` certification evidence packs batch, update checkpoint commit SHA, then select `19-10`.
+- Select and claim the next pending feature after `19-09` certification evidence packs; next pending is `19-10`.
