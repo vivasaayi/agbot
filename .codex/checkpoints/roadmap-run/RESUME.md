@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 99bf815 (`batch-20260617052656`)
-- **Latest checkpoint commit**: 40bb155 checkpoint after 99bf815 (`batch-20260617052656`)
-- **Current batch**: `batch-20260617053612` — `20-03` CMS access control via role model, verified and ready to commit
-- **Completed feature rows**: 461 committed; 2 tests_passed; 2 skipped; 2 blocked; 31 pending in this run.
+- **Last implementation commit**: b9dd141 (`batch-20260617053612`)
+- **Latest checkpoint commit**: this checkpoint commit after b9dd141 (`batch-20260617053612`)
+- **Current batch**: none
+- **Completed feature rows**: 462 committed; 1 tests_passed; 2 skipped; 2 blocked; 31 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval.
 
 ## Latest verification
@@ -44,4 +44,4 @@
 
 ## Next action
 
-- Commit verified `20-03` CMS access control batch, update checkpoint commit SHA, then select `20-04`.
+- Select and claim the next pending feature after `20-03` CMS access control; next pending is `20-04`.
