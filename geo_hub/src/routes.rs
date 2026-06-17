@@ -84,25 +84,26 @@ use provenance::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
-    aggregate_marketplace_ratings, append_content_version, apply_content_taxonomy_tags,
-    assemble_marketplace_org_report, assert_raster_spatial_ref, bind_fleet_node_identity,
-    bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
-    build_collaboration_message, build_content_portal_embed, build_marketplace_account_record,
-    build_marketplace_catalog_item_record, build_marketplace_inventory_record,
-    build_marketplace_portal_entry, build_soil_moisture_reading,
-    build_sustainability_certification_evidence_pack, build_sustainability_record,
-    build_tractor_record, close_marketplace_listing_record, compare_sustainability_baseline,
-    compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_index,
-    compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
-    content_portal_embed_item, create_marketplace_fulfillment_record,
-    create_marketplace_rating_record, create_sustainability_baseline,
-    create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
-    fulfill_marketplace_inventory, normalize_weather_provider_forecast,
-    parse_biodiversity_proxy_status, parse_carbon_footprint_status, parse_content_status,
-    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
-    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
-    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
-    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
+    aggregate_content_engagement, aggregate_marketplace_ratings, append_content_version,
+    apply_content_taxonomy_tags, assemble_marketplace_org_report, assert_raster_spatial_ref,
+    bind_fleet_node_identity, bounds_coverage_fraction, bounds_from_points,
+    build_collaboration_channel, build_collaboration_message, build_content_portal_embed,
+    build_marketplace_account_record, build_marketplace_catalog_item_record,
+    build_marketplace_inventory_record, build_marketplace_portal_entry,
+    build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
+    build_sustainability_record, build_tractor_record, close_marketplace_listing_record,
+    compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
+    compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
+    compute_sustainability_kpi, content_portal_embed_item, create_content_engagement_event,
+    create_marketplace_fulfillment_record, create_marketplace_rating_record,
+    create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
+    estimate_biomass, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
+    parse_biodiversity_proxy_status, parse_carbon_footprint_status,
+    parse_content_engagement_event_type, parse_content_status, parse_content_type,
+    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
+    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
+    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
+    parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
     parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
@@ -120,17 +121,19 @@ use shared::schemas::{
     CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
     CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
     CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
-    ContentCreateRequest, ContentEditRequest, ContentError, ContentPermissionResolveRequest,
-    ContentPermissionSet, ContentPortalEmbed, ContentPortalEmbedItem, ContentPortalEmbedRequest,
-    ContentRecord, ContentSearchDocument, ContentSearchRequest, ContentSearchResult, ContentStatus,
-    ContentTagApplyRequest, ContentTagRecord, ContentTaxonomyKind, ContentType,
-    ContentVersionRecord, ContentWorkflowAction, ContentWorkflowAuditRecord,
-    ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult, DroughtIndexComputeRequest,
-    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
-    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
-    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    ContentCreateRequest, ContentEditRequest, ContentEngagementEventCreateRequest,
+    ContentEngagementEventRecord, ContentEngagementSummary, ContentError,
+    ContentPermissionResolveRequest, ContentPermissionSet, ContentPortalEmbed,
+    ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument,
+    ContentSearchRequest, ContentSearchResult, ContentStatus, ContentTagApplyRequest,
+    ContentTagRecord, ContentTaxonomyKind, ContentType, ContentVersionRecord,
+    ContentWorkflowAction, ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest,
+    ContentWorkflowTransitionResult, DroughtIndexComputeRequest, DroughtIndexError,
+    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
     MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
     MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
     MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
@@ -936,6 +939,12 @@ pub struct ContentTagFilterQuery {
     pub org_id: String,
     pub kind: ContentTaxonomyKind,
     pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentEngagementSummaryQuery {
+    pub org_id: String,
+    pub period: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5196,6 +5205,56 @@ pub async fn apply_content_item_tags(
     insert_content_tags(&state, &tags).await?;
 
     Ok(Json(tags))
+}
+
+pub async fn create_content_engagement_event_route(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<ContentEngagementEventCreateRequest>,
+) -> AppResult<Json<ContentEngagementEventRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id || content.status != ContentStatus::Published {
+        return Err(AppError::NotFound);
+    }
+    let event = create_content_engagement_event(
+        &content,
+        request,
+        format!("content-engagement-event-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    insert_content_engagement_event(&state, &event).await?;
+
+    Ok(Json(event))
+}
+
+pub async fn get_content_engagement_summary(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentEngagementSummaryQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ContentEngagementSummary>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let period = normalize_optional_text(Some(query.period))
+        .ok_or_else(|| AppError::BadRequest("period query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id || content.status != ContentStatus::Published {
+        return Err(AppError::NotFound);
+    }
+    let events = load_content_engagement_events(&state, &content_id, &org_id, &period).await?;
+    let summary =
+        aggregate_content_engagement(&content, &events, period, current_record_timestamp())
+            .map_err(content_error)?;
+    upsert_content_engagement_summary(&state, &summary).await?;
+
+    Ok(Json(summary))
 }
 
 pub async fn list_content_items_by_tag(
@@ -12309,6 +12368,21 @@ fn decode_content_version_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Con
     })
 }
 
+fn decode_content_engagement_event_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ContentEngagementEventRecord> {
+    Ok(ContentEngagementEventRecord {
+        event_id: row.get("event_id"),
+        content_id: row.get("content_id"),
+        org_id: row.get("org_id"),
+        event_type: parse_content_engagement_event_type(&row.get::<String, _>("event_type"))
+            .map_err(content_error)?,
+        actor_id: row.get("actor_id"),
+        period: row.get("period"),
+        occurred_at: row.get("occurred_at"),
+    })
+}
+
 fn decode_collaboration_channel(
     row: &sqlx::sqlite::SqliteRow,
 ) -> AppResult<CollaborationChannelRecord> {
@@ -15837,6 +15911,70 @@ async fn insert_content_tags(state: &AppState, tags: &[ContentTagRecord]) -> App
     Ok(())
 }
 
+async fn insert_content_engagement_event(
+    state: &AppState,
+    event: &ContentEngagementEventRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_content_engagement_events (
+            event_id, content_id, org_id, event_type, actor_id, period, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&event.event_id)
+    .bind(&event.content_id)
+    .bind(&event.org_id)
+    .bind(event.event_type.as_str())
+    .bind(&event.actor_id)
+    .bind(&event.period)
+    .bind(&event.occurred_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn upsert_content_engagement_summary(
+    state: &AppState,
+    summary: &ContentEngagementSummary,
+) -> AppResult<()> {
+    let evidence_refs_json = serde_json::to_string(&summary.evidence_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO cms_content_engagement_summaries (
+            content_id, org_id, period, views, reads, helpful_votes, event_count,
+            evidence_refs_json, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(content_id, org_id, period) DO UPDATE SET
+            views = excluded.views,
+            reads = excluded.reads,
+            helpful_votes = excluded.helpful_votes,
+            event_count = excluded.event_count,
+            evidence_refs_json = excluded.evidence_refs_json,
+            computed_at = excluded.computed_at
+        "#,
+    )
+    .bind(&summary.content_id)
+    .bind(&summary.org_id)
+    .bind(&summary.period)
+    .bind(summary.views as i64)
+    .bind(summary.reads as i64)
+    .bind(summary.helpful_votes as i64)
+    .bind(summary.event_count as i64)
+    .bind(evidence_refs_json)
+    .bind(&summary.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn insert_content_workflow_audit_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     audit: &ContentWorkflowAuditRecord,
@@ -15979,6 +16117,34 @@ async fn load_content_portal_document(
         })
     })
     .transpose()
+}
+
+async fn load_content_engagement_events(
+    state: &AppState,
+    content_id: &str,
+    org_id: &str,
+    period: &str,
+) -> AppResult<Vec<ContentEngagementEventRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, content_id, org_id, event_type, actor_id, period, occurred_at
+        FROM cms_content_engagement_events
+        WHERE content_id = ?1
+          AND org_id = ?2
+          AND period = ?3
+        ORDER BY occurred_at ASC, event_id ASC
+        "#,
+    )
+    .bind(content_id)
+    .bind(org_id)
+    .bind(period)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_content_engagement_event_record(&row))
+        .collect()
 }
 
 async fn load_content_versions(

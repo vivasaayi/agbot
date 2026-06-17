@@ -12709,6 +12709,57 @@ pub struct ContentPortalEmbed {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ContentEngagementEventType {
+    View,
+    Read,
+    HelpfulVote,
+}
+
+impl ContentEngagementEventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentEngagementEventType::View => "view",
+            ContentEngagementEventType::Read => "read",
+            ContentEngagementEventType::HelpfulVote => "helpful_vote",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentEngagementEventCreateRequest {
+    pub event_type: ContentEngagementEventType,
+    pub actor_id: String,
+    pub period: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentEngagementEventRecord {
+    pub event_id: String,
+    pub content_id: String,
+    pub org_id: String,
+    pub event_type: ContentEngagementEventType,
+    pub actor_id: String,
+    pub period: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentEngagementSummary {
+    pub content_id: String,
+    pub org_id: String,
+    pub period: String,
+    pub views: u64,
+    pub reads: u64,
+    pub helpful_votes: u64,
+    pub event_count: u64,
+    pub computed_at: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContentTaxonomyKind {
     Crop,
     Region,
@@ -12791,6 +12842,12 @@ pub enum ContentError {
     InvalidTaxonomyTag { kind: &'static str, value: String },
     #[error("AI-suggested content tags require editor confirmation")]
     AiTagRequiresEditorConfirmation,
+    #[error("content engagement event_id cannot be empty")]
+    EmptyEngagementEventId,
+    #[error("content engagement period cannot be empty")]
+    EmptyEngagementPeriod,
+    #[error("content engagement event type {value} is unsupported")]
+    UnsupportedEngagementEventType { value: String },
 }
 
 pub fn create_versioned_content(
@@ -13102,6 +13159,75 @@ pub fn content_portal_embed_item(
     })
 }
 
+pub fn create_content_engagement_event(
+    content: &ContentRecord,
+    request: ContentEngagementEventCreateRequest,
+    generated_event_id: String,
+    occurred_at: String,
+) -> Result<ContentEngagementEventRecord, ContentError> {
+    let event_id =
+        normalize_content_text(generated_event_id).ok_or(ContentError::EmptyEngagementEventId)?;
+    let actor_id = normalize_content_text(request.actor_id).ok_or(ContentError::EmptyActorId)?;
+    let period =
+        normalize_content_text(request.period).ok_or(ContentError::EmptyEngagementPeriod)?;
+    let occurred_at = normalize_content_optional_text(request.occurred_at)
+        .or_else(|| normalize_content_text(occurred_at))
+        .ok_or(ContentError::EmptyWorkflowTimestamp)?;
+
+    Ok(ContentEngagementEventRecord {
+        event_id,
+        content_id: content.content_id.clone(),
+        org_id: content.org_id.clone(),
+        event_type: request.event_type,
+        actor_id,
+        period,
+        occurred_at,
+    })
+}
+
+pub fn aggregate_content_engagement(
+    content: &ContentRecord,
+    events: &[ContentEngagementEventRecord],
+    period: String,
+    computed_at: String,
+) -> Result<ContentEngagementSummary, ContentError> {
+    let period = normalize_content_text(period).ok_or(ContentError::EmptyEngagementPeriod)?;
+    let computed_at =
+        normalize_content_text(computed_at).ok_or(ContentError::EmptyWorkflowTimestamp)?;
+    let mut views = 0_u64;
+    let mut reads = 0_u64;
+    let mut helpful_votes = 0_u64;
+    let mut evidence_refs = Vec::new();
+
+    for event in events.iter().filter(|event| {
+        event.content_id == content.content_id
+            && event.org_id == content.org_id
+            && event.period == period
+    }) {
+        match event.event_type {
+            ContentEngagementEventType::View => views += 1,
+            ContentEngagementEventType::Read => reads += 1,
+            ContentEngagementEventType::HelpfulVote => helpful_votes += 1,
+        }
+        evidence_refs.push(format!("content-engagement-event:{}", event.event_id));
+    }
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    evidence_refs.insert(0, format!("content:{}", content.content_id));
+
+    Ok(ContentEngagementSummary {
+        content_id: content.content_id.clone(),
+        org_id: content.org_id.clone(),
+        period,
+        views,
+        reads,
+        helpful_votes,
+        event_count: views + reads + helpful_votes,
+        computed_at,
+        evidence_refs,
+    })
+}
+
 pub fn apply_content_taxonomy_tags(
     content_id: String,
     request: ContentTagApplyRequest,
@@ -13218,6 +13344,19 @@ pub fn parse_content_status(value: &str) -> Result<ContentStatus, ContentError> 
         "rejected" => Ok(ContentStatus::Rejected),
         "unpublished" => Ok(ContentStatus::Unpublished),
         _ => Err(ContentError::UnsupportedContentStatus {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_content_engagement_event_type(
+    value: &str,
+) -> Result<ContentEngagementEventType, ContentError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "view" => Ok(ContentEngagementEventType::View),
+        "read" => Ok(ContentEngagementEventType::Read),
+        "helpful_vote" => Ok(ContentEngagementEventType::HelpfulVote),
+        _ => Err(ContentError::UnsupportedEngagementEventType {
             value: value.to_string(),
         }),
     }
@@ -16671,23 +16810,24 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        advise_weather_operational_windows, aggregate_marketplace_ratings,
-        annotate_weather_record_freshness, append_content_version, append_irrigation_history_event,
-        append_weather_history_records, apply_content_taxonomy_tags,
-        apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
-        apply_tractor_implement_command, assemble_drought_report, assemble_marketplace_org_report,
-        assert_flight_operation_allowed, assert_raster_spatial_ref, bind_fleet_node_identity,
-        bounds_from_points, build_collaboration_channel, build_collaboration_message,
-        build_content_portal_embed, build_fleet_version_inventory,
-        build_marketplace_account_record, build_marketplace_inventory_record,
-        build_marketplace_portal_entry, build_soil_moisture_reading,
-        build_sustainability_certification_evidence_pack, build_sustainability_record,
-        build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
-        close_marketplace_listing_record, compare_sustainability_baseline,
-        compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_baseline_trend,
-        compute_drought_index, compute_drought_risk_score, compute_marketplace_demand_forecast,
-        compute_soil_carbon_proxy, compute_sustainability_kpi, compute_water_evapotranspiration,
-        compute_weather_growing_degree_day, compute_weather_reference_et,
+        advise_weather_operational_windows, aggregate_content_engagement,
+        aggregate_marketplace_ratings, annotate_weather_record_freshness, append_content_version,
+        append_irrigation_history_event, append_weather_history_records,
+        apply_content_taxonomy_tags, apply_dry_run_validated_fleet_config_bundle,
+        apply_fleet_node_heartbeat, apply_tractor_implement_command, assemble_drought_report,
+        assemble_marketplace_org_report, assert_flight_operation_allowed,
+        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
+        build_collaboration_channel, build_collaboration_message, build_content_portal_embed,
+        build_fleet_version_inventory, build_marketplace_account_record,
+        build_marketplace_inventory_record, build_marketplace_portal_entry,
+        build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
+        build_sustainability_record, build_tractor_field_ops_replay,
+        build_tractor_field_ops_session_log, close_marketplace_listing_record,
+        compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
+        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
+        compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
+        compute_water_evapotranspiration, compute_weather_growing_degree_day,
+        compute_weather_reference_et, create_content_engagement_event,
         create_marketplace_fulfillment_record, create_marketplace_rating_record,
         create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
@@ -16719,53 +16859,54 @@ mod tests {
         BiomassEstimateError, BiomassEstimateRequest, BiomassLayerInput, CarbonEmissionFactor,
         CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
         CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
-        CollaborationError, CollaborationMessageCreateRequest, ContentCreateRequest, ContentError,
-        ContentPermissionResolveRequest, ContentPortalEmbedRequest, ContentRecord,
-        ContentSearchDocument, ContentSearchRequest, ContentStatus, ContentTagApplyRequest,
-        ContentTaxonomyKind, ContentTaxonomyTag, ContentType, ContentWorkflowAction,
-        ContentWorkflowActorRole, ContentWorkflowTransitionRequest, CropPlanRecord,
-        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
-        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
-        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
-        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
-        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
-        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
-        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
-        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
-        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
-        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
-        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
-        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
-        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
-        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
-        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
-        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
-        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
-        MarketplaceDemandForecastRequest, MarketplaceDemandForecastStatus,
-        MarketplaceFulfillmentCreateRequest, MarketplaceFulfillmentError,
-        MarketplaceFulfillmentStatus, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
-        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
-        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
-        MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
-        MarketplaceRatingCreateRequest, MarketplaceRatingError, MarketplaceReportPeriod,
-        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
-        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
-        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
-        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
-        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
-        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
-        SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
+        CollaborationError, CollaborationMessageCreateRequest, ContentCreateRequest,
+        ContentEngagementEventCreateRequest, ContentEngagementEventRecord,
+        ContentEngagementEventType, ContentError, ContentPermissionResolveRequest,
+        ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument, ContentSearchRequest,
+        ContentStatus, ContentTagApplyRequest, ContentTaxonomyKind, ContentTaxonomyTag,
+        ContentType, ContentWorkflowAction, ContentWorkflowActorRole,
+        ContentWorkflowTransitionRequest, CropPlanRecord, DroughtAdvisoryLoopRequest,
+        DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
+        DroughtBaselineTrendRequest, DroughtBaselineTrendStatus, DroughtEvidenceFusionError,
+        DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus,
+        DroughtForecastRequest, DroughtForecastStatus, DroughtForecastUncertaintyBand,
+        DroughtHistoryEntry, DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
+        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
+        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
+        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
+        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
+        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
+        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
+        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
+        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
+        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
+        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
+        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
+        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
+        MarketplaceDemandForecastStatus, MarketplaceFulfillmentCreateRequest,
+        MarketplaceFulfillmentError, MarketplaceFulfillmentStatus, MarketplaceInventoryError,
+        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
+        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
+        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
+        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceRatingCreateRequest,
+        MarketplaceRatingError, MarketplaceReportPeriod, MarketplaceUnitOfMeasure,
+        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
+        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
+        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
+        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
+        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
+        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
+        SeasonRecord, SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
         SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
         SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
@@ -19848,6 +19989,64 @@ mod tests {
     }
 
     #[test]
+    fn content_engagement_aggregates_views_reads_and_helpful_votes() {
+        let content =
+            content_record_for_search("article-engagement", "org-alpha", ContentStatus::Published);
+        let events = vec![
+            engagement_event(&content, "event-view-1", ContentEngagementEventType::View),
+            engagement_event(&content, "event-view-2", ContentEngagementEventType::View),
+            engagement_event(&content, "event-read-1", ContentEngagementEventType::Read),
+            engagement_event(
+                &content,
+                "event-helpful-1",
+                ContentEngagementEventType::HelpfulVote,
+            ),
+            ContentEngagementEventRecord {
+                content_id: "article-other".to_string(),
+                ..engagement_event(&content, "event-other", ContentEngagementEventType::View)
+            },
+        ];
+
+        let summary = aggregate_content_engagement(
+            &content,
+            &events,
+            "2026-06".to_string(),
+            "2026-06-17T06:30:00Z".to_string(),
+        )
+        .expect("engagement should aggregate");
+
+        assert_eq!(summary.views, 2);
+        assert_eq!(summary.reads, 1);
+        assert_eq!(summary.helpful_votes, 1);
+        assert_eq!(summary.event_count, 4);
+        assert!(summary
+            .evidence_refs
+            .contains(&"content-engagement-event:event-helpful-1".to_string()));
+    }
+
+    #[test]
+    fn content_engagement_no_activity_reports_zeros() {
+        let content =
+            content_record_for_search("article-engagement", "org-alpha", ContentStatus::Published);
+        let summary = aggregate_content_engagement(
+            &content,
+            &[],
+            "2026-06".to_string(),
+            "2026-06-17T06:30:00Z".to_string(),
+        )
+        .expect("zero activity should still summarize");
+
+        assert_eq!(summary.views, 0);
+        assert_eq!(summary.reads, 0);
+        assert_eq!(summary.helpful_votes, 0);
+        assert_eq!(summary.event_count, 0);
+        assert_eq!(
+            summary.evidence_refs,
+            vec!["content:article-engagement".to_string()]
+        );
+    }
+
+    #[test]
     fn content_taxonomy_validates_controlled_tags_and_ai_confirmation() {
         let tags = apply_content_taxonomy_tags(
             "article-001".to_string(),
@@ -19935,6 +20134,25 @@ mod tests {
             body: "First draft".to_string(),
             status: None,
         }
+    }
+
+    fn engagement_event(
+        content: &ContentRecord,
+        event_id: &str,
+        event_type: ContentEngagementEventType,
+    ) -> ContentEngagementEventRecord {
+        create_content_engagement_event(
+            content,
+            ContentEngagementEventCreateRequest {
+                event_type,
+                actor_id: "grower-001".to_string(),
+                period: "2026-06".to_string(),
+                occurred_at: None,
+            },
+            event_id.to_string(),
+            "2026-06-17T06:30:00Z".to_string(),
+        )
+        .expect("engagement event should create")
     }
 
     fn carbon_footprint_request(include_required: bool) -> CarbonFootprintComputeRequest {

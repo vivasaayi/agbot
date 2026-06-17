@@ -450,6 +450,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::apply_content_item_tags),
         )
         .route(
+            "/api/content/items/:content_id/engagement-events",
+            post(routes::create_content_engagement_event_route),
+        )
+        .route(
+            "/api/content/items/:content_id/engagement",
+            get(routes::get_content_engagement_summary),
+        )
+        .route(
             "/api/content/permissions/resolve",
             get(routes::resolve_content_permissions_route),
         )

@@ -1364,6 +1364,41 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS cms_content_engagement_events (
+            event_id TEXT PRIMARY KEY,
+            content_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            period TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_content_engagement_summaries (
+            content_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            period TEXT NOT NULL,
+            views INTEGER NOT NULL,
+            reads INTEGER NOT NULL,
+            helpful_votes INTEGER NOT NULL,
+            event_count INTEGER NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            computed_at TEXT NOT NULL,
+            PRIMARY KEY (content_id, org_id, period)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS collab_channels (
             channel_id TEXT PRIMARY KEY,
             org_id TEXT NOT NULL,
@@ -2250,6 +2285,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_cms_content_versions_content
         ON cms_content_versions(content_id, created_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_cms_content_engagement_events_scope
+        ON cms_content_engagement_events(content_id, org_id, period);
         "#,
     )
     .execute(pool)

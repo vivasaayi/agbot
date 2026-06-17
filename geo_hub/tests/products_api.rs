@@ -6912,6 +6912,164 @@ async fn content_portal_embed_denies_unreadable_or_unpublished_direct_hits() -> 
 }
 
 #[tokio::test]
+async fn content_engagement_aggregates_reader_events_by_period() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-engagement-001",
+        "Published portal guide with engagement.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-engagement-001", "org-alpha").await?;
+
+    for (event_type, actor_id) in [
+        ("view", "grower-001"),
+        ("view", "grower-002"),
+        ("read", "grower-001"),
+        ("helpful_vote", "grower-001"),
+    ] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/content/items/article-engagement-001/engagement-events?org_id=org-alpha")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "event_type": event_type,
+                            "actor_id": actor_id,
+                            "period": "2026-06",
+                            "occurred_at": "2026-06-17T06:30:00Z"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let summary = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-engagement-001/engagement?org_id=org-alpha&period=2026-06")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = to_bytes(summary.into_body(), 64 * 1024).await?;
+    let summary: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        summary.get("views").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        summary.get("reads").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get("helpful_votes")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        summary.get("event_count").and_then(|value| value.as_u64()),
+        Some(4)
+    );
+    assert!(summary
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|refs| refs.iter().any(|reference| reference
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("content-engagement-event:")))));
+
+    let row = sqlx::query(
+        "SELECT views, reads, helpful_votes, event_count FROM cms_content_engagement_summaries WHERE content_id = ?1 AND org_id = ?2 AND period = ?3",
+    )
+    .bind("article-engagement-001")
+    .bind("org-alpha")
+    .bind("2026-06")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<i64, _>("views"), 2);
+    assert_eq!(row.get::<i64, _>("reads"), 1);
+    assert_eq!(row.get::<i64, _>("helpful_votes"), 1);
+    assert_eq!(row.get::<i64, _>("event_count"), 4);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_engagement_no_activity_persists_zero_summary() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-engagement-empty",
+        "Published guide with no activity.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-engagement-empty", "org-alpha").await?;
+
+    let summary = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-engagement-empty/engagement?org_id=org-alpha&period=2026-06")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = to_bytes(summary.into_body(), 64 * 1024).await?;
+    let summary: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        summary.get("views").and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        summary.get("reads").and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        summary
+            .get("helpful_votes")
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        summary.get("event_count").and_then(|value| value.as_u64()),
+        Some(0)
+    );
+
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT event_count FROM cms_content_engagement_summaries WHERE content_id = ?1 AND period = ?2",
+    )
+    .bind("article-engagement-empty")
+    .bind("2026-06")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(event_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
