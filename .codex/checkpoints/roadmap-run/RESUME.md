@@ -2,11 +2,11 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: eece514 (`batch-20260617055100`)
-- **Latest checkpoint commit**: pending commit for `batch-20260617060600`
-- **Current batch**: `batch-20260617060600`
-- **Completed feature rows**: 464 committed; 2 tests_passed; 2 skipped; 2 blocked; 28 pending in this run.
-- **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch; `20-06` is verified and ready to commit.
+- **Last implementation commit**: eddf01c (`batch-20260617060600`)
+- **Latest checkpoint commit**: pending checkpoint commit after eddf01c (`batch-20260617060600`)
+- **Current batch**: none
+- **Completed feature rows**: 465 committed; 1 tests_passed; 2 skipped; 2 blocked; 28 pending in this run.
+- **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
 
@@ -53,8 +53,8 @@
 - `cargo test -p geo_hub --test products_api content_portal_embed` — pass
 - `cargo test -p geo_hub --test products_api content_` — pass
 - `cargo check -p geo_hub` — pass
-- `20-06` — verified as read-only grower portal knowledge-base embedding with same-org `cms:viewer` visibility, published-only list/open routes, evidence refs, and 403/404 non-leakage for cross-org readers, drafts, and foreign content
+- `20-06` — committed as read-only grower portal knowledge-base embedding with same-org `cms:viewer` visibility, published-only list/open routes, evidence refs, and 403/404 non-leakage for cross-org readers, drafts, and foreign content
 
 ## Next action
 
-- Commit `batch-20260617060600` for `20-06`, update checkpoint commit SHA, then select and claim the next pending feature `20-07`.
+- Select and claim the next pending feature after `20-06` portal embedding; next pending is `20-07` content engagement analytics.
