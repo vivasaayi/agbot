@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: b9dd141 (`batch-20260617053612`)
-- **Latest checkpoint commit**: b92e599 checkpoint after b9dd141 (`batch-20260617053612`)
-- **Current batch**: `batch-20260617054345` — `20-04` published content search, verified and ready to commit
-- **Completed feature rows**: 462 committed; 2 tests_passed; 2 skipped; 2 blocked; 30 pending in this run.
+- **Last implementation commit**: b6d9a51 (`batch-20260617054345`)
+- **Latest checkpoint commit**: this checkpoint commit after b6d9a51 (`batch-20260617054345`)
+- **Current batch**: none
+- **Completed feature rows**: 463 committed; 1 tests_passed; 2 skipped; 2 blocked; 30 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval.
 
 ## Latest verification
@@ -48,4 +48,4 @@
 
 ## Next action
 
-- Commit verified `20-04` published content search batch, update checkpoint commit SHA, then select `20-05`.
+- Select and claim the next pending feature after `20-04` published content search; next pending is `20-05`.
