@@ -1331,6 +1331,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS cms_content_workflow_audits (
+            audit_id TEXT PRIMARY KEY,
+            content_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_role TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            scheduled_effective_at TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS collab_channels (
             channel_id TEXT PRIMARY KEY,
             org_id TEXT NOT NULL,

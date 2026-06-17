@@ -6200,6 +6200,221 @@ async fn content_item_create_rejects_empty_body_without_writing() -> Result<()> 
 }
 
 #[tokio::test]
+async fn content_workflow_submit_and_publish_audits_transitions() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-workflow-001").await?;
+
+    let review = post_content_workflow(
+        &ctx,
+        "article-workflow-001",
+        json!({
+            "action": "submit_for_review",
+            "actor_id": "author-001",
+            "actor_role": "author"
+        }),
+    )
+    .await?;
+    assert_eq!(
+        review
+            .pointer("/content/status")
+            .and_then(|value| value.as_str()),
+        Some("in_review")
+    );
+    assert_eq!(
+        review
+            .pointer("/audit/from_status")
+            .and_then(|value| value.as_str()),
+        Some("draft")
+    );
+    assert_eq!(
+        review
+            .pointer("/audit/to_status")
+            .and_then(|value| value.as_str()),
+        Some("in_review")
+    );
+    assert_eq!(
+        review
+            .pointer("/audit/actor_id")
+            .and_then(|value| value.as_str()),
+        Some("author-001")
+    );
+
+    let publish = post_content_workflow(
+        &ctx,
+        "article-workflow-001",
+        json!({
+            "action": "publish",
+            "actor_id": "editor-001",
+            "actor_role": "editor"
+        }),
+    )
+    .await?;
+    assert_eq!(
+        publish
+            .pointer("/content/status")
+            .and_then(|value| value.as_str()),
+        Some("published")
+    );
+    assert_eq!(
+        publish
+            .pointer("/audit/from_status")
+            .and_then(|value| value.as_str()),
+        Some("in_review")
+    );
+    assert_eq!(
+        publish
+            .pointer("/audit/action")
+            .and_then(|value| value.as_str()),
+        Some("publish")
+    );
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cms_content_workflow_audits WHERE content_id = ?1",
+    )
+    .bind("article-workflow-001")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_workflow_denies_author_publish_and_skip_review() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-workflow-denied").await?;
+
+    let skip_review = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-workflow-denied/workflow?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "publish",
+                        "actor_id": "editor-001",
+                        "actor_role": "editor"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(skip_review.status(), StatusCode::BAD_REQUEST);
+
+    post_content_workflow(
+        &ctx,
+        "article-workflow-denied",
+        json!({
+            "action": "submit_for_review",
+            "actor_id": "author-001",
+            "actor_role": "author"
+        }),
+    )
+    .await?;
+
+    let author_publish = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-workflow-denied/workflow?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "publish",
+                        "actor_id": "author-001",
+                        "actor_role": "author"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(author_publish.status(), StatusCode::FORBIDDEN);
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM cms_contents WHERE content_id = ?1")
+            .bind("article-workflow-denied")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(status, "in_review");
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cms_content_workflow_audits WHERE content_id = ?1",
+    )
+    .bind("article-workflow-denied")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_workflow_scheduled_publish_stays_in_review_until_effective() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-workflow-scheduled").await?;
+    post_content_workflow(
+        &ctx,
+        "article-workflow-scheduled",
+        json!({
+            "action": "submit_for_review",
+            "actor_id": "author-001",
+            "actor_role": "author"
+        }),
+    )
+    .await?;
+
+    let scheduled = post_content_workflow(
+        &ctx,
+        "article-workflow-scheduled",
+        json!({
+            "action": "publish",
+            "actor_id": "editor-001",
+            "actor_role": "editor",
+            "scheduled_effective_at": "2999-01-01T00:00:00Z"
+        }),
+    )
+    .await?;
+    assert_eq!(
+        scheduled
+            .pointer("/content/status")
+            .and_then(|value| value.as_str()),
+        Some("in_review")
+    );
+    assert_eq!(
+        scheduled
+            .pointer("/audit/scheduled_effective_at")
+            .and_then(|value| value.as_str()),
+        Some("2999-01-01T00:00:00Z")
+    );
+
+    let row = sqlx::query(
+        "SELECT status, scheduled_effective_at FROM cms_contents c JOIN cms_content_workflow_audits a ON a.content_id = c.content_id WHERE c.content_id = ?1 AND a.action = 'publish'",
+    )
+    .bind("article-workflow-scheduled")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "in_review");
+    assert_eq!(
+        row.get::<Option<String>, _>("scheduled_effective_at")
+            .as_deref(),
+        Some("2999-01-01T00:00:00Z")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -15298,6 +15513,59 @@ fn sustainability_certification_pack_payload(
         "claimed_output_refs": claimed_output_refs,
         "method_version": "sustainability.certification_pack.v1"
     })
+}
+
+async fn create_content_fixture(ctx: &TestContext, content_id: &str) -> Result<serde_json::Value> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "content_id": content_id,
+                        "content_type": "article",
+                        "author_id": "author-001",
+                        "org_id": "org-alpha",
+                        "body": "First draft"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    serde_json::from_slice(&body).map_err(Into::into)
+}
+
+async fn post_content_workflow(
+    ctx: &TestContext,
+    content_id: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/content/items/{content_id}/workflow?org_id=org-alpha"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    serde_json::from_slice(&body).map_err(Into::into)
 }
 
 async fn register_test_component(

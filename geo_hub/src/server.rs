@@ -442,6 +442,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::append_content_item_version),
         )
         .route(
+            "/api/content/items/:content_id/workflow",
+            post(routes::transition_content_item_workflow),
+        )
+        .route(
             "/api/collaboration/channels",
             get(routes::list_collaboration_channels).post(routes::create_collaboration_channel),
         )

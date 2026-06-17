@@ -3,9 +3,9 @@
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
 - **Last implementation commit**: 635d991 (`batch-20260617051738`)
-- **Latest checkpoint commit**: this checkpoint commit after 635d991 (`batch-20260617051738`)
-- **Current batch**: none
-- **Completed feature rows**: 460 committed; 1 tests_passed; 2 skipped; 2 blocked; 33 pending in this run.
+- **Latest checkpoint commit**: b9e17cd checkpoint after 635d991 (`batch-20260617051738`)
+- **Current batch**: `batch-20260617052656` — `20-02` authoring and editorial workflow, verified and ready to commit
+- **Completed feature rows**: 460 committed; 2 tests_passed; 2 skipped; 2 blocked; 32 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval.
 
 ## Latest verification
@@ -32,7 +32,11 @@
 - `cargo test -p shared sustainability_export --lib` — pass (0 matching tests; shared crate compiled with export structs)
 - `cargo check -p geo_hub` — pass
 - `19-10` — verified as field sustainability export/reporting with CSV row parity, GeoJSON CRS/extent features, PDF method/evidence citations, and valid empty-field artifacts
+- `cargo test -p shared content_workflow --lib` — pass
+- `cargo test -p geo_hub --test products_api content_workflow` — pass
+- `cargo check -p geo_hub` — pass
+- `20-02` — verified as authoring/editorial workflow with draft → review → publish transitions, audit rows with actor/timestamp, non-editor publish denial, skip-review refusal, and future scheduled publish staying in review
 
 ## Next action
 
-- Select and claim the next pending feature after `19-10` sustainability export/reporting; next pending is `20-02`.
+- Commit verified `20-02` authoring/editorial workflow batch, update checkpoint commit SHA, then select `20-03`.

@@ -109,22 +109,23 @@ use shared::schemas::{
     parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
     publish_marketplace_listing_record, release_marketplace_inventory,
     reserve_marketplace_inventory, soil_moisture_rejection_reason_for_error,
-    soil_moisture_rejection_record, transition_marketplace_account_status,
-    transition_marketplace_fulfillment_status, transition_marketplace_order_status,
-    validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
-    BiodiversityProxyError, BiodiversityProxyRequest, BiodiversityProxyResult,
-    BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult,
-    CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintError,
-    CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
+    soil_moisture_rejection_record, transition_content_workflow,
+    transition_marketplace_account_status, transition_marketplace_fulfillment_status,
+    transition_marketplace_order_status, validate_field_boundary, weather_fetch_failure_record,
+    AnnotationGeometry, AnnotationRecord, BiodiversityProxyError, BiodiversityProxyRequest,
+    BiodiversityProxyResult, BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest,
+    BiomassEstimateResult, CarbonEmissionFactor, CarbonFootprintComputeRequest,
+    CarbonFootprintError, CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
     CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
     CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
     ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
-    ContentType, ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError,
-    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
-    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
-    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
-    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    ContentType, ContentVersionRecord, ContentWorkflowAuditRecord,
+    ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult, DroughtIndexComputeRequest,
+    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
+    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
+    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
     MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
     MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
     MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
@@ -5024,6 +5025,32 @@ pub async fn append_content_item_version(
         .await?
         .ok_or(AppError::NotFound)
         .map(Json)
+}
+
+pub async fn transition_content_item_workflow(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<ContentWorkflowTransitionRequest>,
+) -> AppResult<Json<ContentWorkflowTransitionResult>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let transition = transition_content_workflow(
+        &content,
+        request,
+        format!("content-workflow-audit-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    persist_content_workflow_transition(&state, &transition).await?;
+
+    Ok(Json(transition))
 }
 
 pub async fn get_content_item(
@@ -10100,7 +10127,11 @@ fn sustainability_certification_pack_error(
 }
 
 fn content_error(error: ContentError) -> AppError {
-    AppError::BadRequest(error.to_string())
+    if matches!(error, ContentError::PublishRequiresEditor) {
+        AppError::Forbidden(error.to_string())
+    } else {
+        AppError::BadRequest(error.to_string())
+    }
 }
 
 fn collaboration_error(error: CollaborationError) -> AppError {
@@ -15496,6 +15527,59 @@ async fn append_content_version_record(
     .await
     .map_err(Error::from)?;
     tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn persist_content_workflow_transition(
+    state: &AppState,
+    transition: &ContentWorkflowTransitionResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        UPDATE cms_contents
+        SET status = ?2, updated_at = ?3
+        WHERE content_id = ?1
+        "#,
+    )
+    .bind(&transition.content.content_id)
+    .bind(transition.content.status.as_str())
+    .bind(&transition.content.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    insert_content_workflow_audit_in_tx(&mut tx, &transition.audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_content_workflow_audit_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    audit: &ContentWorkflowAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_content_workflow_audits (
+            audit_id, content_id, action, from_status, to_status, actor_id, actor_role,
+            occurred_at, scheduled_effective_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.content_id)
+    .bind(audit.action.as_str())
+    .bind(audit.from_status.as_str())
+    .bind(audit.to_status.as_str())
+    .bind(&audit.actor_id)
+    .bind(audit.actor_role.as_str())
+    .bind(&audit.occurred_at)
+    .bind(&audit.scheduled_effective_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
 
     Ok(())
 }

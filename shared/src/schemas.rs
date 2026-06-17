@@ -12569,6 +12569,73 @@ pub struct VersionedContentRecord {
     pub versions: Vec<ContentVersionRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentWorkflowAction {
+    SubmitForReview,
+    Publish,
+    Reject,
+    Unpublish,
+}
+
+impl ContentWorkflowAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentWorkflowAction::SubmitForReview => "submit_for_review",
+            ContentWorkflowAction::Publish => "publish",
+            ContentWorkflowAction::Reject => "reject",
+            ContentWorkflowAction::Unpublish => "unpublish",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentWorkflowActorRole {
+    Author,
+    Editor,
+    Viewer,
+}
+
+impl ContentWorkflowActorRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentWorkflowActorRole::Author => "author",
+            ContentWorkflowActorRole::Editor => "editor",
+            ContentWorkflowActorRole::Viewer => "viewer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentWorkflowTransitionRequest {
+    pub action: ContentWorkflowAction,
+    pub actor_id: String,
+    pub actor_role: ContentWorkflowActorRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_effective_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentWorkflowAuditRecord {
+    pub audit_id: String,
+    pub content_id: String,
+    pub action: ContentWorkflowAction,
+    pub from_status: ContentStatus,
+    pub to_status: ContentStatus,
+    pub actor_id: String,
+    pub actor_role: ContentWorkflowActorRole,
+    pub occurred_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_effective_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentWorkflowTransitionResult {
+    pub content: ContentRecord,
+    pub audit: ContentWorkflowAuditRecord,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ContentError {
     #[error("content_id cannot be empty")]
@@ -12587,6 +12654,19 @@ pub enum ContentError {
     UnsupportedContentType { value: String },
     #[error("unsupported content status {value}")]
     UnsupportedContentStatus { value: String },
+    #[error("content actor_id cannot be empty")]
+    EmptyActorId,
+    #[error("content workflow audit_id cannot be empty")]
+    EmptyWorkflowAuditId,
+    #[error("content workflow transition time cannot be empty")]
+    EmptyWorkflowTimestamp,
+    #[error("content publish requires editor role")]
+    PublishRequiresEditor,
+    #[error("content workflow action {action} cannot transition {from_status}")]
+    InvalidWorkflowTransition {
+        action: &'static str,
+        from_status: &'static str,
+    },
 }
 
 pub fn create_versioned_content(
@@ -12645,6 +12725,97 @@ pub fn append_content_version(
     };
 
     Ok((updated, version))
+}
+
+pub fn transition_content_workflow(
+    content: &ContentRecord,
+    request: ContentWorkflowTransitionRequest,
+    generated_audit_id: String,
+    occurred_at: String,
+) -> Result<ContentWorkflowTransitionResult, ContentError> {
+    let audit_id =
+        normalize_content_text(generated_audit_id).ok_or(ContentError::EmptyWorkflowAuditId)?;
+    let actor_id = normalize_content_text(request.actor_id).ok_or(ContentError::EmptyActorId)?;
+    let occurred_at =
+        normalize_content_text(occurred_at).ok_or(ContentError::EmptyWorkflowTimestamp)?;
+    let scheduled_effective_at = normalize_content_optional_text(request.scheduled_effective_at);
+    let from_status = content.status;
+    let to_status = match request.action {
+        ContentWorkflowAction::SubmitForReview => match from_status {
+            ContentStatus::Draft | ContentStatus::Rejected | ContentStatus::Unpublished => {
+                ContentStatus::InReview
+            }
+            _ => {
+                return Err(ContentError::InvalidWorkflowTransition {
+                    action: request.action.as_str(),
+                    from_status: from_status.as_str(),
+                });
+            }
+        },
+        ContentWorkflowAction::Publish => {
+            if request.actor_role != ContentWorkflowActorRole::Editor {
+                return Err(ContentError::PublishRequiresEditor);
+            }
+            if from_status != ContentStatus::InReview {
+                return Err(ContentError::InvalidWorkflowTransition {
+                    action: request.action.as_str(),
+                    from_status: from_status.as_str(),
+                });
+            }
+            if scheduled_effective_at
+                .as_deref()
+                .is_some_and(|effective_at| effective_at > occurred_at.as_str())
+            {
+                ContentStatus::InReview
+            } else {
+                ContentStatus::Published
+            }
+        }
+        ContentWorkflowAction::Reject => {
+            if request.actor_role != ContentWorkflowActorRole::Editor {
+                return Err(ContentError::PublishRequiresEditor);
+            }
+            if from_status != ContentStatus::InReview {
+                return Err(ContentError::InvalidWorkflowTransition {
+                    action: request.action.as_str(),
+                    from_status: from_status.as_str(),
+                });
+            }
+            ContentStatus::Rejected
+        }
+        ContentWorkflowAction::Unpublish => {
+            if request.actor_role != ContentWorkflowActorRole::Editor {
+                return Err(ContentError::PublishRequiresEditor);
+            }
+            if from_status != ContentStatus::Published {
+                return Err(ContentError::InvalidWorkflowTransition {
+                    action: request.action.as_str(),
+                    from_status: from_status.as_str(),
+                });
+            }
+            ContentStatus::Unpublished
+        }
+    };
+
+    let mut updated = content.clone();
+    updated.status = to_status;
+    updated.updated_at = occurred_at.clone();
+    let audit = ContentWorkflowAuditRecord {
+        audit_id,
+        content_id: content.content_id.clone(),
+        action: request.action,
+        from_status,
+        to_status,
+        actor_id,
+        actor_role: request.actor_role,
+        occurred_at,
+        scheduled_effective_at,
+    };
+
+    Ok(ContentWorkflowTransitionResult {
+        content: updated,
+        audit,
+    })
 }
 
 pub fn parse_content_type(value: &str) -> Result<ContentType, ContentError> {
@@ -16153,7 +16324,7 @@ mod tests {
         query_weather_history, release_marketplace_inventory, report_water_use_savings,
         reserve_marketplace_inventory, resolve_weather_forecast_to_field, route_weather_alert,
         run_tractor_straight_path_guidance, schedule_irrigation_plan, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, tractor_cross_track_error_m,
+        soil_moisture_rejection_record, tractor_cross_track_error_m, transition_content_workflow,
         transition_marketplace_account_status, transition_marketplace_fulfillment_status,
         transition_marketplace_order_status, validate_field_boundary,
         validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
@@ -16166,7 +16337,8 @@ mod tests {
         CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
         CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
         CollaborationError, CollaborationMessageCreateRequest, ContentCreateRequest, ContentError,
-        ContentStatus, ContentType, CropPlanRecord, DroughtAdvisoryLoopRequest,
+        ContentStatus, ContentType, ContentWorkflowAction, ContentWorkflowActorRole,
+        ContentWorkflowTransitionRequest, CropPlanRecord, DroughtAdvisoryLoopRequest,
         DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
         DroughtBaselineTrendRequest, DroughtBaselineTrendStatus, DroughtEvidenceFusionError,
         DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus,
@@ -18961,6 +19133,161 @@ mod tests {
         assert_eq!(updated.updated_at, "2026-06-13T14:00:00Z");
         assert_eq!(second_version.content_id, content.content_id);
         assert_eq!(second_version.body, "Updated body");
+    }
+
+    #[test]
+    fn content_workflow_submits_for_review_and_editor_publishes_with_audit() {
+        let (content, _) = create_versioned_content(
+            content_create_request(),
+            "generated-content".to_string(),
+            "version-001".to_string(),
+            "2026-06-13T13:00:00Z".to_string(),
+        )
+        .expect("content should create");
+
+        let review = transition_content_workflow(
+            &content,
+            ContentWorkflowTransitionRequest {
+                action: ContentWorkflowAction::SubmitForReview,
+                actor_id: "author-001".to_string(),
+                actor_role: ContentWorkflowActorRole::Author,
+                scheduled_effective_at: None,
+            },
+            "audit-submit".to_string(),
+            "2026-06-13T14:00:00Z".to_string(),
+        )
+        .expect("author should submit draft for review");
+        assert_eq!(review.content.status, ContentStatus::InReview);
+        assert_eq!(review.audit.from_status, ContentStatus::Draft);
+        assert_eq!(review.audit.to_status, ContentStatus::InReview);
+        assert_eq!(review.audit.actor_id, "author-001");
+        assert_eq!(review.audit.occurred_at, "2026-06-13T14:00:00Z");
+
+        let published = transition_content_workflow(
+            &review.content,
+            ContentWorkflowTransitionRequest {
+                action: ContentWorkflowAction::Publish,
+                actor_id: "editor-001".to_string(),
+                actor_role: ContentWorkflowActorRole::Editor,
+                scheduled_effective_at: None,
+            },
+            "audit-publish".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+        )
+        .expect("editor should publish reviewed content");
+        assert_eq!(published.content.status, ContentStatus::Published);
+        assert_eq!(published.audit.from_status, ContentStatus::InReview);
+        assert_eq!(published.audit.to_status, ContentStatus::Published);
+        assert_eq!(published.audit.actor_id, "editor-001");
+    }
+
+    #[test]
+    fn content_workflow_rejects_non_editor_publish_and_skip_review() {
+        let (content, _) = create_versioned_content(
+            content_create_request(),
+            "generated-content".to_string(),
+            "version-001".to_string(),
+            "2026-06-13T13:00:00Z".to_string(),
+        )
+        .expect("content should create");
+        let direct_publish = transition_content_workflow(
+            &content,
+            ContentWorkflowTransitionRequest {
+                action: ContentWorkflowAction::Publish,
+                actor_id: "editor-001".to_string(),
+                actor_role: ContentWorkflowActorRole::Editor,
+                scheduled_effective_at: None,
+            },
+            "audit-direct".to_string(),
+            "2026-06-13T14:00:00Z".to_string(),
+        )
+        .expect_err("draft cannot skip review");
+        assert_eq!(
+            direct_publish,
+            ContentError::InvalidWorkflowTransition {
+                action: "publish",
+                from_status: "draft"
+            }
+        );
+
+        let review = transition_content_workflow(
+            &content,
+            ContentWorkflowTransitionRequest {
+                action: ContentWorkflowAction::SubmitForReview,
+                actor_id: "author-001".to_string(),
+                actor_role: ContentWorkflowActorRole::Author,
+                scheduled_effective_at: None,
+            },
+            "audit-submit".to_string(),
+            "2026-06-13T14:00:00Z".to_string(),
+        )
+        .expect("submit should work");
+        let author_publish = transition_content_workflow(
+            &review.content,
+            ContentWorkflowTransitionRequest {
+                action: ContentWorkflowAction::Publish,
+                actor_id: "author-001".to_string(),
+                actor_role: ContentWorkflowActorRole::Author,
+                scheduled_effective_at: None,
+            },
+            "audit-author-publish".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+        )
+        .expect_err("author cannot publish");
+        assert_eq!(author_publish, ContentError::PublishRequiresEditor);
+    }
+
+    #[test]
+    fn content_workflow_scheduled_publish_waits_until_effective_time() {
+        let (content, _) = create_versioned_content(
+            content_create_request(),
+            "generated-content".to_string(),
+            "version-001".to_string(),
+            "2026-06-13T13:00:00Z".to_string(),
+        )
+        .expect("content should create");
+        let review = transition_content_workflow(
+            &content,
+            ContentWorkflowTransitionRequest {
+                action: ContentWorkflowAction::SubmitForReview,
+                actor_id: "author-001".to_string(),
+                actor_role: ContentWorkflowActorRole::Author,
+                scheduled_effective_at: None,
+            },
+            "audit-submit".to_string(),
+            "2026-06-13T14:00:00Z".to_string(),
+        )
+        .expect("submit should work");
+
+        let scheduled = transition_content_workflow(
+            &review.content,
+            ContentWorkflowTransitionRequest {
+                action: ContentWorkflowAction::Publish,
+                actor_id: "editor-001".to_string(),
+                actor_role: ContentWorkflowActorRole::Editor,
+                scheduled_effective_at: Some("2026-06-14T00:00:00Z".to_string()),
+            },
+            "audit-schedule".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+        )
+        .expect("future publish should be scheduled but not live");
+        assert_eq!(scheduled.content.status, ContentStatus::InReview);
+        assert_eq!(scheduled.audit.to_status, ContentStatus::InReview);
+        assert_eq!(
+            scheduled.audit.scheduled_effective_at.as_deref(),
+            Some("2026-06-14T00:00:00Z")
+        );
+    }
+
+    fn content_create_request() -> ContentCreateRequest {
+        ContentCreateRequest {
+            content_id: Some("article-001".to_string()),
+            content_type: ContentType::Article,
+            author_id: "author-001".to_string(),
+            org_id: "org-alpha".to_string(),
+            body: "First draft".to_string(),
+            status: None,
+        }
     }
 
     fn carbon_footprint_request(include_required: bool) -> CarbonFootprintComputeRequest {
