@@ -446,6 +446,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::transition_content_item_workflow),
         )
         .route(
+            "/api/content/permissions/resolve",
+            get(routes::resolve_content_permissions_route),
+        )
+        .route(
             "/api/collaboration/channels",
             get(routes::list_collaboration_channels).post(routes::create_collaboration_channel),
         )

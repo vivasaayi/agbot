@@ -12636,6 +12636,26 @@ pub struct ContentWorkflowTransitionResult {
     pub audit: ContentWorkflowAuditRecord,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentPermissionResolveRequest {
+    pub org_id: String,
+    pub actor_org_id: String,
+    #[serde(default)]
+    pub role_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentPermissionSet {
+    pub org_id: String,
+    pub actor_org_id: String,
+    pub can_author: bool,
+    pub can_edit: bool,
+    pub can_publish: bool,
+    pub can_moderate: bool,
+    pub can_read: bool,
+    pub role_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ContentError {
     #[error("content_id cannot be empty")]
@@ -12667,6 +12687,8 @@ pub enum ContentError {
         action: &'static str,
         from_status: &'static str,
     },
+    #[error("content access denied for {permission}")]
+    AccessDenied { permission: &'static str },
 }
 
 pub fn create_versioned_content(
@@ -12815,6 +12837,61 @@ pub fn transition_content_workflow(
     Ok(ContentWorkflowTransitionResult {
         content: updated,
         audit,
+    })
+}
+
+pub fn resolve_content_permissions(
+    request: ContentPermissionResolveRequest,
+) -> Result<ContentPermissionSet, ContentError> {
+    let org_id = normalize_content_text(request.org_id).ok_or(ContentError::EmptyOrgId)?;
+    let actor_org_id =
+        normalize_content_text(request.actor_org_id).ok_or(ContentError::EmptyOrgId)?;
+    let role_refs = request
+        .role_refs
+        .into_iter()
+        .filter_map(normalize_content_text)
+        .map(|role| role.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if actor_org_id != org_id {
+        return Ok(ContentPermissionSet {
+            org_id,
+            actor_org_id,
+            can_author: false,
+            can_edit: false,
+            can_publish: false,
+            can_moderate: false,
+            can_read: false,
+            role_refs,
+        });
+    }
+
+    let has = |candidates: &[&str]| {
+        role_refs
+            .iter()
+            .any(|role| candidates.iter().any(|candidate| role == candidate))
+    };
+    let admin = has(&["admin", "cms:admin", "content:admin"]);
+    let editor = admin || has(&["editor", "cms:editor", "content:editor"]);
+    let contributor = editor
+        || has(&[
+            "author",
+            "cms:author",
+            "content:author",
+            "contributor",
+            "cms:contributor",
+            "content:contributor",
+        ]);
+    let viewer = contributor || has(&["viewer", "cms:viewer", "content:viewer"]);
+
+    Ok(ContentPermissionSet {
+        org_id,
+        actor_org_id,
+        can_author: contributor,
+        can_edit: contributor,
+        can_publish: editor,
+        can_moderate: editor,
+        can_read: viewer,
+        role_refs,
     })
 }
 
@@ -16322,9 +16399,10 @@ mod tests {
         place_marketplace_order_record, plan_tractor_swath_coverage,
         publish_marketplace_listing_record, query_drought_history, query_irrigation_history,
         query_weather_history, release_marketplace_inventory, report_water_use_savings,
-        reserve_marketplace_inventory, resolve_weather_forecast_to_field, route_weather_alert,
-        run_tractor_straight_path_guidance, schedule_irrigation_plan, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, tractor_cross_track_error_m, transition_content_workflow,
+        reserve_marketplace_inventory, resolve_content_permissions,
+        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
+        schedule_irrigation_plan, sign_fleet_config_bundle, soil_moisture_rejection_record,
+        tractor_cross_track_error_m, transition_content_workflow,
         transition_marketplace_account_status, transition_marketplace_fulfillment_status,
         transition_marketplace_order_status, validate_field_boundary,
         validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
@@ -16337,49 +16415,50 @@ mod tests {
         CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
         CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
         CollaborationError, CollaborationMessageCreateRequest, ContentCreateRequest, ContentError,
-        ContentStatus, ContentType, ContentWorkflowAction, ContentWorkflowActorRole,
-        ContentWorkflowTransitionRequest, CropPlanRecord, DroughtAdvisoryLoopRequest,
-        DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
-        DroughtBaselineTrendRequest, DroughtBaselineTrendStatus, DroughtEvidenceFusionError,
-        DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus,
-        DroughtForecastRequest, DroughtForecastStatus, DroughtForecastUncertaintyBand,
-        DroughtHistoryEntry, DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
-        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
-        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
-        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
-        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
-        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
-        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
-        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
-        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
-        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
-        MarketplaceDemandForecastStatus, MarketplaceFulfillmentCreateRequest,
-        MarketplaceFulfillmentError, MarketplaceFulfillmentStatus, MarketplaceInventoryError,
-        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
-        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
-        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
-        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceRatingCreateRequest,
-        MarketplaceRatingError, MarketplaceReportPeriod, MarketplaceUnitOfMeasure,
-        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
-        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
-        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
-        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
-        SeasonRecord, SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
+        ContentPermissionResolveRequest, ContentStatus, ContentType, ContentWorkflowAction,
+        ContentWorkflowActorRole, ContentWorkflowTransitionRequest, CropPlanRecord,
+        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
+        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
+        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
+        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
+        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
+        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
+        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
+        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
+        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
+        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
+        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
+        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
+        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
+        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
+        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+        MarketplaceDemandForecastRequest, MarketplaceDemandForecastStatus,
+        MarketplaceFulfillmentCreateRequest, MarketplaceFulfillmentError,
+        MarketplaceFulfillmentStatus, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
+        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
+        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
+        MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
+        MarketplaceRatingCreateRequest, MarketplaceRatingError, MarketplaceReportPeriod,
+        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
+        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
+        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
+        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
+        SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
         SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
         SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
@@ -19277,6 +19356,42 @@ mod tests {
             scheduled.audit.scheduled_effective_at.as_deref(),
             Some("2026-06-14T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn content_permissions_map_editor_viewer_and_cross_org_roles() {
+        let editor = resolve_content_permissions(ContentPermissionResolveRequest {
+            org_id: "org-alpha".to_string(),
+            actor_org_id: "org-alpha".to_string(),
+            role_refs: vec!["cms:editor".to_string()],
+        })
+        .expect("editor permissions should resolve");
+        assert!(editor.can_read);
+        assert!(editor.can_author);
+        assert!(editor.can_edit);
+        assert!(editor.can_publish);
+        assert!(editor.can_moderate);
+
+        let viewer = resolve_content_permissions(ContentPermissionResolveRequest {
+            org_id: "org-alpha".to_string(),
+            actor_org_id: "org-alpha".to_string(),
+            role_refs: vec!["cms:viewer".to_string()],
+        })
+        .expect("viewer permissions should resolve");
+        assert!(viewer.can_read);
+        assert!(!viewer.can_author);
+        assert!(!viewer.can_edit);
+        assert!(!viewer.can_publish);
+        assert!(!viewer.can_moderate);
+
+        let cross_org = resolve_content_permissions(ContentPermissionResolveRequest {
+            org_id: "org-alpha".to_string(),
+            actor_org_id: "org-beta".to_string(),
+            role_refs: vec!["cms:editor".to_string()],
+        })
+        .expect("cross-org permissions should resolve to no access");
+        assert!(!cross_org.can_read);
+        assert!(!cross_org.can_publish);
     }
 
     fn content_create_request() -> ContentCreateRequest {

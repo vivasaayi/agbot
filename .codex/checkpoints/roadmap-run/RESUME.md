@@ -3,9 +3,9 @@
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
 - **Last implementation commit**: 99bf815 (`batch-20260617052656`)
-- **Latest checkpoint commit**: this checkpoint commit after 99bf815 (`batch-20260617052656`)
-- **Current batch**: none
-- **Completed feature rows**: 461 committed; 1 tests_passed; 2 skipped; 2 blocked; 32 pending in this run.
+- **Latest checkpoint commit**: 40bb155 checkpoint after 99bf815 (`batch-20260617052656`)
+- **Current batch**: `batch-20260617053612` — `20-03` CMS access control via role model, verified and ready to commit
+- **Completed feature rows**: 461 committed; 2 tests_passed; 2 skipped; 2 blocked; 31 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval.
 
 ## Latest verification
@@ -36,7 +36,12 @@
 - `cargo test -p geo_hub --test products_api content_workflow` — pass
 - `cargo check -p geo_hub` — pass
 - `20-02` — verified as authoring/editorial workflow with draft → review → publish transitions, audit rows with actor/timestamp, non-editor publish denial, skip-review refusal, and future scheduled publish staying in review
+- `cargo test -p shared content_permissions --lib` — pass
+- `cargo test -p geo_hub --test products_api content_permissions` — pass
+- `cargo test -p geo_hub --test products_api content_workflow` — pass
+- `cargo check -p geo_hub` — pass
+- `20-03` — verified as CMS permission resolution from org-scoped role refs, editor publish capability, cross-org no-access resolution, and viewer workflow write denial with audit
 
 ## Next action
 
-- Select and claim the next pending feature after `20-02` authoring/editorial workflow; next pending is `20-03`.
+- Commit verified `20-03` CMS access control batch, update checkpoint commit SHA, then select `20-04`.

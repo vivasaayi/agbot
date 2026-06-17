@@ -108,24 +108,26 @@ use shared::schemas::{
     parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
     parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
     publish_marketplace_listing_record, release_marketplace_inventory,
-    reserve_marketplace_inventory, soil_moisture_rejection_reason_for_error,
-    soil_moisture_rejection_record, transition_content_workflow,
-    transition_marketplace_account_status, transition_marketplace_fulfillment_status,
-    transition_marketplace_order_status, validate_field_boundary, weather_fetch_failure_record,
-    AnnotationGeometry, AnnotationRecord, BiodiversityProxyError, BiodiversityProxyRequest,
-    BiodiversityProxyResult, BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest,
-    BiomassEstimateResult, CarbonEmissionFactor, CarbonFootprintComputeRequest,
-    CarbonFootprintError, CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
+    reserve_marketplace_inventory, resolve_content_permissions,
+    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
+    transition_content_workflow, transition_marketplace_account_status,
+    transition_marketplace_fulfillment_status, transition_marketplace_order_status,
+    validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
+    BiodiversityProxyError, BiodiversityProxyRequest, BiodiversityProxyResult,
+    BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult,
+    CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintError,
+    CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
     CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
     CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
-    ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
-    ContentType, ContentVersionRecord, ContentWorkflowAuditRecord,
-    ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult, DroughtIndexComputeRequest,
-    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
-    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
-    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    ContentCreateRequest, ContentEditRequest, ContentError, ContentPermissionResolveRequest,
+    ContentPermissionSet, ContentRecord, ContentStatus, ContentType, ContentVersionRecord,
+    ContentWorkflowAction, ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest,
+    ContentWorkflowTransitionResult, DroughtIndexComputeRequest, DroughtIndexError,
+    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
     MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
     MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
     MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
@@ -900,6 +902,16 @@ pub struct ContentItemListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentItemScopeQuery {
     pub org_id: Option<String>,
+    pub actor_org_id: Option<String>,
+    pub role_refs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentPermissionQuery {
+    pub org_id: String,
+    pub actor_org_id: String,
+    #[serde(default)]
+    pub role_refs: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3325,7 +3337,7 @@ pub async fn get_marketplace_account(
     Query(query): Query<MarketplaceAccountScopeQuery>,
     State(state): State<AppState>,
 ) -> AppResult<Json<MarketplaceAccountRecord>> {
-    let org_id = normalize_optional_text(query.org_id)
+    let org_id = normalize_optional_text(query.org_id.clone())
         .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
     let account = load_marketplace_account(&state, &account_id)
         .await?
@@ -3418,7 +3430,7 @@ pub async fn get_marketplace_catalog_item(
     Query(query): Query<MarketplaceCatalogScopeQuery>,
     State(state): State<AppState>,
 ) -> AppResult<Json<MarketplaceCatalogItemRecord>> {
-    let org_id = normalize_optional_text(query.org_id)
+    let org_id = normalize_optional_text(query.org_id.clone())
         .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
     let item = load_marketplace_catalog_item(&state, &item_id)
         .await?
@@ -5033,7 +5045,7 @@ pub async fn transition_content_item_workflow(
     State(state): State<AppState>,
     Json(request): Json<ContentWorkflowTransitionRequest>,
 ) -> AppResult<Json<ContentWorkflowTransitionResult>> {
-    let org_id = normalize_optional_text(query.org_id)
+    let org_id = normalize_optional_text(query.org_id.clone())
         .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
     let content = load_content_record(&state, &content_id)
         .await?
@@ -5041,6 +5053,7 @@ pub async fn transition_content_item_workflow(
     if content.org_id != org_id {
         return Err(AppError::NotFound);
     }
+    assert_content_workflow_permission(&query, &content, &request, &state).await?;
     let transition = transition_content_workflow(
         &content,
         request,
@@ -5051,6 +5064,19 @@ pub async fn transition_content_item_workflow(
     persist_content_workflow_transition(&state, &transition).await?;
 
     Ok(Json(transition))
+}
+
+pub async fn resolve_content_permissions_route(
+    Query(query): Query<ContentPermissionQuery>,
+) -> AppResult<Json<ContentPermissionSet>> {
+    let permissions = resolve_content_permissions(ContentPermissionResolveRequest {
+        org_id: query.org_id,
+        actor_org_id: query.actor_org_id,
+        role_refs: parse_role_refs(query.role_refs),
+    })
+    .map_err(content_error)?;
+
+    Ok(Json(permissions))
 }
 
 pub async fn get_content_item(
@@ -15474,6 +15500,55 @@ async fn load_sustainability_record_linkage(
     }))
 }
 
+async fn assert_content_workflow_permission(
+    query: &ContentItemScopeQuery,
+    content: &ContentRecord,
+    request: &ContentWorkflowTransitionRequest,
+    state: &AppState,
+) -> AppResult<()> {
+    let Some(actor_org_id) = normalize_optional_text(query.actor_org_id.clone()) else {
+        return Ok(());
+    };
+    let Some(role_refs) = query.role_refs.clone() else {
+        return Ok(());
+    };
+    let permissions = resolve_content_permissions(ContentPermissionResolveRequest {
+        org_id: content.org_id.clone(),
+        actor_org_id,
+        role_refs: parse_role_refs(Some(role_refs)),
+    })
+    .map_err(content_error)?;
+    let (allowed, permission) = match request.action {
+        ContentWorkflowAction::SubmitForReview => (permissions.can_author, "can_author"),
+        ContentWorkflowAction::Publish => (permissions.can_publish, "can_publish"),
+        ContentWorkflowAction::Reject | ContentWorkflowAction::Unpublish => {
+            (permissions.can_moderate, "can_moderate")
+        }
+    };
+    if allowed {
+        return Ok(());
+    }
+
+    insert_content_workflow_denial_audit(state, content, request).await?;
+    Err(AppError::Forbidden(
+        ContentError::AccessDenied { permission }.to_string(),
+    ))
+}
+
+fn parse_role_refs(value: Option<String>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|roles| {
+            roles
+                .split(',')
+                .map(str::trim)
+                .filter(|role| !role.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 async fn insert_content_item_with_version(
     state: &AppState,
     content: &ContentRecord,
@@ -15550,6 +15625,30 @@ async fn persist_content_workflow_transition(
     .await
     .map_err(Error::from)?;
     insert_content_workflow_audit_in_tx(&mut tx, &transition.audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_content_workflow_denial_audit(
+    state: &AppState,
+    content: &ContentRecord,
+    request: &ContentWorkflowTransitionRequest,
+) -> AppResult<()> {
+    let audit = ContentWorkflowAuditRecord {
+        audit_id: format!("content-workflow-denied-{}", Uuid::new_v4()),
+        content_id: content.content_id.clone(),
+        action: request.action,
+        from_status: content.status,
+        to_status: content.status,
+        actor_id: normalize_optional_text(Some(request.actor_id.clone()))
+            .unwrap_or_else(|| "unknown".to_string()),
+        actor_role: request.actor_role,
+        occurred_at: current_record_timestamp(),
+        scheduled_effective_at: request.scheduled_effective_at.clone(),
+    };
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    insert_content_workflow_audit_in_tx(&mut tx, &audit).await?;
     tx.commit().await.map_err(Error::from)?;
 
     Ok(())

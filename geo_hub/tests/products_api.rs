@@ -6415,6 +6415,104 @@ async fn content_workflow_scheduled_publish_stays_in_review_until_effective() ->
 }
 
 #[tokio::test]
+async fn content_permissions_resolve_editor_and_cross_org_scope() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let editor = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/permissions/resolve?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:editor")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(editor.status(), StatusCode::OK);
+    let body = to_bytes(editor.into_body(), 64 * 1024).await?;
+    let editor: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        editor.get("can_publish").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        editor.get("can_moderate").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let cross_org = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/permissions/resolve?org_id=org-alpha&actor_org_id=org-beta&role_refs=cms:editor")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::OK);
+    let body = to_bytes(cross_org.into_body(), 64 * 1024).await?;
+    let cross_org: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        cross_org
+            .get("can_publish")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        cross_org.get("can_read").and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_permissions_viewer_write_is_denied_and_audited() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-permission-denied").await?;
+
+    let denied = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-permission-denied/workflow?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "submit_for_review",
+                        "actor_id": "viewer-001",
+                        "actor_role": "viewer"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let row = sqlx::query(
+        "SELECT status, from_status, to_status, actor_id FROM cms_contents c JOIN cms_content_workflow_audits a ON a.content_id = c.content_id WHERE c.content_id = ?1",
+    )
+    .bind("article-permission-denied")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "draft");
+    assert_eq!(row.get::<String, _>("from_status"), "draft");
+    assert_eq!(row.get::<String, _>("to_status"), "draft");
+    assert_eq!(row.get::<String, _>("actor_id"), "viewer-001");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
