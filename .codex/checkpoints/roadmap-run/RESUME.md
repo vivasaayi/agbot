@@ -3,9 +3,9 @@
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
 - **Last implementation commit**: b6d9a51 (`batch-20260617054345`)
-- **Latest checkpoint commit**: this checkpoint commit after b6d9a51 (`batch-20260617054345`)
-- **Current batch**: none
-- **Completed feature rows**: 463 committed; 1 tests_passed; 2 skipped; 2 blocked; 30 pending in this run.
+- **Latest checkpoint commit**: 4e94db8 checkpoint after b6d9a51 (`batch-20260617054345`)
+- **Current batch**: `batch-20260617055100` — `20-05` content taxonomy tagging, verified and ready to commit
+- **Completed feature rows**: 463 committed; 2 tests_passed; 2 skipped; 2 blocked; 29 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval.
 
 ## Latest verification
@@ -45,7 +45,11 @@
 - `cargo test -p geo_hub --test products_api content_search` — pass
 - `cargo check -p geo_hub` — pass
 - `20-04` — verified as published-only content search with deterministic term ranking, org scoping, draft exclusion, result article links, and empty no-match results
+- `cargo test -p shared content_taxonomy --lib` — pass
+- `cargo test -p geo_hub --test products_api content_tags` — pass
+- `cargo check -p geo_hub` — pass
+- `20-05` — verified as controlled crop/region/topic taxonomy tagging, editor-confirmed AI suggestions only, tag-filtered content retrieval, and off-taxonomy rejection
 
 ## Next action
 
-- Select and claim the next pending feature after `20-04` published content search; next pending is `20-05`.
+- Commit verified `20-05` content taxonomy tagging batch, update checkpoint commit SHA, then select `20-06`.

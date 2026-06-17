@@ -84,19 +84,19 @@ use provenance::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
-    aggregate_marketplace_ratings, append_content_version, assemble_marketplace_org_report,
-    assert_raster_spatial_ref, bind_fleet_node_identity, bounds_coverage_fraction,
-    bounds_from_points, build_collaboration_channel, build_collaboration_message,
-    build_marketplace_account_record, build_marketplace_catalog_item_record,
-    build_marketplace_inventory_record, build_marketplace_portal_entry,
-    build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
-    build_sustainability_record, build_tractor_record, close_marketplace_listing_record,
-    compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
-    compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
-    compute_sustainability_kpi, create_marketplace_fulfillment_record,
-    create_marketplace_rating_record, create_sustainability_baseline,
-    create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
-    fulfill_marketplace_inventory, normalize_weather_provider_forecast,
+    aggregate_marketplace_ratings, append_content_version, apply_content_taxonomy_tags,
+    assemble_marketplace_org_report, assert_raster_spatial_ref, bind_fleet_node_identity,
+    bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
+    build_collaboration_message, build_marketplace_account_record,
+    build_marketplace_catalog_item_record, build_marketplace_inventory_record,
+    build_marketplace_portal_entry, build_soil_moisture_reading,
+    build_sustainability_certification_evidence_pack, build_sustainability_record,
+    build_tractor_record, close_marketplace_listing_record, compare_sustainability_baseline,
+    compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_index,
+    compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
+    create_marketplace_fulfillment_record, create_marketplace_rating_record,
+    create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
+    estimate_biomass, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
     parse_biodiversity_proxy_status, parse_carbon_footprint_status, parse_content_status,
     parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
     parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
@@ -121,7 +121,8 @@ use shared::schemas::{
     CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
     ContentCreateRequest, ContentEditRequest, ContentError, ContentPermissionResolveRequest,
     ContentPermissionSet, ContentRecord, ContentSearchDocument, ContentSearchRequest,
-    ContentSearchResult, ContentStatus, ContentType, ContentVersionRecord, ContentWorkflowAction,
+    ContentSearchResult, ContentStatus, ContentTagApplyRequest, ContentTagRecord,
+    ContentTaxonomyKind, ContentType, ContentVersionRecord, ContentWorkflowAction,
     ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult,
     DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord,
     DroughtIndexType, FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord,
@@ -919,6 +920,13 @@ pub struct ContentPermissionQuery {
 pub struct ContentSearchQuery {
     pub org_id: String,
     pub q: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentTagFilterQuery {
+    pub org_id: String,
+    pub kind: ContentTaxonomyKind,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5103,6 +5111,62 @@ pub async fn search_content_items(
     .map_err(content_error)?;
 
     Ok(Json(results))
+}
+
+pub async fn apply_content_item_tags(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<ContentTagApplyRequest>,
+) -> AppResult<Json<Vec<ContentTagRecord>>> {
+    let org_id = normalize_optional_text(query.org_id.clone())
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let tags = apply_content_taxonomy_tags(content_id, request, current_record_timestamp())
+        .map_err(content_error)?;
+    insert_content_tags(&state, &tags).await?;
+
+    Ok(Json(tags))
+}
+
+pub async fn list_content_items_by_tag(
+    Query(query): Query<ContentTagFilterQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ContentRecord>>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let value = normalize_optional_text(Some(query.value))
+        .ok_or_else(|| AppError::BadRequest("tag value query parameter is required".to_string()))?
+        .to_ascii_lowercase()
+        .replace(' ', "_");
+    let rows = sqlx::query(
+        r#"
+        SELECT c.content_id, c.content_type, c.author_id, c.org_id, c.status,
+               c.current_version, c.created_at, c.updated_at
+        FROM cms_contents c
+        JOIN cms_content_tags t ON t.content_id = c.content_id
+        WHERE c.org_id = ?1
+          AND t.kind = ?2
+          AND t.value = ?3
+        ORDER BY c.created_at ASC, c.content_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(query.kind.as_str())
+    .bind(value)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_content_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
 }
 
 pub async fn get_content_item(
@@ -15675,6 +15739,32 @@ async fn insert_content_workflow_denial_audit(
     };
     let mut tx = state.pool.begin().await.map_err(Error::from)?;
     insert_content_workflow_audit_in_tx(&mut tx, &audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_content_tags(state: &AppState, tags: &[ContentTagRecord]) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    for tag in tags {
+        sqlx::query(
+            r#"
+            INSERT INTO cms_content_tags (content_id, kind, value, source, applied_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(content_id, kind, value) DO UPDATE SET
+                source = excluded.source,
+                applied_at = excluded.applied_at
+            "#,
+        )
+        .bind(&tag.content_id)
+        .bind(tag.kind.as_str())
+        .bind(&tag.value)
+        .bind(&tag.source)
+        .bind(&tag.applied_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
     tx.commit().await.map_err(Error::from)?;
 
     Ok(())

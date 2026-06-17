@@ -12679,6 +12679,49 @@ pub struct ContentSearchResult {
     pub snippet: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentTaxonomyKind {
+    Crop,
+    Region,
+    Topic,
+}
+
+impl ContentTaxonomyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentTaxonomyKind::Crop => "crop",
+            ContentTaxonomyKind::Region => "region",
+            ContentTaxonomyKind::Topic => "topic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentTaxonomyTag {
+    pub kind: ContentTaxonomyKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentTagApplyRequest {
+    #[serde(default)]
+    pub tags: Vec<ContentTaxonomyTag>,
+    #[serde(default)]
+    pub suggested_by_ai: bool,
+    #[serde(default)]
+    pub editor_confirmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentTagRecord {
+    pub content_id: String,
+    pub kind: ContentTaxonomyKind,
+    pub value: String,
+    pub source: String,
+    pub applied_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ContentError {
     #[error("content_id cannot be empty")]
@@ -12714,6 +12757,12 @@ pub enum ContentError {
     AccessDenied { permission: &'static str },
     #[error("content search query cannot be empty")]
     EmptySearchQuery,
+    #[error("content tag value cannot be empty")]
+    EmptyTagValue,
+    #[error("content tag outside taxonomy: {kind}:{value}")]
+    InvalidTaxonomyTag { kind: &'static str, value: String },
+    #[error("AI-suggested content tags require editor confirmation")]
+    AiTagRequiresEditorConfirmation,
 }
 
 pub fn create_versioned_content(
@@ -12965,6 +13014,77 @@ pub fn search_published_content(
     });
 
     Ok(results)
+}
+
+pub fn apply_content_taxonomy_tags(
+    content_id: String,
+    request: ContentTagApplyRequest,
+    applied_at: String,
+) -> Result<Vec<ContentTagRecord>, ContentError> {
+    let content_id = normalize_content_text(content_id).ok_or(ContentError::EmptyContentId)?;
+    let applied_at = normalize_content_text(applied_at).ok_or(ContentError::EmptyCreatedAt)?;
+    if request.suggested_by_ai && !request.editor_confirmed {
+        return Err(ContentError::AiTagRequiresEditorConfirmation);
+    }
+    let source = if request.suggested_by_ai {
+        "ai_suggested_editor_confirmed"
+    } else {
+        "editor"
+    }
+    .to_string();
+    request
+        .tags
+        .into_iter()
+        .map(|tag| {
+            let value = normalize_content_text(tag.value)
+                .ok_or(ContentError::EmptyTagValue)?
+                .to_ascii_lowercase()
+                .replace(' ', "_");
+            if !content_taxonomy_contains(tag.kind, &value) {
+                return Err(ContentError::InvalidTaxonomyTag {
+                    kind: tag.kind.as_str(),
+                    value,
+                });
+            }
+            Ok(ContentTagRecord {
+                content_id: content_id.clone(),
+                kind: tag.kind,
+                value,
+                source: source.clone(),
+                applied_at: applied_at.clone(),
+            })
+        })
+        .collect()
+}
+
+pub fn parse_content_taxonomy_kind(value: &str) -> Result<ContentTaxonomyKind, ContentError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "crop" => Ok(ContentTaxonomyKind::Crop),
+        "region" => Ok(ContentTaxonomyKind::Region),
+        "topic" => Ok(ContentTaxonomyKind::Topic),
+        _ => Err(ContentError::InvalidTaxonomyTag {
+            kind: "unknown",
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn content_taxonomy_contains(kind: ContentTaxonomyKind, value: &str) -> bool {
+    let allowed = match kind {
+        ContentTaxonomyKind::Crop => ["corn", "soybean", "wheat", "rice", "cotton"].as_slice(),
+        ContentTaxonomyKind::Region => {
+            ["global", "midwest", "plains", "california", "delta"].as_slice()
+        }
+        ContentTaxonomyKind::Topic => [
+            "cover_crops",
+            "irrigation",
+            "nutrient_management",
+            "pest_management",
+            "soil_health",
+        ]
+        .as_slice(),
+    };
+    allowed.contains(&value)
 }
 
 fn content_search_terms(query: &str) -> Vec<String> {
@@ -16467,22 +16587,23 @@ mod tests {
     use super::{
         advise_weather_operational_windows, aggregate_marketplace_ratings,
         annotate_weather_record_freshness, append_content_version, append_irrigation_history_event,
-        append_weather_history_records, apply_dry_run_validated_fleet_config_bundle,
-        apply_fleet_node_heartbeat, apply_tractor_implement_command, assemble_drought_report,
-        assemble_marketplace_org_report, assert_flight_operation_allowed,
-        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-        build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
-        build_marketplace_account_record, build_marketplace_inventory_record,
-        build_marketplace_portal_entry, build_soil_moisture_reading,
-        build_sustainability_certification_evidence_pack, build_sustainability_record,
-        build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
-        close_marketplace_listing_record, compare_sustainability_baseline,
-        compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_baseline_trend,
-        compute_drought_index, compute_drought_risk_score, compute_marketplace_demand_forecast,
-        compute_soil_carbon_proxy, compute_sustainability_kpi, compute_water_evapotranspiration,
-        compute_weather_growing_degree_day, compute_weather_reference_et,
-        create_marketplace_fulfillment_record, create_marketplace_rating_record,
-        create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
+        append_weather_history_records, apply_content_taxonomy_tags,
+        apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
+        apply_tractor_implement_command, assemble_drought_report, assemble_marketplace_org_report,
+        assert_flight_operation_allowed, assert_raster_spatial_ref, bind_fleet_node_identity,
+        bounds_from_points, build_collaboration_channel, build_collaboration_message,
+        build_fleet_version_inventory, build_marketplace_account_record,
+        build_marketplace_inventory_record, build_marketplace_portal_entry,
+        build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
+        build_sustainability_record, build_tractor_field_ops_replay,
+        build_tractor_field_ops_session_log, close_marketplace_listing_record,
+        compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
+        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
+        compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
+        compute_water_evapotranspiration, compute_weather_growing_degree_day,
+        compute_weather_reference_et, create_marketplace_fulfillment_record,
+        create_marketplace_rating_record, create_sustainability_baseline,
+        create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -16514,50 +16635,50 @@ mod tests {
         CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
         CollaborationError, CollaborationMessageCreateRequest, ContentCreateRequest, ContentError,
         ContentPermissionResolveRequest, ContentRecord, ContentSearchDocument,
-        ContentSearchRequest, ContentStatus, ContentType, ContentWorkflowAction,
-        ContentWorkflowActorRole, ContentWorkflowTransitionRequest, CropPlanRecord,
-        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
-        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
-        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
-        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
-        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
-        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
-        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
-        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
-        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
-        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
-        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
-        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
-        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
-        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
-        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
-        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
-        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
-        MarketplaceDemandForecastRequest, MarketplaceDemandForecastStatus,
-        MarketplaceFulfillmentCreateRequest, MarketplaceFulfillmentError,
-        MarketplaceFulfillmentStatus, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
-        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
-        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
-        MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
-        MarketplaceRatingCreateRequest, MarketplaceRatingError, MarketplaceReportPeriod,
-        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
-        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
-        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
-        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
-        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
-        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
-        SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
+        ContentSearchRequest, ContentStatus, ContentTagApplyRequest, ContentTaxonomyKind,
+        ContentTaxonomyTag, ContentType, ContentWorkflowAction, ContentWorkflowActorRole,
+        ContentWorkflowTransitionRequest, CropPlanRecord, DroughtAdvisoryLoopRequest,
+        DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
+        DroughtBaselineTrendRequest, DroughtBaselineTrendStatus, DroughtEvidenceFusionError,
+        DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus,
+        DroughtForecastRequest, DroughtForecastStatus, DroughtForecastUncertaintyBand,
+        DroughtHistoryEntry, DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
+        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
+        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
+        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
+        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
+        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
+        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
+        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
+        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
+        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
+        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
+        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
+        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
+        MarketplaceDemandForecastStatus, MarketplaceFulfillmentCreateRequest,
+        MarketplaceFulfillmentError, MarketplaceFulfillmentStatus, MarketplaceInventoryError,
+        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
+        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
+        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
+        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceRatingCreateRequest,
+        MarketplaceRatingError, MarketplaceReportPeriod, MarketplaceUnitOfMeasure,
+        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
+        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
+        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
+        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
+        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
+        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
+        SeasonRecord, SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
         SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
         SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
@@ -19560,6 +19681,68 @@ mod tests {
         .expect("no match is not an error");
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn content_taxonomy_validates_controlled_tags_and_ai_confirmation() {
+        let tags = apply_content_taxonomy_tags(
+            "article-001".to_string(),
+            ContentTagApplyRequest {
+                tags: vec![
+                    ContentTaxonomyTag {
+                        kind: ContentTaxonomyKind::Crop,
+                        value: "corn".to_string(),
+                    },
+                    ContentTaxonomyTag {
+                        kind: ContentTaxonomyKind::Topic,
+                        value: "cover crops".to_string(),
+                    },
+                ],
+                suggested_by_ai: true,
+                editor_confirmed: true,
+            },
+            "2026-06-17T06:00:00Z".to_string(),
+        )
+        .expect("confirmed taxonomy tags should apply");
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].source, "ai_suggested_editor_confirmed");
+        assert_eq!(tags[1].value, "cover_crops");
+
+        let unconfirmed = apply_content_taxonomy_tags(
+            "article-001".to_string(),
+            ContentTagApplyRequest {
+                tags: vec![ContentTaxonomyTag {
+                    kind: ContentTaxonomyKind::Topic,
+                    value: "soil_health".to_string(),
+                }],
+                suggested_by_ai: true,
+                editor_confirmed: false,
+            },
+            "2026-06-17T06:00:00Z".to_string(),
+        )
+        .expect_err("AI-suggested tags require editor confirmation");
+        assert_eq!(unconfirmed, ContentError::AiTagRequiresEditorConfirmation);
+
+        let invalid = apply_content_taxonomy_tags(
+            "article-001".to_string(),
+            ContentTagApplyRequest {
+                tags: vec![ContentTaxonomyTag {
+                    kind: ContentTaxonomyKind::Crop,
+                    value: "dragonfruit".to_string(),
+                }],
+                suggested_by_ai: false,
+                editor_confirmed: true,
+            },
+            "2026-06-17T06:00:00Z".to_string(),
+        )
+        .expect_err("off-taxonomy tags should reject");
+        assert_eq!(
+            invalid,
+            ContentError::InvalidTaxonomyTag {
+                kind: "crop",
+                value: "dragonfruit".to_string()
+            }
+        );
     }
 
     fn content_record_for_search(

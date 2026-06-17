@@ -6620,6 +6620,132 @@ async fn content_search_no_match_returns_empty_results() -> Result<()> {
 }
 
 #[tokio::test]
+async fn content_tags_persist_and_filter_by_taxonomy() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-tagged-001",
+        "Cover crop planning guide.",
+        "org-alpha",
+    )
+    .await?;
+
+    let apply = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-tagged-001/tags?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tags": [
+                            { "kind": "crop", "value": "corn" },
+                            { "kind": "topic", "value": "cover crops" }
+                        ],
+                        "suggested_by_ai": true,
+                        "editor_confirmed": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(apply.status(), StatusCode::OK);
+    let body = to_bytes(apply.into_body(), 64 * 1024).await?;
+    let tags: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(tags.len(), 2);
+    assert!(tags.iter().any(|tag| {
+        tag.get("kind").and_then(|value| value.as_str()) == Some("topic")
+            && tag.get("value").and_then(|value| value.as_str()) == Some("cover_crops")
+            && tag.get("source").and_then(|value| value.as_str())
+                == Some("ai_suggested_editor_confirmed")
+    }));
+
+    let list = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/tags?org_id=org-alpha&kind=topic&value=cover_crops")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("content_id").and_then(|value| value.as_str()),
+        Some("article-tagged-001")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_tags_reject_unconfirmed_ai_and_off_taxonomy_values() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-tagged-reject").await?;
+
+    let unconfirmed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-tagged-reject/tags?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tags": [{ "kind": "topic", "value": "soil_health" }],
+                        "suggested_by_ai": true,
+                        "editor_confirmed": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(unconfirmed.status(), StatusCode::BAD_REQUEST);
+
+    let invalid = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-tagged-reject/tags?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tags": [{ "kind": "crop", "value": "dragonfruit" }],
+                        "suggested_by_ai": false,
+                        "editor_confirmed": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let tag_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cms_content_tags")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(tag_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

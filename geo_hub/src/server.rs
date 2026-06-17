@@ -446,10 +446,15 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::transition_content_item_workflow),
         )
         .route(
+            "/api/content/items/:content_id/tags",
+            post(routes::apply_content_item_tags),
+        )
+        .route(
             "/api/content/permissions/resolve",
             get(routes::resolve_content_permissions_route),
         )
         .route("/api/content/search", get(routes::search_content_items))
+        .route("/api/content/tags", get(routes::list_content_items_by_tag))
         .route(
             "/api/collaboration/channels",
             get(routes::list_collaboration_channels).post(routes::create_collaboration_channel),
