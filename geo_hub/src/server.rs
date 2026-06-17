@@ -418,6 +418,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_sustainability_certification_pack),
         )
         .route(
+            "/api/sustainability/exports/field/:field_id/summary.csv",
+            get(routes::export_sustainability_field_csv),
+        )
+        .route(
+            "/api/sustainability/exports/field/:field_id/summary.geojson",
+            get(routes::export_sustainability_field_geojson),
+        )
+        .route(
+            "/api/sustainability/exports/field/:field_id/summary.pdf",
+            get(routes::export_sustainability_field_pdf),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
         )

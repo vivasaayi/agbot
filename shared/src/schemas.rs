@@ -10520,6 +10520,41 @@ pub struct SustainabilityCertificationEvidencePack {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityExportItem {
+    pub record_type: String,
+    pub record_id: String,
+    pub field_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season_id: Option<String>,
+    pub metric_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    pub unit: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent: Option<GeoBounds>,
+    pub method_version: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub result_hash: String,
+    pub computed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityFieldExportSummary {
+    pub field_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season_id: Option<String>,
+    pub crs: String,
+    pub record_count: usize,
+    pub empty: bool,
+    pub items: Vec<SustainabilityExportItem>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BiodiversityImageryLayer {
     pub layer_ref: String,
     pub width: u32,

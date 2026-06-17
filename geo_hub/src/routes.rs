@@ -148,17 +148,17 @@ use shared::schemas::{
     SustainabilityCertificationEvidencePack, SustainabilityCertificationEvidencePackError,
     SustainabilityCertificationEvidencePackRequest, SustainabilityCertificationOutputItem,
     SustainabilityComparisonRequest, SustainabilityComparisonResult,
-    SustainabilityComparisonStatus, SustainabilityKpiError, SustainabilityKpiStatus,
-    SustainabilityKpiTrackingRequest, SustainabilityKpiTrackingResult, SustainabilityMetricType,
-    SustainabilityMrvOutputKind, SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest,
-    SustainabilityMrvTrailError, SustainabilityRecord, SustainabilityRecordCreateRequest,
-    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
-    TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
-    TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
-    TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
-    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
-    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
-    GEO_EXTENT_ASSERTION_TOLERANCE,
+    SustainabilityComparisonStatus, SustainabilityExportItem, SustainabilityFieldExportSummary,
+    SustainabilityKpiError, SustainabilityKpiStatus, SustainabilityKpiTrackingRequest,
+    SustainabilityKpiTrackingResult, SustainabilityMetricType, SustainabilityMrvOutputKind,
+    SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest, SustainabilityMrvTrailError,
+    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
+    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
+    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
+    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
+    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
+    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -882,6 +882,11 @@ pub struct SustainabilityKpiScopeQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SustainabilityCertificationPackScopeQuery {
     pub claim_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityExportQuery {
+    pub season_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4849,6 +4854,128 @@ pub async fn get_sustainability_certification_pack(
     }
 
     Ok(Json(pack))
+}
+
+pub async fn export_sustainability_field_csv(
+    Path(field_id): Path<String>,
+    Query(query): Query<SustainabilityExportQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let summary =
+        load_sustainability_field_export_summary(&state, &field_id, query.season_id).await?;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer
+        .write_record([
+            "record_type",
+            "record_id",
+            "field_id",
+            "season_id",
+            "metric_ref",
+            "value",
+            "unit",
+            "status",
+            "crs",
+            "extent_json",
+            "method_version",
+            "evidence_refs",
+            "result_hash",
+            "computed_at",
+        ])
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    for item in &summary.items {
+        writer
+            .write_record(vec![
+                item.record_type.clone(),
+                item.record_id.clone(),
+                item.field_id.clone(),
+                item.season_id.clone().unwrap_or_default(),
+                item.metric_ref.clone(),
+                item.value
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                item.unit.clone(),
+                item.status.clone(),
+                item.crs.clone().unwrap_or_default(),
+                item.extent
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|err| AppError::Anyhow(err.into()))?
+                    .unwrap_or_default(),
+                item.method_version.clone(),
+                item.evidence_refs.join("|"),
+                item.result_hash.clone(),
+                item.computed_at.clone(),
+            ])
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+    let csv_bytes = writer
+        .into_inner()
+        .map_err(|err| AppError::Anyhow(err.into_error().into()))?;
+
+    response_with_bytes(
+        csv_bytes,
+        "text/csv; charset=utf-8",
+        "sustainability-summary.csv",
+    )
+}
+
+pub async fn export_sustainability_field_geojson(
+    Path(field_id): Path<String>,
+    Query(query): Query<SustainabilityExportQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let summary =
+        load_sustainability_field_export_summary(&state, &field_id, query.season_id).await?;
+    let features = summary
+        .items
+        .iter()
+        .map(sustainability_export_feature)
+        .collect::<AppResult<Vec<_>>>()?;
+    let mut geojson = feature_collection_with_crs(features, &summary.crs);
+    if let GeoJson::FeatureCollection(collection) = &mut geojson {
+        let mut members = collection.foreign_members.take().unwrap_or_default();
+        members.insert(
+            "field_id".to_string(),
+            serde_json::Value::String(summary.field_id),
+        );
+        if let Some(season_id) = summary.season_id {
+            members.insert(
+                "season_id".to_string(),
+                serde_json::Value::String(season_id),
+            );
+        }
+        members.insert(
+            "record_count".to_string(),
+            serde_json::Value::from(summary.record_count as u64),
+        );
+        members.insert("empty".to_string(), serde_json::Value::Bool(summary.empty));
+        members.insert(
+            "generated_at".to_string(),
+            serde_json::Value::String(summary.generated_at),
+        );
+        collection.foreign_members = Some(members);
+    }
+
+    response_with_bytes(
+        serde_json::to_vec(&geojson).map_err(|err| AppError::Anyhow(err.into()))?,
+        "application/geo+json",
+        "sustainability-summary.geojson",
+    )
+}
+
+pub async fn export_sustainability_field_pdf(
+    Path(field_id): Path<String>,
+    Query(query): Query<SustainabilityExportQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let summary =
+        load_sustainability_field_export_summary(&state, &field_id, query.season_id).await?;
+    response_with_bytes(
+        sustainability_summary_pdf_bytes(&summary),
+        "application/pdf",
+        "sustainability-summary.pdf",
+    )
 }
 
 pub async fn create_content_item(
@@ -14714,6 +14841,433 @@ async fn assemble_sustainability_certification_pack_inputs(
         trails,
         evidence_layer_refs.into_iter().collect::<Vec<_>>(),
     ))
+}
+
+async fn load_sustainability_field_export_summary(
+    state: &AppState,
+    field_id: &str,
+    season_id: Option<String>,
+) -> AppResult<SustainabilityFieldExportSummary> {
+    let field = load_field(state, field_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let season_id = normalize_optional_text(season_id);
+    let mut items = Vec::new();
+    items.extend(
+        load_sustainability_carbon_export_items(state, field_id, season_id.as_deref()).await?,
+    );
+    items.extend(
+        load_sustainability_biomass_export_items(state, field_id, season_id.as_deref()).await?,
+    );
+    if season_id.is_none() {
+        items.extend(load_sustainability_biodiversity_export_items(state, field_id).await?);
+        items.extend(load_sustainability_soil_carbon_export_items(state, field_id).await?);
+    }
+    items
+        .extend(load_sustainability_kpi_export_items(state, field_id, season_id.as_deref()).await?);
+    items.sort_by(|left, right| {
+        left.computed_at
+            .cmp(&right.computed_at)
+            .then_with(|| left.record_type.cmp(&right.record_type))
+            .then_with(|| left.record_id.cmp(&right.record_id))
+    });
+    let crs = items
+        .iter()
+        .find_map(|item| item.crs.clone())
+        .unwrap_or_else(|| field_record_crs(&field));
+    let record_count = items.len();
+
+    Ok(SustainabilityFieldExportSummary {
+        field_id: field.field_id,
+        season_id,
+        crs,
+        record_count,
+        empty: record_count == 0,
+        items,
+        generated_at: current_record_timestamp(),
+    })
+}
+
+async fn load_sustainability_carbon_export_items(
+    state: &AppState,
+    field_id: &str,
+    season_id: Option<&str>,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT cf.footprint_id, cf.record_id, cf.operation_id, cf.value_co2e, cf.inputs_json,
+               cf.factor_set_version, cf.factors_json, cf.evidence_refs_json, cf.status,
+               cf.result_hash, cf.computed_at, sr.field_id, sr.season_id
+        FROM carbon_footprints cf
+        JOIN sustainability_records sr ON sr.record_id = cf.record_id
+        WHERE sr.field_id = ?1
+          AND (?2 IS NULL OR sr.season_id = ?2)
+        ORDER BY cf.computed_at ASC, cf.footprint_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let field_id: String = row.get("field_id");
+            let season_id: String = row.get("season_id");
+            let footprint = decode_carbon_footprint_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "carbon_footprint".to_string(),
+                record_id: footprint.footprint_id,
+                field_id,
+                season_id: Some(season_id),
+                metric_ref: format!("record:{}", footprint.record_id),
+                value: footprint.value_co2e,
+                unit: "kg_co2e".to_string(),
+                status: footprint.status.as_str().to_string(),
+                crs: None,
+                extent: None,
+                method_version: footprint.factor_set_version,
+                evidence_refs: footprint.evidence_refs,
+                result_hash: footprint.result_hash,
+                computed_at: footprint.computed_at,
+            })
+        })
+        .collect()
+}
+
+async fn load_sustainability_biomass_export_items(
+    state: &AppState,
+    field_id: &str,
+    season_id: Option<&str>,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT be.estimate_id, be.record_id, be.biomass_value, be.area, be.crs, be.extent_json,
+               be.resolution_json, be.source_layer_refs_json, be.method_version, be.result_hash,
+               be.computed_at, sr.field_id, sr.season_id
+        FROM biomass_estimates be
+        JOIN sustainability_records sr ON sr.record_id = be.record_id
+        WHERE sr.field_id = ?1
+          AND (?2 IS NULL OR sr.season_id = ?2)
+        ORDER BY be.computed_at ASC, be.estimate_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let field_id: String = row.get("field_id");
+            let season_id: String = row.get("season_id");
+            let estimate = decode_biomass_estimate_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "biomass_estimate".to_string(),
+                record_id: estimate.estimate_id,
+                field_id,
+                season_id: Some(season_id),
+                metric_ref: format!("record:{}", estimate.record_id),
+                value: Some(estimate.biomass_value),
+                unit: "biomass_index".to_string(),
+                status: "computed".to_string(),
+                crs: Some(estimate.crs),
+                extent: Some(estimate.extent),
+                method_version: estimate.method_version,
+                evidence_refs: estimate.source_layer_refs,
+                result_hash: estimate.result_hash,
+                computed_at: estimate.computed_at,
+            })
+        })
+        .collect()
+}
+
+async fn load_sustainability_biodiversity_export_items(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT proxy_id, field_id, heterogeneity_score, cover_fraction, uncertainty, status, crs,
+               extent_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biodiversity_proxies
+        WHERE field_id = ?1
+        ORDER BY computed_at ASC, proxy_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let proxy = decode_biodiversity_proxy_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "biodiversity_proxy".to_string(),
+                record_id: proxy.proxy_id,
+                field_id: proxy.field_id,
+                season_id: None,
+                metric_ref: "biodiversity:cover_fraction".to_string(),
+                value: proxy.cover_fraction,
+                unit: "fraction".to_string(),
+                status: proxy.status.as_str().to_string(),
+                crs: Some(proxy.crs),
+                extent: Some(proxy.extent),
+                method_version: proxy.method_version,
+                evidence_refs: proxy.source_layer_refs,
+                result_hash: proxy.result_hash,
+                computed_at: proxy.computed_at,
+            })
+        })
+        .collect()
+}
+
+async fn load_sustainability_soil_carbon_export_items(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT proxy_id, record_id, field_id, proxy_value, uncertainty_low, uncertainty_high,
+               status, evidence_refs_json, method_version, result_hash, computed_at
+        FROM soil_carbon_proxies
+        WHERE field_id = ?1
+        ORDER BY computed_at ASC, proxy_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let proxy = decode_soil_carbon_proxy_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "soil_carbon_proxy".to_string(),
+                record_id: proxy.proxy_id,
+                field_id: proxy.field_id,
+                season_id: None,
+                metric_ref: format!("record:{}", proxy.record_id),
+                value: proxy.proxy_value,
+                unit: "soil_carbon_proxy".to_string(),
+                status: proxy.status.as_str().to_string(),
+                crs: None,
+                extent: None,
+                method_version: proxy.method_version,
+                evidence_refs: proxy.evidence_refs,
+                result_hash: proxy.result_hash,
+                computed_at: proxy.computed_at,
+            })
+        })
+        .collect()
+}
+
+async fn load_sustainability_kpi_export_items(
+    state: &AppState,
+    field_id: &str,
+    season_id: Option<&str>,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT kpi_id, field_id, season_id, metric_ref, current_value, target_value,
+               direction, at_risk_fraction, status, evidence_refs_json, method_version,
+               result_hash, computed_at
+        FROM sustainability_kpis
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR season_id = ?2)
+        ORDER BY computed_at ASC, kpi_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let kpi = decode_sustainability_kpi_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "sustainability_kpi".to_string(),
+                record_id: kpi.kpi_id,
+                field_id: kpi.field_id,
+                season_id: Some(kpi.season_id),
+                metric_ref: kpi.metric_ref,
+                value: kpi.current_value,
+                unit: "kpi_value".to_string(),
+                status: kpi.status.as_str().to_string(),
+                crs: None,
+                extent: None,
+                method_version: kpi.method_version,
+                evidence_refs: kpi.evidence_refs,
+                result_hash: kpi.result_hash,
+                computed_at: kpi.computed_at,
+            })
+        })
+        .collect()
+}
+
+fn sustainability_export_feature(item: &SustainabilityExportItem) -> AppResult<Feature> {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "record_type".to_string(),
+        serde_json::Value::String(item.record_type.clone()),
+    );
+    properties.insert(
+        "record_id".to_string(),
+        serde_json::Value::String(item.record_id.clone()),
+    );
+    properties.insert(
+        "field_id".to_string(),
+        serde_json::Value::String(item.field_id.clone()),
+    );
+    if let Some(season_id) = &item.season_id {
+        properties.insert(
+            "season_id".to_string(),
+            serde_json::Value::String(season_id.clone()),
+        );
+    }
+    properties.insert(
+        "metric_ref".to_string(),
+        serde_json::Value::String(item.metric_ref.clone()),
+    );
+    if let Some(value) = item.value {
+        properties.insert("value".to_string(), serde_json::Value::from(value));
+    }
+    properties.insert(
+        "unit".to_string(),
+        serde_json::Value::String(item.unit.clone()),
+    );
+    properties.insert(
+        "status".to_string(),
+        serde_json::Value::String(item.status.clone()),
+    );
+    if let Some(crs) = &item.crs {
+        properties.insert("crs".to_string(), serde_json::Value::String(crs.clone()));
+    }
+    properties.insert(
+        "method_version".to_string(),
+        serde_json::Value::String(item.method_version.clone()),
+    );
+    properties.insert(
+        "evidence_refs".to_string(),
+        serde_json::to_value(&item.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?,
+    );
+    properties.insert(
+        "result_hash".to_string(),
+        serde_json::Value::String(item.result_hash.clone()),
+    );
+    properties.insert(
+        "computed_at".to_string(),
+        serde_json::Value::String(item.computed_at.clone()),
+    );
+
+    let geometry = item.extent.as_ref().map(|extent| {
+        Geometry::new(GeoJsonValue::Polygon(vec![vec![
+            vec![extent.min_lon, extent.min_lat],
+            vec![extent.max_lon, extent.min_lat],
+            vec![extent.max_lon, extent.max_lat],
+            vec![extent.min_lon, extent.max_lat],
+            vec![extent.min_lon, extent.min_lat],
+        ]]))
+    });
+
+    Ok(Feature {
+        bbox: None,
+        geometry,
+        id: Some(GeoJsonId::String(item.record_id.clone())),
+        properties: Some(properties),
+        foreign_members: None,
+    })
+}
+
+fn sustainability_summary_pdf_bytes(summary: &SustainabilityFieldExportSummary) -> Vec<u8> {
+    let mut lines = vec![
+        "AGBot Sustainability Summary".to_string(),
+        format!("field_id: {}", summary.field_id),
+        format!(
+            "season_id: {}",
+            summary.season_id.as_deref().unwrap_or("all")
+        ),
+        format!("record_count: {}", summary.record_count),
+        format!("generated_at: {}", summary.generated_at),
+    ];
+    if summary.items.is_empty() {
+        lines.push("empty: true".to_string());
+        lines.push("No sustainability records were available for this field scope.".to_string());
+    }
+    for item in &summary.items {
+        lines.push(format!(
+            "{} {} value={} unit={} status={} method_version={} evidence_refs={} result_hash={}",
+            item.record_type,
+            item.record_id,
+            item.value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            item.unit,
+            item.status,
+            item.method_version,
+            item.evidence_refs.join("|"),
+            item.result_hash
+        ));
+    }
+    simple_pdf_bytes(&lines)
+}
+
+fn simple_pdf_bytes(lines: &[String]) -> Vec<u8> {
+    let mut stream = String::from("BT\n/F1 10 Tf\n50 760 Td\n");
+    for (index, line) in lines.iter().take(42).enumerate() {
+        if index > 0 {
+            stream.push_str("0 -16 Td\n");
+        }
+        stream.push('(');
+        stream.push_str(&pdf_escape_text(line));
+        stream.push_str(") Tj\n");
+    }
+    stream.push_str("ET\n");
+    let objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n".to_string(),
+        "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),
+        format!(
+            "5 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+            stream.len(),
+            stream
+        ),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = vec![0_usize];
+    for object in &objects {
+        offsets.push(pdf.len());
+        pdf.push_str(object);
+    }
+    let xref_offset = pdf.len();
+    pdf.push_str("xref\n0 6\n0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    ));
+    pdf.into_bytes()
+}
+
+fn pdf_escape_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '(' => "\\(".to_string(),
+            ')' => "\\)".to_string(),
+            '\\' => "\\\\".to_string(),
+            ch if ch.is_ascii_control() => " ".to_string(),
+            ch => ch.to_string(),
+        })
+        .collect::<String>()
 }
 
 async fn load_latest_sustainability_mrv_trail_for_output(

@@ -5316,6 +5316,280 @@ async fn sustainability_certification_pack_rejects_missing_mrv_without_writing()
 }
 
 #[tokio::test]
+async fn sustainability_field_exports_csv_geojson_and_pdf_summary() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-export", "field-export", "season-2026").await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-carbon-001",
+        "field-export",
+        "season-2026",
+        "operation-carbon-001",
+        "carbon_footprint",
+    )
+    .await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-biomass-001",
+        "field-export",
+        "season-2026",
+        "operation-biomass-001",
+        "biomass",
+    )
+    .await?;
+
+    let carbon = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/carbon-footprints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    carbon_footprint_payload("footprint-export-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(carbon.status(), StatusCode::OK);
+
+    let biomass = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biomass-estimates")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biomass_estimate_payload("biomass-export-001", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(biomass.status(), StatusCode::OK);
+    insert_sustainability_kpi_row(&ctx, "kpi-export-001", "field-export", "season-2026").await?;
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export/summary.csv?season_id=season-2026")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    assert_eq!(
+        csv_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(
+        csv_reader.headers()?.iter().collect::<Vec<_>>(),
+        vec![
+            "record_type",
+            "record_id",
+            "field_id",
+            "season_id",
+            "metric_ref",
+            "value",
+            "unit",
+            "status",
+            "crs",
+            "extent_json",
+            "method_version",
+            "evidence_refs",
+            "result_hash",
+            "computed_at"
+        ]
+    );
+    let rows = csv_reader.records().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|row| {
+        row.get(0) == Some("carbon_footprint")
+            && row.get(10) == Some("agbot-carbon-factors-v1")
+            && row
+                .get(11)
+                .is_some_and(|value| value.contains("input:fuel-log-001"))
+    }));
+    assert!(rows.iter().any(|row| {
+        row.get(0) == Some("biomass_estimate")
+            && row.get(8) == Some("EPSG:32614")
+            && row
+                .get(9)
+                .is_some_and(|value| value.contains("\"max_lon\":20.0"))
+    }));
+    assert!(rows.iter().any(|row| {
+        row.get(0) == Some("sustainability_kpi")
+            && row.get(10) == Some("sustainability.kpi.v1")
+            && row
+                .get(11)
+                .is_some_and(|value| value.contains("target:cover-2026"))
+    }));
+
+    let geojson_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export/summary.geojson?season_id=season-2026")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson
+            .pointer("/crs/properties/name")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:32614")
+    );
+    assert_eq!(
+        geojson.get("record_count").and_then(|value| value.as_u64()),
+        Some(3)
+    );
+    let features = geojson
+        .get("features")
+        .and_then(|value| value.as_array())
+        .expect("features should exist");
+    assert_eq!(features.len(), 3);
+    assert!(features.iter().any(|feature| {
+        feature
+            .pointer("/properties/record_type")
+            .and_then(|value| value.as_str())
+            == Some("biomass_estimate")
+            && feature
+                .pointer("/geometry/type")
+                .and_then(|value| value.as_str())
+                == Some("Polygon")
+    }));
+
+    let pdf_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export/summary.pdf?season_id=season-2026")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(pdf_response.status(), StatusCode::OK);
+    assert_eq!(
+        pdf_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/pdf")
+    );
+    let body = to_bytes(pdf_response.into_body(), 64 * 1024).await?;
+    let pdf = String::from_utf8_lossy(&body);
+    assert!(pdf.starts_with("%PDF-1.4"));
+    assert!(pdf.contains("biomass.canopy_ndvi.v1"));
+    assert!(pdf.contains("layer:ndvi-001"));
+    assert!(pdf.contains("sustainability.kpi.v1"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_sustainability_field_exports_valid_empty_artifacts() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(
+        &ctx,
+        "farm-export-empty",
+        "field-export-empty",
+        "season-2026",
+    )
+    .await?;
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export-empty/summary.csv")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(csv_reader.records().count(), 0);
+
+    let geojson_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export-empty/summary.geojson")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson.get("type").and_then(|value| value.as_str()),
+        Some("FeatureCollection")
+    );
+    assert_eq!(
+        geojson
+            .get("features")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        geojson.get("empty").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let pdf_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export-empty/summary.pdf")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(pdf_response.status(), StatusCode::OK);
+    let body = to_bytes(pdf_response.into_body(), 64 * 1024).await?;
+    let pdf = String::from_utf8_lossy(&body);
+    assert!(pdf.contains("empty: true"));
+    assert!(pdf.contains("No sustainability records were available"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn biodiversity_proxies_compute_get_and_list_georeferenced_metrics() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -14974,6 +15248,40 @@ fn sustainability_kpi_payload(kpi_id: &str, current_value: Option<f64>) -> serde
         "method_version": "sustainability.kpi.v1",
         "evidence_refs": ["biodiversity:biodiversity-001", "target:cover-2026"]
     })
+}
+
+async fn insert_sustainability_kpi_row(
+    ctx: &TestContext,
+    kpi_id: &str,
+    field_id: &str,
+    season_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_kpis (
+            kpi_id, field_id, season_id, metric_ref, current_value, target_value,
+            direction, at_risk_fraction, status, evidence_refs_json, method_version,
+            result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+    )
+    .bind(kpi_id)
+    .bind(field_id)
+    .bind(season_id)
+    .bind("biodiversity:biodiversity-001")
+    .bind(0.72_f64)
+    .bind(0.8_f64)
+    .bind("higher_is_better")
+    .bind(0.8_f64)
+    .bind("on_track")
+    .bind(json!(["biodiversity:biodiversity-001", "target:cover-2026"]).to_string())
+    .bind("sustainability.kpi.v1")
+    .bind("result-hash-kpi-export")
+    .bind("2026-06-18T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
 }
 
 fn sustainability_certification_pack_payload(
