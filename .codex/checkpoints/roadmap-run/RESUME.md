@@ -2,11 +2,11 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: b6d9a51 (`batch-20260617054345`)
-- **Latest checkpoint commit**: 4e94db8 checkpoint after b6d9a51 (`batch-20260617054345`)
-- **Current batch**: `batch-20260617055100` — `20-05` content taxonomy tagging, verified and ready to commit
-- **Completed feature rows**: 463 committed; 2 tests_passed; 2 skipped; 2 blocked; 29 pending in this run.
-- **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval.
+- **Last implementation commit**: eece514 (`batch-20260617055100`)
+- **Latest checkpoint commit**: this checkpoint commit after eece514 (`batch-20260617055100`)
+- **Current batch**: none
+- **Completed feature rows**: 464 committed; 1 tests_passed; 2 skipped; 2 blocked; 29 pending in this run.
+- **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. Stopping this run at a clean checkpoint because remaining context is insufficient to safely implement, validate, commit, and checkpoint `20-06`.
 
 ## Latest verification
 
@@ -52,4 +52,4 @@
 
 ## Next action
 
-- Commit verified `20-05` content taxonomy tagging batch, update checkpoint commit SHA, then select `20-06`.
+- Select and claim the next pending feature after `20-05` content taxonomy tagging; next pending is `20-06`.
