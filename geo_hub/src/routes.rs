@@ -88,12 +88,12 @@ use shared::schemas::{
     assert_raster_spatial_ref, bind_fleet_node_identity, bounds_coverage_fraction,
     bounds_from_points, build_collaboration_channel, build_collaboration_message,
     build_marketplace_account_record, build_marketplace_catalog_item_record,
-    build_marketplace_inventory_record, build_marketplace_portal_entry, build_soil_moisture_reading,
-    build_sustainability_certification_evidence_pack, build_sustainability_record,
-    build_tractor_record, close_marketplace_listing_record, compare_sustainability_baseline,
-    compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_index,
-    compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
-    create_marketplace_fulfillment_record,
+    build_marketplace_inventory_record, build_marketplace_portal_entry,
+    build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
+    build_sustainability_record, build_tractor_record, close_marketplace_listing_record,
+    compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
+    compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
+    compute_sustainability_kpi, create_marketplace_fulfillment_record,
     create_marketplace_rating_record, create_sustainability_baseline,
     create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
     fulfill_marketplace_inventory, normalize_weather_provider_forecast,
@@ -147,12 +147,12 @@ use shared::schemas::{
     SustainabilityBaselineCreateRequest, SustainabilityBaselineError, SustainabilityBaselineRecord,
     SustainabilityCertificationEvidencePack, SustainabilityCertificationEvidencePackError,
     SustainabilityCertificationEvidencePackRequest, SustainabilityCertificationOutputItem,
-    SustainabilityComparisonRequest, SustainabilityComparisonResult, SustainabilityComparisonStatus,
-    SustainabilityKpiError, SustainabilityKpiStatus, SustainabilityKpiTrackingRequest,
-    SustainabilityKpiTrackingResult, SustainabilityMetricType, SustainabilityMrvOutputKind,
-    SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest, SustainabilityMrvTrailError,
-    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
-    SustainabilityRecordLinkage, TractorCommandAuditDecision,
+    SustainabilityComparisonRequest, SustainabilityComparisonResult,
+    SustainabilityComparisonStatus, SustainabilityKpiError, SustainabilityKpiStatus,
+    SustainabilityKpiTrackingRequest, SustainabilityKpiTrackingResult, SustainabilityMetricType,
+    SustainabilityMrvOutputKind, SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest,
+    SustainabilityMrvTrailError, SustainabilityRecord, SustainabilityRecordCreateRequest,
+    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
     TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
     TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
     TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
@@ -11890,45 +11890,42 @@ fn decode_sustainability_kpi_result(
 fn decode_sustainability_certification_pack(
     row: &sqlx::sqlite::SqliteRow,
 ) -> AppResult<SustainabilityCertificationEvidencePack> {
-    let claimed_output_refs = serde_json::from_str::<Vec<String>>(
-        &row.get::<String, _>("claimed_output_refs_json"),
-    )
-    .map_err(|err| {
-        AppError::Anyhow(
-            Error::new(err)
-                .context("failed to decode certification pack claimed_output_refs_json"),
-        )
-    })?;
+    let claimed_output_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("claimed_output_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err)
+                        .context("failed to decode certification pack claimed_output_refs_json"),
+                )
+            })?;
     let outputs = serde_json::from_str::<Vec<SustainabilityCertificationOutputItem>>(
         &row.get::<String, _>("outputs_json"),
     )
     .map_err(|err| {
         AppError::Anyhow(Error::new(err).context("failed to decode certification outputs_json"))
     })?;
-    let evidence_layer_refs = serde_json::from_str::<Vec<String>>(
-        &row.get::<String, _>("evidence_layer_refs_json"),
+    let evidence_layer_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("evidence_layer_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err)
+                        .context("failed to decode certification pack evidence_layer_refs_json"),
+                )
+            })?;
+    let mrv_trails = serde_json::from_str::<Vec<SustainabilityMrvTrail>>(
+        &row.get::<String, _>("mrv_trails_json"),
     )
     .map_err(|err| {
         AppError::Anyhow(
-            Error::new(err)
-                .context("failed to decode certification pack evidence_layer_refs_json"),
+            Error::new(err).context("failed to decode certification pack mrv_trails_json"),
         )
     })?;
-    let mrv_trails =
-        serde_json::from_str::<Vec<SustainabilityMrvTrail>>(&row.get::<String, _>("mrv_trails_json"))
-            .map_err(|err| {
-                AppError::Anyhow(
-                    Error::new(err).context("failed to decode certification pack mrv_trails_json"),
-                )
-            })?;
-    let audit_ids =
-        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("audit_ids_json")).map_err(
-            |err| {
-                AppError::Anyhow(
-                    Error::new(err).context("failed to decode certification pack audit_ids_json"),
-                )
-            },
-        )?;
+    let audit_ids = serde_json::from_str::<Vec<String>>(&row.get::<String, _>("audit_ids_json"))
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode certification pack audit_ids_json"),
+            )
+        })?;
 
     Ok(SustainabilityCertificationEvidencePack {
         pack_id: row.get("pack_id"),

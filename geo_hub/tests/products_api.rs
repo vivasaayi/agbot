@@ -5170,6 +5170,152 @@ async fn sustainability_mrv_trail_rejects_incomplete_without_writing() -> Result
 }
 
 #[tokio::test]
+async fn sustainability_certification_packs_create_and_get_verifiable_bundle() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_biomass_estimate_row(&ctx, "biomass-cert-001", "sustain-biomass-cert").await?;
+
+    let mrv = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/mrv-trails")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_mrv_payload("mrv-cert-001", "biomass-cert-001", true)
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(mrv.status(), StatusCode::OK);
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/certification-packs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_certification_pack_payload(
+                        "cert-pack-001",
+                        "claim-regenerative-001",
+                        vec!["biomass-cert-001"],
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let pack: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        pack.get("claim_id").and_then(|value| value.as_str()),
+        Some("claim-regenerative-001")
+    );
+    assert_eq!(
+        pack.get("claimed_output_refs")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str()),
+        Some("biomass-cert-001")
+    );
+    assert_eq!(
+        pack.get("outputs")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.get("result_hash"))
+            .and_then(|value| value.as_str()),
+        Some("result-hash-biomass-001")
+    );
+    assert_eq!(
+        pack.get("mrv_trails")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.get("trail_id"))
+            .and_then(|value| value.as_str()),
+        Some("mrv-cert-001")
+    );
+    assert!(pack
+        .get("evidence_layer_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|values| values
+            .iter()
+            .any(|value| value.as_str() == Some("layer:ndvi-001"))));
+    let pack_hash = pack
+        .get("pack_hash")
+        .and_then(|value| value.as_str())
+        .expect("pack hash should be present")
+        .to_string();
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/certification-packs/cert-pack-001?claim_id=claim-regenerative-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = to_bytes(get.into_body(), 64 * 1024).await?;
+    let stored: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stored.get("pack_hash").and_then(|value| value.as_str()),
+        Some(pack_hash.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_certification_pack_rejects_missing_mrv_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_biomass_estimate_row(&ctx, "biomass-cert-missing-mrv", "sustain-biomass-cert").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/certification-packs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_certification_pack_payload(
+                        "cert-pack-missing-mrv",
+                        "claim-missing-mrv",
+                        vec!["biomass-cert-missing-mrv"],
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let stored_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sustainability_certification_packs")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(stored_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn biodiversity_proxies_compute_get_and_list_georeferenced_metrics() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -14827,6 +14973,22 @@ fn sustainability_kpi_payload(kpi_id: &str, current_value: Option<f64>) -> serde
         "at_risk_fraction": 0.8,
         "method_version": "sustainability.kpi.v1",
         "evidence_refs": ["biodiversity:biodiversity-001", "target:cover-2026"]
+    })
+}
+
+fn sustainability_certification_pack_payload(
+    pack_id: &str,
+    claim_id: &str,
+    claimed_output_refs: Vec<&str>,
+) -> serde_json::Value {
+    json!({
+        "pack_id": pack_id,
+        "claim_id": claim_id,
+        "claim_type": "regenerative_biomass_gain",
+        "field_id": "field-certification",
+        "season_id": "season-2026",
+        "claimed_output_refs": claimed_output_refs,
+        "method_version": "sustainability.certification_pack.v1"
     })
 }
 
