@@ -12679,6 +12679,34 @@ pub struct ContentSearchResult {
     pub snippet: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentPortalEmbedRequest {
+    pub org_id: String,
+    pub actor_org_id: String,
+    #[serde(default)]
+    pub role_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentPortalEmbedItem {
+    pub content_id: String,
+    pub content_type: ContentType,
+    pub org_id: String,
+    pub current_version: String,
+    pub current_body: String,
+    pub read_only: bool,
+    pub href: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentPortalEmbed {
+    pub org_id: String,
+    pub actor_org_id: String,
+    pub read_only: bool,
+    pub items: Vec<ContentPortalEmbedItem>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentTaxonomyKind {
@@ -13014,6 +13042,64 @@ pub fn search_published_content(
     });
 
     Ok(results)
+}
+
+pub fn build_content_portal_embed(
+    request: ContentPortalEmbedRequest,
+    documents: Vec<ContentSearchDocument>,
+) -> Result<ContentPortalEmbed, ContentError> {
+    let permissions = resolve_content_permissions(ContentPermissionResolveRequest {
+        org_id: request.org_id,
+        actor_org_id: request.actor_org_id,
+        role_refs: request.role_refs,
+    })?;
+    if !permissions.can_read {
+        return Err(ContentError::AccessDenied {
+            permission: "can_read",
+        });
+    }
+
+    let mut items = documents
+        .into_iter()
+        .filter_map(|document| content_portal_embed_item(&permissions.org_id, document))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        left.content_id
+            .cmp(&right.content_id)
+            .then(left.current_version.cmp(&right.current_version))
+    });
+
+    Ok(ContentPortalEmbed {
+        org_id: permissions.org_id,
+        actor_org_id: permissions.actor_org_id,
+        read_only: true,
+        items,
+    })
+}
+
+pub fn content_portal_embed_item(
+    org_id: &str,
+    document: ContentSearchDocument,
+) -> Option<ContentPortalEmbedItem> {
+    if document.content.org_id != org_id || document.content.status != ContentStatus::Published {
+        return None;
+    }
+    Some(ContentPortalEmbedItem {
+        href: format!(
+            "/portal/knowledge-base/{}?org_id={}",
+            document.content.content_id, document.content.org_id
+        ),
+        evidence_refs: vec![
+            format!("content:{}", document.content.content_id),
+            format!("content-version:{}", document.content.current_version),
+        ],
+        content_id: document.content.content_id,
+        content_type: document.content.content_type,
+        org_id: document.content.org_id,
+        current_version: document.content.current_version,
+        current_body: document.current_body,
+        read_only: true,
+    })
 }
 
 pub fn apply_content_taxonomy_tags(
@@ -16592,18 +16678,18 @@ mod tests {
         apply_tractor_implement_command, assemble_drought_report, assemble_marketplace_org_report,
         assert_flight_operation_allowed, assert_raster_spatial_ref, bind_fleet_node_identity,
         bounds_from_points, build_collaboration_channel, build_collaboration_message,
-        build_fleet_version_inventory, build_marketplace_account_record,
-        build_marketplace_inventory_record, build_marketplace_portal_entry,
-        build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
-        build_sustainability_record, build_tractor_field_ops_replay,
-        build_tractor_field_ops_session_log, close_marketplace_listing_record,
-        compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
-        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
-        compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
-        compute_water_evapotranspiration, compute_weather_growing_degree_day,
-        compute_weather_reference_et, create_marketplace_fulfillment_record,
-        create_marketplace_rating_record, create_sustainability_baseline,
-        create_sustainability_mrv_trail, create_versioned_content,
+        build_content_portal_embed, build_fleet_version_inventory,
+        build_marketplace_account_record, build_marketplace_inventory_record,
+        build_marketplace_portal_entry, build_soil_moisture_reading,
+        build_sustainability_certification_evidence_pack, build_sustainability_record,
+        build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
+        close_marketplace_listing_record, compare_sustainability_baseline,
+        compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_baseline_trend,
+        compute_drought_index, compute_drought_risk_score, compute_marketplace_demand_forecast,
+        compute_soil_carbon_proxy, compute_sustainability_kpi, compute_water_evapotranspiration,
+        compute_weather_growing_degree_day, compute_weather_reference_et,
+        create_marketplace_fulfillment_record, create_marketplace_rating_record,
+        create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -16634,51 +16720,52 @@ mod tests {
         CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
         CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
         CollaborationError, CollaborationMessageCreateRequest, ContentCreateRequest, ContentError,
-        ContentPermissionResolveRequest, ContentRecord, ContentSearchDocument,
-        ContentSearchRequest, ContentStatus, ContentTagApplyRequest, ContentTaxonomyKind,
-        ContentTaxonomyTag, ContentType, ContentWorkflowAction, ContentWorkflowActorRole,
-        ContentWorkflowTransitionRequest, CropPlanRecord, DroughtAdvisoryLoopRequest,
-        DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
-        DroughtBaselineTrendRequest, DroughtBaselineTrendStatus, DroughtEvidenceFusionError,
-        DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus,
-        DroughtForecastRequest, DroughtForecastStatus, DroughtForecastUncertaintyBand,
-        DroughtHistoryEntry, DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
-        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
-        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
-        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
-        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
-        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
-        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
-        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
-        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
-        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
-        MarketplaceDemandForecastStatus, MarketplaceFulfillmentCreateRequest,
-        MarketplaceFulfillmentError, MarketplaceFulfillmentStatus, MarketplaceInventoryError,
-        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
-        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
-        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
-        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceRatingCreateRequest,
-        MarketplaceRatingError, MarketplaceReportPeriod, MarketplaceUnitOfMeasure,
-        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
-        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
-        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
-        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
-        SeasonRecord, SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
+        ContentPermissionResolveRequest, ContentPortalEmbedRequest, ContentRecord,
+        ContentSearchDocument, ContentSearchRequest, ContentStatus, ContentTagApplyRequest,
+        ContentTaxonomyKind, ContentTaxonomyTag, ContentType, ContentWorkflowAction,
+        ContentWorkflowActorRole, ContentWorkflowTransitionRequest, CropPlanRecord,
+        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
+        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
+        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
+        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
+        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
+        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
+        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
+        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
+        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
+        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
+        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
+        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
+        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
+        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
+        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+        MarketplaceDemandForecastRequest, MarketplaceDemandForecastStatus,
+        MarketplaceFulfillmentCreateRequest, MarketplaceFulfillmentError,
+        MarketplaceFulfillmentStatus, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
+        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
+        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
+        MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
+        MarketplaceRatingCreateRequest, MarketplaceRatingError, MarketplaceReportPeriod,
+        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
+        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
+        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
+        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
+        SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
         SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
         SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
@@ -19681,6 +19768,83 @@ mod tests {
         .expect("no match is not an error");
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn content_portal_embed_lists_only_readable_published_org_items() {
+        let embed = build_content_portal_embed(
+            ContentPortalEmbedRequest {
+                org_id: "org-alpha".to_string(),
+                actor_org_id: "org-alpha".to_string(),
+                role_refs: vec!["cms:viewer".to_string()],
+            },
+            vec![
+                ContentSearchDocument {
+                    content: content_record_for_search(
+                        "article-published",
+                        "org-alpha",
+                        ContentStatus::Published,
+                    ),
+                    current_body: "Published cover crop guide".to_string(),
+                },
+                ContentSearchDocument {
+                    content: content_record_for_search(
+                        "article-draft",
+                        "org-alpha",
+                        ContentStatus::Draft,
+                    ),
+                    current_body: "Draft should not embed".to_string(),
+                },
+                ContentSearchDocument {
+                    content: content_record_for_search(
+                        "article-foreign",
+                        "org-beta",
+                        ContentStatus::Published,
+                    ),
+                    current_body: "Foreign org should not embed".to_string(),
+                },
+            ],
+        )
+        .expect("same-org viewer can read published portal content");
+
+        assert!(embed.read_only);
+        assert_eq!(embed.items.len(), 1);
+        assert_eq!(embed.items[0].content_id, "article-published");
+        assert!(embed.items[0].read_only);
+        assert_eq!(
+            embed.items[0].href,
+            "/portal/knowledge-base/article-published?org_id=org-alpha"
+        );
+        assert!(embed.items[0]
+            .evidence_refs
+            .contains(&"content:article-published".to_string()));
+    }
+
+    #[test]
+    fn content_portal_embed_rejects_reader_without_visibility() {
+        let error = build_content_portal_embed(
+            ContentPortalEmbedRequest {
+                org_id: "org-alpha".to_string(),
+                actor_org_id: "org-beta".to_string(),
+                role_refs: vec!["cms:viewer".to_string()],
+            },
+            vec![ContentSearchDocument {
+                content: content_record_for_search(
+                    "article-published",
+                    "org-alpha",
+                    ContentStatus::Published,
+                ),
+                current_body: "Published cover crop guide".to_string(),
+            }],
+        )
+        .expect_err("cross-org reader must not see portal content");
+
+        assert_eq!(
+            error,
+            ContentError::AccessDenied {
+                permission: "can_read"
+            }
+        );
     }
 
     #[test]

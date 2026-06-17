@@ -456,6 +456,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/content/search", get(routes::search_content_items))
         .route("/api/content/tags", get(routes::list_content_items_by_tag))
         .route(
+            "/api/portal/knowledge-base",
+            get(routes::list_portal_knowledge_base),
+        )
+        .route(
+            "/api/portal/knowledge-base/:content_id",
+            get(routes::get_portal_knowledge_base_item),
+        )
+        .route(
             "/api/collaboration/channels",
             get(routes::list_collaboration_channels).post(routes::create_collaboration_channel),
         )

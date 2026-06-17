@@ -6746,6 +6746,172 @@ async fn content_tags_reject_unconfirmed_ai_and_off_taxonomy_values() -> Result<
 }
 
 #[tokio::test]
+async fn content_portal_embed_lists_and_opens_published_org_items_read_only() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-a",
+        "Published portal cover crop guide.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-draft",
+        "Draft portal guide should not leak.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-beta",
+        "Other org published guide should not leak.",
+        "org-beta",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-portal-a", "org-alpha").await?;
+    publish_content_fixture(&ctx, "article-portal-beta", "org-beta").await?;
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let embed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        embed.get("read_only").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    let items = embed
+        .get("items")
+        .and_then(|value| value.as_array())
+        .expect("embed should include items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("content_id").and_then(|value| value.as_str()),
+        Some("article-portal-a")
+    );
+    assert_eq!(
+        items[0].get("read_only").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert!(items[0]
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|refs| refs
+            .iter()
+            .any(|reference| reference.as_str() == Some("content:article-portal-a"))));
+
+    let opened = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base/article-portal-a?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(opened.status(), StatusCode::OK);
+    let body = to_bytes(opened.into_body(), 64 * 1024).await?;
+    let opened: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        opened.get("content_id").and_then(|value| value.as_str()),
+        Some("article-portal-a")
+    );
+    assert_eq!(
+        opened.get("current_body").and_then(|value| value.as_str()),
+        Some("Published portal cover crop guide.")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_portal_embed_denies_unreadable_or_unpublished_direct_hits() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-visible",
+        "Published portal guide.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-hidden-draft",
+        "Draft portal guide should not leak.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-hidden-foreign",
+        "Foreign portal guide should not leak.",
+        "org-beta",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-portal-visible", "org-alpha").await?;
+    publish_content_fixture(&ctx, "article-portal-hidden-foreign", "org-beta").await?;
+
+    let cross_org_reader = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base?org_id=org-alpha&actor_org_id=org-beta&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org_reader.status(), StatusCode::FORBIDDEN);
+
+    let draft = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base/article-portal-hidden-draft?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(draft.status(), StatusCode::NOT_FOUND);
+
+    let foreign = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base/article-portal-hidden-foreign?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

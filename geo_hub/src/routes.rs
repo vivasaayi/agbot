@@ -87,16 +87,17 @@ use shared::schemas::{
     aggregate_marketplace_ratings, append_content_version, apply_content_taxonomy_tags,
     assemble_marketplace_org_report, assert_raster_spatial_ref, bind_fleet_node_identity,
     bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
-    build_collaboration_message, build_marketplace_account_record,
+    build_collaboration_message, build_content_portal_embed, build_marketplace_account_record,
     build_marketplace_catalog_item_record, build_marketplace_inventory_record,
     build_marketplace_portal_entry, build_soil_moisture_reading,
     build_sustainability_certification_evidence_pack, build_sustainability_record,
     build_tractor_record, close_marketplace_listing_record, compare_sustainability_baseline,
     compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_index,
     compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
-    create_marketplace_fulfillment_record, create_marketplace_rating_record,
-    create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
-    estimate_biomass, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
+    content_portal_embed_item, create_marketplace_fulfillment_record,
+    create_marketplace_rating_record, create_sustainability_baseline,
+    create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
+    fulfill_marketplace_inventory, normalize_weather_provider_forecast,
     parse_biodiversity_proxy_status, parse_carbon_footprint_status, parse_content_status,
     parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
     parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
@@ -120,19 +121,19 @@ use shared::schemas::{
     CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
     CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
     ContentCreateRequest, ContentEditRequest, ContentError, ContentPermissionResolveRequest,
-    ContentPermissionSet, ContentRecord, ContentSearchDocument, ContentSearchRequest,
-    ContentSearchResult, ContentStatus, ContentTagApplyRequest, ContentTagRecord,
-    ContentTaxonomyKind, ContentType, ContentVersionRecord, ContentWorkflowAction,
-    ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult,
-    DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord,
-    DroughtIndexType, FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord,
-    FieldBoundary, FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError,
-    FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode,
-    FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
-    MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
-    MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
-    MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplaceCatalogItemRecord,
-    MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
+    ContentPermissionSet, ContentPortalEmbed, ContentPortalEmbedItem, ContentPortalEmbedRequest,
+    ContentRecord, ContentSearchDocument, ContentSearchRequest, ContentSearchResult, ContentStatus,
+    ContentTagApplyRequest, ContentTagRecord, ContentTaxonomyKind, ContentType,
+    ContentVersionRecord, ContentWorkflowAction, ContentWorkflowAuditRecord,
+    ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult, DroughtIndexComputeRequest,
+    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
+    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
+    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
+    MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+    MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
     MarketplaceDemandForecastRequest, MarketplaceDemandUncertaintyBand,
     MarketplaceFulfillmentAuditRecord, MarketplaceFulfillmentCreateRequest,
     MarketplaceFulfillmentError, MarketplaceFulfillmentRecord, MarketplaceFulfillmentStatus,
@@ -920,6 +921,14 @@ pub struct ContentPermissionQuery {
 pub struct ContentSearchQuery {
     pub org_id: String,
     pub q: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentPortalEmbedQuery {
+    pub org_id: String,
+    pub actor_org_id: String,
+    #[serde(default)]
+    pub role_refs: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5111,6 +5120,61 @@ pub async fn search_content_items(
     .map_err(content_error)?;
 
     Ok(Json(results))
+}
+
+pub async fn list_portal_knowledge_base(
+    Query(query): Query<ContentPortalEmbedQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ContentPortalEmbed>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let actor_org_id = normalize_optional_text(Some(query.actor_org_id)).ok_or_else(|| {
+        AppError::BadRequest("actor_org_id query parameter is required".to_string())
+    })?;
+    let documents = load_content_search_documents(&state, &org_id).await?;
+    let embed = build_content_portal_embed(
+        ContentPortalEmbedRequest {
+            org_id,
+            actor_org_id,
+            role_refs: parse_role_refs(query.role_refs),
+        },
+        documents,
+    )
+    .map_err(content_error)?;
+
+    Ok(Json(embed))
+}
+
+pub async fn get_portal_knowledge_base_item(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentPortalEmbedQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ContentPortalEmbedItem>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let actor_org_id = normalize_optional_text(Some(query.actor_org_id)).ok_or_else(|| {
+        AppError::BadRequest("actor_org_id query parameter is required".to_string())
+    })?;
+    resolve_content_permissions(ContentPermissionResolveRequest {
+        org_id: org_id.clone(),
+        actor_org_id,
+        role_refs: parse_role_refs(query.role_refs),
+    })
+    .and_then(|permissions| {
+        permissions
+            .can_read
+            .then_some(permissions)
+            .ok_or(ContentError::AccessDenied {
+                permission: "can_read",
+            })
+    })
+    .map_err(content_error)?;
+    let document = load_content_portal_document(&state, &content_id).await?;
+    let item = document
+        .and_then(|document| content_portal_embed_item(&org_id, document))
+        .ok_or(AppError::NotFound)?;
+
+    Ok(Json(item))
 }
 
 pub async fn apply_content_item_tags(
@@ -10243,7 +10307,10 @@ fn sustainability_certification_pack_error(
 }
 
 fn content_error(error: ContentError) -> AppError {
-    if matches!(error, ContentError::PublishRequiresEditor) {
+    if matches!(
+        error,
+        ContentError::PublishRequiresEditor | ContentError::AccessDenied { .. }
+    ) {
         AppError::Forbidden(error.to_string())
     } else {
         AppError::BadRequest(error.to_string())
@@ -15884,6 +15951,34 @@ async fn load_content_search_documents(
             })
         })
         .collect()
+}
+
+async fn load_content_portal_document(
+    state: &AppState,
+    content_id: &str,
+) -> AppResult<Option<ContentSearchDocument>> {
+    let row = sqlx::query(
+        r#"
+        SELECT c.content_id, c.content_type, c.author_id, c.org_id, c.status,
+               c.current_version, c.created_at, c.updated_at, v.body AS current_body
+        FROM cms_contents c
+        JOIN cms_content_versions v ON v.version_id = c.current_version
+        WHERE c.content_id = ?1
+        "#,
+    )
+    .bind(content_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| {
+        let content = decode_content_record(&row)?;
+        Ok(ContentSearchDocument {
+            content,
+            current_body: row.get("current_body"),
+        })
+    })
+    .transpose()
 }
 
 async fn load_content_versions(
