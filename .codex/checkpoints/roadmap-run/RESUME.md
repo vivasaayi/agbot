@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: eddf01c (`batch-20260617060600`)
-- **Latest checkpoint commit**: pending commit for `batch-20260617063000`
-- **Current batch**: `batch-20260617063000`
-- **Completed feature rows**: 465 committed; 2 tests_passed; 2 skipped; 2 blocked; 27 pending in this run.
+- **Last implementation commit**: 0666e86 (`batch-20260617063000`)
+- **Latest checkpoint commit**: pending checkpoint commit after 0666e86 (`batch-20260617063000`)
+- **Current batch**: none
+- **Completed feature rows**: 466 committed; 1 tests_passed; 2 skipped; 2 blocked; 27 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -58,8 +58,8 @@
 - `cargo test -p geo_hub --test products_api content_engagement` — pass
 - `cargo test -p geo_hub --test products_api content_` — pass
 - `cargo check -p geo_hub` — pass
-- `20-07` — verified as content engagement analytics with persisted view/read/helpful-vote events, deterministic per-period summary rows, evidence refs, and zero summaries for published items with no activity
+- `20-07` — committed as content engagement analytics with persisted view/read/helpful-vote events, deterministic per-period summary rows, evidence refs, and zero summaries for published items with no activity
 
 ## Next action
 
-- Commit `batch-20260617063000` for `20-07`, update checkpoint commit SHA, then select and claim the next pending feature `20-08`.
+- Select and claim the next pending feature after `20-07` content engagement analytics; next pending is `20-08` success-story publishing.
