@@ -108,7 +108,7 @@ use shared::schemas::{
     parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
     parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
     publish_marketplace_listing_record, release_marketplace_inventory,
-    reserve_marketplace_inventory, resolve_content_permissions,
+    reserve_marketplace_inventory, resolve_content_permissions, search_published_content,
     soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
     transition_content_workflow, transition_marketplace_account_status,
     transition_marketplace_fulfillment_status, transition_marketplace_order_status,
@@ -120,17 +120,18 @@ use shared::schemas::{
     CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
     CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
     ContentCreateRequest, ContentEditRequest, ContentError, ContentPermissionResolveRequest,
-    ContentPermissionSet, ContentRecord, ContentStatus, ContentType, ContentVersionRecord,
-    ContentWorkflowAction, ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest,
-    ContentWorkflowTransitionResult, DroughtIndexComputeRequest, DroughtIndexError,
-    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
-    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
-    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
-    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
-    MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
-    MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
+    ContentPermissionSet, ContentRecord, ContentSearchDocument, ContentSearchRequest,
+    ContentSearchResult, ContentStatus, ContentType, ContentVersionRecord, ContentWorkflowAction,
+    ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult,
+    DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord,
+    DroughtIndexType, FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord,
+    FieldBoundary, FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError,
+    FleetNodeEnrollmentRequest, FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode,
+    FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords, ImageMetadata,
+    MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+    MarketplaceAccountStatus, MarketplaceCatalogCategory, MarketplaceCatalogError,
+    MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind, MarketplaceCatalogItemRecord,
+    MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
     MarketplaceDemandForecastRequest, MarketplaceDemandUncertaintyBand,
     MarketplaceFulfillmentAuditRecord, MarketplaceFulfillmentCreateRequest,
     MarketplaceFulfillmentError, MarketplaceFulfillmentRecord, MarketplaceFulfillmentStatus,
@@ -912,6 +913,12 @@ pub struct ContentPermissionQuery {
     pub actor_org_id: String,
     #[serde(default)]
     pub role_refs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentSearchQuery {
+    pub org_id: String,
+    pub q: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5077,6 +5084,25 @@ pub async fn resolve_content_permissions_route(
     .map_err(content_error)?;
 
     Ok(Json(permissions))
+}
+
+pub async fn search_content_items(
+    Query(query): Query<ContentSearchQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ContentSearchResult>>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let documents = load_content_search_documents(&state, &org_id).await?;
+    let results = search_published_content(
+        ContentSearchRequest {
+            org_id,
+            query: query.q,
+        },
+        documents,
+    )
+    .map_err(content_error)?;
+
+    Ok(Json(results))
 }
 
 pub async fn get_content_item(
@@ -15738,6 +15764,36 @@ async fn load_versioned_content(
     let versions = load_content_versions(state, content_id).await?;
 
     Ok(Some(VersionedContentRecord { content, versions }))
+}
+
+async fn load_content_search_documents(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<ContentSearchDocument>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT c.content_id, c.content_type, c.author_id, c.org_id, c.status,
+               c.current_version, c.created_at, c.updated_at, v.body AS current_body
+        FROM cms_contents c
+        JOIN cms_content_versions v ON v.version_id = c.current_version
+        WHERE c.org_id = ?1
+        ORDER BY c.content_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let content = decode_content_record(&row)?;
+            Ok(ContentSearchDocument {
+                content,
+                current_body: row.get("current_body"),
+            })
+        })
+        .collect()
 }
 
 async fn load_content_versions(

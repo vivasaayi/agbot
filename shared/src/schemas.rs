@@ -12656,6 +12656,29 @@ pub struct ContentPermissionSet {
     pub role_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentSearchRequest {
+    pub org_id: String,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentSearchDocument {
+    pub content: ContentRecord,
+    pub current_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentSearchResult {
+    pub content_id: String,
+    pub content_type: ContentType,
+    pub org_id: String,
+    pub current_version: String,
+    pub score: usize,
+    pub matched_terms: Vec<String>,
+    pub snippet: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ContentError {
     #[error("content_id cannot be empty")]
@@ -12689,6 +12712,8 @@ pub enum ContentError {
     },
     #[error("content access denied for {permission}")]
     AccessDenied { permission: &'static str },
+    #[error("content search query cannot be empty")]
+    EmptySearchQuery,
 }
 
 pub fn create_versioned_content(
@@ -12893,6 +12918,79 @@ pub fn resolve_content_permissions(
         can_read: viewer,
         role_refs,
     })
+}
+
+pub fn search_published_content(
+    request: ContentSearchRequest,
+    documents: Vec<ContentSearchDocument>,
+) -> Result<Vec<ContentSearchResult>, ContentError> {
+    let org_id = normalize_content_text(request.org_id).ok_or(ContentError::EmptyOrgId)?;
+    let terms = content_search_terms(&request.query);
+    if terms.is_empty() {
+        return Err(ContentError::EmptySearchQuery);
+    }
+
+    let mut results = documents
+        .into_iter()
+        .filter(|document| {
+            document.content.org_id == org_id && document.content.status == ContentStatus::Published
+        })
+        .filter_map(|document| {
+            let searchable = document.current_body.to_ascii_lowercase();
+            let mut score = 0_usize;
+            let mut matched_terms = Vec::new();
+            for term in &terms {
+                let count = searchable.matches(term).count();
+                if count > 0 {
+                    score += count;
+                    matched_terms.push(term.clone());
+                }
+            }
+            (score > 0).then(|| ContentSearchResult {
+                content_id: document.content.content_id,
+                content_type: document.content.content_type,
+                org_id: document.content.org_id,
+                current_version: document.content.current_version,
+                score,
+                matched_terms,
+                snippet: content_search_snippet(&document.current_body, &terms),
+            })
+        })
+        .collect::<Vec<_>>();
+    results.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.content_id.cmp(&right.content_id))
+    });
+
+    Ok(results)
+}
+
+fn content_search_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|term| normalize_content_text(term.to_string()))
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn content_search_snippet(body: &str, terms: &[String]) -> String {
+    let lower = body.to_ascii_lowercase();
+    let start = terms
+        .iter()
+        .filter_map(|term| lower.find(term))
+        .min()
+        .unwrap_or(0);
+    let start = body
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= start)
+        .last()
+        .unwrap_or(0);
+    body[start..].chars().take(160).collect::<String>()
 }
 
 pub fn parse_content_type(value: &str) -> Result<ContentType, ContentError> {
@@ -16401,8 +16499,8 @@ mod tests {
         query_weather_history, release_marketplace_inventory, report_water_use_savings,
         reserve_marketplace_inventory, resolve_content_permissions,
         resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
-        schedule_irrigation_plan, sign_fleet_config_bundle, soil_moisture_rejection_record,
-        tractor_cross_track_error_m, transition_content_workflow,
+        schedule_irrigation_plan, search_published_content, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, tractor_cross_track_error_m, transition_content_workflow,
         transition_marketplace_account_status, transition_marketplace_fulfillment_status,
         transition_marketplace_order_status, validate_field_boundary,
         validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
@@ -16415,7 +16513,8 @@ mod tests {
         CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
         CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
         CollaborationError, CollaborationMessageCreateRequest, ContentCreateRequest, ContentError,
-        ContentPermissionResolveRequest, ContentStatus, ContentType, ContentWorkflowAction,
+        ContentPermissionResolveRequest, ContentRecord, ContentSearchDocument,
+        ContentSearchRequest, ContentStatus, ContentType, ContentWorkflowAction,
         ContentWorkflowActorRole, ContentWorkflowTransitionRequest, CropPlanRecord,
         DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
         DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
@@ -19392,6 +19491,92 @@ mod tests {
         .expect("cross-org permissions should resolve to no access");
         assert!(!cross_org.can_read);
         assert!(!cross_org.can_publish);
+    }
+
+    #[test]
+    fn content_search_ranks_only_published_org_scoped_matches() {
+        let mut published =
+            content_record_for_search("article-a", "org-alpha", ContentStatus::Published);
+        published.current_version = "version-a".to_string();
+        let draft = content_record_for_search("article-draft", "org-alpha", ContentStatus::Draft);
+        let other_org =
+            content_record_for_search("article-beta", "org-beta", ContentStatus::Published);
+        let results = search_published_content(
+            ContentSearchRequest {
+                org_id: "org-alpha".to_string(),
+                query: "cover crop".to_string(),
+            },
+            vec![
+                ContentSearchDocument {
+                    content: published,
+                    current_body: "Cover crop planning. Cover crop residue protects soil."
+                        .to_string(),
+                },
+                ContentSearchDocument {
+                    content: draft,
+                    current_body: "Cover crop draft should not be indexed.".to_string(),
+                },
+                ContentSearchDocument {
+                    content: other_org,
+                    current_body: "Cover crop from another org should not leak.".to_string(),
+                },
+                ContentSearchDocument {
+                    content: content_record_for_search(
+                        "article-b",
+                        "org-alpha",
+                        ContentStatus::Published,
+                    ),
+                    current_body: "Crop scouting guide".to_string(),
+                },
+            ],
+        )
+        .expect("search should run");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].content_id, "article-a");
+        assert!(results[0].score > results[1].score);
+        assert_eq!(results[0].current_version, "version-a");
+        assert!(results[0].matched_terms.contains(&"cover".to_string()));
+        assert!(results[0].snippet.contains("Cover crop"));
+        assert_eq!(results[1].content_id, "article-b");
+    }
+
+    #[test]
+    fn content_search_no_match_returns_empty_results() {
+        let results = search_published_content(
+            ContentSearchRequest {
+                org_id: "org-alpha".to_string(),
+                query: "irrigation".to_string(),
+            },
+            vec![ContentSearchDocument {
+                content: content_record_for_search(
+                    "article-a",
+                    "org-alpha",
+                    ContentStatus::Published,
+                ),
+                current_body: "Cover crop planning".to_string(),
+            }],
+        )
+        .expect("no match is not an error");
+
+        assert!(results.is_empty());
+    }
+
+    fn content_record_for_search(
+        content_id: &str,
+        org_id: &str,
+        status: ContentStatus,
+    ) -> ContentRecord {
+        ContentRecord {
+            content_id: content_id.to_string(),
+            content_type: ContentType::Article,
+            author_id: "author-001".to_string(),
+            org_id: org_id.to_string(),
+            status,
+            current_version: "version-001".to_string(),
+            created_at: "2026-06-13T13:00:00Z".to_string(),
+            updated_at: "2026-06-13T13:00:00Z".to_string(),
+        }
     }
 
     fn content_create_request() -> ContentCreateRequest {

@@ -6513,6 +6513,113 @@ async fn content_permissions_viewer_write_is_denied_and_audited() -> Result<()> 
 }
 
 #[tokio::test]
+async fn content_search_returns_ranked_published_org_matches() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-a",
+        "Cover crop planning guide. Cover crop residue protects soil.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-b",
+        "Crop scouting guide with one cover note.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-draft",
+        "Cover crop draft should not appear.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-beta",
+        "Cover crop from another org should not leak.",
+        "org-beta",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-search-a", "org-alpha").await?;
+    publish_content_fixture(&ctx, "article-search-b", "org-alpha").await?;
+    publish_content_fixture(&ctx, "article-search-beta", "org-beta").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=cover%20crop")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0]
+            .get("content_id")
+            .and_then(|value| value.as_str()),
+        Some("article-search-a")
+    );
+    assert_eq!(
+        results[1]
+            .get("content_id")
+            .and_then(|value| value.as_str()),
+        Some("article-search-b")
+    );
+    assert!(results[0]
+        .get("score")
+        .and_then(|value| value.as_u64())
+        .zip(results[1].get("score").and_then(|value| value.as_u64()))
+        .is_some_and(|(first, second)| first > second));
+    assert!(results.iter().all(|result| {
+        result.get("org_id").and_then(|value| value.as_str()) == Some("org-alpha")
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_search_no_match_returns_empty_results() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-empty",
+        "Cover crop planning guide.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-search-empty", "org-alpha").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=irrigation")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert!(results.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -15614,6 +15721,15 @@ fn sustainability_certification_pack_payload(
 }
 
 async fn create_content_fixture(ctx: &TestContext, content_id: &str) -> Result<serde_json::Value> {
+    create_content_fixture_body(ctx, content_id, "First draft", "org-alpha").await
+}
+
+async fn create_content_fixture_body(
+    ctx: &TestContext,
+    content_id: &str,
+    body: &str,
+    org_id: &str,
+) -> Result<serde_json::Value> {
     let response = ctx
         .app
         .clone()
@@ -15627,8 +15743,8 @@ async fn create_content_fixture(ctx: &TestContext, content_id: &str) -> Result<s
                         "content_id": content_id,
                         "content_type": "article",
                         "author_id": "author-001",
-                        "org_id": "org-alpha",
-                        "body": "First draft"
+                        "org_id": org_id,
+                        "body": body
                     })
                     .to_string(),
                 ))
@@ -15641,9 +15757,44 @@ async fn create_content_fixture(ctx: &TestContext, content_id: &str) -> Result<s
     serde_json::from_slice(&body).map_err(Into::into)
 }
 
+async fn publish_content_fixture(ctx: &TestContext, content_id: &str, org_id: &str) -> Result<()> {
+    post_content_workflow_for_org(
+        ctx,
+        content_id,
+        org_id,
+        json!({
+            "action": "submit_for_review",
+            "actor_id": "author-001",
+            "actor_role": "author"
+        }),
+    )
+    .await?;
+    post_content_workflow_for_org(
+        ctx,
+        content_id,
+        org_id,
+        json!({
+            "action": "publish",
+            "actor_id": "editor-001",
+            "actor_role": "editor"
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn post_content_workflow(
     ctx: &TestContext,
     content_id: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value> {
+    post_content_workflow_for_org(ctx, content_id, "org-alpha", payload).await
+}
+
+async fn post_content_workflow_for_org(
+    ctx: &TestContext,
+    content_id: &str,
+    org_id: &str,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value> {
     let response = ctx
@@ -15653,7 +15804,7 @@ async fn post_content_workflow(
             Request::builder()
                 .method("POST")
                 .uri(format!(
-                    "/api/content/items/{content_id}/workflow?org_id=org-alpha"
+                    "/api/content/items/{content_id}/workflow?org_id={org_id}"
                 ))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(payload.to_string()))
