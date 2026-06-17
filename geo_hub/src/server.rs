@@ -410,6 +410,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_sustainability_kpi),
         )
         .route(
+            "/api/sustainability/certification-packs",
+            post(routes::create_sustainability_certification_pack),
+        )
+        .route(
+            "/api/sustainability/certification-packs/:pack_id",
+            get(routes::get_sustainability_certification_pack),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
         )

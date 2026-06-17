@@ -10471,6 +10471,55 @@ pub struct SustainabilityMrvTrail {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityCertificationOutputItem {
+    pub output_ref: String,
+    pub output_kind: SustainabilityMrvOutputKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    pub method_version: String,
+    pub result_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityCertificationEvidencePackRequest {
+    #[serde(default)]
+    pub pack_id: Option<String>,
+    pub claim_id: String,
+    pub claim_type: String,
+    pub field_id: String,
+    pub season_id: String,
+    #[serde(default)]
+    pub claimed_output_refs: Vec<String>,
+    #[serde(default)]
+    pub outputs: Vec<SustainabilityCertificationOutputItem>,
+    #[serde(default)]
+    pub evidence_layer_refs: Vec<String>,
+    #[serde(default)]
+    pub mrv_trails: Vec<SustainabilityMrvTrail>,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SustainabilityCertificationEvidencePack {
+    pub pack_id: String,
+    pub claim_id: String,
+    pub claim_type: String,
+    pub field_id: String,
+    pub season_id: String,
+    pub claimed_output_refs: Vec<String>,
+    pub outputs: Vec<SustainabilityCertificationOutputItem>,
+    pub evidence_layer_refs: Vec<String>,
+    pub mrv_trails: Vec<SustainabilityMrvTrail>,
+    pub audit_ids: Vec<String>,
+    pub result_hash: String,
+    pub pack_hash: String,
+    pub method_version: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BiodiversityImageryLayer {
     pub layer_ref: String,
     pub width: u32,
@@ -10752,6 +10801,42 @@ pub enum SustainabilityMrvTrailError {
     EmptyCreatedAt,
     #[error("unsupported MRV output kind {value}")]
     UnsupportedOutputKind { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SustainabilityCertificationEvidencePackError {
+    #[error("certification evidence pack_id cannot be empty")]
+    EmptyPackId,
+    #[error("certification claim_id cannot be empty")]
+    EmptyClaimId,
+    #[error("certification claim_type cannot be empty")]
+    EmptyClaimType,
+    #[error("certification field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("certification season_id cannot be empty")]
+    EmptySeasonId,
+    #[error("certification method_version cannot be empty")]
+    EmptyMethodVersion,
+    #[error("certification created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("certification claimed_output_refs cannot be empty")]
+    EmptyClaimedOutputRefs,
+    #[error("certification output_ref cannot be empty")]
+    EmptyOutputRef,
+    #[error("certification output method_version cannot be empty for {output_ref}")]
+    EmptyOutputMethodVersion { output_ref: String },
+    #[error("certification output result_hash cannot be empty for {output_ref}")]
+    EmptyOutputResultHash { output_ref: String },
+    #[error("certification output value is invalid for {output_ref}")]
+    InvalidOutputValue { output_ref: String },
+    #[error("certification claimed output is missing: {output_ref}")]
+    MissingClaimedOutput { output_ref: String },
+    #[error("certification MRV trail is missing for claimed output {output_ref}")]
+    MissingMrvTrail { output_ref: String },
+    #[error("certification MRV trail is not certification-ready for claimed output {output_ref}")]
+    IncompleteMrvTrail { output_ref: String },
+    #[error("certification MRV result hash mismatch for claimed output {output_ref}")]
+    MrvResultHashMismatch { output_ref: String },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -11344,6 +11429,152 @@ pub fn create_sustainability_mrv_trail(
     })
 }
 
+pub fn build_sustainability_certification_evidence_pack(
+    request: SustainabilityCertificationEvidencePackRequest,
+    generated_pack_id: String,
+    created_at: String,
+) -> Result<SustainabilityCertificationEvidencePack, SustainabilityCertificationEvidencePackError> {
+    let pack_id = normalize_sustainability_optional_text(request.pack_id)
+        .or_else(|| normalize_sustainability_text(generated_pack_id))
+        .ok_or(SustainabilityCertificationEvidencePackError::EmptyPackId)?;
+    let claim_id = normalize_sustainability_text(request.claim_id)
+        .ok_or(SustainabilityCertificationEvidencePackError::EmptyClaimId)?;
+    let claim_type = normalize_sustainability_text(request.claim_type)
+        .ok_or(SustainabilityCertificationEvidencePackError::EmptyClaimType)?;
+    let field_id = normalize_sustainability_text(request.field_id)
+        .ok_or(SustainabilityCertificationEvidencePackError::EmptyFieldId)?;
+    let season_id = normalize_sustainability_text(request.season_id)
+        .ok_or(SustainabilityCertificationEvidencePackError::EmptySeasonId)?;
+    let method_version = normalize_sustainability_text(request.method_version)
+        .ok_or(SustainabilityCertificationEvidencePackError::EmptyMethodVersion)?;
+    let created_at = normalize_sustainability_text(created_at)
+        .ok_or(SustainabilityCertificationEvidencePackError::EmptyCreatedAt)?;
+    let claimed_output_refs = request
+        .claimed_output_refs
+        .into_iter()
+        .filter_map(normalize_sustainability_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if claimed_output_refs.is_empty() {
+        return Err(SustainabilityCertificationEvidencePackError::EmptyClaimedOutputRefs);
+    }
+
+    let outputs = normalize_sustainability_certification_outputs(request.outputs)?;
+    let outputs_by_ref = outputs
+        .iter()
+        .map(|output| (output.output_ref.clone(), output))
+        .collect::<BTreeMap<_, _>>();
+    let trails_by_output = request
+        .mrv_trails
+        .iter()
+        .map(|trail| (trail.output_ref.clone(), trail))
+        .collect::<BTreeMap<_, _>>();
+
+    for output_ref in &claimed_output_refs {
+        let output = outputs_by_ref.get(output_ref).ok_or_else(|| {
+            SustainabilityCertificationEvidencePackError::MissingClaimedOutput {
+                output_ref: output_ref.clone(),
+            }
+        })?;
+        let trail = trails_by_output.get(output_ref).ok_or_else(|| {
+            SustainabilityCertificationEvidencePackError::MissingMrvTrail {
+                output_ref: output_ref.clone(),
+            }
+        })?;
+        if !trail.certification_ready
+            || trail.input_layer_refs.is_empty()
+            || trail.method.trim().is_empty()
+            || trail.method_version.trim().is_empty()
+            || trail.crs.trim().is_empty()
+            || !sustainability_extent_is_valid(&trail.extent)
+            || trail.audit_id.trim().is_empty()
+            || trail.result_hash.trim().is_empty()
+        {
+            return Err(
+                SustainabilityCertificationEvidencePackError::IncompleteMrvTrail {
+                    output_ref: output_ref.clone(),
+                },
+            );
+        }
+        if trail.result_hash != output.result_hash {
+            return Err(
+                SustainabilityCertificationEvidencePackError::MrvResultHashMismatch {
+                    output_ref: output_ref.clone(),
+                },
+            );
+        }
+    }
+
+    let mut evidence_layer_refs = request
+        .evidence_layer_refs
+        .into_iter()
+        .filter_map(normalize_sustainability_text)
+        .collect::<BTreeSet<_>>();
+    for output_ref in &claimed_output_refs {
+        let trail = trails_by_output
+            .get(output_ref)
+            .expect("MRV trail presence checked");
+        evidence_layer_refs.extend(trail.input_layer_refs.iter().cloned());
+    }
+    let evidence_layer_refs = evidence_layer_refs.into_iter().collect::<Vec<_>>();
+    let mrv_trails = claimed_output_refs
+        .iter()
+        .map(|output_ref| {
+            (*trails_by_output
+                .get(output_ref)
+                .expect("MRV trail presence checked"))
+            .clone()
+        })
+        .collect::<Vec<_>>();
+    let outputs = claimed_output_refs
+        .iter()
+        .map(|output_ref| {
+            (*outputs_by_ref
+                .get(output_ref)
+                .expect("output presence checked"))
+            .clone()
+        })
+        .collect::<Vec<_>>();
+    let audit_ids = mrv_trails
+        .iter()
+        .map(|trail| trail.audit_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let result_hash = sustainability_certification_result_hash(&claim_id, &outputs, &mrv_trails);
+    let pack_hash = sustainability_certification_pack_hash(
+        &claim_id,
+        &claim_type,
+        &field_id,
+        &season_id,
+        &claimed_output_refs,
+        &outputs,
+        &evidence_layer_refs,
+        &mrv_trails,
+        &audit_ids,
+        &result_hash,
+        &method_version,
+    );
+
+    Ok(SustainabilityCertificationEvidencePack {
+        pack_id,
+        claim_id,
+        claim_type,
+        field_id,
+        season_id,
+        claimed_output_refs,
+        outputs,
+        evidence_layer_refs,
+        mrv_trails,
+        audit_ids,
+        result_hash,
+        pack_hash,
+        method_version,
+        created_at,
+    })
+}
+
 pub fn compute_biodiversity_proxy(
     request: BiodiversityProxyRequest,
     generated_proxy_id: String,
@@ -11807,6 +12038,120 @@ fn sustainability_mrv_rederived_hash(
     }
     for (key, value) in parameters {
         canonical.push_str(&format!("|param:{key}={value}"));
+    }
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn normalize_sustainability_certification_outputs(
+    outputs: Vec<SustainabilityCertificationOutputItem>,
+) -> Result<Vec<SustainabilityCertificationOutputItem>, SustainabilityCertificationEvidencePackError>
+{
+    outputs
+        .into_iter()
+        .map(|output| {
+            let output_ref = normalize_sustainability_text(output.output_ref)
+                .ok_or(SustainabilityCertificationEvidencePackError::EmptyOutputRef)?;
+            let method_version =
+                normalize_sustainability_text(output.method_version).ok_or_else(|| {
+                    SustainabilityCertificationEvidencePackError::EmptyOutputMethodVersion {
+                        output_ref: output_ref.clone(),
+                    }
+                })?;
+            let result_hash =
+                normalize_sustainability_text(output.result_hash).ok_or_else(|| {
+                    SustainabilityCertificationEvidencePackError::EmptyOutputResultHash {
+                        output_ref: output_ref.clone(),
+                    }
+                })?;
+            if output.value.is_some_and(|value| !value.is_finite()) {
+                return Err(
+                    SustainabilityCertificationEvidencePackError::InvalidOutputValue { output_ref },
+                );
+            }
+            Ok(SustainabilityCertificationOutputItem {
+                output_ref,
+                output_kind: output.output_kind,
+                value: output.value,
+                unit: normalize_sustainability_optional_text(output.unit),
+                method_version,
+                result_hash,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn sustainability_certification_result_hash(
+    claim_id: &str,
+    outputs: &[SustainabilityCertificationOutputItem],
+    mrv_trails: &[SustainabilityMrvTrail],
+) -> String {
+    let mut canonical = format!("claim={claim_id}");
+    for output in outputs {
+        canonical.push_str(&format!(
+            "|output:{}|kind:{}|value:{:.6}|unit:{}|method:{}|result:{}",
+            output.output_ref,
+            output.output_kind.as_str(),
+            output.value.unwrap_or(-1.0),
+            output.unit.as_deref().unwrap_or("none"),
+            output.method_version,
+            output.result_hash
+        ));
+    }
+    for trail in mrv_trails {
+        canonical.push_str(&format!(
+            "|trail:{}|output:{}|mrv_result:{}|rederived:{}|audit:{}",
+            trail.trail_id,
+            trail.output_ref,
+            trail.result_hash,
+            trail.rederived_result_hash,
+            trail.audit_id
+        ));
+    }
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn sustainability_certification_pack_hash(
+    claim_id: &str,
+    claim_type: &str,
+    field_id: &str,
+    season_id: &str,
+    claimed_output_refs: &[String],
+    outputs: &[SustainabilityCertificationOutputItem],
+    evidence_layer_refs: &[String],
+    mrv_trails: &[SustainabilityMrvTrail],
+    audit_ids: &[String],
+    result_hash: &str,
+    method_version: &str,
+) -> String {
+    let mut canonical = format!(
+        "claim={claim_id}|type={claim_type}|field={field_id}|season={season_id}|result={result_hash}|method={method_version}"
+    );
+    for output_ref in claimed_output_refs {
+        canonical.push_str(&format!("|claimed:{output_ref}"));
+    }
+    for output in outputs {
+        canonical.push_str(&format!(
+            "|output:{}:{}:{}",
+            output.output_ref,
+            output.output_kind.as_str(),
+            output.result_hash
+        ));
+    }
+    for evidence_layer_ref in evidence_layer_refs {
+        canonical.push_str(&format!("|layer:{evidence_layer_ref}"));
+    }
+    for trail in mrv_trails {
+        canonical.push_str(&format!(
+            "|mrv:{}:{}:{}:{}:{}",
+            trail.trail_id,
+            trail.output_ref,
+            trail.method,
+            trail.method_version,
+            trail.rederived_result_hash
+        ));
+    }
+    for audit_id in audit_ids {
+        canonical.push_str(&format!("|audit:{audit_id}"));
     }
     format!("{:016x}", fnv1a64(canonical.as_bytes()))
 }
@@ -15747,7 +16092,8 @@ mod tests {
         assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
         build_collaboration_channel, build_collaboration_message, build_fleet_version_inventory,
         build_marketplace_account_record, build_marketplace_inventory_record,
-        build_marketplace_portal_entry, build_soil_moisture_reading, build_sustainability_record,
+        build_marketplace_portal_entry, build_soil_moisture_reading,
+        build_sustainability_certification_evidence_pack, build_sustainability_record,
         build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
         close_marketplace_listing_record, compare_sustainability_baseline,
         compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_baseline_trend,
@@ -15830,6 +16176,8 @@ mod tests {
         SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
         SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
+        SustainabilityCertificationEvidencePackError,
+        SustainabilityCertificationEvidencePackRequest, SustainabilityCertificationOutputItem,
         SustainabilityComparisonRequest, SustainabilityComparisonStatus,
         SustainabilityKpiDirection, SustainabilityKpiStatus, SustainabilityKpiTrackingRequest,
         SustainabilityMetricType, SustainabilityMrvOutputKind, SustainabilityMrvTrailCreateRequest,
@@ -18324,6 +18672,85 @@ mod tests {
     }
 
     #[test]
+    fn sustainability_certification_pack_assembles_complete_claim_bundle() {
+        let pack = build_sustainability_certification_evidence_pack(
+            sustainability_certification_pack_request(),
+            "generated-pack".to_string(),
+            "2026-06-18T12:00:00Z".to_string(),
+        )
+        .expect("complete claimed output and MRV trail should assemble");
+
+        assert_eq!(pack.pack_id, "cert-pack-001");
+        assert_eq!(pack.claim_id, "claim-regenerative-001");
+        assert_eq!(pack.claim_type, "regenerative_biomass_gain");
+        assert_eq!(pack.field_id, "field-sustain");
+        assert_eq!(pack.season_id, "season-2026");
+        assert_eq!(pack.claimed_output_refs, vec!["biomass-001"]);
+        assert_eq!(pack.outputs.len(), 1);
+        assert_eq!(pack.outputs[0].result_hash, "result-hash-biomass-001");
+        assert_eq!(pack.mrv_trails.len(), 1);
+        assert_eq!(pack.mrv_trails[0].trail_id, "mrv-001");
+        assert_eq!(pack.audit_ids, vec!["audit-biomass-001"]);
+        assert!(pack
+            .evidence_layer_refs
+            .contains(&"layer:canopy-height-001".to_string()));
+        assert!(pack
+            .evidence_layer_refs
+            .contains(&"layer:ndvi-001".to_string()));
+        assert!(!pack.result_hash.is_empty());
+        assert!(!pack.pack_hash.is_empty());
+
+        let mut second_request = sustainability_certification_pack_request();
+        second_request.pack_id = Some("cert-pack-002".to_string());
+        let second = build_sustainability_certification_evidence_pack(
+            second_request,
+            "generated-pack-002".to_string(),
+            "2026-06-19T12:00:00Z".to_string(),
+        )
+        .expect("same evidence should assemble deterministically");
+        assert_eq!(pack.result_hash, second.result_hash);
+        assert_eq!(pack.pack_hash, second.pack_hash);
+    }
+
+    #[test]
+    fn sustainability_certification_pack_rejects_missing_claimed_output() {
+        let mut request = sustainability_certification_pack_request();
+        request.claimed_output_refs = vec!["biomass-missing".to_string()];
+        let error = build_sustainability_certification_evidence_pack(
+            request,
+            "generated-pack".to_string(),
+            "2026-06-18T12:00:00Z".to_string(),
+        )
+        .expect_err("claimed outputs must be backed by an output item");
+
+        assert_eq!(
+            error,
+            SustainabilityCertificationEvidencePackError::MissingClaimedOutput {
+                output_ref: "biomass-missing".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sustainability_certification_pack_rejects_incomplete_mrv_trail() {
+        let mut request = sustainability_certification_pack_request();
+        request.mrv_trails[0].certification_ready = false;
+        let error = build_sustainability_certification_evidence_pack(
+            request,
+            "generated-pack".to_string(),
+            "2026-06-18T12:00:00Z".to_string(),
+        )
+        .expect_err("non-certification-ready MRV trail must refuse generation");
+
+        assert_eq!(
+            error,
+            SustainabilityCertificationEvidencePackError::IncompleteMrvTrail {
+                output_ref: "biomass-001".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn biodiversity_proxy_computes_heterogeneity_and_cover() {
         let result = compute_biodiversity_proxy(
             biodiversity_proxy_request(vec![0.1, 0.4, 0.6, 0.9]),
@@ -18594,6 +19021,36 @@ mod tests {
             ]),
             audit_id: "audit-biomass-001".to_string(),
             result_hash: "result-hash-biomass-001".to_string(),
+        }
+    }
+
+    fn sustainability_certification_pack_request() -> SustainabilityCertificationEvidencePackRequest
+    {
+        let mrv_trail = create_sustainability_mrv_trail(
+            sustainability_mrv_request(),
+            "generated-trail".to_string(),
+            "2026-06-17T12:00:00Z".to_string(),
+        )
+        .expect("fixture MRV trail should be certification-ready");
+
+        SustainabilityCertificationEvidencePackRequest {
+            pack_id: Some("cert-pack-001".to_string()),
+            claim_id: "claim-regenerative-001".to_string(),
+            claim_type: "regenerative_biomass_gain".to_string(),
+            field_id: "field-sustain".to_string(),
+            season_id: "season-2026".to_string(),
+            claimed_output_refs: vec!["biomass-001".to_string()],
+            outputs: vec![SustainabilityCertificationOutputItem {
+                output_ref: "biomass-001".to_string(),
+                output_kind: SustainabilityMrvOutputKind::BiomassEstimate,
+                value: Some(48.0),
+                unit: Some("kg_biomass".to_string()),
+                method_version: "biomass.canopy_ndvi.v1".to_string(),
+                result_hash: "result-hash-biomass-001".to_string(),
+            }],
+            evidence_layer_refs: vec!["layer:claim-boundary-001".to_string()],
+            mrv_trails: vec![mrv_trail],
+            method_version: "sustainability.certification_pack.v1".to_string(),
         }
     }
 

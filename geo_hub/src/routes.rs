@@ -88,11 +88,12 @@ use shared::schemas::{
     assert_raster_spatial_ref, bind_fleet_node_identity, bounds_coverage_fraction,
     bounds_from_points, build_collaboration_channel, build_collaboration_message,
     build_marketplace_account_record, build_marketplace_catalog_item_record,
-    build_marketplace_inventory_record, build_marketplace_portal_entry,
-    build_soil_moisture_reading, build_sustainability_record, build_tractor_record,
-    close_marketplace_listing_record, compare_sustainability_baseline, compute_biodiversity_proxy,
-    compute_carbon_footprint, compute_drought_index, compute_marketplace_demand_forecast,
-    compute_soil_carbon_proxy, compute_sustainability_kpi, create_marketplace_fulfillment_record,
+    build_marketplace_inventory_record, build_marketplace_portal_entry, build_soil_moisture_reading,
+    build_sustainability_certification_evidence_pack, build_sustainability_record,
+    build_tractor_record, close_marketplace_listing_record, compare_sustainability_baseline,
+    compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_index,
+    compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
+    create_marketplace_fulfillment_record,
     create_marketplace_rating_record, create_sustainability_baseline,
     create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
     fulfill_marketplace_inventory, normalize_weather_provider_forecast,
@@ -144,12 +145,14 @@ use shared::schemas::{
     SoilCarbonUncertaintyBand, SoilMoistureReadingError, SoilMoistureReadingRecord,
     SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
     SustainabilityBaselineCreateRequest, SustainabilityBaselineError, SustainabilityBaselineRecord,
-    SustainabilityComparisonRequest, SustainabilityComparisonResult,
-    SustainabilityComparisonStatus, SustainabilityKpiError, SustainabilityKpiStatus,
-    SustainabilityKpiTrackingRequest, SustainabilityKpiTrackingResult, SustainabilityMetricType,
-    SustainabilityMrvOutputKind, SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest,
-    SustainabilityMrvTrailError, SustainabilityRecord, SustainabilityRecordCreateRequest,
-    SustainabilityRecordError, SustainabilityRecordLinkage, TractorCommandAuditDecision,
+    SustainabilityCertificationEvidencePack, SustainabilityCertificationEvidencePackError,
+    SustainabilityCertificationEvidencePackRequest, SustainabilityCertificationOutputItem,
+    SustainabilityComparisonRequest, SustainabilityComparisonResult, SustainabilityComparisonStatus,
+    SustainabilityKpiError, SustainabilityKpiStatus, SustainabilityKpiTrackingRequest,
+    SustainabilityKpiTrackingResult, SustainabilityMetricType, SustainabilityMrvOutputKind,
+    SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest, SustainabilityMrvTrailError,
+    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+    SustainabilityRecordLinkage, TractorCommandAuditDecision,
     TractorCommandAuditRecord, TractorCommandRejection, TractorCommandRejectionReason,
     TractorImplementRef, TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord,
     TractorRegistrationRequest, TractorRegistryError, VersionedContentRecord,
@@ -874,6 +877,11 @@ pub struct SustainabilityKpiListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SustainabilityKpiScopeQuery {
     pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityCertificationPackScopeQuery {
+    pub claim_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4798,6 +4806,49 @@ pub async fn get_sustainability_kpi(
     }
 
     Ok(Json(kpi))
+}
+
+pub async fn create_sustainability_certification_pack(
+    State(state): State<AppState>,
+    Json(mut request): Json<SustainabilityCertificationEvidencePackRequest>,
+) -> AppResult<Json<SustainabilityCertificationEvidencePack>> {
+    let claimed_output_refs = request
+        .claimed_output_refs
+        .iter()
+        .filter_map(|value| normalize_optional_text(Some(value.clone())))
+        .collect::<Vec<_>>();
+    let (outputs, mrv_trails, evidence_layer_refs) =
+        assemble_sustainability_certification_pack_inputs(&state, &claimed_output_refs).await?;
+    request.outputs = outputs;
+    request.mrv_trails = mrv_trails;
+    request.evidence_layer_refs.extend(evidence_layer_refs);
+
+    let pack = build_sustainability_certification_evidence_pack(
+        request,
+        format!("sustainability-certification-pack-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_certification_pack_error)?;
+    insert_sustainability_certification_pack(&state, &pack).await?;
+
+    Ok(Json(pack))
+}
+
+pub async fn get_sustainability_certification_pack(
+    Path(pack_id): Path<String>,
+    Query(query): Query<SustainabilityCertificationPackScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SustainabilityCertificationEvidencePack>> {
+    let pack = load_sustainability_certification_pack(&state, &pack_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if let Some(claim_id) = normalize_optional_text(query.claim_id) {
+        if pack.claim_id != claim_id {
+            return Err(AppError::NotFound);
+        }
+    }
+
+    Ok(Json(pack))
 }
 
 pub async fn create_content_item(
@@ -9915,6 +9966,12 @@ fn sustainability_kpi_error(error: SustainabilityKpiError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn sustainability_certification_pack_error(
+    error: SustainabilityCertificationEvidencePackError,
+) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn content_error(error: ContentError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
@@ -11827,6 +11884,67 @@ fn decode_sustainability_kpi_result(
         method_version: row.get("method_version"),
         result_hash: row.get("result_hash"),
         computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_sustainability_certification_pack(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityCertificationEvidencePack> {
+    let claimed_output_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("claimed_output_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err)
+                .context("failed to decode certification pack claimed_output_refs_json"),
+        )
+    })?;
+    let outputs = serde_json::from_str::<Vec<SustainabilityCertificationOutputItem>>(
+        &row.get::<String, _>("outputs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode certification outputs_json"))
+    })?;
+    let evidence_layer_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_layer_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err)
+                .context("failed to decode certification pack evidence_layer_refs_json"),
+        )
+    })?;
+    let mrv_trails =
+        serde_json::from_str::<Vec<SustainabilityMrvTrail>>(&row.get::<String, _>("mrv_trails_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode certification pack mrv_trails_json"),
+                )
+            })?;
+    let audit_ids =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("audit_ids_json")).map_err(
+            |err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode certification pack audit_ids_json"),
+                )
+            },
+        )?;
+
+    Ok(SustainabilityCertificationEvidencePack {
+        pack_id: row.get("pack_id"),
+        claim_id: row.get("claim_id"),
+        claim_type: row.get("claim_type"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        claimed_output_refs,
+        outputs,
+        evidence_layer_refs,
+        mrv_trails,
+        audit_ids,
+        result_hash: row.get("result_hash"),
+        pack_hash: row.get("pack_hash"),
+        method_version: row.get("method_version"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -14564,6 +14682,197 @@ async fn load_sustainability_kpi_result(
     .map_err(Error::from)?;
 
     row.map(|row| decode_sustainability_kpi_result(&row))
+        .transpose()
+}
+
+async fn assemble_sustainability_certification_pack_inputs(
+    state: &AppState,
+    claimed_output_refs: &[String],
+) -> AppResult<(
+    Vec<SustainabilityCertificationOutputItem>,
+    Vec<SustainabilityMrvTrail>,
+    Vec<String>,
+)> {
+    let mut outputs = Vec::new();
+    let mut trails = Vec::new();
+    let mut evidence_layer_refs = BTreeSet::new();
+
+    for output_ref in claimed_output_refs {
+        let trail = load_latest_sustainability_mrv_trail_for_output(state, output_ref)
+            .await?
+            .ok_or_else(|| {
+                sustainability_certification_pack_error(
+                    SustainabilityCertificationEvidencePackError::MissingMrvTrail {
+                        output_ref: output_ref.clone(),
+                    },
+                )
+            })?;
+        evidence_layer_refs.extend(trail.input_layer_refs.iter().cloned());
+        outputs.push(load_sustainability_certification_output_item(state, &trail).await?);
+        trails.push(trail);
+    }
+
+    Ok((
+        outputs,
+        trails,
+        evidence_layer_refs.into_iter().collect::<Vec<_>>(),
+    ))
+}
+
+async fn load_latest_sustainability_mrv_trail_for_output(
+    state: &AppState,
+    output_ref: &str,
+) -> AppResult<Option<SustainabilityMrvTrail>> {
+    let row = sqlx::query(
+        r#"
+        SELECT trail_id, output_ref, output_kind, input_layer_refs_json, method,
+               method_version, crs, extent_json, parameters_json, audit_id, result_hash,
+               rederived_result_hash, certification_ready, created_at
+        FROM sustainability_mrv_trails
+        WHERE output_ref = ?1
+        ORDER BY created_at DESC, trail_id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(output_ref)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_mrv_trail(&row))
+        .transpose()
+}
+
+async fn load_sustainability_certification_output_item(
+    state: &AppState,
+    trail: &SustainabilityMrvTrail,
+) -> AppResult<SustainabilityCertificationOutputItem> {
+    match trail.output_kind {
+        SustainabilityMrvOutputKind::CarbonFootprint => {
+            let output = load_carbon_footprint_result(state, &trail.output_ref)
+                .await?
+                .ok_or_else(|| {
+                    sustainability_certification_pack_error(
+                        SustainabilityCertificationEvidencePackError::MissingClaimedOutput {
+                            output_ref: trail.output_ref.clone(),
+                        },
+                    )
+                })?;
+            Ok(SustainabilityCertificationOutputItem {
+                output_ref: output.footprint_id,
+                output_kind: SustainabilityMrvOutputKind::CarbonFootprint,
+                value: output.value_co2e,
+                unit: Some("kg_co2e".to_string()),
+                method_version: output.factor_set_version,
+                result_hash: output.result_hash,
+            })
+        }
+        SustainabilityMrvOutputKind::BiomassEstimate => {
+            let output = load_biomass_estimate_result(state, &trail.output_ref)
+                .await?
+                .ok_or_else(|| {
+                    sustainability_certification_pack_error(
+                        SustainabilityCertificationEvidencePackError::MissingClaimedOutput {
+                            output_ref: trail.output_ref.clone(),
+                        },
+                    )
+                })?;
+            Ok(SustainabilityCertificationOutputItem {
+                output_ref: output.estimate_id,
+                output_kind: SustainabilityMrvOutputKind::BiomassEstimate,
+                value: Some(output.biomass_value),
+                unit: Some("biomass_index".to_string()),
+                method_version: output.method_version,
+                result_hash: output.result_hash,
+            })
+        }
+        SustainabilityMrvOutputKind::SustainabilityKpi => {
+            let output = load_sustainability_kpi_result(state, &trail.output_ref)
+                .await?
+                .ok_or_else(|| {
+                    sustainability_certification_pack_error(
+                        SustainabilityCertificationEvidencePackError::MissingClaimedOutput {
+                            output_ref: trail.output_ref.clone(),
+                        },
+                    )
+                })?;
+            Ok(SustainabilityCertificationOutputItem {
+                output_ref: output.kpi_id,
+                output_kind: SustainabilityMrvOutputKind::SustainabilityKpi,
+                value: output.current_value,
+                unit: Some("kpi_value".to_string()),
+                method_version: output.method_version,
+                result_hash: output.result_hash,
+            })
+        }
+    }
+}
+
+async fn insert_sustainability_certification_pack(
+    state: &AppState,
+    pack: &SustainabilityCertificationEvidencePack,
+) -> AppResult<()> {
+    let claimed_output_refs_json = serde_json::to_string(&pack.claimed_output_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let outputs_json =
+        serde_json::to_string(&pack.outputs).map_err(|err| AppError::Anyhow(err.into()))?;
+    let evidence_layer_refs_json = serde_json::to_string(&pack.evidence_layer_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let mrv_trails_json =
+        serde_json::to_string(&pack.mrv_trails).map_err(|err| AppError::Anyhow(err.into()))?;
+    let audit_ids_json =
+        serde_json::to_string(&pack.audit_ids).map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_certification_packs (
+            pack_id, claim_id, claim_type, field_id, season_id, claimed_output_refs_json,
+            outputs_json, evidence_layer_refs_json, mrv_trails_json, audit_ids_json,
+            result_hash, pack_hash, method_version, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+    )
+    .bind(&pack.pack_id)
+    .bind(&pack.claim_id)
+    .bind(&pack.claim_type)
+    .bind(&pack.field_id)
+    .bind(&pack.season_id)
+    .bind(claimed_output_refs_json)
+    .bind(outputs_json)
+    .bind(evidence_layer_refs_json)
+    .bind(mrv_trails_json)
+    .bind(audit_ids_json)
+    .bind(&pack.result_hash)
+    .bind(&pack.pack_hash)
+    .bind(&pack.method_version)
+    .bind(&pack.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_certification_pack(
+    state: &AppState,
+    pack_id: &str,
+) -> AppResult<Option<SustainabilityCertificationEvidencePack>> {
+    let row = sqlx::query(
+        r#"
+        SELECT pack_id, claim_id, claim_type, field_id, season_id, claimed_output_refs_json,
+               outputs_json, evidence_layer_refs_json, mrv_trails_json, audit_ids_json,
+               result_hash, pack_hash, method_version, created_at
+        FROM sustainability_certification_packs
+        WHERE pack_id = ?1
+        "#,
+    )
+    .bind(pack_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_certification_pack(&row))
         .transpose()
 }
 

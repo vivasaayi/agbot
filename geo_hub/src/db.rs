@@ -1278,6 +1278,29 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS sustainability_certification_packs (
+            pack_id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL,
+            claim_type TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            claimed_output_refs_json TEXT NOT NULL,
+            outputs_json TEXT NOT NULL,
+            evidence_layer_refs_json TEXT NOT NULL,
+            mrv_trails_json TEXT NOT NULL,
+            audit_ids_json TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            pack_hash TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS cms_contents (
             content_id TEXT PRIMARY KEY,
             content_type TEXT NOT NULL,
@@ -2158,6 +2181,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_sustainability_kpis_field_status
         ON sustainability_kpis(field_id, season_id, status, computed_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_certification_packs_claim
+        ON sustainability_certification_packs(claim_id, claim_type, created_at);
         "#,
     )
     .execute(pool)
