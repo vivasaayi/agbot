@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 635d991 (`batch-20260617051738`)
-- **Latest checkpoint commit**: b9e17cd checkpoint after 635d991 (`batch-20260617051738`)
-- **Current batch**: `batch-20260617052656` — `20-02` authoring and editorial workflow, verified and ready to commit
-- **Completed feature rows**: 460 committed; 2 tests_passed; 2 skipped; 2 blocked; 32 pending in this run.
+- **Last implementation commit**: 99bf815 (`batch-20260617052656`)
+- **Latest checkpoint commit**: this checkpoint commit after 99bf815 (`batch-20260617052656`)
+- **Current batch**: none
+- **Completed feature rows**: 461 committed; 1 tests_passed; 2 skipped; 2 blocked; 32 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval.
 
 ## Latest verification
@@ -39,4 +39,4 @@
 
 ## Next action
 
-- Commit verified `20-02` authoring/editorial workflow batch, update checkpoint commit SHA, then select `20-03`.
+- Select and claim the next pending feature after `20-02` authoring/editorial workflow; next pending is `20-03`.
