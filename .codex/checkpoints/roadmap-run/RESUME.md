@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: e53e9a4 (`batch-20260618080000`)
-- **Latest checkpoint commit**: c20c138
+- **Last implementation commit**: e86d92c (`batch-20260618083500`)
+- **Latest checkpoint commit**: c4ef457
 - **Current batch**: none
-- **Completed feature rows**: 488 committed; 1 tests_passed; 2 skipped; 2 blocked; 5 pending in this run.
+- **Completed feature rows**: 489 committed; 1 tests_passed; 2 skipped; 2 blocked; 4 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -179,7 +179,11 @@
 - `cargo test -p soil_iot drift_recalibration --lib` — pass
 - `cargo check -p soil_iot` — pass
 - `27-15` — verified as soil IoT drift/recalibration advisory with feature gating, fresh validated target and neighbor/aerial reference requirements, uncertainty bounds, cited soil/fusion evidence, pending approval, and no automatic recalibration
+- `cargo fmt` — pass
+- `cargo test -p alerting adaptive_aggregation --lib` — pass
+- `cargo check -p alerting` — pass
+- `29-16` — verified as adaptive alert aggregation advisory with recorded alert history and dedup evidence, flapping/storm signal thresholds, uncertainty bounds, feature/history gating, pending approval, and no automatic suppression of critical alerts
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `27-15` soil IoT drift advisory.
+- Select and claim the next pending roadmap feature after `29-16` adaptive alert aggregation advisory.
