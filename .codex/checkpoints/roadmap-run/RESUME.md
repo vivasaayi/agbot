@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: d3b3833 (`batch-20260618092711`)
-- **Latest checkpoint commit**: b7f447d
+- **Last implementation commit**: 9180eee (`batch-20260618094613`)
+- **Latest checkpoint commit**: 0d8e7e5
 - **Current batch**: none
-- **Completed feature rows**: 491 committed; 1 tests_passed; 2 skipped; 2 blocked; 2 pending in this run.
+- **Completed feature rows**: 492 committed; 1 tests_passed; 2 skipped; 2 blocked; 1 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -191,7 +191,11 @@
 - `cargo test -p interop trimble --lib` — pass
 - `cargo check -p interop` — pass
 - `32-11` — verified as Trimble connector boundary import with mock endpoint, CRS/unit validation, field-boundary record creation in the target CRS, retry/backoff on endpoint timeout, and timeout surfacing without imported results
+- `cargo fmt` — pass
+- `cargo test -p interop migration --lib` — pass
+- `cargo check -p interop` — pass
+- `32-13` — verified as platform migration round-trip with mock source pulls for boundaries and prescriptions, reuse of validated import/export paths, reconciliation counts/areas/CRS, and invalid item reporting as unmigrated with discrepancy flagged
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `32-11` Trimble connector.
+- Select and claim the next pending roadmap feature after `32-13` platform migration round-trip.
