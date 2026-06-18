@@ -8622,6 +8622,307 @@ async fn collaboration_session_records_replays_ordered_events_and_denies_cross_o
 }
 
 #[tokio::test]
+async fn collaboration_mission_edit_conflicts_and_dispatch_guardrails() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans?actor_org_id=org-alpha&actor_id=expert-1&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "plan_id": "plan-001",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "waypoints": [
+                            {
+                                "waypoint_id": "wp-1",
+                                "latitude": 42.35,
+                                "longitude": -71.08,
+                                "altitude_m": 32.0
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = to_bytes(create.into_body(), 64 * 1024).await?;
+    let plan: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        plan.get("version").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+
+    let edit = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-001/edits?org_id=org-alpha&actor_org_id=org-alpha&actor_id=expert-1&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "expert-1",
+                        "base_version": 1,
+                        "waypoint": {
+                            "waypoint_id": "wp-1",
+                            "latitude": 42.351,
+                            "longitude": -71.081,
+                            "altitude_m": 36.0
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(edit.status(), StatusCode::OK);
+    let body = to_bytes(edit.into_body(), 64 * 1024).await?;
+    let edit: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        edit.pointer("/plan/version")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        edit.pointer("/audit/decision")
+            .and_then(|value| value.as_str()),
+        Some("accepted")
+    );
+
+    let stale = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-001/edits?org_id=org-alpha&actor_org_id=org-alpha&actor_id=expert-2&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "expert-2",
+                        "base_version": 1,
+                        "waypoint": {
+                            "waypoint_id": "wp-1",
+                            "latitude": 42.5,
+                            "longitude": -71.2,
+                            "altitude_m": 40.0
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stale.status(), StatusCode::OK);
+    let body = to_bytes(stale.into_body(), 64 * 1024).await?;
+    let stale: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stale
+            .pointer("/plan/version")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        stale
+            .pointer("/audit/decision")
+            .and_then(|value| value.as_str()),
+        Some("rejected")
+    );
+    assert_eq!(
+        stale
+            .pointer("/audit/reason_code")
+            .and_then(|value| value.as_str()),
+        Some("version_conflict")
+    );
+
+    let allowed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-001/dispatch?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "operator-1",
+                        "guardrails": {
+                            "geofence_clear": true,
+                            "altitude_clear": true,
+                            "battery_clear": true,
+                            "abort_path_available": true
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let body = to_bytes(allowed.into_body(), 64 * 1024).await?;
+    let allowed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        allowed.get("allowed").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let blocked = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-001/dispatch?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "operator-1",
+                        "guardrails": {
+                            "geofence_clear": false,
+                            "altitude_clear": true,
+                            "battery_clear": true,
+                            "abort_path_available": true
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(blocked.status(), StatusCode::OK);
+    let body = to_bytes(blocked.into_body(), 64 * 1024).await?;
+    let blocked: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        blocked.get("allowed").and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        blocked
+            .pointer("/blocking_guardrails/0")
+            .and_then(|value| value.as_str()),
+        Some("geofence")
+    );
+
+    let stored_version: i64 =
+        sqlx::query_scalar("SELECT version FROM collab_mission_plans WHERE plan_id = 'plan-001'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(stored_version, 2);
+    let edit_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_mission_edit_audits WHERE plan_id = 'plan-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(edit_audits, 2);
+    let dispatch_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_mission_dispatch_audits WHERE plan_id = 'plan-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(dispatch_audits, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_mission_viewer_dispatch_is_denied_without_dispatch_audit() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans?actor_org_id=org-alpha&actor_id=expert-1&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "plan_id": "plan-denied",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-denied",
+                        "waypoints": [
+                            {
+                                "waypoint_id": "wp-1",
+                                "latitude": 42.35,
+                                "longitude": -71.08,
+                                "altitude_m": 32.0
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-denied/dispatch?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "viewer-1",
+                        "guardrails": {
+                            "geofence_clear": true,
+                            "altitude_clear": true,
+                            "battery_clear": true,
+                            "abort_path_available": true
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let dispatch_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_mission_dispatch_audits WHERE plan_id = 'plan-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(dispatch_audits, 0);
+    let permission_audits: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM collab_permission_audits
+        WHERE actor_id = 'viewer-1'
+          AND action = 'dispatch'
+          AND allowed = 0
+        "#,
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(permission_audits, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

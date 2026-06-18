@@ -14234,6 +14234,110 @@ pub struct CollaborationSessionReplay {
     pub events: Vec<CollaborationSessionEventRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollaborationMissionWaypoint {
+    pub waypoint_id: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollaborationMissionPlanCreateRequest {
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    pub org_id: String,
+    pub mission_ref: String,
+    #[serde(default)]
+    pub waypoints: Vec<CollaborationMissionWaypoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollaborationMissionPlanRecord {
+    pub plan_id: String,
+    pub org_id: String,
+    pub mission_ref: String,
+    pub version: u64,
+    pub waypoints: Vec<CollaborationMissionWaypoint>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollaborationMissionWaypointEditRequest {
+    pub actor_id: String,
+    pub base_version: u64,
+    pub waypoint: CollaborationMissionWaypoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationMissionEditDecision {
+    Accepted,
+    Rejected,
+}
+
+impl CollaborationMissionEditDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollaborationMissionEditDecision::Accepted => "accepted",
+            CollaborationMissionEditDecision::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationMissionEditAuditRecord {
+    pub audit_id: String,
+    pub plan_id: String,
+    pub mission_ref: String,
+    pub actor_id: String,
+    pub waypoint_id: String,
+    pub base_version: u64,
+    pub resulting_version: u64,
+    pub decision: CollaborationMissionEditDecision,
+    pub reason_code: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollaborationMissionEditResult {
+    pub plan: CollaborationMissionPlanRecord,
+    pub audit: CollaborationMissionEditAuditRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationMissionDispatchGuardrails {
+    pub geofence_clear: bool,
+    pub altitude_clear: bool,
+    pub battery_clear: bool,
+    pub abort_path_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationMissionDispatchRequest {
+    pub actor_id: String,
+    pub guardrails: CollaborationMissionDispatchGuardrails,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationMissionDispatchAuditRecord {
+    pub audit_id: String,
+    pub plan_id: String,
+    pub mission_ref: String,
+    pub actor_id: String,
+    pub version: u64,
+    pub allowed: bool,
+    pub blocking_guardrails: Vec<String>,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationMissionDispatchResult {
+    pub allowed: bool,
+    pub blocking_guardrails: Vec<String>,
+    pub audit: CollaborationMissionDispatchAuditRecord,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollaborationPermissionResolveRequest {
     pub org_id: String,
@@ -14371,6 +14475,23 @@ pub enum CollaborationError {
     EmptySessionEventId,
     #[error("collaboration session event subject_ref cannot be empty")]
     EmptySessionSubjectRef,
+    #[error("collaboration mission plan_id cannot be empty")]
+    EmptyMissionPlanId,
+    #[error("collaboration mission waypoint_id cannot be empty")]
+    EmptyMissionWaypointId,
+    #[error("collaboration mission plan requires at least one waypoint")]
+    EmptyMissionWaypoints,
+    #[error("collaboration mission waypoint contains invalid coordinates")]
+    InvalidMissionWaypointCoordinates,
+    #[error("collaboration mission edit conflict: base version {base_version} != current version {current_version}")]
+    MissionEditConflict {
+        base_version: u64,
+        current_version: u64,
+    },
+    #[error("collaboration mission edit audit_id cannot be empty")]
+    EmptyMissionEditAuditId,
+    #[error("collaboration mission dispatch audit_id cannot be empty")]
+    EmptyMissionDispatchAuditId,
 }
 
 pub fn build_collaboration_channel(
@@ -14903,6 +15024,139 @@ pub fn record_collaboration_session(
     Ok(CollaborationSessionReplay { session, events })
 }
 
+pub fn create_collaboration_mission_plan(
+    request: CollaborationMissionPlanCreateRequest,
+    generated_plan_id: String,
+    created_at: String,
+) -> Result<CollaborationMissionPlanRecord, CollaborationError> {
+    let plan_id = normalize_collaboration_optional_text(request.plan_id)
+        .or_else(|| normalize_collaboration_text(generated_plan_id))
+        .ok_or(CollaborationError::EmptyMissionPlanId)?;
+    let org_id =
+        normalize_collaboration_text(request.org_id).ok_or(CollaborationError::EmptyOrgId)?;
+    let mission_ref = normalize_collaboration_text(request.mission_ref)
+        .ok_or(CollaborationError::EmptyMissionRef)?;
+    let updated_at =
+        normalize_collaboration_text(created_at).ok_or(CollaborationError::EmptyTimestamp)?;
+    let waypoints = normalize_collaboration_mission_waypoints(request.waypoints)?;
+
+    Ok(CollaborationMissionPlanRecord {
+        plan_id,
+        org_id,
+        mission_ref,
+        version: 1,
+        waypoints,
+        updated_at,
+    })
+}
+
+pub fn apply_collaboration_mission_edit(
+    plan: &CollaborationMissionPlanRecord,
+    request: CollaborationMissionWaypointEditRequest,
+    generated_audit_id: String,
+    occurred_at: String,
+) -> Result<CollaborationMissionEditResult, CollaborationError> {
+    let audit_id = normalize_collaboration_text(generated_audit_id)
+        .ok_or(CollaborationError::EmptyMissionEditAuditId)?;
+    let actor_id =
+        normalize_collaboration_text(request.actor_id).ok_or(CollaborationError::EmptyActorId)?;
+    let waypoint = normalize_collaboration_mission_waypoint(request.waypoint)?;
+    let occurred_at =
+        normalize_collaboration_text(occurred_at).ok_or(CollaborationError::EmptyTimestamp)?;
+    if request.base_version != plan.version {
+        let audit = CollaborationMissionEditAuditRecord {
+            audit_id,
+            plan_id: plan.plan_id.clone(),
+            mission_ref: plan.mission_ref.clone(),
+            actor_id,
+            waypoint_id: waypoint.waypoint_id,
+            base_version: request.base_version,
+            resulting_version: plan.version,
+            decision: CollaborationMissionEditDecision::Rejected,
+            reason_code: "version_conflict".to_string(),
+            occurred_at,
+        };
+        return Ok(CollaborationMissionEditResult {
+            plan: plan.clone(),
+            audit,
+        });
+    }
+
+    let mut updated = plan.clone();
+    if let Some(existing) = updated
+        .waypoints
+        .iter_mut()
+        .find(|existing| existing.waypoint_id == waypoint.waypoint_id)
+    {
+        *existing = waypoint.clone();
+    } else {
+        updated.waypoints.push(waypoint.clone());
+    }
+    updated.version += 1;
+    updated.updated_at = occurred_at.clone();
+    let audit = CollaborationMissionEditAuditRecord {
+        audit_id,
+        plan_id: plan.plan_id.clone(),
+        mission_ref: plan.mission_ref.clone(),
+        actor_id,
+        waypoint_id: waypoint.waypoint_id,
+        base_version: request.base_version,
+        resulting_version: updated.version,
+        decision: CollaborationMissionEditDecision::Accepted,
+        reason_code: "edit_applied".to_string(),
+        occurred_at,
+    };
+
+    Ok(CollaborationMissionEditResult {
+        plan: updated,
+        audit,
+    })
+}
+
+pub fn evaluate_collaboration_mission_dispatch(
+    plan: &CollaborationMissionPlanRecord,
+    request: CollaborationMissionDispatchRequest,
+    generated_audit_id: String,
+    occurred_at: String,
+) -> Result<CollaborationMissionDispatchResult, CollaborationError> {
+    let audit_id = normalize_collaboration_text(generated_audit_id)
+        .ok_or(CollaborationError::EmptyMissionDispatchAuditId)?;
+    let actor_id =
+        normalize_collaboration_text(request.actor_id).ok_or(CollaborationError::EmptyActorId)?;
+    let occurred_at =
+        normalize_collaboration_text(occurred_at).ok_or(CollaborationError::EmptyTimestamp)?;
+    let mut blocking_guardrails = Vec::new();
+    if !request.guardrails.geofence_clear {
+        blocking_guardrails.push("geofence".to_string());
+    }
+    if !request.guardrails.altitude_clear {
+        blocking_guardrails.push("altitude".to_string());
+    }
+    if !request.guardrails.battery_clear {
+        blocking_guardrails.push("battery".to_string());
+    }
+    if !request.guardrails.abort_path_available {
+        blocking_guardrails.push("abort_path".to_string());
+    }
+    let allowed = blocking_guardrails.is_empty();
+    let audit = CollaborationMissionDispatchAuditRecord {
+        audit_id,
+        plan_id: plan.plan_id.clone(),
+        mission_ref: plan.mission_ref.clone(),
+        actor_id,
+        version: plan.version,
+        allowed,
+        blocking_guardrails: blocking_guardrails.clone(),
+        occurred_at,
+    };
+
+    Ok(CollaborationMissionDispatchResult {
+        allowed,
+        blocking_guardrails,
+        audit,
+    })
+}
+
 fn normalize_collaboration_members(
     members: Vec<String>,
 ) -> Result<Vec<String>, CollaborationError> {
@@ -14926,6 +15180,43 @@ fn normalize_collaboration_optional_text(value: Option<String>) -> Option<String
 fn normalize_collaboration_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_collaboration_mission_waypoints(
+    waypoints: Vec<CollaborationMissionWaypoint>,
+) -> Result<Vec<CollaborationMissionWaypoint>, CollaborationError> {
+    let waypoints = waypoints
+        .into_iter()
+        .map(normalize_collaboration_mission_waypoint)
+        .collect::<Result<Vec<_>, _>>()?;
+    if waypoints.is_empty() {
+        Err(CollaborationError::EmptyMissionWaypoints)
+    } else {
+        Ok(waypoints)
+    }
+}
+
+fn normalize_collaboration_mission_waypoint(
+    waypoint: CollaborationMissionWaypoint,
+) -> Result<CollaborationMissionWaypoint, CollaborationError> {
+    let waypoint_id = normalize_collaboration_text(waypoint.waypoint_id)
+        .ok_or(CollaborationError::EmptyMissionWaypointId)?;
+    if !waypoint.latitude.is_finite()
+        || !waypoint.longitude.is_finite()
+        || !waypoint.altitude_m.is_finite()
+        || !(-90.0..=90.0).contains(&waypoint.latitude)
+        || !(-180.0..=180.0).contains(&waypoint.longitude)
+        || waypoint.altitude_m < 0.0
+    {
+        return Err(CollaborationError::InvalidMissionWaypointCoordinates);
+    }
+
+    Ok(CollaborationMissionWaypoint {
+        waypoint_id,
+        latitude: waypoint.latitude,
+        longitude: waypoint.longitude,
+        altitude_m: waypoint.altitude_m,
+    })
 }
 
 fn default_collaboration_stream_latency_budget_ms() -> u64 {
@@ -18233,11 +18524,11 @@ mod tests {
         advise_weather_operational_windows, aggregate_content_engagement,
         aggregate_marketplace_ratings, annotate_weather_record_freshness, append_content_version,
         append_irrigation_history_event, append_weather_history_records,
-        apply_content_taxonomy_tags, apply_dry_run_validated_fleet_config_bundle,
-        apply_fleet_node_heartbeat, apply_tractor_implement_command, assemble_drought_report,
-        assemble_marketplace_org_report, assert_flight_operation_allowed,
-        assert_raster_spatial_ref, bind_fleet_node_identity, bounds_from_points,
-        build_collaboration_channel, build_collaboration_message,
+        apply_collaboration_mission_edit, apply_content_taxonomy_tags,
+        apply_dry_run_validated_fleet_config_bundle, apply_fleet_node_heartbeat,
+        apply_tractor_implement_command, assemble_drought_report, assemble_marketplace_org_report,
+        assert_flight_operation_allowed, assert_raster_spatial_ref, bind_fleet_node_identity,
+        bounds_from_points, build_collaboration_channel, build_collaboration_message,
         build_collaboration_notifications, build_content_portal_embed,
         build_fleet_version_inventory, build_marketplace_account_record,
         build_marketplace_inventory_record, build_marketplace_portal_entry,
@@ -18248,16 +18539,17 @@ mod tests {
         compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
         compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
-        compute_weather_reference_et, create_community_contribution,
-        create_content_engagement_event, create_content_locale_variant,
-        create_marketplace_fulfillment_record, create_marketplace_rating_record,
-        create_success_story_content, create_sustainability_baseline,
-        create_sustainability_mrv_trail, create_versioned_content,
+        compute_weather_reference_et, create_collaboration_mission_plan,
+        create_community_contribution, create_content_engagement_event,
+        create_content_locale_variant, create_marketplace_fulfillment_record,
+        create_marketplace_rating_record, create_success_story_content,
+        create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
-        evaluate_and_route_water_alerts, evaluate_crop_stage_weather_risks,
-        evaluate_drought_advisory_loop, evaluate_tractor_geofence, evaluate_tractor_motion_gate,
+        evaluate_and_route_water_alerts, evaluate_collaboration_mission_dispatch,
+        evaluate_crop_stage_weather_risks, evaluate_drought_advisory_loop,
+        evaluate_tractor_geofence, evaluate_tractor_motion_gate,
         evaluate_tractor_weather_window_gate, evaluate_weather_risk_alerts,
         evaluate_weather_value_freshness, execute_irrigation_valve_plan,
         execute_tractor_prescription, expire_lapsed_collaboration_presence, forecast_drought_risk,
@@ -18289,6 +18581,9 @@ mod tests {
         CollaborationEmergencyAlertCreateRequest, CollaborationEmergencyAlertSource,
         CollaborationEmergencyAlertState, CollaborationEmergencyAlertTransitionRequest,
         CollaborationError, CollaborationMessageCreateRequest,
+        CollaborationMissionDispatchGuardrails, CollaborationMissionDispatchRequest,
+        CollaborationMissionEditDecision, CollaborationMissionPlanCreateRequest,
+        CollaborationMissionWaypoint, CollaborationMissionWaypointEditRequest,
         CollaborationNotificationEventRequest, CollaborationPermissionResolveRequest,
         CollaborationPresenceState, CollaborationPresenceUpdateRequest,
         CollaborationSessionEventInput, CollaborationSessionEventKind,
@@ -22426,6 +22721,106 @@ mod tests {
             CollaborationSessionEventKind::StreamGap
         );
         assert_eq!(replay.events[2].event_id, "event-alert");
+    }
+
+    #[test]
+    fn collaboration_mission_edit_conflicts_and_dispatch_guardrails_are_audited() {
+        let plan = create_collaboration_mission_plan(
+            CollaborationMissionPlanCreateRequest {
+                plan_id: Some("plan-001".to_string()),
+                org_id: "org-alpha".to_string(),
+                mission_ref: "mission:mission-001".to_string(),
+                waypoints: vec![CollaborationMissionWaypoint {
+                    waypoint_id: "wp-1".to_string(),
+                    latitude: 42.0,
+                    longitude: -93.0,
+                    altitude_m: 50.0,
+                }],
+            },
+            "generated-plan".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+        )
+        .expect("mission plan should create");
+        let accepted = apply_collaboration_mission_edit(
+            &plan,
+            CollaborationMissionWaypointEditRequest {
+                actor_id: "ag-1".to_string(),
+                base_version: 1,
+                waypoint: CollaborationMissionWaypoint {
+                    waypoint_id: "wp-1".to_string(),
+                    latitude: 42.1,
+                    longitude: -93.1,
+                    altitude_m: 60.0,
+                },
+            },
+            "audit-edit-1".to_string(),
+            "2026-06-13T15:01:00Z".to_string(),
+        )
+        .expect("current version edit should apply");
+        assert_eq!(accepted.plan.version, 2);
+        assert_eq!(
+            accepted.audit.decision,
+            CollaborationMissionEditDecision::Accepted
+        );
+
+        let stale = apply_collaboration_mission_edit(
+            &accepted.plan,
+            CollaborationMissionWaypointEditRequest {
+                actor_id: "ag-2".to_string(),
+                base_version: 1,
+                waypoint: CollaborationMissionWaypoint {
+                    waypoint_id: "wp-1".to_string(),
+                    latitude: 42.2,
+                    longitude: -93.2,
+                    altitude_m: 65.0,
+                },
+            },
+            "audit-edit-2".to_string(),
+            "2026-06-13T15:02:00Z".to_string(),
+        )
+        .expect("stale edit should produce rejection audit");
+        assert_eq!(stale.plan.version, 2);
+        assert_eq!(
+            stale.audit.decision,
+            CollaborationMissionEditDecision::Rejected
+        );
+        assert_eq!(stale.audit.reason_code, "version_conflict");
+
+        let allowed = evaluate_collaboration_mission_dispatch(
+            &accepted.plan,
+            CollaborationMissionDispatchRequest {
+                actor_id: "ops-1".to_string(),
+                guardrails: CollaborationMissionDispatchGuardrails {
+                    geofence_clear: true,
+                    altitude_clear: true,
+                    battery_clear: true,
+                    abort_path_available: true,
+                },
+            },
+            "audit-dispatch-1".to_string(),
+            "2026-06-13T15:03:00Z".to_string(),
+        )
+        .expect("clear guardrails should allow dispatch");
+        assert!(allowed.allowed);
+        assert!(allowed.blocking_guardrails.is_empty());
+
+        let blocked = evaluate_collaboration_mission_dispatch(
+            &accepted.plan,
+            CollaborationMissionDispatchRequest {
+                actor_id: "ops-1".to_string(),
+                guardrails: CollaborationMissionDispatchGuardrails {
+                    geofence_clear: false,
+                    altitude_clear: true,
+                    battery_clear: true,
+                    abort_path_available: true,
+                },
+            },
+            "audit-dispatch-2".to_string(),
+            "2026-06-13T15:04:00Z".to_string(),
+        )
+        .expect("failed guardrail should block dispatch");
+        assert!(!blocked.allowed);
+        assert_eq!(blocked.blocking_guardrails, vec!["geofence"]);
     }
 
     #[test]

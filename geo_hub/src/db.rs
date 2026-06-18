@@ -1690,6 +1690,57 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS collab_mission_plans (
+            plan_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            mission_ref TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            waypoints_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_mission_edit_audits (
+            audit_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            mission_ref TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            waypoint_id TEXT NOT NULL,
+            base_version INTEGER NOT NULL,
+            resulting_version INTEGER NOT NULL,
+            decision TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_mission_dispatch_audits (
+            audit_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            mission_ref TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            allowed INTEGER NOT NULL,
+            blocking_guardrails_json TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,

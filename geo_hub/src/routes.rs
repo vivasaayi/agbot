@@ -85,29 +85,29 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
     aggregate_content_engagement, aggregate_marketplace_ratings, append_content_version,
-    apply_content_taxonomy_tags, assemble_marketplace_org_report, assert_raster_spatial_ref,
-    authorize_collaboration_action, bind_fleet_node_identity, bounds_coverage_fraction,
-    bounds_from_points, build_collaboration_channel, build_collaboration_message,
-    build_collaboration_notifications, build_content_portal_embed,
+    apply_collaboration_mission_edit, apply_content_taxonomy_tags, assemble_marketplace_org_report,
+    assert_raster_spatial_ref, authorize_collaboration_action, bind_fleet_node_identity,
+    bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
+    build_collaboration_message, build_collaboration_notifications, build_content_portal_embed,
     build_marketplace_account_record, build_marketplace_catalog_item_record,
     build_marketplace_inventory_record, build_marketplace_portal_entry,
     build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
     build_sustainability_record, build_tractor_record, close_marketplace_listing_record,
     compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
     compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
-    compute_sustainability_kpi, content_portal_embed_item, create_community_contribution,
-    create_content_engagement_event, create_content_locale_variant,
+    compute_sustainability_kpi, content_portal_embed_item, create_collaboration_mission_plan,
+    create_community_contribution, create_content_engagement_event, create_content_locale_variant,
     create_marketplace_fulfillment_record, create_marketplace_rating_record,
     create_success_story_content, create_sustainability_baseline, create_sustainability_mrv_trail,
-    create_versioned_content, estimate_biomass, expire_lapsed_collaboration_presence,
-    fulfill_marketplace_inventory, moderate_community_contribution,
-    normalize_weather_provider_forecast, parse_biodiversity_proxy_status,
-    parse_carbon_footprint_status, parse_content_contribution_status,
-    parse_content_engagement_event_type, parse_content_status, parse_content_type,
-    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
-    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
-    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
-    parse_marketplace_order_status, parse_marketplace_party_type,
+    create_versioned_content, estimate_biomass, evaluate_collaboration_mission_dispatch,
+    expire_lapsed_collaboration_presence, fulfill_marketplace_inventory,
+    moderate_community_contribution, normalize_weather_provider_forecast,
+    parse_biodiversity_proxy_status, parse_carbon_footprint_status,
+    parse_content_contribution_status, parse_content_engagement_event_type, parse_content_status,
+    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
+    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
+    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
+    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
     parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
@@ -133,6 +133,11 @@ use shared::schemas::{
     CollaborationEmergencyAlertState, CollaborationEmergencyAlertTransitionRequest,
     CollaborationEmergencyAlertTransitionResult, CollaborationError, CollaborationLiveStreamRecord,
     CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    CollaborationMissionDispatchAuditRecord, CollaborationMissionDispatchRequest,
+    CollaborationMissionDispatchResult, CollaborationMissionEditAuditRecord,
+    CollaborationMissionEditDecision, CollaborationMissionEditResult,
+    CollaborationMissionPlanCreateRequest, CollaborationMissionPlanRecord,
+    CollaborationMissionWaypoint, CollaborationMissionWaypointEditRequest,
     CollaborationNotificationEventRequest, CollaborationNotificationRecord,
     CollaborationPermissionDecision, CollaborationPermissionResolveRequest,
     CollaborationPermissionSet, CollaborationPresenceRecord, CollaborationPresenceState,
@@ -5903,6 +5908,104 @@ pub async fn replay_collaboration_session_route(
     .await?;
 
     Ok(Json(replay))
+}
+
+pub async fn create_collaboration_mission_plan_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationMissionPlanCreateRequest>,
+) -> AppResult<Json<CollaborationMissionPlanRecord>> {
+    assert_collaboration_action_permission(
+        &state,
+        &request.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Annotate,
+        None,
+    )
+    .await?;
+    let plan = create_collaboration_mission_plan(
+        request,
+        format!("collab-mission-plan-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    upsert_collaboration_mission_plan(&state, &plan).await?;
+
+    Ok(Json(plan))
+}
+
+pub async fn edit_collaboration_mission_plan_route(
+    Path(plan_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationMissionWaypointEditRequest>,
+) -> AppResult<Json<CollaborationMissionEditResult>> {
+    let plan = load_collaboration_mission_plan(&state, &plan_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if plan.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &plan.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Annotate,
+        None,
+    )
+    .await?;
+    let result = apply_collaboration_mission_edit(
+        &plan,
+        request,
+        format!("collab-mission-edit-audit-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_mission_edit_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn dispatch_collaboration_mission_plan_route(
+    Path(plan_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationMissionDispatchRequest>,
+) -> AppResult<Json<CollaborationMissionDispatchResult>> {
+    let plan = load_collaboration_mission_plan(&state, &plan_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if plan.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &plan.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Dispatch,
+        None,
+    )
+    .await?;
+    let result = evaluate_collaboration_mission_dispatch(
+        &plan,
+        request,
+        format!("collab-mission-dispatch-audit-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_mission_dispatch_audit(&state, &result.audit).await?;
+
+    Ok(Json(result))
 }
 
 pub async fn start_collaboration_stream_route(
@@ -17419,6 +17522,161 @@ fn parse_collaboration_session_event_kind(value: &str) -> AppResult<Collaboratio
             "unsupported collaboration session event kind {value}"
         ))),
     }
+}
+
+async fn upsert_collaboration_mission_plan(
+    state: &AppState,
+    plan: &CollaborationMissionPlanRecord,
+) -> AppResult<()> {
+    let waypoints_json =
+        serde_json::to_string(&plan.waypoints).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_mission_plans (
+            plan_id, org_id, mission_ref, version, waypoints_json, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(plan_id) DO UPDATE SET org_id = excluded.org_id,
+                                             mission_ref = excluded.mission_ref,
+                                             version = excluded.version,
+                                             waypoints_json = excluded.waypoints_json,
+                                             updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&plan.plan_id)
+    .bind(&plan.org_id)
+    .bind(&plan.mission_ref)
+    .bind(plan.version as i64)
+    .bind(waypoints_json)
+    .bind(&plan.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn persist_collaboration_mission_edit_result(
+    state: &AppState,
+    result: &CollaborationMissionEditResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    if result.audit.decision == CollaborationMissionEditDecision::Accepted {
+        let waypoints_json = serde_json::to_string(&result.plan.waypoints)
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+        sqlx::query(
+            r#"
+            UPDATE collab_mission_plans
+            SET version = ?1, waypoints_json = ?2, updated_at = ?3
+            WHERE plan_id = ?4
+            "#,
+        )
+        .bind(result.plan.version as i64)
+        .bind(waypoints_json)
+        .bind(&result.plan.updated_at)
+        .bind(&result.plan.plan_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+    insert_collaboration_mission_edit_audit_query(&mut tx, &result.audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn insert_collaboration_mission_edit_audit_query(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    audit: &CollaborationMissionEditAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_mission_edit_audits (
+            audit_id, plan_id, mission_ref, actor_id, waypoint_id, base_version,
+            resulting_version, decision, reason_code, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.plan_id)
+    .bind(&audit.mission_ref)
+    .bind(&audit.actor_id)
+    .bind(&audit.waypoint_id)
+    .bind(audit.base_version as i64)
+    .bind(audit.resulting_version as i64)
+    .bind(audit.decision.as_str())
+    .bind(&audit.reason_code)
+    .bind(&audit.occurred_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn insert_collaboration_mission_dispatch_audit(
+    state: &AppState,
+    audit: &CollaborationMissionDispatchAuditRecord,
+) -> AppResult<()> {
+    let blocking_guardrails_json = serde_json::to_string(&audit.blocking_guardrails)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_mission_dispatch_audits (
+            audit_id, plan_id, mission_ref, actor_id, version, allowed,
+            blocking_guardrails_json, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.plan_id)
+    .bind(&audit.mission_ref)
+    .bind(&audit.actor_id)
+    .bind(audit.version as i64)
+    .bind(if audit.allowed { 1_i64 } else { 0_i64 })
+    .bind(blocking_guardrails_json)
+    .bind(&audit.occurred_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_mission_plan(
+    state: &AppState,
+    plan_id: &str,
+) -> AppResult<Option<CollaborationMissionPlanRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT plan_id, org_id, mission_ref, version, waypoints_json, updated_at
+        FROM collab_mission_plans
+        WHERE plan_id = ?1
+        "#,
+    )
+    .bind(plan_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    row.map(|row| decode_collaboration_mission_plan(&row))
+        .transpose()
+}
+
+fn decode_collaboration_mission_plan(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationMissionPlanRecord> {
+    let waypoints = serde_json::from_str::<Vec<CollaborationMissionWaypoint>>(
+        &row.get::<String, _>("waypoints_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode collab mission waypoints_json"))
+    })?;
+    Ok(CollaborationMissionPlanRecord {
+        plan_id: row.get("plan_id"),
+        org_id: row.get("org_id"),
+        mission_ref: row.get("mission_ref"),
+        version: row.get::<i64, _>("version") as u64,
+        waypoints,
+        updated_at: row.get("updated_at"),
+    })
 }
 
 async fn persist_collaboration_emergency_alert_raise(

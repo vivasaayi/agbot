@@ -533,6 +533,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::replay_collaboration_session_route),
         )
         .route(
+            "/api/collaboration/mission-plans",
+            post(routes::create_collaboration_mission_plan_route),
+        )
+        .route(
+            "/api/collaboration/mission-plans/:plan_id/edits",
+            post(routes::edit_collaboration_mission_plan_route),
+        )
+        .route(
+            "/api/collaboration/mission-plans/:plan_id/dispatch",
+            post(routes::dispatch_collaboration_mission_plan_route),
+        )
+        .route(
             "/api/collaboration/streams",
             post(routes::start_collaboration_stream_route),
         )
