@@ -23,11 +23,15 @@ use axum::{
 };
 use compliance::{
     airspace_zone_contains_point, airspace_zone_is_effective_at, append_compliance_record_version,
-    build_airspace_zone_record, build_compliance_audit_report, build_initial_compliance_record,
-    refuse_in_place_mutation, AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError,
+    build_airspace_zone_record, build_compliance_audit_report, build_compliance_authority_export,
+    build_compliance_authority_share, build_initial_compliance_record, refuse_in_place_mutation,
+    revoke_compliance_authority_share, AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError,
     AirspaceZoneIngestRequest, AirspaceZoneRecord, AppendComplianceRecordVersionRequest,
     ComplianceAuditReport, ComplianceAuditReportError, ComplianceAuditReportRequest,
-    ComplianceRecord, ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
+    ComplianceAuthorityExportArtifact, ComplianceAuthorityExportError,
+    ComplianceAuthorityExportRequest, ComplianceAuthorityFormat, ComplianceAuthorityShareArtifact,
+    ComplianceAuthorityShareError, ComplianceAuthorityShareRequest, ComplianceRecord,
+    ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType, ComplianceRetentionClass,
     CreateComplianceRecordRequest,
 };
 use copilot::{
@@ -1232,6 +1236,46 @@ pub struct ComplianceAuditReportExportRequest {
     pub generated_at: Option<String>,
     #[serde(default)]
     pub mandatory_record_types: Vec<ComplianceRecordType>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceAuthorityExportApiRequest {
+    pub authority_format: ComplianceAuthorityFormat,
+    #[serde(default)]
+    pub report_id: Option<String>,
+    #[serde(default)]
+    pub org_id: String,
+    #[serde(default)]
+    pub field_id: String,
+    #[serde(default)]
+    pub generated_at: Option<String>,
+    #[serde(default)]
+    pub mandatory_record_types: Vec<ComplianceRecordType>,
+    #[serde(default)]
+    pub residency_tag: String,
+    #[serde(default)]
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceAuthorityShareApiRequest {
+    #[serde(flatten)]
+    pub export_request: ComplianceAuthorityExportApiRequest,
+    #[serde(default)]
+    pub share_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceAuthorityShareRevokeRequest {
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -7889,6 +7933,82 @@ pub async fn export_compliance_audit_report(
     Ok(Json(report))
 }
 
+pub async fn export_compliance_authority_report(
+    State(state): State<AppState>,
+    Json(request): Json<ComplianceAuthorityExportApiRequest>,
+) -> AppResult<Json<ComplianceAuthorityExportArtifact>> {
+    let export = build_compliance_authority_export_from_api(&state, request).await?;
+    persist_compliance_authority_export(&state, &export).await?;
+
+    Ok(Json(export))
+}
+
+pub async fn create_compliance_authority_share(
+    State(state): State<AppState>,
+    Json(request): Json<ComplianceAuthorityShareApiRequest>,
+) -> AppResult<Json<ComplianceAuthorityShareArtifact>> {
+    let export = build_compliance_authority_export_from_api(&state, request.export_request).await?;
+    persist_compliance_authority_export(&state, &export).await?;
+    let created_at = request.created_at.unwrap_or_else(current_record_timestamp);
+    let share = build_compliance_authority_share(ComplianceAuthorityShareRequest {
+        share_id: request
+            .share_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("compliance-share-{}", Uuid::new_v4())),
+        export,
+        created_at,
+        expires_at: request.expires_at,
+    })
+    .map_err(compliance_authority_share_error)?;
+    persist_compliance_authority_share(&state, &share).await?;
+    audit_compliance_authority_share_event(&state, &share, "share_created", None, None).await?;
+
+    Ok(Json(share))
+}
+
+pub async fn get_compliance_authority_share(
+    Path(share_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ComplianceAuthorityExportArtifact>> {
+    let share = load_compliance_authority_share(&state, &share_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if share.revoked_at.is_some() {
+        return Err(AppError::Forbidden(
+            "compliance authority share has been revoked".to_string(),
+        ));
+    }
+    audit_compliance_authority_share_event(&state, &share, "share_accessed", None, None).await?;
+
+    Ok(Json(share.export))
+}
+
+pub async fn revoke_compliance_authority_share_route(
+    Path(share_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<ComplianceAuthorityShareRevokeRequest>,
+) -> AppResult<Json<ComplianceAuthorityShareArtifact>> {
+    let share = load_compliance_authority_share(&state, &share_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let revoked = revoke_compliance_authority_share(
+        share,
+        request.revoked_at.unwrap_or_else(current_record_timestamp),
+    )
+    .map_err(compliance_authority_share_error)?;
+    persist_compliance_authority_share(&state, &revoked).await?;
+    audit_compliance_authority_share_event(
+        &state,
+        &revoked,
+        "share_revoked",
+        request.actor.as_deref(),
+        revoked.revoked_at.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(revoked))
+}
+
 pub async fn ingest_airspace_zone(
     State(state): State<AppState>,
     Json(request): Json<AirspaceZoneIngestRequest>,
@@ -11450,6 +11570,14 @@ fn compliance_record_error(error: ComplianceRecordError) -> AppError {
 }
 
 fn compliance_audit_report_error(error: ComplianceAuditReportError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn compliance_authority_export_error(error: ComplianceAuthorityExportError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn compliance_authority_share_error(error: ComplianceAuthorityShareError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
@@ -19877,6 +20005,174 @@ fn default_compliance_report_mandatory_types() -> Vec<ComplianceRecordType> {
         ComplianceRecordType::OperatorCertification,
         ComplianceRecordType::AuthorizationDecision,
     ]
+}
+
+async fn build_compliance_authority_export_from_api(
+    state: &AppState,
+    request: ComplianceAuthorityExportApiRequest,
+) -> AppResult<ComplianceAuthorityExportArtifact> {
+    let records =
+        load_compliance_records_for_report(state, &request.org_id, &request.field_id).await?;
+    let mandatory_record_types = if request.mandatory_record_types.is_empty() {
+        default_compliance_report_mandatory_types()
+    } else {
+        request.mandatory_record_types
+    };
+    let generated_at = request
+        .generated_at
+        .unwrap_or_else(current_record_timestamp);
+    let report = build_compliance_audit_report(ComplianceAuditReportRequest {
+        report_id: request
+            .report_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("compliance-report-{}", Uuid::new_v4())),
+        org_id: request.org_id,
+        field_id: request.field_id,
+        generated_at: generated_at.clone(),
+        records,
+        mandatory_record_types,
+    })
+    .map_err(compliance_audit_report_error)?;
+
+    build_compliance_authority_export(ComplianceAuthorityExportRequest {
+        authority_format: request.authority_format,
+        report,
+        generated_at,
+        residency_tag: request.residency_tag,
+        storage_region: request.storage_region,
+        retention_class: request.retention_class,
+    })
+    .map_err(compliance_authority_export_error)
+}
+
+fn compliance_authority_export_id(export: &ComplianceAuthorityExportArtifact) -> String {
+    format!("{}:{}", export.report_id, export.authority_format.as_str())
+}
+
+async fn persist_compliance_authority_export(
+    state: &AppState,
+    export: &ComplianceAuthorityExportArtifact,
+) -> AppResult<()> {
+    let export_json = serde_json::to_string(export).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO compliance_authority_exports (
+            export_id, report_id, authority_format, org_id, field_id, generated_at,
+            residency_tag, storage_region, retention_class, export_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(export_id) DO UPDATE SET
+            generated_at = excluded.generated_at,
+            residency_tag = excluded.residency_tag,
+            storage_region = excluded.storage_region,
+            retention_class = excluded.retention_class,
+            export_json = excluded.export_json
+        "#,
+    )
+    .bind(compliance_authority_export_id(export))
+    .bind(&export.report_id)
+    .bind(export.authority_format.as_str())
+    .bind(&export.org_id)
+    .bind(&export.field_id)
+    .bind(&export.generated_at)
+    .bind(&export.residency_tag)
+    .bind(&export.storage_region)
+    .bind(format!("{:?}", export.retention_class))
+    .bind(export_json)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn persist_compliance_authority_share(
+    state: &AppState,
+    share: &ComplianceAuthorityShareArtifact,
+) -> AppResult<()> {
+    let share_json = serde_json::to_string(share).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO compliance_authority_shares (
+            share_id, export_id, report_id, authority_format, created_at, expires_at, revoked_at,
+            residency_tag, storage_region, retention_class, share_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(share_id) DO UPDATE SET
+            revoked_at = excluded.revoked_at,
+            share_json = excluded.share_json
+        "#,
+    )
+    .bind(&share.share_id)
+    .bind(compliance_authority_export_id(&share.export))
+    .bind(&share.report_id)
+    .bind(share.authority_format.as_str())
+    .bind(&share.created_at)
+    .bind(&share.expires_at)
+    .bind(&share.revoked_at)
+    .bind(&share.residency_tag)
+    .bind(&share.storage_region)
+    .bind(format!("{:?}", share.retention_class))
+    .bind(share_json)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_compliance_authority_share(
+    state: &AppState,
+    share_id: &str,
+) -> AppResult<Option<ComplianceAuthorityShareArtifact>> {
+    let share_json = sqlx::query_scalar::<_, String>(
+        "SELECT share_json FROM compliance_authority_shares WHERE share_id = ?1",
+    )
+    .bind(share_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    share_json
+        .map(|json| {
+            serde_json::from_str::<ComplianceAuthorityShareArtifact>(&json).map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode compliance authority share_json"),
+                )
+            })
+        })
+        .transpose()
+}
+
+async fn audit_compliance_authority_share_event(
+    state: &AppState,
+    share: &ComplianceAuthorityShareArtifact,
+    event_type: &str,
+    actor: Option<&str>,
+    created_at: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO compliance_authority_share_events (
+            share_id, event_type, actor, created_at, details
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(&share.share_id)
+    .bind(event_type)
+    .bind(actor)
+    .bind(created_at.unwrap_or_else(|| share.created_at.as_str()))
+    .bind(format!(
+        "{} share for report {}",
+        share.authority_format.as_str(),
+        share.report_id
+    ))
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
 }
 
 async fn audit_compliance_record_event(

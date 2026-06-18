@@ -1,5 +1,6 @@
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -647,6 +648,82 @@ pub struct ComplianceAuditReport {
     pub records: Vec<ComplianceRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceAuthorityFormat {
+    FaaRemoteId,
+    StatePesticideApplication,
+}
+
+impl ComplianceAuthorityFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FaaRemoteId => "faa_remote_id",
+            Self::StatePesticideApplication => "state_pesticide_application",
+        }
+    }
+
+    fn required_record_type(self) -> ComplianceRecordType {
+        match self {
+            Self::FaaRemoteId => ComplianceRecordType::RemoteIdLog,
+            Self::StatePesticideApplication => ComplianceRecordType::ChemicalApplication,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuthorityExportRequest {
+    pub authority_format: ComplianceAuthorityFormat,
+    pub report: ComplianceAuditReport,
+    pub generated_at: String,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuthorityExportArtifact {
+    pub schema_version: String,
+    pub authority_format: ComplianceAuthorityFormat,
+    pub report_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub generated_at: String,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub content_type: String,
+    pub file_name: String,
+    pub included_record_ids: Vec<String>,
+    pub provenance_refs: Vec<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuthorityShareRequest {
+    pub share_id: String,
+    pub export: ComplianceAuthorityExportArtifact,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuthorityShareArtifact {
+    pub share_id: String,
+    pub report_id: String,
+    pub authority_format: ComplianceAuthorityFormat,
+    pub url_path: String,
+    pub created_at: String,
+    pub expires_at: String,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub revocable: bool,
+    pub export: ComplianceAuthorityExportArtifact,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComplianceAuditReportError {
     EmptyReportId,
@@ -699,6 +776,30 @@ impl std::fmt::Display for ComplianceAuditReportError {
 }
 
 impl std::error::Error for ComplianceAuditReportError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceAuthorityExportError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("residency_tag cannot be empty")]
+    EmptyResidencyTag,
+    #[error("storage_region cannot be empty")]
+    EmptyStorageRegion,
+    #[error("authority export requires at least one {record_type} record")]
+    MissingAuthorityRecord { record_type: ComplianceRecordType },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceAuthorityShareError {
+    #[error("share_id cannot be empty")]
+    EmptyShareId,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("expires_at cannot be empty")]
+    EmptyExpiresAt,
+    #[error("revoked_at cannot be empty")]
+    EmptyRevokedAt,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ComplianceRecordError {
@@ -1098,6 +1199,130 @@ pub fn build_compliance_audit_report(
         provenance_refs: provenance_refs.into_iter().collect(),
         records,
     })
+}
+
+pub fn build_compliance_authority_export(
+    request: ComplianceAuthorityExportRequest,
+) -> Result<ComplianceAuthorityExportArtifact, ComplianceAuthorityExportError> {
+    let generated_at = normalize_authority_export_text(
+        request.generated_at,
+        ComplianceAuthorityExportError::EmptyGeneratedAt,
+    )?;
+    let residency_tag = normalize_authority_export_text(
+        request.residency_tag,
+        ComplianceAuthorityExportError::EmptyResidencyTag,
+    )?;
+    let storage_region = normalize_authority_export_text(
+        request.storage_region,
+        ComplianceAuthorityExportError::EmptyStorageRegion,
+    )?;
+    let required_record_type = request.authority_format.required_record_type();
+    let records = request
+        .report
+        .records
+        .iter()
+        .filter(|record| record.record_type == required_record_type)
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Err(ComplianceAuthorityExportError::MissingAuthorityRecord {
+            record_type: required_record_type,
+        });
+    }
+
+    let included_record_ids = records
+        .iter()
+        .map(|record| record.record_id.clone())
+        .collect::<Vec<_>>();
+    let payload_records = records
+        .iter()
+        .map(|record| {
+            json!({
+                "record_id": record.record_id,
+                "version": record.version,
+                "flight_id": record.flight_id,
+                "provenance_ref": record.provenance_ref,
+                "payload": record.payload,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = match request.authority_format {
+        ComplianceAuthorityFormat::FaaRemoteId => json!({
+            "authority": "faa",
+            "format": request.authority_format.as_str(),
+            "report_id": request.report.report_id,
+            "remote_id_logs": payload_records,
+        }),
+        ComplianceAuthorityFormat::StatePesticideApplication => json!({
+            "authority": "state_pesticide_regulator",
+            "format": request.authority_format.as_str(),
+            "report_id": request.report.report_id,
+            "chemical_applications": payload_records,
+        }),
+    };
+
+    Ok(ComplianceAuthorityExportArtifact {
+        schema_version: "compliance.authority_export.v1".to_string(),
+        authority_format: request.authority_format,
+        report_id: request.report.report_id.clone(),
+        org_id: request.report.org_id.clone(),
+        field_id: request.report.field_id.clone(),
+        generated_at,
+        residency_tag,
+        storage_region,
+        retention_class: request.retention_class,
+        content_type: "application/json".to_string(),
+        file_name: format!(
+            "{}-{}.json",
+            request.report.report_id,
+            request.authority_format.as_str()
+        ),
+        included_record_ids,
+        provenance_refs: request.report.provenance_refs.clone(),
+        payload,
+    })
+}
+
+pub fn build_compliance_authority_share(
+    request: ComplianceAuthorityShareRequest,
+) -> Result<ComplianceAuthorityShareArtifact, ComplianceAuthorityShareError> {
+    let share_id = normalize_authority_share_text(
+        request.share_id,
+        ComplianceAuthorityShareError::EmptyShareId,
+    )?;
+    let created_at = normalize_authority_share_text(
+        request.created_at,
+        ComplianceAuthorityShareError::EmptyCreatedAt,
+    )?;
+    let expires_at = normalize_authority_share_text(
+        request.expires_at,
+        ComplianceAuthorityShareError::EmptyExpiresAt,
+    )?;
+
+    Ok(ComplianceAuthorityShareArtifact {
+        url_path: format!("/api/compliance/authority-shares/{share_id}"),
+        share_id,
+        report_id: request.export.report_id.clone(),
+        authority_format: request.export.authority_format,
+        created_at,
+        expires_at,
+        revoked_at: None,
+        residency_tag: request.export.residency_tag.clone(),
+        storage_region: request.export.storage_region.clone(),
+        retention_class: request.export.retention_class,
+        revocable: true,
+        export: request.export,
+    })
+}
+
+pub fn revoke_compliance_authority_share(
+    mut share: ComplianceAuthorityShareArtifact,
+    revoked_at: String,
+) -> Result<ComplianceAuthorityShareArtifact, ComplianceAuthorityShareError> {
+    share.revoked_at = Some(normalize_authority_share_text(
+        revoked_at,
+        ComplianceAuthorityShareError::EmptyRevokedAt,
+    )?);
+    Ok(share)
 }
 
 pub fn build_airspace_zone_record(
@@ -2052,6 +2277,30 @@ fn normalize_required_report_text(
     }
 }
 
+fn normalize_authority_export_text(
+    value: String,
+    error: ComplianceAuthorityExportError,
+) -> Result<String, ComplianceAuthorityExportError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_authority_share_text(
+    value: String,
+    error: ComplianceAuthorityShareError,
+) -> Result<String, ComplianceAuthorityShareError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn normalize_required_airspace_text(
     value: String,
     error: AirspaceZoneError,
@@ -2658,24 +2907,28 @@ mod tests {
     use super::{
         airspace_zone_contains_point, airspace_zone_intersects_polygon,
         append_compliance_record_version, build_airspace_zone_record,
-        build_compliance_audit_report, build_compliance_evidence_record,
+        build_compliance_audit_report, build_compliance_authority_export,
+        build_compliance_authority_share, build_compliance_evidence_record,
         build_initial_compliance_record, build_operator_certification_record,
         check_operator_certification, compute_rei_phi_window, evaluate_compliance_record_deletion,
         evaluate_compliance_record_storage, evaluate_entry_harvest_clearance,
         evaluate_preflight_authorization, evaluate_spray_buffer_compliance,
-        refuse_compliance_evidence_overwrite, refuse_in_place_mutation, AirspaceCoordinate,
-        AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
-        AppendComplianceRecordVersionRequest, ApplicationGeometry, AuthorizationBlockReason,
-        AuthorizationDecisionStatus, CertificationBlockReason, CertificationStatus,
-        ChemicalApplicationRecord, ComplianceAlertScheduleRequest, ComplianceAlertSeverity,
-        ComplianceAuditReportError, ComplianceAuditReportRequest, ComplianceCheckKind,
-        ComplianceDeadlineRecord, ComplianceEvidenceError, ComplianceEvidenceInput,
-        ComplianceEvidenceRequest, CompliancePolicyBlockReason, CompliancePolicyDecisionStatus,
-        ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordSourceHealth,
-        ComplianceRecordSourceStatus, ComplianceRecordStoragePlan, ComplianceRecordType,
-        ComplianceRetentionClass, ComplianceRetentionPolicyRule, CreateComplianceRecordRequest,
-        EntryHarvestAction, EntryHarvestBlockReason, EntryHarvestDecisionStatus,
-        IntervalWindowStatus, OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
+        refuse_compliance_evidence_overwrite, refuse_in_place_mutation,
+        revoke_compliance_authority_share, AirspaceCoordinate, AirspaceZoneClass,
+        AirspaceZoneError, AirspaceZoneIngestRequest, AppendComplianceRecordVersionRequest,
+        ApplicationGeometry, AuthorizationBlockReason, AuthorizationDecisionStatus,
+        CertificationBlockReason, CertificationStatus, ChemicalApplicationRecord,
+        ComplianceAlertScheduleRequest, ComplianceAlertSeverity, ComplianceAuditReportError,
+        ComplianceAuditReportRequest, ComplianceAuthorityExportError,
+        ComplianceAuthorityExportRequest, ComplianceAuthorityFormat,
+        ComplianceAuthorityShareRequest, ComplianceCheckKind, ComplianceDeadlineRecord,
+        ComplianceEvidenceError, ComplianceEvidenceInput, ComplianceEvidenceRequest,
+        CompliancePolicyBlockReason, CompliancePolicyDecisionStatus, ComplianceRecordError,
+        ComplianceRecordPayload, ComplianceRecordSourceHealth, ComplianceRecordSourceStatus,
+        ComplianceRecordStoragePlan, ComplianceRecordType, ComplianceRetentionClass,
+        ComplianceRetentionPolicyRule, CreateComplianceRecordRequest, EntryHarvestAction,
+        EntryHarvestBlockReason, EntryHarvestDecisionStatus, IntervalWindowStatus,
+        OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
         PreflightAuthorizationRequest, ProductLabelInterval, RemoteIdFlightLogRecord,
         RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType, SprayBufferBlockReason,
         SprayBufferComplianceError, SprayBufferDecisionStatus, TelemetryGapRecord,
@@ -3674,6 +3927,147 @@ mod tests {
                 missing: vec![ComplianceRecordType::ChemicalApplication]
             }
         );
+    }
+
+    #[test]
+    fn authority_export_adapts_validated_report_to_specific_layout() {
+        let report = complete_audit_report();
+
+        let export = build_compliance_authority_export(ComplianceAuthorityExportRequest {
+            authority_format: ComplianceAuthorityFormat::FaaRemoteId,
+            report,
+            generated_at: "2026-06-13T12:05:00Z".to_string(),
+            residency_tag: "us".to_string(),
+            storage_region: "us-east-1".to_string(),
+            retention_class: ComplianceRetentionClass::AuditEvidence,
+        })
+        .expect("remote ID authority export should build from the report");
+
+        assert_eq!(export.schema_version, "compliance.authority_export.v1");
+        assert_eq!(
+            export.authority_format,
+            ComplianceAuthorityFormat::FaaRemoteId
+        );
+        assert_eq!(export.file_name, "report-field-north-faa_remote_id.json");
+        assert_eq!(export.included_record_ids, vec!["remote-log-1".to_string()]);
+        assert_eq!(export.residency_tag, "us");
+        assert_eq!(
+            export
+                .payload
+                .pointer("/remote_id_logs/0/record_id")
+                .and_then(|value| value.as_str()),
+            Some("remote-log-1")
+        );
+        assert!(export
+            .provenance_refs
+            .contains(&"provenance:remote-id/remote-log-1/v1".to_string()));
+    }
+
+    #[test]
+    fn authority_export_refuses_format_without_required_record() {
+        let report = build_compliance_audit_report(ComplianceAuditReportRequest {
+            report_id: "report-field-north".to_string(),
+            org_id: "org-alpha".to_string(),
+            field_id: "field-north".to_string(),
+            generated_at: "2026-06-13T12:00:00Z".to_string(),
+            records: vec![compliance_record(
+                "remote-log-1",
+                ComplianceRecordType::RemoteIdLog,
+                Some("flight-77"),
+                "provenance:remote-id/remote-log-1/v1",
+                Some(ComplianceRecordPayload::RemoteIdFlightLog(remote_id_log())),
+            )],
+            mandatory_record_types: vec![ComplianceRecordType::RemoteIdLog],
+        })
+        .expect("remote-only report should build");
+
+        let error = build_compliance_authority_export(ComplianceAuthorityExportRequest {
+            authority_format: ComplianceAuthorityFormat::StatePesticideApplication,
+            report,
+            generated_at: "2026-06-13T12:05:00Z".to_string(),
+            residency_tag: "us".to_string(),
+            storage_region: "us-east-1".to_string(),
+            retention_class: ComplianceRetentionClass::AuditEvidence,
+        })
+        .expect_err("state pesticide export requires chemical applications");
+
+        assert_eq!(
+            error,
+            ComplianceAuthorityExportError::MissingAuthorityRecord {
+                record_type: ComplianceRecordType::ChemicalApplication
+            }
+        );
+    }
+
+    #[test]
+    fn authority_share_is_bounded_and_revocable() {
+        let export = build_compliance_authority_export(ComplianceAuthorityExportRequest {
+            authority_format: ComplianceAuthorityFormat::StatePesticideApplication,
+            report: complete_audit_report(),
+            generated_at: "2026-06-13T12:05:00Z".to_string(),
+            residency_tag: "us".to_string(),
+            storage_region: "us-east-1".to_string(),
+            retention_class: ComplianceRetentionClass::AuditEvidence,
+        })
+        .expect("authority export should build");
+
+        let share = build_compliance_authority_share(ComplianceAuthorityShareRequest {
+            share_id: "share-state-1".to_string(),
+            export,
+            created_at: "2026-06-13T12:10:00Z".to_string(),
+            expires_at: "2026-06-20T12:10:00Z".to_string(),
+        })
+        .expect("share artifact should build");
+
+        assert_eq!(
+            share.url_path,
+            "/api/compliance/authority-shares/share-state-1"
+        );
+        assert_eq!(share.residency_tag, "us");
+        assert!(share.revocable);
+        assert_eq!(share.revoked_at, None);
+
+        let revoked = revoke_compliance_authority_share(share, "2026-06-14T12:10:00Z".to_string())
+            .expect("share should revoke with audit timestamp");
+        assert_eq!(revoked.revoked_at.as_deref(), Some("2026-06-14T12:10:00Z"));
+    }
+
+    fn complete_audit_report() -> super::ComplianceAuditReport {
+        build_compliance_audit_report(ComplianceAuditReportRequest {
+            report_id: "report-field-north".to_string(),
+            org_id: "org-alpha".to_string(),
+            field_id: "field-north".to_string(),
+            generated_at: "2026-06-13T12:00:00Z".to_string(),
+            records: vec![
+                compliance_record(
+                    "remote-log-1",
+                    ComplianceRecordType::RemoteIdLog,
+                    Some("flight-77"),
+                    "provenance:remote-id/remote-log-1/v1",
+                    Some(ComplianceRecordPayload::RemoteIdFlightLog(remote_id_log())),
+                ),
+                compliance_record(
+                    "chem-app-1",
+                    ComplianceRecordType::ChemicalApplication,
+                    None,
+                    "provenance:application/chem-app-1/v1",
+                    Some(ComplianceRecordPayload::ChemicalApplication(
+                        chemical_application(
+                            "chem-app-1",
+                            ApplicationGeometry {
+                                crs: "EPSG:4326".to_string(),
+                                coordinates: square_zone(),
+                            },
+                        ),
+                    )),
+                ),
+            ],
+            mandatory_record_types: vec![
+                ComplianceRecordType::RemoteIdLog,
+                ComplianceRecordType::ChemicalApplication,
+            ],
+        })
+        .expect("complete audit report should build")
     }
 
     fn compliance_record(

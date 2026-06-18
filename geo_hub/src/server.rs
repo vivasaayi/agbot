@@ -173,6 +173,22 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::export_compliance_audit_report),
         )
         .route(
+            "/api/compliance/reports/authority-export",
+            post(routes::export_compliance_authority_report),
+        )
+        .route(
+            "/api/compliance/reports/authority-shares",
+            post(routes::create_compliance_authority_share),
+        )
+        .route(
+            "/api/compliance/authority-shares/:share_id",
+            get(routes::get_compliance_authority_share),
+        )
+        .route(
+            "/api/compliance/authority-shares/:share_id/revoke",
+            post(routes::revoke_compliance_authority_share_route),
+        )
+        .route(
             "/api/compliance/records/:record_id/versions",
             post(routes::append_compliance_record_version_route),
         )

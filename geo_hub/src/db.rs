@@ -2158,6 +2158,60 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS compliance_authority_exports (
+            export_id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            authority_format TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            residency_tag TEXT NOT NULL,
+            storage_region TEXT NOT NULL,
+            retention_class TEXT NOT NULL,
+            export_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS compliance_authority_shares (
+            share_id TEXT PRIMARY KEY,
+            export_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            authority_format TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            residency_tag TEXT NOT NULL,
+            storage_region TEXT NOT NULL,
+            retention_class TEXT NOT NULL,
+            share_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS compliance_authority_share_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor TEXT,
+            created_at TEXT NOT NULL,
+            details TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS compliance_airspace_zones (
             zone_id TEXT PRIMARY KEY,
             zone_class TEXT NOT NULL,

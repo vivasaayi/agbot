@@ -13928,6 +13928,173 @@ async fn compliance_audit_report_export_rejects_missing_mandatory_records() -> R
 }
 
 #[tokio::test]
+async fn compliance_authority_exports_share_and_revoke_bounded_links() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_compliance_field(&ctx, "field-north", "org-alpha").await?;
+    seed_compliance_export_records(&ctx).await?;
+
+    let export_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/reports/authority-export")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "authority_format": "faa_remote_id",
+                        "report_id": "report-field-north",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:05:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application",
+                            "operator_certification",
+                            "authorization_decision"
+                        ],
+                        "residency_tag": "us",
+                        "storage_region": "us-east-1",
+                        "retention_class": "audit_evidence"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(export_response.status(), StatusCode::OK);
+    let body = to_bytes(export_response.into_body(), 128 * 1024).await?;
+    let export: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        export
+            .get("schema_version")
+            .and_then(|value| value.as_str()),
+        Some("compliance.authority_export.v1")
+    );
+    assert_eq!(
+        export
+            .get("authority_format")
+            .and_then(|value| value.as_str()),
+        Some("faa_remote_id")
+    );
+    assert_eq!(
+        export
+            .pointer("/payload/remote_id_logs/0/record_id")
+            .and_then(|value| value.as_str()),
+        Some("remote-log-1")
+    );
+    assert_eq!(
+        export.get("residency_tag").and_then(|value| value.as_str()),
+        Some("us")
+    );
+
+    let share_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/reports/authority-shares")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "share_id": "share-faa-1",
+                        "authority_format": "faa_remote_id",
+                        "report_id": "report-field-north",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:05:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application",
+                            "operator_certification",
+                            "authorization_decision"
+                        ],
+                        "residency_tag": "us",
+                        "storage_region": "us-east-1",
+                        "retention_class": "audit_evidence",
+                        "created_at": "2026-06-13T12:10:00Z",
+                        "expires_at": "2026-06-20T12:10:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(share_response.status(), StatusCode::OK);
+    let body = to_bytes(share_response.into_body(), 128 * 1024).await?;
+    let share: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        share.get("url_path").and_then(|value| value.as_str()),
+        Some("/api/compliance/authority-shares/share-faa-1")
+    );
+    assert_eq!(share.get("revoked_at"), Some(&serde_json::Value::Null));
+
+    let download = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/compliance/authority-shares/share-faa-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(download.status(), StatusCode::OK);
+
+    let revoke = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/authority-shares/share-faa-1/revoke")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor": "compliance-officer-1",
+                        "revoked_at": "2026-06-14T12:10:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(revoke.status(), StatusCode::OK);
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/compliance/authority-shares/share-faa-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM compliance_authority_share_events WHERE share_id = 'share-faa-1'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(events, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn compliance_airspace_zones_ingest_query_and_reject_invalid_crs() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
