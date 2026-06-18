@@ -405,6 +405,90 @@ pub struct SoilCaptureFreshnessCoverageReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilZoneGeometry {
+    pub zone_id: String,
+    pub crs: String,
+    pub polygon: Vec<Vec<GeoJsonCoordinate>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GeoJsonCoordinate {
+    pub lon: f64,
+    pub lat: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapZoneSummary {
+    pub field_id: String,
+    pub zone_id: String,
+    pub device_count: usize,
+    pub fresh_device_count: usize,
+    pub stale_device_count: usize,
+    pub never_seen_device_count: usize,
+    pub coverage_fraction: f64,
+    pub is_gap: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapExport {
+    pub field_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub crs: String,
+    pub zone_summaries: Vec<SoilCoverageGapZoneSummary>,
+    pub gap_csv: String,
+    pub gap_geojson: SoilCoverageGapFeatureCollection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapFeatureCollection {
+    #[serde(rename = "type")]
+    pub collection_type: String,
+    pub crs: SoilCoverageGapCrs,
+    pub features: Vec<SoilCoverageGapFeature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapCrs {
+    #[serde(rename = "type")]
+    pub crs_type: String,
+    pub properties: SoilCoverageGapCrsProperties,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapCrsProperties {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapFeature {
+    #[serde(rename = "type")]
+    pub feature_type: String,
+    pub id: String,
+    pub geometry: SoilCoverageGapGeometry,
+    pub properties: SoilCoverageGapFeatureProperties,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapGeometry {
+    #[serde(rename = "type")]
+    pub geometry_type: String,
+    pub coordinates: Vec<Vec<[f64; 2]>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapFeatureProperties {
+    pub field_id: String,
+    pub zone_id: String,
+    pub device_count: usize,
+    pub fresh_device_count: usize,
+    pub stale_device_count: usize,
+    pub never_seen_device_count: usize,
+    pub coverage_fraction: f64,
+    pub is_gap: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StuckSensorWindowConfig {
     pub min_samples: usize,
     pub variance_threshold: f64,
@@ -968,6 +1052,12 @@ pub enum SoilIotError {
     InvalidFreshnessTimestamp { value: String },
     #[error("freshness devices must belong to one field, saw {left} and {right}")]
     MixedFreshnessFieldScope { left: String, right: String },
+    #[error("coverage gap export CRS cannot be empty")]
+    EmptyCoverageGapCrs,
+    #[error("coverage gap export is missing geometry for uncovered zone {zone_id}")]
+    MissingCoverageGapZoneGeometry { zone_id: String },
+    #[error("coverage gap export geometry for zone {zone_id} is invalid")]
+    InvalidCoverageGapZoneGeometry { zone_id: String },
     #[error("irrigation trigger config must be finite with low_moisture_threshold >= 0")]
     InvalidIrrigationTriggerConfig,
     #[error("stuck-sensor window must contain one device and metric")]
@@ -1458,6 +1548,94 @@ pub fn evaluate_soil_capture_freshness_coverage(
         method_version: config.method_version,
         devices: device_records,
         zones,
+    })
+}
+
+pub fn export_soil_coverage_gaps(
+    report: SoilCaptureFreshnessCoverageReport,
+    zone_geometries: Vec<SoilZoneGeometry>,
+    crs: String,
+) -> Result<SoilCoverageGapExport, SoilIotError> {
+    let crs = normalize_required_text(crs, SoilIotError::EmptyCoverageGapCrs)?;
+    let geometry_by_zone = zone_geometries
+        .into_iter()
+        .filter_map(|geometry| {
+            normalize_optional_text(Some(geometry.zone_id.clone())).map(|zone_id| {
+                (
+                    zone_id,
+                    SoilZoneGeometry {
+                        zone_id: geometry.zone_id,
+                        crs: geometry.crs,
+                        polygon: geometry.polygon,
+                    },
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut zone_summaries = report
+        .zones
+        .iter()
+        .map(|zone| SoilCoverageGapZoneSummary {
+            field_id: zone.field_id.clone(),
+            zone_id: zone.zone_id.clone(),
+            device_count: zone.device_count,
+            fresh_device_count: zone.fresh_device_count,
+            stale_device_count: zone.stale_device_count,
+            never_seen_device_count: zone.never_seen_device_count,
+            coverage_fraction: zone.coverage_fraction,
+            is_gap: zone.fresh_device_count == 0,
+        })
+        .collect::<Vec<_>>();
+    zone_summaries.sort_by(|left, right| left.zone_id.cmp(&right.zone_id));
+
+    let mut gap_features = Vec::new();
+    for summary in zone_summaries.iter().filter(|summary| summary.is_gap) {
+        let geometry = geometry_by_zone.get(&summary.zone_id).ok_or_else(|| {
+            SoilIotError::MissingCoverageGapZoneGeometry {
+                zone_id: summary.zone_id.clone(),
+            }
+        })?;
+        validate_gap_geometry(geometry, &crs)?;
+        gap_features.push(SoilCoverageGapFeature {
+            feature_type: "Feature".to_string(),
+            id: summary.zone_id.clone(),
+            geometry: SoilCoverageGapGeometry {
+                geometry_type: "Polygon".to_string(),
+                coordinates: geometry
+                    .polygon
+                    .iter()
+                    .map(|ring| ring.iter().map(|coord| [coord.lon, coord.lat]).collect())
+                    .collect(),
+            },
+            properties: SoilCoverageGapFeatureProperties {
+                field_id: summary.field_id.clone(),
+                zone_id: summary.zone_id.clone(),
+                device_count: summary.device_count,
+                fresh_device_count: summary.fresh_device_count,
+                stale_device_count: summary.stale_device_count,
+                never_seen_device_count: summary.never_seen_device_count,
+                coverage_fraction: summary.coverage_fraction,
+                is_gap: true,
+            },
+        });
+    }
+
+    let gap_csv = render_gap_csv(&zone_summaries);
+    Ok(SoilCoverageGapExport {
+        field_id: report.field_id,
+        evaluated_at: report.evaluated_at,
+        method_version: report.method_version,
+        crs: crs.clone(),
+        zone_summaries,
+        gap_csv,
+        gap_geojson: SoilCoverageGapFeatureCollection {
+            collection_type: "FeatureCollection".to_string(),
+            crs: SoilCoverageGapCrs {
+                crs_type: "name".to_string(),
+                properties: SoilCoverageGapCrsProperties { name: crs },
+            },
+            features: gap_features,
+        },
     })
 }
 
@@ -2319,6 +2497,61 @@ fn normalize_text_values(
         .map(|values| values.into_iter().collect())
 }
 
+fn validate_gap_geometry(geometry: &SoilZoneGeometry, crs: &str) -> Result<(), SoilIotError> {
+    let zone_id = normalize_optional_text(Some(geometry.zone_id.clone()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let geometry_crs = normalize_required_text(geometry.crs.clone(), SoilIotError::EmptyCrs)?;
+    if geometry_crs != crs {
+        return Err(SoilIotError::UnsupportedCrs {
+            value: geometry_crs,
+        });
+    }
+    if geometry.polygon.is_empty()
+        || geometry.polygon[0].len() < 4
+        || !geometry
+            .polygon
+            .iter()
+            .flatten()
+            .all(valid_geojson_coordinate)
+    {
+        return Err(SoilIotError::InvalidCoverageGapZoneGeometry { zone_id });
+    }
+    Ok(())
+}
+
+fn valid_geojson_coordinate(coord: &GeoJsonCoordinate) -> bool {
+    coord.lat.is_finite()
+        && coord.lon.is_finite()
+        && (-90.0..=90.0).contains(&coord.lat)
+        && (-180.0..=180.0).contains(&coord.lon)
+}
+
+fn render_gap_csv(summaries: &[SoilCoverageGapZoneSummary]) -> String {
+    let mut csv = "field_id,zone_id,device_count,fresh_device_count,stale_device_count,never_seen_device_count,coverage_fraction,is_gap\n".to_string();
+    for summary in summaries.iter().filter(|summary| summary.is_gap) {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{:.6},{}\n",
+            csv_escape(&summary.field_id),
+            csv_escape(&summary.zone_id),
+            summary.device_count,
+            summary.fresh_device_count,
+            summary.stale_device_count,
+            summary.never_seen_device_count,
+            summary.coverage_fraction,
+            summary.is_gap
+        ));
+    }
+    csv
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn pinned_rail(values: &[f64], config: &StuckSensorWindowConfig) -> Option<StuckSensorRail> {
     if values
         .iter()
@@ -2394,22 +2627,23 @@ mod tests {
         build_zone_soil_product_summary, decode_gateway_payload, detect_stuck_sensor_window,
         emit_sensor_health_alert_events, evaluate_irrigation_trigger,
         evaluate_sensor_health_snapshot, evaluate_soil_aerial_fusion,
-        evaluate_soil_capture_freshness_coverage, ingest_gateway_readings,
-        reading_rejection_for_device, rederive_validated_series_evidence,
+        evaluate_soil_capture_freshness_coverage, export_soil_coverage_gaps,
+        ingest_gateway_readings, reading_rejection_for_device, rederive_validated_series_evidence,
         transition_soil_config_push_status, transition_soil_device_status,
         validate_and_calibrate_reading, AerialIndexZoneProduct, CalibrationProfile,
         GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
-        GatewayReadingRecord, GeoPosition, IrrigationTriggerConfig,
+        GatewayReadingRecord, GeoJsonCoordinate, GeoPosition, IrrigationTriggerConfig,
         IrrigationTriggerSuppressionReason, RawGatewayReading, ReadingGeolocationStatus,
         ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
         SensorHealthEventKind, SensorHealthLinkStatus, SensorHealthMonitorState,
         SensorHealthReasonCode, SensorHealthSnapshot, SensorHealthThresholds, SimulatedGateway,
         SoilAerialFusionOutcome, SoilAerialFusionRefusalReason, SoilAerialFusionRequest,
-        SoilCaptureFreshnessConfig, SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus,
-        SoilDeviceConfigPushStatusUpdate, SoilDeviceFreshnessState, SoilDeviceStatus, SoilIotError,
-        SoilSensorType, StuckSensorRail, StuckSensorWindowConfig, ValidatedSoilReading,
-        ValidationEvidenceRequest, ZoneSoilMoistureProduct, ZoneSoilProductFreshness,
-        ZoneSoilProductRequest, ZoneSoilProductSummary,
+        SoilCaptureFreshnessConfig, SoilCaptureFreshnessCoverageReport,
+        SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate,
+        SoilDeviceFreshnessState, SoilDeviceStatus, SoilIotError, SoilSensorType,
+        SoilZoneCoverageRecord, SoilZoneGeometry, StuckSensorRail, StuckSensorWindowConfig,
+        ValidatedSoilReading, ValidationEvidenceRequest, ZoneSoilMoistureProduct,
+        ZoneSoilProductFreshness, ZoneSoilProductRequest, ZoneSoilProductSummary,
     };
     use alerting::{AlertEventBackbone, AlertSeverityHint};
     use timeseries::SeriesValue;
@@ -2933,6 +3167,77 @@ mod tests {
         assert_eq!(report.zones[0].fresh_device_count, 0);
         assert_eq!(report.zones[0].stale_device_count, 1);
         assert_eq!(report.zones[0].coverage_fraction, 0.0);
+    }
+
+    #[test]
+    fn coverage_gap_export_outputs_geojson_and_csv_for_uncovered_zones() {
+        let export = export_soil_coverage_gaps(
+            coverage_report(vec![
+                coverage_zone("zone-ne", 2, 1, 1, 0),
+                coverage_zone("zone-sw", 1, 0, 0, 1),
+            ]),
+            vec![zone_geometry("zone-ne"), zone_geometry("zone-sw")],
+            "EPSG:4326".to_string(),
+        )
+        .expect("gap export should build");
+
+        assert_eq!(export.zone_summaries.len(), 2);
+        assert!(!export.zone_summaries[0].is_gap);
+        assert!(export.zone_summaries[1].is_gap);
+        assert!(export.gap_csv.starts_with("field_id,zone_id"));
+        assert!(export
+            .gap_csv
+            .contains("field-001,zone-sw,1,0,0,1,0.000000,true"));
+        assert!(!export.gap_csv.contains("zone-ne,2,1"));
+        assert_eq!(export.gap_geojson.collection_type, "FeatureCollection");
+        assert_eq!(export.gap_geojson.crs.properties.name, "EPSG:4326");
+        assert_eq!(export.gap_geojson.features.len(), 1);
+        assert_eq!(export.gap_geojson.features[0].id, "zone-sw");
+        assert_eq!(
+            export.gap_geojson.features[0].properties.fresh_device_count,
+            0
+        );
+        assert_eq!(
+            export.gap_geojson.features[0].geometry.coordinates[0][0],
+            [-121.50, 38.58]
+        );
+    }
+
+    #[test]
+    fn coverage_gap_export_returns_valid_empty_gap_set_when_fully_covered() {
+        let export = export_soil_coverage_gaps(
+            coverage_report(vec![
+                coverage_zone("zone-ne", 2, 2, 0, 0),
+                coverage_zone("zone-sw", 1, 1, 0, 0),
+            ]),
+            vec![zone_geometry("zone-ne"), zone_geometry("zone-sw")],
+            "EPSG:4326".to_string(),
+        )
+        .expect("fully covered export should build");
+
+        assert!(export.zone_summaries.iter().all(|zone| !zone.is_gap));
+        assert!(export.gap_geojson.features.is_empty());
+        assert_eq!(
+            export.gap_csv,
+            "field_id,zone_id,device_count,fresh_device_count,stale_device_count,never_seen_device_count,coverage_fraction,is_gap\n"
+        );
+    }
+
+    #[test]
+    fn coverage_gap_export_requires_geometry_for_uncovered_zone() {
+        let error = export_soil_coverage_gaps(
+            coverage_report(vec![coverage_zone("zone-sw", 1, 0, 0, 1)]),
+            vec![zone_geometry("zone-ne")],
+            "EPSG:4326".to_string(),
+        )
+        .expect_err("uncovered zone without geometry should fail");
+
+        assert_eq!(
+            error,
+            SoilIotError::MissingCoverageGapZoneGeometry {
+                zone_id: "zone-sw".to_string()
+            }
+        );
     }
 
     #[test]
@@ -3511,6 +3816,63 @@ mod tests {
         SoilCaptureFreshnessConfig {
             expected_interval_seconds: 300,
             method_version: "soil-capture-freshness-v1".to_string(),
+        }
+    }
+
+    fn coverage_report(zones: Vec<SoilZoneCoverageRecord>) -> SoilCaptureFreshnessCoverageReport {
+        SoilCaptureFreshnessCoverageReport {
+            field_id: "field-001".to_string(),
+            evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+            method_version: "soil-capture-freshness-v1".to_string(),
+            devices: Vec::new(),
+            zones,
+        }
+    }
+
+    fn coverage_zone(
+        zone_id: &str,
+        device_count: usize,
+        fresh_device_count: usize,
+        stale_device_count: usize,
+        never_seen_device_count: usize,
+    ) -> SoilZoneCoverageRecord {
+        SoilZoneCoverageRecord {
+            field_id: "field-001".to_string(),
+            zone_id: zone_id.to_string(),
+            device_count,
+            fresh_device_count,
+            stale_device_count,
+            never_seen_device_count,
+            coverage_fraction: if device_count == 0 {
+                0.0
+            } else {
+                fresh_device_count as f64 / device_count as f64
+            },
+        }
+    }
+
+    fn zone_geometry(zone_id: &str) -> SoilZoneGeometry {
+        SoilZoneGeometry {
+            zone_id: zone_id.to_string(),
+            crs: "EPSG:4326".to_string(),
+            polygon: vec![vec![
+                GeoJsonCoordinate {
+                    lon: -121.50,
+                    lat: 38.58,
+                },
+                GeoJsonCoordinate {
+                    lon: -121.49,
+                    lat: 38.58,
+                },
+                GeoJsonCoordinate {
+                    lon: -121.49,
+                    lat: 38.59,
+                },
+                GeoJsonCoordinate {
+                    lon: -121.50,
+                    lat: 38.58,
+                },
+            ]],
         }
     }
 
