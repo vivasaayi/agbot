@@ -94,16 +94,18 @@ use shared::schemas::{
     build_sustainability_record, build_tractor_record, close_marketplace_listing_record,
     compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
     compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
-    compute_sustainability_kpi, content_portal_embed_item, create_content_engagement_event,
-    create_marketplace_fulfillment_record, create_marketplace_rating_record,
-    create_success_story_content, create_sustainability_baseline, create_sustainability_mrv_trail,
-    create_versioned_content, estimate_biomass, fulfill_marketplace_inventory,
+    compute_sustainability_kpi, content_portal_embed_item, create_community_contribution,
+    create_content_engagement_event, create_marketplace_fulfillment_record,
+    create_marketplace_rating_record, create_success_story_content, create_sustainability_baseline,
+    create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
+    fulfill_marketplace_inventory, moderate_community_contribution,
     normalize_weather_provider_forecast, parse_biodiversity_proxy_status,
-    parse_carbon_footprint_status, parse_content_engagement_event_type, parse_content_status,
-    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
-    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
-    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
-    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
+    parse_carbon_footprint_status, parse_content_contribution_status,
+    parse_content_engagement_event_type, parse_content_status, parse_content_type,
+    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
+    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
+    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
+    parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
     parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
@@ -121,9 +123,11 @@ use shared::schemas::{
     CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
     CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
     CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
-    ContentCreateRequest, ContentEditRequest, ContentEngagementEventCreateRequest,
-    ContentEngagementEventRecord, ContentEngagementSummary, ContentError,
-    ContentPermissionResolveRequest, ContentPermissionSet, ContentPortalEmbed,
+    ContentCommunityContributionCreateRequest, ContentCommunityContributionRecord,
+    ContentContributionModerationAuditRecord, ContentContributionModerationRequest,
+    ContentContributionModerationResult, ContentCreateRequest, ContentEditRequest,
+    ContentEngagementEventCreateRequest, ContentEngagementEventRecord, ContentEngagementSummary,
+    ContentError, ContentPermissionResolveRequest, ContentPermissionSet, ContentPortalEmbed,
     ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument,
     ContentSearchRequest, ContentSearchResult, ContentStatus, ContentSuccessStoryCreateRequest,
     ContentSuccessStoryRecord, ContentTagApplyRequest, ContentTagRecord, ContentTaxonomyKind,
@@ -5349,6 +5353,55 @@ pub async fn get_success_story_item(
         versions: versioned.versions,
         success_story,
     }))
+}
+
+pub async fn create_community_contribution_route(
+    State(state): State<AppState>,
+    Json(request): Json<ContentCommunityContributionCreateRequest>,
+) -> AppResult<Json<ContentCommunityContributionRecord>> {
+    let contribution = create_community_contribution(
+        request,
+        format!("content-community-contribution-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    insert_community_contribution(&state, &contribution).await?;
+
+    Ok(Json(contribution))
+}
+
+pub async fn moderate_community_contribution_route(
+    Path(contribution_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(mut request): Json<ContentContributionModerationRequest>,
+) -> AppResult<Json<ContentContributionModerationResult>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let contribution = load_community_contribution(&state, &contribution_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if contribution.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    if let Some(actor_org_id) = normalize_optional_text(query.actor_org_id) {
+        request.actor_org_id = actor_org_id;
+    }
+    if let Some(role_refs) = query.role_refs {
+        request.role_refs = parse_role_refs(Some(role_refs));
+    }
+    let result = moderate_community_contribution(
+        &contribution,
+        request,
+        format!("content-community-moderation-audit-{}", Uuid::new_v4()),
+        format!("content-community-{}", Uuid::new_v4()),
+        format!("content-version-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    persist_community_moderation_result(&state, &result).await?;
+
+    Ok(Json(result))
 }
 
 pub async fn list_content_items(
@@ -12432,6 +12485,24 @@ fn decode_success_story_record(
     })
 }
 
+fn decode_community_contribution_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ContentCommunityContributionRecord> {
+    Ok(ContentCommunityContributionRecord {
+        contribution_id: row.get("contribution_id"),
+        org_id: row.get("org_id"),
+        contributor_id: row.get("contributor_id"),
+        content_type: parse_content_type(&row.get::<String, _>("content_type"))
+            .map_err(content_error)?,
+        body: row.get("body"),
+        status: parse_content_contribution_status(&row.get::<String, _>("status"))
+            .map_err(content_error)?,
+        content_id: row.get("content_id"),
+        submitted_at: row.get("submitted_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 fn decode_content_engagement_event_record(
     row: &sqlx::sqlite::SqliteRow,
 ) -> AppResult<ContentEngagementEventRecord> {
@@ -15928,6 +15999,86 @@ async fn insert_success_story_item_with_version(
     Ok(())
 }
 
+async fn insert_community_contribution(
+    state: &AppState,
+    contribution: &ContentCommunityContributionRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_community_contributions (
+            contribution_id, org_id, contributor_id, content_type, body, status, content_id,
+            submitted_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&contribution.contribution_id)
+    .bind(&contribution.org_id)
+    .bind(&contribution.contributor_id)
+    .bind(contribution.content_type.as_str())
+    .bind(&contribution.body)
+    .bind(contribution.status.as_str())
+    .bind(&contribution.content_id)
+    .bind(&contribution.submitted_at)
+    .bind(&contribution.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn persist_community_moderation_result(
+    state: &AppState,
+    result: &ContentContributionModerationResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        UPDATE cms_community_contributions
+        SET status = ?2, content_id = ?3, updated_at = ?4
+        WHERE contribution_id = ?1
+        "#,
+    )
+    .bind(&result.contribution.contribution_id)
+    .bind(result.contribution.status.as_str())
+    .bind(&result.contribution.content_id)
+    .bind(&result.contribution.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    insert_community_moderation_audit_in_tx(&mut tx, &result.audit).await?;
+    if let Some(content) = &result.content {
+        let version = content.versions.first().ok_or_else(|| {
+            AppError::BadRequest("approved contribution missing version".to_string())
+        })?;
+        sqlx::query(
+            r#"
+            INSERT INTO cms_contents (
+                content_id, content_type, author_id, org_id, status, current_version,
+                created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&content.content.content_id)
+        .bind(content.content.content_type.as_str())
+        .bind(&content.content.author_id)
+        .bind(&content.content.org_id)
+        .bind(content.content.status.as_str())
+        .bind(&content.content.current_version)
+        .bind(&content.content.created_at)
+        .bind(&content.content.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+        insert_content_version_in_tx(&mut tx, version).await?;
+    }
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn append_content_version_record(
     state: &AppState,
     content: &ContentRecord,
@@ -16120,6 +16271,34 @@ async fn insert_content_workflow_audit_in_tx(
     Ok(())
 }
 
+async fn insert_community_moderation_audit_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    audit: &ContentContributionModerationAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_community_contribution_audits (
+            audit_id, contribution_id, action, from_status, to_status, moderator_id,
+            occurred_at, reason
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.contribution_id)
+    .bind(audit.action.as_str())
+    .bind(audit.from_status.as_str())
+    .bind(audit.to_status.as_str())
+    .bind(&audit.moderator_id)
+    .bind(&audit.occurred_at)
+    .bind(&audit.reason)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn insert_content_version_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     version: &ContentVersionRecord,
@@ -16194,6 +16373,27 @@ async fn load_success_story_record(
     .map_err(Error::from)?;
 
     row.map(|row| decode_success_story_record(&row)).transpose()
+}
+
+async fn load_community_contribution(
+    state: &AppState,
+    contribution_id: &str,
+) -> AppResult<Option<ContentCommunityContributionRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT contribution_id, org_id, contributor_id, content_type, body, status,
+               content_id, submitted_at, updated_at
+        FROM cms_community_contributions
+        WHERE contribution_id = ?1
+        "#,
+    )
+    .bind(contribution_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_community_contribution_record(&row))
+        .transpose()
 }
 
 async fn load_content_search_documents(

@@ -12807,6 +12807,96 @@ pub struct ContentEngagementSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ContentContributionStatus {
+    Submitted,
+    Approved,
+    Rejected,
+}
+
+impl ContentContributionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentContributionStatus::Submitted => "submitted",
+            ContentContributionStatus::Approved => "approved",
+            ContentContributionStatus::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentContributionModerationAction {
+    Approve,
+    Reject,
+}
+
+impl ContentContributionModerationAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentContributionModerationAction::Approve => "approve",
+            ContentContributionModerationAction::Reject => "reject",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentCommunityContributionCreateRequest {
+    #[serde(default)]
+    pub contribution_id: Option<String>,
+    pub org_id: String,
+    pub contributor_id: String,
+    pub content_type: ContentType,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentCommunityContributionRecord {
+    pub contribution_id: String,
+    pub org_id: String,
+    pub contributor_id: String,
+    pub content_type: ContentType,
+    pub body: String,
+    pub status: ContentContributionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
+    pub submitted_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentContributionModerationRequest {
+    pub action: ContentContributionModerationAction,
+    pub moderator_id: String,
+    pub actor_org_id: String,
+    #[serde(default)]
+    pub role_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentContributionModerationAuditRecord {
+    pub audit_id: String,
+    pub contribution_id: String,
+    pub action: ContentContributionModerationAction,
+    pub from_status: ContentContributionStatus,
+    pub to_status: ContentContributionStatus,
+    pub moderator_id: String,
+    pub occurred_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentContributionModerationResult {
+    pub contribution: ContentCommunityContributionRecord,
+    pub audit: ContentContributionModerationAuditRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<VersionedContentRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContentTaxonomyKind {
     Crop,
     Region,
@@ -12899,6 +12989,19 @@ pub enum ContentError {
     EmptySuccessStoryField { field: &'static str },
     #[error("success story requires at least one metric")]
     EmptySuccessStoryMetrics,
+    #[error("content contribution_id cannot be empty")]
+    EmptyContributionId,
+    #[error("content contribution moderator_id cannot be empty")]
+    EmptyModeratorId,
+    #[error("content contribution moderation audit_id cannot be empty")]
+    EmptyContributionAuditId,
+    #[error("content contribution action {action} cannot transition {from_status}")]
+    InvalidContributionTransition {
+        action: &'static str,
+        from_status: &'static str,
+    },
+    #[error("unsupported content contribution status {value}")]
+    UnsupportedContributionStatus { value: String },
 }
 
 pub fn create_versioned_content(
@@ -12988,6 +13091,111 @@ pub fn create_success_story_content(
     let success_story = validate_success_story_fields(content.content_id.clone(), request.fields)?;
 
     Ok((content, version, success_story))
+}
+
+pub fn create_community_contribution(
+    request: ContentCommunityContributionCreateRequest,
+    generated_contribution_id: String,
+    submitted_at: String,
+) -> Result<ContentCommunityContributionRecord, ContentError> {
+    let contribution_id = normalize_content_optional_text(request.contribution_id)
+        .or_else(|| normalize_content_text(generated_contribution_id))
+        .ok_or(ContentError::EmptyContributionId)?;
+    let org_id = normalize_content_text(request.org_id).ok_or(ContentError::EmptyOrgId)?;
+    let contributor_id =
+        normalize_content_text(request.contributor_id).ok_or(ContentError::EmptyAuthorId)?;
+    let body = normalize_content_text(request.body).ok_or(ContentError::EmptyBody)?;
+    let submitted_at = normalize_content_text(submitted_at).ok_or(ContentError::EmptyCreatedAt)?;
+
+    Ok(ContentCommunityContributionRecord {
+        contribution_id,
+        org_id,
+        contributor_id,
+        content_type: request.content_type,
+        body,
+        status: ContentContributionStatus::Submitted,
+        content_id: None,
+        submitted_at: submitted_at.clone(),
+        updated_at: submitted_at,
+    })
+}
+
+pub fn moderate_community_contribution(
+    contribution: &ContentCommunityContributionRecord,
+    request: ContentContributionModerationRequest,
+    generated_audit_id: String,
+    generated_content_id: String,
+    generated_version_id: String,
+    occurred_at: String,
+) -> Result<ContentContributionModerationResult, ContentError> {
+    let audit_id =
+        normalize_content_text(generated_audit_id).ok_or(ContentError::EmptyContributionAuditId)?;
+    let moderator_id =
+        normalize_content_text(request.moderator_id).ok_or(ContentError::EmptyModeratorId)?;
+    let occurred_at =
+        normalize_content_text(occurred_at).ok_or(ContentError::EmptyWorkflowTimestamp)?;
+    let permissions = resolve_content_permissions(ContentPermissionResolveRequest {
+        org_id: contribution.org_id.clone(),
+        actor_org_id: request.actor_org_id,
+        role_refs: request.role_refs,
+    })?;
+    if !permissions.can_moderate {
+        return Err(ContentError::AccessDenied {
+            permission: "can_moderate",
+        });
+    }
+    if contribution.status != ContentContributionStatus::Submitted {
+        return Err(ContentError::InvalidContributionTransition {
+            action: request.action.as_str(),
+            from_status: contribution.status.as_str(),
+        });
+    }
+
+    let to_status = match request.action {
+        ContentContributionModerationAction::Approve => ContentContributionStatus::Approved,
+        ContentContributionModerationAction::Reject => ContentContributionStatus::Rejected,
+    };
+    let mut updated = contribution.clone();
+    updated.status = to_status;
+    updated.updated_at = occurred_at.clone();
+    let content = if request.action == ContentContributionModerationAction::Approve {
+        let (content, version) = create_versioned_content(
+            ContentCreateRequest {
+                content_id: Some(generated_content_id),
+                content_type: contribution.content_type,
+                author_id: contribution.contributor_id.clone(),
+                org_id: contribution.org_id.clone(),
+                body: contribution.body.clone(),
+                status: Some(ContentStatus::Draft),
+            },
+            "unused-generated-content".to_string(),
+            generated_version_id,
+            occurred_at.clone(),
+        )?;
+        updated.content_id = Some(content.content_id.clone());
+        Some(VersionedContentRecord {
+            content,
+            versions: vec![version],
+        })
+    } else {
+        None
+    };
+    let audit = ContentContributionModerationAuditRecord {
+        audit_id,
+        contribution_id: contribution.contribution_id.clone(),
+        action: request.action,
+        from_status: contribution.status,
+        to_status,
+        moderator_id,
+        occurred_at,
+        reason: normalize_content_optional_text(request.reason),
+    };
+
+    Ok(ContentContributionModerationResult {
+        contribution: updated,
+        audit,
+        content,
+    })
 }
 
 pub fn transition_content_workflow(
@@ -13440,6 +13648,19 @@ pub fn parse_content_engagement_event_type(
         "read" => Ok(ContentEngagementEventType::Read),
         "helpful_vote" => Ok(ContentEngagementEventType::HelpfulVote),
         _ => Err(ContentError::UnsupportedEngagementEventType {
+            value: value.to_string(),
+        }),
+    }
+}
+
+pub fn parse_content_contribution_status(
+    value: &str,
+) -> Result<ContentContributionStatus, ContentError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "submitted" => Ok(ContentContributionStatus::Submitted),
+        "approved" => Ok(ContentContributionStatus::Approved),
+        "rejected" => Ok(ContentContributionStatus::Rejected),
+        _ => Err(ContentError::UnsupportedContributionStatus {
             value: value.to_string(),
         }),
     }
@@ -16964,10 +17185,10 @@ mod tests {
         compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
         compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
-        compute_weather_reference_et, create_content_engagement_event,
-        create_marketplace_fulfillment_record, create_marketplace_rating_record,
-        create_success_story_content, create_sustainability_baseline,
-        create_sustainability_mrv_trail, create_versioned_content,
+        compute_weather_reference_et, create_community_contribution,
+        create_content_engagement_event, create_marketplace_fulfillment_record,
+        create_marketplace_rating_record, create_success_story_content,
+        create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -16978,11 +17199,11 @@ mod tests {
         execute_tractor_prescription, forecast_drought_risk, fulfill_marketplace_inventory,
         fuse_drought_evidence, ingest_drought_stress_evidence,
         ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
-        map_zone_water_need, marketplace_inventory_available, normalize_weather_provider_forecast,
-        place_marketplace_order_record, plan_tractor_swath_coverage,
-        publish_marketplace_listing_record, query_drought_history, query_irrigation_history,
-        query_weather_history, release_marketplace_inventory, report_water_use_savings,
-        reserve_marketplace_inventory, resolve_content_permissions,
+        map_zone_water_need, marketplace_inventory_available, moderate_community_contribution,
+        normalize_weather_provider_forecast, place_marketplace_order_record,
+        plan_tractor_swath_coverage, publish_marketplace_listing_record, query_drought_history,
+        query_irrigation_history, query_weather_history, release_marketplace_inventory,
+        report_water_use_savings, reserve_marketplace_inventory, resolve_content_permissions,
         resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
         schedule_irrigation_plan, search_published_content, sign_fleet_config_bundle,
         soil_moisture_rejection_record, tractor_cross_track_error_m, transition_content_workflow,
@@ -16997,7 +17218,9 @@ mod tests {
         BiomassEstimateError, BiomassEstimateRequest, BiomassLayerInput, CarbonEmissionFactor,
         CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
         CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
-        CollaborationError, CollaborationMessageCreateRequest, ContentCreateRequest,
+        CollaborationError, CollaborationMessageCreateRequest,
+        ContentCommunityContributionCreateRequest, ContentContributionModerationAction,
+        ContentContributionModerationRequest, ContentContributionStatus, ContentCreateRequest,
         ContentEngagementEventCreateRequest, ContentEngagementEventRecord,
         ContentEngagementEventType, ContentError, ContentPermissionResolveRequest,
         ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument, ContentSearchRequest,
@@ -19839,6 +20062,94 @@ mod tests {
     }
 
     #[test]
+    fn community_contribution_submits_into_moderation_queue() {
+        let contribution = create_community_contribution(
+            community_contribution_request(),
+            "generated-contribution".to_string(),
+            "2026-06-17T07:10:00Z".to_string(),
+        )
+        .expect("community contribution should submit");
+
+        assert_eq!(contribution.contribution_id, "community-001");
+        assert_eq!(contribution.status, ContentContributionStatus::Submitted);
+        assert_eq!(contribution.content_id, None);
+        assert_eq!(contribution.body, "Grower note about cover crops.");
+    }
+
+    #[test]
+    fn moderator_approval_creates_draft_content_for_publish_flow() {
+        let contribution = create_community_contribution(
+            community_contribution_request(),
+            "generated-contribution".to_string(),
+            "2026-06-17T07:10:00Z".to_string(),
+        )
+        .expect("community contribution should submit");
+        let result = moderate_community_contribution(
+            &contribution,
+            ContentContributionModerationRequest {
+                action: ContentContributionModerationAction::Approve,
+                moderator_id: "editor-001".to_string(),
+                actor_org_id: "org-alpha".to_string(),
+                role_refs: vec!["cms:editor".to_string()],
+                reason: Some("Useful field note".to_string()),
+            },
+            "audit-community-approve".to_string(),
+            "content-community-001".to_string(),
+            "version-community-001".to_string(),
+            "2026-06-17T07:11:00Z".to_string(),
+        )
+        .expect("moderator should approve contribution");
+
+        assert_eq!(
+            result.contribution.status,
+            ContentContributionStatus::Approved
+        );
+        assert_eq!(
+            result.contribution.content_id.as_deref(),
+            Some("content-community-001")
+        );
+        let content = result
+            .content
+            .expect("approval should create draft content");
+        assert_eq!(content.content.status, ContentStatus::Draft);
+        assert_eq!(content.content.author_id, "grower-001");
+        assert_eq!(content.versions[0].body, "Grower note about cover crops.");
+        assert_eq!(result.audit.to_status, ContentContributionStatus::Approved);
+    }
+
+    #[test]
+    fn non_moderator_cannot_approve_community_contribution() {
+        let contribution = create_community_contribution(
+            community_contribution_request(),
+            "generated-contribution".to_string(),
+            "2026-06-17T07:10:00Z".to_string(),
+        )
+        .expect("community contribution should submit");
+        let error = moderate_community_contribution(
+            &contribution,
+            ContentContributionModerationRequest {
+                action: ContentContributionModerationAction::Approve,
+                moderator_id: "viewer-001".to_string(),
+                actor_org_id: "org-alpha".to_string(),
+                role_refs: vec!["cms:viewer".to_string()],
+                reason: None,
+            },
+            "audit-community-denied".to_string(),
+            "content-community-denied".to_string(),
+            "version-community-denied".to_string(),
+            "2026-06-17T07:11:00Z".to_string(),
+        )
+        .expect_err("viewer cannot moderate contributions");
+
+        assert_eq!(
+            error,
+            ContentError::AccessDenied {
+                permission: "can_moderate"
+            }
+        );
+    }
+
+    #[test]
     fn content_workflow_submits_for_review_and_editor_publishes_with_audit() {
         let (content, _) = create_versioned_content(
             content_create_request(),
@@ -20334,6 +20645,16 @@ mod tests {
                     evidence_ref: "kpi:soil-organic-matter".to_string(),
                 }],
             },
+        }
+    }
+
+    fn community_contribution_request() -> ContentCommunityContributionCreateRequest {
+        ContentCommunityContributionCreateRequest {
+            contribution_id: Some("community-001".to_string()),
+            org_id: "org-alpha".to_string(),
+            contributor_id: "grower-001".to_string(),
+            content_type: ContentType::Post,
+            body: "Grower note about cover crops.".to_string(),
         }
     }
 

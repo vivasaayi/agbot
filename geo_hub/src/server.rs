@@ -442,6 +442,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_success_story_item),
         )
         .route(
+            "/api/content/community-contributions",
+            post(routes::create_community_contribution_route),
+        )
+        .route(
+            "/api/content/community-contributions/:contribution_id/moderation",
+            post(routes::moderate_community_contribution_route),
+        )
+        .route(
             "/api/content/items/:content_id",
             get(routes::get_content_item),
         )

@@ -7263,6 +7263,256 @@ async fn content_success_story_rejects_missing_structured_field_without_writing(
 }
 
 #[tokio::test]
+async fn content_community_contribution_submits_hidden_until_moderated() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let submit = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "contribution_id": "community-001",
+                        "org_id": "org-alpha",
+                        "contributor_id": "grower-001",
+                        "content_type": "post",
+                        "body": "Grower note about cover crops."
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(submit.status(), StatusCode::OK);
+    let body = to_bytes(submit.into_body(), 64 * 1024).await?;
+    let contribution: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        contribution.get("status").and_then(|value| value.as_str()),
+        Some("submitted")
+    );
+    assert!(contribution
+        .get("content_id")
+        .is_none_or(|value| value.is_null()));
+
+    let search = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=cover%20crops")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert!(results.is_empty());
+
+    let content_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cms_contents WHERE author_id = ?1")
+            .bind("grower-001")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(content_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_community_contribution_moderator_approval_creates_draft_and_audit() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    submit_community_contribution(&ctx, "community-approve").await?;
+
+    let approve = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions/community-approve/moderation?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "approve",
+                        "moderator_id": "editor-001",
+                        "actor_org_id": "org-alpha",
+                        "role_refs": ["cms:editor"],
+                        "reason": "Useful field note"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(approve.status(), StatusCode::OK);
+    let body = to_bytes(approve.into_body(), 64 * 1024).await?;
+    let result: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        result
+            .pointer("/contribution/status")
+            .and_then(|value| value.as_str()),
+        Some("approved")
+    );
+    let content_id = result
+        .pointer("/content/content/content_id")
+        .and_then(|value| value.as_str())
+        .expect("approval should create content");
+    assert_eq!(
+        result
+            .pointer("/content/content/status")
+            .and_then(|value| value.as_str()),
+        Some("draft")
+    );
+
+    let row = sqlx::query(
+        "SELECT c.status, c.author_id, q.status AS contribution_status FROM cms_contents c JOIN cms_community_contributions q ON q.content_id = c.content_id WHERE c.content_id = ?1",
+    )
+    .bind(content_id)
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "draft");
+    assert_eq!(row.get::<String, _>("author_id"), "grower-001");
+    assert_eq!(row.get::<String, _>("contribution_status"), "approved");
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cms_community_contribution_audits WHERE contribution_id = ?1 AND action = 'approve'",
+    )
+    .bind("community-approve")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    let search = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=cover%20crops")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert!(results.is_empty(), "approved draft must not be public");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_community_contribution_non_moderator_approval_is_denied() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    submit_community_contribution(&ctx, "community-denied").await?;
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions/community-denied/moderation?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "approve",
+                        "moderator_id": "viewer-001",
+                        "actor_org_id": "org-alpha",
+                        "role_refs": ["cms:viewer"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let row = sqlx::query(
+        "SELECT status, content_id FROM cms_community_contributions WHERE contribution_id = ?1",
+    )
+    .bind("community-denied")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "submitted");
+    assert_eq!(row.get::<Option<String>, _>("content_id"), None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_community_contribution_moderator_rejects_with_audit_without_content() -> Result<()>
+{
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    submit_community_contribution(&ctx, "community-reject").await?;
+
+    let reject = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions/community-reject/moderation?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "reject",
+                        "moderator_id": "editor-001",
+                        "actor_org_id": "org-alpha",
+                        "role_refs": ["cms:editor"],
+                        "reason": "Duplicate content"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(reject.status(), StatusCode::OK);
+    let body = to_bytes(reject.into_body(), 64 * 1024).await?;
+    let result: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        result
+            .pointer("/contribution/status")
+            .and_then(|value| value.as_str()),
+        Some("rejected")
+    );
+    assert!(result.get("content").is_none());
+
+    let row = sqlx::query(
+        "SELECT q.status, q.content_id, a.action, a.to_status, a.reason FROM cms_community_contributions q JOIN cms_community_contribution_audits a ON a.contribution_id = q.contribution_id WHERE q.contribution_id = ?1",
+    )
+    .bind("community-reject")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "rejected");
+    assert_eq!(row.get::<Option<String>, _>("content_id"), None);
+    assert_eq!(row.get::<String, _>("action"), "reject");
+    assert_eq!(row.get::<String, _>("to_status"), "rejected");
+    assert_eq!(
+        row.get::<Option<String>, _>("reason").as_deref(),
+        Some("Duplicate content")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -16423,6 +16673,33 @@ async fn publish_content_fixture(ctx: &TestContext, content_id: &str, org_id: &s
         }),
     )
     .await?;
+    Ok(())
+}
+
+async fn submit_community_contribution(ctx: &TestContext, contribution_id: &str) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "contribution_id": contribution_id,
+                        "org_id": "org-alpha",
+                        "contributor_id": "grower-001",
+                        "content_type": "post",
+                        "body": "Grower note about cover crops."
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
 

@@ -1379,6 +1379,41 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS cms_community_contributions (
+            contribution_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            contributor_id TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            body TEXT NOT NULL,
+            status TEXT NOT NULL,
+            content_id TEXT,
+            submitted_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_community_contribution_audits (
+            audit_id TEXT PRIMARY KEY,
+            contribution_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            moderator_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            reason TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS cms_content_engagement_events (
             event_id TEXT PRIMARY KEY,
             content_id TEXT NOT NULL,
@@ -2300,6 +2335,15 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_cms_content_versions_content
         ON cms_content_versions(content_id, created_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_cms_community_contributions_org_status
+        ON cms_community_contributions(org_id, status);
         "#,
     )
     .execute(pool)
