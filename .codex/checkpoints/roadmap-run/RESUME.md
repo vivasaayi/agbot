@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: a7fcf63 (`batch-20260618034000`)
-- **Latest checkpoint commit**: 95d3c5a
+- **Last implementation commit**: 4f09f86 (`batch-20260618043000`)
+- **Latest checkpoint commit**: e47b888
 - **Current batch**: none
-- **Completed feature rows**: 482 committed; 1 tests_passed; 2 skipped; 2 blocked; 11 pending in this run.
+- **Completed feature rows**: 483 committed; 1 tests_passed; 2 skipped; 2 blocked; 10 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -148,7 +148,15 @@
 - `cargo check -p compliance` — pass
 - `cargo check -p geo_hub` — pass
 - `24-13` — committed as per-authority compliance export/share with FAA Remote ID and state pesticide adapters, validated record-set filtering, residency/retention metadata, persisted bounded share links, revoked-link denial, and share create/access/revoke audit rows
+- `cargo fmt` — pass
+- `cargo test -p compliance regulation_assist --lib` — pass
+- `cargo test -p compliance assist --lib` — pass
+- `cargo test -p geo_hub --test products_api compliance_regulation_assist` — pass
+- `cargo test -p geo_hub --test products_api compliance_` — pass
+- `cargo check -p compliance` — pass
+- `cargo check -p geo_hub` — pass
+- `24-14` — committed as evidence-gated regulation-summary assist with deterministic source-record/rule citations, uncertainty flags, feature gating, non-authorizing output flags, and explicit refusal to authorize flights or clear violations
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `24-13` per-authority compliance export sharing.
+- Select and claim the next pending roadmap feature after `24-14` evidence-gated compliance regulation assist.
