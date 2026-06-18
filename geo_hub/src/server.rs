@@ -508,6 +508,15 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::post_collaboration_message),
         )
         .route(
+            "/api/collaboration/channels/:channel_id/presence",
+            get(routes::list_collaboration_presence)
+                .post(routes::update_collaboration_presence_route),
+        )
+        .route(
+            "/api/collaboration/channels/:channel_id/notifications",
+            post(routes::create_collaboration_notifications),
+        )
+        .route(
             "/api/collaboration/permissions/resolve",
             get(routes::resolve_collaboration_permissions_route),
         )

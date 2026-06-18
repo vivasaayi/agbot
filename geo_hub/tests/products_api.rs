@@ -7976,6 +7976,126 @@ async fn collaboration_viewer_post_is_denied_and_does_not_write_message() -> Res
 }
 
 #[tokio::test]
+async fn collaboration_presence_expires_and_notifications_fan_out() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-collab", "field-collab", "season-2026").await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "channel_id": "channel-presence",
+                        "org_id": "org-alpha",
+                        "field_ref": "field:field-collab",
+                        "member_account_ids": ["user-a", "user-b"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let presence = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-presence/presence?org_id=org-alpha&actor_org_id=org-alpha&actor_id=user-a&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "account_id": "user-a",
+                        "state": "online",
+                        "last_seen": "2026-06-13T15:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(presence.status(), StatusCode::OK);
+
+    let notifications = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-presence/notifications?org_id=org-alpha&actor_org_id=org-alpha&actor_id=user-a&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "event_id": "event-presence-001",
+                        "event_type": "field_event",
+                        "source_ref": "field:field-collab",
+                        "body": "Scout event"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(notifications.status(), StatusCode::OK);
+    let body = to_bytes(notifications.into_body(), 64 * 1024).await?;
+    let notifications: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(notifications.len(), 2);
+    assert!(notifications.iter().all(|notification| {
+        notification
+            .get("delivery_state")
+            .and_then(|value| value.as_str())
+            == Some("delivered")
+    }));
+
+    let listed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/channels/channel-presence/presence?org_id=org-alpha&stale_before=2026-06-13T15:01:00Z")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body = to_bytes(listed.into_body(), 64 * 1024).await?;
+    let presence: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(
+        presence
+            .iter()
+            .find(
+                |record| record.get("account_id").and_then(|value| value.as_str())
+                    == Some("user-a")
+            )
+            .and_then(|record| record.get("state"))
+            .and_then(|value| value.as_str()),
+        Some("offline")
+    );
+
+    let notification_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_notifications WHERE event_id = 'event-presence-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(notification_count, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

@@ -1529,6 +1529,41 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS collab_presence (
+            org_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (channel_id, account_id)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_notifications (
+            notification_id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            recipient_account_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            body TEXT NOT NULL,
+            delivery_state TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,

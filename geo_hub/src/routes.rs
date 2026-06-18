@@ -88,17 +88,18 @@ use shared::schemas::{
     apply_content_taxonomy_tags, assemble_marketplace_org_report, assert_raster_spatial_ref,
     authorize_collaboration_action, bind_fleet_node_identity, bounds_coverage_fraction,
     bounds_from_points, build_collaboration_channel, build_collaboration_message,
-    build_content_portal_embed, build_marketplace_account_record,
-    build_marketplace_catalog_item_record, build_marketplace_inventory_record,
-    build_marketplace_portal_entry, build_soil_moisture_reading,
-    build_sustainability_certification_evidence_pack, build_sustainability_record,
-    build_tractor_record, close_marketplace_listing_record, compare_sustainability_baseline,
-    compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_index,
-    compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
-    content_portal_embed_item, create_community_contribution, create_content_engagement_event,
-    create_content_locale_variant, create_marketplace_fulfillment_record,
-    create_marketplace_rating_record, create_success_story_content, create_sustainability_baseline,
-    create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
+    build_collaboration_notifications, build_content_portal_embed,
+    build_marketplace_account_record, build_marketplace_catalog_item_record,
+    build_marketplace_inventory_record, build_marketplace_portal_entry,
+    build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
+    build_sustainability_record, build_tractor_record, close_marketplace_listing_record,
+    compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
+    compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
+    compute_sustainability_kpi, content_portal_embed_item, create_community_contribution,
+    create_content_engagement_event, create_content_locale_variant,
+    create_marketplace_fulfillment_record, create_marketplace_rating_record,
+    create_success_story_content, create_sustainability_baseline, create_sustainability_mrv_trail,
+    create_versioned_content, estimate_biomass, expire_lapsed_collaboration_presence,
     fulfill_marketplace_inventory, moderate_community_contribution,
     normalize_weather_provider_forecast, parse_biodiversity_proxy_status,
     parse_carbon_footprint_status, parse_content_contribution_status,
@@ -117,32 +118,35 @@ use shared::schemas::{
     search_published_content, soil_moisture_rejection_reason_for_error,
     soil_moisture_rejection_record, transition_content_workflow,
     transition_marketplace_account_status, transition_marketplace_fulfillment_status,
-    transition_marketplace_order_status, validate_field_boundary, weather_fetch_failure_record,
-    AnnotationGeometry, AnnotationRecord, BiodiversityProxyError, BiodiversityProxyRequest,
-    BiodiversityProxyResult, BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest,
-    BiomassEstimateResult, CarbonEmissionFactor, CarbonFootprintComputeRequest,
-    CarbonFootprintError, CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
-    CollaborationAction, CollaborationActionAuthorizeRequest, CollaborationChannelCreateRequest,
+    transition_marketplace_order_status, update_collaboration_presence, validate_field_boundary,
+    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord, BiodiversityProxyError,
+    BiodiversityProxyRequest, BiodiversityProxyResult, BiodiversityProxyStatus,
+    BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult, CarbonEmissionFactor,
+    CarbonFootprintComputeRequest, CarbonFootprintError, CarbonFootprintInput,
+    CarbonFootprintResult, CarbonFootprintStatus, CollaborationAction,
+    CollaborationActionAuthorizeRequest, CollaborationChannelCreateRequest,
     CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
-    CollaborationMessageCreateRequest, CollaborationMessageRecord, CollaborationPermissionDecision,
-    CollaborationPermissionResolveRequest, CollaborationPermissionSet,
-    ContentCommunityContributionCreateRequest, ContentCommunityContributionRecord,
-    ContentContributionModerationAuditRecord, ContentContributionModerationRequest,
-    ContentContributionModerationResult, ContentCreateRequest, ContentEditRequest,
-    ContentEngagementEventCreateRequest, ContentEngagementEventRecord, ContentEngagementSummary,
-    ContentError, ContentLocaleVariantCreateRequest, ContentLocaleVariantRecord,
-    ContentLocalizedRecord, ContentPermissionResolveRequest, ContentPermissionSet,
-    ContentPortalEmbed, ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord,
-    ContentSearchDocument, ContentSearchRequest, ContentSearchResult, ContentStatus,
-    ContentSuccessStoryCreateRequest, ContentSuccessStoryRecord, ContentTagApplyRequest,
-    ContentTagRecord, ContentTaxonomyKind, ContentType, ContentVersionRecord,
-    ContentWorkflowAction, ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest,
-    ContentWorkflowTransitionResult, DroughtIndexComputeRequest, DroughtIndexError,
-    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
-    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
-    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
-    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    CollaborationNotificationEventRequest, CollaborationNotificationRecord,
+    CollaborationPermissionDecision, CollaborationPermissionResolveRequest,
+    CollaborationPermissionSet, CollaborationPresenceRecord, CollaborationPresenceState,
+    CollaborationPresenceUpdateRequest, ContentCommunityContributionCreateRequest,
+    ContentCommunityContributionRecord, ContentContributionModerationAuditRecord,
+    ContentContributionModerationRequest, ContentContributionModerationResult,
+    ContentCreateRequest, ContentEditRequest, ContentEngagementEventCreateRequest,
+    ContentEngagementEventRecord, ContentEngagementSummary, ContentError,
+    ContentLocaleVariantCreateRequest, ContentLocaleVariantRecord, ContentLocalizedRecord,
+    ContentPermissionResolveRequest, ContentPermissionSet, ContentPortalEmbed,
+    ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument,
+    ContentSearchRequest, ContentSearchResult, ContentStatus, ContentSuccessStoryCreateRequest,
+    ContentSuccessStoryRecord, ContentTagApplyRequest, ContentTagRecord, ContentTaxonomyKind,
+    ContentType, ContentVersionRecord, ContentWorkflowAction, ContentWorkflowAuditRecord,
+    ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult, DroughtIndexComputeRequest,
+    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
+    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
+    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
     MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
     MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
     MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
@@ -984,6 +988,13 @@ pub struct CollaborationPermissionQuery {
     pub actor_org_id: String,
     #[serde(default)]
     pub role_refs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CollaborationPresenceListQuery {
+    pub org_id: String,
+    #[serde(default)]
+    pub stale_before: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5657,6 +5668,99 @@ pub async fn post_collaboration_message(
     insert_collaboration_message(&state, &message, &channel.org_id).await?;
 
     Ok(Json(message))
+}
+
+pub async fn update_collaboration_presence_route(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationPresenceUpdateRequest>,
+) -> AppResult<Json<CollaborationPresenceRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let channel = load_collaboration_channel(&state, &channel_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("collaboration channel {channel_id} does not exist"))
+        })?;
+    if channel.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &channel.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        Some(&channel.channel_id),
+    )
+    .await?;
+    let record = update_collaboration_presence(&channel, request, current_record_timestamp())
+        .map_err(collaboration_error)?;
+    upsert_collaboration_presence(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_collaboration_presence(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationPresenceListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CollaborationPresenceRecord>>> {
+    let channel = load_collaboration_channel(&state, &channel_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if channel.org_id != query.org_id {
+        return Err(AppError::NotFound);
+    }
+    let mut records = load_collaboration_presence_records(&state, &channel_id).await?;
+    if let Some(stale_before) = normalize_optional_text(query.stale_before) {
+        records =
+            expire_lapsed_collaboration_presence(records, stale_before, current_record_timestamp())
+                .map_err(collaboration_error)?;
+        upsert_collaboration_presence_records(&state, &records).await?;
+    }
+
+    Ok(Json(records))
+}
+
+pub async fn create_collaboration_notifications(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationNotificationEventRequest>,
+) -> AppResult<Json<Vec<CollaborationNotificationRecord>>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let channel = load_collaboration_channel(&state, &channel_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("collaboration channel {channel_id} does not exist"))
+        })?;
+    if channel.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &channel.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Post,
+        Some(&channel.channel_id),
+    )
+    .await?;
+    let notifications = build_collaboration_notifications(
+        &channel,
+        request,
+        format!("collab-event-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_notifications(&state, &notifications).await?;
+
+    Ok(Json(notifications))
 }
 
 pub async fn list_time_series_points(
@@ -16846,6 +16950,121 @@ async fn insert_collaboration_permission_audit(
     .map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn upsert_collaboration_presence(
+    state: &AppState,
+    record: &CollaborationPresenceRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_presence (
+            org_id, channel_id, account_id, state, last_seen, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(channel_id, account_id) DO UPDATE SET org_id = excluded.org_id,
+                                                          state = excluded.state,
+                                                          last_seen = excluded.last_seen,
+                                                          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&record.org_id)
+    .bind(&record.channel_id)
+    .bind(&record.account_id)
+    .bind(record.state.as_str())
+    .bind(&record.last_seen)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn upsert_collaboration_presence_records(
+    state: &AppState,
+    records: &[CollaborationPresenceRecord],
+) -> AppResult<()> {
+    for record in records {
+        upsert_collaboration_presence(state, record).await?;
+    }
+    Ok(())
+}
+
+async fn load_collaboration_presence_records(
+    state: &AppState,
+    channel_id: &str,
+) -> AppResult<Vec<CollaborationPresenceRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT org_id, channel_id, account_id, state, last_seen, updated_at
+        FROM collab_presence
+        WHERE channel_id = ?1
+        ORDER BY account_id ASC
+        "#,
+    )
+    .bind(channel_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(CollaborationPresenceRecord {
+                org_id: row.get("org_id"),
+                channel_id: row.get("channel_id"),
+                account_id: row.get("account_id"),
+                state: parse_collaboration_presence_state(&row.get::<String, _>("state"))?,
+                last_seen: row.get("last_seen"),
+                updated_at: row.get("updated_at"),
+            })
+        })
+        .collect()
+}
+
+async fn insert_collaboration_notifications(
+    state: &AppState,
+    notifications: &[CollaborationNotificationRecord],
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    for notification in notifications {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_notifications (
+                notification_id, event_id, org_id, channel_id, recipient_account_id,
+                event_type, source_ref, body, delivery_state, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        )
+        .bind(&notification.notification_id)
+        .bind(&notification.event_id)
+        .bind(&notification.org_id)
+        .bind(&notification.channel_id)
+        .bind(&notification.recipient_account_id)
+        .bind(&notification.event_type)
+        .bind(&notification.source_ref)
+        .bind(&notification.body)
+        .bind(notification.delivery_state.as_str())
+        .bind(&notification.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+fn parse_collaboration_presence_state(value: &str) -> AppResult<CollaborationPresenceState> {
+    match value {
+        "online" => Ok(CollaborationPresenceState::Online),
+        "away" => Ok(CollaborationPresenceState::Away),
+        "offline" => Ok(CollaborationPresenceState::Offline),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration presence state {value}"
+        ))),
+    }
 }
 
 async fn load_collaboration_channel(
