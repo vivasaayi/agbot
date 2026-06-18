@@ -11,6 +11,7 @@ pub enum FleetAlertKind {
     LowFleetBattery,
     ProcessingStall,
     ResourceBudget,
+    FleetHealth,
 }
 
 impl FleetAlertKind {
@@ -21,6 +22,7 @@ impl FleetAlertKind {
             FleetAlertKind::LowFleetBattery => "low_fleet_battery",
             FleetAlertKind::ProcessingStall => "processing_stall",
             FleetAlertKind::ResourceBudget => "resource_budget",
+            FleetAlertKind::FleetHealth => "fleet_health",
         }
     }
 }
@@ -274,6 +276,7 @@ fn alert_rank(kind: FleetAlertKind) -> u8 {
         FleetAlertKind::LowFleetBattery => 2,
         FleetAlertKind::ProcessingStall => 3,
         FleetAlertKind::ResourceBudget => 4,
+        FleetAlertKind::FleetHealth => 5,
     }
 }
 

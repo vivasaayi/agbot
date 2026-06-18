@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
-    assert_raster_spatial_ref, GeoBounds, RasterSpatialRef, RasterSpatialRefError,
+    assert_raster_spatial_ref, GeoBounds, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +147,95 @@ pub struct InferenceRunRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferenceRunProgressInput {
+    pub run_id: String,
+    pub tiles_total: u64,
+    pub tiles_done: u64,
+    pub stage: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferenceRunProgressRecord {
+    pub progress_id: String,
+    pub run_id: String,
+    pub tiles_total: u64,
+    pub tiles_done: u64,
+    pub coverage_fraction: f64,
+    pub stage: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferenceRunProgressStream {
+    pub run_id: String,
+    pub latest: Option<InferenceRunProgressRecord>,
+    pub events: Vec<InferenceRunProgressRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferenceRunStallEvent {
+    pub stall_id: String,
+    pub run_id: String,
+    pub last_progress_at: String,
+    pub detected_at: String,
+    pub stall_window_seconds: u64,
+    pub flagged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledInferenceInput {
+    pub tile_id: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledInferenceTile {
+    pub tile_id: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub footprint: GeoBounds,
+    pub resolution: RasterResolution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TiledInferenceSkipReason {
+    InvalidGeoreference,
+    CrsMismatch,
+    EvaluatorFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TiledInferenceTileSkip {
+    pub tile_id: String,
+    pub reason: TiledInferenceSkipReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledInferenceTileOutput<T> {
+    pub tile_id: String,
+    pub spatial_ref: RasterSpatialRef,
+    pub footprint: GeoBounds,
+    pub result: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TiledInferenceReport<T> {
+    pub field_crs: String,
+    pub field_extent: GeoBounds,
+    pub tiles_total: usize,
+    pub tiles_processed: usize,
+    pub tiles_skipped: usize,
+    pub outputs: Vec<TiledInferenceTileOutput<T>>,
+    pub skipped_tiles: Vec<TiledInferenceTileSkip>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlantCountConfig {
     pub min_component_pixels: usize,
@@ -289,6 +378,54 @@ pub struct CanopyCoverReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GrowthStageConfig {
+    pub emergence_cover_max: f64,
+    pub vegetative_cover_min: f64,
+    pub reproductive_cover_min: f64,
+    pub min_index_observations_for_confidence: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowthIndexObservation {
+    pub observed_at: String,
+    pub mean_index_value: f64,
+    pub evidence_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrowthStage {
+    Emergence,
+    Vegetative,
+    Reproductive,
+    InsufficientEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrowthStageConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowthStageEstimate {
+    pub field_id: String,
+    pub crop: String,
+    pub generated_at: String,
+    pub stage: GrowthStage,
+    pub confidence: GrowthStageConfidence,
+    pub cover_fraction: f64,
+    pub stand_density_plants_per_ha: f64,
+    pub index_observation_count: usize,
+    pub index_delta: Option<f64>,
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DiseaseDetectionConfig {
     pub low_confidence_threshold: f64,
 }
@@ -327,6 +464,43 @@ pub struct DiseaseDetectionReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PestDetectionConfig {
+    pub detection_threshold: f64,
+    pub low_confidence_threshold: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PestDetectionCandidate {
+    pub tile_id: String,
+    pub pest_label: String,
+    pub confidence: f64,
+    pub bbox: GeoBounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PestDetection {
+    pub detection_id: String,
+    pub pest_label: String,
+    pub confidence: f64,
+    pub low_confidence: bool,
+    pub evidence_tile_ref: String,
+    pub zone_geometry: DetectionZoneGeometry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PestDetectionReport {
+    pub field_id: String,
+    pub crs: String,
+    pub generated_at: String,
+    pub model: ModelGateResponse,
+    pub deterministic_cover_valid_pixels: usize,
+    pub detection_threshold: f64,
+    pub rejected_candidate_count: usize,
+    pub low_confidence_count: usize,
+    pub detections: Vec<PestDetection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WeedMappingConfig {
     pub low_confidence_threshold: f64,
 }
@@ -358,6 +532,12 @@ pub struct WeedMapReport {
     pub total_weed_area_m2: f64,
     pub low_confidence_count: usize,
     pub zones: Vec<WeedMapZone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeedSpotSprayPrescriptionConfig {
+    pub rate_per_zone: f64,
+    pub unit: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,6 +630,123 @@ pub struct CropDetectionCorrectionLabel {
     pub evidence_tile_refs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingDatasetSplit {
+    Train,
+    Validation,
+    Test,
+}
+
+impl TrainingDatasetSplit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrainingDatasetSplit::Train => "train",
+            TrainingDatasetSplit::Validation => "validation",
+            TrainingDatasetSplit::Test => "test",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TrainingDatasetSplitConfig {
+    pub train_fraction: f64,
+    pub validation_fraction: f64,
+    pub test_fraction: f64,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabeledTileRecord {
+    pub tile_ref: String,
+    pub field_id: String,
+    pub captured_at: String,
+    pub label: String,
+    pub labeler: String,
+    pub source_run: String,
+    pub provenance_ref: String,
+    #[serde(default)]
+    pub assigned_split: Option<TrainingDatasetSplit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrainingDatasetTile {
+    pub tile_ref: String,
+    pub field_id: String,
+    pub capture_date: String,
+    pub label: String,
+    pub labeler: String,
+    pub source_run: String,
+    pub provenance_ref: String,
+    pub split: TrainingDatasetSplit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrainingDatasetSplitCounts {
+    pub train: usize,
+    pub validation: usize,
+    pub test: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrainingDatasetManifest {
+    pub dataset_id: String,
+    pub generated_at: String,
+    pub provenance_ref: String,
+    pub split_config: TrainingDatasetSplitConfig,
+    pub split_counts: TrainingDatasetSplitCounts,
+    pub label_count: usize,
+    pub field_date_count: usize,
+    pub label_provenance_refs: Vec<String>,
+    pub tiles: Vec<TrainingDatasetTile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelEvaluationConfig {
+    pub min_precision: f64,
+    pub min_recall: f64,
+    pub min_mean_iou: f64,
+    pub max_score_drift: f64,
+    pub max_input_drift: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelEvaluationObservation {
+    pub tile_ref: String,
+    pub expected_label: String,
+    #[serde(default)]
+    pub predicted_label: Option<String>,
+    pub confidence: f64,
+    pub iou: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelDriftSample {
+    pub baseline_score_distribution: Vec<f64>,
+    pub current_score_distribution: Vec<f64>,
+    pub baseline_input_distribution: Vec<f64>,
+    pub current_input_distribution: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelEvaluationReport {
+    pub model: ModelGateResponse,
+    pub dataset_id: String,
+    pub generated_at: String,
+    pub provenance_ref: String,
+    pub evaluated_tile_count: usize,
+    pub true_positive_count: usize,
+    pub false_positive_count: usize,
+    pub false_negative_count: usize,
+    pub precision: f64,
+    pub recall: f64,
+    pub mean_iou: f64,
+    pub score_drift: f64,
+    pub input_drift: f64,
+    pub production_ready: bool,
+    pub block_reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CropDetectionVerificationRecord {
     pub detection_id: String,
@@ -515,6 +812,71 @@ pub struct CropDetectionFindingRecord {
     pub emitted_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CropClosedLoopAction {
+    Refly,
+    Treatment,
+    ReflyAndTreatment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CropClosedLoopApprovalStatus {
+    Pending,
+}
+
+impl CropClosedLoopApprovalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CropClosedLoopApprovalStatus::Pending => "pending",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropClosedLoopProposalRequest {
+    pub proposal_id: String,
+    pub action: CropClosedLoopAction,
+    pub findings: Vec<CropDetectionFindingRecord>,
+    pub requested_by: String,
+    pub created_at: String,
+    pub confidence_floor: f64,
+    #[serde(default)]
+    pub treatment_prescription_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropClosedLoopFindingEvidence {
+    pub finding_id: String,
+    pub finding_type: CropModelTask,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    pub detection_id: String,
+    pub confidence: f64,
+    pub evidence_refs: Vec<String>,
+    pub zone_geometry: DetectionZoneGeometry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropClosedLoopProposal {
+    pub proposal_id: String,
+    pub action: CropClosedLoopAction,
+    pub field_id: String,
+    pub requested_by: String,
+    pub created_at: String,
+    pub approval_status: CropClosedLoopApprovalStatus,
+    pub approval_required: bool,
+    pub dispatch_authorized: bool,
+    pub confidence_floor: f64,
+    #[serde(default)]
+    pub refly_area: Option<DetectionZoneGeometry>,
+    #[serde(default)]
+    pub treatment_prescription_ref: Option<String>,
+    pub findings: Vec<CropClosedLoopFindingEvidence>,
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CropModelRegistryError {
     #[error("model_id cannot be empty")]
@@ -565,6 +927,32 @@ pub enum InferenceRunError {
         #[source]
         source: CropModelRegistryError,
     },
+    #[error("progress_id cannot be empty")]
+    EmptyProgressId,
+    #[error("progress stage cannot be empty")]
+    EmptyProgressStage,
+    #[error("progress observed_at cannot be empty")]
+    EmptyObservedAt,
+    #[error("tiles_total must be positive")]
+    InvalidTilesTotal,
+    #[error("tiles_done cannot exceed tiles_total")]
+    TilesDoneExceedsTotal,
+    #[error("progress timestamp is invalid: {timestamp}")]
+    InvalidProgressTimestamp { timestamp: String },
+    #[error("stall_id cannot be empty")]
+    EmptyStallId,
+    #[error("detected_at cannot be empty")]
+    EmptyDetectedAt,
+    #[error("stall window seconds must be positive")]
+    InvalidStallWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TiledInferenceError {
+    #[error("tiled inference requires at least one tile")]
+    EmptyTiles,
+    #[error("tiled inference had no valid georeferenced tiles")]
+    NoValidTiles,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -615,6 +1003,27 @@ pub enum CanopyCoverError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GrowthStageError {
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("crop cannot be empty")]
+    EmptyCrop,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error(
+        "stand count field_id {stand_field_id} does not match canopy field_id {canopy_field_id}"
+    )]
+    FieldMismatch {
+        stand_field_id: String,
+        canopy_field_id: String,
+    },
+    #[error("growth stage config is invalid")]
+    InvalidConfig,
+    #[error("index observation has invalid value or missing evidence")]
+    InvalidIndexObservation,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DiseaseDetectionError {
     #[error("field_id cannot be empty")]
@@ -632,6 +1041,37 @@ pub enum DiseaseDetectionError {
     InvalidThreshold,
     #[error("tile_id cannot be empty")]
     EmptyTileId,
+    #[error("candidate on tile {tile_id} has invalid confidence")]
+    InvalidConfidence { tile_id: String },
+    #[error("candidate on tile {tile_id} has invalid zone geometry")]
+    InvalidZoneGeometry { tile_id: String },
+    #[error("candidate references tile {tile_id} without deterministic cover evidence")]
+    MissingCoverTile { tile_id: String },
+    #[error("cover report field {actual} does not match requested field {expected}")]
+    CoverFieldMismatch { expected: String, actual: String },
+    #[error("candidate on tile {tile_id} falls outside the deterministic cover tile extent")]
+    ZoneOutsideTileExtent { tile_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum PestDetectionError {
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("deterministic canopy cover is required before pest detection")]
+    DeterministicCoverRequired,
+    #[error("pest model gate failed: {source}")]
+    ModelGate {
+        #[source]
+        source: CropModelRegistryError,
+    },
+    #[error("detection thresholds must be finite, between 0 and 1, and ordered")]
+    InvalidThreshold,
+    #[error("tile_id cannot be empty")]
+    EmptyTileId,
+    #[error("pest_label cannot be empty")]
+    EmptyPestLabel,
     #[error("candidate on tile {tile_id} has invalid confidence")]
     InvalidConfidence { tile_id: String },
     #[error("candidate on tile {tile_id} has invalid zone geometry")]
@@ -671,6 +1111,85 @@ pub enum WeedMappingError {
     CoverFieldMismatch { expected: String, actual: String },
     #[error("candidate on tile {tile_id} falls outside the deterministic cover tile extent")]
     ZoneOutsideTileExtent { tile_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TrainingDatasetError {
+    #[error("dataset_id cannot be empty")]
+    EmptyDatasetId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("provenance_ref cannot be empty")]
+    EmptyProvenanceRef,
+    #[error("labeled tile set cannot be empty")]
+    EmptyLabels,
+    #[error("labeled tile has an empty required field")]
+    EmptyLabelField,
+    #[error("split fractions must be finite, non-negative, and sum to 1")]
+    InvalidSplitFractions,
+    #[error("tile {tile_ref} is assigned to both {first:?} and {second:?}")]
+    ConflictingTileSplit {
+        tile_ref: String,
+        first: TrainingDatasetSplit,
+        second: TrainingDatasetSplit,
+    },
+    #[error("field/date {field_date_key} leaks across {first:?} and {second:?}")]
+    FieldDateLeakage {
+        field_date_key: String,
+        first: TrainingDatasetSplit,
+        second: TrainingDatasetSplit,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ModelEvaluationError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("provenance_ref cannot be empty")]
+    EmptyProvenanceRef,
+    #[error("model gate failed: {source}")]
+    ModelGate {
+        #[source]
+        source: CropModelRegistryError,
+    },
+    #[error("held-out dataset must contain at least one validation or test tile")]
+    EmptyHeldOutSet,
+    #[error("evaluation observation has an empty required field")]
+    EmptyObservationField,
+    #[error("evaluation observation for tile {tile_ref} has invalid confidence or IoU")]
+    InvalidObservationMetric { tile_ref: String },
+    #[error("evaluation config thresholds are invalid")]
+    InvalidConfig,
+    #[error("drift distributions must be non-empty, equal length, and finite")]
+    InvalidDriftDistribution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeedPrescriptionError {
+    #[error("prescription_id cannot be empty")]
+    EmptyPrescriptionId,
+    #[error("field boundary CRS cannot be empty")]
+    EmptyFieldBoundaryCrs,
+    #[error("unit cannot be empty")]
+    EmptyUnit,
+    #[error("verified weed map must contain at least one zone")]
+    EmptyZones,
+    #[error("rate_per_zone must be finite and positive")]
+    InvalidRate,
+    #[error("field boundary geometry is invalid")]
+    InvalidFieldBoundary,
+    #[error("field boundary CRS {field_crs} does not match weed map CRS {weed_crs}")]
+    FieldCrsMismatch { field_crs: String, weed_crs: String },
+    #[error("weed zone {zone_id} CRS {zone_crs} does not match field CRS {field_crs}")]
+    ZoneCrsMismatch {
+        zone_id: String,
+        zone_crs: String,
+        field_crs: String,
+    },
+    #[error("weed zone {zone_id} is outside the field boundary")]
+    ZoneOutsideField { zone_id: String },
+    #[error("weed zone {zone_id} has not been verified")]
+    UnverifiedZone { zone_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -737,6 +1256,44 @@ pub enum CropDetectionFindingError {
     UnverifiedDetection { detection_id: String },
     #[error("detection {detection_id} was rejected and cannot be emitted as a finding")]
     RejectedDetection { detection_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum CropClosedLoopProposalError {
+    #[error("proposal_id cannot be empty")]
+    EmptyProposalId,
+    #[error("requested_by cannot be empty")]
+    EmptyRequestedBy,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("closed-loop proposal requires at least one finding")]
+    EmptyFindings,
+    #[error("confidence_floor must be finite and between 0 and 1")]
+    InvalidConfidenceFloor,
+    #[error("finding {finding_id} belongs to field {finding_field_id}, expected {field_id}")]
+    FieldMismatch {
+        finding_id: String,
+        field_id: String,
+        finding_field_id: String,
+    },
+    #[error("finding {finding_id} is not human verified")]
+    UnverifiedFinding { finding_id: String },
+    #[error("finding {finding_id} confidence {confidence} is below floor {confidence_floor}")]
+    LowConfidenceFinding {
+        finding_id: String,
+        confidence: f64,
+        confidence_floor: f64,
+    },
+    #[error("finding {finding_id} does not cite evidence")]
+    UncitedFinding { finding_id: String },
+    #[error("finding {finding_id} CRS {finding_crs} does not match proposal CRS {proposal_crs}")]
+    FindingCrsMismatch {
+        finding_id: String,
+        proposal_crs: String,
+        finding_crs: String,
+    },
+    #[error("treatment proposals require a treatment_prescription_ref")]
+    EmptyTreatmentPrescriptionRef,
 }
 
 pub fn build_model_version_record(
@@ -846,6 +1403,91 @@ pub fn transition_inference_run_status(
     Ok(record)
 }
 
+pub fn build_inference_run_progress_record(
+    input: InferenceRunProgressInput,
+    generated_progress_id: String,
+) -> Result<InferenceRunProgressRecord, InferenceRunError> {
+    let progress_id =
+        normalize_run_text(generated_progress_id).ok_or(InferenceRunError::EmptyProgressId)?;
+    let run_id = normalize_run_text(input.run_id).ok_or(InferenceRunError::EmptyRunId)?;
+    let stage = normalize_run_text(input.stage).ok_or(InferenceRunError::EmptyProgressStage)?;
+    let observed_at =
+        normalize_run_text(input.observed_at).ok_or(InferenceRunError::EmptyObservedAt)?;
+    parse_progress_timestamp(&observed_at)?;
+    if input.tiles_total == 0 {
+        return Err(InferenceRunError::InvalidTilesTotal);
+    }
+    if input.tiles_done > input.tiles_total {
+        return Err(InferenceRunError::TilesDoneExceedsTotal);
+    }
+    Ok(InferenceRunProgressRecord {
+        progress_id,
+        run_id,
+        tiles_total: input.tiles_total,
+        tiles_done: input.tiles_done,
+        coverage_fraction: input.tiles_done as f64 / input.tiles_total as f64,
+        stage,
+        observed_at,
+    })
+}
+
+pub fn inference_run_progress_stream(
+    run_id: String,
+    mut events: Vec<InferenceRunProgressRecord>,
+) -> Result<InferenceRunProgressStream, InferenceRunError> {
+    let run_id = normalize_run_text(run_id).ok_or(InferenceRunError::EmptyRunId)?;
+    events.retain(|event| event.run_id == run_id);
+    events.sort_by(|left, right| {
+        left.observed_at
+            .cmp(&right.observed_at)
+            .then_with(|| left.progress_id.cmp(&right.progress_id))
+    });
+    let latest = events.last().cloned();
+    Ok(InferenceRunProgressStream {
+        run_id,
+        latest,
+        events,
+    })
+}
+
+pub fn detect_inference_run_stall(
+    latest: Option<&InferenceRunProgressRecord>,
+    run_id: String,
+    generated_stall_id: String,
+    detected_at: String,
+    stall_window_seconds: u64,
+) -> Result<Option<InferenceRunStallEvent>, InferenceRunError> {
+    let run_id = normalize_run_text(run_id).ok_or(InferenceRunError::EmptyRunId)?;
+    let stall_id = normalize_run_text(generated_stall_id).ok_or(InferenceRunError::EmptyStallId)?;
+    let detected_at = normalize_run_text(detected_at).ok_or(InferenceRunError::EmptyDetectedAt)?;
+    let detected_at_ts = parse_progress_timestamp(&detected_at)?;
+    if stall_window_seconds == 0 {
+        return Err(InferenceRunError::InvalidStallWindow);
+    }
+    let Some(latest) = latest else {
+        return Ok(None);
+    };
+    if latest.run_id != run_id {
+        return Ok(None);
+    }
+    let last_progress_at = parse_progress_timestamp(&latest.observed_at)?;
+    let elapsed_seconds = detected_at_ts
+        .signed_duration_since(last_progress_at)
+        .num_seconds();
+    if elapsed_seconds < stall_window_seconds as i64 {
+        return Ok(None);
+    }
+
+    Ok(Some(InferenceRunStallEvent {
+        stall_id,
+        run_id,
+        last_progress_at: latest.observed_at.clone(),
+        detected_at,
+        stall_window_seconds,
+        flagged: true,
+    }))
+}
+
 pub fn validate_inference_run_transition(
     current: InferenceRunStatus,
     next: InferenceRunStatus,
@@ -856,6 +1498,108 @@ pub fn validate_inference_run_transition(
         | (InferenceRunStatus::Running, InferenceRunStatus::Failed) => Ok(()),
         (from, to) => Err(InferenceRunError::InvalidTransition { from, to }),
     }
+}
+
+pub fn run_tiled_inference_pipeline<T, F>(
+    tiles: Vec<TiledInferenceInput>,
+    mut evaluator: F,
+) -> Result<TiledInferenceReport<T>, TiledInferenceError>
+where
+    F: FnMut(&TiledInferenceTile) -> Result<T, String>,
+{
+    if tiles.is_empty() {
+        return Err(TiledInferenceError::EmptyTiles);
+    }
+
+    let tiles_total = tiles.len();
+    let mut field_crs: Option<String> = None;
+    let mut field_extent: Option<GeoBounds> = None;
+    let mut outputs = Vec::new();
+    let mut skipped_tiles = Vec::new();
+
+    for tile in tiles {
+        let tile_id = normalize_optional_run_text(Some(tile.tile_id.clone()))
+            .unwrap_or_else(|| "unnamed_tile".to_string());
+        let spatial_ref =
+            match assert_raster_spatial_ref(Some(&tile.spatial_ref), tile.width_px, tile.height_px)
+            {
+                Ok(spatial_ref) => spatial_ref,
+                Err(error) => {
+                    skipped_tiles.push(TiledInferenceTileSkip {
+                        tile_id,
+                        reason: TiledInferenceSkipReason::InvalidGeoreference,
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+        let tile_crs = spatial_ref.crs.clone().unwrap_or_default();
+        if let Some(expected_crs) = field_crs.as_ref() {
+            if expected_crs != &tile_crs {
+                skipped_tiles.push(TiledInferenceTileSkip {
+                    tile_id,
+                    reason: TiledInferenceSkipReason::CrsMismatch,
+                    detail: format!("tile CRS {tile_crs} does not match field CRS {expected_crs}"),
+                });
+                continue;
+            }
+        } else {
+            field_crs = Some(tile_crs);
+        }
+
+        let footprint = spatial_ref
+            .bbox
+            .clone()
+            .expect("assert_raster_spatial_ref returns a bbox");
+        let resolution = spatial_ref
+            .resolution
+            .expect("assert_raster_spatial_ref returns a resolution");
+        let prepared_tile = TiledInferenceTile {
+            tile_id: tile_id.clone(),
+            width_px: tile.width_px,
+            height_px: tile.height_px,
+            spatial_ref,
+            footprint: footprint.clone(),
+            resolution,
+        };
+        let result = match evaluator(&prepared_tile) {
+            Ok(result) => result,
+            Err(detail) => {
+                skipped_tiles.push(TiledInferenceTileSkip {
+                    tile_id,
+                    reason: TiledInferenceSkipReason::EvaluatorFailed,
+                    detail,
+                });
+                continue;
+            }
+        };
+
+        field_extent = Some(match field_extent {
+            Some(extent) => merge_bounds(&extent, &footprint),
+            None => footprint.clone(),
+        });
+        outputs.push(TiledInferenceTileOutput {
+            tile_id,
+            spatial_ref: prepared_tile.spatial_ref,
+            footprint,
+            result,
+        });
+    }
+
+    let field_crs = field_crs.ok_or(TiledInferenceError::NoValidTiles)?;
+    let field_extent = field_extent.ok_or(TiledInferenceError::NoValidTiles)?;
+    outputs.sort_by(|left, right| left.tile_id.cmp(&right.tile_id));
+    skipped_tiles.sort_by(|left, right| left.tile_id.cmp(&right.tile_id));
+
+    Ok(TiledInferenceReport {
+        field_crs,
+        field_extent,
+        tiles_total,
+        tiles_processed: outputs.len(),
+        tiles_skipped: skipped_tiles.len(),
+        outputs,
+        skipped_tiles,
+    })
 }
 
 pub fn run_stand_count(
@@ -996,6 +1740,91 @@ pub fn run_canopy_cover(
     })
 }
 
+pub fn estimate_growth_stage(
+    crop: String,
+    stand: &StandCountReport,
+    canopy: &CanopyCoverReport,
+    mut index_observations: Vec<GrowthIndexObservation>,
+    config: GrowthStageConfig,
+    generated_at: String,
+) -> Result<GrowthStageEstimate, GrowthStageError> {
+    let crop = normalize_growth_text(crop, GrowthStageError::EmptyCrop)?;
+    let generated_at = normalize_growth_text(generated_at, GrowthStageError::EmptyGeneratedAt)?;
+    if stand.field_id != canopy.field_id {
+        return Err(GrowthStageError::FieldMismatch {
+            stand_field_id: stand.field_id.clone(),
+            canopy_field_id: canopy.field_id.clone(),
+        });
+    }
+    normalize_growth_field_id(&stand.field_id)?;
+    validate_growth_stage_config(config)?;
+    for observation in &index_observations {
+        if !observation.mean_index_value.is_finite()
+            || observation.evidence_ref.trim().is_empty()
+            || observation.observed_at.trim().is_empty()
+        {
+            return Err(GrowthStageError::InvalidIndexObservation);
+        }
+    }
+    index_observations.sort_by(|left, right| left.observed_at.cmp(&right.observed_at));
+    let index_observation_count = index_observations.len();
+    let index_delta = match (index_observations.first(), index_observations.last()) {
+        (Some(first), Some(last)) if index_observation_count >= 2 => {
+            Some(last.mean_index_value - first.mean_index_value)
+        }
+        _ => None,
+    };
+    let evidence_refs = growth_stage_evidence_refs(stand, canopy, &index_observations);
+
+    if index_observation_count < config.min_index_observations_for_confidence {
+        return Ok(GrowthStageEstimate {
+            field_id: stand.field_id.clone(),
+            crop,
+            generated_at,
+            stage: GrowthStage::InsufficientEvidence,
+            confidence: GrowthStageConfidence::Low,
+            cover_fraction: canopy.cover_fraction,
+            stand_density_plants_per_ha: stand.field_density_plants_per_ha,
+            index_observation_count,
+            index_delta,
+            evidence_refs,
+            reason_code: Some("insufficient_index_trajectory".to_string()),
+        });
+    }
+
+    let stage = if canopy.cover_fraction >= config.reproductive_cover_min
+        && index_delta.is_some_and(|delta| delta <= 0.0)
+    {
+        GrowthStage::Reproductive
+    } else if canopy.cover_fraction >= config.vegetative_cover_min {
+        GrowthStage::Vegetative
+    } else {
+        GrowthStage::Emergence
+    };
+    let confidence = if index_observation_count >= config.min_index_observations_for_confidence + 1
+        && canopy.valid_pixels > canopy.excluded_pixels
+        && stand.total_count > 0
+    {
+        GrowthStageConfidence::High
+    } else {
+        GrowthStageConfidence::Medium
+    };
+
+    Ok(GrowthStageEstimate {
+        field_id: stand.field_id.clone(),
+        crop,
+        generated_at,
+        stage,
+        confidence,
+        cover_fraction: canopy.cover_fraction,
+        stand_density_plants_per_ha: stand.field_density_plants_per_ha,
+        index_observation_count,
+        index_delta,
+        evidence_refs,
+        reason_code: None,
+    })
+}
+
 pub fn run_disease_lesion_detection(
     field_id: String,
     model: InferenceModelReference,
@@ -1085,6 +1914,107 @@ pub fn run_disease_lesion_detection(
     })
 }
 
+pub fn run_pest_detection(
+    field_id: String,
+    model: InferenceModelReference,
+    model_registered: bool,
+    deterministic_cover: Option<&CanopyCoverReport>,
+    candidates: Vec<PestDetectionCandidate>,
+    config: PestDetectionConfig,
+    generated_at: String,
+) -> Result<PestDetectionReport, PestDetectionError> {
+    let field_id = normalize_pest_text(field_id, PestDetectionError::EmptyFieldId)?;
+    let generated_at = normalize_pest_text(generated_at, PestDetectionError::EmptyGeneratedAt)?;
+    if !is_unit_fraction(config.detection_threshold)
+        || !is_unit_fraction(config.low_confidence_threshold)
+        || config.detection_threshold > config.low_confidence_threshold
+    {
+        return Err(PestDetectionError::InvalidThreshold);
+    }
+    let model = validate_model_reference(model, model_registered)
+        .map_err(|source| PestDetectionError::ModelGate { source })?;
+    let cover = deterministic_cover.ok_or(PestDetectionError::DeterministicCoverRequired)?;
+    if cover.field_id != field_id {
+        return Err(PestDetectionError::CoverFieldMismatch {
+            expected: field_id,
+            actual: cover.field_id.clone(),
+        });
+    }
+
+    let cover_tiles = cover
+        .tiles
+        .iter()
+        .map(|tile| (tile.tile_id.as_str(), tile))
+        .collect::<BTreeMap<_, _>>();
+    let mut detections = Vec::new();
+    let mut tile_detection_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut rejected_candidate_count = 0;
+
+    for candidate in candidates {
+        let tile_id =
+            normalize_pest_text(candidate.tile_id.clone(), PestDetectionError::EmptyTileId)?;
+        let pest_label = normalize_pest_text(
+            candidate.pest_label.clone(),
+            PestDetectionError::EmptyPestLabel,
+        )?;
+        if !is_unit_fraction(candidate.confidence) {
+            return Err(PestDetectionError::InvalidConfidence { tile_id });
+        }
+        let cover_tile = cover_tiles.get(tile_id.as_str()).ok_or_else(|| {
+            PestDetectionError::MissingCoverTile {
+                tile_id: tile_id.clone(),
+            }
+        })?;
+        let tile_bbox = cover_tile.spatial_ref.bbox.as_ref().ok_or_else(|| {
+            PestDetectionError::MissingCoverTile {
+                tile_id: tile_id.clone(),
+            }
+        })?;
+        if !valid_bbox(&candidate.bbox) {
+            return Err(PestDetectionError::InvalidZoneGeometry { tile_id });
+        }
+        if !bbox_within(&candidate.bbox, tile_bbox) {
+            return Err(PestDetectionError::ZoneOutsideTileExtent { tile_id });
+        }
+        if candidate.confidence < config.detection_threshold {
+            rejected_candidate_count += 1;
+            continue;
+        }
+
+        let sequence = tile_detection_counts.entry(tile_id.clone()).or_insert(0);
+        *sequence += 1;
+        detections.push(PestDetection {
+            detection_id: format!("pest:{tile_id}:{}", *sequence),
+            pest_label,
+            confidence: candidate.confidence,
+            low_confidence: candidate.confidence < config.low_confidence_threshold,
+            evidence_tile_ref: tile_id,
+            zone_geometry: DetectionZoneGeometry {
+                crs: cover.crs.clone(),
+                bbox: candidate.bbox,
+            },
+        });
+    }
+
+    detections.sort_by(|left, right| left.detection_id.cmp(&right.detection_id));
+    let low_confidence_count = detections
+        .iter()
+        .filter(|detection| detection.low_confidence)
+        .count();
+
+    Ok(PestDetectionReport {
+        field_id,
+        crs: cover.crs.clone(),
+        generated_at,
+        model,
+        deterministic_cover_valid_pixels: cover.valid_pixels,
+        detection_threshold: config.detection_threshold,
+        rejected_candidate_count,
+        low_confidence_count,
+        detections,
+    })
+}
+
 pub fn run_weed_mapping(
     field_id: String,
     model: InferenceModelReference,
@@ -1168,6 +2098,327 @@ pub fn run_weed_mapping(
         total_weed_area_m2,
         low_confidence_count,
         zones,
+    })
+}
+
+pub fn build_weed_spot_spray_prescription(
+    prescription_id: String,
+    weed_map: &WeedMapReport,
+    field_boundary: DetectionZoneGeometry,
+    verified_zone_ids: Vec<String>,
+    config: WeedSpotSprayPrescriptionConfig,
+) -> Result<interop::PrescriptionShapefileRequest, WeedPrescriptionError> {
+    let prescription_id =
+        normalize_prescription_text(prescription_id, WeedPrescriptionError::EmptyPrescriptionId)?;
+    let unit = normalize_prescription_text(config.unit, WeedPrescriptionError::EmptyUnit)?;
+    if !config.rate_per_zone.is_finite() || config.rate_per_zone <= 0.0 {
+        return Err(WeedPrescriptionError::InvalidRate);
+    }
+    let field_crs = normalize_prescription_text(
+        field_boundary.crs,
+        WeedPrescriptionError::EmptyFieldBoundaryCrs,
+    )?;
+    if field_crs != weed_map.crs {
+        return Err(WeedPrescriptionError::FieldCrsMismatch {
+            field_crs,
+            weed_crs: weed_map.crs.clone(),
+        });
+    }
+    if !valid_bbox(&field_boundary.bbox) {
+        return Err(WeedPrescriptionError::InvalidFieldBoundary);
+    }
+    if weed_map.zones.is_empty() {
+        return Err(WeedPrescriptionError::EmptyZones);
+    }
+    let verified_zone_ids = verified_zone_ids
+        .into_iter()
+        .map(|zone_id| normalize_prescription_text(zone_id, WeedPrescriptionError::EmptyZones))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+
+    let mut zones = Vec::new();
+    for zone in &weed_map.zones {
+        if !verified_zone_ids.contains(&zone.zone_id) {
+            return Err(WeedPrescriptionError::UnverifiedZone {
+                zone_id: zone.zone_id.clone(),
+            });
+        }
+        if zone.geometry.crs != field_crs {
+            return Err(WeedPrescriptionError::ZoneCrsMismatch {
+                zone_id: zone.zone_id.clone(),
+                zone_crs: zone.geometry.crs.clone(),
+                field_crs: field_crs.clone(),
+            });
+        }
+        if !bbox_within(&zone.geometry.bbox, &field_boundary.bbox) {
+            return Err(WeedPrescriptionError::ZoneOutsideField {
+                zone_id: zone.zone_id.clone(),
+            });
+        }
+        zones.push(interop::PrescriptionZone {
+            zone_id: zone.zone_id.clone(),
+            polygon: bbox_to_interop_ring(&zone.geometry.bbox),
+            crs: field_crs.clone(),
+            rate: config.rate_per_zone,
+            unit: unit.clone(),
+        });
+    }
+
+    Ok(interop::PrescriptionShapefileRequest {
+        prescription_id,
+        field: interop::PrescriptionField {
+            field_id: weed_map.field_id.clone(),
+            crs: field_crs,
+            boundary: bbox_to_interop_ring(&field_boundary.bbox),
+        },
+        zones,
+    })
+}
+
+pub fn build_training_dataset_manifest(
+    dataset_id: String,
+    labels: Vec<LabeledTileRecord>,
+    config: TrainingDatasetSplitConfig,
+    provenance_ref: String,
+    generated_at: String,
+) -> Result<TrainingDatasetManifest, TrainingDatasetError> {
+    let dataset_id = normalize_training_text(dataset_id, TrainingDatasetError::EmptyDatasetId)?;
+    let provenance_ref =
+        normalize_training_text(provenance_ref, TrainingDatasetError::EmptyProvenanceRef)?;
+    let generated_at =
+        normalize_training_text(generated_at, TrainingDatasetError::EmptyGeneratedAt)?;
+    validate_training_split_config(config)?;
+    if labels.is_empty() {
+        return Err(TrainingDatasetError::EmptyLabels);
+    }
+
+    let mut explicit_tile_splits: BTreeMap<String, TrainingDatasetSplit> = BTreeMap::new();
+    let mut group_splits: BTreeMap<String, TrainingDatasetSplit> = BTreeMap::new();
+    let mut normalized_labels = Vec::with_capacity(labels.len());
+
+    for label in labels {
+        let tile_ref =
+            normalize_training_text(label.tile_ref, TrainingDatasetError::EmptyLabelField)?;
+        let field_id =
+            normalize_training_text(label.field_id, TrainingDatasetError::EmptyLabelField)?;
+        let captured_at =
+            normalize_training_text(label.captured_at, TrainingDatasetError::EmptyLabelField)?;
+        let label_text =
+            normalize_training_text(label.label, TrainingDatasetError::EmptyLabelField)?;
+        let labeler =
+            normalize_training_text(label.labeler, TrainingDatasetError::EmptyLabelField)?;
+        let source_run =
+            normalize_training_text(label.source_run, TrainingDatasetError::EmptyLabelField)?;
+        let label_provenance =
+            normalize_training_text(label.provenance_ref, TrainingDatasetError::EmptyLabelField)?;
+        let capture_date = capture_date_key(&captured_at);
+        let field_date_key = format!("{field_id}:{capture_date}");
+
+        if let Some(split) = label.assigned_split {
+            if let Some(first) = explicit_tile_splits.insert(tile_ref.clone(), split) {
+                if first != split {
+                    return Err(TrainingDatasetError::ConflictingTileSplit {
+                        tile_ref,
+                        first,
+                        second: split,
+                    });
+                }
+            }
+            if let Some(first) = group_splits.insert(field_date_key.clone(), split) {
+                if first != split {
+                    return Err(TrainingDatasetError::FieldDateLeakage {
+                        field_date_key,
+                        first,
+                        second: split,
+                    });
+                }
+            }
+        }
+
+        normalized_labels.push((
+            tile_ref,
+            field_id,
+            capture_date,
+            label_text,
+            labeler,
+            source_run,
+            label_provenance,
+            field_date_key,
+        ));
+    }
+
+    let mut tiles = Vec::with_capacity(normalized_labels.len());
+    let mut label_provenance_refs = BTreeSet::new();
+    let mut field_date_keys = BTreeSet::new();
+    for (
+        tile_ref,
+        field_id,
+        capture_date,
+        label,
+        labeler,
+        source_run,
+        label_provenance,
+        field_date_key,
+    ) in normalized_labels
+    {
+        let split = group_splits
+            .get(&field_date_key)
+            .copied()
+            .unwrap_or_else(|| assign_split_for_group(&field_date_key, config));
+        label_provenance_refs.insert(label_provenance.clone());
+        field_date_keys.insert(field_date_key);
+        tiles.push(TrainingDatasetTile {
+            tile_ref,
+            field_id,
+            capture_date,
+            label,
+            labeler,
+            source_run,
+            provenance_ref: label_provenance,
+            split,
+        });
+    }
+    tiles.sort_by(|left, right| left.tile_ref.cmp(&right.tile_ref));
+    let split_counts = training_split_counts(&tiles);
+
+    Ok(TrainingDatasetManifest {
+        dataset_id,
+        generated_at,
+        provenance_ref,
+        split_config: config,
+        split_counts,
+        label_count: tiles.len(),
+        field_date_count: field_date_keys.len(),
+        label_provenance_refs: label_provenance_refs.into_iter().collect(),
+        tiles,
+    })
+}
+
+pub fn evaluate_model_version(
+    model: InferenceModelReference,
+    model_registered: bool,
+    dataset: &TrainingDatasetManifest,
+    observations: Vec<ModelEvaluationObservation>,
+    drift: ModelDriftSample,
+    config: ModelEvaluationConfig,
+    provenance_ref: String,
+    generated_at: String,
+) -> Result<ModelEvaluationReport, ModelEvaluationError> {
+    let model = validate_model_reference(model, model_registered)
+        .map_err(|source| ModelEvaluationError::ModelGate { source })?;
+    let provenance_ref =
+        normalize_evaluation_text(provenance_ref, ModelEvaluationError::EmptyProvenanceRef)?;
+    let generated_at =
+        normalize_evaluation_text(generated_at, ModelEvaluationError::EmptyGeneratedAt)?;
+    validate_model_evaluation_config(&config)?;
+    let held_out_tiles = dataset
+        .tiles
+        .iter()
+        .filter(|tile| {
+            matches!(
+                tile.split,
+                TrainingDatasetSplit::Validation | TrainingDatasetSplit::Test
+            )
+        })
+        .map(|tile| tile.tile_ref.as_str())
+        .collect::<BTreeSet<_>>();
+    if held_out_tiles.is_empty() {
+        return Err(ModelEvaluationError::EmptyHeldOutSet);
+    }
+
+    let mut true_positive_count = 0;
+    let mut false_positive_count = 0;
+    let mut false_negative_count = 0;
+    let mut true_positive_iou = Vec::new();
+    let mut evaluated_tile_refs = BTreeSet::new();
+
+    for observation in observations {
+        let tile_ref = normalize_evaluation_text(
+            observation.tile_ref,
+            ModelEvaluationError::EmptyObservationField,
+        )?;
+        if !held_out_tiles.contains(tile_ref.as_str()) {
+            continue;
+        }
+        let expected_label = normalize_evaluation_text(
+            observation.expected_label,
+            ModelEvaluationError::EmptyObservationField,
+        )?;
+        let predicted_label = observation
+            .predicted_label
+            .map(|value| {
+                normalize_evaluation_text(value, ModelEvaluationError::EmptyObservationField)
+            })
+            .transpose()?;
+        if !is_unit_fraction(observation.confidence) || !is_unit_fraction(observation.iou) {
+            return Err(ModelEvaluationError::InvalidObservationMetric { tile_ref });
+        }
+        evaluated_tile_refs.insert(tile_ref);
+
+        let expected_positive = is_positive_label(&expected_label);
+        let predicted_positive = predicted_label.as_deref().is_some_and(is_positive_label);
+        let exact_match = predicted_label
+            .as_deref()
+            .is_some_and(|predicted| predicted == expected_label);
+
+        if expected_positive && predicted_positive && exact_match {
+            true_positive_count += 1;
+            true_positive_iou.push(observation.iou);
+        } else {
+            if predicted_positive {
+                false_positive_count += 1;
+            }
+            if expected_positive {
+                false_negative_count += 1;
+            }
+        }
+    }
+
+    let precision = ratio_or_one(
+        true_positive_count,
+        true_positive_count + false_positive_count,
+    );
+    let recall = ratio_or_one(
+        true_positive_count,
+        true_positive_count + false_negative_count,
+    );
+    let mean_iou = if true_positive_iou.is_empty() {
+        0.0
+    } else {
+        true_positive_iou.iter().sum::<f64>() / true_positive_iou.len() as f64
+    };
+    let score_drift = distribution_drift(
+        &drift.baseline_score_distribution,
+        &drift.current_score_distribution,
+    )?;
+    let input_drift = distribution_drift(
+        &drift.baseline_input_distribution,
+        &drift.current_input_distribution,
+    )?;
+    let block_reasons = model_evaluation_block_reasons(
+        precision,
+        recall,
+        mean_iou,
+        score_drift,
+        input_drift,
+        &config,
+    );
+
+    Ok(ModelEvaluationReport {
+        model,
+        dataset_id: dataset.dataset_id.clone(),
+        generated_at,
+        provenance_ref,
+        evaluated_tile_count: evaluated_tile_refs.len(),
+        true_positive_count,
+        false_positive_count,
+        false_negative_count,
+        precision,
+        recall,
+        mean_iou,
+        score_drift,
+        input_drift,
+        production_ready: block_reasons.is_empty(),
+        block_reasons,
     })
 }
 
@@ -1365,6 +2616,136 @@ pub fn assemble_detection_finding(
     })
 }
 
+pub fn build_crop_closed_loop_proposal(
+    request: CropClosedLoopProposalRequest,
+) -> Result<CropClosedLoopProposal, CropClosedLoopProposalError> {
+    let proposal_id = normalize_closed_loop_text(
+        request.proposal_id,
+        CropClosedLoopProposalError::EmptyProposalId,
+    )?;
+    let requested_by = normalize_closed_loop_text(
+        request.requested_by,
+        CropClosedLoopProposalError::EmptyRequestedBy,
+    )?;
+    let created_at = normalize_closed_loop_text(
+        request.created_at,
+        CropClosedLoopProposalError::EmptyCreatedAt,
+    )?;
+    if !request.confidence_floor.is_finite()
+        || request.confidence_floor < 0.0
+        || request.confidence_floor > 1.0
+    {
+        return Err(CropClosedLoopProposalError::InvalidConfidenceFloor);
+    }
+    if request.findings.is_empty() {
+        return Err(CropClosedLoopProposalError::EmptyFindings);
+    }
+
+    let treatment_prescription_ref = match request.action {
+        CropClosedLoopAction::Treatment | CropClosedLoopAction::ReflyAndTreatment => {
+            Some(normalize_closed_loop_text(
+                request.treatment_prescription_ref.unwrap_or_default(),
+                CropClosedLoopProposalError::EmptyTreatmentPrescriptionRef,
+            )?)
+        }
+        CropClosedLoopAction::Refly => request
+            .treatment_prescription_ref
+            .and_then(normalize_optional_finding_text),
+    };
+
+    let field_id = normalize_closed_loop_text(
+        request.findings[0].field_id.clone(),
+        CropClosedLoopProposalError::EmptyFindings,
+    )?;
+    let proposal_crs = normalize_closed_loop_text(
+        request.findings[0].zone_geometry.crs.clone(),
+        CropClosedLoopProposalError::UncitedFinding {
+            finding_id: request.findings[0].finding_id.clone(),
+        },
+    )?;
+    let mut refly_bbox = request.findings[0].zone_geometry.bbox.clone();
+    let mut findings = Vec::new();
+    let mut evidence_refs = BTreeSet::new();
+
+    for finding in request.findings {
+        if finding.field_id != field_id {
+            return Err(CropClosedLoopProposalError::FieldMismatch {
+                finding_id: finding.finding_id,
+                field_id,
+                finding_field_id: finding.field_id,
+            });
+        }
+        match finding.verification_state {
+            DetectionVerificationState::Confirmed | DetectionVerificationState::Corrected => {}
+            DetectionVerificationState::Unverified | DetectionVerificationState::Rejected => {
+                return Err(CropClosedLoopProposalError::UnverifiedFinding {
+                    finding_id: finding.finding_id,
+                });
+            }
+        }
+        if finding.confidence < request.confidence_floor {
+            return Err(CropClosedLoopProposalError::LowConfidenceFinding {
+                finding_id: finding.finding_id,
+                confidence: finding.confidence,
+                confidence_floor: request.confidence_floor,
+            });
+        }
+        if finding.evidence_refs.is_empty() || finding.evidence_tile_refs.is_empty() {
+            return Err(CropClosedLoopProposalError::UncitedFinding {
+                finding_id: finding.finding_id,
+            });
+        }
+        if finding.zone_geometry.crs != proposal_crs {
+            return Err(CropClosedLoopProposalError::FindingCrsMismatch {
+                finding_id: finding.finding_id,
+                proposal_crs,
+                finding_crs: finding.zone_geometry.crs,
+            });
+        }
+
+        refly_bbox.min_lon = refly_bbox.min_lon.min(finding.zone_geometry.bbox.min_lon);
+        refly_bbox.min_lat = refly_bbox.min_lat.min(finding.zone_geometry.bbox.min_lat);
+        refly_bbox.max_lon = refly_bbox.max_lon.max(finding.zone_geometry.bbox.max_lon);
+        refly_bbox.max_lat = refly_bbox.max_lat.max(finding.zone_geometry.bbox.max_lat);
+        evidence_refs.insert(format!("finding:{}", finding.finding_id));
+        evidence_refs.insert(format!("detection:{}", finding.detection_id));
+        evidence_refs.extend(finding.evidence_refs.iter().cloned());
+
+        findings.push(CropClosedLoopFindingEvidence {
+            finding_id: finding.finding_id,
+            finding_type: finding.finding_type,
+            zone_id: finding.zone_id,
+            detection_id: finding.detection_id,
+            confidence: finding.confidence,
+            evidence_refs: finding.evidence_refs,
+            zone_geometry: finding.zone_geometry,
+        });
+    }
+
+    if let Some(prescription_ref) = treatment_prescription_ref.as_ref() {
+        evidence_refs.insert(format!("treatment_prescription:{prescription_ref}"));
+    }
+
+    Ok(CropClosedLoopProposal {
+        proposal_id,
+        action: request.action,
+        field_id,
+        requested_by,
+        created_at,
+        approval_status: CropClosedLoopApprovalStatus::Pending,
+        approval_required: true,
+        dispatch_authorized: false,
+        confidence_floor: request.confidence_floor,
+        refly_area: Some(DetectionZoneGeometry {
+            crs: proposal_crs,
+            bbox: refly_bbox,
+        }),
+        treatment_prescription_ref,
+        findings,
+        evidence_refs: evidence_refs.into_iter().collect(),
+    })
+}
+
 fn normalize_required_text(
     value: String,
     error: CropModelRegistryError,
@@ -1384,6 +2765,16 @@ fn normalize_run_text(value: String) -> Option<String> {
 
 fn normalize_optional_run_text(value: Option<String>) -> Option<String> {
     value.and_then(normalize_run_text)
+}
+
+fn parse_progress_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::FixedOffset>, InferenceRunError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|_| {
+        InferenceRunError::InvalidProgressTimestamp {
+            timestamp: timestamp.to_string(),
+        }
+    })
 }
 
 fn validate_metrics(metrics: &serde_json::Value) -> Result<(), CropModelRegistryError> {
@@ -1655,6 +3046,54 @@ fn normalize_canopy_text(
     }
 }
 
+fn normalize_growth_text(
+    value: String,
+    error: GrowthStageError,
+) -> Result<String, GrowthStageError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_growth_field_id(value: &str) -> Result<(), GrowthStageError> {
+    if value.trim().is_empty() {
+        Err(GrowthStageError::EmptyFieldId)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_growth_stage_config(config: GrowthStageConfig) -> Result<(), GrowthStageError> {
+    let valid = is_unit_fraction(config.emergence_cover_max)
+        && is_unit_fraction(config.vegetative_cover_min)
+        && is_unit_fraction(config.reproductive_cover_min)
+        && config.emergence_cover_max <= config.vegetative_cover_min
+        && config.vegetative_cover_min <= config.reproductive_cover_min
+        && config.min_index_observations_for_confidence >= 2;
+    if valid {
+        Ok(())
+    } else {
+        Err(GrowthStageError::InvalidConfig)
+    }
+}
+
+fn growth_stage_evidence_refs(
+    stand: &StandCountReport,
+    canopy: &CanopyCoverReport,
+    observations: &[GrowthIndexObservation],
+) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    refs.insert(format!("stand_count:{}", stand.generated_at));
+    refs.insert(format!("canopy_cover:{}", canopy.generated_at));
+    for observation in observations {
+        refs.insert(observation.evidence_ref.trim().to_string());
+    }
+    refs.into_iter().collect()
+}
+
 fn cover_fraction(vegetation_pixels: usize, valid_pixels: usize) -> f64 {
     if valid_pixels > 0 {
         vegetation_pixels as f64 / valid_pixels as f64
@@ -1673,6 +3112,219 @@ fn normalize_disease_text(
     } else {
         Ok(trimmed.to_string())
     }
+}
+
+fn normalize_pest_text(
+    value: String,
+    error: PestDetectionError,
+) -> Result<String, PestDetectionError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_training_text(
+    value: String,
+    error: TrainingDatasetError,
+) -> Result<String, TrainingDatasetError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn validate_training_split_config(
+    config: TrainingDatasetSplitConfig,
+) -> Result<(), TrainingDatasetError> {
+    let sum = config.train_fraction + config.validation_fraction + config.test_fraction;
+    let valid = config.train_fraction.is_finite()
+        && config.validation_fraction.is_finite()
+        && config.test_fraction.is_finite()
+        && config.train_fraction >= 0.0
+        && config.validation_fraction >= 0.0
+        && config.test_fraction >= 0.0
+        && (sum - 1.0).abs() <= 1.0e-9;
+    if valid {
+        Ok(())
+    } else {
+        Err(TrainingDatasetError::InvalidSplitFractions)
+    }
+}
+
+fn capture_date_key(captured_at: &str) -> String {
+    captured_at
+        .split_once('T')
+        .map(|(date, _)| date)
+        .unwrap_or(captured_at)
+        .to_string()
+}
+
+fn assign_split_for_group(
+    field_date_key: &str,
+    config: TrainingDatasetSplitConfig,
+) -> TrainingDatasetSplit {
+    let bucket = stable_split_bucket(config.seed, field_date_key) as f64 / 10_000.0;
+    if bucket < config.train_fraction {
+        TrainingDatasetSplit::Train
+    } else if bucket < config.train_fraction + config.validation_fraction {
+        TrainingDatasetSplit::Validation
+    } else {
+        TrainingDatasetSplit::Test
+    }
+}
+
+fn stable_split_bucket(seed: u64, value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash % 10_000
+}
+
+fn training_split_counts(tiles: &[TrainingDatasetTile]) -> TrainingDatasetSplitCounts {
+    let mut counts = TrainingDatasetSplitCounts {
+        train: 0,
+        validation: 0,
+        test: 0,
+    };
+    for tile in tiles {
+        match tile.split {
+            TrainingDatasetSplit::Train => counts.train += 1,
+            TrainingDatasetSplit::Validation => counts.validation += 1,
+            TrainingDatasetSplit::Test => counts.test += 1,
+        }
+    }
+    counts
+}
+
+fn normalize_evaluation_text(
+    value: String,
+    error: ModelEvaluationError,
+) -> Result<String, ModelEvaluationError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn validate_model_evaluation_config(
+    config: &ModelEvaluationConfig,
+) -> Result<(), ModelEvaluationError> {
+    let valid = is_unit_fraction(config.min_precision)
+        && is_unit_fraction(config.min_recall)
+        && is_unit_fraction(config.min_mean_iou)
+        && config.max_score_drift.is_finite()
+        && config.max_score_drift >= 0.0
+        && config.max_input_drift.is_finite()
+        && config.max_input_drift >= 0.0;
+    if valid {
+        Ok(())
+    } else {
+        Err(ModelEvaluationError::InvalidConfig)
+    }
+}
+
+fn is_positive_label(label: &str) -> bool {
+    !matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "healthy" | "none" | "no_pest" | "no_disease" | "no_weed"
+    )
+}
+
+fn ratio_or_one(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        1.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn distribution_drift(baseline: &[f64], current: &[f64]) -> Result<f64, ModelEvaluationError> {
+    if baseline.is_empty()
+        || baseline.len() != current.len()
+        || !baseline.iter().all(|value| value.is_finite())
+        || !current.iter().all(|value| value.is_finite())
+    {
+        return Err(ModelEvaluationError::InvalidDriftDistribution);
+    }
+    Ok(baseline
+        .iter()
+        .zip(current)
+        .map(|(left, right)| (left - right).abs())
+        .sum::<f64>()
+        / baseline.len() as f64)
+}
+
+fn model_evaluation_block_reasons(
+    precision: f64,
+    recall: f64,
+    mean_iou: f64,
+    score_drift: f64,
+    input_drift: f64,
+    config: &ModelEvaluationConfig,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if precision < config.min_precision {
+        reasons.push("precision_below_floor".to_string());
+    }
+    if recall < config.min_recall {
+        reasons.push("recall_below_floor".to_string());
+    }
+    if mean_iou < config.min_mean_iou {
+        reasons.push("iou_below_floor".to_string());
+    }
+    if score_drift > config.max_score_drift {
+        reasons.push("score_drift_exceeded".to_string());
+    }
+    if input_drift > config.max_input_drift {
+        reasons.push("input_drift_exceeded".to_string());
+    }
+    reasons
+}
+
+fn normalize_prescription_text(
+    value: String,
+    error: WeedPrescriptionError,
+) -> Result<String, WeedPrescriptionError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn bbox_to_interop_ring(bbox: &GeoBounds) -> Vec<interop::InteropCoordinate> {
+    vec![
+        interop::InteropCoordinate {
+            x: bbox.min_lon,
+            y: bbox.min_lat,
+        },
+        interop::InteropCoordinate {
+            x: bbox.max_lon,
+            y: bbox.min_lat,
+        },
+        interop::InteropCoordinate {
+            x: bbox.max_lon,
+            y: bbox.max_lat,
+        },
+        interop::InteropCoordinate {
+            x: bbox.min_lon,
+            y: bbox.max_lat,
+        },
+        interop::InteropCoordinate {
+            x: bbox.min_lon,
+            y: bbox.min_lat,
+        },
+    ]
 }
 
 fn is_unit_fraction(value: f64) -> bool {
@@ -1694,6 +3346,15 @@ fn bbox_within(inner: &GeoBounds, outer: &GeoBounds) -> bool {
         && inner.min_lat + TOLERANCE >= outer.min_lat
         && inner.max_lon <= outer.max_lon + TOLERANCE
         && inner.max_lat <= outer.max_lat + TOLERANCE
+}
+
+fn merge_bounds(left: &GeoBounds, right: &GeoBounds) -> GeoBounds {
+    GeoBounds {
+        min_lon: left.min_lon.min(right.min_lon),
+        min_lat: left.min_lat.min(right.min_lat),
+        max_lon: left.max_lon.max(right.max_lon),
+        max_lat: left.max_lat.max(right.max_lat),
+    }
 }
 
 fn normalize_weed_text(value: String, error: WeedMappingError) -> Result<String, WeedMappingError> {
@@ -1789,6 +3450,18 @@ fn normalize_optional_finding_text(value: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn normalize_closed_loop_text(
+    value: String,
+    error: CropClosedLoopProposalError,
+) -> Result<String, CropClosedLoopProposalError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn normalize_finding_evidence_refs(
     values: Vec<String>,
 ) -> Result<Vec<String>, CropDetectionFindingError> {
@@ -1824,18 +3497,28 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_detection_verification, assemble_detection_finding, build_inference_run_record,
-        build_model_version_record, run_canopy_cover, run_disease_lesion_detection,
-        run_stand_count, run_weed_mapping, transition_inference_run_status,
+        apply_detection_verification, assemble_detection_finding, build_crop_closed_loop_proposal,
+        build_inference_run_progress_record, build_inference_run_record,
+        build_model_version_record, build_training_dataset_manifest,
+        build_weed_spot_spray_prescription, detect_inference_run_stall, estimate_growth_stage,
+        evaluate_model_version, inference_run_progress_stream, run_canopy_cover,
+        run_disease_lesion_detection, run_pest_detection, run_stand_count,
+        run_tiled_inference_pipeline, run_weed_mapping, transition_inference_run_status,
         validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
-        CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
+        CanopyCoverError, CanopyCoverTile, CropClosedLoopAction, CropClosedLoopProposalError,
+        CropClosedLoopProposalRequest, CropDetectionFindingError, CropDetectionFindingRequest,
         CropDetectionVerificationAction, CropDetectionVerificationRequest, CropModelRegistryError,
         CropModelTask, DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
-        FindingPromotionRequest, InferenceModelReference, InferenceRunError, InferenceRunStatus,
-        InferenceRunSubmissionRequest, ModelVersionRegistrationRequest, PlantCountConfig,
-        PlantCountTile, PlantCountZeroReason, WeedMappingConfig, WeedMappingError,
-        WeedZoneCandidate,
+        FindingPromotionRequest, GrowthIndexObservation, GrowthStage, GrowthStageConfidence,
+        GrowthStageConfig, InferenceModelReference, InferenceRunError, InferenceRunProgressInput,
+        InferenceRunStatus, InferenceRunSubmissionRequest, LabeledTileRecord, ModelDriftSample,
+        ModelEvaluationConfig, ModelEvaluationObservation, ModelVersionRegistrationRequest,
+        PestDetectionCandidate, PestDetectionConfig, PestDetectionError, PlantCountConfig,
+        PlantCountTile, PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason,
+        TrainingDatasetError, TrainingDatasetManifest, TrainingDatasetSplit,
+        TrainingDatasetSplitConfig, WeedMappingConfig, WeedMappingError, WeedPrescriptionError,
+        WeedSpotSprayPrescriptionConfig, WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
@@ -1995,6 +3678,87 @@ mod tests {
     }
 
     #[test]
+    fn inference_run_progress_orders_stages_and_reports_coverage() {
+        let later = build_inference_run_progress_record(
+            InferenceRunProgressInput {
+                run_id: "run-progress-001".to_string(),
+                tiles_total: 10,
+                tiles_done: 6,
+                stage: "tile_inference".to_string(),
+                observed_at: "2026-06-13T15:02:00Z".to_string(),
+            },
+            "progress-002".to_string(),
+        )
+        .expect("later progress should build");
+        let earlier = build_inference_run_progress_record(
+            InferenceRunProgressInput {
+                run_id: "run-progress-001".to_string(),
+                tiles_total: 10,
+                tiles_done: 2,
+                stage: "tile_inference".to_string(),
+                observed_at: "2026-06-13T15:01:00Z".to_string(),
+            },
+            "progress-001".to_string(),
+        )
+        .expect("earlier progress should build");
+
+        let stream = inference_run_progress_stream(
+            "run-progress-001".to_string(),
+            vec![later.clone(), earlier],
+        )
+        .expect("progress stream should build");
+
+        assert_eq!(stream.events[0].progress_id, "progress-001");
+        assert_eq!(
+            stream
+                .latest
+                .as_ref()
+                .map(|event| event.progress_id.as_str()),
+            Some("progress-002")
+        );
+        assert_eq!(later.coverage_fraction, 0.6);
+    }
+
+    #[test]
+    fn inference_run_stall_is_flagged_after_progress_window() {
+        let latest = build_inference_run_progress_record(
+            InferenceRunProgressInput {
+                run_id: "run-stall-001".to_string(),
+                tiles_total: 10,
+                tiles_done: 4,
+                stage: "tile_inference".to_string(),
+                observed_at: "2026-06-13T15:00:00Z".to_string(),
+            },
+            "progress-stall-001".to_string(),
+        )
+        .expect("progress should build");
+
+        let healthy = detect_inference_run_stall(
+            Some(&latest),
+            "run-stall-001".to_string(),
+            "stall-healthy".to_string(),
+            "2026-06-13T15:04:59Z".to_string(),
+            300,
+        )
+        .expect("healthy stall check should run");
+        assert!(healthy.is_none());
+
+        let stalled = detect_inference_run_stall(
+            Some(&latest),
+            "run-stall-001".to_string(),
+            "stall-001".to_string(),
+            "2026-06-13T15:05:00Z".to_string(),
+            300,
+        )
+        .expect("stalled check should run")
+        .expect("stalled run should be flagged");
+
+        assert!(stalled.flagged);
+        assert_eq!(stalled.last_progress_at, "2026-06-13T15:00:00Z");
+        assert_eq!(stalled.stall_window_seconds, 300);
+    }
+
+    #[test]
     fn inference_run_rejects_invalid_transition_and_unregistered_model() {
         let run = build_inference_run_record(
             InferenceRunSubmissionRequest {
@@ -2050,6 +3814,123 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn tiled_inference_pipeline_preserves_crs_extent_and_reassembles_outputs() {
+        let report = run_tiled_inference_pipeline(
+            vec![
+                inference_tile(
+                    "tile-west",
+                    2,
+                    2,
+                    GeoBounds {
+                        min_lon: 0.0,
+                        min_lat: 0.0,
+                        max_lon: 20.0,
+                        max_lat: 20.0,
+                    },
+                ),
+                inference_tile(
+                    "tile-east",
+                    2,
+                    2,
+                    GeoBounds {
+                        min_lon: 20.0,
+                        min_lat: 0.0,
+                        max_lon: 40.0,
+                        max_lat: 20.0,
+                    },
+                ),
+            ],
+            |tile| Ok(tile.footprint.max_lon - tile.footprint.min_lon),
+        )
+        .expect("tiled inference should assemble valid tiles");
+
+        assert_eq!(report.field_crs, "EPSG:32614");
+        assert_eq!(
+            report.field_extent,
+            GeoBounds {
+                min_lon: 0.0,
+                min_lat: 0.0,
+                max_lon: 40.0,
+                max_lat: 20.0,
+            }
+        );
+        assert_eq!(report.tiles_total, 2);
+        assert_eq!(report.tiles_processed, 2);
+        assert_eq!(report.tiles_skipped, 0);
+        assert_eq!(
+            report
+                .outputs
+                .iter()
+                .map(|tile| &tile.tile_id)
+                .collect::<Vec<_>>(),
+            vec![&"tile-east".to_string(), &"tile-west".to_string()]
+        );
+        assert!(report
+            .outputs
+            .iter()
+            .all(|tile| tile.spatial_ref.crs.as_deref() == Some("EPSG:32614")));
+        assert_eq!(report.outputs[0].result, 20.0);
+    }
+
+    #[test]
+    fn tiled_inference_pipeline_skips_bad_georeference_without_default_origin() {
+        let mut bad_tile = inference_tile(
+            "tile-bad",
+            2,
+            2,
+            GeoBounds {
+                min_lon: 100.0,
+                min_lat: 100.0,
+                max_lon: 120.0,
+                max_lat: 120.0,
+            },
+        );
+        bad_tile.spatial_ref.georeferenced = false;
+
+        let report = run_tiled_inference_pipeline(
+            vec![
+                bad_tile,
+                inference_tile(
+                    "tile-good",
+                    2,
+                    2,
+                    GeoBounds {
+                        min_lon: 20.0,
+                        min_lat: 0.0,
+                        max_lon: 40.0,
+                        max_lat: 20.0,
+                    },
+                ),
+            ],
+            |tile| Ok(tile.tile_id.clone()),
+        )
+        .expect("valid tile should still run");
+
+        assert_eq!(report.tiles_total, 2);
+        assert_eq!(report.tiles_processed, 1);
+        assert_eq!(report.tiles_skipped, 1);
+        assert_eq!(report.outputs[0].tile_id, "tile-good");
+        assert_eq!(
+            report.field_extent,
+            GeoBounds {
+                min_lon: 20.0,
+                min_lat: 0.0,
+                max_lon: 40.0,
+                max_lat: 20.0,
+            }
+        );
+        assert_eq!(report.skipped_tiles[0].tile_id, "tile-bad");
+        assert_eq!(
+            report.skipped_tiles[0].reason,
+            TiledInferenceSkipReason::InvalidGeoreference
+        );
+        assert!(!report
+            .outputs
+            .iter()
+            .any(|tile| tile.footprint.min_lon == 0.0 && tile.footprint.min_lat == 0.0));
     }
 
     #[test]
@@ -2242,6 +4123,69 @@ mod tests {
     }
 
     #[test]
+    fn growth_stage_estimation_uses_index_cover_and_stand_evidence() {
+        let stand = stand_count_fixture();
+        let canopy = canopy_cover_fixture(vec![0.72, 0.68, 0.74, 0.7], vec![true; 4]);
+
+        let estimate = estimate_growth_stage(
+            "corn".to_string(),
+            &stand,
+            &canopy,
+            vec![
+                index_observation("2026-06-01T00:00:00Z", 0.52, "ndvi:2026-06-01"),
+                index_observation("2026-06-08T00:00:00Z", 0.66, "ndvi:2026-06-08"),
+                index_observation("2026-06-15T00:00:00Z", 0.71, "ndvi:2026-06-15"),
+            ],
+            growth_config(),
+            "2026-06-15T12:00:00Z".to_string(),
+        )
+        .expect("growth stage should estimate");
+
+        assert_eq!(estimate.field_id, "field-1");
+        assert_eq!(estimate.stage, GrowthStage::Vegetative);
+        assert_eq!(estimate.confidence, GrowthStageConfidence::High);
+        assert_eq!(estimate.index_observation_count, 3);
+        assert!((estimate.index_delta.unwrap() - 0.19).abs() < 1e-9);
+        assert!(estimate.reason_code.is_none());
+        assert!(estimate
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence == "ndvi:2026-06-15"));
+        assert!(estimate
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("canopy_cover:")));
+    }
+
+    #[test]
+    fn growth_stage_single_date_returns_low_confidence_insufficient_evidence() {
+        let stand = stand_count_fixture();
+        let canopy = canopy_cover_fixture(vec![0.72, 0.68, 0.74, 0.7], vec![true; 4]);
+
+        let estimate = estimate_growth_stage(
+            "corn".to_string(),
+            &stand,
+            &canopy,
+            vec![index_observation(
+                "2026-06-15T00:00:00Z",
+                0.71,
+                "ndvi:2026-06-15",
+            )],
+            growth_config(),
+            "2026-06-15T12:00:00Z".to_string(),
+        )
+        .expect("single-date estimate should return a low-confidence result");
+
+        assert_eq!(estimate.stage, GrowthStage::InsufficientEvidence);
+        assert_eq!(estimate.confidence, GrowthStageConfidence::Low);
+        assert_eq!(estimate.index_delta, None);
+        assert_eq!(
+            estimate.reason_code.as_deref(),
+            Some("insufficient_index_trajectory")
+        );
+    }
+
+    #[test]
     fn disease_detection_returns_confidence_evidence_and_bounded_zone() {
         let cover = cover_report();
         let report = run_disease_lesion_detection(
@@ -2345,6 +4289,109 @@ mod tests {
     }
 
     #[test]
+    fn pest_detection_returns_confidence_evidence_and_bounded_zone() {
+        let cover = cover_report();
+        let report = run_pest_detection(
+            "field-1".to_string(),
+            pest_model(),
+            true,
+            Some(&cover),
+            vec![pest_candidate(
+                "tile-1",
+                "corn_earworm",
+                0.88,
+                GeoBounds {
+                    min_lon: 4.0,
+                    min_lat: 6.0,
+                    max_lon: 16.0,
+                    max_lat: 18.0,
+                },
+            )],
+            PestDetectionConfig {
+                detection_threshold: 0.5,
+                low_confidence_threshold: 0.7,
+            },
+            "2026-06-01T12:18:00Z".to_string(),
+        )
+        .expect("pest detection should run");
+
+        assert_eq!(report.field_id, "field-1");
+        assert_eq!(report.crs, "EPSG:32614");
+        assert_eq!(report.model.model_id, "pest-detector");
+        assert_eq!(report.deterministic_cover_valid_pixels, cover.valid_pixels);
+        assert_eq!(report.detection_threshold, 0.5);
+        assert_eq!(report.rejected_candidate_count, 0);
+        assert_eq!(report.detections.len(), 1);
+        let detection = &report.detections[0];
+        assert_eq!(detection.detection_id, "pest:tile-1:1");
+        assert_eq!(detection.pest_label, "corn_earworm");
+        assert_eq!(detection.evidence_tile_ref, "tile-1");
+        assert_eq!(detection.confidence, 0.88);
+        assert!(!detection.low_confidence);
+        assert_eq!(detection.zone_geometry.crs, "EPSG:32614");
+        assert_eq!(
+            detection.zone_geometry.bbox,
+            GeoBounds {
+                min_lon: 4.0,
+                min_lat: 6.0,
+                max_lon: 16.0,
+                max_lat: 18.0,
+            }
+        );
+    }
+
+    #[test]
+    fn pest_detection_clear_field_excludes_below_threshold_without_false_zones() {
+        let cover = cover_report();
+        let report = run_pest_detection(
+            "field-1".to_string(),
+            pest_model(),
+            true,
+            Some(&cover),
+            vec![pest_candidate(
+                "tile-1",
+                "aphid",
+                0.24,
+                GeoBounds {
+                    min_lon: 0.0,
+                    min_lat: 0.0,
+                    max_lon: 8.0,
+                    max_lat: 8.0,
+                },
+            )],
+            PestDetectionConfig {
+                detection_threshold: 0.5,
+                low_confidence_threshold: 0.7,
+            },
+            "2026-06-01T12:18:00Z".to_string(),
+        )
+        .expect("clear-field pest report should run");
+
+        assert!(report.detections.is_empty());
+        assert_eq!(report.rejected_candidate_count, 1);
+        assert_eq!(report.low_confidence_count, 0);
+    }
+
+    #[test]
+    fn pest_detection_refuses_to_run_without_deterministic_cover() {
+        let error = run_pest_detection(
+            "field-1".to_string(),
+            pest_model(),
+            true,
+            None,
+            Vec::new(),
+            PestDetectionConfig {
+                detection_threshold: 0.5,
+                low_confidence_threshold: 0.7,
+            },
+            "2026-06-01T12:18:00Z".to_string(),
+        )
+        .expect_err("deterministic cover is required");
+
+        assert_eq!(error, PestDetectionError::DeterministicCoverRequired);
+    }
+
+    #[test]
     fn weed_mapping_returns_georeferenced_confidence_zones_and_area() {
         let cover = cover_report();
         let report = run_weed_mapping(
@@ -2428,6 +4475,288 @@ mod tests {
         .expect_err("deterministic cover is required");
 
         assert_eq!(error, WeedMappingError::DeterministicCoverRequired);
+    }
+
+    #[test]
+    fn verified_weed_map_builds_vra_prescription_request_for_interop() {
+        let request = build_weed_spot_spray_prescription(
+            "rx:weed:field-1".to_string(),
+            &verified_weed_map(),
+            detection_geometry(0.0, 0.0, 10.0, 10.0),
+            vec!["weed:tile-1:1".to_string()],
+            spot_spray_config(),
+        )
+        .expect("verified weed map should become a prescription request");
+
+        assert_eq!(request.prescription_id, "rx:weed:field-1");
+        assert_eq!(request.field.field_id, "field-1");
+        assert_eq!(request.field.crs, "EPSG:32614");
+        assert_eq!(request.zones.len(), 1);
+        assert_eq!(request.zones[0].zone_id, "weed:tile-1:1");
+        assert_eq!(request.zones[0].rate, 12.5);
+        assert_eq!(request.zones[0].unit, "l_ha");
+
+        let taskdata = interop::export_prescription_taskdata(request)
+            .expect("aligned request should export through interop");
+        assert_eq!(taskdata.prescription_id, "rx:weed:field-1");
+        assert_eq!(taskdata.zone_count, 1);
+        assert!(taskdata.validation.valid);
+    }
+
+    #[test]
+    fn weed_prescription_refuses_crs_or_extent_mismatch() {
+        let weed_map = verified_weed_map();
+        let crs_error = build_weed_spot_spray_prescription(
+            "rx:weed:field-1".to_string(),
+            &weed_map,
+            DetectionZoneGeometry {
+                crs: "EPSG:4326".to_string(),
+                bbox: GeoBounds {
+                    min_lon: 0.0,
+                    min_lat: 0.0,
+                    max_lon: 100.0,
+                    max_lat: 100.0,
+                },
+            },
+            vec!["weed:tile-1:1".to_string()],
+            spot_spray_config(),
+        )
+        .expect_err("CRS mismatch should be refused");
+        assert!(matches!(
+            crs_error,
+            WeedPrescriptionError::FieldCrsMismatch { .. }
+        ));
+
+        let extent_error = build_weed_spot_spray_prescription(
+            "rx:weed:field-1".to_string(),
+            &weed_map,
+            detection_geometry(0.0, 0.0, 5.0, 5.0),
+            vec!["weed:tile-1:1".to_string()],
+            spot_spray_config(),
+        )
+        .expect_err("out-of-field weed zone should be refused");
+        assert_eq!(
+            extent_error,
+            WeedPrescriptionError::ZoneOutsideField {
+                zone_id: "weed:tile-1:1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn weed_prescription_refuses_unverified_zone() {
+        let error = build_weed_spot_spray_prescription(
+            "rx:weed:field-1".to_string(),
+            &verified_weed_map(),
+            detection_geometry(0.0, 0.0, 100.0, 100.0),
+            Vec::new(),
+            spot_spray_config(),
+        )
+        .expect_err("unverified zone should be refused");
+
+        assert_eq!(
+            error,
+            WeedPrescriptionError::UnverifiedZone {
+                zone_id: "weed:tile-1:1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn training_dataset_manifest_produces_reproducible_splits_with_provenance() {
+        let labels = vec![
+            labeled_tile("tile-a", "field-1", "2026-06-01T10:00:00Z", "aphid", None),
+            labeled_tile("tile-b", "field-1", "2026-06-01T11:00:00Z", "aphid", None),
+            labeled_tile(
+                "tile-c",
+                "field-2",
+                "2026-06-02T10:00:00Z",
+                "corn_earworm",
+                Some(TrainingDatasetSplit::Validation),
+            ),
+            labeled_tile(
+                "tile-d",
+                "field-3",
+                "2026-06-03T10:00:00Z",
+                "healthy",
+                Some(TrainingDatasetSplit::Test),
+            ),
+        ];
+
+        let first = build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            labels.clone(),
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect("dataset manifest should build");
+        let second = build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            labels,
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect("dataset manifest should be reproducible");
+
+        assert_eq!(first, second);
+        assert_eq!(first.dataset_id, "dataset:pest:v1");
+        assert_eq!(first.label_count, 4);
+        assert_eq!(first.field_date_count, 3);
+        assert_eq!(first.label_provenance_refs.len(), 4);
+        assert_eq!(
+            first.tiles[0].split, first.tiles[1].split,
+            "same field/date must remain in one split"
+        );
+        assert_eq!(first.tiles[2].split, TrainingDatasetSplit::Validation);
+        assert_eq!(first.tiles[3].split, TrainingDatasetSplit::Test);
+        assert_eq!(
+            first.split_counts.train + first.split_counts.validation + first.split_counts.test,
+            4
+        );
+    }
+
+    #[test]
+    fn training_dataset_rejects_field_date_leakage_across_splits() {
+        let error = build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            vec![
+                labeled_tile(
+                    "tile-a",
+                    "field-1",
+                    "2026-06-01T10:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Train),
+                ),
+                labeled_tile(
+                    "tile-b",
+                    "field-1",
+                    "2026-06-01T11:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Validation),
+                ),
+            ],
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect_err("same field/date cannot leak across splits");
+
+        assert!(matches!(
+            error,
+            TrainingDatasetError::FieldDateLeakage {
+                field_date_key,
+                first: TrainingDatasetSplit::Train,
+                second: TrainingDatasetSplit::Validation,
+            } if field_date_key == "field-1:2026-06-01"
+        ));
+    }
+
+    #[test]
+    fn training_dataset_rejects_conflicting_tile_split_assignment() {
+        let error = build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            vec![
+                labeled_tile(
+                    "tile-a",
+                    "field-1",
+                    "2026-06-01T10:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Train),
+                ),
+                labeled_tile(
+                    "tile-a",
+                    "field-2",
+                    "2026-06-02T10:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Test),
+                ),
+            ],
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect_err("same tile cannot be assigned to conflicting splits");
+
+        assert_eq!(
+            error,
+            TrainingDatasetError::ConflictingTileSplit {
+                tile_ref: "tile-a".to_string(),
+                first: TrainingDatasetSplit::Train,
+                second: TrainingDatasetSplit::Test,
+            }
+        );
+    }
+
+    #[test]
+    fn model_evaluation_records_metrics_against_held_out_dataset() {
+        let dataset = evaluation_dataset();
+        let report = evaluate_model_version(
+            pest_model(),
+            true,
+            &dataset,
+            vec![
+                evaluation_observation("tile-c", "corn_earworm", Some("corn_earworm"), 0.91, 0.82),
+                evaluation_observation("tile-d", "healthy", None, 0.08, 0.0),
+            ],
+            stable_drift_sample(),
+            evaluation_config(),
+            "provenance:evaluation:pest:v1".to_string(),
+            "2026-06-14T20:16:00Z".to_string(),
+        )
+        .expect("evaluation should run");
+
+        assert_eq!(report.model.model_id, "pest-detector");
+        assert_eq!(report.dataset_id, "dataset:pest:v1");
+        assert_eq!(report.evaluated_tile_count, 2);
+        assert_eq!(report.true_positive_count, 1);
+        assert_eq!(report.false_positive_count, 0);
+        assert_eq!(report.false_negative_count, 0);
+        assert_eq!(report.precision, 1.0);
+        assert_eq!(report.recall, 1.0);
+        assert_eq!(report.mean_iou, 0.82);
+        assert!(report.production_ready);
+        assert!(report.block_reasons.is_empty());
+    }
+
+    #[test]
+    fn model_evaluation_blocks_subfloor_or_drifted_model() {
+        let dataset = evaluation_dataset();
+        let report = evaluate_model_version(
+            pest_model(),
+            true,
+            &dataset,
+            vec![
+                evaluation_observation("tile-c", "corn_earworm", Some("aphid"), 0.84, 0.21),
+                evaluation_observation("tile-d", "healthy", Some("aphid"), 0.72, 0.0),
+            ],
+            drifted_sample(),
+            evaluation_config(),
+            "provenance:evaluation:pest:v1".to_string(),
+            "2026-06-14T20:16:00Z".to_string(),
+        )
+        .expect("evaluation should run and block");
+
+        assert!(!report.production_ready);
+        assert_eq!(report.true_positive_count, 0);
+        assert_eq!(report.false_positive_count, 2);
+        assert_eq!(report.false_negative_count, 1);
+        assert!(report
+            .block_reasons
+            .contains(&"precision_below_floor".to_string()));
+        assert!(report
+            .block_reasons
+            .contains(&"recall_below_floor".to_string()));
+        assert!(report
+            .block_reasons
+            .contains(&"iou_below_floor".to_string()));
+        assert!(report
+            .block_reasons
+            .contains(&"score_drift_exceeded".to_string()));
+        assert!(report
+            .block_reasons
+            .contains(&"input_drift_exceeded".to_string()));
     }
 
     #[test]
@@ -2561,6 +4890,96 @@ mod tests {
         assert_eq!(error, CropDetectionFindingError::EmptyEvidence);
     }
 
+    #[test]
+    fn verified_findings_build_approval_gated_closed_loop_proposal() {
+        let finding = assemble_detection_finding(CropDetectionFindingRequest {
+            finding_id: "finding-closed-loop-1".to_string(),
+            field_id: "field-1".to_string(),
+            zone_id: Some("zone-a".to_string()),
+            detection: confirmed_detection(),
+            model: registered_model(),
+            emitted_at: "2026-06-12T15:00:00Z".to_string(),
+        })
+        .expect("verified detection should assemble into a finding");
+
+        let proposal = build_crop_closed_loop_proposal(CropClosedLoopProposalRequest {
+            proposal_id: "proposal-1".to_string(),
+            action: CropClosedLoopAction::ReflyAndTreatment,
+            findings: vec![finding],
+            requested_by: "agronomist-7".to_string(),
+            created_at: "2026-06-12T15:05:00Z".to_string(),
+            confidence_floor: 0.75,
+            treatment_prescription_ref: Some("rx:weed:field-1".to_string()),
+        })
+        .expect("verified cited finding should produce an advisory proposal");
+
+        assert_eq!(proposal.proposal_id, "proposal-1");
+        assert_eq!(proposal.field_id, "field-1");
+        assert!(proposal.approval_required);
+        assert!(!proposal.dispatch_authorized);
+        assert_eq!(
+            proposal.treatment_prescription_ref.as_deref(),
+            Some("rx:weed:field-1")
+        );
+        assert_eq!(
+            proposal
+                .refly_area
+                .as_ref()
+                .expect("proposal should bound a re-fly area")
+                .bbox,
+            GeoBounds {
+                min_lon: 5.0,
+                min_lat: 5.0,
+                max_lon: 15.0,
+                max_lat: 15.0,
+            }
+        );
+        assert!(proposal
+            .evidence_refs
+            .iter()
+            .any(|value| value == "finding:finding-closed-loop-1"));
+        assert!(proposal
+            .evidence_refs
+            .iter()
+            .any(|value| value == "treatment_prescription:rx:weed:field-1"));
+    }
+
+    #[test]
+    fn closed_loop_proposal_refuses_unverified_or_low_confidence_findings() {
+        let mut finding = assemble_detection_finding(CropDetectionFindingRequest {
+            finding_id: "finding-low-confidence".to_string(),
+            field_id: "field-1".to_string(),
+            zone_id: Some("zone-a".to_string()),
+            detection: confirmed_detection(),
+            model: registered_model(),
+            emitted_at: "2026-06-12T15:00:00Z".to_string(),
+        })
+        .expect("verified detection should assemble into a finding");
+        finding.confidence = 0.60;
+
+        let error = build_crop_closed_loop_proposal(CropClosedLoopProposalRequest {
+            proposal_id: "proposal-low-confidence".to_string(),
+            action: CropClosedLoopAction::Refly,
+            findings: vec![finding],
+            requested_by: "agronomist-7".to_string(),
+            created_at: "2026-06-12T15:05:00Z".to_string(),
+            confidence_floor: 0.75,
+            treatment_prescription_ref: None,
+        })
+        .expect_err("low-confidence finding should not produce an action proposal");
+
+        assert!(matches!(
+            error,
+            CropClosedLoopProposalError::LowConfidenceFinding {
+                finding_id,
+                confidence,
+                confidence_floor,
+            } if finding_id == "finding-low-confidence"
+                && (confidence - 0.60).abs() < f64::EPSILON
+                && (confidence_floor - 0.75).abs() < f64::EPSILON
+        ));
+    }
+
     fn plant_tile(
         tile_id: &str,
         zone_id: Option<&str>,
@@ -2578,6 +4997,20 @@ mod tests {
             max_x_m: 40.0,
             max_y_m: 40.0,
             crop_mask,
+        }
+    }
+
+    fn inference_tile(
+        tile_id: &str,
+        width_px: u32,
+        height_px: u32,
+        bbox: GeoBounds,
+    ) -> TiledInferenceInput {
+        TiledInferenceInput {
+            tile_id: tile_id.to_string(),
+            width_px,
+            height_px,
+            spatial_ref: spatial_ref_with_bbox(width_px, height_px, bbox),
         }
     }
 
@@ -2619,6 +5052,70 @@ mod tests {
         .expect("cover report should be valid")
     }
 
+    fn stand_count_fixture() -> super::StandCountReport {
+        run_stand_count(
+            "field-1".to_string(),
+            "EPSG:32614".to_string(),
+            vec![plant_tile(
+                "tile-stand",
+                Some("zone-a"),
+                true,
+                vec![
+                    true, false, true, false, false, true, false, false, true, false, false, true,
+                    false, false, true, false,
+                ],
+            )],
+            PlantCountConfig {
+                min_component_pixels: 1,
+            },
+            "2026-06-01T12:05:00Z".to_string(),
+        )
+        .expect("stand count fixture should be valid")
+    }
+
+    fn canopy_cover_fixture(
+        index_values: Vec<f64>,
+        valid_mask: Vec<bool>,
+    ) -> super::CanopyCoverReport {
+        run_canopy_cover(
+            "field-1".to_string(),
+            vec![canopy_tile(
+                "tile-growth",
+                Some("zone-a"),
+                2,
+                2,
+                index_values,
+                valid_mask,
+            )],
+            CanopyCoverConfig {
+                vegetation_index_threshold: 0.5,
+            },
+            "2026-06-01T12:10:00Z".to_string(),
+        )
+        .expect("canopy cover fixture should be valid")
+    }
+
+    fn growth_config() -> GrowthStageConfig {
+        GrowthStageConfig {
+            emergence_cover_max: 0.2,
+            vegetative_cover_min: 0.35,
+            reproductive_cover_min: 0.85,
+            min_index_observations_for_confidence: 2,
+        }
+    }
+
+    fn index_observation(
+        observed_at: &str,
+        mean_index_value: f64,
+        evidence_ref: &str,
+    ) -> GrowthIndexObservation {
+        GrowthIndexObservation {
+            observed_at: observed_at.to_string(),
+            mean_index_value,
+            evidence_ref: evidence_ref.to_string(),
+        }
+    }
+
     fn registered_model() -> InferenceModelReference {
         InferenceModelReference {
             model_id: "lesion-detector".to_string(),
@@ -2651,6 +5148,27 @@ mod tests {
         }
     }
 
+    fn pest_model() -> InferenceModelReference {
+        InferenceModelReference {
+            model_id: "pest-detector".to_string(),
+            version: "2026.06.1".to_string(),
+        }
+    }
+
+    fn pest_candidate(
+        tile_id: &str,
+        pest_label: &str,
+        confidence: f64,
+        bbox: GeoBounds,
+    ) -> PestDetectionCandidate {
+        PestDetectionCandidate {
+            tile_id: tile_id.to_string(),
+            pest_label: pest_label.to_string(),
+            confidence,
+            bbox,
+        }
+    }
+
     fn weed_model() -> InferenceModelReference {
         InferenceModelReference {
             model_id: "weed-detector".to_string(),
@@ -2663,6 +5181,143 @@ mod tests {
             tile_id: tile_id.to_string(),
             confidence,
             bbox,
+        }
+    }
+
+    fn verified_weed_map() -> super::WeedMapReport {
+        let cover = cover_report();
+        run_weed_mapping(
+            "field-1".to_string(),
+            weed_model(),
+            true,
+            Some(&cover),
+            vec![weed_candidate(
+                "tile-1",
+                0.76,
+                GeoBounds {
+                    min_lon: 0.0,
+                    min_lat: 0.0,
+                    max_lon: 10.0,
+                    max_lat: 10.0,
+                },
+            )],
+            WeedMappingConfig {
+                low_confidence_threshold: 0.65,
+            },
+            "2026-06-01T12:20:00Z".to_string(),
+        )
+        .expect("weed map should build")
+    }
+
+    fn spot_spray_config() -> WeedSpotSprayPrescriptionConfig {
+        WeedSpotSprayPrescriptionConfig {
+            rate_per_zone: 12.5,
+            unit: "l_ha".to_string(),
+        }
+    }
+
+    fn split_config() -> TrainingDatasetSplitConfig {
+        TrainingDatasetSplitConfig {
+            train_fraction: 0.6,
+            validation_fraction: 0.2,
+            test_fraction: 0.2,
+            seed: 42,
+        }
+    }
+
+    fn labeled_tile(
+        tile_ref: &str,
+        field_id: &str,
+        captured_at: &str,
+        label: &str,
+        assigned_split: Option<TrainingDatasetSplit>,
+    ) -> LabeledTileRecord {
+        LabeledTileRecord {
+            tile_ref: tile_ref.to_string(),
+            field_id: field_id.to_string(),
+            captured_at: captured_at.to_string(),
+            label: label.to_string(),
+            labeler: "labeler-7".to_string(),
+            source_run: format!("run:{tile_ref}"),
+            provenance_ref: format!("provenance:label:{tile_ref}"),
+            assigned_split,
+        }
+    }
+
+    fn evaluation_dataset() -> TrainingDatasetManifest {
+        build_training_dataset_manifest(
+            "dataset:pest:v1".to_string(),
+            vec![
+                labeled_tile(
+                    "tile-a",
+                    "field-1",
+                    "2026-06-01T10:00:00Z",
+                    "aphid",
+                    Some(TrainingDatasetSplit::Train),
+                ),
+                labeled_tile(
+                    "tile-c",
+                    "field-2",
+                    "2026-06-02T10:00:00Z",
+                    "corn_earworm",
+                    Some(TrainingDatasetSplit::Validation),
+                ),
+                labeled_tile(
+                    "tile-d",
+                    "field-3",
+                    "2026-06-03T10:00:00Z",
+                    "healthy",
+                    Some(TrainingDatasetSplit::Test),
+                ),
+            ],
+            split_config(),
+            "provenance:dataset:pest:v1".to_string(),
+            "2026-06-14T20:05:00Z".to_string(),
+        )
+        .expect("evaluation dataset should build")
+    }
+
+    fn evaluation_config() -> ModelEvaluationConfig {
+        ModelEvaluationConfig {
+            min_precision: 0.8,
+            min_recall: 0.8,
+            min_mean_iou: 0.5,
+            max_score_drift: 0.15,
+            max_input_drift: 0.2,
+        }
+    }
+
+    fn evaluation_observation(
+        tile_ref: &str,
+        expected_label: &str,
+        predicted_label: Option<&str>,
+        confidence: f64,
+        iou: f64,
+    ) -> ModelEvaluationObservation {
+        ModelEvaluationObservation {
+            tile_ref: tile_ref.to_string(),
+            expected_label: expected_label.to_string(),
+            predicted_label: predicted_label.map(|value| value.to_string()),
+            confidence,
+            iou,
+        }
+    }
+
+    fn stable_drift_sample() -> ModelDriftSample {
+        ModelDriftSample {
+            baseline_score_distribution: vec![0.1, 0.5, 0.9],
+            current_score_distribution: vec![0.12, 0.48, 0.88],
+            baseline_input_distribution: vec![0.2, 0.4, 0.6],
+            current_input_distribution: vec![0.22, 0.39, 0.58],
+        }
+    }
+
+    fn drifted_sample() -> ModelDriftSample {
+        ModelDriftSample {
+            baseline_score_distribution: vec![0.1, 0.5, 0.9],
+            current_score_distribution: vec![0.8, 0.2, 0.1],
+            baseline_input_distribution: vec![0.2, 0.4, 0.6],
+            current_input_distribution: vec![0.9, 0.8, 0.1],
         }
     }
 
@@ -2686,17 +5341,37 @@ mod tests {
     fn spatial_ref(width_px: u32, height_px: u32) -> RasterSpatialRef {
         let max_x = width_px as f64 * 10.0;
         let max_y = height_px as f64 * 10.0;
-        RasterSpatialRef {
-            georeferenced: true,
-            crs: Some("EPSG:32614".to_string()),
-            bbox: Some(GeoBounds {
+        spatial_ref_with_bbox(
+            width_px,
+            height_px,
+            GeoBounds {
                 min_lon: 0.0,
                 min_lat: 0.0,
                 max_lon: max_x,
                 max_lat: max_y,
+            },
+        )
+    }
+
+    fn spatial_ref_with_bbox(width_px: u32, height_px: u32, bbox: GeoBounds) -> RasterSpatialRef {
+        let x_resolution = (bbox.max_lon - bbox.min_lon) / width_px as f64;
+        let y_resolution = (bbox.max_lat - bbox.min_lat) / height_px as f64;
+        RasterSpatialRef {
+            georeferenced: true,
+            crs: Some("EPSG:32614".to_string()),
+            geo_transform: Some([
+                bbox.min_lon,
+                x_resolution,
+                0.0,
+                bbox.max_lat,
+                0.0,
+                -y_resolution,
+            ]),
+            bbox: Some(bbox),
+            resolution: Some(RasterResolution {
+                x: x_resolution,
+                y: y_resolution,
             }),
-            geo_transform: Some([0.0, 10.0, 0.0, max_y, 0.0, -10.0]),
-            resolution: Some(RasterResolution { x: 10.0, y: 10.0 }),
         }
     }
 }

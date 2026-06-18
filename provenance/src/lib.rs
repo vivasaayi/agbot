@@ -13,6 +13,8 @@ pub enum ArtifactKind {
     Scene,
     Product,
     Finding,
+    Annotation,
+    Recommendation,
     Report,
     Action,
 }
@@ -137,10 +139,38 @@ pub struct BackwardProvenanceTrace {
     pub gaps: Vec<LineageGap>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForwardProvenanceTrace {
+    pub source_artifact_id: String,
+    pub affected_records: Vec<LineageRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageGap {
     pub missing_artifact_id: String,
     pub referenced_by: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProductLineageEmissionRequest {
+    pub product_id: String,
+    pub product_kind: ArtifactKind,
+    pub source_scene_ref: String,
+    #[serde(default)]
+    pub additional_inputs: Vec<String>,
+    pub method: String,
+    pub parameters: ProvenanceParameters,
+    pub operator: String,
+    pub actor: ActorIdentity,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProductLineageEmission {
+    pub record: LineageRecord,
+    pub source_scene_ref: String,
+    #[serde(default)]
+    pub preserved_geospatial_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -269,6 +299,60 @@ pub struct AuditChainVerification {
     pub reason: Option<AuditChainBreachReason>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionDecision {
+    Retain,
+    Archive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRetentionPolicy {
+    pub policy_id: String,
+    pub archive_before: String,
+    #[serde(default)]
+    pub artifact_kind: Option<ArtifactKind>,
+    #[serde(default)]
+    pub field_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRetentionRecord {
+    pub seq: u64,
+    pub action_ref: String,
+    pub artifact_ref: Option<String>,
+    pub decision: RetentionDecision,
+    pub reason: String,
+    pub entry_hash: String,
+    pub prev_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRetentionReport {
+    pub policy_id: String,
+    pub archived: Vec<AuditRetentionRecord>,
+    pub retained: Vec<AuditRetentionRecord>,
+    pub chain_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLedgerExportRequest {
+    pub start_seq: u64,
+    pub end_seq: u64,
+    #[serde(default)]
+    pub include_predecessor_proof: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditLedgerSliceExport {
+    pub start_seq: u64,
+    pub end_seq: u64,
+    pub predecessor_hash: Option<String>,
+    pub first_prev_hash: Option<String>,
+    pub terminal_hash: Option<String>,
+    pub entries: Vec<AuditEntry>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LineageLedger {
     records: BTreeMap<String, LineageRecord>,
@@ -297,6 +381,8 @@ pub enum ProvenanceError {
     EmptyActorId,
     #[error("input artifact id cannot be empty for {artifact_id}")]
     EmptyInputArtifactId { artifact_id: String },
+    #[error("source scene ref cannot be empty for {product_id}")]
+    EmptySourceSceneRef { product_id: String },
     #[error("method cannot be empty for {artifact_id}")]
     EmptyMethod { artifact_id: String },
     #[error("operator cannot be empty for {artifact_id}")]
@@ -376,6 +462,14 @@ pub enum ProvenanceError {
         action_ref: String,
         attempted_operation: String,
     },
+    #[error("retention policy_id cannot be empty")]
+    EmptyRetentionPolicyId,
+    #[error("retention archive_before cannot be empty for {policy_id}")]
+    EmptyRetentionArchiveBefore { policy_id: String },
+    #[error("audit export range is invalid: start {start_seq}, end {end_seq}")]
+    InvalidAuditExportRange { start_seq: u64, end_seq: u64 },
+    #[error("audit export slice {start_seq}-{end_seq} would break chain continuity")]
+    AuditExportContinuityBreak { start_seq: u64, end_seq: u64 },
     #[error("evidence serialization failed: {details}")]
     EvidenceSerializationFailed { details: String },
     #[error("audit serialization failed: {details}")]
@@ -383,6 +477,20 @@ pub enum ProvenanceError {
 }
 
 impl LineageLedger {
+    pub fn from_persisted_records(records: Vec<LineageRecord>) -> Result<Self, ProvenanceError> {
+        let mut ledger = Self::default();
+        for record in records {
+            let record = normalize_lineage_record(record)?;
+            if ledger.records.contains_key(&record.artifact_id) {
+                return Err(ProvenanceError::DuplicateArtifactId {
+                    artifact_id: record.artifact_id,
+                });
+            }
+            ledger.records.insert(record.artifact_id.clone(), record);
+        }
+        Ok(ledger)
+    }
+
     pub fn record_lineage(
         &mut self,
         record: LineageRecord,
@@ -433,6 +541,21 @@ impl LineageLedger {
         Ok(trace)
     }
 
+    pub fn trace_forward(
+        &self,
+        artifact_id: &str,
+    ) -> Result<ForwardProvenanceTrace, ProvenanceError> {
+        let source_artifact_id =
+            normalize_required_text(artifact_id.to_string(), ProvenanceError::EmptyArtifactId)?;
+        let mut visited = BTreeSet::new();
+        let mut affected_records = Vec::new();
+        self.collect_forward_lineage(&source_artifact_id, &mut visited, &mut affected_records);
+        Ok(ForwardProvenanceTrace {
+            source_artifact_id,
+            affected_records,
+        })
+    }
+
     fn collect_backward_lineage(
         &self,
         artifact_id: &str,
@@ -460,6 +583,30 @@ impl LineageLedger {
                 visited,
                 trace,
             );
+        }
+    }
+
+    fn collect_forward_lineage(
+        &self,
+        artifact_id: &str,
+        visited: &mut BTreeSet<String>,
+        affected_records: &mut Vec<LineageRecord>,
+    ) {
+        let mut downstream = self
+            .records
+            .values()
+            .filter(|record| record.inputs.iter().any(|input| input == artifact_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        downstream.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+
+        for record in downstream {
+            if !visited.insert(record.artifact_id.clone()) {
+                continue;
+            }
+            let downstream_artifact_id = record.artifact_id.clone();
+            affected_records.push(record);
+            self.collect_forward_lineage(&downstream_artifact_id, visited, affected_records);
         }
     }
 }
@@ -639,6 +786,104 @@ impl AuditLedger {
         verify_audit_chain(&self.entries)
     }
 
+    pub fn apply_retention_policy(
+        &self,
+        policy: AuditRetentionPolicy,
+    ) -> Result<AuditRetentionReport, ProvenanceError> {
+        let policy = normalize_retention_policy(policy)?;
+        let chain_verified = self.verify_chain().verified;
+        let mut archived = Vec::new();
+        let mut retained = Vec::new();
+
+        for entry in &self.entries {
+            let governed_by_age = entry.ts < policy.archive_before;
+            let governed_by_kind = policy
+                .artifact_kind
+                .map_or(true, |kind| entry_artifact_kind(entry) == Some(kind));
+            let governed_by_field = policy
+                .field_ref
+                .as_deref()
+                .map_or(true, |field_ref| entry_mentions_field(entry, field_ref));
+            let decision = if governed_by_age && governed_by_kind && governed_by_field {
+                RetentionDecision::Archive
+            } else {
+                RetentionDecision::Retain
+            };
+            let record = AuditRetentionRecord {
+                seq: entry.seq,
+                action_ref: entry.action.action_ref.clone(),
+                artifact_ref: entry.action.artifact_ref.clone(),
+                decision,
+                reason: retention_reason(decision, &policy),
+                entry_hash: entry.entry_hash.clone(),
+                prev_hash: entry.prev_hash.clone(),
+            };
+            match decision {
+                RetentionDecision::Archive => archived.push(record),
+                RetentionDecision::Retain => retained.push(record),
+            }
+        }
+
+        Ok(AuditRetentionReport {
+            policy_id: policy.policy_id,
+            archived,
+            retained,
+            chain_verified,
+        })
+    }
+
+    pub fn export_slice(
+        &self,
+        request: AuditLedgerExportRequest,
+    ) -> Result<AuditLedgerSliceExport, ProvenanceError> {
+        let request = normalize_audit_export_request(request)?;
+        let entries = self
+            .entries
+            .iter()
+            .filter(|entry| entry.seq >= request.start_seq && entry.seq <= request.end_seq)
+            .cloned()
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Err(ProvenanceError::InvalidAuditExportRange {
+                start_seq: request.start_seq,
+                end_seq: request.end_seq,
+            });
+        }
+
+        let first_prev_hash = entries.first().and_then(|entry| entry.prev_hash.clone());
+        let predecessor_hash = if request.start_seq == 1 {
+            None
+        } else if request.include_predecessor_proof {
+            self.entries
+                .iter()
+                .find(|entry| entry.seq + 1 == request.start_seq)
+                .map(|entry| entry.entry_hash.clone())
+        } else {
+            return Err(ProvenanceError::AuditExportContinuityBreak {
+                start_seq: request.start_seq,
+                end_seq: request.end_seq,
+            });
+        };
+
+        if first_prev_hash != predecessor_hash {
+            return Err(ProvenanceError::AuditExportContinuityBreak {
+                start_seq: request.start_seq,
+                end_seq: request.end_seq,
+            });
+        }
+
+        let export = AuditLedgerSliceExport {
+            start_seq: request.start_seq,
+            end_seq: request.end_seq,
+            predecessor_hash,
+            first_prev_hash,
+            terminal_hash: entries.last().map(|entry| entry.entry_hash.clone()),
+            entries,
+        };
+        verify_audit_slice_export(&export)?;
+        Ok(export)
+    }
+
     pub fn replace_entry(
         &mut self,
         _seq: u64,
@@ -754,6 +999,87 @@ pub fn verify_audit_chain(entries: &[AuditEntry]) -> AuditChainVerification {
     }
 }
 
+pub fn verify_audit_slice_export(
+    export: &AuditLedgerSliceExport,
+) -> Result<AuditChainVerification, ProvenanceError> {
+    if export.start_seq == 0 || export.end_seq < export.start_seq || export.entries.is_empty() {
+        return Err(ProvenanceError::InvalidAuditExportRange {
+            start_seq: export.start_seq,
+            end_seq: export.end_seq,
+        });
+    }
+    let first = export.entries.first().expect("empty checked");
+    let last = export.entries.last().expect("empty checked");
+    if first.seq != export.start_seq || last.seq != export.end_seq {
+        return Err(ProvenanceError::InvalidAuditExportRange {
+            start_seq: export.start_seq,
+            end_seq: export.end_seq,
+        });
+    }
+    if first.prev_hash != export.predecessor_hash || export.first_prev_hash != first.prev_hash {
+        return Err(ProvenanceError::AuditExportContinuityBreak {
+            start_seq: export.start_seq,
+            end_seq: export.end_seq,
+        });
+    }
+    if export.terminal_hash != Some(last.entry_hash.clone()) {
+        return Err(ProvenanceError::AuditExportContinuityBreak {
+            start_seq: export.start_seq,
+            end_seq: export.end_seq,
+        });
+    }
+
+    for (offset, entry) in export.entries.iter().enumerate() {
+        let expected_seq = export.start_seq + offset as u64;
+        if entry.seq != expected_seq {
+            return Ok(audit_chain_breach(
+                offset,
+                AuditChainBreachReason::SequenceMismatch,
+            ));
+        }
+        let expected_prev_hash = if offset == 0 {
+            export.predecessor_hash.clone()
+        } else {
+            Some(export.entries[offset - 1].entry_hash.clone())
+        };
+        if entry.prev_hash != expected_prev_hash {
+            return Ok(audit_chain_breach(
+                offset,
+                AuditChainBreachReason::PreviousHashMismatch,
+            ));
+        }
+        let expected_payload_hash = audit_payload_hash(&entry.action)?;
+        if entry.payload_hash != expected_payload_hash {
+            return Ok(audit_chain_breach(
+                offset,
+                AuditChainBreachReason::PayloadHashMismatch,
+            ));
+        }
+        let expected_entry_hash = audit_entry_hash(
+            entry.seq,
+            &entry.prev_hash,
+            &entry.payload_hash,
+            &entry.actor,
+            &entry.ts,
+            entry.outcome,
+            entry.refusal_reason,
+        )?;
+        if entry.entry_hash != expected_entry_hash {
+            return Ok(audit_chain_breach(
+                offset,
+                AuditChainBreachReason::EntryHashMismatch,
+            ));
+        }
+    }
+
+    Ok(AuditChainVerification {
+        verified: true,
+        verified_len: export.entries.len(),
+        breach_index: None,
+        reason: None,
+    })
+}
+
 pub fn build_reproducibility_manifest(
     product: &LineageRecord,
     input_digests: Vec<String>,
@@ -773,6 +1099,38 @@ pub fn build_reproducibility_manifest(
         method: product.method,
         method_version,
         parameters: product.parameters,
+    })
+}
+
+pub fn emit_product_lineage(
+    ledger: &mut LineageLedger,
+    request: ProductLineageEmissionRequest,
+) -> Result<ProductLineageEmission, ProvenanceError> {
+    let request = normalize_product_lineage_emission_request(request)?;
+    let mut inputs = Vec::with_capacity(1 + request.additional_inputs.len());
+    inputs.push(request.source_scene_ref.clone());
+    for input in request.additional_inputs {
+        if !inputs.contains(&input) {
+            inputs.push(input);
+        }
+    }
+
+    let preserved_geospatial_refs = geospatial_refs_from_parameters(request.parameters.as_json());
+    let record = ledger.record_lineage(LineageRecord {
+        artifact_id: request.product_id,
+        kind: request.product_kind,
+        inputs,
+        method: request.method,
+        parameters: request.parameters,
+        operator: request.operator,
+        actor: request.actor,
+        created_at: request.created_at,
+    })?;
+
+    Ok(ProductLineageEmission {
+        record,
+        source_scene_ref: request.source_scene_ref,
+        preserved_geospatial_refs,
     })
 }
 
@@ -1030,6 +1388,159 @@ fn normalize_lineage_record(mut record: LineageRecord) -> Result<LineageRecord, 
         },
     )?;
     Ok(record)
+}
+
+fn normalize_product_lineage_emission_request(
+    mut request: ProductLineageEmissionRequest,
+) -> Result<ProductLineageEmissionRequest, ProvenanceError> {
+    request.product_id =
+        normalize_required_text(request.product_id, ProvenanceError::EmptyArtifactId)?;
+    request.source_scene_ref = normalize_required_text(
+        request.source_scene_ref,
+        ProvenanceError::EmptySourceSceneRef {
+            product_id: request.product_id.clone(),
+        },
+    )?;
+    request.additional_inputs = request
+        .additional_inputs
+        .into_iter()
+        .map(|input| {
+            normalize_required_text(
+                input,
+                ProvenanceError::EmptyInputArtifactId {
+                    artifact_id: request.product_id.clone(),
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    request.method = normalize_required_text(
+        request.method,
+        ProvenanceError::EmptyMethod {
+            artifact_id: request.product_id.clone(),
+        },
+    )?;
+    request.operator = normalize_required_text(
+        request.operator,
+        ProvenanceError::EmptyOperator {
+            artifact_id: request.product_id.clone(),
+        },
+    )?;
+    request.actor = normalize_actor_identity(request.actor)?;
+    request.created_at = normalize_required_text(
+        request.created_at,
+        ProvenanceError::EmptyCreatedAt {
+            artifact_id: request.product_id.clone(),
+        },
+    )?;
+    Ok(request)
+}
+
+fn normalize_retention_policy(
+    mut policy: AuditRetentionPolicy,
+) -> Result<AuditRetentionPolicy, ProvenanceError> {
+    policy.policy_id =
+        normalize_required_text(policy.policy_id, ProvenanceError::EmptyRetentionPolicyId)?;
+    policy.archive_before = normalize_required_text(
+        policy.archive_before,
+        ProvenanceError::EmptyRetentionArchiveBefore {
+            policy_id: policy.policy_id.clone(),
+        },
+    )?;
+    policy.field_ref = policy.field_ref.and_then(normalize_optional_text_owned);
+    Ok(policy)
+}
+
+fn normalize_audit_export_request(
+    request: AuditLedgerExportRequest,
+) -> Result<AuditLedgerExportRequest, ProvenanceError> {
+    if request.start_seq == 0 || request.end_seq < request.start_seq {
+        return Err(ProvenanceError::InvalidAuditExportRange {
+            start_seq: request.start_seq,
+            end_seq: request.end_seq,
+        });
+    }
+    Ok(request)
+}
+
+fn entry_artifact_kind(entry: &AuditEntry) -> Option<ArtifactKind> {
+    let artifact_ref = entry.action.artifact_ref.as_deref()?;
+    if artifact_ref.starts_with("capture:") {
+        Some(ArtifactKind::Capture)
+    } else if artifact_ref.starts_with("scene:") {
+        Some(ArtifactKind::Scene)
+    } else if artifact_ref.starts_with("product:") {
+        Some(ArtifactKind::Product)
+    } else if artifact_ref.starts_with("finding:") {
+        Some(ArtifactKind::Finding)
+    } else if artifact_ref.starts_with("annotation:") {
+        Some(ArtifactKind::Annotation)
+    } else if artifact_ref.starts_with("recommendation:") {
+        Some(ArtifactKind::Recommendation)
+    } else if artifact_ref.starts_with("report:") {
+        Some(ArtifactKind::Report)
+    } else if artifact_ref.starts_with("action:") || artifact_ref.starts_with("mission:") {
+        Some(ArtifactKind::Action)
+    } else {
+        None
+    }
+}
+
+fn entry_mentions_field(entry: &AuditEntry, field_ref: &str) -> bool {
+    entry
+        .action
+        .artifact_ref
+        .as_deref()
+        .is_some_and(|artifact_ref| artifact_ref.contains(field_ref))
+        || entry
+            .action
+            .payload
+            .as_json()
+            .to_string()
+            .contains(field_ref)
+}
+
+fn retention_reason(decision: RetentionDecision, policy: &AuditRetentionPolicy) -> String {
+    match decision {
+        RetentionDecision::Archive => format!(
+            "archived by policy {} before {}",
+            policy.policy_id, policy.archive_before
+        ),
+        RetentionDecision::Retain => format!(
+            "retained by policy {} to preserve governed ledger slice",
+            policy.policy_id
+        ),
+    }
+}
+
+fn geospatial_refs_from_parameters(parameters: &serde_json::Value) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    collect_geospatial_refs(parameters, &mut refs);
+    refs.into_iter().collect()
+}
+
+fn collect_geospatial_refs(value: &serde_json::Value, refs: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                let captures_ref = matches!(
+                    key.as_str(),
+                    "crs" | "extent_ref" | "grid_ref" | "scene_ref" | "source_scene_ref"
+                );
+                if captures_ref {
+                    if let Some(text) = value.as_str().and_then(normalize_optional_text) {
+                        refs.insert(format!("{key}:{text}"));
+                    }
+                }
+                collect_geospatial_refs(value, refs);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_geospatial_refs(value, refs);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn normalize_actor_identity(mut actor: ActorIdentity) -> Result<ActorIdentity, ProvenanceError> {
@@ -1291,12 +1802,15 @@ fn normalize_optional_text_owned(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_evidence_pack, build_reproducibility_manifest, output_hash_for_bytes,
-        verify_audit_chain, verify_evidence_pack_schema, verify_reproducible_output, ActionContext,
-        ActorIdentity, ActorKind, ArtifactKind, AuditAction, AuditChainBreachReason, AuditLedger,
-        AuditOutcome, AuditRefusalReason, EvidenceObject, EvidencePackRequest, EvidenceStore,
-        LineageLedger, LineageRecord, ProvenanceError, ProvenanceParameters,
+        build_evidence_pack, build_reproducibility_manifest, emit_product_lineage,
+        output_hash_for_bytes, verify_audit_chain, verify_audit_slice_export,
+        verify_evidence_pack_schema, verify_reproducible_output, ActionContext, ActorIdentity,
+        ActorKind, ArtifactKind, AuditAction, AuditChainBreachReason, AuditLedger,
+        AuditLedgerExportRequest, AuditOutcome, AuditRefusalReason, AuditRetentionPolicy,
+        EvidenceObject, EvidencePackRequest, EvidenceStore, LineageLedger, LineageRecord,
+        ProductLineageEmissionRequest, ProvenanceError, ProvenanceParameters,
         ReproducibilityInputBytes, ReproducibilityManifestStore, ReproducibilityMismatchReason,
+        RetentionDecision,
     };
 
     #[test]
@@ -1339,6 +1853,95 @@ mod tests {
                 "zone": "NE"
             }))
         );
+    }
+
+    #[test]
+    fn product_domain_emission_records_source_scene_parameters_and_geospatial_refs() {
+        let mut ledger = LineageLedger::default();
+        ledger
+            .record_lineage(capture_lineage())
+            .expect("capture lineage should be recorded");
+        ledger
+            .record_lineage(scene_lineage_with_capture())
+            .expect("scene lineage should be recorded");
+
+        let ndvi = emit_product_lineage(
+            &mut ledger,
+            domain_product_request(
+                "product:05:ndvi-alpha",
+                "05.imagery_ndvi",
+                serde_json::json!({
+                    "index": "ndvi",
+                    "crs": "EPSG:32614",
+                    "extent_ref": "extent:field-alpha:2026-06-12"
+                }),
+            ),
+        )
+        .expect("imagery product should emit lineage");
+        let canopy = emit_product_lineage(
+            &mut ledger,
+            domain_product_request(
+                "product:06:canopy-height-alpha",
+                "06.lidar_canopy_height",
+                serde_json::json!({
+                    "grid_ref": "grid:canopy-alpha-1m",
+                    "crs": "EPSG:32614"
+                }),
+            ),
+        )
+        .expect("lidar product should emit lineage");
+        let orthomosaic = emit_product_lineage(
+            &mut ledger,
+            domain_product_request(
+                "product:22:orthomosaic-alpha",
+                "22.orthomosaic_publish",
+                serde_json::json!({
+                    "scene_ref": "scene:alpha-2026-06-12",
+                    "crs": "EPSG:32614",
+                    "extent_ref": "extent:field-alpha:2026-06-12"
+                }),
+            ),
+        )
+        .expect("orthomosaic product should emit lineage");
+
+        assert_eq!(ndvi.record.inputs, vec!["scene:alpha-2026-06-12"]);
+        assert_eq!(canopy.record.inputs, vec!["scene:alpha-2026-06-12"]);
+        assert_eq!(orthomosaic.record.inputs, vec!["scene:alpha-2026-06-12"]);
+        assert!(ndvi
+            .preserved_geospatial_refs
+            .contains(&"crs:EPSG:32614".to_string()));
+        assert!(ndvi
+            .preserved_geospatial_refs
+            .contains(&"extent_ref:extent:field-alpha:2026-06-12".to_string()));
+        assert!(canopy
+            .preserved_geospatial_refs
+            .contains(&"grid_ref:grid:canopy-alpha-1m".to_string()));
+        assert!(orthomosaic
+            .preserved_geospatial_refs
+            .contains(&"scene_ref:scene:alpha-2026-06-12".to_string()));
+        assert_eq!(ledger.artifact_count(), 5);
+    }
+
+    #[test]
+    fn product_domain_emission_refuses_missing_source_scene_ref() {
+        let mut ledger = LineageLedger::default();
+        let mut request = domain_product_request(
+            "product:05:ndvi-alpha",
+            "05.imagery_ndvi",
+            serde_json::json!({ "index": "ndvi" }),
+        );
+        request.source_scene_ref = " ".to_string();
+
+        let error = emit_product_lineage(&mut ledger, request)
+            .expect_err("missing source scene should fail emission");
+
+        assert_eq!(
+            error,
+            ProvenanceError::EmptySourceSceneRef {
+                product_id: "product:05:ndvi-alpha".to_string(),
+            }
+        );
+        assert_eq!(ledger.artifact_count(), 0);
     }
 
     #[test]
@@ -1504,6 +2107,82 @@ mod tests {
     }
 
     #[test]
+    fn retention_policy_archives_governed_records_without_breaking_chain() {
+        let audit = seeded_audit_ledger();
+
+        let report = audit
+            .apply_retention_policy(AuditRetentionPolicy {
+                policy_id: "policy-field-alpha-retention".to_string(),
+                archive_before: "2026-06-12T13:07:00Z".to_string(),
+                artifact_kind: Some(ArtifactKind::Action),
+                field_ref: Some("field:alpha".to_string()),
+            })
+            .expect("retention policy should evaluate");
+
+        assert!(report.chain_verified);
+        assert_eq!(report.archived.len(), 2);
+        assert_eq!(report.archived[0].decision, RetentionDecision::Archive);
+        assert_eq!(report.archived[0].prev_hash, None);
+        assert_eq!(report.retained.len(), 1);
+        assert_eq!(report.retained[0].seq, 3);
+        assert!(report.archived[0]
+            .reason
+            .contains("policy-field-alpha-retention"));
+    }
+
+    #[test]
+    fn audit_slice_export_carries_independent_chain_proof() {
+        let audit = seeded_audit_ledger();
+
+        let export = audit
+            .export_slice(AuditLedgerExportRequest {
+                start_seq: 2,
+                end_seq: 3,
+                include_predecessor_proof: true,
+            })
+            .expect("slice with predecessor proof should export");
+
+        assert_eq!(export.entries.len(), 2);
+        assert_eq!(export.start_seq, 2);
+        assert_eq!(export.end_seq, 3);
+        assert_eq!(
+            export.predecessor_hash,
+            Some(audit.entries()[0].entry_hash.clone())
+        );
+        assert_eq!(export.first_prev_hash, export.predecessor_hash);
+        assert_eq!(
+            export.terminal_hash,
+            Some(audit.entries()[2].entry_hash.clone())
+        );
+
+        let verification =
+            verify_audit_slice_export(&export).expect("export verification should run");
+        assert!(verification.verified);
+        assert_eq!(verification.verified_len, 2);
+    }
+
+    #[test]
+    fn audit_slice_export_refuses_continuity_breaking_slice() {
+        let audit = seeded_audit_ledger();
+
+        let error = audit
+            .export_slice(AuditLedgerExportRequest {
+                start_seq: 2,
+                end_seq: 3,
+                include_predecessor_proof: false,
+            })
+            .expect_err("slice without predecessor proof should be refused");
+
+        assert_eq!(
+            error,
+            ProvenanceError::AuditExportContinuityBreak {
+                start_seq: 2,
+                end_seq: 3,
+            }
+        );
+    }
+
+    #[test]
     fn evidence_store_addresses_object_by_digest_and_retrieves_it() {
         let mut store = EvidenceStore::default();
 
@@ -1611,6 +2290,99 @@ mod tests {
             trace.gaps[0].referenced_by,
             Some("finding:09:stress-ne-zone".to_string())
         );
+    }
+
+    #[test]
+    fn persisted_lineage_records_preserve_retracted_source_gaps() {
+        let report = LineageRecord {
+            artifact_id: "report:field-alpha:weekly".to_string(),
+            kind: ArtifactKind::Report,
+            inputs: vec![
+                "scene:alpha-2026-06-12".to_string(),
+                "annotation:stress-zone".to_string(),
+                "recommendation:refly-zone-ne".to_string(),
+            ],
+            method: "10.report_deliverable".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "field_id": "field-alpha"
+            })),
+            operator: "operator:dsp-7".to_string(),
+            actor: ActorIdentity::system("geo_hub"),
+            created_at: "2026-06-12T11:00:00Z".to_string(),
+        };
+        let scene = LineageRecord {
+            artifact_id: "scene:alpha-2026-06-12".to_string(),
+            kind: ArtifactKind::Scene,
+            inputs: Vec::new(),
+            method: "07.scene_registry".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({})),
+            operator: "operator:dsp-7".to_string(),
+            actor: ActorIdentity::system("geo_hub"),
+            created_at: "2026-06-12T09:00:00Z".to_string(),
+        };
+
+        let ledger = LineageLedger::from_persisted_records(vec![report, scene])
+            .expect("persisted records should allow gaps during reconstruction");
+        let trace = ledger
+            .trace_backward("report:field-alpha:weekly")
+            .expect("trace should resolve present records and gaps");
+
+        assert_eq!(trace.records.len(), 2);
+        assert_eq!(
+            trace
+                .gaps
+                .iter()
+                .map(|gap| gap.missing_artifact_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["annotation:stress-zone", "recommendation:refly-zone-ne"]
+        );
+    }
+
+    #[test]
+    fn forward_provenance_trace_finds_all_downstream_findings_reports_and_actions() {
+        let mut ledger = LineageLedger::default();
+        seed_capture_graph(&mut ledger);
+        seed_downstream_artifacts(&mut ledger);
+
+        let trace = ledger
+            .trace_forward("scene:alpha-2026-06-12")
+            .expect("forward trace should run");
+
+        let artifact_ids = trace
+            .affected_records
+            .iter()
+            .map(|record| record.artifact_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            artifact_ids,
+            vec![
+                "product:ndvi:alpha-2026-06-12",
+                "finding:09:stress-ne-zone",
+                "action:mission:refly-zone-ne",
+                "report:field-alpha:weekly"
+            ]
+        );
+        assert_eq!(trace.source_artifact_id, "scene:alpha-2026-06-12");
+        assert_eq!(trace.affected_records[2].kind, ArtifactKind::Action);
+        assert_eq!(trace.affected_records[3].kind, ArtifactKind::Report);
+    }
+
+    #[test]
+    fn forward_provenance_trace_returns_empty_for_scene_without_downstream() {
+        let mut ledger = LineageLedger::default();
+        ledger
+            .record_lineage(capture_lineage())
+            .expect("capture lineage should record");
+        ledger
+            .record_lineage(scene_lineage_with_capture())
+            .expect("scene lineage should record");
+
+        let trace = ledger
+            .trace_forward("scene:alpha-2026-06-12")
+            .expect("forward trace should run");
+
+        assert_eq!(trace.source_artifact_id, "scene:alpha-2026-06-12");
+        assert!(trace.affected_records.is_empty());
     }
 
     #[test]
@@ -2077,6 +2849,15 @@ mod tests {
             .expect("finding lineage should be recorded");
     }
 
+    fn seed_downstream_artifacts(ledger: &mut LineageLedger) {
+        ledger
+            .record_lineage(report_lineage())
+            .expect("report lineage should be recorded");
+        ledger
+            .record_lineage(action_lineage())
+            .expect("action lineage should be recorded");
+    }
+
     fn capture_lineage() -> LineageRecord {
         LineageRecord {
             artifact_id: "capture:alpha-2026-06-12".to_string(),
@@ -2149,6 +2930,56 @@ mod tests {
         }
     }
 
+    fn report_lineage() -> LineageRecord {
+        LineageRecord {
+            artifact_id: "report:field-alpha:weekly".to_string(),
+            kind: ArtifactKind::Report,
+            inputs: vec!["finding:09:stress-ne-zone".to_string()],
+            method: "18.weekly_field_report".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "report_period": "2026-W24",
+                "field_id": "field:alpha"
+            })),
+            operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
+            created_at: "2026-06-12T13:30:00Z".to_string(),
+        }
+    }
+
+    fn action_lineage() -> LineageRecord {
+        LineageRecord {
+            artifact_id: "action:mission:refly-zone-ne".to_string(),
+            kind: ArtifactKind::Action,
+            inputs: vec!["finding:09:stress-ne-zone".to_string()],
+            method: "01.refly_proposal".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "zone": "NE",
+                "approval_required": true
+            })),
+            operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
+            created_at: "2026-06-12T13:20:00Z".to_string(),
+        }
+    }
+
+    fn domain_product_request(
+        product_id: &str,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> ProductLineageEmissionRequest {
+        ProductLineageEmissionRequest {
+            product_id: product_id.to_string(),
+            product_kind: ArtifactKind::Product,
+            source_scene_ref: "scene:alpha-2026-06-12".to_string(),
+            additional_inputs: Vec::new(),
+            method: method.to_string(),
+            parameters: ProvenanceParameters::from_json(parameters),
+            operator: "operator:dsp-7".to_string(),
+            actor: sample_actor(),
+            created_at: "2026-06-12T13:10:00Z".to_string(),
+        }
+    }
+
     fn sample_actor() -> ActorIdentity {
         ActorIdentity {
             actor_id: "operator:dsp-7".to_string(),
@@ -2167,6 +2998,42 @@ mod tests {
             })),
             occurred_at: "2026-06-12T13:05:00Z".to_string(),
         }
+    }
+
+    fn seeded_audit_ledger() -> AuditLedger {
+        let mut audit = AuditLedger::default();
+        audit
+            .append_action(
+                sample_actor(),
+                sample_audit_action("action:field-alpha:mission:create"),
+            )
+            .expect("first action should append");
+        audit
+            .append_action(
+                sample_actor(),
+                AuditAction {
+                    action_ref: "action:field-alpha:mission:approve".to_string(),
+                    occurred_at: "2026-06-12T13:06:00Z".to_string(),
+                    ..sample_audit_action("action:field-alpha:mission:approve")
+                },
+            )
+            .expect("second action should append");
+        audit
+            .append_action(
+                sample_actor(),
+                AuditAction {
+                    action_ref: "action:field-beta:mission:create".to_string(),
+                    artifact_ref: Some("mission:beta-4".to_string()),
+                    payload: ProvenanceParameters::from_json(serde_json::json!({
+                        "field_id": "field:beta",
+                        "approved": false
+                    })),
+                    occurred_at: "2026-06-12T13:09:00Z".to_string(),
+                    ..sample_audit_action("action:field-beta:mission:create")
+                },
+            )
+            .expect("third action should append");
+        audit
     }
 
     fn audit_action_for_artifact(action_ref: &str, artifact_ref: &str) -> AuditAction {

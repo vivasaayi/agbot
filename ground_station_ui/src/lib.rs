@@ -9,30 +9,41 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 pub mod cli_interface;
+pub mod fleet_operations;
 pub mod link_client;
 pub mod map_state;
 pub mod message_dispatch;
 pub mod operator_actions;
+pub mod operator_advisory;
 pub mod operator_session;
 pub mod web_server;
 
+pub use cli_interface::{
+    cli_status_snapshot, submit_cli_operator_action, CliCommandOutcome, CliStatusSnapshot,
+};
+pub use fleet_operations::{
+    build_fleet_status_overview, summarize_fleet_operations_feed, FleetOperationsConsoleSummary,
+    FleetOverviewAircraftStatus, FleetOverviewLinkState, FleetStatusOverview,
+};
 pub use link_client::{
     run_websocket_client_until, run_websocket_client_with_dispatch_until,
     run_websocket_client_with_handler_until, shared_link_state, ConnectionState, LinkStateMachine,
     LinkStateSnapshot, ReconnectPolicy, SharedLinkState,
 };
 pub use map_state::{
-    assert_overlay_matches_basemap, project_wgs84_to_web_mercator, BasemapLayer, FlightPathSample,
-    GeofenceBreach, MapOverlayLayer, MapPathPoint, MapRenderError, MapRenderState,
-    MissionMapOverlay, MissionOverlayInput, MissionPolygonInput, MissionPolygonOverlay,
-    MissionPolygonVertex, MissionWaypointInput, MissionWaypointOverlay, OverlayAssertion,
-    ProjectedExtent, ProjectedPoint, DEFAULT_FLIGHT_PATH_LIMIT, WEB_MERCATOR_CRS, WGS84_CRS,
+    assert_overlay_matches_basemap, project_wgs84_to_web_mercator, BasemapLayer, CaptureEventInput,
+    CaptureMapMarker, FlightPathSample, GeofenceBreach, MapOverlayLayer, MapPathPoint,
+    MapRenderError, MapRenderState, MissionMapOverlay, MissionOverlayInput, MissionPolygonInput,
+    MissionPolygonOverlay, MissionPolygonVertex, MissionWaypointInput, MissionWaypointOverlay,
+    OverlayAssertion, ProjectedExtent, ProjectedPoint, DEFAULT_FLIGHT_PATH_LIMIT, WEB_MERCATOR_CRS,
+    WGS84_CRS,
 };
 pub use message_dispatch::{
     shared_message_dispatch_state, CaptureEvent, CaptureEventKind, DispatchError,
     DispatchedMessage, MessageDispatchState, MessageRoute, MissionStatusSnapshot,
-    SharedMessageDispatchState, SystemStatusSnapshot, TelemetryFreshnessSnapshot,
-    TelemetryFreshnessState, TelemetryTileSnapshot, TelemetryTileValues,
+    SharedMessageDispatchState, SystemAlertPanelEntry, SystemAlertSeverity, SystemStatusSnapshot,
+    TelemetryFreshnessSnapshot, TelemetryFreshnessState, TelemetryTileSnapshot,
+    TelemetryTileValues,
 };
 pub use operator_actions::{
     shared_operator_action_audit_log, shared_operator_action_state, ActionAckStatus,
@@ -41,6 +52,10 @@ pub use operator_actions::{
     OperatorActionError, OperatorActionKind, OperatorActionState, OperatorActionSubmission,
     RejectingMissionControlActionClient, SharedMissionControlActionClient,
     SharedOperatorActionAuditLog, SharedOperatorActionState,
+};
+pub use operator_advisory::{
+    evaluate_operator_assist_advisory, GeofenceProximitySignal, OperatorAssistAdvisory,
+    OperatorAssistThresholds,
 };
 pub use operator_session::{
     shared_operator_session_registry, AuthorizedOperatorAction, OperatorCredential,

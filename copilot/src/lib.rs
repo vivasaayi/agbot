@@ -132,6 +132,35 @@ pub struct CopilotTurnRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopilotFieldContext {
+    pub conversation_id: String,
+    pub field_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_scene: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_zone: Option<String>,
+    pub last_evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopilotContextResolution {
+    pub context: CopilotFieldContext,
+    pub rejected_evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CopilotContextUpdateRequest {
+    #[serde(default)]
+    pub field_id: Option<String>,
+    #[serde(default)]
+    pub active_scene: Option<String>,
+    #[serde(default)]
+    pub active_zone: Option<String>,
+    #[serde(default)]
+    pub retrieved_evidence: Vec<EvidenceIndexEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CopilotConversationError {
     #[error("conversation_id cannot be empty")]
@@ -151,6 +180,26 @@ pub enum CopilotConversationError {
     },
     #[error("turn role {value} is invalid")]
     UnsupportedRole { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotContextError {
+    #[error("conversation_id cannot be empty")]
+    EmptyConversationId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("context conversation {context_conversation_id} does not match conversation {conversation_id}")]
+    ConversationScopeMismatch {
+        conversation_id: String,
+        context_conversation_id: String,
+    },
+    #[error(
+        "context field {context_field_id} does not match requested field {requested_field_id}"
+    )]
+    FieldScopeMismatch {
+        context_field_id: String,
+        requested_field_id: String,
+    },
 }
 
 pub trait LedgerEvidenceResolver {
@@ -197,6 +246,20 @@ pub struct GroundedCopilotQuestionRequest {
     pub claims: Vec<CopilotAnswerClaim>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotExplanationRequest {
+    pub question: String,
+    pub field_id: String,
+    pub zone_ref: String,
+    pub retrieved_evidence: Vec<EvidenceIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotExplanation {
+    pub answer: GroundedCopilotAnswer,
+    pub no_comparable_history: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CopilotRefusalReason {
@@ -215,6 +278,80 @@ pub struct GroundedCopilotTurn {
     pub refused: bool,
     pub refusal: Option<CopilotRefusal>,
     pub answer: Option<GroundedCopilotAnswer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotTurnAuditRequest {
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub field_id: String,
+    pub question: String,
+    pub turn: GroundedCopilotTurn,
+    pub interface_version: String,
+    pub ts: String,
+    pub ledger_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotTurnAuditRecord {
+    pub audit_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub field_id: String,
+    pub question: String,
+    pub refused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<CopilotRefusalReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    pub cited_evidence_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    pub interface_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    pub ts: String,
+    pub ledger_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotAuditedTurn {
+    pub turn: GroundedCopilotTurn,
+    pub audit: CopilotTurnAuditRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotCitationExport {
+    pub evidence_id: String,
+    pub kind: EvidenceKind,
+    pub ledger_ref: String,
+    pub field_id: String,
+    pub scene_ref: Option<String>,
+    pub zone_ref: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotAnswerExportRequest {
+    pub question: String,
+    pub turn: GroundedCopilotTurn,
+    pub retrieved_evidence: Vec<EvidenceIndexEntry>,
+    pub exported_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopilotAnswerExport {
+    pub question: String,
+    pub refused: bool,
+    pub refusal_reason: Option<CopilotRefusalReason>,
+    pub answer: Option<String>,
+    pub confidence: Option<f64>,
+    pub cited_evidence: Vec<CopilotCitationExport>,
+    pub exported_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +461,84 @@ pub struct ApprovedCopilotRecommendation {
     pub recommendation: RecommendationRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopilotProactiveChangeSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProactiveClosedLoopAdvisoryRequest {
+    pub advisory_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub scene_id: String,
+    pub zone_ref: String,
+    pub author_user_id: String,
+    pub change_event_id: String,
+    pub change_event_summary: String,
+    pub severity: CopilotProactiveChangeSeverity,
+    pub event_evidence_ids: Vec<String>,
+    pub retrieved_evidence: Vec<EvidenceIndexEntry>,
+    pub action_category: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at: String,
+    pub interface_version: String,
+    pub audit_ledger_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProactiveClosedLoopAdvisorySkipReason {
+    SeverityBelowHigh,
+    UnresolvedEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProactiveClosedLoopAdvisory {
+    pub advisory_id: String,
+    pub change_event_id: String,
+    pub severity: CopilotProactiveChangeSeverity,
+    pub answer: GroundedCopilotAnswer,
+    pub draft_action: CopilotRecommendationDraft,
+    pub audit: CopilotTurnAuditRecord,
+    pub requires_human_approval: bool,
+    pub action_executed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProactiveClosedLoopAdvisoryResult {
+    pub surfaced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<ProactiveClosedLoopAdvisory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<ProactiveClosedLoopAdvisorySkipReason>,
+    pub action_executed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ProactiveClosedLoopAdvisoryError {
+    #[error("advisory_id cannot be empty")]
+    EmptyAdvisoryId,
+    #[error("change_event_id cannot be empty")]
+    EmptyChangeEventId,
+    #[error("change_event_summary cannot be empty")]
+    EmptyChangeEventSummary,
+    #[error("proactive advisory requires at least one event evidence id")]
+    EmptyEventEvidenceIds,
+    #[error(transparent)]
+    Draft(#[from] CopilotRecommendationDraftError),
+    #[error(transparent)]
+    Audit(#[from] CopilotAuditError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CopilotRecommendationDraftError {
     #[error("draft_id cannot be empty")]
@@ -428,6 +643,22 @@ pub enum CopilotGroundingError {
     EmptyModelVersion,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotExplanationError {
+    #[error("question cannot be empty")]
+    EmptyQuestion,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("zone_ref cannot be empty")]
+    EmptyZoneRef,
+    #[error("explanation requires finding evidence")]
+    MissingFindingEvidence,
+    #[error("explanation requires zone evidence")]
+    MissingZoneEvidence,
+    #[error("explanation requires domain 28 change/trend evidence")]
+    MissingChangeEvidence,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CopilotTurnError {
     #[error("question cannot be empty")]
@@ -438,8 +669,48 @@ pub enum CopilotTurnError {
     Grounding(#[from] CopilotGroundingError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotAuditError {
+    #[error("conversation_id cannot be empty")]
+    EmptyConversationId,
+    #[error("turn_id cannot be empty")]
+    EmptyTurnId,
+    #[error("field_id cannot be empty")]
+    EmptyFieldId,
+    #[error("question cannot be empty")]
+    EmptyQuestion,
+    #[error("interface_version cannot be empty")]
+    EmptyInterfaceVersion,
+    #[error("audit timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("ledger_ref cannot be empty")]
+    EmptyLedgerRef,
+    #[error("completed answer must cite at least one evidence id before audit")]
+    AnswerWithoutCitations,
+    #[error("copilot audit write failed: {reason}")]
+    AuditWriteFailed { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CopilotAnswerExportError {
+    #[error("question cannot be empty")]
+    EmptyQuestion,
+    #[error("export timestamp cannot be empty")]
+    EmptyTimestamp,
+    #[error("completed answer must cite at least one evidence id before export")]
+    AnswerWithoutCitations,
+    #[error("citation {evidence_id} is missing from retrieved evidence")]
+    CitationNotRetrieved { evidence_id: String },
+    #[error("citation {evidence_id} is missing a resolvable ledger ref")]
+    CitationMissingLedgerRef { evidence_id: String },
+}
+
 pub trait CopilotModel {
     fn answer(&self, request: CopilotAnswerRequest) -> Result<CopilotAnswer, CopilotModelError>;
+}
+
+pub trait CopilotAuditSink {
+    fn write_turn_audit(&mut self, record: &CopilotTurnAuditRecord) -> Result<(), String>;
 }
 
 impl DeterministicCopilotModel {
@@ -541,6 +812,219 @@ pub fn answer_grounded_question(
         refused: false,
         refusal: None,
         answer: Some(grounded),
+    })
+}
+
+pub fn explain_zone_finding_change(
+    request: CopilotExplanationRequest,
+) -> Result<CopilotExplanation, CopilotExplanationError> {
+    let question =
+        normalize_text(request.question).ok_or(CopilotExplanationError::EmptyQuestion)?;
+    let field_id = normalize_text(request.field_id).ok_or(CopilotExplanationError::EmptyFieldId)?;
+    let zone_ref = normalize_text(request.zone_ref).ok_or(CopilotExplanationError::EmptyZoneRef)?;
+    let mut scoped = request
+        .retrieved_evidence
+        .into_iter()
+        .filter(|entry| {
+            normalize_text(entry.evidence_id.clone()).is_some()
+                && normalize_text(entry.ledger_ref.clone()).is_some()
+                && normalize_text(entry.field_id.clone()).as_deref() == Some(field_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    scoped.sort_by(|left, right| left.evidence_id.cmp(&right.evidence_id));
+
+    let finding = scoped
+        .iter()
+        .find(|entry| entry.kind == EvidenceKind::Finding)
+        .ok_or(CopilotExplanationError::MissingFindingEvidence)?;
+    let zone = scoped
+        .iter()
+        .find(|entry| {
+            entry.zone_ref.as_deref() == Some(zone_ref.as_str())
+                && entry.evidence_id != finding.evidence_id
+                && entry.kind != EvidenceKind::Trend
+        })
+        .ok_or(CopilotExplanationError::MissingZoneEvidence)?;
+    let change = scoped
+        .iter()
+        .find(|entry| entry.kind == EvidenceKind::Trend)
+        .ok_or(CopilotExplanationError::MissingChangeEvidence)?;
+    let no_comparable_history = is_no_baseline_change(change);
+    let cited_evidence_ids = BTreeSet::from([
+        finding.evidence_id.clone(),
+        zone.evidence_id.clone(),
+        change.evidence_id.clone(),
+    ])
+    .into_iter()
+    .collect::<Vec<_>>();
+
+    let change_text = if no_comparable_history {
+        "Domain 28 reports no comparable baseline/history for this change request; no change magnitude is inferred."
+            .to_string()
+    } else {
+        format!("Domain 28 change context: {}", change.summary)
+    };
+    let text = format!(
+        "{} Finding: {} Zone context: {} {}",
+        question, finding.summary, zone.summary, change_text
+    );
+    let claims = vec![
+        CopilotAnswerClaim {
+            text: format!("Finding evidence: {}", finding.summary),
+            cited_evidence_ids: vec![finding.evidence_id.clone()],
+        },
+        CopilotAnswerClaim {
+            text: format!("Zone evidence: {}", zone.summary),
+            cited_evidence_ids: vec![zone.evidence_id.clone()],
+        },
+        CopilotAnswerClaim {
+            text: change_text,
+            cited_evidence_ids: vec![change.evidence_id.clone()],
+        },
+    ];
+
+    Ok(CopilotExplanation {
+        answer: GroundedCopilotAnswer {
+            text,
+            claims,
+            cited_evidence_ids,
+            confidence: if no_comparable_history { 0.74 } else { 0.86 },
+            model_provider: "deterministic".to_string(),
+            model_id: "copilot-explain-zone-finding-change".to_string(),
+            model_version: "v1".to_string(),
+        },
+        no_comparable_history,
+    })
+}
+
+pub fn finalize_audited_turn(
+    sink: &mut impl CopilotAuditSink,
+    request: CopilotTurnAuditRequest,
+) -> Result<CopilotAuditedTurn, CopilotAuditError> {
+    let conversation_id = normalize_audit_text(
+        request.conversation_id,
+        CopilotAuditError::EmptyConversationId,
+    )?;
+    let turn_id = normalize_audit_text(request.turn_id, CopilotAuditError::EmptyTurnId)?;
+    let field_id = normalize_audit_text(request.field_id, CopilotAuditError::EmptyFieldId)?;
+    let question = normalize_audit_text(request.question, CopilotAuditError::EmptyQuestion)?;
+    let interface_version = normalize_audit_text(
+        request.interface_version,
+        CopilotAuditError::EmptyInterfaceVersion,
+    )?;
+    let ts = normalize_audit_text(request.ts, CopilotAuditError::EmptyTimestamp)?;
+    let ledger_ref = normalize_audit_text(request.ledger_ref, CopilotAuditError::EmptyLedgerRef)?;
+
+    let (answer, cited_evidence_ids, confidence, model_provider, model_id, model_version) =
+        if request.turn.refused {
+            (None, Vec::new(), None, None, None, None)
+        } else {
+            let answer = request
+                .turn
+                .answer
+                .as_ref()
+                .ok_or(CopilotAuditError::AnswerWithoutCitations)?;
+            let cited_evidence_ids = normalize_audit_citations(answer.cited_evidence_ids.clone())?;
+            (
+                Some(answer.text.clone()),
+                cited_evidence_ids,
+                Some(answer.confidence),
+                Some(answer.model_provider.clone()),
+                Some(answer.model_id.clone()),
+                Some(answer.model_version.clone()),
+            )
+        };
+    let refusal_reason = request.turn.refusal.as_ref().map(|refusal| refusal.reason);
+
+    let audit = CopilotTurnAuditRecord {
+        audit_id: format!("copilot-audit:{conversation_id}:{turn_id}:{ts}"),
+        conversation_id,
+        turn_id,
+        field_id,
+        question,
+        refused: request.turn.refused,
+        refusal_reason,
+        answer,
+        cited_evidence_ids,
+        confidence,
+        interface_version,
+        model_provider,
+        model_id,
+        model_version,
+        ts,
+        ledger_ref,
+    };
+    sink.write_turn_audit(&audit)
+        .map_err(|reason| CopilotAuditError::AuditWriteFailed { reason })?;
+
+    Ok(CopilotAuditedTurn {
+        turn: request.turn,
+        audit,
+    })
+}
+
+pub fn export_copilot_answer_with_citations(
+    request: CopilotAnswerExportRequest,
+) -> Result<CopilotAnswerExport, CopilotAnswerExportError> {
+    let question =
+        normalize_export_text(request.question, CopilotAnswerExportError::EmptyQuestion)?;
+    let exported_at = normalize_export_text(
+        request.exported_at,
+        CopilotAnswerExportError::EmptyTimestamp,
+    )?;
+    if request.turn.refused {
+        return Ok(CopilotAnswerExport {
+            question,
+            refused: true,
+            refusal_reason: request.turn.refusal.map(|refusal| refusal.reason),
+            answer: None,
+            confidence: None,
+            cited_evidence: Vec::new(),
+            exported_at,
+        });
+    }
+
+    let answer = request
+        .turn
+        .answer
+        .ok_or(CopilotAnswerExportError::AnswerWithoutCitations)?;
+    let cited_ids = normalize_export_citations(answer.cited_evidence_ids)?;
+    let evidence_by_id = request
+        .retrieved_evidence
+        .into_iter()
+        .filter_map(|entry| normalize_text(entry.evidence_id.clone()).map(|id| (id, entry)))
+        .collect::<BTreeMap<_, _>>();
+    let mut cited_evidence = Vec::new();
+    for evidence_id in cited_ids {
+        let entry = evidence_by_id.get(&evidence_id).ok_or_else(|| {
+            CopilotAnswerExportError::CitationNotRetrieved {
+                evidence_id: evidence_id.clone(),
+            }
+        })?;
+        let ledger_ref = normalize_text(entry.ledger_ref.clone()).ok_or_else(|| {
+            CopilotAnswerExportError::CitationMissingLedgerRef {
+                evidence_id: evidence_id.clone(),
+            }
+        })?;
+        cited_evidence.push(CopilotCitationExport {
+            evidence_id,
+            kind: entry.kind,
+            ledger_ref,
+            field_id: entry.field_id.clone(),
+            scene_ref: entry.scene_ref.clone(),
+            zone_ref: entry.zone_ref.clone(),
+            summary: entry.summary.clone(),
+        });
+    }
+
+    Ok(CopilotAnswerExport {
+        question,
+        refused: false,
+        refusal_reason: None,
+        answer: Some(answer.text),
+        confidence: Some(answer.confidence),
+        cited_evidence,
+        exported_at,
     })
 }
 
@@ -719,6 +1203,123 @@ pub fn approve_recommendation_draft(
     })
 }
 
+pub fn surface_proactive_closed_loop_advisory(
+    sink: &mut impl CopilotAuditSink,
+    request: ProactiveClosedLoopAdvisoryRequest,
+) -> Result<ProactiveClosedLoopAdvisoryResult, ProactiveClosedLoopAdvisoryError> {
+    let advisory_id = normalize_proactive_text(
+        request.advisory_id,
+        ProactiveClosedLoopAdvisoryError::EmptyAdvisoryId,
+    )?;
+    let change_event_id = normalize_proactive_text(
+        request.change_event_id,
+        ProactiveClosedLoopAdvisoryError::EmptyChangeEventId,
+    )?;
+    let change_event_summary = normalize_proactive_text(
+        request.change_event_summary,
+        ProactiveClosedLoopAdvisoryError::EmptyChangeEventSummary,
+    )?;
+    let event_evidence_ids = normalize_proactive_citations(request.event_evidence_ids)?;
+
+    if !is_high_severity_change(request.severity) {
+        return Ok(ProactiveClosedLoopAdvisoryResult {
+            surfaced: false,
+            advisory: None,
+            skip_reason: Some(ProactiveClosedLoopAdvisorySkipReason::SeverityBelowHigh),
+            action_executed: false,
+        });
+    }
+
+    let evidence_by_id = request
+        .retrieved_evidence
+        .iter()
+        .filter_map(|entry| normalize_text(entry.evidence_id.clone()).map(|id| (id, entry)))
+        .collect::<BTreeMap<_, _>>();
+    let resolved_evidence = event_evidence_ids
+        .iter()
+        .filter_map(|evidence_id| {
+            evidence_by_id.get(evidence_id).and_then(|entry| {
+                normalize_text(entry.ledger_ref.clone())?;
+                Some((*entry).clone())
+            })
+        })
+        .collect::<Vec<_>>();
+    if resolved_evidence.len() != event_evidence_ids.len() {
+        return Ok(ProactiveClosedLoopAdvisoryResult {
+            surfaced: false,
+            advisory: None,
+            skip_reason: Some(ProactiveClosedLoopAdvisorySkipReason::UnresolvedEvidence),
+            action_executed: false,
+        });
+    }
+
+    let answer = GroundedCopilotAnswer {
+        text: format!(
+            "Proactive advisory for change event {change_event_id}: {change_event_summary}"
+        ),
+        claims: resolved_evidence
+            .iter()
+            .map(|entry| CopilotAnswerClaim {
+                text: format!("Change evidence {}: {}", entry.evidence_id, entry.summary),
+                cited_evidence_ids: vec![entry.evidence_id.clone()],
+            })
+            .collect(),
+        cited_evidence_ids: event_evidence_ids.clone(),
+        confidence: 0.84,
+        model_provider: "deterministic".to_string(),
+        model_id: "copilot-proactive-closed-loop-advisory".to_string(),
+        model_version: "v1".to_string(),
+    };
+    let draft_action = draft_recommendation_from_answer(CopilotRecommendationDraftRequest {
+        draft_id: format!("draft:{advisory_id}"),
+        org_id: request.org_id,
+        field_id: request.field_id.clone(),
+        scene_id: request.scene_id,
+        author_user_id: request.author_user_id,
+        title: request.title,
+        note: request.note,
+        action_category: request.action_category,
+        priority: RecommendationPriority::High,
+        zone_ref: request.zone_ref,
+        answer: answer.clone(),
+        created_at: request.created_at.clone(),
+    })?;
+    let turn = GroundedCopilotTurn {
+        refused: false,
+        refusal: None,
+        answer: Some(answer.clone()),
+    };
+    let audited = finalize_audited_turn(
+        sink,
+        CopilotTurnAuditRequest {
+            conversation_id: request.conversation_id,
+            turn_id: request.turn_id,
+            field_id: request.field_id,
+            question: format!("proactive closed-loop advisory for {change_event_id}"),
+            turn,
+            interface_version: request.interface_version,
+            ts: request.created_at,
+            ledger_ref: request.audit_ledger_ref,
+        },
+    )?;
+
+    Ok(ProactiveClosedLoopAdvisoryResult {
+        surfaced: true,
+        advisory: Some(ProactiveClosedLoopAdvisory {
+            advisory_id,
+            change_event_id,
+            severity: request.severity,
+            answer,
+            draft_action,
+            audit: audited.audit,
+            requires_human_approval: true,
+            action_executed: false,
+        }),
+        skip_reason: None,
+        action_executed: false,
+    })
+}
+
 pub fn start_copilot_conversation(
     request: CopilotConversationStartRequest,
     generated_conversation_id: String,
@@ -767,6 +1368,91 @@ pub fn create_copilot_turn(
         turn_id,
         role: request.role,
         created_at,
+    })
+}
+
+pub fn resolve_copilot_field_context(
+    conversation: &CopilotConversationRecord,
+    previous: Option<&CopilotFieldContext>,
+    request: CopilotContextUpdateRequest,
+) -> Result<CopilotContextResolution, CopilotContextError> {
+    let conversation_id = normalize_context_text(
+        conversation.conversation_id.clone(),
+        CopilotContextError::EmptyConversationId,
+    )?;
+    let conversation_field_id = normalize_context_text(
+        conversation.field_id.clone(),
+        CopilotContextError::EmptyFieldId,
+    )?;
+
+    if let Some(previous) = previous {
+        let context_conversation_id = normalize_context_text(
+            previous.conversation_id.clone(),
+            CopilotContextError::EmptyConversationId,
+        )?;
+        if context_conversation_id != conversation_id {
+            return Err(CopilotContextError::ConversationScopeMismatch {
+                conversation_id,
+                context_conversation_id,
+            });
+        }
+        if previous.field_id != conversation_field_id {
+            return Err(CopilotContextError::FieldScopeMismatch {
+                context_field_id: previous.field_id.clone(),
+                requested_field_id: conversation_field_id,
+            });
+        }
+    }
+
+    let requested_field_id = request
+        .field_id
+        .and_then(normalize_text)
+        .unwrap_or_else(|| conversation_field_id.clone());
+    if requested_field_id != conversation_field_id {
+        return Err(CopilotContextError::FieldScopeMismatch {
+            context_field_id: conversation_field_id,
+            requested_field_id,
+        });
+    }
+
+    let previous_scene = previous.and_then(|context| context.active_scene.clone());
+    let previous_zone = previous.and_then(|context| context.active_zone.clone());
+    let active_scene = normalize_optional_text(request.active_scene).or(previous_scene);
+    let active_zone = normalize_optional_text(request.active_zone).or(previous_zone);
+    let mut rejected_evidence_ids = Vec::new();
+    let mut last_evidence_ids = request
+        .retrieved_evidence
+        .into_iter()
+        .filter_map(|entry| {
+            let evidence_id = normalize_text(entry.evidence_id)?;
+            let evidence_field = normalize_text(entry.field_id)?;
+            if evidence_field == conversation_field_id {
+                Some(evidence_id)
+            } else {
+                rejected_evidence_ids.push(evidence_id);
+                None
+            }
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if last_evidence_ids.is_empty() {
+        last_evidence_ids = previous
+            .map(|context| context.last_evidence_ids.clone())
+            .unwrap_or_default();
+    }
+    rejected_evidence_ids.sort();
+    rejected_evidence_ids.dedup();
+
+    Ok(CopilotContextResolution {
+        context: CopilotFieldContext {
+            conversation_id,
+            field_id: conversation_field_id,
+            active_scene,
+            active_zone,
+            last_evidence_ids,
+        },
+        rejected_evidence_ids,
     })
 }
 
@@ -918,6 +1604,13 @@ fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
         EvidenceKind::Report => "report",
         EvidenceKind::Trend => "trend change",
     }
+}
+
+fn is_no_baseline_change(entry: &EvidenceIndexEntry) -> bool {
+    let summary = entry.summary.to_ascii_lowercase();
+    summary.contains("no baseline")
+        || summary.contains("no comparable history")
+        || summary.contains("insufficient baseline")
 }
 
 fn meaningful_tokens(value: &str) -> BTreeSet<String> {
@@ -1095,6 +1788,50 @@ fn normalize_grounding_text(
     normalize_text(value).ok_or(error)
 }
 
+fn normalize_audit_text(
+    value: String,
+    error: CopilotAuditError,
+) -> Result<String, CopilotAuditError> {
+    normalize_text(value).ok_or(error)
+}
+
+fn normalize_audit_citations(values: Vec<String>) -> Result<Vec<String>, CopilotAuditError> {
+    let cited_evidence_ids = values
+        .into_iter()
+        .filter_map(normalize_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if cited_evidence_ids.is_empty() {
+        Err(CopilotAuditError::AnswerWithoutCitations)
+    } else {
+        Ok(cited_evidence_ids)
+    }
+}
+
+fn normalize_export_text(
+    value: String,
+    error: CopilotAnswerExportError,
+) -> Result<String, CopilotAnswerExportError> {
+    normalize_text(value).ok_or(error)
+}
+
+fn normalize_export_citations(
+    values: Vec<String>,
+) -> Result<Vec<String>, CopilotAnswerExportError> {
+    let cited_evidence_ids = values
+        .into_iter()
+        .filter_map(normalize_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if cited_evidence_ids.is_empty() {
+        Err(CopilotAnswerExportError::AnswerWithoutCitations)
+    } else {
+        Ok(cited_evidence_ids)
+    }
+}
+
 fn normalize_draft_text(
     value: String,
     error: CopilotRecommendationDraftError,
@@ -1102,8 +1839,22 @@ fn normalize_draft_text(
     normalize_text(value).ok_or(error)
 }
 
+fn normalize_proactive_text(
+    value: String,
+    error: ProactiveClosedLoopAdvisoryError,
+) -> Result<String, ProactiveClosedLoopAdvisoryError> {
+    normalize_text(value).ok_or(error)
+}
+
 fn normalize_conversation_text(value: String) -> Option<String> {
     normalize_text(value)
+}
+
+fn normalize_context_text(
+    value: String,
+    error: CopilotContextError,
+) -> Result<String, CopilotContextError> {
+    normalize_text(value).ok_or(error)
 }
 
 fn normalize_optional_conversation_text(value: Option<String>) -> Option<String> {
@@ -1124,6 +1875,29 @@ fn normalize_draft_citations(
     } else {
         Ok(cited_evidence_ids)
     }
+}
+
+fn normalize_proactive_citations(
+    values: Vec<String>,
+) -> Result<Vec<String>, ProactiveClosedLoopAdvisoryError> {
+    let cited_evidence_ids = values
+        .into_iter()
+        .filter_map(normalize_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if cited_evidence_ids.is_empty() {
+        Err(ProactiveClosedLoopAdvisoryError::EmptyEventEvidenceIds)
+    } else {
+        Ok(cited_evidence_ids)
+    }
+}
+
+fn is_high_severity_change(severity: CopilotProactiveChangeSeverity) -> bool {
+    matches!(
+        severity,
+        CopilotProactiveChangeSeverity::High | CopilotProactiveChangeSeverity::Critical
+    )
 }
 
 fn normalize_fixture(
@@ -1174,16 +1948,23 @@ mod tests {
     use super::{
         annotate_answer_uncertainty, answer_grounded_question, approve_recommendation_draft,
         build_evidence_retrieval_index, create_copilot_turn, draft_recommendation_from_answer,
-        post_check_grounded_answer, start_copilot_conversation, CopilotAnswer, CopilotAnswerClaim,
-        CopilotAnswerRequest, CopilotConfidenceLevel, CopilotConversationError,
-        CopilotConversationStartRequest, CopilotGroundingError, CopilotIndexError, CopilotModel,
-        CopilotModelError, CopilotRecommendationApproval, CopilotRecommendationDraftError,
-        CopilotRecommendationDraftRequest, CopilotRecommendationDraftStatus, CopilotRefusalReason,
-        CopilotTurnCreateRequest, CopilotTurnRole, DeterministicAnswerFixture,
-        DeterministicCopilotModel, EvidenceCandidate, EvidenceFreshnessRecord,
-        EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind, EvidenceRejectionReason,
-        GroundedCopilotAnswer, GroundedCopilotQuestionRequest, LedgerEvidenceResolver,
-        UnavailableCopilotModel, UncertaintyReasonCode,
+        explain_zone_finding_change, export_copilot_answer_with_citations, finalize_audited_turn,
+        post_check_grounded_answer, resolve_copilot_field_context, start_copilot_conversation,
+        surface_proactive_closed_loop_advisory, CopilotAnswer, CopilotAnswerClaim,
+        CopilotAnswerExportError, CopilotAnswerExportRequest, CopilotAnswerRequest,
+        CopilotAuditError, CopilotAuditSink, CopilotConfidenceLevel, CopilotContextError,
+        CopilotContextUpdateRequest, CopilotConversationError, CopilotConversationStartRequest,
+        CopilotExplanationError, CopilotExplanationRequest, CopilotFieldContext,
+        CopilotGroundingError, CopilotIndexError, CopilotModel, CopilotModelError,
+        CopilotProactiveChangeSeverity, CopilotRecommendationApproval,
+        CopilotRecommendationDraftError, CopilotRecommendationDraftRequest,
+        CopilotRecommendationDraftStatus, CopilotRefusalReason, CopilotTurnAuditRecord,
+        CopilotTurnAuditRequest, CopilotTurnCreateRequest, CopilotTurnRole,
+        DeterministicAnswerFixture, DeterministicCopilotModel, EvidenceCandidate,
+        EvidenceFreshnessRecord, EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind,
+        EvidenceRejectionReason, GroundedCopilotAnswer, GroundedCopilotQuestionRequest,
+        LedgerEvidenceResolver, ProactiveClosedLoopAdvisoryRequest,
+        ProactiveClosedLoopAdvisorySkipReason, UnavailableCopilotModel, UncertaintyReasonCode,
     };
     use shared::schemas::{RecommendationLifecycleRegistry, RecommendationPriority};
 
@@ -1378,6 +2159,215 @@ mod tests {
                 turn_field_id: "field-foreign".to_string()
             }
         );
+    }
+
+    #[test]
+    fn field_context_carries_scene_zone_and_evidence_into_followup() {
+        let conversation = conversation_record("conversation-001", "field-001");
+        let first = resolve_copilot_field_context(
+            &conversation,
+            None,
+            CopilotContextUpdateRequest {
+                field_id: None,
+                active_scene: Some("scene-2026-06-12".to_string()),
+                active_zone: Some("zone-ne".to_string()),
+                retrieved_evidence: vec![retrieved_evidence("evidence-ndvi-001")],
+            },
+        )
+        .expect("initial context should resolve");
+
+        let followup = resolve_copilot_field_context(
+            &conversation,
+            Some(&first.context),
+            CopilotContextUpdateRequest {
+                field_id: None,
+                active_scene: None,
+                active_zone: None,
+                retrieved_evidence: vec![],
+            },
+        )
+        .expect("follow-up should carry context");
+
+        assert_eq!(followup.context.field_id, "field-001");
+        assert_eq!(
+            followup.context.active_scene.as_deref(),
+            Some("scene-2026-06-12")
+        );
+        assert_eq!(followup.context.active_zone.as_deref(), Some("zone-ne"));
+        assert_eq!(
+            followup.context.last_evidence_ids,
+            vec!["evidence-ndvi-001"]
+        );
+        assert!(followup.rejected_evidence_ids.is_empty());
+    }
+
+    #[test]
+    fn field_context_isolates_other_field_evidence() {
+        let conversation = conversation_record("conversation-001", "field-001");
+        let resolution = resolve_copilot_field_context(
+            &conversation,
+            None,
+            CopilotContextUpdateRequest {
+                field_id: None,
+                active_scene: Some("scene-2026-06-12".to_string()),
+                active_zone: None,
+                retrieved_evidence: vec![
+                    retrieved_evidence("evidence-ndvi-001"),
+                    retrieved_evidence_for_field("evidence-other-field", "field-foreign"),
+                ],
+            },
+        )
+        .expect("context should resolve with isolated evidence");
+
+        assert_eq!(
+            resolution.context.last_evidence_ids,
+            vec!["evidence-ndvi-001"]
+        );
+        assert_eq!(
+            resolution.rejected_evidence_ids,
+            vec!["evidence-other-field"]
+        );
+    }
+
+    #[test]
+    fn field_context_rejects_cross_field_followup_scope() {
+        let conversation = conversation_record("conversation-001", "field-001");
+        let previous = CopilotFieldContext {
+            conversation_id: "conversation-001".to_string(),
+            field_id: "field-001".to_string(),
+            active_scene: None,
+            active_zone: None,
+            last_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+        };
+
+        let error = resolve_copilot_field_context(
+            &conversation,
+            Some(&previous),
+            CopilotContextUpdateRequest {
+                field_id: Some("field-foreign".to_string()),
+                active_scene: None,
+                active_zone: None,
+                retrieved_evidence: vec![],
+            },
+        )
+        .expect_err("cross-field follow-up should be rejected");
+
+        assert_eq!(
+            error,
+            CopilotContextError::FieldScopeMismatch {
+                context_field_id: "field-001".to_string(),
+                requested_field_id: "field-foreign".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn explain_zone_finding_change_cites_finding_zone_and_28_change() {
+        let explanation = explain_zone_finding_change(CopilotExplanationRequest {
+            question: "explain the NE zone".to_string(),
+            field_id: "field-001".to_string(),
+            zone_ref: "zone-ne".to_string(),
+            retrieved_evidence: vec![
+                evidence_entry(
+                    "finding-09-001",
+                    EvidenceKind::Finding,
+                    Some("zone-ne"),
+                    "09 finding: northeast zone is stressed with low NDVI.",
+                ),
+                evidence_entry(
+                    "zone-10-ne",
+                    EvidenceKind::ImageryProduct,
+                    Some("zone-ne"),
+                    "Zone NE boundary covers the stressed canopy cluster.",
+                ),
+                evidence_entry(
+                    "change-28-001",
+                    EvidenceKind::Trend,
+                    Some("zone-ne"),
+                    "28 ranked change event: NDVI declined 0.18 versus aligned baseline pair.",
+                ),
+            ],
+        })
+        .expect("explanation should build");
+
+        assert!(!explanation.no_comparable_history);
+        assert_eq!(
+            explanation.answer.cited_evidence_ids,
+            vec![
+                "change-28-001".to_string(),
+                "finding-09-001".to_string(),
+                "zone-10-ne".to_string()
+            ]
+        );
+        assert_eq!(explanation.answer.claims.len(), 3);
+        assert!(explanation.answer.text.contains("Domain 28 change context"));
+    }
+
+    #[test]
+    fn explain_change_with_no_baseline_does_not_invent_history() {
+        let explanation = explain_zone_finding_change(CopilotExplanationRequest {
+            question: "what changed since last flight?".to_string(),
+            field_id: "field-001".to_string(),
+            zone_ref: "zone-ne".to_string(),
+            retrieved_evidence: vec![
+                evidence_entry(
+                    "finding-09-001",
+                    EvidenceKind::Finding,
+                    Some("zone-ne"),
+                    "09 finding: northeast zone has low vigor.",
+                ),
+                evidence_entry(
+                    "zone-10-ne",
+                    EvidenceKind::ImageryProduct,
+                    Some("zone-ne"),
+                    "Zone NE boundary covers the stressed canopy cluster.",
+                ),
+                evidence_entry(
+                    "change-28-no-baseline",
+                    EvidenceKind::Trend,
+                    Some("zone-ne"),
+                    "28 reports no baseline for this zone, so no comparable history exists.",
+                ),
+            ],
+        })
+        .expect("no-baseline explanation should build");
+
+        assert!(explanation.no_comparable_history);
+        assert!(explanation
+            .answer
+            .text
+            .contains("no comparable baseline/history"));
+        assert!(!explanation.answer.text.contains("declined 0."));
+        assert_eq!(
+            explanation.answer.claims[2].cited_evidence_ids,
+            vec!["change-28-no-baseline".to_string()]
+        );
+    }
+
+    #[test]
+    fn explain_zone_refuses_without_28_change_evidence() {
+        let error = explain_zone_finding_change(CopilotExplanationRequest {
+            question: "explain the NE zone".to_string(),
+            field_id: "field-001".to_string(),
+            zone_ref: "zone-ne".to_string(),
+            retrieved_evidence: vec![
+                evidence_entry(
+                    "finding-09-001",
+                    EvidenceKind::Finding,
+                    Some("zone-ne"),
+                    "09 finding: northeast zone is stressed.",
+                ),
+                evidence_entry(
+                    "zone-10-ne",
+                    EvidenceKind::ImageryProduct,
+                    Some("zone-ne"),
+                    "Zone NE boundary covers the stressed canopy cluster.",
+                ),
+            ],
+        })
+        .expect_err("28 change evidence is required");
+
+        assert_eq!(error, CopilotExplanationError::MissingChangeEvidence);
     }
 
     #[test]
@@ -1635,6 +2625,150 @@ mod tests {
     }
 
     #[test]
+    fn completed_turn_writes_cited_audit_record_before_finalizing() {
+        let turn = answer_grounded_question(
+            &RecordingCopilotModel::new(fixture_answer()),
+            grounded_question_request(
+                "why is the northeast zone stressed?",
+                vec![retrieved_evidence("evidence-ndvi-001")],
+            ),
+        )
+        .expect("grounded answer should return");
+        let mut sink = RecordingAuditSink::default();
+
+        let finalized = finalize_audited_turn(&mut sink, audit_request(turn))
+            .expect("audit write should finalize turn");
+
+        assert!(!finalized.turn.refused);
+        assert_eq!(sink.records.len(), 1);
+        assert_eq!(
+            finalized.audit.question,
+            "why is the northeast zone stressed?"
+        );
+        assert_eq!(
+            finalized.audit.answer.as_deref(),
+            Some("The northeast zone is stressed.")
+        );
+        assert_eq!(
+            finalized.audit.cited_evidence_ids,
+            vec!["evidence-ndvi-001"]
+        );
+        assert_eq!(finalized.audit.confidence, Some(0.82));
+        assert_eq!(finalized.audit.interface_version, "copilot-interface-v1");
+        assert_eq!(finalized.audit.ledger_ref, "ledger:30:copilot:turn-001");
+        assert_eq!(
+            finalized.audit.model_provider.as_deref(),
+            Some("test-double")
+        );
+    }
+
+    #[test]
+    fn audit_write_failure_blocks_final_answer() {
+        let turn = answer_grounded_question(
+            &RecordingCopilotModel::new(fixture_answer()),
+            grounded_question_request(
+                "why is the northeast zone stressed?",
+                vec![retrieved_evidence("evidence-ndvi-001")],
+            ),
+        )
+        .expect("grounded answer should return");
+        let mut sink = FailingAuditSink;
+
+        let error = finalize_audited_turn(&mut sink, audit_request(turn))
+            .expect_err("failed audit must block finalization");
+
+        assert_eq!(
+            error,
+            CopilotAuditError::AuditWriteFailed {
+                reason: "ledger unavailable".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn refused_turn_is_audited_without_model_citations() {
+        let turn = answer_grounded_question(
+            &RecordingCopilotModel::new(fixture_answer()),
+            grounded_question_request("why is the northeast zone stressed?", vec![]),
+        )
+        .expect("no-evidence turn should refuse");
+        let mut sink = RecordingAuditSink::default();
+
+        let finalized = finalize_audited_turn(&mut sink, audit_request(turn))
+            .expect("refusal audit should finalize");
+
+        assert!(finalized.turn.refused);
+        assert_eq!(
+            finalized.audit.refusal_reason,
+            Some(CopilotRefusalReason::NoEvidence)
+        );
+        assert!(finalized.audit.answer.is_none());
+        assert!(finalized.audit.cited_evidence_ids.is_empty());
+        assert_eq!(sink.records.len(), 1);
+    }
+
+    #[test]
+    fn answer_export_includes_resolvable_citation_ledger_refs() {
+        let export = export_copilot_answer_with_citations(CopilotAnswerExportRequest {
+            question: "explain the NE zone".to_string(),
+            turn: completed_turn(),
+            retrieved_evidence: vec![retrieved_evidence("evidence-ndvi-001")],
+            exported_at: "2026-06-13T17:00:00Z".to_string(),
+        })
+        .expect("export should validate");
+
+        assert!(!export.refused);
+        assert_eq!(export.answer.as_deref(), Some("The zone needs attention."));
+        assert_eq!(export.confidence, Some(0.82));
+        assert_eq!(export.cited_evidence.len(), 1);
+        assert_eq!(
+            export.cited_evidence[0].ledger_ref,
+            "ledger:30:evidence-ndvi-001"
+        );
+        assert_eq!(export.cited_evidence[0].evidence_id, "evidence-ndvi-001");
+    }
+
+    #[test]
+    fn answer_export_rejects_citation_without_ledger_ref() {
+        let mut evidence = retrieved_evidence("evidence-ndvi-001");
+        evidence.ledger_ref = " ".to_string();
+        let error = export_copilot_answer_with_citations(CopilotAnswerExportRequest {
+            question: "explain the NE zone".to_string(),
+            turn: completed_turn(),
+            retrieved_evidence: vec![evidence],
+            exported_at: "2026-06-13T17:00:00Z".to_string(),
+        })
+        .expect_err("missing ledger ref should fail export validation");
+
+        assert_eq!(
+            error,
+            CopilotAnswerExportError::CitationMissingLedgerRef {
+                evidence_id: "evidence-ndvi-001".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_export_records_reason_without_fabricated_answer() {
+        let export = export_copilot_answer_with_citations(CopilotAnswerExportRequest {
+            question: "what changed in unknown field?".to_string(),
+            turn: no_evidence_turn(),
+            retrieved_evidence: vec![],
+            exported_at: "2026-06-13T17:00:00Z".to_string(),
+        })
+        .expect("refusal export should validate");
+
+        assert!(export.refused);
+        assert_eq!(
+            export.refusal_reason,
+            Some(CopilotRefusalReason::NoEvidence)
+        );
+        assert!(export.answer.is_none());
+        assert!(export.confidence.is_none());
+        assert!(export.cited_evidence.is_empty());
+    }
+
+    #[test]
     fn uncertainty_marker_is_high_for_fully_cited_fresh_answer() {
         let annotated = annotate_answer_uncertainty(
             grounded_answer_with_claims(vec![CopilotAnswerClaim {
@@ -1787,15 +2921,151 @@ mod tests {
         assert_eq!(error, CopilotRecommendationDraftError::NoCitedEvidence);
     }
 
+    #[test]
+    fn proactive_closed_loop_advisory_surfaces_cited_draft_and_audit_for_high_severity_change() {
+        let mut sink = RecordingAuditSink::default();
+
+        let result = surface_proactive_closed_loop_advisory(
+            &mut sink,
+            proactive_request(vec![retrieved_evidence("change-evidence-001")]),
+        )
+        .expect("high-severity event should produce proactive advisory");
+
+        assert!(result.surfaced);
+        assert!(!result.action_executed);
+        let advisory = result.advisory.expect("advisory should be surfaced");
+        assert_eq!(advisory.advisory_id, "proactive-001");
+        assert_eq!(advisory.change_event_id, "domain28-change-001");
+        assert_eq!(
+            advisory.answer.cited_evidence_ids,
+            vec!["change-evidence-001"]
+        );
+        assert_eq!(
+            advisory.draft_action.status,
+            CopilotRecommendationDraftStatus::Draft
+        );
+        assert_eq!(
+            advisory.draft_action.cited_evidence_ids,
+            vec!["change-evidence-001"]
+        );
+        assert!(advisory.requires_human_approval);
+        assert!(!advisory.action_executed);
+        assert_eq!(sink.records.len(), 1);
+        assert_eq!(advisory.audit.ledger_ref, "ledger:30:copilot:proactive-001");
+        assert_eq!(
+            advisory.audit.cited_evidence_ids,
+            vec!["change-evidence-001"]
+        );
+    }
+
+    #[test]
+    fn proactive_closed_loop_advisory_draft_is_inert_without_approval() {
+        let mut sink = RecordingAuditSink::default();
+        let registry = RecommendationLifecycleRegistry::default();
+
+        let result = surface_proactive_closed_loop_advisory(
+            &mut sink,
+            proactive_request(vec![retrieved_evidence("change-evidence-001")]),
+        )
+        .expect("high-severity event should produce proactive advisory");
+        let advisory = result.advisory.expect("advisory should be surfaced");
+
+        assert_eq!(
+            advisory.draft_action.status,
+            CopilotRecommendationDraftStatus::Draft
+        );
+        assert!(registry.recommendations_for_org("org-a").is_empty());
+        assert!(!result.action_executed);
+        assert!(!advisory.action_executed);
+    }
+
+    #[test]
+    fn proactive_closed_loop_advisory_skips_unresolved_evidence_without_claim_or_action() {
+        let mut sink = RecordingAuditSink::default();
+        let mut unresolved = retrieved_evidence("change-evidence-001");
+        unresolved.ledger_ref = " ".to_string();
+
+        let result =
+            surface_proactive_closed_loop_advisory(&mut sink, proactive_request(vec![unresolved]))
+                .expect("unresolved evidence should skip without surfacing");
+
+        assert!(!result.surfaced);
+        assert!(result.advisory.is_none());
+        assert_eq!(
+            result.skip_reason,
+            Some(ProactiveClosedLoopAdvisorySkipReason::UnresolvedEvidence)
+        );
+        assert!(!result.action_executed);
+        assert!(sink.records.is_empty());
+    }
+
     fn retrieved_evidence(evidence_id: &str) -> EvidenceIndexEntry {
+        retrieved_evidence_for_field(evidence_id, "field-001")
+    }
+
+    fn retrieved_evidence_for_field(evidence_id: &str, field_id: &str) -> EvidenceIndexEntry {
         EvidenceIndexEntry {
             evidence_id: evidence_id.to_string(),
             kind: EvidenceKind::ImageryProduct,
-            field_id: "field-001".to_string(),
+            field_id: field_id.to_string(),
             scene_ref: Some("scene-2026-06-01".to_string()),
             zone_ref: Some("zone-ne".to_string()),
             ledger_ref: format!("ledger:30:{evidence_id}"),
             summary: "NDVI in the northeast zone dropped below threshold.".to_string(),
+        }
+    }
+
+    fn proactive_request(
+        retrieved_evidence: Vec<EvidenceIndexEntry>,
+    ) -> ProactiveClosedLoopAdvisoryRequest {
+        ProactiveClosedLoopAdvisoryRequest {
+            advisory_id: "proactive-001".to_string(),
+            conversation_id: "conversation-001".to_string(),
+            turn_id: "turn-proactive-001".to_string(),
+            org_id: "org-a".to_string(),
+            field_id: "field-001".to_string(),
+            scene_id: "scene-2026-06-12".to_string(),
+            zone_ref: "zone-ne".to_string(),
+            author_user_id: "copilot".to_string(),
+            change_event_id: "domain28-change-001".to_string(),
+            change_event_summary: "NDVI dropped sharply in the northeast zone.".to_string(),
+            severity: CopilotProactiveChangeSeverity::High,
+            event_evidence_ids: vec!["change-evidence-001".to_string()],
+            retrieved_evidence,
+            action_category: "scouting".to_string(),
+            title: "Review high-severity crop change".to_string(),
+            note: Some("Drafted from a cited domain 28 change event.".to_string()),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+            interface_version: "copilot-interface-v1".to_string(),
+            audit_ledger_ref: "ledger:30:copilot:proactive-001".to_string(),
+        }
+    }
+
+    fn evidence_entry(
+        evidence_id: &str,
+        kind: EvidenceKind,
+        zone_ref: Option<&str>,
+        summary: &str,
+    ) -> EvidenceIndexEntry {
+        EvidenceIndexEntry {
+            evidence_id: evidence_id.to_string(),
+            kind,
+            field_id: "field-001".to_string(),
+            scene_ref: Some("scene-2026-06-01".to_string()),
+            zone_ref: zone_ref.map(ToOwned::to_owned),
+            ledger_ref: format!("ledger:30:{evidence_id}"),
+            summary: summary.to_string(),
+        }
+    }
+
+    fn conversation_record(
+        conversation_id: &str,
+        field_id: &str,
+    ) -> super::CopilotConversationRecord {
+        super::CopilotConversationRecord {
+            conversation_id: conversation_id.to_string(),
+            field_id: field_id.to_string(),
+            created_at: "2026-06-13T16:00:00Z".to_string(),
         }
     }
 
@@ -1849,6 +3119,72 @@ mod tests {
             model_provider: "test-double".to_string(),
             model_id: "fixture-rag".to_string(),
             model_version: "2026-06-12".to_string(),
+        }
+    }
+
+    fn completed_turn() -> super::GroundedCopilotTurn {
+        super::GroundedCopilotTurn {
+            refused: false,
+            refusal: None,
+            answer: Some(GroundedCopilotAnswer {
+                text: "The zone needs attention.".to_string(),
+                claims: vec![CopilotAnswerClaim {
+                    text: "The zone needs attention.".to_string(),
+                    cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+                }],
+                cited_evidence_ids: vec!["evidence-ndvi-001".to_string()],
+                confidence: 0.82,
+                model_provider: "test-double".to_string(),
+                model_id: "fixture-rag".to_string(),
+                model_version: "2026-06-12".to_string(),
+            }),
+        }
+    }
+
+    fn no_evidence_turn() -> super::GroundedCopilotTurn {
+        super::GroundedCopilotTurn {
+            refused: true,
+            refusal: Some(super::CopilotRefusal {
+                refused: true,
+                reason: CopilotRefusalReason::NoEvidence,
+                needed_evidence: vec![
+                    "resolvable indexed evidence relevant to the question".to_string()
+                ],
+            }),
+            answer: None,
+        }
+    }
+
+    fn audit_request(turn: super::GroundedCopilotTurn) -> CopilotTurnAuditRequest {
+        CopilotTurnAuditRequest {
+            conversation_id: "conversation-001".to_string(),
+            turn_id: "turn-001".to_string(),
+            field_id: "field-001".to_string(),
+            question: "why is the northeast zone stressed?".to_string(),
+            turn,
+            interface_version: "copilot-interface-v1".to_string(),
+            ts: "2026-06-13T16:02:00Z".to_string(),
+            ledger_ref: "ledger:30:copilot:turn-001".to_string(),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAuditSink {
+        records: Vec<CopilotTurnAuditRecord>,
+    }
+
+    impl CopilotAuditSink for RecordingAuditSink {
+        fn write_turn_audit(&mut self, record: &CopilotTurnAuditRecord) -> Result<(), String> {
+            self.records.push(record.clone());
+            Ok(())
+        }
+    }
+
+    struct FailingAuditSink;
+
+    impl CopilotAuditSink for FailingAuditSink {
+        fn write_turn_audit(&mut self, _record: &CopilotTurnAuditRecord) -> Result<(), String> {
+            Err("ledger unavailable".to_string())
         }
     }
 

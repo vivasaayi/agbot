@@ -23,11 +23,18 @@ use axum::{
 };
 use compliance::{
     airspace_zone_contains_point, airspace_zone_is_effective_at, append_compliance_record_version,
-    build_airspace_zone_record, build_compliance_audit_report, build_initial_compliance_record,
-    refuse_in_place_mutation, AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError,
-    AirspaceZoneIngestRequest, AirspaceZoneRecord, AppendComplianceRecordVersionRequest,
-    ComplianceAuditReport, ComplianceAuditReportError, ComplianceAuditReportRequest,
-    ComplianceRecord, ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType,
+    build_airspace_zone_record, build_compliance_audit_report, build_compliance_authority_export,
+    build_compliance_authority_share, build_compliance_regulation_assist,
+    build_initial_compliance_record, refuse_in_place_mutation, revoke_compliance_authority_share,
+    AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
+    AirspaceZoneRecord, AppendComplianceRecordVersionRequest, ComplianceAuditReport,
+    ComplianceAuditReportError, ComplianceAuditReportRequest, ComplianceAuthorityExportArtifact,
+    ComplianceAuthorityExportError, ComplianceAuthorityExportRequest, ComplianceAuthorityFormat,
+    ComplianceAuthorityShareArtifact, ComplianceAuthorityShareError,
+    ComplianceAuthorityShareRequest, ComplianceRecord, ComplianceRecordError,
+    ComplianceRecordPayload, ComplianceRecordType, ComplianceRegulationAssistError,
+    ComplianceRegulationAssistIntent, ComplianceRegulationAssistOutput,
+    ComplianceRegulationAssistRequest, ComplianceRetentionClass, ComplianceRuleCitation,
     CreateComplianceRecordRequest,
 };
 use copilot::{
@@ -36,26 +43,31 @@ use copilot::{
     CopilotTurnRecord, CopilotTurnRole,
 };
 use crop_intelligence::{
-    apply_detection_verification, assemble_detection_finding, build_inference_run_record,
-    build_model_version_record, transition_inference_run_status,
-    validate_detection_finding_promotion, validate_model_reference, CropDetectionCorrectionLabel,
+    apply_detection_verification, assemble_detection_finding, build_crop_closed_loop_proposal,
+    build_inference_run_progress_record, build_inference_run_record, build_model_version_record,
+    detect_inference_run_stall, inference_run_progress_stream, transition_inference_run_status,
+    validate_detection_finding_promotion, validate_model_reference, CropClosedLoopAction,
+    CropClosedLoopApprovalStatus, CropClosedLoopFindingEvidence, CropClosedLoopProposal,
+    CropClosedLoopProposalError, CropClosedLoopProposalRequest, CropDetectionCorrectionLabel,
     CropDetectionFindingError, CropDetectionFindingRecord, CropDetectionFindingRequest,
     CropDetectionVerificationAction, CropDetectionVerificationError,
     CropDetectionVerificationRecord, CropDetectionVerificationRequest, CropModelRegistryError,
     CropModelTask, DetectionVerificationState, DetectionZoneGeometry, FindingPromotionDecision,
     FindingPromotionError, FindingPromotionRequest, InferenceModelReference, InferenceRunError,
-    InferenceRunRecord, InferenceRunStatus, InferenceRunSubmissionRequest, ModelGateResponse,
-    ModelVersionRecord, ModelVersionRegistrationRequest,
+    InferenceRunProgressInput, InferenceRunProgressRecord, InferenceRunProgressStream,
+    InferenceRunRecord, InferenceRunStallEvent, InferenceRunStatus, InferenceRunSubmissionRequest,
+    ModelGateResponse, ModelVersionRecord, ModelVersionRegistrationRequest,
 };
 use fleet_health::{
     accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
     build_component_record, component_event, derive_health_indicators, evaluate_ota_rollout,
-    install_component, ComponentDutyAccrualRecord, DutyAccrualRequest, FleetComponentEventRecord,
-    FleetComponentRecord, FleetComponentType, FleetHealthError, FleetHealthIndicator,
-    FleetHealthIndicatorDerivation, FleetHealthIndicatorSample, HealthIndicatorFreshness,
-    HealthTelemetryGap, InstallComponentRequest, OtaRolloutDecision, OtaRolloutRequest,
-    RegisterComponentRequest, RolloutControlDecision, RolloutControlRequest, ServiceHistoryEntry,
-    TelemetryHealthIndicatorRequest,
+    install_component, integrate_ground_vehicle_health, ComponentDutyAccrualRecord,
+    DutyAccrualRequest, FleetComponentEventRecord, FleetComponentRecord, FleetComponentType,
+    FleetHealthError, FleetHealthIndicator, FleetHealthIndicatorDerivation,
+    FleetHealthIndicatorSample, GroundVehicleHealthIngestRequest, GroundVehicleHealthIntegration,
+    HealthIndicatorFreshness, HealthTelemetryGap, InstallComponentRequest, OtaRolloutDecision,
+    OtaRolloutRequest, RegisterComponentRequest, RolloutControlDecision, RolloutControlRequest,
+    ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
 };
 use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
@@ -77,43 +89,131 @@ use plugin_sdk::{
     SandboxExecutionStatus, SandboxTerminationReason,
 };
 use provenance::{
-    ActorIdentity, ActorKind, AuditAction, AuditEntry, AuditLedger, AuditRefusalReason,
-    LineageRecord, ProvenanceParameters,
+    ActorIdentity, ActorKind, ArtifactKind, AuditAction, AuditEntry, AuditLedger,
+    AuditRefusalReason, BackwardProvenanceTrace, LineageLedger, LineageRecord,
+    ProvenanceParameters,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
-    append_content_version, assert_raster_spatial_ref, bind_fleet_node_identity,
-    bounds_from_points, build_collaboration_channel, build_collaboration_message,
-    build_marketplace_account_record, build_soil_moisture_reading, build_sustainability_record,
-    build_tractor_record, compute_drought_index, create_versioned_content,
-    normalize_weather_provider_forecast, parse_content_status, parse_content_type,
-    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_party_type,
-    parse_soil_moisture_qa_flag, parse_soil_moisture_rejection_reason,
-    parse_sustainability_metric_type, soil_moisture_rejection_reason_for_error,
-    soil_moisture_rejection_record, transition_marketplace_account_status, validate_field_boundary,
-    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
-    CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
-    CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
-    ContentCreateRequest, ContentEditRequest, ContentError, ContentRecord, ContentStatus,
-    ContentType, ContentVersionRecord, DroughtIndexComputeRequest, DroughtIndexError,
+    aggregate_content_engagement, aggregate_marketplace_ratings, append_content_version,
+    apply_collaboration_mission_edit, apply_content_taxonomy_tags, assemble_marketplace_org_report,
+    assert_raster_spatial_ref, authorize_collaboration_action, bind_fleet_node_identity,
+    bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
+    build_collaboration_message, build_collaboration_notifications,
+    build_collaboration_operator_console_feed, build_content_portal_embed,
+    build_marketplace_account_record, build_marketplace_catalog_item_record,
+    build_marketplace_inventory_record, build_marketplace_portal_entry,
+    build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
+    build_sustainability_record, build_tractor_record, close_marketplace_listing_record,
+    compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
+    compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
+    compute_sustainability_kpi, content_portal_embed_item, create_collaboration_mission_plan,
+    create_community_contribution, create_content_engagement_event, create_content_locale_variant,
+    create_marketplace_fulfillment_record, create_marketplace_rating_record,
+    create_success_story_content, create_sustainability_baseline, create_sustainability_mrv_trail,
+    create_versioned_content, estimate_biomass, evaluate_collaboration_mission_dispatch,
+    expire_lapsed_collaboration_presence, fulfill_marketplace_inventory,
+    link_collaboration_session_annotation, moderate_community_contribution,
+    normalize_weather_provider_forecast, parse_biodiversity_proxy_status,
+    parse_carbon_footprint_status, parse_content_contribution_status,
+    parse_content_engagement_event_type, parse_content_status, parse_content_type,
+    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
+    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
+    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
+    parse_marketplace_order_status, parse_marketplace_party_type,
+    parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
+    parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
+    parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
+    parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
+    parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
+    publish_marketplace_listing_record, raise_collaboration_emergency_alert,
+    record_collaboration_session, relay_collaboration_stream_frame, release_marketplace_inventory,
+    reserve_marketplace_inventory, resolve_content_permissions, resolve_localized_content,
+    search_published_content, soil_moisture_rejection_reason_for_error,
+    soil_moisture_rejection_record, start_collaboration_stream,
+    transition_collaboration_emergency_alert, transition_content_workflow,
+    transition_marketplace_account_status, transition_marketplace_fulfillment_status,
+    transition_marketplace_order_status, update_collaboration_presence, validate_field_boundary,
+    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord, BiodiversityProxyError,
+    BiodiversityProxyRequest, BiodiversityProxyResult, BiodiversityProxyStatus,
+    BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult, CarbonEmissionFactor,
+    CarbonFootprintComputeRequest, CarbonFootprintError, CarbonFootprintInput,
+    CarbonFootprintResult, CarbonFootprintStatus, CollaborationAction,
+    CollaborationActionAuthorizeRequest, CollaborationChannelCreateRequest,
+    CollaborationChannelRecord, CollaborationChannelThread, CollaborationEmergencyAlertAuditRecord,
+    CollaborationEmergencyAlertCreateRequest, CollaborationEmergencyAlertRaiseResult,
+    CollaborationEmergencyAlertRecord, CollaborationEmergencyAlertSource,
+    CollaborationEmergencyAlertState, CollaborationEmergencyAlertTransitionRequest,
+    CollaborationEmergencyAlertTransitionResult, CollaborationError, CollaborationLiveStreamRecord,
+    CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    CollaborationMissionDispatchAuditRecord, CollaborationMissionDispatchRequest,
+    CollaborationMissionDispatchResult, CollaborationMissionEditAuditRecord,
+    CollaborationMissionEditDecision, CollaborationMissionEditResult,
+    CollaborationMissionPlanCreateRequest, CollaborationMissionPlanRecord,
+    CollaborationMissionWaypoint, CollaborationMissionWaypointEditRequest,
+    CollaborationNotificationEventRequest, CollaborationNotificationRecord,
+    CollaborationOperatorConsoleFeed, CollaborationPermissionDecision,
+    CollaborationPermissionResolveRequest, CollaborationPermissionSet, CollaborationPortalFeed,
+    CollaborationPresenceRecord, CollaborationPresenceState, CollaborationPresenceUpdateRequest,
+    CollaborationSessionAnnotationLinkRecord, CollaborationSessionAnnotationLinkRequest,
+    CollaborationSessionAnnotationRecord, CollaborationSessionEventKind,
+    CollaborationSessionEventRecord, CollaborationSessionRecord, CollaborationSessionRecordRequest,
+    CollaborationSessionReplay, CollaborationStreamFrameRecord,
+    CollaborationStreamFrameRelayRequest, CollaborationStreamRelayResult,
+    CollaborationStreamStartRequest, CollaborationStreamState,
+    ContentCommunityContributionCreateRequest, ContentCommunityContributionRecord,
+    ContentContributionModerationAuditRecord, ContentContributionModerationRequest,
+    ContentContributionModerationResult, ContentCreateRequest, ContentEditRequest,
+    ContentEngagementEventCreateRequest, ContentEngagementEventRecord, ContentEngagementSummary,
+    ContentError, ContentLocaleVariantCreateRequest, ContentLocaleVariantRecord,
+    ContentLocalizedRecord, ContentPermissionResolveRequest, ContentPermissionSet,
+    ContentPortalEmbed, ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord,
+    ContentSearchDocument, ContentSearchRequest, ContentSearchResult, ContentStatus,
+    ContentSuccessStoryCreateRequest, ContentSuccessStoryRecord, ContentTagApplyRequest,
+    ContentTagRecord, ContentTaxonomyKind, ContentType, ContentVersionRecord,
+    ContentWorkflowAction, ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest,
+    ContentWorkflowTransitionResult, DroughtIndexComputeRequest, DroughtIndexError,
     DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
     FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
     FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
     FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
     ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplacePartyType, MultispectralImage,
-    RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationRecord,
-    RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility, SoilMoistureReadingError,
-    SoilMoistureReadingRecord, SoilMoistureReadingRequest, SoilMoistureRejectionReason,
-    SoilMoistureRejectionRecord, SustainabilityMetricType, SustainabilityRecord,
-    SustainabilityRecordCreateRequest, SustainabilityRecordError, SustainabilityRecordLinkage,
-    TractorCommandAuditDecision, TractorCommandAuditRecord, TractorCommandRejection,
-    TractorCommandRejectionReason, TractorImplementRef, TractorLifecycleStatus,
-    TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest, TractorRegistryError,
-    VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
-    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
-    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
+    MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
+    MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+    MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
+    MarketplaceDemandForecastRequest, MarketplaceDemandUncertaintyBand,
+    MarketplaceFulfillmentAuditRecord, MarketplaceFulfillmentCreateRequest,
+    MarketplaceFulfillmentError, MarketplaceFulfillmentRecord, MarketplaceFulfillmentStatus,
+    MarketplaceInventoryError, MarketplaceInventoryRecord, MarketplaceInventoryUpsertRequest,
+    MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingRecord,
+    MarketplaceListingStatus, MarketplaceOrderAuditRecord, MarketplaceOrderCreateRequest,
+    MarketplaceOrderError, MarketplaceOrderRecord, MarketplaceOrderStatus, MarketplaceOrgReport,
+    MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntry,
+    MarketplacePortalEntryError, MarketplaceRatingAggregate, MarketplaceRatingCreateRequest,
+    MarketplaceRatingError, MarketplaceRatingRecord, MarketplaceReportError,
+    MarketplaceReportPeriod, MultispectralImage, OpenDataPublication, OpenDataPublishError,
+    OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RecommendationPriority,
+    RecommendationRecord, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
+    SoilCarbonProxyError, SoilCarbonProxyRequest, SoilCarbonProxyResult, SoilCarbonProxyStatus,
+    SoilCarbonUncertaintyBand, SoilMoistureReadingError, SoilMoistureReadingRecord,
+    SoilMoistureReadingRequest, SoilMoistureRejectionReason, SoilMoistureRejectionRecord,
+    SustainabilityBaselineCreateRequest, SustainabilityBaselineError, SustainabilityBaselineRecord,
+    SustainabilityCertificationEvidencePack, SustainabilityCertificationEvidencePackError,
+    SustainabilityCertificationEvidencePackRequest, SustainabilityCertificationOutputItem,
+    SustainabilityComparisonRequest, SustainabilityComparisonResult,
+    SustainabilityComparisonStatus, SustainabilityExportItem, SustainabilityFieldExportSummary,
+    SustainabilityKpiError, SustainabilityKpiStatus, SustainabilityKpiTrackingRequest,
+    SustainabilityKpiTrackingResult, SustainabilityMetricType, SustainabilityMrvOutputKind,
+    SustainabilityMrvTrail, SustainabilityMrvTrailCreateRequest, SustainabilityMrvTrailError,
+    SustainabilityRecord, SustainabilityRecordCreateRequest, SustainabilityRecordError,
+    SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
+    TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
+    TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
+    TractorRegistryError, VersionedContentRecord, VersionedSuccessStoryContentRecord,
+    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
+    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
+    GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -136,7 +236,12 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 const TILE_SIZE: u32 = 256;
+const DEFAULT_LAYER_STALE_AFTER_DAYS: i64 = 14;
 const MOBILE_APP_HTML: &str = include_str!("mobile_app.html");
+
+fn default_connection_active() -> bool {
+    true
+}
 
 #[derive(Debug, Serialize)]
 pub struct SceneSummary {
@@ -167,6 +272,28 @@ pub struct SceneRefreshAdvisoriesResponse {
     pub advisory_enabled: bool,
     pub reason: Option<String>,
     pub advisories: Vec<SceneRefreshAdvisory>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SceneChangeAdvisory {
+    pub baseline_scene_id: String,
+    pub comparison_scene_id: String,
+    pub baseline_acquired_at: String,
+    pub comparison_acquired_at: String,
+    pub common_extent: Option<SceneExtent>,
+    pub coverage_fraction: f64,
+    pub change_score: f64,
+    pub uncertainty_low: f64,
+    pub uncertainty_high: f64,
+    pub confidence: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SceneChangeAdvisoriesResponse {
+    pub advisory_enabled: bool,
+    pub reason: Option<String>,
+    pub advisories: Vec<SceneChangeAdvisory>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,6 +345,7 @@ pub struct LayerListQuery {
     pub season_id: Option<String>,
     pub product_kind: Option<String>,
     pub date: Option<String>,
+    pub stale_after_days: Option<i64>,
     pub page: Option<usize>,
     pub page_size: Option<usize>,
 }
@@ -260,6 +388,39 @@ pub struct LayerFreshness {
     pub acquired_at: String,
     pub ingested_at: Option<String>,
     pub coverage_fraction: Option<f64>,
+    pub stale_after_days: i64,
+    pub age_days: Option<i64>,
+    pub stale: bool,
+    pub field_coverage_fraction: Option<f64>,
+    pub field_coverage_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenDataLayerPublishRequest {
+    pub license: String,
+    pub attribution: String,
+    #[serde(default)]
+    pub owner_identifier: Option<String>,
+    #[serde(default)]
+    pub field_identifier: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenDataCatalogResponse {
+    pub layers: Vec<OpenDataLayerCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenDataLayerCatalogEntry {
+    pub open_data_id: String,
+    pub product_kind: String,
+    pub license: String,
+    pub attribution: String,
+    pub anonymized: bool,
+    pub spatial_ref: RasterSpatialRef,
+    pub url_path: String,
+    pub tile_url_template: String,
+    pub published_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -363,6 +524,16 @@ pub struct CreateAnnotationRequest {
     pub note: Option<String>,
     pub severity: Option<String>,
     pub geometry: AnnotationGeometry,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CollaborationSessionAnnotationCreateRequest {
+    pub actor_id: String,
+    pub scene_id: String,
+    pub stream_id: String,
+    #[serde(default = "default_connection_active")]
+    pub connection_active: bool,
+    pub annotation: CreateAnnotationRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -559,6 +730,123 @@ pub struct MarketplaceAccountScopeQuery {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceCatalogListQuery {
+    pub org_id: Option<String>,
+    pub kind: Option<MarketplaceCatalogItemKind>,
+    pub category: Option<MarketplaceCatalogCategory>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceCatalogScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplacePortalEntryQuery {
+    pub org_id: Option<String>,
+    pub account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceListingListQuery {
+    pub org_id: Option<String>,
+    pub status: Option<MarketplaceListingStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceListingScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceListingCloseRequest {
+    pub org_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceInventoryListQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceInventoryScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceInventoryAdjustmentRequest {
+    pub org_id: String,
+    pub qty: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceOrderListQuery {
+    pub org_id: Option<String>,
+    pub status: Option<MarketplaceOrderStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceOrderScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceOrderTransitionRequest {
+    pub org_id: String,
+    pub actor_id: String,
+    pub status: MarketplaceOrderStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceFulfillmentListQuery {
+    pub org_id: Option<String>,
+    pub order_ref: Option<String>,
+    pub status: Option<MarketplaceFulfillmentStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceFulfillmentScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceFulfillmentTransitionRequest {
+    pub org_id: String,
+    pub actor_id: String,
+    pub status: MarketplaceFulfillmentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceRatingListQuery {
+    pub org_id: Option<String>,
+    pub order_ref: Option<String>,
+    pub ratee_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceRatingAggregateQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceDemandForecastListQuery {
+    pub org_id: Option<String>,
+    pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceDemandForecastScopeQuery {
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceReportQuery {
+    pub org_id: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct MarketplaceAccountStatusRequest {
     pub org_id: String,
     pub status: MarketplaceAccountStatus,
@@ -577,6 +865,100 @@ pub struct SustainabilityRecordScopeQuery {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CarbonFootprintListQuery {
+    pub record_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub status: Option<CarbonFootprintStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CarbonFootprintScopeQuery {
+    pub record_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiomassEstimateListQuery {
+    pub record_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiomassEstimateScopeQuery {
+    pub record_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityBaselineListQuery {
+    pub field_id: Option<String>,
+    pub metric_type: Option<SustainabilityMetricType>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityComparisonListQuery {
+    pub field_id: Option<String>,
+    pub status: Option<SustainabilityComparisonStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityComparisonScopeQuery {
+    pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityMrvTrailListQuery {
+    pub output_ref: Option<String>,
+    pub output_kind: Option<SustainabilityMrvOutputKind>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityMrvTrailScopeQuery {
+    pub output_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiodiversityProxyListQuery {
+    pub field_id: Option<String>,
+    pub status: Option<BiodiversityProxyStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiodiversityProxyScopeQuery {
+    pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoilCarbonProxyListQuery {
+    pub field_id: Option<String>,
+    pub status: Option<SoilCarbonProxyStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoilCarbonProxyScopeQuery {
+    pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityKpiListQuery {
+    pub field_id: Option<String>,
+    pub season_id: Option<String>,
+    pub status: Option<SustainabilityKpiStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityKpiScopeQuery {
+    pub field_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityCertificationPackScopeQuery {
+    pub claim_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SustainabilityExportQuery {
+    pub season_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ContentItemListQuery {
     pub org_id: Option<String>,
     pub content_type: Option<ContentType>,
@@ -586,6 +968,49 @@ pub struct ContentItemListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentItemScopeQuery {
     pub org_id: Option<String>,
+    pub actor_org_id: Option<String>,
+    pub role_refs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentPermissionQuery {
+    pub org_id: String,
+    pub actor_org_id: String,
+    #[serde(default)]
+    pub role_refs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentSearchQuery {
+    pub org_id: String,
+    pub q: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentPortalEmbedQuery {
+    pub org_id: String,
+    pub actor_org_id: String,
+    #[serde(default)]
+    pub role_refs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentTagFilterQuery {
+    pub org_id: String,
+    pub kind: ContentTaxonomyKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentEngagementSummaryQuery {
+    pub org_id: String,
+    pub period: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentLocalizedQuery {
+    pub org_id: String,
+    pub locale: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -597,6 +1022,25 @@ pub struct CollaborationChannelListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollaborationScopeQuery {
     pub org_id: Option<String>,
+    pub actor_org_id: Option<String>,
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub role_refs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CollaborationPermissionQuery {
+    pub org_id: String,
+    pub actor_org_id: String,
+    #[serde(default)]
+    pub role_refs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CollaborationPresenceListQuery {
+    pub org_id: String,
+    #[serde(default)]
+    pub stale_before: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -738,6 +1182,12 @@ pub struct UpdateCropInferenceRunStatusRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CropInferenceStallCheckRequest {
+    pub detected_at: String,
+    pub stall_window_seconds: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct VerifyCropDetectionRequest {
     pub task: CropModelTask,
     pub label: String,
@@ -790,6 +1240,65 @@ pub struct ComplianceAuditReportExportRequest {
     pub generated_at: Option<String>,
     #[serde(default)]
     pub mandatory_record_types: Vec<ComplianceRecordType>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceAuthorityExportApiRequest {
+    pub authority_format: ComplianceAuthorityFormat,
+    #[serde(default)]
+    pub report_id: Option<String>,
+    #[serde(default)]
+    pub org_id: String,
+    #[serde(default)]
+    pub field_id: String,
+    #[serde(default)]
+    pub generated_at: Option<String>,
+    #[serde(default)]
+    pub mandatory_record_types: Vec<ComplianceRecordType>,
+    #[serde(default)]
+    pub residency_tag: String,
+    #[serde(default)]
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceAuthorityShareApiRequest {
+    #[serde(flatten)]
+    pub export_request: ComplianceAuthorityExportApiRequest,
+    #[serde(default)]
+    pub share_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceAuthorityShareRevokeRequest {
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceRegulationAssistApiRequest {
+    pub intent: ComplianceRegulationAssistIntent,
+    #[serde(default)]
+    pub assist_id: Option<String>,
+    #[serde(default)]
+    pub org_id: String,
+    #[serde(default)]
+    pub field_id: String,
+    #[serde(default)]
+    pub generated_at: Option<String>,
+    #[serde(default)]
+    pub mandatory_record_types: Vec<ComplianceRecordType>,
+    #[serde(default)]
+    pub rule_citations: Vec<ComplianceRuleCitation>,
+    #[serde(default)]
+    pub feature_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2551,6 +3060,34 @@ pub async fn derive_fleet_health_indicators_route(
     Ok(Json(derived))
 }
 
+pub async fn ingest_tractor_fleet_health(
+    Path(tractor_id): Path<String>,
+    State(state): State<AppState>,
+    Json(mut request): Json<GroundVehicleHealthIngestRequest>,
+) -> AppResult<Json<GroundVehicleHealthIntegration>> {
+    load_tractor(&state, &tractor_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    request.vehicle_id = tractor_id.clone();
+    let integration = integrate_ground_vehicle_health(request).map_err(fleet_health_error)?;
+    upsert_fleet_component(&state, &integration.component).await?;
+    append_fleet_component_event(
+        &state,
+        &component_event(
+            &integration.component.component_id,
+            "ground_vehicle_health_ingested",
+            Some(tractor_id),
+            integration.readiness_decision.checked_at.clone(),
+            None,
+            Some("tractor health ingested from domain 14".to_string()),
+        )
+        .map_err(fleet_health_error)?,
+    )
+    .await?;
+
+    Ok(Json(integration))
+}
+
 pub async fn list_fleet_health_indicators(
     Query(query): Query<FleetHealthIndicatorListQuery>,
     State(state): State<AppState>,
@@ -3011,7 +3548,7 @@ pub async fn get_marketplace_account(
     Query(query): Query<MarketplaceAccountScopeQuery>,
     State(state): State<AppState>,
 ) -> AppResult<Json<MarketplaceAccountRecord>> {
-    let org_id = normalize_optional_text(query.org_id)
+    let org_id = normalize_optional_text(query.org_id.clone())
         .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
     let account = load_marketplace_account(&state, &account_id)
         .await?
@@ -3042,6 +3579,816 @@ pub async fn update_marketplace_account_status(
     update_marketplace_account_record(&state, &updated).await?;
 
     Ok(Json(updated))
+}
+
+pub async fn create_marketplace_catalog_item(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceCatalogItemCreateRequest>,
+) -> AppResult<Json<MarketplaceCatalogItemRecord>> {
+    let owner_account_id = normalize_optional_text(Some(request.owner_account_id.clone()))
+        .ok_or_else(|| {
+            AppError::BadRequest("marketplace owner_account_id is required".to_string())
+        })?;
+    let owner_account = load_marketplace_account(&state, &owner_account_id).await?;
+    let record = build_marketplace_catalog_item_record(
+        request,
+        owner_account.as_ref(),
+        format!("marketplace-item-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_catalog_error)?;
+    insert_marketplace_catalog_item_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_catalog_items(
+    Query(query): Query<MarketplaceCatalogListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceCatalogItemRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace catalog".to_string(),
+        )
+    })?;
+    let kind = query.kind.map(|kind| kind.as_str().to_string());
+    let category = query.category.map(|category| category.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT item_id, org_id, kind, category, name, unit_of_measure, owner_account_id, created_at
+        FROM marketplace_catalog_items
+        WHERE (?1 IS NULL OR org_id = ?1)
+          AND (?2 IS NULL OR kind = ?2)
+          AND (?3 IS NULL OR category = ?3)
+        ORDER BY created_at ASC, item_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(kind)
+    .bind(category)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_catalog_item_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_catalog_item(
+    Path(item_id): Path<String>,
+    Query(query): Query<MarketplaceCatalogScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceCatalogItemRecord>> {
+    let org_id = normalize_optional_text(query.org_id.clone())
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let item = load_marketplace_catalog_item(&state, &item_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if item.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(item))
+}
+
+pub async fn get_marketplace_portal_entry(
+    Query(query): Query<MarketplacePortalEntryQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplacePortalEntry>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let account_id = normalize_optional_text(query.account_id).ok_or_else(|| {
+        AppError::BadRequest("account_id query parameter is required".to_string())
+    })?;
+    let account = load_marketplace_account(&state, &account_id).await?;
+    let entry = build_marketplace_portal_entry(account.as_ref(), org_id)
+        .map_err(marketplace_portal_entry_error)?;
+
+    Ok(Json(entry))
+}
+
+pub async fn publish_marketplace_listing(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceListingPublishRequest>,
+) -> AppResult<Json<MarketplaceListingRecord>> {
+    let item_id = normalize_optional_text(Some(request.item_id.clone()))
+        .ok_or_else(|| AppError::BadRequest("marketplace item_id is required".to_string()))?;
+    let catalog_item = load_marketplace_catalog_item(&state, &item_id).await?;
+    let record = publish_marketplace_listing_record(
+        request,
+        catalog_item.as_ref(),
+        format!("marketplace-listing-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_listing_error)?;
+    insert_marketplace_listing_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_listings(
+    Query(query): Query<MarketplaceListingListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceListingRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace listings".to_string(),
+        )
+    })?;
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT listing_id, item_id, org_id, price, currency, available_qty,
+               window_from, window_to, status, created_at, updated_at
+        FROM marketplace_listings
+        WHERE (?1 IS NULL OR org_id = ?1)
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY created_at ASC, listing_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_listing_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_listing(
+    Path(listing_id): Path<String>,
+    Query(query): Query<MarketplaceListingScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceListingRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let listing = load_marketplace_listing(&state, &listing_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if listing.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(listing))
+}
+
+pub async fn close_marketplace_listing(
+    Path(listing_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceListingCloseRequest>,
+) -> AppResult<Json<MarketplaceListingRecord>> {
+    let org_id = normalize_optional_text(Some(request.org_id))
+        .ok_or_else(|| AppError::BadRequest("marketplace org_id is required".to_string()))?;
+    let listing = load_marketplace_listing(&state, &listing_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if listing.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let updated = close_marketplace_listing_record(&listing, current_record_timestamp())
+        .map_err(marketplace_listing_error)?;
+    update_marketplace_listing_record(&state, &updated).await?;
+
+    Ok(Json(updated))
+}
+
+pub async fn upsert_marketplace_inventory(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceInventoryUpsertRequest>,
+) -> AppResult<Json<MarketplaceInventoryRecord>> {
+    let item_id = normalize_optional_text(Some(request.item_id.clone()))
+        .ok_or_else(|| AppError::BadRequest("marketplace item_id is required".to_string()))?;
+    let catalog_item = load_marketplace_catalog_item(&state, &item_id).await?;
+    let record = build_marketplace_inventory_record(
+        request,
+        catalog_item.as_ref(),
+        format!("marketplace-inventory-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_inventory_error)?;
+    upsert_marketplace_inventory_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_inventory(
+    Query(query): Query<MarketplaceInventoryListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceInventoryRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace inventory".to_string(),
+        )
+    })?;
+    let rows = sqlx::query(
+        r#"
+        SELECT inventory_id, item_id, org_id, on_hand, reserved, updated_at
+        FROM marketplace_inventory
+        WHERE org_id = ?1
+        ORDER BY item_id ASC, inventory_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_inventory_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_inventory(
+    Path(inventory_id): Path<String>,
+    Query(query): Query<MarketplaceInventoryScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceInventoryRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let inventory = load_marketplace_inventory(&state, &inventory_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if inventory.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(inventory))
+}
+
+pub async fn reserve_marketplace_inventory_endpoint(
+    Path(inventory_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceInventoryAdjustmentRequest>,
+) -> AppResult<Json<MarketplaceInventoryRecord>> {
+    let org_id = normalize_optional_text(Some(request.org_id))
+        .ok_or_else(|| AppError::BadRequest("marketplace org_id is required".to_string()))?;
+    let inventory = load_marketplace_inventory(&state, &inventory_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if inventory.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    reserve_marketplace_inventory(&inventory, request.qty, current_record_timestamp())
+        .map_err(marketplace_inventory_error)?;
+    update_marketplace_inventory_reserve(&state, &inventory_id, &org_id, request.qty).await?;
+    load_marketplace_inventory(&state, &inventory_id)
+        .await?
+        .ok_or(AppError::NotFound)
+        .map(Json)
+}
+
+pub async fn fulfill_marketplace_inventory_endpoint(
+    Path(inventory_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceInventoryAdjustmentRequest>,
+) -> AppResult<Json<MarketplaceInventoryRecord>> {
+    let org_id = normalize_optional_text(Some(request.org_id))
+        .ok_or_else(|| AppError::BadRequest("marketplace org_id is required".to_string()))?;
+    let inventory = load_marketplace_inventory(&state, &inventory_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if inventory.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    fulfill_marketplace_inventory(&inventory, request.qty, current_record_timestamp())
+        .map_err(marketplace_inventory_error)?;
+    update_marketplace_inventory_fulfill(&state, &inventory_id, &org_id, request.qty).await?;
+    load_marketplace_inventory(&state, &inventory_id)
+        .await?
+        .ok_or(AppError::NotFound)
+        .map(Json)
+}
+
+pub async fn release_marketplace_inventory_endpoint(
+    Path(inventory_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceInventoryAdjustmentRequest>,
+) -> AppResult<Json<MarketplaceInventoryRecord>> {
+    let org_id = normalize_optional_text(Some(request.org_id))
+        .ok_or_else(|| AppError::BadRequest("marketplace org_id is required".to_string()))?;
+    let inventory = load_marketplace_inventory(&state, &inventory_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if inventory.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    release_marketplace_inventory(&inventory, request.qty, current_record_timestamp())
+        .map_err(marketplace_inventory_error)?;
+    update_marketplace_inventory_release(&state, &inventory_id, &org_id, request.qty).await?;
+    load_marketplace_inventory(&state, &inventory_id)
+        .await?
+        .ok_or(AppError::NotFound)
+        .map(Json)
+}
+
+pub async fn place_marketplace_order(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceOrderCreateRequest>,
+) -> AppResult<Json<MarketplaceOrderRecord>> {
+    let listing_ref = normalize_optional_text(Some(request.listing_ref.clone()))
+        .ok_or_else(|| AppError::BadRequest("marketplace listing_ref is required".to_string()))?;
+    let buyer_account_id = normalize_optional_text(Some(request.buyer_account_id.clone()))
+        .ok_or_else(|| {
+            AppError::BadRequest("marketplace buyer_account_id is required".to_string())
+        })?;
+    let listing = load_marketplace_listing(&state, &listing_ref).await?;
+    let buyer_account = load_marketplace_account(&state, &buyer_account_id).await?;
+    let (order, audit) = place_marketplace_order_record(
+        request,
+        listing.as_ref(),
+        buyer_account.as_ref(),
+        format!("marketplace-order-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_order_error)?;
+    let listing = listing.ok_or(AppError::NotFound)?;
+    let inventory = load_marketplace_inventory_by_item(&state, &listing.item_id, &order.org_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("marketplace inventory is required".to_string()))?;
+    reserve_marketplace_inventory(&inventory, order.qty, current_record_timestamp())
+        .map_err(marketplace_inventory_error)?;
+    update_marketplace_inventory_reserve(&state, &inventory.inventory_id, &order.org_id, order.qty)
+        .await?;
+    insert_marketplace_order_record(&state, &order).await?;
+    insert_marketplace_order_audit_record(&state, &audit).await?;
+
+    Ok(Json(order))
+}
+
+pub async fn list_marketplace_orders(
+    Query(query): Query<MarketplaceOrderListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceOrderRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace orders".to_string(),
+        )
+    })?;
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT order_id, org_id, listing_ref, buyer_account_id, qty, line_total,
+               status, created_at, updated_at
+        FROM marketplace_orders
+        WHERE org_id = ?1
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY created_at ASC, order_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_order_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_order(
+    Path(order_id): Path<String>,
+    Query(query): Query<MarketplaceOrderScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceOrderRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let order = load_marketplace_order(&state, &order_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if order.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(order))
+}
+
+pub async fn transition_marketplace_order(
+    Path(order_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceOrderTransitionRequest>,
+) -> AppResult<Json<MarketplaceOrderRecord>> {
+    let org_id = normalize_optional_text(Some(request.org_id))
+        .ok_or_else(|| AppError::BadRequest("marketplace org_id is required".to_string()))?;
+    let order = load_marketplace_order(&state, &order_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if order.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let (updated, audit) = transition_marketplace_order_status(
+        &order,
+        request.status,
+        request.actor_id,
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_order_error)?;
+    if updated.status == MarketplaceOrderStatus::Fulfilled {
+        let listing = load_marketplace_listing(&state, &order.listing_ref)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let inventory = load_marketplace_inventory_by_item(&state, &listing.item_id, &order.org_id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest("marketplace inventory is required".to_string()))?;
+        update_marketplace_inventory_fulfill(
+            &state,
+            &inventory.inventory_id,
+            &order.org_id,
+            order.qty,
+        )
+        .await?;
+    } else if updated.status == MarketplaceOrderStatus::Cancelled {
+        let listing = load_marketplace_listing(&state, &order.listing_ref)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let inventory = load_marketplace_inventory_by_item(&state, &listing.item_id, &order.org_id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest("marketplace inventory is required".to_string()))?;
+        update_marketplace_inventory_release(
+            &state,
+            &inventory.inventory_id,
+            &order.org_id,
+            order.qty,
+        )
+        .await?;
+    }
+    update_marketplace_order_record(&state, &updated).await?;
+    insert_marketplace_order_audit_record(&state, &audit).await?;
+
+    Ok(Json(updated))
+}
+
+pub async fn list_marketplace_order_audits(
+    Path(order_id): Path<String>,
+    Query(query): Query<MarketplaceOrderScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceOrderAuditRecord>>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let order = load_marketplace_order(&state, &order_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if order.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT audit_id, order_id, from_status, to_status, actor_id, occurred_at
+        FROM marketplace_order_audits
+        WHERE order_id = ?1
+        ORDER BY occurred_at ASC, audit_id ASC
+        "#,
+    )
+    .bind(order_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_order_audit_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn create_marketplace_fulfillment(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceFulfillmentCreateRequest>,
+) -> AppResult<Json<MarketplaceFulfillmentRecord>> {
+    let order_ref = normalize_optional_text(Some(request.order_ref.clone())).ok_or_else(|| {
+        AppError::BadRequest("marketplace fulfillment order_ref is required".to_string())
+    })?;
+    let actor_id = normalize_optional_text(Some(request.actor_id.clone())).ok_or_else(|| {
+        AppError::BadRequest("marketplace fulfillment actor_id is required".to_string())
+    })?;
+    let order = load_marketplace_order(&state, &order_ref).await?;
+    let (record, audit) = create_marketplace_fulfillment_record(
+        request,
+        order.as_ref(),
+        format!("marketplace-fulfillment-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_fulfillment_error)?;
+    let order = order.ok_or(AppError::NotFound)?;
+    let (fulfilled_order, order_audit) = transition_marketplace_order_status(
+        &order,
+        MarketplaceOrderStatus::Fulfilled,
+        actor_id,
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_order_error)?;
+    let listing = load_marketplace_listing(&state, &order.listing_ref)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let inventory = load_marketplace_inventory_by_item(&state, &listing.item_id, &order.org_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("marketplace inventory is required".to_string()))?;
+    update_marketplace_inventory_fulfill(&state, &inventory.inventory_id, &order.org_id, order.qty)
+        .await?;
+    update_marketplace_order_record(&state, &fulfilled_order).await?;
+    insert_marketplace_order_audit_record(&state, &order_audit).await?;
+    insert_marketplace_fulfillment_record(&state, &record).await?;
+    insert_marketplace_fulfillment_audit_record(&state, &audit).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_fulfillments(
+    Query(query): Query<MarketplaceFulfillmentListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceFulfillmentRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace fulfillments".to_string(),
+        )
+    })?;
+    let order_ref = normalize_optional_text(query.order_ref);
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT fulfillment_id, order_ref, org_id, carrier_ref, tracking_ref,
+               status, created_at, updated_at
+        FROM marketplace_fulfillments
+        WHERE org_id = ?1
+          AND (?2 IS NULL OR order_ref = ?2)
+          AND (?3 IS NULL OR status = ?3)
+        ORDER BY created_at ASC, fulfillment_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(order_ref)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_fulfillment_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_fulfillment(
+    Path(fulfillment_id): Path<String>,
+    Query(query): Query<MarketplaceFulfillmentScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceFulfillmentRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let fulfillment = load_marketplace_fulfillment(&state, &fulfillment_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if fulfillment.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(fulfillment))
+}
+
+pub async fn transition_marketplace_fulfillment(
+    Path(fulfillment_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceFulfillmentTransitionRequest>,
+) -> AppResult<Json<MarketplaceFulfillmentRecord>> {
+    let org_id = normalize_optional_text(Some(request.org_id))
+        .ok_or_else(|| AppError::BadRequest("marketplace org_id is required".to_string()))?;
+    let fulfillment = load_marketplace_fulfillment(&state, &fulfillment_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if fulfillment.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let (updated, audit) = transition_marketplace_fulfillment_status(
+        &fulfillment,
+        request.status,
+        request.actor_id,
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_fulfillment_error)?;
+    update_marketplace_fulfillment_record(&state, &updated).await?;
+    insert_marketplace_fulfillment_audit_record(&state, &audit).await?;
+
+    Ok(Json(updated))
+}
+
+pub async fn list_marketplace_fulfillment_audits(
+    Path(fulfillment_id): Path<String>,
+    Query(query): Query<MarketplaceFulfillmentScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceFulfillmentAuditRecord>>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let fulfillment = load_marketplace_fulfillment(&state, &fulfillment_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if fulfillment.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT audit_id, fulfillment_id, from_status, to_status, actor_id, occurred_at
+        FROM marketplace_fulfillment_audits
+        WHERE fulfillment_id = ?1
+        ORDER BY occurred_at ASC, audit_id ASC
+        "#,
+    )
+    .bind(fulfillment_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_fulfillment_audit_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn create_marketplace_rating(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceRatingCreateRequest>,
+) -> AppResult<Json<MarketplaceRatingRecord>> {
+    let order_ref = normalize_optional_text(Some(request.order_ref.clone())).ok_or_else(|| {
+        AppError::BadRequest("marketplace rating order_ref is required".to_string())
+    })?;
+    let order = load_marketplace_order(&state, &order_ref).await?;
+    let participants = if let Some(order) = order.as_ref() {
+        marketplace_order_participants(&state, order).await?
+    } else {
+        Vec::new()
+    };
+    let existing = load_marketplace_ratings_for_order(&state, &order_ref).await?;
+    let record = create_marketplace_rating_record(
+        request,
+        order.as_ref(),
+        &participants,
+        &existing,
+        format!("marketplace-rating-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_rating_error)?;
+    insert_marketplace_rating_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_ratings(
+    Query(query): Query<MarketplaceRatingListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceRatingRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace ratings".to_string(),
+        )
+    })?;
+    let order_ref = normalize_optional_text(query.order_ref);
+    let ratee_account_id = normalize_optional_text(query.ratee_account_id);
+    let rows = sqlx::query(
+        r#"
+        SELECT rating_id, order_ref, rater_account_id, ratee_account_id,
+               score, comment, org_scope, created_at
+        FROM marketplace_ratings
+        WHERE org_scope = ?1
+          AND (?2 IS NULL OR order_ref = ?2)
+          AND (?3 IS NULL OR ratee_account_id = ?3)
+        ORDER BY created_at ASC, rating_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(order_ref)
+    .bind(ratee_account_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_rating_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_rating_aggregate(
+    Path(account_id): Path<String>,
+    Query(query): Query<MarketplaceRatingAggregateQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceRatingAggregate>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let ratings = load_marketplace_ratings_for_ratee(&state, &account_id, &org_id).await?;
+    let aggregate = aggregate_marketplace_ratings(account_id, org_id, &ratings)
+        .map_err(marketplace_rating_error)?;
+
+    Ok(Json(aggregate))
+}
+
+pub async fn create_marketplace_demand_forecast(
+    State(state): State<AppState>,
+    Json(request): Json<MarketplaceDemandForecastRequest>,
+) -> AppResult<Json<MarketplaceDemandForecastRecord>> {
+    let field_id = normalize_optional_text(Some(request.field_id.clone())).ok_or_else(|| {
+        AppError::BadRequest("marketplace demand field_id is required".to_string())
+    })?;
+    let field = load_field(&state, &field_id).await?;
+    let evidence_refs = load_marketplace_demand_evidence_refs(&state, &field_id).await?;
+    let record = compute_marketplace_demand_forecast(
+        request,
+        field.as_ref(),
+        evidence_refs,
+        format!("marketplace-demand-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_demand_forecast_error)?;
+    insert_marketplace_demand_forecast_record(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_marketplace_demand_forecasts(
+    Query(query): Query<MarketplaceDemandForecastListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<MarketplaceDemandForecastRecord>>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace demand forecasts".to_string(),
+        )
+    })?;
+    let field_id = normalize_optional_text(query.field_id);
+    let rows = sqlx::query(
+        r#"
+        SELECT forecast_id, org_id, field_id, item_kind, horizon, value,
+               evidence_refs_json, status, uncertainty_low, uncertainty_high,
+               method, created_at
+        FROM marketplace_demand_forecasts
+        WHERE org_id = ?1
+          AND (?2 IS NULL OR field_id = ?2)
+        ORDER BY created_at ASC, forecast_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_demand_forecast_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_marketplace_demand_forecast(
+    Path(forecast_id): Path<String>,
+    Query(query): Query<MarketplaceDemandForecastScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceDemandForecastRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let forecast = load_marketplace_demand_forecast(&state, &forecast_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if forecast.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(forecast))
+}
+
+pub async fn get_marketplace_org_report(
+    Query(query): Query<MarketplaceReportQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<MarketplaceOrgReport>> {
+    let org_id = normalize_optional_text(query.org_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "org_id query parameter is required for marketplace report".to_string(),
+        )
+    })?;
+    let from = normalize_optional_text(query.from).ok_or_else(|| {
+        AppError::BadRequest("from query parameter is required for marketplace report".to_string())
+    })?;
+    let to = normalize_optional_text(query.to).ok_or_else(|| {
+        AppError::BadRequest("to query parameter is required for marketplace report".to_string())
+    })?;
+    let orders = load_marketplace_orders_for_org_period(&state, &org_id, &from, &to).await?;
+    let listings = load_marketplace_listings_for_org(&state, &org_id).await?;
+    let inventory = load_marketplace_inventory_for_org(&state, &org_id).await?;
+    let report = assemble_marketplace_org_report(
+        MarketplaceOrgReportRequest {
+            org_id,
+            period: MarketplaceReportPeriod { from, to },
+        },
+        &orders,
+        &listings,
+        &inventory,
+        current_record_timestamp(),
+    )
+    .map_err(marketplace_report_error)?;
+
+    Ok(Json(report))
 }
 
 pub async fn create_sustainability_record(
@@ -3121,6 +4468,740 @@ pub async fn get_sustainability_record(
     Ok(Json(record))
 }
 
+pub async fn create_carbon_footprint(
+    State(state): State<AppState>,
+    Json(request): Json<CarbonFootprintComputeRequest>,
+) -> AppResult<Json<CarbonFootprintResult>> {
+    let requested_record_id =
+        normalize_optional_text(Some(request.record_id.clone())).ok_or_else(|| {
+            AppError::BadRequest("carbon footprint record_id is required".to_string())
+        })?;
+    let record = load_sustainability_record(&state, &requested_record_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "sustainability record {requested_record_id} is required for carbon footprint"
+            ))
+        })?;
+    let result = compute_carbon_footprint(
+        request,
+        format!("carbon-footprint-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(carbon_footprint_error)?;
+    if result.operation_id != record.operation_id {
+        return Err(AppError::BadRequest(format!(
+            "carbon footprint operation_id {} does not match sustainability record operation_id {}",
+            result.operation_id, record.operation_id
+        )));
+    }
+    insert_carbon_footprint_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_carbon_footprints(
+    Query(query): Query<CarbonFootprintListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CarbonFootprintResult>>> {
+    let record_id = normalize_optional_text(query.record_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "record_id query parameter is required for carbon footprints".to_string(),
+        )
+    })?;
+    let operation_id = normalize_optional_text(query.operation_id);
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT footprint_id, record_id, operation_id, value_co2e, inputs_json,
+               factor_set_version, factors_json, evidence_refs_json, status, result_hash,
+               computed_at
+        FROM carbon_footprints
+        WHERE record_id = ?1
+          AND (?2 IS NULL OR operation_id = ?2)
+          AND (?3 IS NULL OR status = ?3)
+        ORDER BY computed_at ASC, footprint_id ASC
+        "#,
+    )
+    .bind(record_id)
+    .bind(operation_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_carbon_footprint_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_carbon_footprint(
+    Path(footprint_id): Path<String>,
+    Query(query): Query<CarbonFootprintScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CarbonFootprintResult>> {
+    let record_id = normalize_optional_text(query.record_id)
+        .ok_or_else(|| AppError::BadRequest("record_id query parameter is required".to_string()))?;
+    let footprint = load_carbon_footprint_result(&state, &footprint_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if footprint.record_id != record_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(footprint))
+}
+
+pub async fn create_biomass_estimate(
+    State(state): State<AppState>,
+    Json(request): Json<BiomassEstimateRequest>,
+) -> AppResult<Json<BiomassEstimateResult>> {
+    let requested_record_id = normalize_optional_text(Some(request.record_id.clone()))
+        .ok_or_else(|| AppError::BadRequest("biomass record_id is required".to_string()))?;
+    load_sustainability_record(&state, &requested_record_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "sustainability record {requested_record_id} is required for biomass estimate"
+            ))
+        })?;
+    let result = estimate_biomass(
+        request,
+        format!("biomass-estimate-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(biomass_estimate_error)?;
+    insert_biomass_estimate_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_biomass_estimates(
+    Query(query): Query<BiomassEstimateListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<BiomassEstimateResult>>> {
+    let record_id = normalize_optional_text(query.record_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "record_id query parameter is required for biomass estimates".to_string(),
+        )
+    })?;
+    let rows = sqlx::query(
+        r#"
+        SELECT estimate_id, record_id, biomass_value, area, crs, extent_json,
+               resolution_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biomass_estimates
+        WHERE record_id = ?1
+        ORDER BY computed_at ASC, estimate_id ASC
+        "#,
+    )
+    .bind(record_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_biomass_estimate_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_biomass_estimate(
+    Path(estimate_id): Path<String>,
+    Query(query): Query<BiomassEstimateScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<BiomassEstimateResult>> {
+    let record_id = normalize_optional_text(query.record_id)
+        .ok_or_else(|| AppError::BadRequest("record_id query parameter is required".to_string()))?;
+    let estimate = load_biomass_estimate_result(&state, &estimate_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if estimate.record_id != record_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(estimate))
+}
+
+pub async fn create_sustainability_baseline_record(
+    State(state): State<AppState>,
+    Json(request): Json<SustainabilityBaselineCreateRequest>,
+) -> AppResult<Json<SustainabilityBaselineRecord>> {
+    let source_record = load_sustainability_record(&state, &request.source_record_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "sustainability record {} is required for baseline",
+                request.source_record_id
+            ))
+        })?;
+    if source_record.field_id != request.field_id
+        || source_record.season_id != request.season_id
+        || source_record.metric_type != request.metric_type
+    {
+        return Err(AppError::BadRequest(
+            "baseline source record does not match requested field, season, and metric".to_string(),
+        ));
+    }
+    let baseline = create_sustainability_baseline(
+        request,
+        format!("sustainability-baseline-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_baseline_error)?;
+    insert_sustainability_baseline(&state, &baseline).await?;
+
+    Ok(Json(baseline))
+}
+
+pub async fn list_sustainability_baselines(
+    Query(query): Query<SustainabilityBaselineListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SustainabilityBaselineRecord>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for sustainability baselines".to_string(),
+        )
+    })?;
+    let metric_type = query
+        .metric_type
+        .map(|metric_type| metric_type.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT baseline_id, field_id, season_id, metric_type, metric_value, source_record_id,
+               method_version, evidence_refs_json, created_at
+        FROM sustainability_baselines
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR metric_type = ?2)
+        ORDER BY season_id ASC, metric_type ASC, baseline_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(metric_type)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_sustainability_baseline(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn create_sustainability_comparison(
+    State(state): State<AppState>,
+    Json(request): Json<SustainabilityComparisonRequest>,
+) -> AppResult<Json<SustainabilityComparisonResult>> {
+    let current_record = load_sustainability_record(&state, &request.current_source_record_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "sustainability record {} is required for comparison",
+                request.current_source_record_id
+            ))
+        })?;
+    if current_record.field_id != request.field_id
+        || current_record.season_id != request.current_season_id
+        || current_record.metric_type != request.metric_type
+    {
+        return Err(AppError::BadRequest(
+            "current source record does not match requested field, season, and metric".to_string(),
+        ));
+    }
+    let baseline = load_sustainability_baseline_for_metric(
+        &state,
+        &request.field_id,
+        &request.baseline_season_id,
+        request.metric_type,
+    )
+    .await?;
+    let result = compare_sustainability_baseline(
+        baseline.as_ref(),
+        request,
+        format!("sustainability-comparison-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_baseline_error)?;
+    insert_sustainability_comparison(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_sustainability_comparisons(
+    Query(query): Query<SustainabilityComparisonListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SustainabilityComparisonResult>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for sustainability comparisons".to_string(),
+        )
+    })?;
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT comparison_id, field_id, baseline_season_id, current_season_id, metric_type,
+               baseline_value, current_value, delta, trend, status, baseline_source_record_id,
+               current_source_record_id, evidence_refs_json, method_version, result_hash,
+               compared_at
+        FROM sustainability_comparisons
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY compared_at ASC, comparison_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_sustainability_comparison(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_sustainability_comparison(
+    Path(comparison_id): Path<String>,
+    Query(query): Query<SustainabilityComparisonScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SustainabilityComparisonResult>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    let comparison = load_sustainability_comparison(&state, &comparison_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if comparison.field_id != field_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(comparison))
+}
+
+pub async fn create_sustainability_mrv_trail_record(
+    State(state): State<AppState>,
+    Json(request): Json<SustainabilityMrvTrailCreateRequest>,
+) -> AppResult<Json<SustainabilityMrvTrail>> {
+    validate_sustainability_mrv_output_ref(&state, request.output_kind, &request.output_ref)
+        .await?;
+    let trail = create_sustainability_mrv_trail(
+        request,
+        format!("sustainability-mrv-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_mrv_trail_error)?;
+    insert_sustainability_mrv_trail(&state, &trail).await?;
+
+    Ok(Json(trail))
+}
+
+pub async fn list_sustainability_mrv_trails(
+    Query(query): Query<SustainabilityMrvTrailListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SustainabilityMrvTrail>>> {
+    let output_ref = normalize_optional_text(query.output_ref);
+    let output_kind = query.output_kind.map(|kind| kind.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT trail_id, output_ref, output_kind, input_layer_refs_json, method,
+               method_version, crs, extent_json, parameters_json, audit_id, result_hash,
+               rederived_result_hash, certification_ready, created_at
+        FROM sustainability_mrv_trails
+        WHERE (?1 IS NULL OR output_ref = ?1)
+          AND (?2 IS NULL OR output_kind = ?2)
+        ORDER BY created_at ASC, trail_id ASC
+        "#,
+    )
+    .bind(output_ref)
+    .bind(output_kind)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_sustainability_mrv_trail(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_sustainability_mrv_trail(
+    Path(trail_id): Path<String>,
+    Query(query): Query<SustainabilityMrvTrailScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SustainabilityMrvTrail>> {
+    let trail = load_sustainability_mrv_trail(&state, &trail_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if let Some(output_ref) = normalize_optional_text(query.output_ref) {
+        if trail.output_ref != output_ref {
+            return Err(AppError::NotFound);
+        }
+    }
+
+    Ok(Json(trail))
+}
+
+pub async fn create_biodiversity_proxy(
+    State(state): State<AppState>,
+    Json(request): Json<BiodiversityProxyRequest>,
+) -> AppResult<Json<BiodiversityProxyResult>> {
+    let result = compute_biodiversity_proxy(
+        request,
+        format!("biodiversity-proxy-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(biodiversity_proxy_error)?;
+    insert_biodiversity_proxy_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_biodiversity_proxies(
+    Query(query): Query<BiodiversityProxyListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<BiodiversityProxyResult>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for biodiversity proxies".to_string(),
+        )
+    })?;
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT proxy_id, field_id, heterogeneity_score, cover_fraction, uncertainty, status,
+               crs, extent_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biodiversity_proxies
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY computed_at ASC, proxy_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_biodiversity_proxy_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_biodiversity_proxy(
+    Path(proxy_id): Path<String>,
+    Query(query): Query<BiodiversityProxyScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<BiodiversityProxyResult>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    let proxy = load_biodiversity_proxy_result(&state, &proxy_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if proxy.field_id != field_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(proxy))
+}
+
+pub async fn create_soil_carbon_proxy(
+    State(state): State<AppState>,
+    Json(request): Json<SoilCarbonProxyRequest>,
+) -> AppResult<Json<SoilCarbonProxyResult>> {
+    let result = compute_soil_carbon_proxy(
+        request,
+        format!("soil-carbon-proxy-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(soil_carbon_proxy_error)?;
+    insert_soil_carbon_proxy_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_soil_carbon_proxies(
+    Query(query): Query<SoilCarbonProxyListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SoilCarbonProxyResult>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for soil-carbon proxies".to_string(),
+        )
+    })?;
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT proxy_id, record_id, field_id, proxy_value, uncertainty_low, uncertainty_high,
+               status, evidence_refs_json, method_version, result_hash, computed_at
+        FROM soil_carbon_proxies
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR status = ?2)
+        ORDER BY computed_at ASC, proxy_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_soil_carbon_proxy_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_soil_carbon_proxy(
+    Path(proxy_id): Path<String>,
+    Query(query): Query<SoilCarbonProxyScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SoilCarbonProxyResult>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    let proxy = load_soil_carbon_proxy_result(&state, &proxy_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if proxy.field_id != field_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(proxy))
+}
+
+pub async fn create_sustainability_kpi(
+    State(state): State<AppState>,
+    Json(request): Json<SustainabilityKpiTrackingRequest>,
+) -> AppResult<Json<SustainabilityKpiTrackingResult>> {
+    let result = compute_sustainability_kpi(
+        request,
+        format!("sustainability-kpi-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_kpi_error)?;
+    insert_sustainability_kpi_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_sustainability_kpis(
+    Query(query): Query<SustainabilityKpiListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<SustainabilityKpiTrackingResult>>> {
+    let field_id = normalize_optional_text(query.field_id).ok_or_else(|| {
+        AppError::BadRequest(
+            "field_id query parameter is required for sustainability KPIs".to_string(),
+        )
+    })?;
+    let season_id = normalize_optional_text(query.season_id);
+    let status = query.status.map(|status| status.as_str().to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT kpi_id, field_id, season_id, metric_ref, current_value, target_value,
+               direction, at_risk_fraction, status, evidence_refs_json, method_version,
+               result_hash, computed_at
+        FROM sustainability_kpis
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR season_id = ?2)
+          AND (?3 IS NULL OR status = ?3)
+        ORDER BY computed_at ASC, kpi_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .bind(status)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_sustainability_kpi_result(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
+pub async fn get_sustainability_kpi(
+    Path(kpi_id): Path<String>,
+    Query(query): Query<SustainabilityKpiScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SustainabilityKpiTrackingResult>> {
+    let field_id = normalize_optional_text(query.field_id)
+        .ok_or_else(|| AppError::BadRequest("field_id query parameter is required".to_string()))?;
+    let kpi = load_sustainability_kpi_result(&state, &kpi_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if kpi.field_id != field_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(kpi))
+}
+
+pub async fn create_sustainability_certification_pack(
+    State(state): State<AppState>,
+    Json(mut request): Json<SustainabilityCertificationEvidencePackRequest>,
+) -> AppResult<Json<SustainabilityCertificationEvidencePack>> {
+    let claimed_output_refs = request
+        .claimed_output_refs
+        .iter()
+        .filter_map(|value| normalize_optional_text(Some(value.clone())))
+        .collect::<Vec<_>>();
+    let (outputs, mrv_trails, evidence_layer_refs) =
+        assemble_sustainability_certification_pack_inputs(&state, &claimed_output_refs).await?;
+    request.outputs = outputs;
+    request.mrv_trails = mrv_trails;
+    request.evidence_layer_refs.extend(evidence_layer_refs);
+
+    let pack = build_sustainability_certification_evidence_pack(
+        request,
+        format!("sustainability-certification-pack-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(sustainability_certification_pack_error)?;
+    insert_sustainability_certification_pack(&state, &pack).await?;
+
+    Ok(Json(pack))
+}
+
+pub async fn get_sustainability_certification_pack(
+    Path(pack_id): Path<String>,
+    Query(query): Query<SustainabilityCertificationPackScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SustainabilityCertificationEvidencePack>> {
+    let pack = load_sustainability_certification_pack(&state, &pack_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if let Some(claim_id) = normalize_optional_text(query.claim_id) {
+        if pack.claim_id != claim_id {
+            return Err(AppError::NotFound);
+        }
+    }
+
+    Ok(Json(pack))
+}
+
+pub async fn export_sustainability_field_csv(
+    Path(field_id): Path<String>,
+    Query(query): Query<SustainabilityExportQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let summary =
+        load_sustainability_field_export_summary(&state, &field_id, query.season_id).await?;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer
+        .write_record([
+            "record_type",
+            "record_id",
+            "field_id",
+            "season_id",
+            "metric_ref",
+            "value",
+            "unit",
+            "status",
+            "crs",
+            "extent_json",
+            "method_version",
+            "evidence_refs",
+            "result_hash",
+            "computed_at",
+        ])
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    for item in &summary.items {
+        writer
+            .write_record(vec![
+                item.record_type.clone(),
+                item.record_id.clone(),
+                item.field_id.clone(),
+                item.season_id.clone().unwrap_or_default(),
+                item.metric_ref.clone(),
+                item.value
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                item.unit.clone(),
+                item.status.clone(),
+                item.crs.clone().unwrap_or_default(),
+                item.extent
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|err| AppError::Anyhow(err.into()))?
+                    .unwrap_or_default(),
+                item.method_version.clone(),
+                item.evidence_refs.join("|"),
+                item.result_hash.clone(),
+                item.computed_at.clone(),
+            ])
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+    let csv_bytes = writer
+        .into_inner()
+        .map_err(|err| AppError::Anyhow(err.into_error().into()))?;
+
+    response_with_bytes(
+        csv_bytes,
+        "text/csv; charset=utf-8",
+        "sustainability-summary.csv",
+    )
+}
+
+pub async fn export_sustainability_field_geojson(
+    Path(field_id): Path<String>,
+    Query(query): Query<SustainabilityExportQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let summary =
+        load_sustainability_field_export_summary(&state, &field_id, query.season_id).await?;
+    let features = summary
+        .items
+        .iter()
+        .map(sustainability_export_feature)
+        .collect::<AppResult<Vec<_>>>()?;
+    let mut geojson = feature_collection_with_crs(features, &summary.crs);
+    if let GeoJson::FeatureCollection(collection) = &mut geojson {
+        let mut members = collection.foreign_members.take().unwrap_or_default();
+        members.insert(
+            "field_id".to_string(),
+            serde_json::Value::String(summary.field_id),
+        );
+        if let Some(season_id) = summary.season_id {
+            members.insert(
+                "season_id".to_string(),
+                serde_json::Value::String(season_id),
+            );
+        }
+        members.insert(
+            "record_count".to_string(),
+            serde_json::Value::from(summary.record_count as u64),
+        );
+        members.insert("empty".to_string(), serde_json::Value::Bool(summary.empty));
+        members.insert(
+            "generated_at".to_string(),
+            serde_json::Value::String(summary.generated_at),
+        );
+        collection.foreign_members = Some(members);
+    }
+
+    response_with_bytes(
+        serde_json::to_vec(&geojson).map_err(|err| AppError::Anyhow(err.into()))?,
+        "application/geo+json",
+        "sustainability-summary.geojson",
+    )
+}
+
+pub async fn export_sustainability_field_pdf(
+    Path(field_id): Path<String>,
+    Query(query): Query<SustainabilityExportQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let summary =
+        load_sustainability_field_export_summary(&state, &field_id, query.season_id).await?;
+    response_with_bytes(
+        sustainability_summary_pdf_bytes(&summary),
+        "application/pdf",
+        "sustainability-summary.pdf",
+    )
+}
+
 pub async fn create_content_item(
     State(state): State<AppState>,
     Json(request): Json<ContentCreateRequest>,
@@ -3137,6 +5218,26 @@ pub async fn create_content_item(
     Ok(Json(VersionedContentRecord {
         content,
         versions: vec![version],
+    }))
+}
+
+pub async fn create_success_story_item(
+    State(state): State<AppState>,
+    Json(request): Json<ContentSuccessStoryCreateRequest>,
+) -> AppResult<Json<VersionedSuccessStoryContentRecord>> {
+    let (content, version, success_story) = create_success_story_content(
+        request,
+        format!("content-{}", Uuid::new_v4()),
+        format!("content-version-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    insert_success_story_item_with_version(&state, &content, &version, &success_story).await?;
+
+    Ok(Json(VersionedSuccessStoryContentRecord {
+        content,
+        versions: vec![version],
+        success_story,
     }))
 }
 
@@ -3169,6 +5270,279 @@ pub async fn append_content_item_version(
         .map(Json)
 }
 
+pub async fn transition_content_item_workflow(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<ContentWorkflowTransitionRequest>,
+) -> AppResult<Json<ContentWorkflowTransitionResult>> {
+    let org_id = normalize_optional_text(query.org_id.clone())
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_content_workflow_permission(&query, &content, &request, &state).await?;
+    let transition = transition_content_workflow(
+        &content,
+        request,
+        format!("content-workflow-audit-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    persist_content_workflow_transition(&state, &transition).await?;
+
+    Ok(Json(transition))
+}
+
+pub async fn resolve_content_permissions_route(
+    Query(query): Query<ContentPermissionQuery>,
+) -> AppResult<Json<ContentPermissionSet>> {
+    let permissions = resolve_content_permissions(ContentPermissionResolveRequest {
+        org_id: query.org_id,
+        actor_org_id: query.actor_org_id,
+        role_refs: parse_role_refs(query.role_refs),
+    })
+    .map_err(content_error)?;
+
+    Ok(Json(permissions))
+}
+
+pub async fn search_content_items(
+    Query(query): Query<ContentSearchQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ContentSearchResult>>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let documents = load_content_search_documents(&state, &org_id).await?;
+    let results = search_published_content(
+        ContentSearchRequest {
+            org_id,
+            query: query.q,
+        },
+        documents,
+    )
+    .map_err(content_error)?;
+
+    Ok(Json(results))
+}
+
+pub async fn list_portal_knowledge_base(
+    Query(query): Query<ContentPortalEmbedQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ContentPortalEmbed>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let actor_org_id = normalize_optional_text(Some(query.actor_org_id)).ok_or_else(|| {
+        AppError::BadRequest("actor_org_id query parameter is required".to_string())
+    })?;
+    let documents = load_content_search_documents(&state, &org_id).await?;
+    let embed = build_content_portal_embed(
+        ContentPortalEmbedRequest {
+            org_id,
+            actor_org_id,
+            role_refs: parse_role_refs(query.role_refs),
+        },
+        documents,
+    )
+    .map_err(content_error)?;
+
+    Ok(Json(embed))
+}
+
+pub async fn get_portal_knowledge_base_item(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentPortalEmbedQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ContentPortalEmbedItem>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let actor_org_id = normalize_optional_text(Some(query.actor_org_id)).ok_or_else(|| {
+        AppError::BadRequest("actor_org_id query parameter is required".to_string())
+    })?;
+    resolve_content_permissions(ContentPermissionResolveRequest {
+        org_id: org_id.clone(),
+        actor_org_id,
+        role_refs: parse_role_refs(query.role_refs),
+    })
+    .and_then(|permissions| {
+        permissions
+            .can_read
+            .then_some(permissions)
+            .ok_or(ContentError::AccessDenied {
+                permission: "can_read",
+            })
+    })
+    .map_err(content_error)?;
+    let document = load_content_portal_document(&state, &content_id).await?;
+    let item = document
+        .and_then(|document| content_portal_embed_item(&org_id, document))
+        .ok_or(AppError::NotFound)?;
+
+    Ok(Json(item))
+}
+
+pub async fn apply_content_item_tags(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<ContentTagApplyRequest>,
+) -> AppResult<Json<Vec<ContentTagRecord>>> {
+    let org_id = normalize_optional_text(query.org_id.clone())
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let tags = apply_content_taxonomy_tags(content_id, request, current_record_timestamp())
+        .map_err(content_error)?;
+    insert_content_tags(&state, &tags).await?;
+
+    Ok(Json(tags))
+}
+
+pub async fn create_content_engagement_event_route(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<ContentEngagementEventCreateRequest>,
+) -> AppResult<Json<ContentEngagementEventRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id || content.status != ContentStatus::Published {
+        return Err(AppError::NotFound);
+    }
+    let event = create_content_engagement_event(
+        &content,
+        request,
+        format!("content-engagement-event-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    insert_content_engagement_event(&state, &event).await?;
+
+    Ok(Json(event))
+}
+
+pub async fn create_content_locale_variant_route(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<ContentLocaleVariantCreateRequest>,
+) -> AppResult<Json<ContentLocaleVariantRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let variant = create_content_locale_variant(
+        &content,
+        request,
+        format!("content-locale-version-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    upsert_content_locale_variant(&state, &variant).await?;
+
+    Ok(Json(variant))
+}
+
+pub async fn get_localized_content_item(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentLocalizedQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ContentLocalizedRecord>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let versioned = load_versioned_content(&state, &content_id, &org_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let canonical = versioned
+        .versions
+        .iter()
+        .find(|version| version.version_id == versioned.content.current_version)
+        .ok_or(AppError::NotFound)?;
+    let variant = load_content_locale_variant(&state, &content_id, &query.locale).await?;
+    let localized = resolve_localized_content(
+        &versioned.content,
+        canonical.body.clone(),
+        query.locale,
+        variant,
+    )
+    .map_err(content_error)?;
+
+    Ok(Json(localized))
+}
+
+pub async fn get_content_engagement_summary(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentEngagementSummaryQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ContentEngagementSummary>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let period = normalize_optional_text(Some(query.period))
+        .ok_or_else(|| AppError::BadRequest("period query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id || content.status != ContentStatus::Published {
+        return Err(AppError::NotFound);
+    }
+    let events = load_content_engagement_events(&state, &content_id, &org_id, &period).await?;
+    let summary =
+        aggregate_content_engagement(&content, &events, period, current_record_timestamp())
+            .map_err(content_error)?;
+    upsert_content_engagement_summary(&state, &summary).await?;
+
+    Ok(Json(summary))
+}
+
+pub async fn list_content_items_by_tag(
+    Query(query): Query<ContentTagFilterQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ContentRecord>>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let value = normalize_optional_text(Some(query.value))
+        .ok_or_else(|| AppError::BadRequest("tag value query parameter is required".to_string()))?
+        .to_ascii_lowercase()
+        .replace(' ', "_");
+    let rows = sqlx::query(
+        r#"
+        SELECT c.content_id, c.content_type, c.author_id, c.org_id, c.status,
+               c.current_version, c.created_at, c.updated_at
+        FROM cms_contents c
+        JOIN cms_content_tags t ON t.content_id = c.content_id
+        WHERE c.org_id = ?1
+          AND t.kind = ?2
+          AND t.value = ?3
+        ORDER BY c.created_at ASC, c.content_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(query.kind.as_str())
+    .bind(value)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_content_record(&row))
+        .collect::<AppResult<Vec<_>>>()
+        .map(Json)
+}
+
 pub async fn get_content_item(
     Path(content_id): Path<String>,
     Query(query): Query<ContentItemScopeQuery>,
@@ -3181,6 +5555,79 @@ pub async fn get_content_item(
         .await?
         .ok_or(AppError::NotFound)
         .map(Json)
+}
+
+pub async fn get_success_story_item(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<VersionedSuccessStoryContentRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let versioned = load_versioned_content(&state, &content_id, &org_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if versioned.content.content_type != ContentType::SuccessStory {
+        return Err(AppError::NotFound);
+    }
+    let success_story = load_success_story_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    Ok(Json(VersionedSuccessStoryContentRecord {
+        content: versioned.content,
+        versions: versioned.versions,
+        success_story,
+    }))
+}
+
+pub async fn create_community_contribution_route(
+    State(state): State<AppState>,
+    Json(request): Json<ContentCommunityContributionCreateRequest>,
+) -> AppResult<Json<ContentCommunityContributionRecord>> {
+    let contribution = create_community_contribution(
+        request,
+        format!("content-community-contribution-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    insert_community_contribution(&state, &contribution).await?;
+
+    Ok(Json(contribution))
+}
+
+pub async fn moderate_community_contribution_route(
+    Path(contribution_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(mut request): Json<ContentContributionModerationRequest>,
+) -> AppResult<Json<ContentContributionModerationResult>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let contribution = load_community_contribution(&state, &contribution_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if contribution.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    if let Some(actor_org_id) = normalize_optional_text(query.actor_org_id) {
+        request.actor_org_id = actor_org_id;
+    }
+    if let Some(role_refs) = query.role_refs {
+        request.role_refs = parse_role_refs(Some(role_refs));
+    }
+    let result = moderate_community_contribution(
+        &contribution,
+        request,
+        format!("content-community-moderation-audit-{}", Uuid::new_v4()),
+        format!("content-community-{}", Uuid::new_v4()),
+        format!("content-version-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    persist_community_moderation_result(&state, &result).await?;
+
+    Ok(Json(result))
 }
 
 pub async fn list_content_items(
@@ -3232,6 +5679,50 @@ pub async fn create_collaboration_channel(
     insert_collaboration_channel(&state, &channel).await?;
 
     Ok(Json(channel))
+}
+
+pub async fn resolve_collaboration_permissions_route(
+    Query(query): Query<CollaborationPermissionQuery>,
+) -> AppResult<Json<CollaborationPermissionSet>> {
+    let permissions =
+        shared::schemas::resolve_collaboration_permissions(CollaborationPermissionResolveRequest {
+            org_id: query.org_id,
+            actor_org_id: query.actor_org_id,
+            role_refs: parse_role_refs(query.role_refs),
+        })
+        .map_err(collaboration_error)?;
+
+    Ok(Json(permissions))
+}
+
+pub async fn authorize_collaboration_action_route(
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationActionAuthorizeRequest>,
+) -> AppResult<Json<CollaborationPermissionDecision>> {
+    let actor_id = normalize_optional_text(Some(request.actor_id.clone()))
+        .ok_or_else(|| collaboration_error(CollaborationError::EmptyActorId))?;
+    let channel_id = normalize_optional_text(request.channel_id.clone());
+    let decision = authorize_collaboration_action(
+        CollaborationPermissionResolveRequest {
+            org_id: request.org_id,
+            actor_org_id: request.actor_org_id,
+            role_refs: request.role_refs,
+        },
+        request.action,
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_permission_audit(&state, &decision, &actor_id, channel_id.as_deref())
+        .await?;
+    if !decision.allowed {
+        return Err(AppError::Forbidden(
+            CollaborationError::AccessDenied {
+                permission: decision.action.permission_name(),
+            }
+            .to_string(),
+        ));
+    }
+
+    Ok(Json(decision))
 }
 
 pub async fn list_collaboration_channels(
@@ -3296,6 +5787,16 @@ pub async fn post_collaboration_message(
     if channel.org_id != org_id {
         return Err(AppError::NotFound);
     }
+    assert_collaboration_action_permission(
+        &state,
+        &channel.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Post,
+        Some(&channel.channel_id),
+    )
+    .await?;
     let message = build_collaboration_message(
         request,
         Some(&channel),
@@ -3306,6 +5807,624 @@ pub async fn post_collaboration_message(
     insert_collaboration_message(&state, &message, &channel.org_id).await?;
 
     Ok(Json(message))
+}
+
+pub async fn update_collaboration_presence_route(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationPresenceUpdateRequest>,
+) -> AppResult<Json<CollaborationPresenceRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let channel = load_collaboration_channel(&state, &channel_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("collaboration channel {channel_id} does not exist"))
+        })?;
+    if channel.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &channel.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        Some(&channel.channel_id),
+    )
+    .await?;
+    let record = update_collaboration_presence(&channel, request, current_record_timestamp())
+        .map_err(collaboration_error)?;
+    upsert_collaboration_presence(&state, &record).await?;
+
+    Ok(Json(record))
+}
+
+pub async fn list_collaboration_presence(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationPresenceListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CollaborationPresenceRecord>>> {
+    let channel = load_collaboration_channel(&state, &channel_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if channel.org_id != query.org_id {
+        return Err(AppError::NotFound);
+    }
+    let mut records = load_collaboration_presence_records(&state, &channel_id).await?;
+    if let Some(stale_before) = normalize_optional_text(query.stale_before) {
+        records =
+            expire_lapsed_collaboration_presence(records, stale_before, current_record_timestamp())
+                .map_err(collaboration_error)?;
+        upsert_collaboration_presence_records(&state, &records).await?;
+    }
+
+    Ok(Json(records))
+}
+
+pub async fn create_collaboration_notifications(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationNotificationEventRequest>,
+) -> AppResult<Json<Vec<CollaborationNotificationRecord>>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let channel = load_collaboration_channel(&state, &channel_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("collaboration channel {channel_id} does not exist"))
+        })?;
+    if channel.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &channel.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Post,
+        Some(&channel.channel_id),
+    )
+    .await?;
+    let notifications = build_collaboration_notifications(
+        &channel,
+        request,
+        format!("collab-event-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_notifications(&state, &notifications).await?;
+
+    Ok(Json(notifications))
+}
+
+pub async fn raise_collaboration_emergency_alert_route(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationEmergencyAlertCreateRequest>,
+) -> AppResult<Json<CollaborationEmergencyAlertRaiseResult>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let actor_id = normalize_optional_text(query.actor_id.clone())
+        .ok_or_else(|| collaboration_error(CollaborationError::EmptyActorId))?;
+    let channel = load_collaboration_channel(&state, &channel_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("collaboration channel {channel_id} does not exist"))
+        })?;
+    if channel.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &channel.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Alert,
+        Some(&channel.channel_id),
+    )
+    .await?;
+    let result = raise_collaboration_emergency_alert(
+        &channel,
+        request,
+        format!("collab-alert-{}", Uuid::new_v4()),
+        format!("collab-alert-audit-{}", Uuid::new_v4()),
+        actor_id,
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_emergency_alert_raise(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn transition_collaboration_emergency_alert_route(
+    Path(alert_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationEmergencyAlertTransitionRequest>,
+) -> AppResult<Json<CollaborationEmergencyAlertTransitionResult>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let alert = load_collaboration_emergency_alert(&state, &alert_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if alert.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &alert.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Alert,
+        Some(&alert.channel_id),
+    )
+    .await?;
+    let result = transition_collaboration_emergency_alert(
+        &alert,
+        request,
+        format!("collab-alert-audit-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_emergency_alert_transition(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn record_collaboration_session_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationSessionRecordRequest>,
+) -> AppResult<Json<CollaborationSessionReplay>> {
+    assert_collaboration_action_permission(
+        &state,
+        &request.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Post,
+        None,
+    )
+    .await?;
+    let replay = record_collaboration_session(
+        request,
+        format!("collab-session-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_session_replay(&state, &replay).await?;
+
+    Ok(Json(replay))
+}
+
+pub async fn replay_collaboration_session_route(
+    Path(session_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationSessionReplay>> {
+    let replay = load_collaboration_session_replay(&state, &session_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if replay.session.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &replay.session.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+
+    Ok(Json(replay))
+}
+
+pub async fn create_collaboration_session_annotation_route(
+    Path(session_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(mut request): Json<CollaborationSessionAnnotationCreateRequest>,
+) -> AppResult<Json<CollaborationSessionAnnotationRecord>> {
+    let replay = load_collaboration_session_replay(&state, &session_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if replay.session.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &replay.session.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Annotate,
+        None,
+    )
+    .await?;
+    if !scene_exists(&state, &request.scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+    let stream = load_collaboration_stream(&state, &request.stream_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if stream.org_id != replay.session.org_id {
+        return Err(AppError::NotFound);
+    }
+    if stream.state == CollaborationStreamState::Ended {
+        return Err(AppError::BadRequest(
+            "collaboration stream is not active".to_string(),
+        ));
+    }
+
+    request.annotation.author = Some(request.actor_id.clone());
+    let generated_link_id = format!("collab-session-annotation-{}", Uuid::new_v4());
+    request.annotation.audit_id = Some(generated_link_id.clone());
+    let annotation = build_annotation_record(&state, &request.scene_id, request.annotation).await?;
+    let link = link_collaboration_session_annotation(
+        CollaborationSessionAnnotationLinkRequest {
+            session_id,
+            org_id: replay.session.org_id,
+            scene_id: annotation.scene_id.clone(),
+            annotation_id: annotation.annotation_id.clone(),
+            actor_id: request.actor_id,
+            connection_active: request.connection_active,
+        },
+        generated_link_id,
+        annotation.created_at.clone(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_session_annotation(&state, &link, &annotation).await?;
+
+    Ok(Json(CollaborationSessionAnnotationRecord {
+        link,
+        annotation,
+    }))
+}
+
+pub async fn list_collaboration_session_annotations_route(
+    Path(session_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CollaborationSessionAnnotationRecord>>> {
+    let replay = load_collaboration_session_replay(&state, &session_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if replay.session.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &replay.session.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+
+    Ok(Json(
+        load_collaboration_session_annotations(&state, &session_id, &org_id).await?,
+    ))
+}
+
+pub async fn collaboration_operator_console_feed_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationOperatorConsoleFeed>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    assert_collaboration_action_permission(
+        &state,
+        &org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Stream,
+        None,
+    )
+    .await?;
+    let streams = load_collaboration_operator_console_streams(&state, &org_id).await?;
+    let alerts = load_collaboration_operator_console_active_alerts(&state, &org_id).await?;
+    let feed = build_collaboration_operator_console_feed(
+        org_id,
+        streams,
+        alerts,
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+
+    Ok(Json(feed))
+}
+
+pub async fn collaboration_portal_feed_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationPortalFeed>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    assert_collaboration_action_permission(
+        &state,
+        &org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+    let streams = load_collaboration_operator_console_streams(&state, &org_id).await?;
+    let alerts = load_collaboration_operator_console_active_alerts(&state, &org_id).await?;
+    let feed = build_collaboration_operator_console_feed(
+        org_id,
+        streams,
+        alerts,
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+
+    Ok(Json(feed))
+}
+
+pub async fn collaboration_portal_stream_route(
+    Path(stream_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationLiveStreamRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    assert_collaboration_action_permission(
+        &state,
+        &org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+    let stream = load_collaboration_stream(&state, &stream_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if stream.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(stream))
+}
+
+pub async fn collaboration_portal_alert_route(
+    Path(alert_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationEmergencyAlertRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    assert_collaboration_action_permission(
+        &state,
+        &org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+    let alert = load_collaboration_emergency_alert(&state, &alert_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if alert.org_id != org_id || alert.state == CollaborationEmergencyAlertState::Resolved {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(alert))
+}
+
+pub async fn create_collaboration_mission_plan_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationMissionPlanCreateRequest>,
+) -> AppResult<Json<CollaborationMissionPlanRecord>> {
+    assert_collaboration_action_permission(
+        &state,
+        &request.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Annotate,
+        None,
+    )
+    .await?;
+    let plan = create_collaboration_mission_plan(
+        request,
+        format!("collab-mission-plan-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    upsert_collaboration_mission_plan(&state, &plan).await?;
+
+    Ok(Json(plan))
+}
+
+pub async fn edit_collaboration_mission_plan_route(
+    Path(plan_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationMissionWaypointEditRequest>,
+) -> AppResult<Json<CollaborationMissionEditResult>> {
+    let plan = load_collaboration_mission_plan(&state, &plan_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if plan.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &plan.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Annotate,
+        None,
+    )
+    .await?;
+    let result = apply_collaboration_mission_edit(
+        &plan,
+        request,
+        format!("collab-mission-edit-audit-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_mission_edit_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn dispatch_collaboration_mission_plan_route(
+    Path(plan_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationMissionDispatchRequest>,
+) -> AppResult<Json<CollaborationMissionDispatchResult>> {
+    let plan = load_collaboration_mission_plan(&state, &plan_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if plan.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &plan.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Dispatch,
+        None,
+    )
+    .await?;
+    let result = evaluate_collaboration_mission_dispatch(
+        &plan,
+        request,
+        format!("collab-mission-dispatch-audit-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_mission_dispatch_audit(&state, &result.audit).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn start_collaboration_stream_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationStreamStartRequest>,
+) -> AppResult<Json<CollaborationLiveStreamRecord>> {
+    assert_collaboration_action_permission(
+        &state,
+        &request.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Stream,
+        None,
+    )
+    .await?;
+    let stream = start_collaboration_stream(
+        request,
+        format!("collab-stream-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_stream(&state, &stream).await?;
+
+    Ok(Json(stream))
+}
+
+pub async fn relay_collaboration_stream_frame_route(
+    Path(stream_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationStreamFrameRelayRequest>,
+) -> AppResult<Json<CollaborationStreamRelayResult>> {
+    let stream = load_collaboration_stream(&state, &stream_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if stream.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &stream.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Stream,
+        None,
+    )
+    .await?;
+    let next_sequence = next_collaboration_stream_sequence(&state, &stream_id).await?;
+    let result = relay_collaboration_stream_frame(
+        &stream,
+        request,
+        format!("collab-frame-{}", Uuid::new_v4()),
+        next_sequence,
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_stream_relay_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_collaboration_stream_frames(
+    Path(stream_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CollaborationStreamFrameRecord>>> {
+    let stream = load_collaboration_stream(&state, &stream_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if stream.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &stream.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+    let frames = load_collaboration_stream_frames(&state, &stream_id).await?;
+
+    Ok(Json(frames))
 }
 
 pub async fn list_time_series_points(
@@ -4560,6 +7679,62 @@ pub async fn update_crop_inference_run_status(
     Ok(Json(updated))
 }
 
+pub async fn record_crop_inference_run_progress(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+    Json(mut request): Json<InferenceRunProgressInput>,
+) -> AppResult<Json<InferenceRunProgressRecord>> {
+    if load_crop_inference_run(&state, &run_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+    request.run_id = run_id;
+    let progress =
+        build_inference_run_progress_record(request, format!("crop-progress-{}", Uuid::new_v4()))
+            .map_err(crop_inference_run_error)?;
+    insert_crop_inference_progress(&state, &progress).await?;
+
+    Ok(Json(progress))
+}
+
+pub async fn list_crop_inference_run_progress(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<InferenceRunProgressStream>> {
+    if load_crop_inference_run(&state, &run_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+    let events = load_crop_inference_progress(&state, &run_id).await?;
+    let stream = inference_run_progress_stream(run_id, events).map_err(crop_inference_run_error)?;
+
+    Ok(Json(stream))
+}
+
+pub async fn check_crop_inference_run_stall(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CropInferenceStallCheckRequest>,
+) -> AppResult<Json<Option<InferenceRunStallEvent>>> {
+    if load_crop_inference_run(&state, &run_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+    let events = load_crop_inference_progress(&state, &run_id).await?;
+    let stream =
+        inference_run_progress_stream(run_id.clone(), events).map_err(crop_inference_run_error)?;
+    let stall = detect_inference_run_stall(
+        stream.latest.as_ref(),
+        run_id,
+        format!("crop-stall-{}", Uuid::new_v4()),
+        request.detected_at,
+        request.stall_window_seconds,
+    )
+    .map_err(crop_inference_run_error)?;
+    if let Some(stall) = stall.as_ref() {
+        insert_crop_inference_stall_event(&state, stall).await?;
+    }
+
+    Ok(Json(stall))
+}
+
 pub async fn verify_crop_detection(
     Path(detection_id): Path<String>,
     State(state): State<AppState>,
@@ -4644,6 +7819,28 @@ pub async fn emit_crop_detection_finding(
     persist_crop_detection_finding_recommendation(&state, &annotation, &recommendation).await?;
 
     Ok(Json(recommendation))
+}
+
+pub async fn create_crop_closed_loop_proposal(
+    State(state): State<AppState>,
+    Json(request): Json<CropClosedLoopProposalRequest>,
+) -> AppResult<Json<CropClosedLoopProposal>> {
+    let proposal =
+        build_crop_closed_loop_proposal(request).map_err(crop_closed_loop_proposal_error)?;
+    persist_crop_closed_loop_proposal(&state, &proposal).await?;
+
+    Ok(Json(proposal))
+}
+
+pub async fn get_crop_closed_loop_proposal(
+    Path(proposal_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CropClosedLoopProposal>> {
+    let proposal = load_crop_closed_loop_proposal(&state, &proposal_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    Ok(Json(proposal))
 }
 
 pub async fn create_compliance_record(
@@ -4785,6 +7982,122 @@ pub async fn export_compliance_audit_report(
     .map_err(compliance_audit_report_error)?;
 
     Ok(Json(report))
+}
+
+pub async fn export_compliance_authority_report(
+    State(state): State<AppState>,
+    Json(request): Json<ComplianceAuthorityExportApiRequest>,
+) -> AppResult<Json<ComplianceAuthorityExportArtifact>> {
+    let export = build_compliance_authority_export_from_api(&state, request).await?;
+    persist_compliance_authority_export(&state, &export).await?;
+
+    Ok(Json(export))
+}
+
+pub async fn create_compliance_authority_share(
+    State(state): State<AppState>,
+    Json(request): Json<ComplianceAuthorityShareApiRequest>,
+) -> AppResult<Json<ComplianceAuthorityShareArtifact>> {
+    let export = build_compliance_authority_export_from_api(&state, request.export_request).await?;
+    persist_compliance_authority_export(&state, &export).await?;
+    let created_at = request.created_at.unwrap_or_else(current_record_timestamp);
+    let share = build_compliance_authority_share(ComplianceAuthorityShareRequest {
+        share_id: request
+            .share_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("compliance-share-{}", Uuid::new_v4())),
+        export,
+        created_at,
+        expires_at: request.expires_at,
+    })
+    .map_err(compliance_authority_share_error)?;
+    persist_compliance_authority_share(&state, &share).await?;
+    audit_compliance_authority_share_event(&state, &share, "share_created", None, None).await?;
+
+    Ok(Json(share))
+}
+
+pub async fn get_compliance_authority_share(
+    Path(share_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ComplianceAuthorityExportArtifact>> {
+    let share = load_compliance_authority_share(&state, &share_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if share.revoked_at.is_some() {
+        return Err(AppError::Forbidden(
+            "compliance authority share has been revoked".to_string(),
+        ));
+    }
+    audit_compliance_authority_share_event(&state, &share, "share_accessed", None, None).await?;
+
+    Ok(Json(share.export))
+}
+
+pub async fn revoke_compliance_authority_share_route(
+    Path(share_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<ComplianceAuthorityShareRevokeRequest>,
+) -> AppResult<Json<ComplianceAuthorityShareArtifact>> {
+    let share = load_compliance_authority_share(&state, &share_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let revoked = revoke_compliance_authority_share(
+        share,
+        request.revoked_at.unwrap_or_else(current_record_timestamp),
+    )
+    .map_err(compliance_authority_share_error)?;
+    persist_compliance_authority_share(&state, &revoked).await?;
+    audit_compliance_authority_share_event(
+        &state,
+        &revoked,
+        "share_revoked",
+        request.actor.as_deref(),
+        revoked.revoked_at.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(revoked))
+}
+
+pub async fn run_compliance_regulation_assist(
+    State(state): State<AppState>,
+    Json(request): Json<ComplianceRegulationAssistApiRequest>,
+) -> AppResult<Json<ComplianceRegulationAssistOutput>> {
+    let records =
+        load_compliance_records_for_report(&state, &request.org_id, &request.field_id).await?;
+    let mandatory_record_types = if request.mandatory_record_types.is_empty() {
+        default_compliance_report_mandatory_types()
+    } else {
+        request.mandatory_record_types
+    };
+    let generated_at = request
+        .generated_at
+        .unwrap_or_else(current_record_timestamp);
+    let report = build_compliance_audit_report(ComplianceAuditReportRequest {
+        report_id: format!("compliance-assist-report-{}", Uuid::new_v4()),
+        org_id: request.org_id,
+        field_id: request.field_id,
+        generated_at: generated_at.clone(),
+        records,
+        mandatory_record_types,
+    })
+    .map_err(compliance_audit_report_error)?;
+
+    let output = build_compliance_regulation_assist(ComplianceRegulationAssistRequest {
+        assist_id: request
+            .assist_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("compliance-assist-{}", Uuid::new_v4())),
+        intent: request.intent,
+        report,
+        generated_at,
+        rule_citations: request.rule_citations,
+        feature_enabled: request.feature_enabled,
+    })
+    .map_err(compliance_regulation_assist_error)?;
+
+    Ok(Json(output))
 }
 
 pub async fn ingest_airspace_zone(
@@ -5653,6 +8966,27 @@ pub async fn download_scene_report(
     report_file_response(&report).await
 }
 
+pub async fn get_scene_report_lineage(
+    Path((scene_id, report_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<Json<BackwardProvenanceTrace>> {
+    if !scene_exists(&state, &scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    let report = load_report(&state, &scene_id, &report_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let records = build_report_lineage_records(&state, &report).await?;
+    let ledger = LineageLedger::from_persisted_records(records)
+        .map_err(|err| AppError::Anyhow(Error::new(err)))?;
+    let trace = ledger
+        .trace_backward(&report_artifact_ref(&report.report_id))
+        .map_err(|err| AppError::Anyhow(Error::new(err)))?;
+
+    Ok(Json(trace))
+}
+
 pub async fn create_report_share(
     Path((scene_id, report_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -5926,6 +9260,130 @@ pub async fn export_scene_recommendations_geojson(
     )
 }
 
+pub async fn export_field_records_csv(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let field = load_field(&state, &field_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let annotations = load_field_annotation_records(&state, &field_id).await?;
+    let recommendations = load_field_recommendation_records(&state, &field_id).await?;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer
+        .write_record([
+            "record_type",
+            "record_id",
+            "scene_id",
+            "field_id",
+            "crs",
+            "title",
+            "label",
+            "status",
+            "priority",
+            "evidence_refs",
+            "annotation_ids",
+            "geometry_type",
+            "geometry_json",
+            "created_at",
+            "updated_at",
+        ])
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    for annotation in &annotations {
+        let geometry_type = annotation_geometry_type(&annotation.geometry).to_string();
+        let geometry_json = serde_json::to_string(&annotation.geometry)
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+        writer
+            .write_record(vec![
+                "annotation".to_string(),
+                annotation.annotation_id.clone(),
+                annotation.scene_id.clone(),
+                annotation
+                    .field_id
+                    .clone()
+                    .unwrap_or_else(|| field.field_id.clone()),
+                annotation
+                    .crs
+                    .clone()
+                    .unwrap_or_else(|| field_record_crs(&field)),
+                String::new(),
+                annotation.label.clone(),
+                String::new(),
+                annotation.severity.clone().unwrap_or_default(),
+                String::new(),
+                String::new(),
+                geometry_type,
+                geometry_json,
+                annotation.created_at.clone(),
+                annotation.updated_at.clone(),
+            ])
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+
+    for recommendation in recommendations {
+        writer
+            .write_record(vec![
+                "recommendation".to_string(),
+                recommendation.recommendation_id,
+                recommendation.scene_id,
+                recommendation
+                    .field_id
+                    .unwrap_or_else(|| field.field_id.clone()),
+                field_record_crs(&field),
+                recommendation.title,
+                String::new(),
+                recommendation_status_str(recommendation.status).to_string(),
+                recommendation_priority_str(recommendation.priority).to_string(),
+                recommendation.evidence_refs.join("|"),
+                recommendation.annotation_ids.join("|"),
+                String::new(),
+                String::new(),
+                recommendation.created_at,
+                recommendation.updated_at,
+            ])
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+    }
+
+    let csv_bytes = writer
+        .into_inner()
+        .map_err(|err| AppError::Anyhow(err.into_error().into()))?;
+
+    response_with_bytes(csv_bytes, "text/csv; charset=utf-8", "field-records.csv")
+}
+
+pub async fn export_field_records_geojson(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let field = load_field(&state, &field_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let field_crs = field_record_crs(&field);
+    let annotations = load_field_annotation_records(&state, &field_id).await?;
+    assert_field_bundle_annotation_crs(&annotations, &field_crs)?;
+    let recommendations = load_field_recommendation_records(&state, &field_id).await?;
+
+    let mut features = vec![feature_from_field(field.clone())];
+    features.extend(
+        annotations
+            .iter()
+            .map(feature_from_annotation)
+            .collect::<AppResult<Vec<_>>>()?,
+    );
+    for recommendation in &recommendations {
+        features.extend(recommendation_features(recommendation, &annotations)?);
+    }
+
+    let geojson = feature_collection_with_crs(features, &field_crs);
+
+    response_with_bytes(
+        serde_json::to_vec(&geojson).map_err(|err| AppError::Anyhow(err.into()))?,
+        "application/geo+json",
+        "field-records.geojson",
+    )
+}
+
 pub async fn create_field(
     State(state): State<AppState>,
     Json(request): Json<CreateFieldRequest>,
@@ -6142,6 +9600,129 @@ pub async fn list_field_scene_refresh_advisories(
     }))
 }
 
+pub async fn list_field_scene_change_advisories(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<SceneChangeAdvisoriesResponse>> {
+    if load_field(&state, &field_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let rows = sqlx::query(
+        "SELECT scene_id, acquired_at, data_path, metadata_json, cloud_cover FROM scenes WHERE field_id = ?1 ORDER BY acquired_at DESC LIMIT 2",
+    )
+    .bind(&field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    if rows.len() < 2 {
+        return Ok(Json(SceneChangeAdvisoriesResponse {
+            advisory_enabled: true,
+            reason: Some("single-linked-scene: no comparison available".to_string()),
+            advisories: Vec::new(),
+        }));
+    }
+
+    let comparison_scene_id: String = rows[0].get("scene_id");
+    let comparison_acquired_at: String = rows[0].get("acquired_at");
+    let comparison_data_path: String = rows[0].get("data_path");
+    let comparison_cloud_cover: Option<f64> = rows[0].get("cloud_cover");
+    let comparison_metadata =
+        load_scene_metadata(Some(&rows[0]), FsPath::new(&comparison_data_path)).await?;
+    let comparison_spatial_ref =
+        ingest::load_scene_spatial_ref(&state.pool, &comparison_scene_id).await?;
+
+    let baseline_scene_id: String = rows[1].get("scene_id");
+    let baseline_acquired_at: String = rows[1].get("acquired_at");
+    let baseline_data_path: String = rows[1].get("data_path");
+    let baseline_cloud_cover: Option<f64> = rows[1].get("cloud_cover");
+    let baseline_metadata =
+        load_scene_metadata(Some(&rows[1]), FsPath::new(&baseline_data_path)).await?;
+    let baseline_spatial_ref =
+        ingest::load_scene_spatial_ref(&state.pool, &baseline_scene_id).await?;
+
+    let baseline_extent =
+        scene_extent_for_link(baseline_metadata.as_ref(), baseline_spatial_ref.as_ref());
+    let comparison_extent = scene_extent_for_link(
+        comparison_metadata.as_ref(),
+        comparison_spatial_ref.as_ref(),
+    );
+
+    let comparable = baseline_spatial_ref
+        .as_ref()
+        .zip(comparison_spatial_ref.as_ref())
+        .is_some_and(|(baseline, comparison)| {
+            assert_scene_spatial_ref_integrity(baseline_metadata.as_ref(), Some(baseline)).is_ok()
+                && assert_scene_spatial_ref_integrity(
+                    comparison_metadata.as_ref(),
+                    Some(comparison),
+                )
+                .is_ok()
+                && assert_spatial_refs_equivalent(baseline, comparison).is_ok()
+        });
+
+    let common_extent = baseline_extent
+        .as_ref()
+        .zip(comparison_extent.as_ref())
+        .and_then(|(baseline, comparison)| common_scene_extent(baseline, comparison));
+    let coverage_fraction = common_extent
+        .as_ref()
+        .zip(baseline_extent.as_ref())
+        .map(|(common, baseline)| {
+            let baseline_area = scene_extent_area(baseline);
+            if baseline_area <= f64::EPSILON {
+                0.0
+            } else {
+                (scene_extent_area(common) / baseline_area).clamp(0.0, 1.0)
+            }
+        })
+        .unwrap_or(0.0);
+
+    let (change_score, uncertainty_low, uncertainty_high, reason, confidence) = if comparable {
+        let score = coarse_scene_change_score(baseline_cloud_cover, comparison_cloud_cover);
+        let uncertainty = if baseline_cloud_cover.is_some() && comparison_cloud_cover.is_some() {
+            0.05
+        } else {
+            0.25
+        };
+        (
+            score,
+            (score - uncertainty).max(0.0),
+            (score + uncertainty).min(1.0),
+            "aligned-common-extent".to_string(),
+            if uncertainty <= 0.05 { "medium" } else { "low" }.to_string(),
+        )
+    } else {
+        (
+            0.0,
+            0.0,
+            1.0,
+            "spatial-ref-mismatch: change unavailable without comparable CRS/extent/resolution"
+                .to_string(),
+            "low".to_string(),
+        )
+    };
+
+    Ok(Json(SceneChangeAdvisoriesResponse {
+        advisory_enabled: true,
+        reason: None,
+        advisories: vec![SceneChangeAdvisory {
+            baseline_scene_id,
+            comparison_scene_id,
+            baseline_acquired_at,
+            comparison_acquired_at,
+            common_extent: if comparable { common_extent } else { None },
+            coverage_fraction: if comparable { coverage_fraction } else { 0.0 },
+            change_score,
+            uncertainty_low,
+            uncertainty_high,
+            confidence,
+            reason,
+        }],
+    }))
+}
+
 pub async fn link_scene_to_field(
     Path((scene_id, field_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -6302,6 +9883,7 @@ pub async fn list_layers(
 ) -> AppResult<Json<LayerListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let stale_after_days = normalized_stale_after_days(query.stale_after_days);
     let rows = load_layer_rows(&state).await?;
     let mut layers = Vec::new();
 
@@ -6309,7 +9891,7 @@ pub async fn list_layers(
         if !layer_row_matches_query(&row, &query) {
             continue;
         }
-        if let Some(layer) = layer_from_row(&row, false).await? {
+        if let Some(layer) = layer_from_row(&row, false, stale_after_days).await? {
             layers.push(layer);
         }
     }
@@ -6333,10 +9915,91 @@ pub async fn get_layer_metadata(
     let row = load_layer_row(&state, &scene_id, &kind)
         .await?
         .ok_or(AppError::NotFound)?;
-    let layer = layer_from_row(&row, true)
+    let layer = layer_from_row(&row, true, DEFAULT_LAYER_STALE_AFTER_DAYS)
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(layer))
+}
+
+pub async fn publish_open_data_layer(
+    Path((scene_id, kind)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<OpenDataLayerPublishRequest>,
+) -> AppResult<Json<OpenDataLayerCatalogEntry>> {
+    let row = load_layer_row(&state, &scene_id, &kind)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let layer = layer_from_row(&row, true, DEFAULT_LAYER_STALE_AFTER_DAYS)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let source_layer_ref = layer.layer_id.clone();
+    let generated_open_data_id = format!("open-data:{}:{}", layer.scene_id, layer.product_kind);
+    let publication = prepare_open_data_publication(
+        OpenDataPublishRequest {
+            source_layer_ref,
+            license: request.license,
+            attribution: request.attribution,
+            owner_identifier: request.owner_identifier,
+            field_identifier: request.field_identifier,
+        },
+        generated_open_data_id,
+    )
+    .map_err(open_data_publish_error)?;
+
+    sqlx::query(
+        r#"
+        UPDATE products
+        SET open_data_license = ?3,
+            open_data_attribution = ?4,
+            open_data_anonymized = 1,
+            open_data_refusal_reason = NULL,
+            open_data_published_at = datetime('now')
+        WHERE scene_id = ?1 AND lower(kind) = lower(?2)
+        "#,
+    )
+    .bind(&scene_id)
+    .bind(&kind)
+    .bind(&publication.license)
+    .bind(&publication.attribution)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(open_data_catalog_entry_from_layer(
+        &layer,
+        &publication,
+        None,
+    )))
+}
+
+pub async fn list_open_data_layers(
+    State(state): State<AppState>,
+) -> AppResult<Json<OpenDataCatalogResponse>> {
+    let rows = load_layer_rows(&state).await?;
+    let mut layers = Vec::new();
+    for row in rows {
+        if let Some(layer) = layer_from_row(&row, false, DEFAULT_LAYER_STALE_AFTER_DAYS).await? {
+            let license = row.get::<Option<String>, _>("open_data_license");
+            let attribution = row.get::<Option<String>, _>("open_data_attribution");
+            let anonymized = row.get::<Option<i64>, _>("open_data_anonymized") == Some(1);
+            if let (Some(license), Some(attribution), true) = (license, attribution, anonymized) {
+                let publication = OpenDataPublication {
+                    open_data_id: format!("open-data:{}:{}", layer.scene_id, layer.product_kind),
+                    source_layer_ref: layer.layer_id.clone(),
+                    license,
+                    attribution,
+                    anonymized,
+                };
+                layers.push(open_data_catalog_entry_from_layer(
+                    &layer,
+                    &publication,
+                    row.get("open_data_published_at"),
+                ));
+            }
+        }
+    }
+
+    Ok(Json(OpenDataCatalogResponse { layers }))
 }
 
 pub async fn get_scene_audit(
@@ -6433,7 +10096,7 @@ pub async fn export_layer_geotiff(
     let row = load_layer_row(&state, &scene_id, &kind)
         .await?
         .ok_or(AppError::NotFound)?;
-    let layer = layer_from_row(&row, true)
+    let layer = layer_from_row(&row, true, DEFAULT_LAYER_STALE_AFTER_DAYS)
         .await?
         .ok_or(AppError::NotFound)?;
     let metadata_json: String = row.get("metadata_json");
@@ -6760,6 +10423,11 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
             p.qa_report_ref,
             p.provenance_hash,
             p.downstream_consumers_json,
+            p.open_data_license,
+            p.open_data_attribution,
+            p.open_data_anonymized,
+            p.open_data_refusal_reason,
+            p.open_data_published_at,
             s.scene_id,
             s.sensor,
             s.acquired_at,
@@ -6769,11 +10437,13 @@ async fn load_layer_rows(state: &AppState) -> AppResult<Vec<sqlx::sqlite::Sqlite
             i.ingested_at,
             i.coverage_fraction,
             i.source_path AS ingest_source_path,
-            sr.spatial_ref_json AS scene_spatial_ref_json
+            sr.spatial_ref_json AS scene_spatial_ref_json,
+            f.boundary_json AS field_boundary_json
         FROM products p
         JOIN scenes s ON s.scene_id = p.scene_id
         LEFT JOIN scene_ingests i ON i.scene_id = s.scene_id
         LEFT JOIN scene_spatial_refs sr ON sr.scene_id = s.scene_id
+        LEFT JOIN fields f ON f.field_id = COALESCE(p.field_id, s.field_id)
         ORDER BY s.acquired_at DESC, p.kind ASC
         "#,
     )
@@ -6806,6 +10476,11 @@ async fn load_layer_row(
             p.qa_report_ref,
             p.provenance_hash,
             p.downstream_consumers_json,
+            p.open_data_license,
+            p.open_data_attribution,
+            p.open_data_anonymized,
+            p.open_data_refusal_reason,
+            p.open_data_published_at,
             s.scene_id,
             s.sensor,
             s.acquired_at,
@@ -6815,11 +10490,13 @@ async fn load_layer_row(
             i.ingested_at,
             i.coverage_fraction,
             i.source_path AS ingest_source_path,
-            sr.spatial_ref_json AS scene_spatial_ref_json
+            sr.spatial_ref_json AS scene_spatial_ref_json,
+            f.boundary_json AS field_boundary_json
         FROM products p
         JOIN scenes s ON s.scene_id = p.scene_id
         LEFT JOIN scene_ingests i ON i.scene_id = s.scene_id
         LEFT JOIN scene_spatial_refs sr ON sr.scene_id = s.scene_id
+        LEFT JOIN fields f ON f.field_id = COALESCE(p.field_id, s.field_id)
         WHERE p.scene_id = ?1 AND lower(p.kind) = lower(?2)
         "#,
     )
@@ -6877,9 +10554,36 @@ fn optional_filter_matches(row_value: Option<String>, filter: Option<&String>) -
     row_value.as_deref() == Some(filter)
 }
 
+fn open_data_publish_error(error: OpenDataPublishError) -> AppError {
+    match error {
+        OpenDataPublishError::Refused { reason } => {
+            AppError::BadRequest(format!("open_data_refused:{reason:?}").to_ascii_lowercase())
+        }
+    }
+}
+
+fn open_data_catalog_entry_from_layer(
+    layer: &LayerMetadata,
+    publication: &OpenDataPublication,
+    published_at: Option<String>,
+) -> OpenDataLayerCatalogEntry {
+    OpenDataLayerCatalogEntry {
+        open_data_id: publication.open_data_id.clone(),
+        product_kind: layer.product_kind.clone(),
+        license: publication.license.clone(),
+        attribution: publication.attribution.clone(),
+        anonymized: publication.anonymized,
+        spatial_ref: layer.spatial_ref.clone(),
+        url_path: layer.url_path.clone(),
+        tile_url_template: layer.tile_url_template.clone(),
+        published_at,
+    }
+}
+
 async fn layer_from_row(
     row: &sqlx::sqlite::SqliteRow,
     strict: bool,
+    stale_after_days: i64,
 ) -> AppResult<Option<LayerMetadata>> {
     let product_path = PathBuf::from(row.get::<String, _>("path"));
     if !fs::try_exists(&product_path)
@@ -6955,6 +10659,8 @@ async fn layer_from_row(
     let product_id = row
         .get::<Option<String>, _>("product_id")
         .filter(|value| !value.trim().is_empty());
+    let acquired_at = row.get::<String, _>("acquired_at");
+    let (field_coverage_fraction, field_coverage_status) = layer_field_coverage(row, &spatial_ref)?;
 
     Ok(Some(LayerMetadata {
         layer_id: format!("{scene_id}:{product_kind}"),
@@ -6974,15 +10680,97 @@ async fn layer_from_row(
         qa_report_ref: row.get("qa_report_ref"),
         provenance_hash: row.get("provenance_hash"),
         downstream_consumers: decode_downstream_consumers(row.get("downstream_consumers_json"))?,
-        freshness: LayerFreshness {
-            acquired_at: row.get("acquired_at"),
-            ingested_at: row.get("ingested_at"),
-            coverage_fraction: row.get("coverage_fraction"),
-        },
+        freshness: layer_freshness(
+            acquired_at,
+            row.get("ingested_at"),
+            row.get("coverage_fraction"),
+            stale_after_days,
+            field_coverage_fraction,
+            field_coverage_status,
+        ),
         source,
         tile_url_template: format!("{url_path}/tiles/{{z}}/{{x}}/{{y}}.png"),
         url_path,
     }))
+}
+
+fn normalized_stale_after_days(value: Option<i64>) -> i64 {
+    value
+        .unwrap_or(DEFAULT_LAYER_STALE_AFTER_DAYS)
+        .clamp(0, 3650)
+}
+
+fn layer_freshness(
+    acquired_at: String,
+    ingested_at: Option<String>,
+    coverage_fraction: Option<f64>,
+    stale_after_days: i64,
+    field_coverage_fraction: Option<f64>,
+    field_coverage_status: Option<String>,
+) -> LayerFreshness {
+    let age_days = chrono::DateTime::parse_from_rfc3339(&acquired_at)
+        .ok()
+        .map(|acquired| {
+            chrono::Utc::now()
+                .signed_duration_since(acquired.with_timezone(&chrono::Utc))
+                .num_days()
+        });
+    let stale = age_days.is_some_and(|age| age > stale_after_days);
+
+    LayerFreshness {
+        acquired_at,
+        ingested_at,
+        coverage_fraction,
+        stale_after_days,
+        age_days,
+        stale,
+        field_coverage_fraction,
+        field_coverage_status,
+    }
+}
+
+fn layer_field_coverage(
+    row: &sqlx::sqlite::SqliteRow,
+    spatial_ref: &RasterSpatialRef,
+) -> AppResult<(Option<f64>, Option<String>)> {
+    let Some(boundary_json) = row.get::<Option<String>, _>("field_boundary_json") else {
+        return Ok((None, None));
+    };
+    let Some(layer_bounds) = spatial_ref.bbox.as_ref() else {
+        return Ok((None, None));
+    };
+    let boundary = serde_json::from_str::<FieldBoundary>(&boundary_json).map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode field boundary_json"))
+    })?;
+    let validated = match validate_field_boundary(&boundary) {
+        Ok(validated) => validated,
+        Err(_) => return Ok((None, Some("invalid_boundary".to_string()))),
+    };
+
+    let Some(layer_crs) = spatial_ref.crs.as_deref() else {
+        return Ok((None, Some("missing_crs".to_string())));
+    };
+
+    if boundary
+        .crs
+        .as_deref()
+        .map(str::trim)
+        .filter(|crs| !crs.is_empty())
+        != Some(layer_crs)
+    {
+        return Ok((None, Some("crs_mismatch".to_string())));
+    }
+
+    let fraction = bounds_coverage_fraction(&validated.extent, layer_bounds);
+    let status = if fraction == 0.0 {
+        "no_coverage"
+    } else if fraction >= 0.999_999 {
+        "full"
+    } else {
+        "partial"
+    };
+
+    Ok((Some(fraction), Some(status.to_string())))
 }
 
 async fn is_supported_product_file(entry: &DirEntry) -> AppResult<bool> {
@@ -7685,16 +11473,105 @@ fn marketplace_account_error(error: MarketplaceAccountError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn marketplace_catalog_error(error: MarketplaceCatalogError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn marketplace_portal_entry_error(error: MarketplacePortalEntryError) -> AppError {
+    match error {
+        MarketplacePortalEntryError::MissingAccount
+        | MarketplacePortalEntryError::OrgMismatch { .. }
+        | MarketplacePortalEntryError::AccountNotActive { .. }
+        | MarketplacePortalEntryError::MissingMarketplaceRole { .. } => {
+            AppError::Forbidden(error.to_string())
+        }
+        MarketplacePortalEntryError::EmptyOrgId => AppError::BadRequest(error.to_string()),
+    }
+}
+
+fn marketplace_listing_error(error: MarketplaceListingError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn marketplace_inventory_error(error: MarketplaceInventoryError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn marketplace_order_error(error: MarketplaceOrderError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn marketplace_fulfillment_error(error: MarketplaceFulfillmentError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn marketplace_rating_error(error: MarketplaceRatingError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn marketplace_demand_forecast_error(error: MarketplaceDemandForecastError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn marketplace_report_error(error: MarketplaceReportError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn sustainability_record_error(error: SustainabilityRecordError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
-fn content_error(error: ContentError) -> AppError {
+fn carbon_footprint_error(error: CarbonFootprintError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
-fn collaboration_error(error: CollaborationError) -> AppError {
+fn biomass_estimate_error(error: BiomassEstimateError) -> AppError {
     AppError::BadRequest(error.to_string())
+}
+
+fn sustainability_baseline_error(error: SustainabilityBaselineError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn sustainability_mrv_trail_error(error: SustainabilityMrvTrailError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn biodiversity_proxy_error(error: BiodiversityProxyError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn soil_carbon_proxy_error(error: SoilCarbonProxyError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn sustainability_kpi_error(error: SustainabilityKpiError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn sustainability_certification_pack_error(
+    error: SustainabilityCertificationEvidencePackError,
+) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn content_error(error: ContentError) -> AppError {
+    if matches!(
+        error,
+        ContentError::PublishRequiresEditor | ContentError::AccessDenied { .. }
+    ) {
+        AppError::Forbidden(error.to_string())
+    } else {
+        AppError::BadRequest(error.to_string())
+    }
+}
+
+fn collaboration_error(error: CollaborationError) -> AppError {
+    if matches!(error, CollaborationError::AccessDenied { .. }) {
+        AppError::Forbidden(error.to_string())
+    } else {
+        AppError::BadRequest(error.to_string())
+    }
 }
 
 fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
@@ -7757,6 +11634,10 @@ fn crop_detection_finding_error(error: CropDetectionFindingError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
+fn crop_closed_loop_proposal_error(error: CropClosedLoopProposalError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
 fn parse_crop_model_task(value: String) -> AppResult<CropModelTask> {
     value
         .parse::<CropModelTask>()
@@ -7781,6 +11662,26 @@ fn compliance_record_error(error: ComplianceRecordError) -> AppError {
 
 fn compliance_audit_report_error(error: ComplianceAuditReportError) -> AppError {
     AppError::BadRequest(error.to_string())
+}
+
+fn compliance_authority_export_error(error: ComplianceAuthorityExportError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn compliance_authority_share_error(error: ComplianceAuthorityShareError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn compliance_regulation_assist_error(error: ComplianceRegulationAssistError) -> AppError {
+    if matches!(
+        error,
+        ComplianceRegulationAssistError::DeterministicGateRequired
+            | ComplianceRegulationAssistError::FeatureDisabled
+    ) {
+        AppError::Forbidden(error.to_string())
+    } else {
+        AppError::BadRequest(error.to_string())
+    }
 }
 
 fn parse_compliance_record_type(value: String) -> AppResult<ComplianceRecordType> {
@@ -8370,6 +12271,36 @@ fn collection_crs_from_annotations(annotations: &[AnnotationRecord]) -> AppResul
     Ok(collection_crs.unwrap_or_else(|| "EPSG:4326".to_string()))
 }
 
+fn field_record_crs(field: &FieldRecord) -> String {
+    field
+        .boundary
+        .crs
+        .clone()
+        .unwrap_or_else(|| "EPSG:4326".to_string())
+}
+
+fn assert_field_bundle_annotation_crs(
+    annotations: &[AnnotationRecord],
+    field_crs: &str,
+) -> AppResult<()> {
+    let field_crs = normalize_geojson_crs(Some(field_crs.to_string()))?;
+    for annotation in annotations {
+        let annotation_crs = annotation
+            .crs
+            .as_ref()
+            .map(|crs| normalize_geojson_crs(Some(crs.clone())))
+            .transpose()?
+            .unwrap_or_else(|| field_crs.clone());
+        if annotation_crs != field_crs {
+            return Err(AppError::BadRequest(format!(
+                "field export requires annotation {} CRS {} to match field CRS {}",
+                annotation.annotation_id, annotation_crs, field_crs
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn annotation_geometry_type(geometry: &AnnotationGeometry) -> &'static str {
     match geometry {
         AnnotationGeometry::Point { .. } => "point",
@@ -8627,11 +12558,9 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
     let boundary = serde_json::from_str::<FieldBoundary>(&boundary_json).map_err(|err| {
         AppError::Anyhow(anyhow::Error::new(err).context("failed to decode field boundary_json"))
     })?;
-    let extent = bounds_from_points(&boundary.coordinates).ok_or_else(|| {
-        AppError::Anyhow(anyhow::anyhow!(
-            "field boundary does not contain any coordinates"
-        ))
-    })?;
+    let validated_boundary =
+        validate_field_boundary(&boundary).map_err(|err| AppError::Anyhow(Error::new(err)))?;
+    let extent = validated_boundary.extent;
 
     Ok(FieldRecord {
         farm_id: row.get("farm_id"),
@@ -8639,7 +12568,7 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
         org_id: row.get("owner"),
         owner: row.get("owner"),
         name: row.get("name"),
-        area_ha: None,
+        area_ha: Some(validated_boundary.area_ha),
         crop: row.get("crop"),
         season: row.get("season"),
         notes: row.get("notes"),
@@ -9115,6 +13044,179 @@ fn decode_marketplace_account_record(
     })
 }
 
+fn decode_marketplace_catalog_item_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceCatalogItemRecord> {
+    Ok(MarketplaceCatalogItemRecord {
+        item_id: row.get("item_id"),
+        org_id: row.get("org_id"),
+        kind: parse_marketplace_catalog_item_kind(&row.get::<String, _>("kind"))
+            .map_err(marketplace_catalog_error)?,
+        category: parse_marketplace_catalog_category(&row.get::<String, _>("category"))
+            .map_err(marketplace_catalog_error)?,
+        name: row.get("name"),
+        unit_of_measure: parse_marketplace_unit_of_measure(
+            &row.get::<String, _>("unit_of_measure"),
+        )
+        .map_err(marketplace_catalog_error)?,
+        owner_account_id: row.get("owner_account_id"),
+        created_at: row.get("created_at"),
+    })
+}
+
+fn decode_marketplace_listing_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceListingRecord> {
+    Ok(MarketplaceListingRecord {
+        listing_id: row.get("listing_id"),
+        item_id: row.get("item_id"),
+        org_id: row.get("org_id"),
+        price: row.get("price"),
+        currency: row.get("currency"),
+        available_qty: row.get("available_qty"),
+        window: shared::schemas::MarketplaceAvailabilityWindow {
+            from: row.get("window_from"),
+            to: row.get("window_to"),
+        },
+        status: parse_marketplace_listing_status(&row.get::<String, _>("status"))
+            .map_err(marketplace_listing_error)?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_marketplace_inventory_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceInventoryRecord> {
+    Ok(MarketplaceInventoryRecord {
+        inventory_id: row.get("inventory_id"),
+        item_id: row.get("item_id"),
+        org_id: row.get("org_id"),
+        on_hand: row.get("on_hand"),
+        reserved: row.get("reserved"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_marketplace_order_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceOrderRecord> {
+    Ok(MarketplaceOrderRecord {
+        order_id: row.get("order_id"),
+        org_id: row.get("org_id"),
+        listing_ref: row.get("listing_ref"),
+        buyer_account_id: row.get("buyer_account_id"),
+        qty: row.get("qty"),
+        line_total: row.get("line_total"),
+        status: parse_marketplace_order_status(&row.get::<String, _>("status"))
+            .map_err(marketplace_order_error)?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_marketplace_order_audit_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceOrderAuditRecord> {
+    let from_status = row
+        .get::<Option<String>, _>("from_status")
+        .map(|status| parse_marketplace_order_status(&status).map_err(marketplace_order_error))
+        .transpose()?;
+    Ok(MarketplaceOrderAuditRecord {
+        audit_id: row.get("audit_id"),
+        order_id: row.get("order_id"),
+        from_status,
+        to_status: parse_marketplace_order_status(&row.get::<String, _>("to_status"))
+            .map_err(marketplace_order_error)?,
+        actor_id: row.get("actor_id"),
+        occurred_at: row.get("occurred_at"),
+    })
+}
+
+fn decode_marketplace_fulfillment_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceFulfillmentRecord> {
+    Ok(MarketplaceFulfillmentRecord {
+        fulfillment_id: row.get("fulfillment_id"),
+        order_ref: row.get("order_ref"),
+        org_id: row.get("org_id"),
+        carrier_ref: row.get("carrier_ref"),
+        tracking_ref: row.get("tracking_ref"),
+        status: parse_marketplace_fulfillment_status(&row.get::<String, _>("status"))
+            .map_err(marketplace_fulfillment_error)?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_marketplace_fulfillment_audit_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceFulfillmentAuditRecord> {
+    let from_status = row
+        .get::<Option<String>, _>("from_status")
+        .map(|status| {
+            parse_marketplace_fulfillment_status(&status).map_err(marketplace_fulfillment_error)
+        })
+        .transpose()?;
+    Ok(MarketplaceFulfillmentAuditRecord {
+        audit_id: row.get("audit_id"),
+        fulfillment_id: row.get("fulfillment_id"),
+        from_status,
+        to_status: parse_marketplace_fulfillment_status(&row.get::<String, _>("to_status"))
+            .map_err(marketplace_fulfillment_error)?,
+        actor_id: row.get("actor_id"),
+        occurred_at: row.get("occurred_at"),
+    })
+}
+
+fn decode_marketplace_rating_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceRatingRecord> {
+    Ok(MarketplaceRatingRecord {
+        rating_id: row.get("rating_id"),
+        order_ref: row.get("order_ref"),
+        rater_account_id: row.get("rater_account_id"),
+        ratee_account_id: row.get("ratee_account_id"),
+        score: row.get("score"),
+        comment: row.get("comment"),
+        org_scope: row.get("org_scope"),
+        created_at: row.get("created_at"),
+    })
+}
+
+fn decode_marketplace_demand_forecast_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<MarketplaceDemandForecastRecord> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode demand forecast evidence_refs_json"),
+        )
+    })?;
+    let uncertainty_low: Option<f64> = row.get("uncertainty_low");
+    let uncertainty_high: Option<f64> = row.get("uncertainty_high");
+    let uncertainty_band = uncertainty_low
+        .zip(uncertainty_high)
+        .map(|(low, high)| MarketplaceDemandUncertaintyBand { low, high });
+    Ok(MarketplaceDemandForecastRecord {
+        forecast_id: row.get("forecast_id"),
+        org_id: row.get("org_id"),
+        field_id: row.get("field_id"),
+        item_kind: parse_marketplace_catalog_item_kind(&row.get::<String, _>("item_kind"))
+            .map_err(marketplace_catalog_error)?,
+        horizon: row.get("horizon"),
+        value: row.get("value"),
+        evidence_refs,
+        status: parse_marketplace_demand_forecast_status(&row.get::<String, _>("status"))
+            .map_err(marketplace_demand_forecast_error)?,
+        uncertainty_band,
+        method: row.get("method"),
+        created_at: row.get("created_at"),
+    })
+}
+
 fn decode_sustainability_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<SustainabilityRecord> {
     Ok(SustainabilityRecord {
         record_id: row.get("record_id"),
@@ -9126,6 +13228,338 @@ fn decode_sustainability_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Sust
         method_version: row.get("method_version"),
         created_at: row.get("created_at"),
         audit_id: row.get("audit_id"),
+    })
+}
+
+fn decode_carbon_footprint_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CarbonFootprintResult> {
+    let inputs =
+        serde_json::from_str::<Vec<CarbonFootprintInput>>(&row.get::<String, _>("inputs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode carbon footprint inputs_json"),
+                )
+            })?;
+    let factors =
+        serde_json::from_str::<Vec<CarbonEmissionFactor>>(&row.get::<String, _>("factors_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode carbon footprint factors_json"),
+                )
+            })?;
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode carbon footprint evidence_refs_json"),
+        )
+    })?;
+
+    Ok(CarbonFootprintResult {
+        footprint_id: row.get("footprint_id"),
+        record_id: row.get("record_id"),
+        operation_id: row.get("operation_id"),
+        value_co2e: row.get("value_co2e"),
+        inputs,
+        factor_set_version: row.get("factor_set_version"),
+        factors,
+        evidence_refs,
+        status: parse_carbon_footprint_status(&row.get::<String, _>("status"))
+            .map_err(carbon_footprint_error)?,
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_biomass_estimate_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<BiomassEstimateResult> {
+    let extent =
+        serde_json::from_str::<GeoBounds>(&row.get::<String, _>("extent_json")).map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode biomass extent_json"))
+        })?;
+    let resolution =
+        serde_json::from_str::<RasterResolution>(&row.get::<String, _>("resolution_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode biomass resolution_json"),
+                )
+            })?;
+    let source_layer_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("source_layer_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode biomass source_layer_refs_json"),
+                )
+            })?;
+
+    Ok(BiomassEstimateResult {
+        estimate_id: row.get("estimate_id"),
+        record_id: row.get("record_id"),
+        biomass_value: row.get("biomass_value"),
+        area: row.get("area"),
+        crs: row.get("crs"),
+        extent,
+        resolution,
+        source_layer_refs,
+        method_version: row.get("method_version"),
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_sustainability_baseline(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityBaselineRecord> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode sustainability baseline evidence_refs_json"),
+        )
+    })?;
+
+    Ok(SustainabilityBaselineRecord {
+        baseline_id: row.get("baseline_id"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        metric_type: parse_sustainability_metric_type(&row.get::<String, _>("metric_type"))
+            .map_err(sustainability_record_error)?,
+        metric_value: row.get("metric_value"),
+        source_record_id: row.get("source_record_id"),
+        method_version: row.get("method_version"),
+        evidence_refs,
+        created_at: row.get("created_at"),
+    })
+}
+
+fn decode_sustainability_comparison(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityComparisonResult> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err)
+                .context("failed to decode sustainability comparison evidence_refs_json"),
+        )
+    })?;
+
+    Ok(SustainabilityComparisonResult {
+        comparison_id: row.get("comparison_id"),
+        field_id: row.get("field_id"),
+        baseline_season_id: row.get("baseline_season_id"),
+        current_season_id: row.get("current_season_id"),
+        metric_type: parse_sustainability_metric_type(&row.get::<String, _>("metric_type"))
+            .map_err(sustainability_record_error)?,
+        baseline_value: row.get("baseline_value"),
+        current_value: row.get("current_value"),
+        delta: row.get("delta"),
+        trend: parse_sustainability_trend(&row.get::<String, _>("trend"))
+            .map_err(sustainability_baseline_error)?,
+        status: parse_sustainability_comparison_status(&row.get::<String, _>("status"))
+            .map_err(sustainability_baseline_error)?,
+        baseline_source_record_id: row.get("baseline_source_record_id"),
+        current_source_record_id: row.get("current_source_record_id"),
+        evidence_refs,
+        method_version: row.get("method_version"),
+        result_hash: row.get("result_hash"),
+        compared_at: row.get("compared_at"),
+    })
+}
+
+fn decode_sustainability_mrv_trail(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityMrvTrail> {
+    let input_layer_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("input_layer_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode MRV input_layer_refs_json"),
+                )
+            })?;
+    let extent =
+        serde_json::from_str::<GeoBounds>(&row.get::<String, _>("extent_json")).map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode MRV extent_json"))
+        })?;
+    let parameters =
+        serde_json::from_str::<BTreeMap<String, String>>(&row.get::<String, _>("parameters_json"))
+            .map_err(|err| {
+                AppError::Anyhow(Error::new(err).context("failed to decode MRV parameters_json"))
+            })?;
+
+    Ok(SustainabilityMrvTrail {
+        trail_id: row.get("trail_id"),
+        output_ref: row.get("output_ref"),
+        output_kind: parse_sustainability_mrv_output_kind(&row.get::<String, _>("output_kind"))
+            .map_err(sustainability_mrv_trail_error)?,
+        input_layer_refs,
+        method: row.get("method"),
+        method_version: row.get("method_version"),
+        crs: row.get("crs"),
+        extent,
+        parameters,
+        audit_id: row.get("audit_id"),
+        result_hash: row.get("result_hash"),
+        rederived_result_hash: row.get("rederived_result_hash"),
+        certification_ready: row.get::<i64, _>("certification_ready") != 0,
+        created_at: row.get("created_at"),
+    })
+}
+
+fn decode_biodiversity_proxy_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<BiodiversityProxyResult> {
+    let extent =
+        serde_json::from_str::<GeoBounds>(&row.get::<String, _>("extent_json")).map_err(|err| {
+            AppError::Anyhow(Error::new(err).context("failed to decode biodiversity extent_json"))
+        })?;
+    let source_layer_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("source_layer_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode biodiversity source_layer_refs_json"),
+                )
+            })?;
+
+    Ok(BiodiversityProxyResult {
+        proxy_id: row.get("proxy_id"),
+        field_id: row.get("field_id"),
+        heterogeneity_score: row.get("heterogeneity_score"),
+        cover_fraction: row.get("cover_fraction"),
+        uncertainty: row.get("uncertainty"),
+        status: parse_biodiversity_proxy_status(&row.get::<String, _>("status"))
+            .map_err(biodiversity_proxy_error)?,
+        crs: row.get("crs"),
+        extent,
+        source_layer_refs,
+        method_version: row.get("method_version"),
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_soil_carbon_proxy_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SoilCarbonProxyResult> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode soil-carbon evidence_refs_json"))
+    })?;
+    let uncertainty_low: Option<f64> = row.get("uncertainty_low");
+    let uncertainty_high: Option<f64> = row.get("uncertainty_high");
+    let uncertainty_band = match (uncertainty_low, uncertainty_high) {
+        (Some(low), Some(high)) => Some(SoilCarbonUncertaintyBand { low, high }),
+        _ => None,
+    };
+
+    Ok(SoilCarbonProxyResult {
+        proxy_id: row.get("proxy_id"),
+        record_id: row.get("record_id"),
+        field_id: row.get("field_id"),
+        proxy_value: row.get("proxy_value"),
+        uncertainty_band,
+        status: parse_soil_carbon_proxy_status(&row.get::<String, _>("status"))
+            .map_err(soil_carbon_proxy_error)?,
+        evidence_refs,
+        method_version: row.get("method_version"),
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_sustainability_kpi_result(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityKpiTrackingResult> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode sustainability KPI evidence_refs_json"),
+        )
+    })?;
+
+    Ok(SustainabilityKpiTrackingResult {
+        kpi_id: row.get("kpi_id"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        metric_ref: row.get("metric_ref"),
+        current_value: row.get("current_value"),
+        target_value: row.get("target_value"),
+        direction: parse_sustainability_kpi_direction(&row.get::<String, _>("direction"))
+            .map_err(sustainability_kpi_error)?,
+        at_risk_fraction: row.get("at_risk_fraction"),
+        status: parse_sustainability_kpi_status(&row.get::<String, _>("status"))
+            .map_err(sustainability_kpi_error)?,
+        evidence_refs,
+        method_version: row.get("method_version"),
+        result_hash: row.get("result_hash"),
+        computed_at: row.get("computed_at"),
+    })
+}
+
+fn decode_sustainability_certification_pack(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<SustainabilityCertificationEvidencePack> {
+    let claimed_output_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("claimed_output_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err)
+                        .context("failed to decode certification pack claimed_output_refs_json"),
+                )
+            })?;
+    let outputs = serde_json::from_str::<Vec<SustainabilityCertificationOutputItem>>(
+        &row.get::<String, _>("outputs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode certification outputs_json"))
+    })?;
+    let evidence_layer_refs =
+        serde_json::from_str::<Vec<String>>(&row.get::<String, _>("evidence_layer_refs_json"))
+            .map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err)
+                        .context("failed to decode certification pack evidence_layer_refs_json"),
+                )
+            })?;
+    let mrv_trails = serde_json::from_str::<Vec<SustainabilityMrvTrail>>(
+        &row.get::<String, _>("mrv_trails_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode certification pack mrv_trails_json"),
+        )
+    })?;
+    let audit_ids = serde_json::from_str::<Vec<String>>(&row.get::<String, _>("audit_ids_json"))
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode certification pack audit_ids_json"),
+            )
+        })?;
+
+    Ok(SustainabilityCertificationEvidencePack {
+        pack_id: row.get("pack_id"),
+        claim_id: row.get("claim_id"),
+        claim_type: row.get("claim_type"),
+        field_id: row.get("field_id"),
+        season_id: row.get("season_id"),
+        claimed_output_refs,
+        outputs,
+        evidence_layer_refs,
+        mrv_trails,
+        audit_ids,
+        result_hash: row.get("result_hash"),
+        pack_hash: row.get("pack_hash"),
+        method_version: row.get("method_version"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -9149,6 +13583,72 @@ fn decode_content_version_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Con
         content_id: row.get("content_id"),
         body: row.get("body"),
         created_at: row.get("created_at"),
+    })
+}
+
+fn decode_success_story_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ContentSuccessStoryRecord> {
+    let metrics = serde_json::from_str::<Vec<shared::schemas::ContentSuccessMetric>>(
+        &row.get::<String, _>("metrics_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode success story metrics_json"))
+    })?;
+    Ok(ContentSuccessStoryRecord {
+        content_id: row.get("content_id"),
+        grower: row.get("grower"),
+        crop: row.get("crop"),
+        region: row.get("region"),
+        outcome_summary: row.get("outcome_summary"),
+        metrics,
+    })
+}
+
+fn decode_community_contribution_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ContentCommunityContributionRecord> {
+    Ok(ContentCommunityContributionRecord {
+        contribution_id: row.get("contribution_id"),
+        org_id: row.get("org_id"),
+        contributor_id: row.get("contributor_id"),
+        content_type: parse_content_type(&row.get::<String, _>("content_type"))
+            .map_err(content_error)?,
+        body: row.get("body"),
+        status: parse_content_contribution_status(&row.get::<String, _>("status"))
+            .map_err(content_error)?,
+        content_id: row.get("content_id"),
+        submitted_at: row.get("submitted_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_content_locale_variant_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ContentLocaleVariantRecord> {
+    Ok(ContentLocaleVariantRecord {
+        content_id: row.get("content_id"),
+        locale: row.get("locale"),
+        version_id: row.get("version_id"),
+        body: row.get("body"),
+        status: parse_content_status(&row.get::<String, _>("status")).map_err(content_error)?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_content_engagement_event_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ContentEngagementEventRecord> {
+    Ok(ContentEngagementEventRecord {
+        event_id: row.get("event_id"),
+        content_id: row.get("content_id"),
+        org_id: row.get("org_id"),
+        event_type: parse_content_engagement_event_type(&row.get::<String, _>("event_type"))
+            .map_err(content_error)?,
+        actor_id: row.get("actor_id"),
+        period: row.get("period"),
+        occurred_at: row.get("occurred_at"),
     })
 }
 
@@ -9785,6 +14285,48 @@ async fn insert_fleet_component(state: &AppState, record: &FleetComponentRecord)
             service_history_json, flight_hours, cycles, duty_score, created_at, updated_at
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&record.component_id)
+    .bind(record.component_type.as_str())
+    .bind(&record.serial)
+    .bind(&record.airframe_id)
+    .bind(&record.installed_at)
+    .bind(&record.removed_at)
+    .bind(service_history_json)
+    .bind(record.flight_hours)
+    .bind(i64::from(record.cycles))
+    .bind(record.duty_score)
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn upsert_fleet_component(state: &AppState, record: &FleetComponentRecord) -> AppResult<()> {
+    let service_history_json = serde_json::to_string(&record.service_history)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO fleet_components (
+            component_id, component_type, serial, airframe_id, installed_at, removed_at,
+            service_history_json, flight_hours, cycles, duty_score, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(component_id) DO UPDATE SET
+            component_type = excluded.component_type,
+            serial = excluded.serial,
+            airframe_id = excluded.airframe_id,
+            installed_at = excluded.installed_at,
+            removed_at = excluded.removed_at,
+            service_history_json = excluded.service_history_json,
+            flight_hours = excluded.flight_hours,
+            cycles = excluded.cycles,
+            duty_score = excluded.duty_score,
+            updated_at = excluded.updated_at
         "#,
     )
     .bind(&record.component_id)
@@ -10529,6 +15071,33 @@ async fn update_marketplace_account_record(
     Ok(())
 }
 
+async fn insert_marketplace_catalog_item_record(
+    state: &AppState,
+    record: &MarketplaceCatalogItemRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_catalog_items (
+            item_id, org_id, kind, category, name, unit_of_measure, owner_account_id, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&record.item_id)
+    .bind(&record.org_id)
+    .bind(record.kind.as_str())
+    .bind(record.category.as_str())
+    .bind(&record.name)
+    .bind(record.unit_of_measure.as_str())
+    .bind(&record.owner_account_id)
+    .bind(&record.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn load_marketplace_account(
     state: &AppState,
     account_id: &str,
@@ -10547,6 +15116,716 @@ async fn load_marketplace_account(
 
     row.map(|row| decode_marketplace_account_record(&row))
         .transpose()
+}
+
+async fn load_marketplace_catalog_item(
+    state: &AppState,
+    item_id: &str,
+) -> AppResult<Option<MarketplaceCatalogItemRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT item_id, org_id, kind, category, name, unit_of_measure, owner_account_id, created_at
+        FROM marketplace_catalog_items
+        WHERE item_id = ?1
+        "#,
+    )
+    .bind(item_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_catalog_item_record(&row))
+        .transpose()
+}
+
+async fn insert_marketplace_listing_record(
+    state: &AppState,
+    record: &MarketplaceListingRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_listings (
+            listing_id, item_id, org_id, price, currency, available_qty,
+            window_from, window_to, status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&record.listing_id)
+    .bind(&record.item_id)
+    .bind(&record.org_id)
+    .bind(record.price)
+    .bind(&record.currency)
+    .bind(record.available_qty)
+    .bind(&record.window.from)
+    .bind(&record.window.to)
+    .bind(record.status.as_str())
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn update_marketplace_listing_record(
+    state: &AppState,
+    record: &MarketplaceListingRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE marketplace_listings
+        SET status = ?2, updated_at = ?3
+        WHERE listing_id = ?1
+        "#,
+    )
+    .bind(&record.listing_id)
+    .bind(record.status.as_str())
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_marketplace_listing(
+    state: &AppState,
+    listing_id: &str,
+) -> AppResult<Option<MarketplaceListingRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT listing_id, item_id, org_id, price, currency, available_qty,
+               window_from, window_to, status, created_at, updated_at
+        FROM marketplace_listings
+        WHERE listing_id = ?1
+        "#,
+    )
+    .bind(listing_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_listing_record(&row))
+        .transpose()
+}
+
+async fn upsert_marketplace_inventory_record(
+    state: &AppState,
+    record: &MarketplaceInventoryRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_inventory (
+            inventory_id, item_id, org_id, on_hand, reserved, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(inventory_id) DO UPDATE SET
+            item_id = excluded.item_id,
+            org_id = excluded.org_id,
+            on_hand = excluded.on_hand,
+            reserved = excluded.reserved,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&record.inventory_id)
+    .bind(&record.item_id)
+    .bind(&record.org_id)
+    .bind(record.on_hand)
+    .bind(record.reserved)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_marketplace_inventory(
+    state: &AppState,
+    inventory_id: &str,
+) -> AppResult<Option<MarketplaceInventoryRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT inventory_id, item_id, org_id, on_hand, reserved, updated_at
+        FROM marketplace_inventory
+        WHERE inventory_id = ?1
+        "#,
+    )
+    .bind(inventory_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_inventory_record(&row))
+        .transpose()
+}
+
+async fn load_marketplace_inventory_by_item(
+    state: &AppState,
+    item_id: &str,
+    org_id: &str,
+) -> AppResult<Option<MarketplaceInventoryRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT inventory_id, item_id, org_id, on_hand, reserved, updated_at
+        FROM marketplace_inventory
+        WHERE item_id = ?1 AND org_id = ?2
+        ORDER BY inventory_id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(item_id)
+    .bind(org_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_inventory_record(&row))
+        .transpose()
+}
+
+async fn update_marketplace_inventory_reserve(
+    state: &AppState,
+    inventory_id: &str,
+    org_id: &str,
+    qty: f64,
+) -> AppResult<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE marketplace_inventory
+        SET reserved = reserved + ?3, updated_at = ?4
+        WHERE inventory_id = ?1
+          AND org_id = ?2
+          AND reserved + ?3 <= on_hand
+        "#,
+    )
+    .bind(inventory_id)
+    .bind(org_id)
+    .bind(qty)
+    .bind(current_record_timestamp())
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    if result.rows_affected() == 0 {
+        return Err(marketplace_inventory_error(
+            MarketplaceInventoryError::InsufficientAvailableQuantity,
+        ));
+    }
+    Ok(())
+}
+
+async fn update_marketplace_inventory_fulfill(
+    state: &AppState,
+    inventory_id: &str,
+    org_id: &str,
+    qty: f64,
+) -> AppResult<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE marketplace_inventory
+        SET on_hand = on_hand - ?3, reserved = reserved - ?3, updated_at = ?4
+        WHERE inventory_id = ?1
+          AND org_id = ?2
+          AND reserved >= ?3
+        "#,
+    )
+    .bind(inventory_id)
+    .bind(org_id)
+    .bind(qty)
+    .bind(current_record_timestamp())
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    if result.rows_affected() == 0 {
+        return Err(marketplace_inventory_error(
+            MarketplaceInventoryError::InsufficientReservedQuantity,
+        ));
+    }
+    Ok(())
+}
+
+async fn update_marketplace_inventory_release(
+    state: &AppState,
+    inventory_id: &str,
+    org_id: &str,
+    qty: f64,
+) -> AppResult<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE marketplace_inventory
+        SET reserved = reserved - ?3, updated_at = ?4
+        WHERE inventory_id = ?1
+          AND org_id = ?2
+          AND reserved >= ?3
+        "#,
+    )
+    .bind(inventory_id)
+    .bind(org_id)
+    .bind(qty)
+    .bind(current_record_timestamp())
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    if result.rows_affected() == 0 {
+        return Err(marketplace_inventory_error(
+            MarketplaceInventoryError::InsufficientReservedQuantity,
+        ));
+    }
+    Ok(())
+}
+
+async fn insert_marketplace_order_record(
+    state: &AppState,
+    record: &MarketplaceOrderRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_orders (
+            order_id, org_id, listing_ref, buyer_account_id, qty, line_total,
+            status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&record.order_id)
+    .bind(&record.org_id)
+    .bind(&record.listing_ref)
+    .bind(&record.buyer_account_id)
+    .bind(record.qty)
+    .bind(record.line_total)
+    .bind(record.status.as_str())
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn update_marketplace_order_record(
+    state: &AppState,
+    record: &MarketplaceOrderRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE marketplace_orders
+        SET status = ?2, updated_at = ?3
+        WHERE order_id = ?1
+        "#,
+    )
+    .bind(&record.order_id)
+    .bind(record.status.as_str())
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_marketplace_order(
+    state: &AppState,
+    order_id: &str,
+) -> AppResult<Option<MarketplaceOrderRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT order_id, org_id, listing_ref, buyer_account_id, qty, line_total,
+               status, created_at, updated_at
+        FROM marketplace_orders
+        WHERE order_id = ?1
+        "#,
+    )
+    .bind(order_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_order_record(&row))
+        .transpose()
+}
+
+async fn insert_marketplace_order_audit_record(
+    state: &AppState,
+    record: &MarketplaceOrderAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_order_audits (
+            audit_id, order_id, from_status, to_status, actor_id, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&record.audit_id)
+    .bind(&record.order_id)
+    .bind(record.from_status.map(|status| status.as_str().to_string()))
+    .bind(record.to_status.as_str())
+    .bind(&record.actor_id)
+    .bind(&record.occurred_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_marketplace_fulfillment_record(
+    state: &AppState,
+    record: &MarketplaceFulfillmentRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_fulfillments (
+            fulfillment_id, order_ref, org_id, carrier_ref, tracking_ref,
+            status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&record.fulfillment_id)
+    .bind(&record.order_ref)
+    .bind(&record.org_id)
+    .bind(&record.carrier_ref)
+    .bind(&record.tracking_ref)
+    .bind(record.status.as_str())
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn update_marketplace_fulfillment_record(
+    state: &AppState,
+    record: &MarketplaceFulfillmentRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE marketplace_fulfillments
+        SET status = ?2, updated_at = ?3
+        WHERE fulfillment_id = ?1
+        "#,
+    )
+    .bind(&record.fulfillment_id)
+    .bind(record.status.as_str())
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_marketplace_fulfillment(
+    state: &AppState,
+    fulfillment_id: &str,
+) -> AppResult<Option<MarketplaceFulfillmentRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT fulfillment_id, order_ref, org_id, carrier_ref, tracking_ref,
+               status, created_at, updated_at
+        FROM marketplace_fulfillments
+        WHERE fulfillment_id = ?1
+        "#,
+    )
+    .bind(fulfillment_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_fulfillment_record(&row))
+        .transpose()
+}
+
+async fn insert_marketplace_fulfillment_audit_record(
+    state: &AppState,
+    record: &MarketplaceFulfillmentAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_fulfillment_audits (
+            audit_id, fulfillment_id, from_status, to_status, actor_id, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&record.audit_id)
+    .bind(&record.fulfillment_id)
+    .bind(record.from_status.map(|status| status.as_str().to_string()))
+    .bind(record.to_status.as_str())
+    .bind(&record.actor_id)
+    .bind(&record.occurred_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn marketplace_order_participants(
+    state: &AppState,
+    order: &MarketplaceOrderRecord,
+) -> AppResult<Vec<String>> {
+    let listing = load_marketplace_listing(state, &order.listing_ref)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let item = load_marketplace_catalog_item(state, &listing.item_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(vec![order.buyer_account_id.clone(), item.owner_account_id])
+}
+
+async fn insert_marketplace_rating_record(
+    state: &AppState,
+    record: &MarketplaceRatingRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_ratings (
+            rating_id, order_ref, rater_account_id, ratee_account_id,
+            score, comment, org_scope, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&record.rating_id)
+    .bind(&record.order_ref)
+    .bind(&record.rater_account_id)
+    .bind(&record.ratee_account_id)
+    .bind(record.score)
+    .bind(&record.comment)
+    .bind(&record.org_scope)
+    .bind(&record.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(|err| {
+        if err.to_string().contains("UNIQUE constraint failed") {
+            AppError::BadRequest(format!(
+                "marketplace rating already exists for order {} and rater {}",
+                record.order_ref, record.rater_account_id
+            ))
+        } else {
+            AppError::Anyhow(err.into())
+        }
+    })?;
+
+    Ok(())
+}
+
+async fn load_marketplace_ratings_for_order(
+    state: &AppState,
+    order_ref: &str,
+) -> AppResult<Vec<MarketplaceRatingRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT rating_id, order_ref, rater_account_id, ratee_account_id,
+               score, comment, org_scope, created_at
+        FROM marketplace_ratings
+        WHERE order_ref = ?1
+        ORDER BY created_at ASC, rating_id ASC
+        "#,
+    )
+    .bind(order_ref)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_rating_record(&row))
+        .collect()
+}
+
+async fn load_marketplace_ratings_for_ratee(
+    state: &AppState,
+    ratee_account_id: &str,
+    org_scope: &str,
+) -> AppResult<Vec<MarketplaceRatingRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT rating_id, order_ref, rater_account_id, ratee_account_id,
+               score, comment, org_scope, created_at
+        FROM marketplace_ratings
+        WHERE ratee_account_id = ?1 AND org_scope = ?2
+        ORDER BY created_at ASC, rating_id ASC
+        "#,
+    )
+    .bind(ratee_account_id)
+    .bind(org_scope)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_rating_record(&row))
+        .collect()
+}
+
+async fn load_marketplace_demand_evidence_refs(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT product_id, scene_id, kind
+        FROM products
+        WHERE field_id = ?1
+          AND kind IN ('yield', 'yield_map', 'health', 'ndvi', 'biomass')
+        ORDER BY scene_id ASC, kind ASC, COALESCE(product_id, '') ASC
+        "#,
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let product_id: Option<String> = row.get("product_id");
+            let scene_id: String = row.get("scene_id");
+            let kind: String = row.get("kind");
+            product_id
+                .filter(|id| !id.trim().is_empty())
+                .map(|id| format!("product:{id}"))
+                .unwrap_or_else(|| format!("product:{scene_id}:{kind}"))
+        })
+        .collect())
+}
+
+async fn insert_marketplace_demand_forecast_record(
+    state: &AppState,
+    record: &MarketplaceDemandForecastRecord,
+) -> AppResult<()> {
+    let evidence_refs_json =
+        serde_json::to_string(&record.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO marketplace_demand_forecasts (
+            forecast_id, org_id, field_id, item_kind, horizon, value,
+            evidence_refs_json, status, uncertainty_low, uncertainty_high,
+            method, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&record.forecast_id)
+    .bind(&record.org_id)
+    .bind(&record.field_id)
+    .bind(record.item_kind.as_str())
+    .bind(&record.horizon)
+    .bind(record.value)
+    .bind(evidence_refs_json)
+    .bind(record.status.as_str())
+    .bind(record.uncertainty_band.as_ref().map(|band| band.low))
+    .bind(record.uncertainty_band.as_ref().map(|band| band.high))
+    .bind(&record.method)
+    .bind(&record.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_marketplace_demand_forecast(
+    state: &AppState,
+    forecast_id: &str,
+) -> AppResult<Option<MarketplaceDemandForecastRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT forecast_id, org_id, field_id, item_kind, horizon, value,
+               evidence_refs_json, status, uncertainty_low, uncertainty_high,
+               method, created_at
+        FROM marketplace_demand_forecasts
+        WHERE forecast_id = ?1
+        "#,
+    )
+    .bind(forecast_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_marketplace_demand_forecast_record(&row))
+        .transpose()
+}
+
+async fn load_marketplace_orders_for_org_period(
+    state: &AppState,
+    org_id: &str,
+    from: &str,
+    to: &str,
+) -> AppResult<Vec<MarketplaceOrderRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT order_id, org_id, listing_ref, buyer_account_id, qty, line_total,
+               status, created_at, updated_at
+        FROM marketplace_orders
+        WHERE org_id = ?1
+          AND created_at >= ?2
+          AND created_at <= ?3
+        ORDER BY created_at ASC, order_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_order_record(&row))
+        .collect()
+}
+
+async fn load_marketplace_listings_for_org(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<MarketplaceListingRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT listing_id, item_id, org_id, price, currency, available_qty,
+               window_from, window_to, status, created_at, updated_at
+        FROM marketplace_listings
+        WHERE org_id = ?1
+        ORDER BY created_at ASC, listing_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_listing_record(&row))
+        .collect()
+}
+
+async fn load_marketplace_inventory_for_org(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<MarketplaceInventoryRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT inventory_id, item_id, org_id, on_hand, reserved, updated_at
+        FROM marketplace_inventory
+        WHERE org_id = ?1
+        ORDER BY item_id ASC, inventory_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_marketplace_inventory_record(&row))
+        .collect()
 }
 
 async fn marketplace_org_exists(state: &AppState, org_id: &str) -> AppResult<bool> {
@@ -10616,6 +15895,1137 @@ async fn load_sustainability_record(
         .transpose()
 }
 
+async fn insert_carbon_footprint_result(
+    state: &AppState,
+    result: &CarbonFootprintResult,
+) -> AppResult<()> {
+    let inputs_json =
+        serde_json::to_string(&result.inputs).map_err(|err| AppError::Anyhow(err.into()))?;
+    let factors_json =
+        serde_json::to_string(&result.factors).map_err(|err| AppError::Anyhow(err.into()))?;
+    let evidence_refs_json =
+        serde_json::to_string(&result.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO carbon_footprints (
+            footprint_id, record_id, operation_id, value_co2e, inputs_json,
+            factor_set_version, factors_json, evidence_refs_json, status, result_hash,
+            computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&result.footprint_id)
+    .bind(&result.record_id)
+    .bind(&result.operation_id)
+    .bind(result.value_co2e)
+    .bind(inputs_json)
+    .bind(&result.factor_set_version)
+    .bind(factors_json)
+    .bind(evidence_refs_json)
+    .bind(result.status.as_str())
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_carbon_footprint_result(
+    state: &AppState,
+    footprint_id: &str,
+) -> AppResult<Option<CarbonFootprintResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT footprint_id, record_id, operation_id, value_co2e, inputs_json,
+               factor_set_version, factors_json, evidence_refs_json, status, result_hash,
+               computed_at
+        FROM carbon_footprints
+        WHERE footprint_id = ?1
+        "#,
+    )
+    .bind(footprint_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_carbon_footprint_result(&row))
+        .transpose()
+}
+
+async fn insert_biomass_estimate_result(
+    state: &AppState,
+    result: &BiomassEstimateResult,
+) -> AppResult<()> {
+    let extent_json =
+        serde_json::to_string(&result.extent).map_err(|err| AppError::Anyhow(err.into()))?;
+    let resolution_json =
+        serde_json::to_string(&result.resolution).map_err(|err| AppError::Anyhow(err.into()))?;
+    let source_layer_refs_json = serde_json::to_string(&result.source_layer_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO biomass_estimates (
+            estimate_id, record_id, biomass_value, area, crs, extent_json,
+            resolution_json, source_layer_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&result.estimate_id)
+    .bind(&result.record_id)
+    .bind(result.biomass_value)
+    .bind(result.area)
+    .bind(&result.crs)
+    .bind(extent_json)
+    .bind(resolution_json)
+    .bind(source_layer_refs_json)
+    .bind(&result.method_version)
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_biomass_estimate_result(
+    state: &AppState,
+    estimate_id: &str,
+) -> AppResult<Option<BiomassEstimateResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT estimate_id, record_id, biomass_value, area, crs, extent_json,
+               resolution_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biomass_estimates
+        WHERE estimate_id = ?1
+        "#,
+    )
+    .bind(estimate_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_biomass_estimate_result(&row))
+        .transpose()
+}
+
+async fn insert_sustainability_baseline(
+    state: &AppState,
+    baseline: &SustainabilityBaselineRecord,
+) -> AppResult<()> {
+    let evidence_refs_json = serde_json::to_string(&baseline.evidence_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_baselines (
+            baseline_id, field_id, season_id, metric_type, metric_value, source_record_id,
+            method_version, evidence_refs_json, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&baseline.baseline_id)
+    .bind(&baseline.field_id)
+    .bind(&baseline.season_id)
+    .bind(baseline.metric_type.as_str())
+    .bind(baseline.metric_value)
+    .bind(&baseline.source_record_id)
+    .bind(&baseline.method_version)
+    .bind(evidence_refs_json)
+    .bind(&baseline.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_baseline_for_metric(
+    state: &AppState,
+    field_id: &str,
+    season_id: &str,
+    metric_type: SustainabilityMetricType,
+) -> AppResult<Option<SustainabilityBaselineRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT baseline_id, field_id, season_id, metric_type, metric_value, source_record_id,
+               method_version, evidence_refs_json, created_at
+        FROM sustainability_baselines
+        WHERE field_id = ?1
+          AND season_id = ?2
+          AND metric_type = ?3
+        ORDER BY created_at DESC, baseline_id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .bind(metric_type.as_str())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_baseline(&row))
+        .transpose()
+}
+
+async fn insert_sustainability_comparison(
+    state: &AppState,
+    comparison: &SustainabilityComparisonResult,
+) -> AppResult<()> {
+    let evidence_refs_json = serde_json::to_string(&comparison.evidence_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_comparisons (
+            comparison_id, field_id, baseline_season_id, current_season_id, metric_type,
+            baseline_value, current_value, delta, trend, status, baseline_source_record_id,
+            current_source_record_id, evidence_refs_json, method_version, result_hash,
+            compared_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        "#,
+    )
+    .bind(&comparison.comparison_id)
+    .bind(&comparison.field_id)
+    .bind(&comparison.baseline_season_id)
+    .bind(&comparison.current_season_id)
+    .bind(comparison.metric_type.as_str())
+    .bind(comparison.baseline_value)
+    .bind(comparison.current_value)
+    .bind(comparison.delta)
+    .bind(comparison.trend.as_str())
+    .bind(comparison.status.as_str())
+    .bind(&comparison.baseline_source_record_id)
+    .bind(&comparison.current_source_record_id)
+    .bind(evidence_refs_json)
+    .bind(&comparison.method_version)
+    .bind(&comparison.result_hash)
+    .bind(&comparison.compared_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_comparison(
+    state: &AppState,
+    comparison_id: &str,
+) -> AppResult<Option<SustainabilityComparisonResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT comparison_id, field_id, baseline_season_id, current_season_id, metric_type,
+               baseline_value, current_value, delta, trend, status, baseline_source_record_id,
+               current_source_record_id, evidence_refs_json, method_version, result_hash,
+               compared_at
+        FROM sustainability_comparisons
+        WHERE comparison_id = ?1
+        "#,
+    )
+    .bind(comparison_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_comparison(&row))
+        .transpose()
+}
+
+async fn validate_sustainability_mrv_output_ref(
+    state: &AppState,
+    output_kind: SustainabilityMrvOutputKind,
+    output_ref: &str,
+) -> AppResult<()> {
+    let exists: i64 = match output_kind {
+        SustainabilityMrvOutputKind::CarbonFootprint => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM carbon_footprints WHERE footprint_id = ?1")
+                .bind(output_ref)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(Error::from)?
+        }
+        SustainabilityMrvOutputKind::BiomassEstimate => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM biomass_estimates WHERE estimate_id = ?1")
+                .bind(output_ref)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(Error::from)?
+        }
+        SustainabilityMrvOutputKind::SustainabilityKpi => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM sustainability_kpis WHERE kpi_id = ?1")
+                .bind(output_ref)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(Error::from)?
+        }
+    };
+    if exists == 0 {
+        return Err(AppError::BadRequest(format!(
+            "MRV output_ref {output_ref} does not exist for {}",
+            output_kind.as_str()
+        )));
+    }
+    Ok(())
+}
+
+async fn insert_sustainability_mrv_trail(
+    state: &AppState,
+    trail: &SustainabilityMrvTrail,
+) -> AppResult<()> {
+    let input_layer_refs_json = serde_json::to_string(&trail.input_layer_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let extent_json =
+        serde_json::to_string(&trail.extent).map_err(|err| AppError::Anyhow(err.into()))?;
+    let parameters_json =
+        serde_json::to_string(&trail.parameters).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_mrv_trails (
+            trail_id, output_ref, output_kind, input_layer_refs_json, method, method_version,
+            crs, extent_json, parameters_json, audit_id, result_hash, rederived_result_hash,
+            certification_ready, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+    )
+    .bind(&trail.trail_id)
+    .bind(&trail.output_ref)
+    .bind(trail.output_kind.as_str())
+    .bind(input_layer_refs_json)
+    .bind(&trail.method)
+    .bind(&trail.method_version)
+    .bind(&trail.crs)
+    .bind(extent_json)
+    .bind(parameters_json)
+    .bind(&trail.audit_id)
+    .bind(&trail.result_hash)
+    .bind(&trail.rederived_result_hash)
+    .bind(if trail.certification_ready {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(&trail.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_mrv_trail(
+    state: &AppState,
+    trail_id: &str,
+) -> AppResult<Option<SustainabilityMrvTrail>> {
+    let row = sqlx::query(
+        r#"
+        SELECT trail_id, output_ref, output_kind, input_layer_refs_json, method,
+               method_version, crs, extent_json, parameters_json, audit_id, result_hash,
+               rederived_result_hash, certification_ready, created_at
+        FROM sustainability_mrv_trails
+        WHERE trail_id = ?1
+        "#,
+    )
+    .bind(trail_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_mrv_trail(&row))
+        .transpose()
+}
+
+async fn insert_biodiversity_proxy_result(
+    state: &AppState,
+    result: &BiodiversityProxyResult,
+) -> AppResult<()> {
+    let extent_json =
+        serde_json::to_string(&result.extent).map_err(|err| AppError::Anyhow(err.into()))?;
+    let source_layer_refs_json = serde_json::to_string(&result.source_layer_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO biodiversity_proxies (
+            proxy_id, field_id, heterogeneity_score, cover_fraction, uncertainty, status,
+            crs, extent_json, source_layer_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&result.proxy_id)
+    .bind(&result.field_id)
+    .bind(result.heterogeneity_score)
+    .bind(result.cover_fraction)
+    .bind(result.uncertainty)
+    .bind(result.status.as_str())
+    .bind(&result.crs)
+    .bind(extent_json)
+    .bind(source_layer_refs_json)
+    .bind(&result.method_version)
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_biodiversity_proxy_result(
+    state: &AppState,
+    proxy_id: &str,
+) -> AppResult<Option<BiodiversityProxyResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT proxy_id, field_id, heterogeneity_score, cover_fraction, uncertainty, status,
+               crs, extent_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biodiversity_proxies
+        WHERE proxy_id = ?1
+        "#,
+    )
+    .bind(proxy_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_biodiversity_proxy_result(&row))
+        .transpose()
+}
+
+async fn insert_soil_carbon_proxy_result(
+    state: &AppState,
+    result: &SoilCarbonProxyResult,
+) -> AppResult<()> {
+    let evidence_refs_json =
+        serde_json::to_string(&result.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO soil_carbon_proxies (
+            proxy_id, record_id, field_id, proxy_value, uncertainty_low, uncertainty_high, status,
+            evidence_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&result.proxy_id)
+    .bind(&result.record_id)
+    .bind(&result.field_id)
+    .bind(result.proxy_value)
+    .bind(result.uncertainty_band.as_ref().map(|band| band.low))
+    .bind(result.uncertainty_band.as_ref().map(|band| band.high))
+    .bind(result.status.as_str())
+    .bind(evidence_refs_json)
+    .bind(&result.method_version)
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_soil_carbon_proxy_result(
+    state: &AppState,
+    proxy_id: &str,
+) -> AppResult<Option<SoilCarbonProxyResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT proxy_id, record_id, field_id, proxy_value, uncertainty_low, uncertainty_high,
+               status, evidence_refs_json, method_version, result_hash, computed_at
+        FROM soil_carbon_proxies
+        WHERE proxy_id = ?1
+        "#,
+    )
+    .bind(proxy_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_soil_carbon_proxy_result(&row))
+        .transpose()
+}
+
+async fn insert_sustainability_kpi_result(
+    state: &AppState,
+    result: &SustainabilityKpiTrackingResult,
+) -> AppResult<()> {
+    let evidence_refs_json =
+        serde_json::to_string(&result.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_kpis (
+            kpi_id, field_id, season_id, metric_ref, current_value, target_value, direction,
+            at_risk_fraction, status, evidence_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+    )
+    .bind(&result.kpi_id)
+    .bind(&result.field_id)
+    .bind(&result.season_id)
+    .bind(&result.metric_ref)
+    .bind(result.current_value)
+    .bind(result.target_value)
+    .bind(result.direction.as_str())
+    .bind(result.at_risk_fraction)
+    .bind(result.status.as_str())
+    .bind(evidence_refs_json)
+    .bind(&result.method_version)
+    .bind(&result.result_hash)
+    .bind(&result.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_kpi_result(
+    state: &AppState,
+    kpi_id: &str,
+) -> AppResult<Option<SustainabilityKpiTrackingResult>> {
+    let row = sqlx::query(
+        r#"
+        SELECT kpi_id, field_id, season_id, metric_ref, current_value, target_value,
+               direction, at_risk_fraction, status, evidence_refs_json, method_version,
+               result_hash, computed_at
+        FROM sustainability_kpis
+        WHERE kpi_id = ?1
+        "#,
+    )
+    .bind(kpi_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_kpi_result(&row))
+        .transpose()
+}
+
+async fn assemble_sustainability_certification_pack_inputs(
+    state: &AppState,
+    claimed_output_refs: &[String],
+) -> AppResult<(
+    Vec<SustainabilityCertificationOutputItem>,
+    Vec<SustainabilityMrvTrail>,
+    Vec<String>,
+)> {
+    let mut outputs = Vec::new();
+    let mut trails = Vec::new();
+    let mut evidence_layer_refs = BTreeSet::new();
+
+    for output_ref in claimed_output_refs {
+        let trail = load_latest_sustainability_mrv_trail_for_output(state, output_ref)
+            .await?
+            .ok_or_else(|| {
+                sustainability_certification_pack_error(
+                    SustainabilityCertificationEvidencePackError::MissingMrvTrail {
+                        output_ref: output_ref.clone(),
+                    },
+                )
+            })?;
+        evidence_layer_refs.extend(trail.input_layer_refs.iter().cloned());
+        outputs.push(load_sustainability_certification_output_item(state, &trail).await?);
+        trails.push(trail);
+    }
+
+    Ok((
+        outputs,
+        trails,
+        evidence_layer_refs.into_iter().collect::<Vec<_>>(),
+    ))
+}
+
+async fn load_sustainability_field_export_summary(
+    state: &AppState,
+    field_id: &str,
+    season_id: Option<String>,
+) -> AppResult<SustainabilityFieldExportSummary> {
+    let field = load_field(state, field_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let season_id = normalize_optional_text(season_id);
+    let mut items = Vec::new();
+    items.extend(
+        load_sustainability_carbon_export_items(state, field_id, season_id.as_deref()).await?,
+    );
+    items.extend(
+        load_sustainability_biomass_export_items(state, field_id, season_id.as_deref()).await?,
+    );
+    if season_id.is_none() {
+        items.extend(load_sustainability_biodiversity_export_items(state, field_id).await?);
+        items.extend(load_sustainability_soil_carbon_export_items(state, field_id).await?);
+    }
+    items
+        .extend(load_sustainability_kpi_export_items(state, field_id, season_id.as_deref()).await?);
+    items.sort_by(|left, right| {
+        left.computed_at
+            .cmp(&right.computed_at)
+            .then_with(|| left.record_type.cmp(&right.record_type))
+            .then_with(|| left.record_id.cmp(&right.record_id))
+    });
+    let crs = items
+        .iter()
+        .find_map(|item| item.crs.clone())
+        .unwrap_or_else(|| field_record_crs(&field));
+    let record_count = items.len();
+
+    Ok(SustainabilityFieldExportSummary {
+        field_id: field.field_id,
+        season_id,
+        crs,
+        record_count,
+        empty: record_count == 0,
+        items,
+        generated_at: current_record_timestamp(),
+    })
+}
+
+async fn load_sustainability_carbon_export_items(
+    state: &AppState,
+    field_id: &str,
+    season_id: Option<&str>,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT cf.footprint_id, cf.record_id, cf.operation_id, cf.value_co2e, cf.inputs_json,
+               cf.factor_set_version, cf.factors_json, cf.evidence_refs_json, cf.status,
+               cf.result_hash, cf.computed_at, sr.field_id, sr.season_id
+        FROM carbon_footprints cf
+        JOIN sustainability_records sr ON sr.record_id = cf.record_id
+        WHERE sr.field_id = ?1
+          AND (?2 IS NULL OR sr.season_id = ?2)
+        ORDER BY cf.computed_at ASC, cf.footprint_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let field_id: String = row.get("field_id");
+            let season_id: String = row.get("season_id");
+            let footprint = decode_carbon_footprint_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "carbon_footprint".to_string(),
+                record_id: footprint.footprint_id,
+                field_id,
+                season_id: Some(season_id),
+                metric_ref: format!("record:{}", footprint.record_id),
+                value: footprint.value_co2e,
+                unit: "kg_co2e".to_string(),
+                status: footprint.status.as_str().to_string(),
+                crs: None,
+                extent: None,
+                method_version: footprint.factor_set_version,
+                evidence_refs: footprint.evidence_refs,
+                result_hash: footprint.result_hash,
+                computed_at: footprint.computed_at,
+            })
+        })
+        .collect()
+}
+
+async fn load_sustainability_biomass_export_items(
+    state: &AppState,
+    field_id: &str,
+    season_id: Option<&str>,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT be.estimate_id, be.record_id, be.biomass_value, be.area, be.crs, be.extent_json,
+               be.resolution_json, be.source_layer_refs_json, be.method_version, be.result_hash,
+               be.computed_at, sr.field_id, sr.season_id
+        FROM biomass_estimates be
+        JOIN sustainability_records sr ON sr.record_id = be.record_id
+        WHERE sr.field_id = ?1
+          AND (?2 IS NULL OR sr.season_id = ?2)
+        ORDER BY be.computed_at ASC, be.estimate_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let field_id: String = row.get("field_id");
+            let season_id: String = row.get("season_id");
+            let estimate = decode_biomass_estimate_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "biomass_estimate".to_string(),
+                record_id: estimate.estimate_id,
+                field_id,
+                season_id: Some(season_id),
+                metric_ref: format!("record:{}", estimate.record_id),
+                value: Some(estimate.biomass_value),
+                unit: "biomass_index".to_string(),
+                status: "computed".to_string(),
+                crs: Some(estimate.crs),
+                extent: Some(estimate.extent),
+                method_version: estimate.method_version,
+                evidence_refs: estimate.source_layer_refs,
+                result_hash: estimate.result_hash,
+                computed_at: estimate.computed_at,
+            })
+        })
+        .collect()
+}
+
+async fn load_sustainability_biodiversity_export_items(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT proxy_id, field_id, heterogeneity_score, cover_fraction, uncertainty, status, crs,
+               extent_json, source_layer_refs_json, method_version, result_hash, computed_at
+        FROM biodiversity_proxies
+        WHERE field_id = ?1
+        ORDER BY computed_at ASC, proxy_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let proxy = decode_biodiversity_proxy_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "biodiversity_proxy".to_string(),
+                record_id: proxy.proxy_id,
+                field_id: proxy.field_id,
+                season_id: None,
+                metric_ref: "biodiversity:cover_fraction".to_string(),
+                value: proxy.cover_fraction,
+                unit: "fraction".to_string(),
+                status: proxy.status.as_str().to_string(),
+                crs: Some(proxy.crs),
+                extent: Some(proxy.extent),
+                method_version: proxy.method_version,
+                evidence_refs: proxy.source_layer_refs,
+                result_hash: proxy.result_hash,
+                computed_at: proxy.computed_at,
+            })
+        })
+        .collect()
+}
+
+async fn load_sustainability_soil_carbon_export_items(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT proxy_id, record_id, field_id, proxy_value, uncertainty_low, uncertainty_high,
+               status, evidence_refs_json, method_version, result_hash, computed_at
+        FROM soil_carbon_proxies
+        WHERE field_id = ?1
+        ORDER BY computed_at ASC, proxy_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let proxy = decode_soil_carbon_proxy_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "soil_carbon_proxy".to_string(),
+                record_id: proxy.proxy_id,
+                field_id: proxy.field_id,
+                season_id: None,
+                metric_ref: format!("record:{}", proxy.record_id),
+                value: proxy.proxy_value,
+                unit: "soil_carbon_proxy".to_string(),
+                status: proxy.status.as_str().to_string(),
+                crs: None,
+                extent: None,
+                method_version: proxy.method_version,
+                evidence_refs: proxy.evidence_refs,
+                result_hash: proxy.result_hash,
+                computed_at: proxy.computed_at,
+            })
+        })
+        .collect()
+}
+
+async fn load_sustainability_kpi_export_items(
+    state: &AppState,
+    field_id: &str,
+    season_id: Option<&str>,
+) -> AppResult<Vec<SustainabilityExportItem>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT kpi_id, field_id, season_id, metric_ref, current_value, target_value,
+               direction, at_risk_fraction, status, evidence_refs_json, method_version,
+               result_hash, computed_at
+        FROM sustainability_kpis
+        WHERE field_id = ?1
+          AND (?2 IS NULL OR season_id = ?2)
+        ORDER BY computed_at ASC, kpi_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .bind(season_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let kpi = decode_sustainability_kpi_result(&row)?;
+            Ok(SustainabilityExportItem {
+                record_type: "sustainability_kpi".to_string(),
+                record_id: kpi.kpi_id,
+                field_id: kpi.field_id,
+                season_id: Some(kpi.season_id),
+                metric_ref: kpi.metric_ref,
+                value: kpi.current_value,
+                unit: "kpi_value".to_string(),
+                status: kpi.status.as_str().to_string(),
+                crs: None,
+                extent: None,
+                method_version: kpi.method_version,
+                evidence_refs: kpi.evidence_refs,
+                result_hash: kpi.result_hash,
+                computed_at: kpi.computed_at,
+            })
+        })
+        .collect()
+}
+
+fn sustainability_export_feature(item: &SustainabilityExportItem) -> AppResult<Feature> {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "record_type".to_string(),
+        serde_json::Value::String(item.record_type.clone()),
+    );
+    properties.insert(
+        "record_id".to_string(),
+        serde_json::Value::String(item.record_id.clone()),
+    );
+    properties.insert(
+        "field_id".to_string(),
+        serde_json::Value::String(item.field_id.clone()),
+    );
+    if let Some(season_id) = &item.season_id {
+        properties.insert(
+            "season_id".to_string(),
+            serde_json::Value::String(season_id.clone()),
+        );
+    }
+    properties.insert(
+        "metric_ref".to_string(),
+        serde_json::Value::String(item.metric_ref.clone()),
+    );
+    if let Some(value) = item.value {
+        properties.insert("value".to_string(), serde_json::Value::from(value));
+    }
+    properties.insert(
+        "unit".to_string(),
+        serde_json::Value::String(item.unit.clone()),
+    );
+    properties.insert(
+        "status".to_string(),
+        serde_json::Value::String(item.status.clone()),
+    );
+    if let Some(crs) = &item.crs {
+        properties.insert("crs".to_string(), serde_json::Value::String(crs.clone()));
+    }
+    properties.insert(
+        "method_version".to_string(),
+        serde_json::Value::String(item.method_version.clone()),
+    );
+    properties.insert(
+        "evidence_refs".to_string(),
+        serde_json::to_value(&item.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?,
+    );
+    properties.insert(
+        "result_hash".to_string(),
+        serde_json::Value::String(item.result_hash.clone()),
+    );
+    properties.insert(
+        "computed_at".to_string(),
+        serde_json::Value::String(item.computed_at.clone()),
+    );
+
+    let geometry = item.extent.as_ref().map(|extent| {
+        Geometry::new(GeoJsonValue::Polygon(vec![vec![
+            vec![extent.min_lon, extent.min_lat],
+            vec![extent.max_lon, extent.min_lat],
+            vec![extent.max_lon, extent.max_lat],
+            vec![extent.min_lon, extent.max_lat],
+            vec![extent.min_lon, extent.min_lat],
+        ]]))
+    });
+
+    Ok(Feature {
+        bbox: None,
+        geometry,
+        id: Some(GeoJsonId::String(item.record_id.clone())),
+        properties: Some(properties),
+        foreign_members: None,
+    })
+}
+
+fn sustainability_summary_pdf_bytes(summary: &SustainabilityFieldExportSummary) -> Vec<u8> {
+    let mut lines = vec![
+        "AGBot Sustainability Summary".to_string(),
+        format!("field_id: {}", summary.field_id),
+        format!(
+            "season_id: {}",
+            summary.season_id.as_deref().unwrap_or("all")
+        ),
+        format!("record_count: {}", summary.record_count),
+        format!("generated_at: {}", summary.generated_at),
+    ];
+    if summary.items.is_empty() {
+        lines.push("empty: true".to_string());
+        lines.push("No sustainability records were available for this field scope.".to_string());
+    }
+    for item in &summary.items {
+        lines.push(format!(
+            "{} {} value={} unit={} status={} method_version={} evidence_refs={} result_hash={}",
+            item.record_type,
+            item.record_id,
+            item.value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            item.unit,
+            item.status,
+            item.method_version,
+            item.evidence_refs.join("|"),
+            item.result_hash
+        ));
+    }
+    simple_pdf_bytes(&lines)
+}
+
+fn simple_pdf_bytes(lines: &[String]) -> Vec<u8> {
+    let mut stream = String::from("BT\n/F1 10 Tf\n50 760 Td\n");
+    for (index, line) in lines.iter().take(42).enumerate() {
+        if index > 0 {
+            stream.push_str("0 -16 Td\n");
+        }
+        stream.push('(');
+        stream.push_str(&pdf_escape_text(line));
+        stream.push_str(") Tj\n");
+    }
+    stream.push_str("ET\n");
+    let objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n".to_string(),
+        "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),
+        format!(
+            "5 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+            stream.len(),
+            stream
+        ),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = vec![0_usize];
+    for object in &objects {
+        offsets.push(pdf.len());
+        pdf.push_str(object);
+    }
+    let xref_offset = pdf.len();
+    pdf.push_str("xref\n0 6\n0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    ));
+    pdf.into_bytes()
+}
+
+fn pdf_escape_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '(' => "\\(".to_string(),
+            ')' => "\\)".to_string(),
+            '\\' => "\\\\".to_string(),
+            ch if ch.is_ascii_control() => " ".to_string(),
+            ch => ch.to_string(),
+        })
+        .collect::<String>()
+}
+
+async fn load_latest_sustainability_mrv_trail_for_output(
+    state: &AppState,
+    output_ref: &str,
+) -> AppResult<Option<SustainabilityMrvTrail>> {
+    let row = sqlx::query(
+        r#"
+        SELECT trail_id, output_ref, output_kind, input_layer_refs_json, method,
+               method_version, crs, extent_json, parameters_json, audit_id, result_hash,
+               rederived_result_hash, certification_ready, created_at
+        FROM sustainability_mrv_trails
+        WHERE output_ref = ?1
+        ORDER BY created_at DESC, trail_id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(output_ref)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_mrv_trail(&row))
+        .transpose()
+}
+
+async fn load_sustainability_certification_output_item(
+    state: &AppState,
+    trail: &SustainabilityMrvTrail,
+) -> AppResult<SustainabilityCertificationOutputItem> {
+    match trail.output_kind {
+        SustainabilityMrvOutputKind::CarbonFootprint => {
+            let output = load_carbon_footprint_result(state, &trail.output_ref)
+                .await?
+                .ok_or_else(|| {
+                    sustainability_certification_pack_error(
+                        SustainabilityCertificationEvidencePackError::MissingClaimedOutput {
+                            output_ref: trail.output_ref.clone(),
+                        },
+                    )
+                })?;
+            Ok(SustainabilityCertificationOutputItem {
+                output_ref: output.footprint_id,
+                output_kind: SustainabilityMrvOutputKind::CarbonFootprint,
+                value: output.value_co2e,
+                unit: Some("kg_co2e".to_string()),
+                method_version: output.factor_set_version,
+                result_hash: output.result_hash,
+            })
+        }
+        SustainabilityMrvOutputKind::BiomassEstimate => {
+            let output = load_biomass_estimate_result(state, &trail.output_ref)
+                .await?
+                .ok_or_else(|| {
+                    sustainability_certification_pack_error(
+                        SustainabilityCertificationEvidencePackError::MissingClaimedOutput {
+                            output_ref: trail.output_ref.clone(),
+                        },
+                    )
+                })?;
+            Ok(SustainabilityCertificationOutputItem {
+                output_ref: output.estimate_id,
+                output_kind: SustainabilityMrvOutputKind::BiomassEstimate,
+                value: Some(output.biomass_value),
+                unit: Some("biomass_index".to_string()),
+                method_version: output.method_version,
+                result_hash: output.result_hash,
+            })
+        }
+        SustainabilityMrvOutputKind::SustainabilityKpi => {
+            let output = load_sustainability_kpi_result(state, &trail.output_ref)
+                .await?
+                .ok_or_else(|| {
+                    sustainability_certification_pack_error(
+                        SustainabilityCertificationEvidencePackError::MissingClaimedOutput {
+                            output_ref: trail.output_ref.clone(),
+                        },
+                    )
+                })?;
+            Ok(SustainabilityCertificationOutputItem {
+                output_ref: output.kpi_id,
+                output_kind: SustainabilityMrvOutputKind::SustainabilityKpi,
+                value: output.current_value,
+                unit: Some("kpi_value".to_string()),
+                method_version: output.method_version,
+                result_hash: output.result_hash,
+            })
+        }
+    }
+}
+
+async fn insert_sustainability_certification_pack(
+    state: &AppState,
+    pack: &SustainabilityCertificationEvidencePack,
+) -> AppResult<()> {
+    let claimed_output_refs_json = serde_json::to_string(&pack.claimed_output_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let outputs_json =
+        serde_json::to_string(&pack.outputs).map_err(|err| AppError::Anyhow(err.into()))?;
+    let evidence_layer_refs_json = serde_json::to_string(&pack.evidence_layer_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let mrv_trails_json =
+        serde_json::to_string(&pack.mrv_trails).map_err(|err| AppError::Anyhow(err.into()))?;
+    let audit_ids_json =
+        serde_json::to_string(&pack.audit_ids).map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_certification_packs (
+            pack_id, claim_id, claim_type, field_id, season_id, claimed_output_refs_json,
+            outputs_json, evidence_layer_refs_json, mrv_trails_json, audit_ids_json,
+            result_hash, pack_hash, method_version, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+    )
+    .bind(&pack.pack_id)
+    .bind(&pack.claim_id)
+    .bind(&pack.claim_type)
+    .bind(&pack.field_id)
+    .bind(&pack.season_id)
+    .bind(claimed_output_refs_json)
+    .bind(outputs_json)
+    .bind(evidence_layer_refs_json)
+    .bind(mrv_trails_json)
+    .bind(audit_ids_json)
+    .bind(&pack.result_hash)
+    .bind(&pack.pack_hash)
+    .bind(&pack.method_version)
+    .bind(&pack.created_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_sustainability_certification_pack(
+    state: &AppState,
+    pack_id: &str,
+) -> AppResult<Option<SustainabilityCertificationEvidencePack>> {
+    let row = sqlx::query(
+        r#"
+        SELECT pack_id, claim_id, claim_type, field_id, season_id, claimed_output_refs_json,
+               outputs_json, evidence_layer_refs_json, mrv_trails_json, audit_ids_json,
+               result_hash, pack_hash, method_version, created_at
+        FROM sustainability_certification_packs
+        WHERE pack_id = ?1
+        "#,
+    )
+    .bind(pack_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_sustainability_certification_pack(&row))
+        .transpose()
+}
+
 async fn load_sustainability_record_linkage(
     state: &AppState,
     field_id: &str,
@@ -10630,6 +17040,93 @@ async fn load_sustainability_record_linkage(
         field_id: row.get("field_id"),
         season_id: row.get("season"),
     }))
+}
+
+async fn assert_content_workflow_permission(
+    query: &ContentItemScopeQuery,
+    content: &ContentRecord,
+    request: &ContentWorkflowTransitionRequest,
+    state: &AppState,
+) -> AppResult<()> {
+    let Some(actor_org_id) = normalize_optional_text(query.actor_org_id.clone()) else {
+        return Ok(());
+    };
+    let Some(role_refs) = query.role_refs.clone() else {
+        return Ok(());
+    };
+    let permissions = resolve_content_permissions(ContentPermissionResolveRequest {
+        org_id: content.org_id.clone(),
+        actor_org_id,
+        role_refs: parse_role_refs(Some(role_refs)),
+    })
+    .map_err(content_error)?;
+    let (allowed, permission) = match request.action {
+        ContentWorkflowAction::SubmitForReview => (permissions.can_author, "can_author"),
+        ContentWorkflowAction::Publish => (permissions.can_publish, "can_publish"),
+        ContentWorkflowAction::Reject | ContentWorkflowAction::Unpublish => {
+            (permissions.can_moderate, "can_moderate")
+        }
+    };
+    if allowed {
+        return Ok(());
+    }
+
+    insert_content_workflow_denial_audit(state, content, request).await?;
+    Err(AppError::Forbidden(
+        ContentError::AccessDenied { permission }.to_string(),
+    ))
+}
+
+fn parse_role_refs(value: Option<String>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|roles| {
+            roles
+                .split(',')
+                .map(str::trim)
+                .filter(|role| !role.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+async fn assert_collaboration_action_permission(
+    state: &AppState,
+    org_id: &str,
+    actor_org_id: Option<String>,
+    actor_id: Option<String>,
+    role_refs: Option<String>,
+    action: CollaborationAction,
+    channel_id: Option<&str>,
+) -> AppResult<()> {
+    let Some(actor_org_id) = normalize_optional_text(actor_org_id) else {
+        return Ok(());
+    };
+    let Some(role_refs) = role_refs else {
+        return Ok(());
+    };
+    let actor_id = normalize_optional_text(actor_id).unwrap_or_else(|| "unknown".to_string());
+    let decision = authorize_collaboration_action(
+        CollaborationPermissionResolveRequest {
+            org_id: org_id.to_string(),
+            actor_org_id,
+            role_refs: parse_role_refs(Some(role_refs)),
+        },
+        action,
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_permission_audit(state, &decision, &actor_id, channel_id).await?;
+    if decision.allowed {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        CollaborationError::AccessDenied {
+            permission: decision.action.permission_name(),
+        }
+        .to_string(),
+    ))
 }
 
 async fn insert_content_item_with_version(
@@ -10664,6 +17161,138 @@ async fn insert_content_item_with_version(
     Ok(())
 }
 
+async fn insert_success_story_item_with_version(
+    state: &AppState,
+    content: &ContentRecord,
+    version: &ContentVersionRecord,
+    success_story: &ContentSuccessStoryRecord,
+) -> AppResult<()> {
+    let metrics_json = serde_json::to_string(&success_story.metrics)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        INSERT INTO cms_contents (
+            content_id, content_type, author_id, org_id, status, current_version,
+            created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&content.content_id)
+    .bind(content.content_type.as_str())
+    .bind(&content.author_id)
+    .bind(&content.org_id)
+    .bind(content.status.as_str())
+    .bind(&content.current_version)
+    .bind(&content.created_at)
+    .bind(&content.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    insert_content_version_in_tx(&mut tx, version).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO cms_success_stories (
+            content_id, grower, crop, region, outcome_summary, metrics_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&success_story.content_id)
+    .bind(&success_story.grower)
+    .bind(&success_story.crop)
+    .bind(&success_story.region)
+    .bind(&success_story.outcome_summary)
+    .bind(metrics_json)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_community_contribution(
+    state: &AppState,
+    contribution: &ContentCommunityContributionRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_community_contributions (
+            contribution_id, org_id, contributor_id, content_type, body, status, content_id,
+            submitted_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&contribution.contribution_id)
+    .bind(&contribution.org_id)
+    .bind(&contribution.contributor_id)
+    .bind(contribution.content_type.as_str())
+    .bind(&contribution.body)
+    .bind(contribution.status.as_str())
+    .bind(&contribution.content_id)
+    .bind(&contribution.submitted_at)
+    .bind(&contribution.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn persist_community_moderation_result(
+    state: &AppState,
+    result: &ContentContributionModerationResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        UPDATE cms_community_contributions
+        SET status = ?2, content_id = ?3, updated_at = ?4
+        WHERE contribution_id = ?1
+        "#,
+    )
+    .bind(&result.contribution.contribution_id)
+    .bind(result.contribution.status.as_str())
+    .bind(&result.contribution.content_id)
+    .bind(&result.contribution.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    insert_community_moderation_audit_in_tx(&mut tx, &result.audit).await?;
+    if let Some(content) = &result.content {
+        let version = content.versions.first().ok_or_else(|| {
+            AppError::BadRequest("approved contribution missing version".to_string())
+        })?;
+        sqlx::query(
+            r#"
+            INSERT INTO cms_contents (
+                content_id, content_type, author_id, org_id, status, current_version,
+                created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&content.content.content_id)
+        .bind(content.content.content_type.as_str())
+        .bind(&content.content.author_id)
+        .bind(&content.content.org_id)
+        .bind(content.content.status.as_str())
+        .bind(&content.content.current_version)
+        .bind(&content.content.created_at)
+        .bind(&content.content.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+        insert_content_version_in_tx(&mut tx, version).await?;
+    }
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn append_content_version_record(
     state: &AppState,
     content: &ContentRecord,
@@ -10685,6 +17314,232 @@ async fn append_content_version_record(
     .await
     .map_err(Error::from)?;
     tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn persist_content_workflow_transition(
+    state: &AppState,
+    transition: &ContentWorkflowTransitionResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        UPDATE cms_contents
+        SET status = ?2, updated_at = ?3
+        WHERE content_id = ?1
+        "#,
+    )
+    .bind(&transition.content.content_id)
+    .bind(transition.content.status.as_str())
+    .bind(&transition.content.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    insert_content_workflow_audit_in_tx(&mut tx, &transition.audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_content_workflow_denial_audit(
+    state: &AppState,
+    content: &ContentRecord,
+    request: &ContentWorkflowTransitionRequest,
+) -> AppResult<()> {
+    let audit = ContentWorkflowAuditRecord {
+        audit_id: format!("content-workflow-denied-{}", Uuid::new_v4()),
+        content_id: content.content_id.clone(),
+        action: request.action,
+        from_status: content.status,
+        to_status: content.status,
+        actor_id: normalize_optional_text(Some(request.actor_id.clone()))
+            .unwrap_or_else(|| "unknown".to_string()),
+        actor_role: request.actor_role,
+        occurred_at: current_record_timestamp(),
+        scheduled_effective_at: request.scheduled_effective_at.clone(),
+    };
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    insert_content_workflow_audit_in_tx(&mut tx, &audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_content_tags(state: &AppState, tags: &[ContentTagRecord]) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    for tag in tags {
+        sqlx::query(
+            r#"
+            INSERT INTO cms_content_tags (content_id, kind, value, source, applied_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(content_id, kind, value) DO UPDATE SET
+                source = excluded.source,
+                applied_at = excluded.applied_at
+            "#,
+        )
+        .bind(&tag.content_id)
+        .bind(tag.kind.as_str())
+        .bind(&tag.value)
+        .bind(&tag.source)
+        .bind(&tag.applied_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_content_engagement_event(
+    state: &AppState,
+    event: &ContentEngagementEventRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_content_engagement_events (
+            event_id, content_id, org_id, event_type, actor_id, period, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&event.event_id)
+    .bind(&event.content_id)
+    .bind(&event.org_id)
+    .bind(event.event_type.as_str())
+    .bind(&event.actor_id)
+    .bind(&event.period)
+    .bind(&event.occurred_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn upsert_content_locale_variant(
+    state: &AppState,
+    variant: &ContentLocaleVariantRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_content_locale_variants (
+            content_id, locale, version_id, body, status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(content_id, locale) DO UPDATE SET
+            version_id = excluded.version_id,
+            body = excluded.body,
+            status = excluded.status,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&variant.content_id)
+    .bind(&variant.locale)
+    .bind(&variant.version_id)
+    .bind(&variant.body)
+    .bind(variant.status.as_str())
+    .bind(&variant.created_at)
+    .bind(&variant.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn upsert_content_engagement_summary(
+    state: &AppState,
+    summary: &ContentEngagementSummary,
+) -> AppResult<()> {
+    let evidence_refs_json = serde_json::to_string(&summary.evidence_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO cms_content_engagement_summaries (
+            content_id, org_id, period, views, reads, helpful_votes, event_count,
+            evidence_refs_json, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(content_id, org_id, period) DO UPDATE SET
+            views = excluded.views,
+            reads = excluded.reads,
+            helpful_votes = excluded.helpful_votes,
+            event_count = excluded.event_count,
+            evidence_refs_json = excluded.evidence_refs_json,
+            computed_at = excluded.computed_at
+        "#,
+    )
+    .bind(&summary.content_id)
+    .bind(&summary.org_id)
+    .bind(&summary.period)
+    .bind(summary.views as i64)
+    .bind(summary.reads as i64)
+    .bind(summary.helpful_votes as i64)
+    .bind(summary.event_count as i64)
+    .bind(evidence_refs_json)
+    .bind(&summary.computed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_content_workflow_audit_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    audit: &ContentWorkflowAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_content_workflow_audits (
+            audit_id, content_id, action, from_status, to_status, actor_id, actor_role,
+            occurred_at, scheduled_effective_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.content_id)
+    .bind(audit.action.as_str())
+    .bind(audit.from_status.as_str())
+    .bind(audit.to_status.as_str())
+    .bind(&audit.actor_id)
+    .bind(audit.actor_role.as_str())
+    .bind(&audit.occurred_at)
+    .bind(&audit.scheduled_effective_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_community_moderation_audit_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    audit: &ContentContributionModerationAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_community_contribution_audits (
+            audit_id, contribution_id, action, from_status, to_status, moderator_id,
+            occurred_at, reason
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.contribution_id)
+    .bind(audit.action.as_str())
+    .bind(audit.from_status.as_str())
+    .bind(audit.to_status.as_str())
+    .bind(&audit.moderator_id)
+    .bind(&audit.occurred_at)
+    .bind(&audit.reason)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
 
     Ok(())
 }
@@ -10744,6 +17599,156 @@ async fn load_versioned_content(
     let versions = load_content_versions(state, content_id).await?;
 
     Ok(Some(VersionedContentRecord { content, versions }))
+}
+
+async fn load_success_story_record(
+    state: &AppState,
+    content_id: &str,
+) -> AppResult<Option<ContentSuccessStoryRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT content_id, grower, crop, region, outcome_summary, metrics_json
+        FROM cms_success_stories
+        WHERE content_id = ?1
+        "#,
+    )
+    .bind(content_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_success_story_record(&row)).transpose()
+}
+
+async fn load_community_contribution(
+    state: &AppState,
+    contribution_id: &str,
+) -> AppResult<Option<ContentCommunityContributionRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT contribution_id, org_id, contributor_id, content_type, body, status,
+               content_id, submitted_at, updated_at
+        FROM cms_community_contributions
+        WHERE contribution_id = ?1
+        "#,
+    )
+    .bind(contribution_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_community_contribution_record(&row))
+        .transpose()
+}
+
+async fn load_content_search_documents(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<ContentSearchDocument>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT c.content_id, c.content_type, c.author_id, c.org_id, c.status,
+               c.current_version, c.created_at, c.updated_at, v.body AS current_body
+        FROM cms_contents c
+        JOIN cms_content_versions v ON v.version_id = c.current_version
+        WHERE c.org_id = ?1
+        ORDER BY c.content_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let content = decode_content_record(&row)?;
+            Ok(ContentSearchDocument {
+                content,
+                current_body: row.get("current_body"),
+            })
+        })
+        .collect()
+}
+
+async fn load_content_portal_document(
+    state: &AppState,
+    content_id: &str,
+) -> AppResult<Option<ContentSearchDocument>> {
+    let row = sqlx::query(
+        r#"
+        SELECT c.content_id, c.content_type, c.author_id, c.org_id, c.status,
+               c.current_version, c.created_at, c.updated_at, v.body AS current_body
+        FROM cms_contents c
+        JOIN cms_content_versions v ON v.version_id = c.current_version
+        WHERE c.content_id = ?1
+        "#,
+    )
+    .bind(content_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| {
+        let content = decode_content_record(&row)?;
+        Ok(ContentSearchDocument {
+            content,
+            current_body: row.get("current_body"),
+        })
+    })
+    .transpose()
+}
+
+async fn load_content_engagement_events(
+    state: &AppState,
+    content_id: &str,
+    org_id: &str,
+    period: &str,
+) -> AppResult<Vec<ContentEngagementEventRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, content_id, org_id, event_type, actor_id, period, occurred_at
+        FROM cms_content_engagement_events
+        WHERE content_id = ?1
+          AND org_id = ?2
+          AND period = ?3
+        ORDER BY occurred_at ASC, event_id ASC
+        "#,
+    )
+    .bind(content_id)
+    .bind(org_id)
+    .bind(period)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_content_engagement_event_record(&row))
+        .collect()
+}
+
+async fn load_content_locale_variant(
+    state: &AppState,
+    content_id: &str,
+    locale: &str,
+) -> AppResult<Option<ContentLocaleVariantRecord>> {
+    let normalized_locale = locale.trim().replace('_', "-").to_ascii_lowercase();
+    let row = sqlx::query(
+        r#"
+        SELECT content_id, locale, version_id, body, status, created_at, updated_at
+        FROM cms_content_locale_variants
+        WHERE content_id = ?1
+          AND locale = ?2
+        "#,
+    )
+    .bind(content_id)
+    .bind(normalized_locale)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_content_locale_variant_record(&row))
+        .transpose()
 }
 
 async fn load_content_versions(
@@ -10837,6 +17842,989 @@ async fn insert_collaboration_message(
     tx.commit().await.map_err(Error::from)?;
 
     Ok(())
+}
+
+async fn insert_collaboration_permission_audit(
+    state: &AppState,
+    decision: &CollaborationPermissionDecision,
+    actor_id: &str,
+    channel_id: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_permission_audits (
+            audit_id, org_id, actor_org_id, actor_id, action, permission,
+            allowed, reason_code, channel_id, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(format!("collab-permission-audit-{}", Uuid::new_v4()))
+    .bind(&decision.permissions.org_id)
+    .bind(&decision.permissions.actor_org_id)
+    .bind(actor_id)
+    .bind(format!("{:?}", decision.action).to_ascii_lowercase())
+    .bind(decision.action.permission_name())
+    .bind(if decision.allowed { 1_i64 } else { 0_i64 })
+    .bind(&decision.reason_code)
+    .bind(channel_id)
+    .bind(current_record_timestamp())
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn upsert_collaboration_presence(
+    state: &AppState,
+    record: &CollaborationPresenceRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_presence (
+            org_id, channel_id, account_id, state, last_seen, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(channel_id, account_id) DO UPDATE SET org_id = excluded.org_id,
+                                                          state = excluded.state,
+                                                          last_seen = excluded.last_seen,
+                                                          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&record.org_id)
+    .bind(&record.channel_id)
+    .bind(&record.account_id)
+    .bind(record.state.as_str())
+    .bind(&record.last_seen)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn upsert_collaboration_presence_records(
+    state: &AppState,
+    records: &[CollaborationPresenceRecord],
+) -> AppResult<()> {
+    for record in records {
+        upsert_collaboration_presence(state, record).await?;
+    }
+    Ok(())
+}
+
+async fn load_collaboration_presence_records(
+    state: &AppState,
+    channel_id: &str,
+) -> AppResult<Vec<CollaborationPresenceRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT org_id, channel_id, account_id, state, last_seen, updated_at
+        FROM collab_presence
+        WHERE channel_id = ?1
+        ORDER BY account_id ASC
+        "#,
+    )
+    .bind(channel_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(CollaborationPresenceRecord {
+                org_id: row.get("org_id"),
+                channel_id: row.get("channel_id"),
+                account_id: row.get("account_id"),
+                state: parse_collaboration_presence_state(&row.get::<String, _>("state"))?,
+                last_seen: row.get("last_seen"),
+                updated_at: row.get("updated_at"),
+            })
+        })
+        .collect()
+}
+
+async fn insert_collaboration_notifications(
+    state: &AppState,
+    notifications: &[CollaborationNotificationRecord],
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    for notification in notifications {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_notifications (
+                notification_id, event_id, org_id, channel_id, recipient_account_id,
+                event_type, source_ref, body, delivery_state, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        )
+        .bind(&notification.notification_id)
+        .bind(&notification.event_id)
+        .bind(&notification.org_id)
+        .bind(&notification.channel_id)
+        .bind(&notification.recipient_account_id)
+        .bind(&notification.event_type)
+        .bind(&notification.source_ref)
+        .bind(&notification.body)
+        .bind(notification.delivery_state.as_str())
+        .bind(&notification.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+fn parse_collaboration_presence_state(value: &str) -> AppResult<CollaborationPresenceState> {
+    match value {
+        "online" => Ok(CollaborationPresenceState::Online),
+        "away" => Ok(CollaborationPresenceState::Away),
+        "offline" => Ok(CollaborationPresenceState::Offline),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration presence state {value}"
+        ))),
+    }
+}
+
+async fn persist_collaboration_session_replay(
+    state: &AppState,
+    replay: &CollaborationSessionReplay,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_sessions (
+            session_id, org_id, created_at, event_count, has_explicit_gap
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(&replay.session.session_id)
+    .bind(&replay.session.org_id)
+    .bind(&replay.session.created_at)
+    .bind(replay.session.event_count as i64)
+    .bind(if replay.session.has_explicit_gap {
+        1_i64
+    } else {
+        0_i64
+    })
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    for event in &replay.events {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_session_events (
+                event_id, session_id, org_id, kind, occurred_at, actor_id, subject_ref, note
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&event.event_id)
+        .bind(&event.session_id)
+        .bind(&event.org_id)
+        .bind(event.kind.as_str())
+        .bind(&event.occurred_at)
+        .bind(&event.actor_id)
+        .bind(&event.subject_ref)
+        .bind(&event.note)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_session_replay(
+    state: &AppState,
+    session_id: &str,
+) -> AppResult<Option<CollaborationSessionReplay>> {
+    let row = sqlx::query(
+        r#"
+        SELECT session_id, org_id, created_at, event_count, has_explicit_gap
+        FROM collab_sessions
+        WHERE session_id = ?1
+        "#,
+    )
+    .bind(session_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let session = CollaborationSessionRecord {
+        session_id: row.get("session_id"),
+        org_id: row.get("org_id"),
+        created_at: row.get("created_at"),
+        event_count: row.get::<i64, _>("event_count") as u64,
+        has_explicit_gap: row.get::<i64, _>("has_explicit_gap") != 0,
+    };
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, session_id, org_id, kind, occurred_at, actor_id, subject_ref, note
+        FROM collab_session_events
+        WHERE session_id = ?1
+        ORDER BY occurred_at ASC, kind ASC, event_id ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    let events = rows
+        .into_iter()
+        .map(|row| {
+            Ok(CollaborationSessionEventRecord {
+                event_id: row.get("event_id"),
+                session_id: row.get("session_id"),
+                org_id: row.get("org_id"),
+                kind: parse_collaboration_session_event_kind(&row.get::<String, _>("kind"))?,
+                occurred_at: row.get("occurred_at"),
+                actor_id: row.get("actor_id"),
+                subject_ref: row.get("subject_ref"),
+                note: row.get("note"),
+            })
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(Some(CollaborationSessionReplay { session, events }))
+}
+
+fn parse_collaboration_session_event_kind(value: &str) -> AppResult<CollaborationSessionEventKind> {
+    match value {
+        "stream_frame" => Ok(CollaborationSessionEventKind::StreamFrame),
+        "stream_gap" => Ok(CollaborationSessionEventKind::StreamGap),
+        "alert" => Ok(CollaborationSessionEventKind::Alert),
+        "mission_edit" => Ok(CollaborationSessionEventKind::MissionEdit),
+        "annotation" => Ok(CollaborationSessionEventKind::Annotation),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration session event kind {value}"
+        ))),
+    }
+}
+
+async fn persist_collaboration_session_annotation(
+    state: &AppState,
+    link: &CollaborationSessionAnnotationLinkRecord,
+    annotation: &AnnotationRecord,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        INSERT INTO annotations (
+            annotation_id, scene_id, field_id, author, crs, audit_id, label, note, severity,
+            geometry_json, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&annotation.annotation_id)
+    .bind(&annotation.scene_id)
+    .bind(&annotation.field_id)
+    .bind(&annotation.author)
+    .bind(&annotation.crs)
+    .bind(&annotation.audit_id)
+    .bind(&annotation.label)
+    .bind(&annotation.note)
+    .bind(&annotation.severity)
+    .bind(serde_json::to_string(&annotation.geometry).map_err(|err| AppError::Anyhow(err.into()))?)
+    .bind(&annotation.created_at)
+    .bind(&annotation.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO collab_session_annotations (
+            link_id, session_id, org_id, scene_id, annotation_id, actor_id,
+            visible, recoverable, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&link.link_id)
+    .bind(&link.session_id)
+    .bind(&link.org_id)
+    .bind(&link.scene_id)
+    .bind(&link.annotation_id)
+    .bind(&link.actor_id)
+    .bind(if link.visible { 1_i64 } else { 0_i64 })
+    .bind(if link.recoverable { 1_i64 } else { 0_i64 })
+    .bind(&link.occurred_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO collab_session_events (
+            event_id, session_id, org_id, kind, occurred_at, actor_id, subject_ref, note
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(format!("{}:event", link.link_id))
+    .bind(&link.session_id)
+    .bind(&link.org_id)
+    .bind(CollaborationSessionEventKind::Annotation.as_str())
+    .bind(&link.occurred_at)
+    .bind(&link.actor_id)
+    .bind(format!("annotation:{}", link.annotation_id))
+    .bind(if link.recoverable {
+        "connection_lost_annotation_persisted"
+    } else {
+        "annotation_persisted"
+    })
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query(
+        r#"
+        UPDATE collab_sessions
+        SET event_count = event_count + 1,
+            has_explicit_gap = CASE WHEN ?1 = 1 THEN 1 ELSE has_explicit_gap END
+        WHERE session_id = ?2
+        "#,
+    )
+    .bind(if link.recoverable { 1_i64 } else { 0_i64 })
+    .bind(&link.session_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_session_annotations(
+    state: &AppState,
+    session_id: &str,
+    org_id: &str,
+) -> AppResult<Vec<CollaborationSessionAnnotationRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            csa.link_id, csa.session_id, csa.org_id, csa.scene_id AS link_scene_id,
+            csa.annotation_id AS link_annotation_id, csa.actor_id, csa.visible,
+            csa.recoverable, csa.occurred_at,
+            a.annotation_id, a.scene_id, a.field_id, a.author, a.crs, a.audit_id,
+            a.label, a.note, a.severity, a.geometry_json, a.created_at, a.updated_at
+        FROM collab_session_annotations csa
+        INNER JOIN annotations a ON a.annotation_id = csa.annotation_id
+        WHERE csa.session_id = ?1
+          AND csa.org_id = ?2
+          AND csa.visible = 1
+        ORDER BY csa.occurred_at ASC, csa.link_id ASC
+        "#,
+    )
+    .bind(session_id)
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(CollaborationSessionAnnotationRecord {
+                link: decode_collaboration_session_annotation_link(&row),
+                annotation: decode_annotation_record(&row)?,
+            })
+        })
+        .collect()
+}
+
+fn decode_collaboration_session_annotation_link(
+    row: &sqlx::sqlite::SqliteRow,
+) -> CollaborationSessionAnnotationLinkRecord {
+    CollaborationSessionAnnotationLinkRecord {
+        link_id: row.get("link_id"),
+        session_id: row.get("session_id"),
+        org_id: row.get("org_id"),
+        scene_id: row.get("link_scene_id"),
+        annotation_id: row.get("link_annotation_id"),
+        actor_id: row.get("actor_id"),
+        visible: row.get::<i64, _>("visible") != 0,
+        recoverable: row.get::<i64, _>("recoverable") != 0,
+        occurred_at: row.get("occurred_at"),
+    }
+}
+
+async fn load_collaboration_operator_console_streams(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<CollaborationLiveStreamRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+               started_at, updated_at, evidence_refs_json
+        FROM collab_streams
+        WHERE org_id = ?1
+        ORDER BY updated_at DESC, stream_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_collaboration_stream(&row))
+        .collect()
+}
+
+async fn load_collaboration_operator_console_active_alerts(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<CollaborationEmergencyAlertRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT alert_id, org_id, channel_id, source, severity, trigger_ref,
+               body, state, raised_at, updated_at
+        FROM collab_emergency_alerts
+        WHERE org_id = ?1
+          AND state IN ('raised', 'acknowledged')
+        ORDER BY updated_at DESC, alert_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_collaboration_emergency_alert(&row))
+        .collect()
+}
+
+async fn upsert_collaboration_mission_plan(
+    state: &AppState,
+    plan: &CollaborationMissionPlanRecord,
+) -> AppResult<()> {
+    let waypoints_json =
+        serde_json::to_string(&plan.waypoints).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_mission_plans (
+            plan_id, org_id, mission_ref, version, waypoints_json, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(plan_id) DO UPDATE SET org_id = excluded.org_id,
+                                             mission_ref = excluded.mission_ref,
+                                             version = excluded.version,
+                                             waypoints_json = excluded.waypoints_json,
+                                             updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&plan.plan_id)
+    .bind(&plan.org_id)
+    .bind(&plan.mission_ref)
+    .bind(plan.version as i64)
+    .bind(waypoints_json)
+    .bind(&plan.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn persist_collaboration_mission_edit_result(
+    state: &AppState,
+    result: &CollaborationMissionEditResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    if result.audit.decision == CollaborationMissionEditDecision::Accepted {
+        let waypoints_json = serde_json::to_string(&result.plan.waypoints)
+            .map_err(|err| AppError::Anyhow(err.into()))?;
+        sqlx::query(
+            r#"
+            UPDATE collab_mission_plans
+            SET version = ?1, waypoints_json = ?2, updated_at = ?3
+            WHERE plan_id = ?4
+            "#,
+        )
+        .bind(result.plan.version as i64)
+        .bind(waypoints_json)
+        .bind(&result.plan.updated_at)
+        .bind(&result.plan.plan_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+    insert_collaboration_mission_edit_audit_query(&mut tx, &result.audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn insert_collaboration_mission_edit_audit_query(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    audit: &CollaborationMissionEditAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_mission_edit_audits (
+            audit_id, plan_id, mission_ref, actor_id, waypoint_id, base_version,
+            resulting_version, decision, reason_code, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.plan_id)
+    .bind(&audit.mission_ref)
+    .bind(&audit.actor_id)
+    .bind(&audit.waypoint_id)
+    .bind(audit.base_version as i64)
+    .bind(audit.resulting_version as i64)
+    .bind(audit.decision.as_str())
+    .bind(&audit.reason_code)
+    .bind(&audit.occurred_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn insert_collaboration_mission_dispatch_audit(
+    state: &AppState,
+    audit: &CollaborationMissionDispatchAuditRecord,
+) -> AppResult<()> {
+    let blocking_guardrails_json = serde_json::to_string(&audit.blocking_guardrails)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_mission_dispatch_audits (
+            audit_id, plan_id, mission_ref, actor_id, version, allowed,
+            blocking_guardrails_json, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.plan_id)
+    .bind(&audit.mission_ref)
+    .bind(&audit.actor_id)
+    .bind(audit.version as i64)
+    .bind(if audit.allowed { 1_i64 } else { 0_i64 })
+    .bind(blocking_guardrails_json)
+    .bind(&audit.occurred_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_mission_plan(
+    state: &AppState,
+    plan_id: &str,
+) -> AppResult<Option<CollaborationMissionPlanRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT plan_id, org_id, mission_ref, version, waypoints_json, updated_at
+        FROM collab_mission_plans
+        WHERE plan_id = ?1
+        "#,
+    )
+    .bind(plan_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    row.map(|row| decode_collaboration_mission_plan(&row))
+        .transpose()
+}
+
+fn decode_collaboration_mission_plan(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationMissionPlanRecord> {
+    let waypoints = serde_json::from_str::<Vec<CollaborationMissionWaypoint>>(
+        &row.get::<String, _>("waypoints_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode collab mission waypoints_json"))
+    })?;
+    Ok(CollaborationMissionPlanRecord {
+        plan_id: row.get("plan_id"),
+        org_id: row.get("org_id"),
+        mission_ref: row.get("mission_ref"),
+        version: row.get::<i64, _>("version") as u64,
+        waypoints,
+        updated_at: row.get("updated_at"),
+    })
+}
+
+async fn persist_collaboration_emergency_alert_raise(
+    state: &AppState,
+    result: &CollaborationEmergencyAlertRaiseResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    insert_collaboration_emergency_alert_query(&mut tx, &result.alert).await?;
+    for delivery in &result.deliveries {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_alert_deliveries (
+                delivery_id, alert_id, org_id, channel_id, recipient_account_id,
+                delivery_state, retry_count, last_attempt_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&delivery.delivery_id)
+        .bind(&delivery.alert_id)
+        .bind(&delivery.org_id)
+        .bind(&delivery.channel_id)
+        .bind(&delivery.recipient_account_id)
+        .bind(delivery.delivery_state.as_str())
+        .bind(delivery.retry_count as i64)
+        .bind(&delivery.last_attempt_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+    insert_collaboration_emergency_alert_audit_query(&mut tx, &result.audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn persist_collaboration_emergency_alert_transition(
+    state: &AppState,
+    result: &CollaborationEmergencyAlertTransitionResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        UPDATE collab_emergency_alerts
+        SET state = ?1, updated_at = ?2
+        WHERE alert_id = ?3
+        "#,
+    )
+    .bind(result.alert.state.as_str())
+    .bind(&result.alert.updated_at)
+    .bind(&result.alert.alert_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    insert_collaboration_emergency_alert_audit_query(&mut tx, &result.audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn insert_collaboration_emergency_alert_query(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    alert: &CollaborationEmergencyAlertRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_emergency_alerts (
+            alert_id, org_id, channel_id, source, severity, trigger_ref,
+            body, state, raised_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(&alert.alert_id)
+    .bind(&alert.org_id)
+    .bind(&alert.channel_id)
+    .bind(alert.source.as_str())
+    .bind(&alert.severity)
+    .bind(&alert.trigger_ref)
+    .bind(&alert.body)
+    .bind(alert.state.as_str())
+    .bind(&alert.raised_at)
+    .bind(&alert.updated_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn insert_collaboration_emergency_alert_audit_query(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    audit: &CollaborationEmergencyAlertAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_alert_audits (
+            audit_id, alert_id, action, actor_id, from_state, to_state, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.alert_id)
+    .bind(&audit.action)
+    .bind(&audit.actor_id)
+    .bind(audit.from_state.as_str())
+    .bind(audit.to_state.as_str())
+    .bind(&audit.occurred_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_emergency_alert(
+    state: &AppState,
+    alert_id: &str,
+) -> AppResult<Option<CollaborationEmergencyAlertRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT alert_id, org_id, channel_id, source, severity, trigger_ref,
+               body, state, raised_at, updated_at
+        FROM collab_emergency_alerts
+        WHERE alert_id = ?1
+        "#,
+    )
+    .bind(alert_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_collaboration_emergency_alert(&row))
+        .transpose()
+}
+
+fn decode_collaboration_emergency_alert(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationEmergencyAlertRecord> {
+    Ok(CollaborationEmergencyAlertRecord {
+        alert_id: row.get("alert_id"),
+        org_id: row.get("org_id"),
+        channel_id: row.get("channel_id"),
+        source: parse_collaboration_emergency_alert_source(&row.get::<String, _>("source"))?,
+        severity: row.get("severity"),
+        trigger_ref: row.get("trigger_ref"),
+        body: row.get("body"),
+        state: parse_collaboration_emergency_alert_state(&row.get::<String, _>("state"))?,
+        raised_at: row.get("raised_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn parse_collaboration_emergency_alert_source(
+    value: &str,
+) -> AppResult<CollaborationEmergencyAlertSource> {
+    match value {
+        "01" => Ok(CollaborationEmergencyAlertSource::Safety01),
+        "12" => Ok(CollaborationEmergencyAlertSource::Fleet12),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration emergency alert source {value}"
+        ))),
+    }
+}
+
+fn parse_collaboration_emergency_alert_state(
+    value: &str,
+) -> AppResult<CollaborationEmergencyAlertState> {
+    match value {
+        "raised" => Ok(CollaborationEmergencyAlertState::Raised),
+        "acknowledged" => Ok(CollaborationEmergencyAlertState::Acknowledged),
+        "resolved" => Ok(CollaborationEmergencyAlertState::Resolved),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration emergency alert state {value}"
+        ))),
+    }
+}
+
+async fn insert_collaboration_stream(
+    state: &AppState,
+    stream: &CollaborationLiveStreamRecord,
+) -> AppResult<()> {
+    let evidence_refs_json =
+        serde_json::to_string(&stream.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_streams (
+            stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+            started_at, updated_at, evidence_refs_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&stream.stream_id)
+    .bind(&stream.org_id)
+    .bind(&stream.mission_ref)
+    .bind(&stream.source_ref)
+    .bind(stream.state.as_str())
+    .bind(stream.latency_budget_ms as i64)
+    .bind(&stream.started_at)
+    .bind(&stream.updated_at)
+    .bind(evidence_refs_json)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn persist_collaboration_stream_relay_result(
+    state: &AppState,
+    result: &CollaborationStreamRelayResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        UPDATE collab_streams
+        SET state = ?1, updated_at = ?2
+        WHERE stream_id = ?3
+        "#,
+    )
+    .bind(result.stream.state.as_str())
+    .bind(&result.stream.updated_at)
+    .bind(&result.stream.stream_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    if let Some(frame) = &result.frame {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_stream_frames (
+                frame_id, stream_id, org_id, sequence, captured_at, relayed_at,
+                latency_ms, payload_ref, encoded_ref, relay_ref, view_ref, dropped
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+        )
+        .bind(&frame.frame_id)
+        .bind(&frame.stream_id)
+        .bind(&frame.org_id)
+        .bind(frame.sequence as i64)
+        .bind(&frame.captured_at)
+        .bind(&frame.relayed_at)
+        .bind(frame.latency_ms as i64)
+        .bind(&frame.payload_ref)
+        .bind(&frame.encoded_ref)
+        .bind(&frame.relay_ref)
+        .bind(&frame.view_ref)
+        .bind(if frame.dropped { 1_i64 } else { 0_i64 })
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_stream(
+    state: &AppState,
+    stream_id: &str,
+) -> AppResult<Option<CollaborationLiveStreamRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+               started_at, updated_at, evidence_refs_json
+        FROM collab_streams
+        WHERE stream_id = ?1
+        "#,
+    )
+    .bind(stream_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_collaboration_stream(&row)).transpose()
+}
+
+async fn load_collaboration_stream_frames(
+    state: &AppState,
+    stream_id: &str,
+) -> AppResult<Vec<CollaborationStreamFrameRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT frame_id, stream_id, org_id, sequence, captured_at, relayed_at,
+               latency_ms, payload_ref, encoded_ref, relay_ref, view_ref, dropped
+        FROM collab_stream_frames
+        WHERE stream_id = ?1
+        ORDER BY sequence ASC
+        "#,
+    )
+    .bind(stream_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_collaboration_stream_frame(&row))
+        .collect()
+}
+
+async fn next_collaboration_stream_sequence(state: &AppState, stream_id: &str) -> AppResult<u64> {
+    let max_sequence: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT MAX(sequence)
+        FROM collab_stream_frames
+        WHERE stream_id = ?1
+        "#,
+    )
+    .bind(stream_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(max_sequence.unwrap_or(0) as u64 + 1)
+}
+
+fn decode_collaboration_stream(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationLiveStreamRecord> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode stream evidence_refs_json"))
+    })?;
+    Ok(CollaborationLiveStreamRecord {
+        stream_id: row.get("stream_id"),
+        org_id: row.get("org_id"),
+        mission_ref: row.get("mission_ref"),
+        source_ref: row.get("source_ref"),
+        state: parse_collaboration_stream_state(&row.get::<String, _>("state"))?,
+        latency_budget_ms: row.get::<i64, _>("latency_budget_ms") as u64,
+        started_at: row.get("started_at"),
+        updated_at: row.get("updated_at"),
+        evidence_refs,
+    })
+}
+
+fn decode_collaboration_stream_frame(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationStreamFrameRecord> {
+    Ok(CollaborationStreamFrameRecord {
+        frame_id: row.get("frame_id"),
+        stream_id: row.get("stream_id"),
+        org_id: row.get("org_id"),
+        sequence: row.get::<i64, _>("sequence") as u64,
+        captured_at: row.get("captured_at"),
+        relayed_at: row.get("relayed_at"),
+        latency_ms: row.get::<i64, _>("latency_ms") as u64,
+        payload_ref: row.get("payload_ref"),
+        encoded_ref: row.get("encoded_ref"),
+        relay_ref: row.get("relay_ref"),
+        view_ref: row.get("view_ref"),
+        dropped: row.get::<i64, _>("dropped") != 0,
+    })
+}
+
+fn parse_collaboration_stream_state(value: &str) -> AppResult<CollaborationStreamState> {
+    match value {
+        "starting" => Ok(CollaborationStreamState::Starting),
+        "live" => Ok(CollaborationStreamState::Live),
+        "reconnecting" => Ok(CollaborationStreamState::Reconnecting),
+        "ended" => Ok(CollaborationStreamState::Ended),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration stream state {value}"
+        ))),
+    }
 }
 
 async fn load_collaboration_channel(
@@ -11378,6 +19366,86 @@ async fn update_crop_inference_run(state: &AppState, record: &InferenceRunRecord
     Ok(())
 }
 
+async fn insert_crop_inference_progress(
+    state: &AppState,
+    progress: &InferenceRunProgressRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO crop_inference_progress (
+            progress_id, run_id, tiles_total, tiles_done, coverage_fraction, stage, observed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&progress.progress_id)
+    .bind(&progress.run_id)
+    .bind(progress.tiles_total as i64)
+    .bind(progress.tiles_done as i64)
+    .bind(progress.coverage_fraction)
+    .bind(&progress.stage)
+    .bind(&progress.observed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_crop_inference_progress(
+    state: &AppState,
+    run_id: &str,
+) -> AppResult<Vec<InferenceRunProgressRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT progress_id, run_id, tiles_total, tiles_done, coverage_fraction, stage, observed_at
+        FROM crop_inference_progress
+        WHERE run_id = ?1
+        ORDER BY observed_at ASC, progress_id ASC
+        "#,
+    )
+    .bind(run_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| InferenceRunProgressRecord {
+            progress_id: row.get("progress_id"),
+            run_id: row.get("run_id"),
+            tiles_total: row.get::<i64, _>("tiles_total") as u64,
+            tiles_done: row.get::<i64, _>("tiles_done") as u64,
+            coverage_fraction: row.get("coverage_fraction"),
+            stage: row.get("stage"),
+            observed_at: row.get("observed_at"),
+        })
+        .collect())
+}
+
+async fn insert_crop_inference_stall_event(
+    state: &AppState,
+    event: &InferenceRunStallEvent,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO crop_inference_stall_events (
+            stall_id, run_id, last_progress_at, detected_at, stall_window_seconds, flagged
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&event.stall_id)
+    .bind(&event.run_id)
+    .bind(&event.last_progress_at)
+    .bind(&event.detected_at)
+    .bind(event.stall_window_seconds as i64)
+    .bind(if event.flagged { 1_i64 } else { 0_i64 })
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
 async fn load_crop_inference_run(
     state: &AppState,
     run_id: &str,
@@ -11851,6 +19919,133 @@ async fn persist_crop_detection_finding_recommendation(
     Ok(())
 }
 
+async fn persist_crop_closed_loop_proposal(
+    state: &AppState,
+    proposal: &CropClosedLoopProposal,
+) -> AppResult<()> {
+    let action_json =
+        serde_json::to_string(&proposal.action).map_err(|err| AppError::Anyhow(err.into()))?;
+    let refly_area_json = proposal
+        .refly_area
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let findings_json =
+        serde_json::to_string(&proposal.findings).map_err(|err| AppError::Anyhow(err.into()))?;
+    let evidence_refs_json = serde_json::to_string(&proposal.evidence_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO crop_closed_loop_proposals (
+            proposal_id, action, field_id, requested_by, created_at, approval_status,
+            approval_required, dispatch_authorized, confidence_floor, refly_area_json,
+            treatment_prescription_ref, findings_json, evidence_refs_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+    )
+    .bind(&proposal.proposal_id)
+    .bind(action_json)
+    .bind(&proposal.field_id)
+    .bind(&proposal.requested_by)
+    .bind(&proposal.created_at)
+    .bind(proposal.approval_status.as_str())
+    .bind(proposal.approval_required)
+    .bind(proposal.dispatch_authorized)
+    .bind(proposal.confidence_floor)
+    .bind(refly_area_json)
+    .bind(&proposal.treatment_prescription_ref)
+    .bind(findings_json)
+    .bind(evidence_refs_json)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_crop_closed_loop_proposal(
+    state: &AppState,
+    proposal_id: &str,
+) -> AppResult<Option<CropClosedLoopProposal>> {
+    let row = sqlx::query(
+        r#"
+        SELECT proposal_id, action, field_id, requested_by, created_at, approval_status,
+               approval_required, dispatch_authorized, confidence_floor, refly_area_json,
+               treatment_prescription_ref, findings_json, evidence_refs_json
+        FROM crop_closed_loop_proposals
+        WHERE proposal_id = ?1
+        "#,
+    )
+    .bind(proposal_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_crop_closed_loop_proposal(&row))
+        .transpose()
+}
+
+fn decode_crop_closed_loop_proposal(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CropClosedLoopProposal> {
+    let action = serde_json::from_str::<CropClosedLoopAction>(&row.get::<String, _>("action"))
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode crop closed-loop proposal action"),
+            )
+        })?;
+    let approval_status = match row.get::<String, _>("approval_status").as_str() {
+        "pending" => CropClosedLoopApprovalStatus::Pending,
+        value => {
+            return Err(AppError::Anyhow(Error::msg(format!(
+                "unknown crop closed-loop approval status {value}"
+            ))))
+        }
+    };
+    let refly_area = row
+        .get::<Option<String>, _>("refly_area_json")
+        .map(|json| serde_json::from_str::<DetectionZoneGeometry>(&json))
+        .transpose()
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode crop closed-loop refly_area_json"),
+            )
+        })?;
+    let findings = serde_json::from_str::<Vec<CropClosedLoopFindingEvidence>>(
+        &row.get::<String, _>("findings_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode crop closed-loop findings_json"))
+    })?;
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode crop closed-loop evidence_refs_json"),
+        )
+    })?;
+
+    Ok(CropClosedLoopProposal {
+        proposal_id: row.get("proposal_id"),
+        action,
+        field_id: row.get("field_id"),
+        requested_by: row.get("requested_by"),
+        created_at: row.get("created_at"),
+        approval_status,
+        approval_required: row.get("approval_required"),
+        dispatch_authorized: row.get("dispatch_authorized"),
+        confidence_floor: row.get("confidence_floor"),
+        refly_area,
+        treatment_prescription_ref: row.get("treatment_prescription_ref"),
+        findings,
+        evidence_refs,
+    })
+}
+
 async fn assert_field_owned_by_org(
     state: &AppState,
     org_id: &str,
@@ -11955,6 +20150,174 @@ fn default_compliance_report_mandatory_types() -> Vec<ComplianceRecordType> {
         ComplianceRecordType::OperatorCertification,
         ComplianceRecordType::AuthorizationDecision,
     ]
+}
+
+async fn build_compliance_authority_export_from_api(
+    state: &AppState,
+    request: ComplianceAuthorityExportApiRequest,
+) -> AppResult<ComplianceAuthorityExportArtifact> {
+    let records =
+        load_compliance_records_for_report(state, &request.org_id, &request.field_id).await?;
+    let mandatory_record_types = if request.mandatory_record_types.is_empty() {
+        default_compliance_report_mandatory_types()
+    } else {
+        request.mandatory_record_types
+    };
+    let generated_at = request
+        .generated_at
+        .unwrap_or_else(current_record_timestamp);
+    let report = build_compliance_audit_report(ComplianceAuditReportRequest {
+        report_id: request
+            .report_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("compliance-report-{}", Uuid::new_v4())),
+        org_id: request.org_id,
+        field_id: request.field_id,
+        generated_at: generated_at.clone(),
+        records,
+        mandatory_record_types,
+    })
+    .map_err(compliance_audit_report_error)?;
+
+    build_compliance_authority_export(ComplianceAuthorityExportRequest {
+        authority_format: request.authority_format,
+        report,
+        generated_at,
+        residency_tag: request.residency_tag,
+        storage_region: request.storage_region,
+        retention_class: request.retention_class,
+    })
+    .map_err(compliance_authority_export_error)
+}
+
+fn compliance_authority_export_id(export: &ComplianceAuthorityExportArtifact) -> String {
+    format!("{}:{}", export.report_id, export.authority_format.as_str())
+}
+
+async fn persist_compliance_authority_export(
+    state: &AppState,
+    export: &ComplianceAuthorityExportArtifact,
+) -> AppResult<()> {
+    let export_json = serde_json::to_string(export).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO compliance_authority_exports (
+            export_id, report_id, authority_format, org_id, field_id, generated_at,
+            residency_tag, storage_region, retention_class, export_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(export_id) DO UPDATE SET
+            generated_at = excluded.generated_at,
+            residency_tag = excluded.residency_tag,
+            storage_region = excluded.storage_region,
+            retention_class = excluded.retention_class,
+            export_json = excluded.export_json
+        "#,
+    )
+    .bind(compliance_authority_export_id(export))
+    .bind(&export.report_id)
+    .bind(export.authority_format.as_str())
+    .bind(&export.org_id)
+    .bind(&export.field_id)
+    .bind(&export.generated_at)
+    .bind(&export.residency_tag)
+    .bind(&export.storage_region)
+    .bind(format!("{:?}", export.retention_class))
+    .bind(export_json)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn persist_compliance_authority_share(
+    state: &AppState,
+    share: &ComplianceAuthorityShareArtifact,
+) -> AppResult<()> {
+    let share_json = serde_json::to_string(share).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO compliance_authority_shares (
+            share_id, export_id, report_id, authority_format, created_at, expires_at, revoked_at,
+            residency_tag, storage_region, retention_class, share_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(share_id) DO UPDATE SET
+            revoked_at = excluded.revoked_at,
+            share_json = excluded.share_json
+        "#,
+    )
+    .bind(&share.share_id)
+    .bind(compliance_authority_export_id(&share.export))
+    .bind(&share.report_id)
+    .bind(share.authority_format.as_str())
+    .bind(&share.created_at)
+    .bind(&share.expires_at)
+    .bind(&share.revoked_at)
+    .bind(&share.residency_tag)
+    .bind(&share.storage_region)
+    .bind(format!("{:?}", share.retention_class))
+    .bind(share_json)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_compliance_authority_share(
+    state: &AppState,
+    share_id: &str,
+) -> AppResult<Option<ComplianceAuthorityShareArtifact>> {
+    let share_json = sqlx::query_scalar::<_, String>(
+        "SELECT share_json FROM compliance_authority_shares WHERE share_id = ?1",
+    )
+    .bind(share_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    share_json
+        .map(|json| {
+            serde_json::from_str::<ComplianceAuthorityShareArtifact>(&json).map_err(|err| {
+                AppError::Anyhow(
+                    Error::new(err).context("failed to decode compliance authority share_json"),
+                )
+            })
+        })
+        .transpose()
+}
+
+async fn audit_compliance_authority_share_event(
+    state: &AppState,
+    share: &ComplianceAuthorityShareArtifact,
+    event_type: &str,
+    actor: Option<&str>,
+    created_at: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO compliance_authority_share_events (
+            share_id, event_type, actor, created_at, details
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(&share.share_id)
+    .bind(event_type)
+    .bind(actor)
+    .bind(created_at.unwrap_or_else(|| share.created_at.as_str()))
+    .bind(format!(
+        "{} share for report {}",
+        share.authority_format.as_str(),
+        share.report_id
+    ))
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
 }
 
 async fn audit_compliance_record_event(
@@ -12126,6 +20489,190 @@ async fn load_report(
     row.map(|row| decode_report_record(&row)).transpose()
 }
 
+async fn build_report_lineage_records(
+    state: &AppState,
+    report: &ReportRecord,
+) -> AppResult<Vec<LineageRecord>> {
+    let mut records = load_all_provenance_lineage_records(state).await?;
+    let mut seen = records
+        .iter()
+        .map(|record| record.artifact_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    push_lineage_record_if_absent(
+        &mut records,
+        &mut seen,
+        LineageRecord {
+            artifact_id: scene_artifact_ref(&report.scene_id),
+            kind: ArtifactKind::Scene,
+            inputs: Vec::new(),
+            method: "10.scene_registry".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "scene_id": &report.scene_id,
+                "field_id": &report.field_id,
+            })),
+            operator: report.generated_by.clone(),
+            actor: ActorIdentity::system("geo_hub"),
+            created_at: report.created_at.clone(),
+        },
+    );
+
+    let annotations = load_scene_annotation_records(state, &report.scene_id).await?;
+    for annotation in &annotations {
+        push_lineage_record_if_absent(
+            &mut records,
+            &mut seen,
+            LineageRecord {
+                artifact_id: annotation_artifact_ref(&annotation.annotation_id),
+                kind: ArtifactKind::Annotation,
+                inputs: vec![scene_artifact_ref(&annotation.scene_id)],
+                method: "10.annotation_persistence".to_string(),
+                parameters: ProvenanceParameters::from_json(serde_json::json!({
+                    "field_id": &annotation.field_id,
+                    "label": &annotation.label,
+                    "severity": &annotation.severity,
+                    "crs": &annotation.crs,
+                    "audit_id": &annotation.audit_id,
+                })),
+                operator: annotation
+                    .author
+                    .clone()
+                    .unwrap_or_else(|| report.generated_by.clone()),
+                actor: ActorIdentity::system("geo_hub"),
+                created_at: annotation.created_at.clone(),
+            },
+        );
+    }
+
+    let recommendations = load_scene_recommendation_records(state, &report.scene_id).await?;
+    for recommendation in &recommendations {
+        let annotation_inputs =
+            load_recommendation_annotation_ids(state, &recommendation.recommendation_id)
+                .await?
+                .into_iter()
+                .map(|annotation_id| annotation_artifact_ref(&annotation_id));
+        let inputs = unique_lineage_inputs(
+            annotation_inputs
+                .chain(recommendation.evidence_refs.iter().cloned())
+                .collect::<Vec<_>>(),
+        );
+        push_lineage_record_if_absent(
+            &mut records,
+            &mut seen,
+            LineageRecord {
+                artifact_id: recommendation_artifact_ref(&recommendation.recommendation_id),
+                kind: ArtifactKind::Recommendation,
+                inputs,
+                method: "10.recommendation_lifecycle".to_string(),
+                parameters: ProvenanceParameters::from_json(serde_json::json!({
+                    "field_id": &recommendation.field_id,
+                    "title": &recommendation.title,
+                    "category": &recommendation.category,
+                    "priority": recommendation.priority,
+                    "status": recommendation.status,
+                })),
+                operator: recommendation.author_user_id.clone(),
+                actor: ActorIdentity::system("geo_hub"),
+                created_at: recommendation.created_at.clone(),
+            },
+        );
+    }
+
+    let report_inputs = unique_lineage_inputs(
+        std::iter::once(scene_artifact_ref(&report.scene_id))
+            .chain(
+                annotations
+                    .iter()
+                    .map(|annotation| annotation_artifact_ref(&annotation.annotation_id)),
+            )
+            .chain(recommendations.iter().map(|recommendation| {
+                recommendation_artifact_ref(&recommendation.recommendation_id)
+            }))
+            .chain(report.source_refs.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+    push_lineage_record_if_absent(
+        &mut records,
+        &mut seen,
+        LineageRecord {
+            artifact_id: report_artifact_ref(&report.report_id),
+            kind: ArtifactKind::Report,
+            inputs: report_inputs,
+            method: "10.report_deliverable".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "scene_id": &report.scene_id,
+                "field_id": &report.field_id,
+                "season_id": &report.season_id,
+                "title": &report.title,
+                "artifact_uri": &report.artifact_uri,
+                "annotation_count": report.annotation_count,
+                "recommendation_count": report.recommendation_count,
+            })),
+            operator: report.generated_by.clone(),
+            actor: ActorIdentity::system("geo_hub"),
+            created_at: report.created_at.clone(),
+        },
+    );
+
+    Ok(records)
+}
+
+async fn load_all_provenance_lineage_records(state: &AppState) -> AppResult<Vec<LineageRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT artifact_id, kind, inputs_json, method, parameters_json, operator, actor_id,
+               actor_kind, created_at
+        FROM provenance_lineage_records
+        ORDER BY created_at ASC, artifact_id ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_lineage_record(&row))
+        .collect()
+}
+
+fn push_lineage_record_if_absent(
+    records: &mut Vec<LineageRecord>,
+    seen: &mut BTreeSet<String>,
+    record: LineageRecord,
+) {
+    if seen.insert(record.artifact_id.clone()) {
+        records.push(record);
+    }
+}
+
+fn unique_lineage_inputs(inputs: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    inputs
+        .into_iter()
+        .filter_map(|input| {
+            let input = input.trim();
+            (!input.is_empty()).then(|| input.to_string())
+        })
+        .filter(|input| seen.insert(input.clone()))
+        .collect()
+}
+
+fn scene_artifact_ref(scene_id: &str) -> String {
+    format!("scene:{scene_id}")
+}
+
+fn annotation_artifact_ref(annotation_id: &str) -> String {
+    format!("annotation:{annotation_id}")
+}
+
+fn recommendation_artifact_ref(recommendation_id: &str) -> String {
+    format!("recommendation:{recommendation_id}")
+}
+
+fn report_artifact_ref(report_id: &str) -> String {
+    format!("report:{report_id}")
+}
+
 async fn load_report_share(
     state: &AppState,
     share_token: &str,
@@ -12271,6 +20818,58 @@ async fn load_scene_recommendation_records(
         "#,
     )
     .bind(scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut recommendations = Vec::with_capacity(rows.len());
+    for row in rows {
+        recommendations.push(decode_recommendation_record(state, &row).await?);
+    }
+
+    Ok(recommendations)
+}
+
+async fn load_field_annotation_records(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<AnnotationRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT annotation_id, scene_id, field_id, author, crs, audit_id, label, note, severity, geometry_json, created_at, updated_at
+        FROM annotations
+        WHERE field_id = ?1
+           OR scene_id IN (SELECT scene_id FROM scenes WHERE field_id = ?1)
+        ORDER BY scene_id ASC, created_at ASC, annotation_id ASC
+        "#,
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut annotations = Vec::with_capacity(rows.len());
+    for row in rows {
+        annotations.push(decode_annotation_record(&row)?);
+    }
+
+    Ok(annotations)
+}
+
+async fn load_field_recommendation_records(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<RecommendationRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, evidence_refs_json, created_at, updated_at
+        FROM recommendations
+        WHERE field_id = ?1
+           OR scene_id IN (SELECT scene_id FROM scenes WHERE field_id = ?1)
+        ORDER BY scene_id ASC, created_at ASC, recommendation_id ASC
+        "#,
+    )
+    .bind(field_id)
     .fetch_all(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -12475,6 +21074,37 @@ fn is_lower_cloud(
         (Some(current), Some(candidate)) => (candidate < current, false),
         (None, Some(_)) => (true, true),
         _ => (false, false),
+    }
+}
+
+fn common_scene_extent(left: &SceneExtent, right: &SceneExtent) -> Option<SceneExtent> {
+    let min_lon = left.min_lon.max(right.min_lon);
+    let min_lat = left.min_lat.max(right.min_lat);
+    let max_lon = left.max_lon.min(right.max_lon);
+    let max_lat = left.max_lat.min(right.max_lat);
+    (min_lon < max_lon && min_lat < max_lat).then_some(SceneExtent {
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+    })
+}
+
+fn scene_extent_area(extent: &SceneExtent) -> f64 {
+    let width = (extent.max_lon - extent.min_lon).max(0.0);
+    let height = (extent.max_lat - extent.min_lat).max(0.0);
+    width * height
+}
+
+fn coarse_scene_change_score(
+    baseline_cloud_cover: Option<f64>,
+    comparison_cloud_cover: Option<f64>,
+) -> f64 {
+    match (baseline_cloud_cover, comparison_cloud_cover) {
+        (Some(baseline), Some(comparison)) => {
+            ((comparison - baseline).abs() / 100.0).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
     }
 }
 
@@ -12864,8 +21494,8 @@ mod tests {
     use super::{
         build_field_record, build_geospatial_metadata, build_product_summary,
         cached_landsat_scene_id, content_type_for_path, fields_from_geojson, geojson_from_fields,
-        is_missing_scene_error, is_png, normalize_field_geometry, scene_extent_intersects_bounds,
-        AppError, CreateFieldRequest,
+        is_lower_cloud, is_missing_scene_error, is_png, normalize_field_geometry,
+        scene_extent_intersects_bounds, AppError, CreateFieldRequest,
     };
     use crate::landsat;
     use geojson::{Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue};

@@ -4,6 +4,7 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/HudTelemetry.hpp"
+#include "agbot_flight_sim/LocationScenario.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/MissionPreview.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
@@ -445,48 +446,6 @@ GLuint texture_from_image_data(NSData* data) {
     CGColorSpaceRelease(color_space);
     [image release];
     return texture_id;
-}
-
-Mission mission_for_location(GeoCoordinate center, double area_km2) {
-    const double radius_m = radius_m_for_area_km2(area_km2);
-    const double half_extent_m = radius_m / std::sqrt(2.0);
-
-    Mission mission;
-    std::ostringstream name;
-    name << "Location " << std::fixed << std::setprecision(6)
-         << center.latitude << ", " << center.longitude;
-    mission.name = name.str();
-    mission.home = Vec3(0.0, 0.0, 0.0);
-    mission.home_geo = center;
-    mission.cruise_speed_mps = 12.0;
-    mission.acceptance_radius_m = 3.0;
-
-    const std::vector<std::pair<std::string, Vec3>> points = {
-        {"takeoff", Vec3(0.0, 30.0, 0.0)},
-        {"north_west", Vec3(-half_extent_m, 30.0, half_extent_m)},
-        {"north_east", Vec3(half_extent_m, 30.0, half_extent_m)},
-        {"south_east", Vec3(half_extent_m, 30.0, -half_extent_m)},
-        {"south_west", Vec3(-half_extent_m, 30.0, -half_extent_m)},
-        {"land", Vec3(0.0, 0.0, 0.0)},
-    };
-
-    for (const auto& [waypoint_name, position] : points) {
-        Waypoint waypoint;
-        waypoint.name = waypoint_name;
-        waypoint.position = position;
-        waypoint.geo = geo_from_local(position, center);
-        waypoint.speed_mps = mission.cruise_speed_mps;
-        if (waypoint_name == "takeoff") {
-            waypoint.action = WaypointAction::Takeoff;
-        } else if (waypoint_name == "land") {
-            waypoint.action = WaypointAction::Land;
-        } else {
-            waypoint.action = WaypointAction::FlyThrough;
-        }
-        mission.waypoints.push_back(waypoint);
-    }
-
-    return mission;
 }
 
 GlobePoint project_globe_point(double latitude, double longitude, double center_latitude, double center_longitude) {
@@ -1593,7 +1552,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     try {
         [self finishRecording];
         real_world_area_km2_ = std::clamp(area_km2, 1.0, 400.0);
-        Mission mission = mission_for_location(coordinate, real_world_area_km2_);
+        Mission mission = agbot::flight_sim::mission_for_location(coordinate, real_world_area_km2_);
         simulation_->replace_mission(std::move(mission));
         mission_path_.clear();
         replay_.reset();

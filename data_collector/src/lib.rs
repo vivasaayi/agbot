@@ -1072,6 +1072,162 @@ impl CaptureQaSummary {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReflyGapReason {
+    CoverageGap,
+    LowQualityMask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReflyGapGeometry {
+    pub field_id: Uuid,
+    pub geometry_type: String,
+    pub coordinates: Vec<GpsCoords>,
+    pub area_fraction: f32,
+    pub source_record_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaptureReflyRecommendation {
+    pub session_id: Uuid,
+    pub field_id: Uuid,
+    pub linked_mission_id: Option<Uuid>,
+    pub recommended: bool,
+    pub advisory_only: bool,
+    pub gate: String,
+    pub reasons: Vec<ReflyGapReason>,
+    pub gap_geometry: Option<ReflyGapGeometry>,
+}
+
+fn gap_geometry_for(
+    field_id: Uuid,
+    records: &[FlightDataRecord],
+    area_fraction: f32,
+) -> ReflyGapGeometry {
+    let gps_points = records
+        .iter()
+        .filter_map(|record| record.gps_coords.clone())
+        .collect::<Vec<_>>();
+
+    if gps_points.is_empty() {
+        return ReflyGapGeometry {
+            field_id,
+            geometry_type: "field_relative_unobserved".to_string(),
+            coordinates: Vec::new(),
+            area_fraction,
+            source_record_count: 0,
+        };
+    }
+
+    let mut min_latitude = f64::INFINITY;
+    let mut max_latitude = f64::NEG_INFINITY;
+    let mut min_longitude = f64::INFINITY;
+    let mut max_longitude = f64::NEG_INFINITY;
+    let mut altitude_sum = 0.0;
+    for point in &gps_points {
+        min_latitude = min_latitude.min(point.latitude);
+        max_latitude = max_latitude.max(point.latitude);
+        min_longitude = min_longitude.min(point.longitude);
+        max_longitude = max_longitude.max(point.longitude);
+        altitude_sum += point.altitude;
+    }
+
+    let pad = 0.0001 + f64::from(area_fraction.clamp(0.0, 1.0)) * 0.001;
+    let altitude = altitude_sum / gps_points.len() as f64;
+    let coordinates = vec![
+        GpsCoords {
+            latitude: min_latitude - pad,
+            longitude: min_longitude - pad,
+            altitude,
+        },
+        GpsCoords {
+            latitude: min_latitude - pad,
+            longitude: max_longitude + pad,
+            altitude,
+        },
+        GpsCoords {
+            latitude: max_latitude + pad,
+            longitude: max_longitude + pad,
+            altitude,
+        },
+        GpsCoords {
+            latitude: max_latitude + pad,
+            longitude: min_longitude - pad,
+            altitude,
+        },
+        GpsCoords {
+            latitude: min_latitude - pad,
+            longitude: min_longitude - pad,
+            altitude,
+        },
+    ];
+
+    ReflyGapGeometry {
+        field_id,
+        geometry_type: "geo_bbox".to_string(),
+        coordinates,
+        area_fraction,
+        source_record_count: gps_points.len() as u32,
+    }
+}
+
+pub fn analyze_capture_refly(
+    session: &FlightSession,
+    records: &[FlightDataRecord],
+) -> CaptureReflyRecommendation {
+    let quality_masked_count = session
+        .summary
+        .collection_failures
+        .iter()
+        .filter(|failure| failure.kind == CollectionFailureKind::QualityMasked)
+        .count() as u32;
+
+    let has_coverage_gap = matches!(
+        session.summary.coverage.status,
+        CaptureCoverageStatus::Partial
+    ) || session.summary.coverage.failed_observations > 0
+        || (session.summary.coverage.expected_observations > 0
+            && session.summary.coverage.captured_fraction < 0.999);
+    let has_quality_gap = quality_masked_count > 0;
+
+    let mut reasons = Vec::new();
+    if has_coverage_gap {
+        reasons.push(ReflyGapReason::CoverageGap);
+    }
+    if has_quality_gap {
+        reasons.push(ReflyGapReason::LowQualityMask);
+    }
+
+    let expected = session.summary.coverage.expected_observations.max(1);
+    let uncovered_fraction = if session.summary.coverage.expected_observations == 0 {
+        0.0
+    } else {
+        (1.0 - session.summary.coverage.captured_fraction).clamp(0.0, 1.0)
+    };
+    let quality_fraction = quality_masked_count as f32 / expected as f32;
+    let area_fraction = uncovered_fraction.max(quality_fraction).clamp(0.0, 1.0);
+    let gap_geometry = if reasons.is_empty() {
+        None
+    } else {
+        Some(gap_geometry_for(session.field_id, records, area_fraction))
+    };
+
+    CaptureReflyRecommendation {
+        session_id: session.id,
+        field_id: session.field_id,
+        linked_mission_id: session.mission_id,
+        recommended: !reasons.is_empty() && session.mission_id.is_some(),
+        advisory_only: true,
+        gate: if session.mission_id.is_some() {
+            "advisory_mission_linked".to_string()
+        } else {
+            "mission_link_required".to_string()
+        },
+        reasons,
+        gap_geometry,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureSessionInspection {
     pub session: CaptureSessionListItem,
@@ -1628,6 +1784,26 @@ impl DataCollectorService {
             summary: session.summary.clone(),
             failures: session.summary.collection_failures.clone(),
         })
+    }
+
+    pub async fn recommend_capture_refly(
+        &self,
+        session_id: &Uuid,
+    ) -> Result<CaptureReflyRecommendation> {
+        let session =
+            self.get_session(session_id)
+                .await?
+                .ok_or(SessionLifecycleError::SessionNotFound {
+                    session_id: *session_id,
+                })?;
+        let mut records = Vec::new();
+        for record_id in &session.data_records {
+            if let Some(record) = self.storage.load_data(record_id).await? {
+                records.push(record);
+            }
+        }
+
+        Ok(analyze_capture_refly(&session, &records))
     }
 
     async fn sessions_for_inspection(&self) -> Result<Vec<FlightSession>> {
@@ -2516,6 +2692,101 @@ mod tests {
         assert_eq!(session.summary.coverage.successful_records, 0);
         assert_eq!(session.summary.coverage.failed_observations, 1);
         assert_eq!(session.summary.coverage.captured_fraction, 0.0);
+    }
+
+    #[tokio::test]
+    async fn capture_gap_recommends_advisory_refly_tied_to_field_and_mission() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let mission_id = Uuid::new_v4();
+        let request = capture_request().with_mission_id(mission_id);
+        let field_id = request.field_id;
+        let session_id = start_linked_capture_session(&mut service, request).await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+        let first = telemetry_record_at(
+            &session,
+            Utc.timestamp_opt(1_800_300_000, 0).unwrap(),
+            40.0000,
+            -105.0000,
+            0.9,
+        );
+        let second = telemetry_record_at(
+            &session,
+            Utc.timestamp_opt(1_800_300_010, 0).unwrap(),
+            40.0010,
+            -104.9990,
+            0.9,
+        );
+
+        service.collect_data(&session_id, first).await.unwrap();
+        service.collect_data(&session_id, second).await.unwrap();
+        service
+            .record_collection_failure(
+                &session_id,
+                CollectionFailureRequest {
+                    occurred_at: Some(Utc.timestamp_opt(1_800_300_020, 0).unwrap()),
+                    sensor_id: "multispectral-front".to_string(),
+                    data_type: DataType::MultispectralImage,
+                    kind: CollectionFailureKind::QualityMasked,
+                    message: "cloud_shadow_masked".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let recommendation = service.recommend_capture_refly(&session_id).await.unwrap();
+
+        assert!(recommendation.recommended);
+        assert!(recommendation.advisory_only);
+        assert_eq!(recommendation.field_id, field_id);
+        assert_eq!(recommendation.linked_mission_id, Some(mission_id));
+        assert_eq!(recommendation.gate, "advisory_mission_linked");
+        assert!(recommendation
+            .reasons
+            .contains(&ReflyGapReason::CoverageGap));
+        assert!(recommendation
+            .reasons
+            .contains(&ReflyGapReason::LowQualityMask));
+        let geometry = recommendation.gap_geometry.expect("gap geometry emitted");
+        assert_eq!(geometry.field_id, field_id);
+        assert_eq!(geometry.geometry_type, "geo_bbox");
+        assert_eq!(geometry.coordinates.len(), 5);
+        assert_eq!(geometry.coordinates.first(), geometry.coordinates.last());
+        assert_eq!(geometry.source_record_count, 2);
+        assert!((geometry.area_fraction - (1.0 / 3.0)).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn full_high_quality_capture_does_not_recommend_refly() {
+        let temp_dir = tempdir().unwrap();
+        let mut service = DataCollectorService::new(temp_dir.path().to_path_buf()).unwrap();
+        let session_id = start_linked_capture_session(
+            &mut service,
+            capture_request().with_mission_id(Uuid::new_v4()),
+        )
+        .await;
+        let session = service.get_session(&session_id).await.unwrap().unwrap();
+
+        service
+            .collect_data(
+                &session_id,
+                telemetry_record_at(
+                    &session,
+                    Utc.timestamp_opt(1_800_300_000, 0).unwrap(),
+                    40.0000,
+                    -105.0000,
+                    0.9,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let recommendation = service.recommend_capture_refly(&session_id).await.unwrap();
+
+        assert!(!recommendation.recommended);
+        assert!(recommendation.advisory_only);
+        assert!(recommendation.reasons.is_empty());
+        assert!(recommendation.gap_geometry.is_none());
     }
 
     #[tokio::test]

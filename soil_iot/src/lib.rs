@@ -1,5 +1,6 @@
 use alerting::{AlertCandidateRecord, AlertEvent, AlertSeverityHint, AlertingError, SourceAdapter};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use timeseries::{SeriesPoint, SeriesValue};
 
@@ -325,6 +326,168 @@ pub struct ValidatedSoilReading {
     pub excluded_from_products: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ValidationEvidenceRequest {
+    #[serde(default)]
+    pub readings: Vec<GeolocatedSoilReading>,
+    pub profile: CalibrationProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidationQaEvidenceRecord {
+    pub payload_id: String,
+    pub device_id: String,
+    pub reason_code: ReadingQaReason,
+    pub profile_ref: String,
+    pub method_version: String,
+    pub raw_value: f64,
+    pub calibrated_value: f64,
+    pub valid_min: f64,
+    pub valid_max: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidatedSeriesEvidenceReport {
+    pub profile_ref: String,
+    pub method_version: String,
+    pub output_hash: String,
+    pub reading_count: usize,
+    pub qa_flag_count: usize,
+    #[serde(default)]
+    pub validated_readings: Vec<ValidatedSoilReading>,
+    #[serde(default)]
+    pub qa_evidence: Vec<ValidationQaEvidenceRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoilDeviceFreshnessState {
+    Fresh,
+    Stale,
+    NeverSeen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoilCaptureFreshnessConfig {
+    pub expected_interval_seconds: u64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilDeviceFreshnessRecord {
+    pub device_id: String,
+    pub field_id: String,
+    pub zone_id: Option<String>,
+    pub last_seen: Option<String>,
+    pub age_seconds: Option<u64>,
+    pub expected_interval_seconds: u64,
+    pub state: SoilDeviceFreshnessState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilZoneCoverageRecord {
+    pub field_id: String,
+    pub zone_id: String,
+    pub device_count: usize,
+    pub fresh_device_count: usize,
+    pub stale_device_count: usize,
+    pub never_seen_device_count: usize,
+    pub coverage_fraction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCaptureFreshnessCoverageReport {
+    pub field_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub devices: Vec<SoilDeviceFreshnessRecord>,
+    pub zones: Vec<SoilZoneCoverageRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilZoneGeometry {
+    pub zone_id: String,
+    pub crs: String,
+    pub polygon: Vec<Vec<GeoJsonCoordinate>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GeoJsonCoordinate {
+    pub lon: f64,
+    pub lat: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapZoneSummary {
+    pub field_id: String,
+    pub zone_id: String,
+    pub device_count: usize,
+    pub fresh_device_count: usize,
+    pub stale_device_count: usize,
+    pub never_seen_device_count: usize,
+    pub coverage_fraction: f64,
+    pub is_gap: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapExport {
+    pub field_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub crs: String,
+    pub zone_summaries: Vec<SoilCoverageGapZoneSummary>,
+    pub gap_csv: String,
+    pub gap_geojson: SoilCoverageGapFeatureCollection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapFeatureCollection {
+    #[serde(rename = "type")]
+    pub collection_type: String,
+    pub crs: SoilCoverageGapCrs,
+    pub features: Vec<SoilCoverageGapFeature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapCrs {
+    #[serde(rename = "type")]
+    pub crs_type: String,
+    pub properties: SoilCoverageGapCrsProperties,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapCrsProperties {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapFeature {
+    #[serde(rename = "type")]
+    pub feature_type: String,
+    pub id: String,
+    pub geometry: SoilCoverageGapGeometry,
+    pub properties: SoilCoverageGapFeatureProperties,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapGeometry {
+    #[serde(rename = "type")]
+    pub geometry_type: String,
+    pub coordinates: Vec<Vec<[f64; 2]>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilCoverageGapFeatureProperties {
+    pub field_id: String,
+    pub zone_id: String,
+    pub device_count: usize,
+    pub fresh_device_count: usize,
+    pub stale_device_count: usize,
+    pub never_seen_device_count: usize,
+    pub coverage_fraction: f64,
+    pub is_gap: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StuckSensorWindowConfig {
     pub min_samples: usize,
@@ -523,6 +686,205 @@ pub struct ZoneSoilMoistureProduct {
     pub generated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ZoneSoilProductRequest {
+    #[serde(default)]
+    pub product_id: Option<String>,
+    #[serde(default)]
+    pub field_id: String,
+    #[serde(default)]
+    pub zone_id: String,
+    pub metric: GatewayReadingMetric,
+    #[serde(default)]
+    pub readings: Vec<ValidatedSoilReading>,
+    pub max_freshness_age_seconds: u64,
+    #[serde(default)]
+    pub generated_at: String,
+    #[serde(default)]
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoneSoilProductFreshness {
+    Fresh,
+    Stale,
+    InsufficientEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZoneSoilProductSummary {
+    pub product_id: String,
+    pub field_id: String,
+    pub zone_id: String,
+    pub metric: GatewayReadingMetric,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_value: Option<f64>,
+    pub sample_count: usize,
+    pub freshness: ZoneSoilProductFreshness,
+    pub freshness_age_seconds: u64,
+    pub method_version: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub excluded_payload_ids: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AerialIndexZoneProduct {
+    pub product_id: String,
+    pub field_id: String,
+    pub zone_id: String,
+    pub index_name: String,
+    pub mean_value: f64,
+    pub captured_at: String,
+    pub crs: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SoilAerialFusionRequest {
+    pub soil_product: ZoneSoilProductSummary,
+    pub soil_crs: String,
+    pub aerial_product: AerialIndexZoneProduct,
+    pub max_temporal_gap_seconds: u64,
+    pub max_agreement_delta: f64,
+    #[serde(default)]
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoilAerialFusionOutcome {
+    Agreement,
+    Divergence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoilAerialFusionRefusalReason {
+    FieldMismatch,
+    ZoneMismatch,
+    CrsMismatch,
+    TemporalMismatch,
+    UnsupportedSoilMetric,
+    UnsupportedAerialIndex,
+    MissingSoilValue,
+    MissingEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilAerialFusionSummary {
+    pub field_id: String,
+    pub zone_id: String,
+    pub soil_product_id: String,
+    pub aerial_product_id: String,
+    pub soil_metric: GatewayReadingMetric,
+    pub soil_value: f64,
+    pub soil_crs: String,
+    pub soil_generated_at: String,
+    pub aerial_index: String,
+    pub aerial_mean_value: f64,
+    pub aerial_crs: String,
+    pub aerial_captured_at: String,
+    pub temporal_gap_seconds: u64,
+    pub normalized_delta: f64,
+    pub outcome: SoilAerialFusionOutcome,
+    pub method_version: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoilAerialFusionEvaluation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SoilAerialFusionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_reason: Option<SoilAerialFusionRefusalReason>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriftRecalibrationAdvisoryConfig {
+    pub enabled: bool,
+    pub min_neighbor_delta: f64,
+    pub min_aerial_normalized_delta: f64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DriftRecalibrationAdvisoryRequest {
+    #[serde(default)]
+    pub advisory_id: Option<String>,
+    #[serde(default)]
+    pub evaluated_at: String,
+    pub target_product: ZoneSoilProductSummary,
+    #[serde(default)]
+    pub neighbor_products: Vec<ZoneSoilProductSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aerial_fusion: Option<SoilAerialFusionSummary>,
+    pub config: DriftRecalibrationAdvisoryConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftRecalibrationAdvisoryStatus {
+    Raised,
+    NotRaised,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftRecalibrationAdvisoryReason {
+    FeatureDisabled,
+    MissingTargetValue,
+    StaleTarget,
+    MissingReference,
+    StaleReference,
+    DriftDetected,
+    NoDriftDetected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftRecalibrationApprovalStatus {
+    PendingApproval,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriftRecalibrationAdvisory {
+    pub advisory_id: String,
+    pub field_id: String,
+    pub zone_id: String,
+    pub evaluated_at: String,
+    pub status: DriftRecalibrationAdvisoryStatus,
+    pub reason_code: DriftRecalibrationAdvisoryReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neighbor_reference_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neighbor_delta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aerial_normalized_delta: Option<f64>,
+    pub uncertainty_lower: f64,
+    pub uncertainty_upper: f64,
+    pub uncertainty_reason: String,
+    pub evidence_refs: Vec<String>,
+    pub requires_approval: bool,
+    pub approval_status: DriftRecalibrationApprovalStatus,
+    pub recalibration_applied: bool,
+    pub method_version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IrrigationTriggerConfig {
     pub low_moisture_threshold: f64,
@@ -701,10 +1063,16 @@ pub enum SoilIotError {
         reading_metric: GatewayReadingMetric,
         profile_metric: GatewayReadingMetric,
     },
+    #[error("validation evidence series cannot be empty")]
+    EmptyValidationEvidenceSeries,
+    #[error("validation evidence hash input could not be serialized")]
+    ValidationEvidenceSerializationFailed,
     #[error("stuck-sensor method_version cannot be empty")]
     EmptyStuckWindowMethodVersion,
     #[error("sensor-health method_version cannot be empty")]
     EmptySensorHealthMethodVersion,
+    #[error("freshness coverage method_version cannot be empty")]
+    EmptyFreshnessMethodVersion,
     #[error("sensor-health evaluated_at cannot be empty")]
     EmptySensorHealthEvaluatedAt,
     #[error("sensor-health evidence_ref cannot be empty")]
@@ -715,6 +1083,41 @@ pub enum SoilIotError {
     EmptyZoneId,
     #[error("zone soil product generated_at cannot be empty")]
     EmptyZoneSoilGeneratedAt,
+    #[error("zone soil product method_version cannot be empty")]
+    EmptyZoneSoilProductMethodVersion,
+    #[error("zone soil product readings cannot be empty")]
+    EmptyZoneSoilProductReadings,
+    #[error("zone soil product freshness window must be greater than zero")]
+    InvalidZoneSoilProductFreshnessWindow,
+    #[error("unsupported zone soil product metric {metric:?}")]
+    UnsupportedZoneSoilProductMetric { metric: GatewayReadingMetric },
+    #[error("zone soil product readings must belong to field {expected_field_id} and zone {expected_zone_id}")]
+    MixedZoneSoilProductScope {
+        expected_field_id: String,
+        expected_zone_id: String,
+    },
+    #[error("aerial index product_id cannot be empty")]
+    EmptyAerialIndexProductId,
+    #[error("aerial index name cannot be empty")]
+    EmptyAerialIndexName,
+    #[error("aerial index captured_at cannot be empty")]
+    EmptyAerialIndexCapturedAt,
+    #[error("aerial index CRS cannot be empty")]
+    EmptyAerialIndexCrs,
+    #[error("soil-aerial fusion method_version cannot be empty")]
+    EmptySoilAerialFusionMethodVersion,
+    #[error("soil-aerial fusion config must have max_temporal_gap_seconds > 0 and finite max_agreement_delta >= 0")]
+    InvalidSoilAerialFusionConfig,
+    #[error("soil-aerial fusion evidence_refs cannot contain empty values")]
+    EmptySoilAerialFusionEvidenceRef,
+    #[error("drift advisory_id cannot be empty")]
+    EmptyDriftAdvisoryId,
+    #[error("drift advisory evaluated_at cannot be empty")]
+    EmptyDriftAdvisoryEvaluatedAt,
+    #[error("drift advisory method_version cannot be empty")]
+    EmptyDriftAdvisoryMethodVersion,
+    #[error("drift advisory config thresholds must be finite and non-negative")]
+    InvalidDriftAdvisoryConfig,
     #[error("irrigation trigger method_version cannot be empty")]
     EmptyIrrigationTriggerMethodVersion,
     #[error("irrigation trigger evidence_refs cannot contain empty values")]
@@ -725,6 +1128,18 @@ pub enum SoilIotError {
     InvalidStuckWindowConfig,
     #[error("sensor-health thresholds must be finite with low_battery_voltage >= 0")]
     InvalidSensorHealthThresholds,
+    #[error("freshness expected_interval_seconds must be greater than zero")]
+    InvalidFreshnessInterval,
+    #[error("freshness timestamp is invalid: {value}")]
+    InvalidFreshnessTimestamp { value: String },
+    #[error("freshness devices must belong to one field, saw {left} and {right}")]
+    MixedFreshnessFieldScope { left: String, right: String },
+    #[error("coverage gap export CRS cannot be empty")]
+    EmptyCoverageGapCrs,
+    #[error("coverage gap export is missing geometry for uncovered zone {zone_id}")]
+    MissingCoverageGapZoneGeometry { zone_id: String },
+    #[error("coverage gap export geometry for zone {zone_id} is invalid")]
+    InvalidCoverageGapZoneGeometry { zone_id: String },
     #[error("irrigation trigger config must be finite with low_moisture_threshold >= 0")]
     InvalidIrrigationTriggerConfig,
     #[error("stuck-sensor window must contain one device and metric")]
@@ -1059,6 +1474,253 @@ pub fn validate_and_calibrate_reading(
     })
 }
 
+pub fn rederive_validated_series_evidence(
+    request: ValidationEvidenceRequest,
+) -> Result<ValidatedSeriesEvidenceReport, SoilIotError> {
+    if request.readings.is_empty() {
+        return Err(SoilIotError::EmptyValidationEvidenceSeries);
+    }
+    let profile = normalize_calibration_profile(request.profile)?;
+    let mut validated_readings = Vec::with_capacity(request.readings.len());
+    let mut qa_evidence = Vec::new();
+
+    for reading in request.readings {
+        let validated = validate_and_calibrate_reading(reading, profile.clone())?;
+        for flag in &validated.qa_flags {
+            qa_evidence.push(ValidationQaEvidenceRecord {
+                payload_id: validated.payload_id.clone(),
+                device_id: validated.device_id.clone(),
+                reason_code: flag.reason_code,
+                profile_ref: flag.profile_ref.clone(),
+                method_version: flag.method_version.clone(),
+                raw_value: flag.raw_value,
+                calibrated_value: flag.calibrated_value,
+                valid_min: flag.valid_min,
+                valid_max: flag.valid_max,
+            });
+        }
+        validated_readings.push(validated);
+    }
+
+    let output_hash = validation_evidence_hash(&validated_readings, &qa_evidence)?;
+    Ok(ValidatedSeriesEvidenceReport {
+        profile_ref: profile.profile_ref,
+        method_version: profile.method_version,
+        output_hash,
+        reading_count: validated_readings.len(),
+        qa_flag_count: qa_evidence.len(),
+        validated_readings,
+        qa_evidence,
+    })
+}
+
+pub fn evaluate_soil_capture_freshness_coverage(
+    devices: &[SoilDeviceRecord],
+    readings: &[ValidatedSoilReading],
+    config: SoilCaptureFreshnessConfig,
+    evaluated_at: String,
+) -> Result<SoilCaptureFreshnessCoverageReport, SoilIotError> {
+    let config = normalize_freshness_config(config)?;
+    let evaluated_at_dt = parse_freshness_ts(&evaluated_at)?;
+    let evaluated_at = normalize_required_text(evaluated_at, SoilIotError::EmptyCreatedAt)?;
+    let mut field_id: Option<String> = None;
+    let mut latest_by_device: BTreeMap<String, &ValidatedSoilReading> = BTreeMap::new();
+
+    for reading in readings {
+        let reading_ts = parse_freshness_ts(&reading.ts)?;
+        latest_by_device
+            .entry(reading.device_id.clone())
+            .and_modify(|current| {
+                if parse_freshness_ts(&current.ts)
+                    .map(|current_ts| reading_ts > current_ts)
+                    .unwrap_or(false)
+                {
+                    *current = reading;
+                }
+            })
+            .or_insert(reading);
+    }
+
+    let mut device_records = Vec::new();
+    let mut zone_accumulators: BTreeMap<String, ZoneCoverageAccumulator> = BTreeMap::new();
+    for device in devices
+        .iter()
+        .filter(|device| device.status != SoilDeviceStatus::Retired)
+    {
+        let device_field_id =
+            normalize_required_text(device.field_id.clone(), SoilIotError::EmptyFieldId)?;
+        match field_id.as_ref() {
+            Some(existing) if existing != &device_field_id => {
+                return Err(SoilIotError::MixedFreshnessFieldScope {
+                    left: existing.clone(),
+                    right: device_field_id,
+                });
+            }
+            None => field_id = Some(device_field_id.clone()),
+            _ => {}
+        }
+
+        let latest = latest_by_device.get(&device.device_id).copied();
+        let (last_seen, age_seconds, state) = match latest {
+            Some(reading) => {
+                let last_seen_dt = parse_freshness_ts(&reading.ts)?;
+                let age_seconds = evaluated_at_dt
+                    .signed_duration_since(last_seen_dt)
+                    .num_seconds()
+                    .max(0) as u64;
+                let state = if age_seconds <= config.expected_interval_seconds {
+                    SoilDeviceFreshnessState::Fresh
+                } else {
+                    SoilDeviceFreshnessState::Stale
+                };
+                (Some(reading.ts.clone()), Some(age_seconds), state)
+            }
+            None => (None, None, SoilDeviceFreshnessState::NeverSeen),
+        };
+        let zone_id = device
+            .zone_id
+            .clone()
+            .unwrap_or_else(|| "unassigned".to_string());
+        let entry =
+            zone_accumulators
+                .entry(zone_id.clone())
+                .or_insert_with(|| ZoneCoverageAccumulator {
+                    field_id: device_field_id.clone(),
+                    zone_id,
+                    ..ZoneCoverageAccumulator::default()
+                });
+        entry.device_count += 1;
+        match state {
+            SoilDeviceFreshnessState::Fresh => entry.fresh_device_count += 1,
+            SoilDeviceFreshnessState::Stale => entry.stale_device_count += 1,
+            SoilDeviceFreshnessState::NeverSeen => entry.never_seen_device_count += 1,
+        }
+        device_records.push(SoilDeviceFreshnessRecord {
+            device_id: device.device_id.clone(),
+            field_id: device_field_id,
+            zone_id: device.zone_id.clone(),
+            last_seen,
+            age_seconds,
+            expected_interval_seconds: config.expected_interval_seconds,
+            state,
+        });
+    }
+
+    device_records.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+    let zones = zone_accumulators
+        .into_values()
+        .map(|zone| SoilZoneCoverageRecord {
+            field_id: zone.field_id,
+            zone_id: zone.zone_id,
+            device_count: zone.device_count,
+            fresh_device_count: zone.fresh_device_count,
+            stale_device_count: zone.stale_device_count,
+            never_seen_device_count: zone.never_seen_device_count,
+            coverage_fraction: if zone.device_count > 0 {
+                zone.fresh_device_count as f64 / zone.device_count as f64
+            } else {
+                0.0
+            },
+        })
+        .collect();
+
+    Ok(SoilCaptureFreshnessCoverageReport {
+        field_id: field_id.unwrap_or_default(),
+        evaluated_at,
+        method_version: config.method_version,
+        devices: device_records,
+        zones,
+    })
+}
+
+pub fn export_soil_coverage_gaps(
+    report: SoilCaptureFreshnessCoverageReport,
+    zone_geometries: Vec<SoilZoneGeometry>,
+    crs: String,
+) -> Result<SoilCoverageGapExport, SoilIotError> {
+    let crs = normalize_required_text(crs, SoilIotError::EmptyCoverageGapCrs)?;
+    let geometry_by_zone = zone_geometries
+        .into_iter()
+        .filter_map(|geometry| {
+            normalize_optional_text(Some(geometry.zone_id.clone())).map(|zone_id| {
+                (
+                    zone_id,
+                    SoilZoneGeometry {
+                        zone_id: geometry.zone_id,
+                        crs: geometry.crs,
+                        polygon: geometry.polygon,
+                    },
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut zone_summaries = report
+        .zones
+        .iter()
+        .map(|zone| SoilCoverageGapZoneSummary {
+            field_id: zone.field_id.clone(),
+            zone_id: zone.zone_id.clone(),
+            device_count: zone.device_count,
+            fresh_device_count: zone.fresh_device_count,
+            stale_device_count: zone.stale_device_count,
+            never_seen_device_count: zone.never_seen_device_count,
+            coverage_fraction: zone.coverage_fraction,
+            is_gap: zone.fresh_device_count == 0,
+        })
+        .collect::<Vec<_>>();
+    zone_summaries.sort_by(|left, right| left.zone_id.cmp(&right.zone_id));
+
+    let mut gap_features = Vec::new();
+    for summary in zone_summaries.iter().filter(|summary| summary.is_gap) {
+        let geometry = geometry_by_zone.get(&summary.zone_id).ok_or_else(|| {
+            SoilIotError::MissingCoverageGapZoneGeometry {
+                zone_id: summary.zone_id.clone(),
+            }
+        })?;
+        validate_gap_geometry(geometry, &crs)?;
+        gap_features.push(SoilCoverageGapFeature {
+            feature_type: "Feature".to_string(),
+            id: summary.zone_id.clone(),
+            geometry: SoilCoverageGapGeometry {
+                geometry_type: "Polygon".to_string(),
+                coordinates: geometry
+                    .polygon
+                    .iter()
+                    .map(|ring| ring.iter().map(|coord| [coord.lon, coord.lat]).collect())
+                    .collect(),
+            },
+            properties: SoilCoverageGapFeatureProperties {
+                field_id: summary.field_id.clone(),
+                zone_id: summary.zone_id.clone(),
+                device_count: summary.device_count,
+                fresh_device_count: summary.fresh_device_count,
+                stale_device_count: summary.stale_device_count,
+                never_seen_device_count: summary.never_seen_device_count,
+                coverage_fraction: summary.coverage_fraction,
+                is_gap: true,
+            },
+        });
+    }
+
+    let gap_csv = render_gap_csv(&zone_summaries);
+    Ok(SoilCoverageGapExport {
+        field_id: report.field_id,
+        evaluated_at: report.evaluated_at,
+        method_version: report.method_version,
+        crs: crs.clone(),
+        zone_summaries,
+        gap_csv,
+        gap_geojson: SoilCoverageGapFeatureCollection {
+            collection_type: "FeatureCollection".to_string(),
+            crs: SoilCoverageGapCrs {
+                crs_type: "name".to_string(),
+                properties: SoilCoverageGapCrsProperties { name: crs },
+            },
+            features: gap_features,
+        },
+    })
+}
+
 pub fn detect_stuck_sensor_window(
     readings: &[ValidatedSoilReading],
     config: StuckSensorWindowConfig,
@@ -1185,6 +1847,423 @@ pub fn emit_sensor_health_alert_events(
         .iter()
         .map(|event| adapter.emit(event.to_alert_event()))
         .collect()
+}
+
+pub fn build_zone_soil_product_summary(
+    request: ZoneSoilProductRequest,
+    generated_product_id: String,
+) -> Result<ZoneSoilProductSummary, SoilIotError> {
+    let product_id = match request.product_id {
+        Some(product_id) => {
+            normalize_required_text(product_id, SoilIotError::EmptyZoneSoilProductId)?
+        }
+        None => {
+            normalize_required_text(generated_product_id, SoilIotError::EmptyZoneSoilProductId)?
+        }
+    };
+    let field_id = normalize_required_text(request.field_id, SoilIotError::EmptyFieldId)?;
+    let zone_id = normalize_required_text(request.zone_id, SoilIotError::EmptyZoneId)?;
+    let generated_at =
+        normalize_required_text(request.generated_at, SoilIotError::EmptyZoneSoilGeneratedAt)?;
+    let method_version = normalize_required_text(
+        request.method_version,
+        SoilIotError::EmptyZoneSoilProductMethodVersion,
+    )?;
+    if request.max_freshness_age_seconds == 0 {
+        return Err(SoilIotError::InvalidZoneSoilProductFreshnessWindow);
+    }
+    if request.readings.is_empty() {
+        return Err(SoilIotError::EmptyZoneSoilProductReadings);
+    }
+    if !matches!(
+        request.metric,
+        GatewayReadingMetric::ElectricalConductivity
+            | GatewayReadingMetric::SoilMoisturePercent
+            | GatewayReadingMetric::SoilTemperatureCelsius
+    ) {
+        return Err(SoilIotError::UnsupportedZoneSoilProductMetric {
+            metric: request.metric,
+        });
+    }
+
+    let generated_at_dt = parse_freshness_ts(&generated_at)?;
+    let mut values = Vec::new();
+    let mut evidence_refs = BTreeSet::new();
+    let mut excluded_payload_ids = BTreeSet::new();
+    let mut included_max_age = 0;
+    let mut stale_min_age: Option<u64> = None;
+    let mut saw_in_scope_candidate = false;
+
+    for reading in &request.readings {
+        if reading.field_id != field_id || reading.zone_id.as_deref() != Some(zone_id.as_str()) {
+            return Err(SoilIotError::MixedZoneSoilProductScope {
+                expected_field_id: field_id,
+                expected_zone_id: zone_id,
+            });
+        }
+        if reading.metric != request.metric {
+            excluded_payload_ids.insert(reading.payload_id.clone());
+            continue;
+        }
+        saw_in_scope_candidate = true;
+
+        let reading_ts = parse_freshness_ts(&reading.ts)?;
+        let age_seconds = generated_at_dt
+            .signed_duration_since(reading_ts)
+            .num_seconds()
+            .max(0) as u64;
+        if reading.excluded_from_products || !reading.qa_flags.is_empty() {
+            excluded_payload_ids.insert(reading.payload_id.clone());
+            continue;
+        }
+        if age_seconds > request.max_freshness_age_seconds {
+            stale_min_age = Some(stale_min_age.map_or(age_seconds, |age| age.min(age_seconds)));
+            excluded_payload_ids.insert(reading.payload_id.clone());
+            continue;
+        }
+        if !reading.calibrated_value.is_finite() {
+            excluded_payload_ids.insert(reading.payload_id.clone());
+            continue;
+        }
+
+        values.push(reading.calibrated_value);
+        evidence_refs.insert(format!("soil-iot:{}", reading.payload_id));
+        included_max_age = included_max_age.max(age_seconds);
+    }
+
+    let (mean_value, min_value, max_value, freshness, freshness_age_seconds) = if values.is_empty()
+    {
+        let freshness = if stale_min_age.is_some() {
+            ZoneSoilProductFreshness::Stale
+        } else {
+            ZoneSoilProductFreshness::InsufficientEvidence
+        };
+        (None, None, None, freshness, stale_min_age.unwrap_or(0))
+    } else {
+        let sum = values.iter().sum::<f64>();
+        let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (
+            Some(sum / values.len() as f64),
+            Some(min),
+            Some(max),
+            ZoneSoilProductFreshness::Fresh,
+            included_max_age,
+        )
+    };
+
+    if !saw_in_scope_candidate {
+        return Ok(ZoneSoilProductSummary {
+            product_id,
+            field_id,
+            zone_id,
+            metric: request.metric,
+            mean_value: None,
+            min_value: None,
+            max_value: None,
+            sample_count: 0,
+            freshness: ZoneSoilProductFreshness::InsufficientEvidence,
+            freshness_age_seconds: 0,
+            method_version,
+            evidence_refs: Vec::new(),
+            excluded_payload_ids: excluded_payload_ids.into_iter().collect(),
+            generated_at,
+        });
+    }
+
+    Ok(ZoneSoilProductSummary {
+        product_id,
+        field_id,
+        zone_id,
+        metric: request.metric,
+        mean_value,
+        min_value,
+        max_value,
+        sample_count: values.len(),
+        freshness,
+        freshness_age_seconds,
+        method_version,
+        evidence_refs: evidence_refs.into_iter().collect(),
+        excluded_payload_ids: excluded_payload_ids.into_iter().collect(),
+        generated_at,
+    })
+}
+
+pub fn evaluate_soil_aerial_fusion(
+    request: SoilAerialFusionRequest,
+) -> Result<SoilAerialFusionEvaluation, SoilIotError> {
+    let method_version = normalize_required_text(
+        request.method_version,
+        SoilIotError::EmptySoilAerialFusionMethodVersion,
+    )?;
+    if request.max_temporal_gap_seconds == 0
+        || !request.max_agreement_delta.is_finite()
+        || request.max_agreement_delta < 0.0
+    {
+        return Err(SoilIotError::InvalidSoilAerialFusionConfig);
+    }
+
+    let soil = request.soil_product;
+    let soil_product_id =
+        normalize_required_text(soil.product_id, SoilIotError::EmptyZoneSoilProductId)?;
+    let soil_field_id = normalize_required_text(soil.field_id, SoilIotError::EmptyFieldId)?;
+    let soil_zone_id = normalize_required_text(soil.zone_id, SoilIotError::EmptyZoneId)?;
+    let soil_generated_at =
+        normalize_required_text(soil.generated_at, SoilIotError::EmptyZoneSoilGeneratedAt)?;
+    let soil_crs = normalize_required_text(request.soil_crs, SoilIotError::EmptyCrs)?;
+    let aerial = normalize_aerial_index_zone_product(request.aerial_product)?;
+    let evidence_refs = soil_aerial_evidence_refs(
+        &soil_product_id,
+        &soil.evidence_refs,
+        &aerial.product_id,
+        &aerial.evidence_refs,
+    )?;
+
+    let soil_dt = parse_freshness_ts(&soil_generated_at)?;
+    let aerial_dt = parse_freshness_ts(&aerial.captured_at)?;
+    let temporal_gap_seconds = soil_dt
+        .signed_duration_since(aerial_dt)
+        .num_seconds()
+        .unsigned_abs();
+
+    let refused_reason = if soil_field_id != aerial.field_id {
+        Some(SoilAerialFusionRefusalReason::FieldMismatch)
+    } else if soil_zone_id != aerial.zone_id {
+        Some(SoilAerialFusionRefusalReason::ZoneMismatch)
+    } else if soil_crs != aerial.crs {
+        Some(SoilAerialFusionRefusalReason::CrsMismatch)
+    } else if temporal_gap_seconds > request.max_temporal_gap_seconds {
+        Some(SoilAerialFusionRefusalReason::TemporalMismatch)
+    } else if soil.metric != GatewayReadingMetric::SoilMoisturePercent {
+        Some(SoilAerialFusionRefusalReason::UnsupportedSoilMetric)
+    } else if !aerial.index_name.eq_ignore_ascii_case("ndvi") {
+        Some(SoilAerialFusionRefusalReason::UnsupportedAerialIndex)
+    } else if soil.mean_value.is_none() {
+        Some(SoilAerialFusionRefusalReason::MissingSoilValue)
+    } else if evidence_refs.is_empty() {
+        Some(SoilAerialFusionRefusalReason::MissingEvidence)
+    } else {
+        None
+    };
+
+    if let Some(reason) = refused_reason {
+        return Ok(SoilAerialFusionEvaluation {
+            summary: None,
+            refused_reason: Some(reason),
+            evidence_refs,
+        });
+    }
+
+    let soil_value = soil.mean_value.expect("checked above");
+    let normalized_soil_moisture = (soil_value / 100.0).clamp(0.0, 1.0);
+    let normalized_delta = normalized_soil_moisture - aerial.mean_value;
+    let outcome = if normalized_delta.abs() <= request.max_agreement_delta {
+        SoilAerialFusionOutcome::Agreement
+    } else {
+        SoilAerialFusionOutcome::Divergence
+    };
+
+    Ok(SoilAerialFusionEvaluation {
+        summary: Some(SoilAerialFusionSummary {
+            field_id: soil_field_id,
+            zone_id: soil_zone_id,
+            soil_product_id,
+            aerial_product_id: aerial.product_id,
+            soil_metric: soil.metric,
+            soil_value,
+            soil_crs,
+            soil_generated_at,
+            aerial_index: aerial.index_name,
+            aerial_mean_value: aerial.mean_value,
+            aerial_crs: aerial.crs,
+            aerial_captured_at: aerial.captured_at,
+            temporal_gap_seconds,
+            normalized_delta,
+            outcome,
+            method_version,
+            evidence_refs: evidence_refs.clone(),
+        }),
+        refused_reason: None,
+        evidence_refs,
+    })
+}
+
+pub fn evaluate_drift_recalibration_advisory(
+    request: DriftRecalibrationAdvisoryRequest,
+    generated_advisory_id: String,
+) -> Result<DriftRecalibrationAdvisory, SoilIotError> {
+    let advisory_id = match request.advisory_id {
+        Some(advisory_id) => {
+            normalize_required_text(advisory_id, SoilIotError::EmptyDriftAdvisoryId)?
+        }
+        None => normalize_required_text(generated_advisory_id, SoilIotError::EmptyDriftAdvisoryId)?,
+    };
+    let evaluated_at = normalize_required_text(
+        request.evaluated_at,
+        SoilIotError::EmptyDriftAdvisoryEvaluatedAt,
+    )?;
+    let method_version = normalize_required_text(
+        request.config.method_version,
+        SoilIotError::EmptyDriftAdvisoryMethodVersion,
+    )?;
+    if !request.config.min_neighbor_delta.is_finite()
+        || request.config.min_neighbor_delta < 0.0
+        || !request.config.min_aerial_normalized_delta.is_finite()
+        || request.config.min_aerial_normalized_delta < 0.0
+    {
+        return Err(SoilIotError::InvalidDriftAdvisoryConfig);
+    }
+
+    let target = request.target_product;
+    let field_id = normalize_required_text(target.field_id.clone(), SoilIotError::EmptyFieldId)?;
+    let zone_id = normalize_required_text(target.zone_id.clone(), SoilIotError::EmptyZoneId)?;
+    let target_value = target.mean_value;
+    let mut evidence_refs = BTreeSet::from([format!("soil-product:{}", target.product_id)]);
+    evidence_refs.extend(target.evidence_refs.clone());
+
+    if !request.config.enabled {
+        return Ok(drift_advisory_unavailable(
+            advisory_id,
+            field_id,
+            zone_id,
+            evaluated_at,
+            target_value,
+            DriftRecalibrationAdvisoryReason::FeatureDisabled,
+            evidence_refs,
+            method_version,
+        ));
+    }
+    if target.mean_value.is_none() {
+        return Ok(drift_advisory_unavailable(
+            advisory_id,
+            field_id,
+            zone_id,
+            evaluated_at,
+            target_value,
+            DriftRecalibrationAdvisoryReason::MissingTargetValue,
+            evidence_refs,
+            method_version,
+        ));
+    }
+    if target.freshness != ZoneSoilProductFreshness::Fresh {
+        return Ok(drift_advisory_unavailable(
+            advisory_id,
+            field_id,
+            zone_id,
+            evaluated_at,
+            target_value,
+            DriftRecalibrationAdvisoryReason::StaleTarget,
+            evidence_refs,
+            method_version,
+        ));
+    }
+
+    let mut stale_reference_seen = false;
+    let mut neighbor_values = Vec::new();
+    for neighbor in request.neighbor_products {
+        evidence_refs.insert(format!("soil-product:{}", neighbor.product_id));
+        evidence_refs.extend(neighbor.evidence_refs.clone());
+        if neighbor.field_id != field_id || neighbor.metric != target.metric {
+            continue;
+        }
+        if neighbor.freshness != ZoneSoilProductFreshness::Fresh {
+            stale_reference_seen = true;
+            continue;
+        }
+        if let Some(value) = neighbor.mean_value.filter(|value| value.is_finite()) {
+            neighbor_values.push(value);
+        }
+    }
+
+    let neighbor_reference_value = if neighbor_values.is_empty() {
+        None
+    } else {
+        Some(neighbor_values.iter().sum::<f64>() / neighbor_values.len() as f64)
+    };
+    let neighbor_delta =
+        neighbor_reference_value.map(|reference| target_value.unwrap() - reference);
+    let aerial_normalized_delta = request.aerial_fusion.as_ref().and_then(|fusion| {
+        evidence_refs.insert(format!("soil-aerial-fusion:{}", fusion.soil_product_id));
+        evidence_refs.extend(fusion.evidence_refs.clone());
+        if fusion.field_id == field_id && fusion.zone_id == zone_id {
+            Some(fusion.normalized_delta)
+        } else {
+            None
+        }
+    });
+
+    if neighbor_reference_value.is_none() && aerial_normalized_delta.is_none() {
+        let reason = if stale_reference_seen {
+            DriftRecalibrationAdvisoryReason::StaleReference
+        } else {
+            DriftRecalibrationAdvisoryReason::MissingReference
+        };
+        return Ok(drift_advisory_unavailable(
+            advisory_id,
+            field_id,
+            zone_id,
+            evaluated_at,
+            target_value,
+            reason,
+            evidence_refs,
+            method_version,
+        ));
+    }
+
+    let neighbor_drift = neighbor_delta
+        .map(|delta| delta.abs() >= request.config.min_neighbor_delta)
+        .unwrap_or(false);
+    let aerial_drift = aerial_normalized_delta
+        .map(|delta| delta.abs() >= request.config.min_aerial_normalized_delta)
+        .unwrap_or(false);
+    let drift_magnitude = neighbor_delta.map(f64::abs).unwrap_or(0.0).max(
+        aerial_normalized_delta
+            .map(|delta| delta.abs() * 100.0)
+            .unwrap_or(0.0),
+    );
+    let uncertainty_padding =
+        if neighbor_reference_value.is_some() && aerial_normalized_delta.is_some() {
+            drift_magnitude * 0.15
+        } else {
+            drift_magnitude * 0.30
+        };
+    let status = if neighbor_drift || aerial_drift {
+        DriftRecalibrationAdvisoryStatus::Raised
+    } else {
+        DriftRecalibrationAdvisoryStatus::NotRaised
+    };
+    let reason_code = if status == DriftRecalibrationAdvisoryStatus::Raised {
+        DriftRecalibrationAdvisoryReason::DriftDetected
+    } else {
+        DriftRecalibrationAdvisoryReason::NoDriftDetected
+    };
+
+    Ok(DriftRecalibrationAdvisory {
+        advisory_id,
+        field_id,
+        zone_id,
+        evaluated_at,
+        status,
+        reason_code,
+        target_value,
+        neighbor_reference_value,
+        neighbor_delta,
+        aerial_normalized_delta,
+        uncertainty_lower: (drift_magnitude - uncertainty_padding).max(0.0),
+        uncertainty_upper: drift_magnitude + uncertainty_padding,
+        uncertainty_reason: if neighbor_reference_value.is_some()
+            && aerial_normalized_delta.is_some()
+        {
+            "neighbor_and_aerial_reference".to_string()
+        } else {
+            "single_reference_source".to_string()
+        },
+        evidence_refs: evidence_refs.into_iter().collect(),
+        requires_approval: true,
+        approval_status: DriftRecalibrationApprovalStatus::PendingApproval,
+        recalibration_applied: false,
+        method_version,
+    })
 }
 
 pub fn evaluate_irrigation_trigger(
@@ -1322,6 +2401,39 @@ fn normalize_calibration_profile(
     } else {
         Err(SoilIotError::InvalidCalibrationProfile { profile_ref })
     }
+}
+
+#[derive(Default)]
+struct ZoneCoverageAccumulator {
+    field_id: String,
+    zone_id: String,
+    device_count: usize,
+    fresh_device_count: usize,
+    stale_device_count: usize,
+    never_seen_device_count: usize,
+}
+
+fn normalize_freshness_config(
+    config: SoilCaptureFreshnessConfig,
+) -> Result<SoilCaptureFreshnessConfig, SoilIotError> {
+    if config.expected_interval_seconds == 0 {
+        return Err(SoilIotError::InvalidFreshnessInterval);
+    }
+    Ok(SoilCaptureFreshnessConfig {
+        expected_interval_seconds: config.expected_interval_seconds,
+        method_version: normalize_required_text(
+            config.method_version,
+            SoilIotError::EmptyFreshnessMethodVersion,
+        )?,
+    })
+}
+
+fn parse_freshness_ts(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>, SoilIotError> {
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+        SoilIotError::InvalidFreshnessTimestamp {
+            value: value.to_string(),
+        }
+    })
 }
 
 fn normalize_stuck_window_config(
@@ -1538,6 +2650,87 @@ fn normalize_zone_soil_moisture_product(
     })
 }
 
+fn drift_advisory_unavailable(
+    advisory_id: String,
+    field_id: String,
+    zone_id: String,
+    evaluated_at: String,
+    target_value: Option<f64>,
+    reason_code: DriftRecalibrationAdvisoryReason,
+    evidence_refs: BTreeSet<String>,
+    method_version: String,
+) -> DriftRecalibrationAdvisory {
+    DriftRecalibrationAdvisory {
+        advisory_id,
+        field_id,
+        zone_id,
+        evaluated_at,
+        status: DriftRecalibrationAdvisoryStatus::Unavailable,
+        reason_code,
+        target_value,
+        neighbor_reference_value: None,
+        neighbor_delta: None,
+        aerial_normalized_delta: None,
+        uncertainty_lower: 0.0,
+        uncertainty_upper: 0.0,
+        uncertainty_reason: "unavailable_reference".to_string(),
+        evidence_refs: evidence_refs.into_iter().collect(),
+        requires_approval: true,
+        approval_status: DriftRecalibrationApprovalStatus::PendingApproval,
+        recalibration_applied: false,
+        method_version,
+    }
+}
+
+fn normalize_aerial_index_zone_product(
+    product: AerialIndexZoneProduct,
+) -> Result<AerialIndexZoneProduct, SoilIotError> {
+    if !product.mean_value.is_finite() {
+        return Err(SoilIotError::InvalidReadingValue);
+    }
+
+    Ok(AerialIndexZoneProduct {
+        product_id: normalize_required_text(
+            product.product_id,
+            SoilIotError::EmptyAerialIndexProductId,
+        )?,
+        field_id: normalize_required_text(product.field_id, SoilIotError::EmptyFieldId)?,
+        zone_id: normalize_required_text(product.zone_id, SoilIotError::EmptyZoneId)?,
+        index_name: normalize_required_text(
+            product.index_name,
+            SoilIotError::EmptyAerialIndexName,
+        )?,
+        mean_value: product.mean_value,
+        captured_at: normalize_required_text(
+            product.captured_at,
+            SoilIotError::EmptyAerialIndexCapturedAt,
+        )?,
+        crs: normalize_required_text(product.crs, SoilIotError::EmptyAerialIndexCrs)?,
+        evidence_refs: normalize_text_values(
+            product.evidence_refs,
+            SoilIotError::EmptySoilAerialFusionEvidenceRef,
+        )?,
+    })
+}
+
+fn soil_aerial_evidence_refs(
+    soil_product_id: &str,
+    soil_refs: &[String],
+    aerial_product_id: &str,
+    aerial_refs: &[String],
+) -> Result<Vec<String>, SoilIotError> {
+    let mut refs = BTreeSet::new();
+    refs.insert(format!("soil-product:{soil_product_id}"));
+    refs.insert(format!("aerial-index:{aerial_product_id}"));
+    for evidence_ref in soil_refs.iter().chain(aerial_refs.iter()) {
+        refs.insert(normalize_required_text(
+            evidence_ref.clone(),
+            SoilIotError::EmptySoilAerialFusionEvidenceRef,
+        )?);
+    }
+    Ok(refs.into_iter().collect())
+}
+
 fn normalize_irrigation_trigger_config(
     config: IrrigationTriggerConfig,
 ) -> Result<IrrigationTriggerConfig, SoilIotError> {
@@ -1556,6 +2749,35 @@ fn normalize_irrigation_trigger_config(
     })
 }
 
+fn validation_evidence_hash(
+    validated_readings: &[ValidatedSoilReading],
+    qa_evidence: &[ValidationQaEvidenceRecord],
+) -> Result<String, SoilIotError> {
+    #[derive(Serialize)]
+    struct HashInput<'a> {
+        validated_readings: &'a [ValidatedSoilReading],
+        qa_evidence: &'a [ValidationQaEvidenceRecord],
+    }
+
+    let bytes = serde_json::to_vec(&HashInput {
+        validated_readings,
+        qa_evidence,
+    })
+    .map_err(|_| SoilIotError::ValidationEvidenceSerializationFailed)?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{}", to_hex(&digest)))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 fn normalize_text_values(
     values: Vec<String>,
     error: SoilIotError,
@@ -1565,6 +2787,61 @@ fn normalize_text_values(
         .map(|value| normalize_required_text(value, error.clone()))
         .collect::<Result<BTreeSet<_>, _>>()
         .map(|values| values.into_iter().collect())
+}
+
+fn validate_gap_geometry(geometry: &SoilZoneGeometry, crs: &str) -> Result<(), SoilIotError> {
+    let zone_id = normalize_optional_text(Some(geometry.zone_id.clone()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let geometry_crs = normalize_required_text(geometry.crs.clone(), SoilIotError::EmptyCrs)?;
+    if geometry_crs != crs {
+        return Err(SoilIotError::UnsupportedCrs {
+            value: geometry_crs,
+        });
+    }
+    if geometry.polygon.is_empty()
+        || geometry.polygon[0].len() < 4
+        || !geometry
+            .polygon
+            .iter()
+            .flatten()
+            .all(valid_geojson_coordinate)
+    {
+        return Err(SoilIotError::InvalidCoverageGapZoneGeometry { zone_id });
+    }
+    Ok(())
+}
+
+fn valid_geojson_coordinate(coord: &GeoJsonCoordinate) -> bool {
+    coord.lat.is_finite()
+        && coord.lon.is_finite()
+        && (-90.0..=90.0).contains(&coord.lat)
+        && (-180.0..=180.0).contains(&coord.lon)
+}
+
+fn render_gap_csv(summaries: &[SoilCoverageGapZoneSummary]) -> String {
+    let mut csv = "field_id,zone_id,device_count,fresh_device_count,stale_device_count,never_seen_device_count,coverage_fraction,is_gap\n".to_string();
+    for summary in summaries.iter().filter(|summary| summary.is_gap) {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{:.6},{}\n",
+            csv_escape(&summary.field_id),
+            csv_escape(&summary.zone_id),
+            summary.device_count,
+            summary.fresh_device_count,
+            summary.stale_device_count,
+            summary.never_seen_device_count,
+            summary.coverage_fraction,
+            summary.is_gap
+        ));
+    }
+    csv
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 fn pinned_rail(values: &[f64], config: &StuckSensorWindowConfig) -> Option<StuckSensorRail> {
@@ -1639,19 +2916,29 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 mod tests {
     use super::{
         build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
-        decode_gateway_payload, detect_stuck_sensor_window, emit_sensor_health_alert_events,
-        evaluate_irrigation_trigger, evaluate_sensor_health_snapshot, ingest_gateway_readings,
-        reading_rejection_for_device, transition_soil_config_push_status,
-        transition_soil_device_status, validate_and_calibrate_reading, CalibrationProfile,
-        GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
-        GatewayReadingRecord, GeoPosition, IrrigationTriggerConfig,
-        IrrigationTriggerSuppressionReason, RawGatewayReading, ReadingGeolocationStatus,
-        ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
-        SensorHealthEventKind, SensorHealthLinkStatus, SensorHealthMonitorState,
-        SensorHealthReasonCode, SensorHealthSnapshot, SensorHealthThresholds, SimulatedGateway,
-        SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate,
-        SoilDeviceStatus, SoilIotError, SoilSensorType, StuckSensorRail, StuckSensorWindowConfig,
-        ZoneSoilMoistureProduct,
+        build_zone_soil_product_summary, decode_gateway_payload, detect_stuck_sensor_window,
+        emit_sensor_health_alert_events, evaluate_drift_recalibration_advisory,
+        evaluate_irrigation_trigger, evaluate_sensor_health_snapshot, evaluate_soil_aerial_fusion,
+        evaluate_soil_capture_freshness_coverage, export_soil_coverage_gaps,
+        ingest_gateway_readings, reading_rejection_for_device, rederive_validated_series_evidence,
+        transition_soil_config_push_status, transition_soil_device_status,
+        validate_and_calibrate_reading, AerialIndexZoneProduct, CalibrationProfile,
+        DriftRecalibrationAdvisoryConfig, DriftRecalibrationAdvisoryReason,
+        DriftRecalibrationAdvisoryRequest, DriftRecalibrationAdvisoryStatus,
+        DriftRecalibrationApprovalStatus, GatewayIngestError, GatewayPayloadRejectionReason,
+        GatewayReadingMetric, GatewayReadingRecord, GeoJsonCoordinate, GeoPosition,
+        IrrigationTriggerConfig, IrrigationTriggerSuppressionReason, RawGatewayReading,
+        ReadingGeolocationStatus, ReadingQaFlag, ReadingQaReason, ReadingRejectionReason,
+        RegisterSoilDeviceRequest, SensorHealthEventKind, SensorHealthLinkStatus,
+        SensorHealthMonitorState, SensorHealthReasonCode, SensorHealthSnapshot,
+        SensorHealthThresholds, SimulatedGateway, SoilAerialFusionOutcome,
+        SoilAerialFusionRefusalReason, SoilAerialFusionRequest, SoilCaptureFreshnessConfig,
+        SoilCaptureFreshnessCoverageReport, SoilDeviceConfigPushRequest,
+        SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate, SoilDeviceFreshnessState,
+        SoilDeviceStatus, SoilIotError, SoilSensorType, SoilZoneCoverageRecord, SoilZoneGeometry,
+        StuckSensorRail, StuckSensorWindowConfig, ValidatedSoilReading, ValidationEvidenceRequest,
+        ZoneSoilMoistureProduct, ZoneSoilProductFreshness, ZoneSoilProductRequest,
+        ZoneSoilProductSummary,
     };
     use alerting::{AlertEventBackbone, AlertSeverityHint};
     use timeseries::SeriesValue;
@@ -2027,6 +3314,61 @@ mod tests {
     }
 
     #[test]
+    fn validation_evidence_rederivation_is_deterministic() {
+        let readings = validation_evidence_fixture_readings();
+        let profile = calibration_profile(
+            GatewayReadingMetric::SoilMoisturePercent,
+            1.0,
+            0.0,
+            0.0,
+            100.0,
+        );
+
+        let first = rederive_validated_series_evidence(ValidationEvidenceRequest {
+            readings: readings.clone(),
+            profile: profile.clone(),
+        })
+        .expect("validation evidence should be derived");
+        let second =
+            rederive_validated_series_evidence(ValidationEvidenceRequest { readings, profile })
+                .expect("same validation evidence should be re-derived");
+
+        assert_eq!(first.output_hash, second.output_hash);
+        assert!(first.output_hash.starts_with("sha256:"));
+        assert_eq!(first.reading_count, 2);
+        assert_eq!(first.qa_flag_count, 1);
+        assert_eq!(first.validated_readings, second.validated_readings);
+        assert_eq!(first.qa_evidence, second.qa_evidence);
+    }
+
+    #[test]
+    fn validation_evidence_retains_qa_rule_thresholds_and_raw_value() {
+        let report = rederive_validated_series_evidence(ValidationEvidenceRequest {
+            readings: validation_evidence_fixture_readings(),
+            profile: calibration_profile(
+                GatewayReadingMetric::SoilMoisturePercent,
+                1.0,
+                0.0,
+                0.0,
+                100.0,
+            ),
+        })
+        .expect("validation evidence should be derived");
+
+        assert_eq!(report.qa_evidence.len(), 1);
+        let flag = &report.qa_evidence[0];
+        assert_eq!(flag.payload_id, "payload-out-of-range");
+        assert_eq!(flag.device_id, "soil-probe-001");
+        assert_eq!(flag.reason_code, ReadingQaReason::OutOfRange);
+        assert_eq!(flag.profile_ref, "calibration:soil-probe-001:v1");
+        assert_eq!(flag.method_version, "linear-v1");
+        assert_eq!(flag.raw_value, 250.0);
+        assert_eq!(flag.calibrated_value, 250.0);
+        assert_eq!(flag.valid_min, 0.0);
+        assert_eq!(flag.valid_max, 100.0);
+    }
+
+    #[test]
     fn validation_rejects_profile_for_wrong_metric() {
         let reading = build_geolocated_soil_reading(&valid_device(), valid_gateway_record())
             .expect("reading should geolocate");
@@ -2048,6 +3390,147 @@ mod tests {
             SoilIotError::CalibrationMetricMismatch {
                 reading_metric: GatewayReadingMetric::SoilMoisturePercent,
                 profile_metric: GatewayReadingMetric::SoilTemperatureCelsius
+            }
+        );
+    }
+
+    #[test]
+    fn freshness_coverage_counts_fresh_and_stale_devices_per_zone() {
+        let devices = vec![
+            soil_device("soil-probe-001", "zone-ne"),
+            soil_device("soil-probe-002", "zone-ne"),
+            soil_device("soil-probe-003", "zone-sw"),
+        ];
+        let report = evaluate_soil_capture_freshness_coverage(
+            &devices,
+            &[
+                validated_reading(
+                    "payload-001",
+                    "soil-probe-001",
+                    "zone-ne",
+                    "2026-06-12T10:09:30Z",
+                ),
+                validated_reading(
+                    "payload-002",
+                    "soil-probe-002",
+                    "zone-ne",
+                    "2026-06-12T10:00:00Z",
+                ),
+            ],
+            freshness_config(),
+            "2026-06-12T10:10:00Z".to_string(),
+        )
+        .expect("freshness report should evaluate");
+
+        assert_eq!(report.field_id, "field-001");
+        assert_eq!(report.devices.len(), 3);
+        assert_eq!(report.devices[0].state, SoilDeviceFreshnessState::Fresh);
+        assert_eq!(report.devices[0].age_seconds, Some(30));
+        assert_eq!(report.devices[1].state, SoilDeviceFreshnessState::Stale);
+        assert_eq!(report.devices[1].age_seconds, Some(600));
+        assert_eq!(report.devices[2].state, SoilDeviceFreshnessState::NeverSeen);
+
+        let zone_ne = report
+            .zones
+            .iter()
+            .find(|zone| zone.zone_id == "zone-ne")
+            .expect("zone-ne coverage should exist");
+        assert_eq!(zone_ne.device_count, 2);
+        assert_eq!(zone_ne.fresh_device_count, 1);
+        assert_eq!(zone_ne.stale_device_count, 1);
+        assert_eq!(zone_ne.coverage_fraction, 0.5);
+    }
+
+    #[test]
+    fn freshness_marks_silent_device_stale_after_interval_elapses() {
+        let devices = vec![soil_device("soil-probe-001", "zone-ne")];
+        let report = evaluate_soil_capture_freshness_coverage(
+            &devices,
+            &[validated_reading(
+                "payload-old",
+                "soil-probe-001",
+                "zone-ne",
+                "2026-06-12T10:00:00Z",
+            )],
+            freshness_config(),
+            "2026-06-12T10:06:01Z".to_string(),
+        )
+        .expect("freshness report should evaluate");
+
+        assert_eq!(report.devices[0].state, SoilDeviceFreshnessState::Stale);
+        assert_eq!(report.devices[0].age_seconds, Some(361));
+        assert_eq!(report.zones[0].fresh_device_count, 0);
+        assert_eq!(report.zones[0].stale_device_count, 1);
+        assert_eq!(report.zones[0].coverage_fraction, 0.0);
+    }
+
+    #[test]
+    fn coverage_gap_export_outputs_geojson_and_csv_for_uncovered_zones() {
+        let export = export_soil_coverage_gaps(
+            coverage_report(vec![
+                coverage_zone("zone-ne", 2, 1, 1, 0),
+                coverage_zone("zone-sw", 1, 0, 0, 1),
+            ]),
+            vec![zone_geometry("zone-ne"), zone_geometry("zone-sw")],
+            "EPSG:4326".to_string(),
+        )
+        .expect("gap export should build");
+
+        assert_eq!(export.zone_summaries.len(), 2);
+        assert!(!export.zone_summaries[0].is_gap);
+        assert!(export.zone_summaries[1].is_gap);
+        assert!(export.gap_csv.starts_with("field_id,zone_id"));
+        assert!(export
+            .gap_csv
+            .contains("field-001,zone-sw,1,0,0,1,0.000000,true"));
+        assert!(!export.gap_csv.contains("zone-ne,2,1"));
+        assert_eq!(export.gap_geojson.collection_type, "FeatureCollection");
+        assert_eq!(export.gap_geojson.crs.properties.name, "EPSG:4326");
+        assert_eq!(export.gap_geojson.features.len(), 1);
+        assert_eq!(export.gap_geojson.features[0].id, "zone-sw");
+        assert_eq!(
+            export.gap_geojson.features[0].properties.fresh_device_count,
+            0
+        );
+        assert_eq!(
+            export.gap_geojson.features[0].geometry.coordinates[0][0],
+            [-121.50, 38.58]
+        );
+    }
+
+    #[test]
+    fn coverage_gap_export_returns_valid_empty_gap_set_when_fully_covered() {
+        let export = export_soil_coverage_gaps(
+            coverage_report(vec![
+                coverage_zone("zone-ne", 2, 2, 0, 0),
+                coverage_zone("zone-sw", 1, 1, 0, 0),
+            ]),
+            vec![zone_geometry("zone-ne"), zone_geometry("zone-sw")],
+            "EPSG:4326".to_string(),
+        )
+        .expect("fully covered export should build");
+
+        assert!(export.zone_summaries.iter().all(|zone| !zone.is_gap));
+        assert!(export.gap_geojson.features.is_empty());
+        assert_eq!(
+            export.gap_csv,
+            "field_id,zone_id,device_count,fresh_device_count,stale_device_count,never_seen_device_count,coverage_fraction,is_gap\n"
+        );
+    }
+
+    #[test]
+    fn coverage_gap_export_requires_geometry_for_uncovered_zone() {
+        let error = export_soil_coverage_gaps(
+            coverage_report(vec![coverage_zone("zone-sw", 1, 0, 0, 1)]),
+            vec![zone_geometry("zone-ne")],
+            "EPSG:4326".to_string(),
+        )
+        .expect_err("uncovered zone without geometry should fail");
+
+        assert_eq!(
+            error,
+            SoilIotError::MissingCoverageGapZoneGeometry {
+                zone_id: "zone-sw".to_string()
             }
         );
     }
@@ -2250,6 +3733,398 @@ mod tests {
     }
 
     #[test]
+    fn zone_soil_product_summary_averages_fresh_moisture_readings() {
+        let mut first = validated_reading(
+            "payload-moisture-001",
+            "soil-probe-001",
+            "zone-ne",
+            "2026-06-12T11:58:30Z",
+        );
+        first.calibrated_value = 21.0;
+        let mut second = validated_reading(
+            "payload-moisture-002",
+            "soil-probe-002",
+            "zone-ne",
+            "2026-06-12T11:59:00Z",
+        );
+        second.calibrated_value = 29.0;
+
+        let summary = build_zone_soil_product_summary(
+            zone_product_request(
+                GatewayReadingMetric::SoilMoisturePercent,
+                vec![first, second],
+            ),
+            "generated-product".to_string(),
+        )
+        .expect("fresh moisture readings should summarize");
+
+        assert_eq!(summary.product_id, "generated-product");
+        assert_eq!(summary.field_id, "field-001");
+        assert_eq!(summary.zone_id, "zone-ne");
+        assert_eq!(summary.metric, GatewayReadingMetric::SoilMoisturePercent);
+        assert_eq!(summary.freshness, ZoneSoilProductFreshness::Fresh);
+        assert_eq!(summary.sample_count, 2);
+        assert_eq!(summary.mean_value, Some(25.0));
+        assert_eq!(summary.min_value, Some(21.0));
+        assert_eq!(summary.max_value, Some(29.0));
+        assert_eq!(summary.freshness_age_seconds, 90);
+        assert_eq!(
+            summary.evidence_refs,
+            vec![
+                "soil-iot:payload-moisture-001".to_string(),
+                "soil-iot:payload-moisture-002".to_string()
+            ]
+        );
+        assert!(summary.excluded_payload_ids.is_empty());
+    }
+
+    #[test]
+    fn zone_soil_product_summary_excludes_qa_flagged_ec_readings() {
+        let mut valid = validated_reading(
+            "payload-ec-001",
+            "soil-probe-001",
+            "zone-ne",
+            "2026-06-12T11:59:45Z",
+        );
+        valid.metric = GatewayReadingMetric::ElectricalConductivity;
+        valid.raw_value = 1.2;
+        valid.calibrated_value = 1.2;
+        let mut flagged = validated_reading(
+            "payload-ec-qa",
+            "soil-probe-002",
+            "zone-ne",
+            "2026-06-12T11:59:50Z",
+        );
+        flagged.metric = GatewayReadingMetric::ElectricalConductivity;
+        flagged.raw_value = 9.8;
+        flagged.calibrated_value = 9.8;
+        flagged.excluded_from_products = true;
+        flagged.qa_flags.push(ReadingQaFlag {
+            reason_code: ReadingQaReason::OutOfRange,
+            profile_ref: "calibration:ec:v1".to_string(),
+            method_version: "soil-calibration-v1".to_string(),
+            raw_value: 9.8,
+            calibrated_value: 9.8,
+            valid_min: 0.0,
+            valid_max: 5.0,
+        });
+
+        let summary = build_zone_soil_product_summary(
+            zone_product_request(
+                GatewayReadingMetric::ElectricalConductivity,
+                vec![valid, flagged],
+            ),
+            "zone-ec-product-001".to_string(),
+        )
+        .expect("fresh clean EC readings should summarize");
+
+        assert_eq!(summary.freshness, ZoneSoilProductFreshness::Fresh);
+        assert_eq!(summary.sample_count, 1);
+        assert_eq!(summary.mean_value, Some(1.2));
+        assert_eq!(summary.evidence_refs, vec!["soil-iot:payload-ec-001"]);
+        assert_eq!(summary.excluded_payload_ids, vec!["payload-ec-qa"]);
+    }
+
+    #[test]
+    fn zone_soil_product_summary_marks_stale_temperature_without_value() {
+        let mut stale = validated_reading(
+            "payload-temp-stale",
+            "soil-probe-001",
+            "zone-ne",
+            "2026-06-12T11:45:00Z",
+        );
+        stale.metric = GatewayReadingMetric::SoilTemperatureCelsius;
+        stale.raw_value = 18.4;
+        stale.calibrated_value = 18.4;
+
+        let summary = build_zone_soil_product_summary(
+            zone_product_request(GatewayReadingMetric::SoilTemperatureCelsius, vec![stale]),
+            "zone-temp-product-001".to_string(),
+        )
+        .expect("stale temperature readings should produce a stale product");
+
+        assert_eq!(summary.freshness, ZoneSoilProductFreshness::Stale);
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.mean_value, None);
+        assert_eq!(summary.min_value, None);
+        assert_eq!(summary.max_value, None);
+        assert_eq!(summary.freshness_age_seconds, 900);
+        assert!(summary.evidence_refs.is_empty());
+        assert_eq!(summary.excluded_payload_ids, vec!["payload-temp-stale"]);
+    }
+
+    #[test]
+    fn zone_soil_product_summary_rejects_battery_products() {
+        let mut reading = validated_reading(
+            "payload-battery-001",
+            "soil-probe-001",
+            "zone-ne",
+            "2026-06-12T11:59:00Z",
+        );
+        reading.metric = GatewayReadingMetric::BatteryVoltage;
+
+        let error = build_zone_soil_product_summary(
+            zone_product_request(GatewayReadingMetric::BatteryVoltage, vec![reading]),
+            "zone-battery-product-001".to_string(),
+        )
+        .expect_err("battery voltage is not a zone soil agronomic product");
+
+        assert_eq!(
+            error,
+            SoilIotError::UnsupportedZoneSoilProductMetric {
+                metric: GatewayReadingMetric::BatteryVoltage
+            }
+        );
+    }
+
+    #[test]
+    fn soil_aerial_fusion_reports_cited_divergence_for_aligned_ndvi() {
+        let evaluation = evaluate_soil_aerial_fusion(fusion_request(
+            zone_soil_product_summary(Some(18.0), ZoneSoilProductFreshness::Fresh),
+            "EPSG:4326",
+            aerial_ndvi_product(
+                "field-001",
+                "zone-ne",
+                "EPSG:4326",
+                "2026-06-12T11:55:00Z",
+                0.72,
+            ),
+        ))
+        .expect("aligned soil and NDVI products should evaluate");
+
+        assert!(evaluation.refused_reason.is_none());
+        let summary = evaluation.summary.expect("aligned products should fuse");
+        assert_eq!(summary.field_id, "field-001");
+        assert_eq!(summary.zone_id, "zone-ne");
+        assert_eq!(
+            summary.soil_metric,
+            GatewayReadingMetric::SoilMoisturePercent
+        );
+        assert_eq!(summary.soil_value, 18.0);
+        assert_eq!(summary.soil_crs, "EPSG:4326");
+        assert_eq!(summary.aerial_index, "ndvi");
+        assert_eq!(summary.aerial_mean_value, 0.72);
+        assert_eq!(summary.aerial_crs, "EPSG:4326");
+        assert_eq!(summary.temporal_gap_seconds, 300);
+        assert!((summary.normalized_delta - -0.54).abs() < 1e-9);
+        assert_eq!(summary.outcome, SoilAerialFusionOutcome::Divergence);
+        assert!(summary
+            .evidence_refs
+            .contains(&"soil-product:zone-soil-001".to_string()));
+        assert!(summary
+            .evidence_refs
+            .contains(&"aerial-index:ndvi-zone-001".to_string()));
+        assert!(summary
+            .evidence_refs
+            .contains(&"soil-iot:payload-moisture-001".to_string()));
+        assert!(summary
+            .evidence_refs
+            .contains(&"imagery:ndvi-zone-001".to_string()));
+    }
+
+    #[test]
+    fn soil_aerial_fusion_refuses_crs_mismatch() {
+        let evaluation = evaluate_soil_aerial_fusion(fusion_request(
+            zone_soil_product_summary(Some(42.0), ZoneSoilProductFreshness::Fresh),
+            "EPSG:4326",
+            aerial_ndvi_product(
+                "field-001",
+                "zone-ne",
+                "EPSG:32614",
+                "2026-06-12T11:55:00Z",
+                0.4,
+            ),
+        ))
+        .expect("CRS mismatch should be a refusal, not a blind fusion");
+
+        assert!(evaluation.summary.is_none());
+        assert_eq!(
+            evaluation.refused_reason,
+            Some(SoilAerialFusionRefusalReason::CrsMismatch)
+        );
+        assert!(evaluation
+            .evidence_refs
+            .contains(&"aerial-index:ndvi-zone-001".to_string()));
+    }
+
+    #[test]
+    fn soil_aerial_fusion_refuses_temporal_mismatch() {
+        let evaluation = evaluate_soil_aerial_fusion(fusion_request(
+            zone_soil_product_summary(Some(42.0), ZoneSoilProductFreshness::Fresh),
+            "EPSG:4326",
+            aerial_ndvi_product(
+                "field-001",
+                "zone-ne",
+                "EPSG:4326",
+                "2026-06-12T10:30:00Z",
+                0.4,
+            ),
+        ))
+        .expect("temporal mismatch should be a refusal");
+
+        assert!(evaluation.summary.is_none());
+        assert_eq!(
+            evaluation.refused_reason,
+            Some(SoilAerialFusionRefusalReason::TemporalMismatch)
+        );
+        assert!(evaluation
+            .evidence_refs
+            .contains(&"soil-product:zone-soil-001".to_string()));
+    }
+
+    #[test]
+    fn drift_recalibration_advisory_raises_with_uncertainty_and_approval_gate() {
+        let fusion = evaluate_soil_aerial_fusion(fusion_request(
+            zone_soil_product_summary(Some(18.0), ZoneSoilProductFreshness::Fresh),
+            "EPSG:4326",
+            aerial_ndvi_product(
+                "field-001",
+                "zone-ne",
+                "EPSG:4326",
+                "2026-06-12T11:55:00Z",
+                0.72,
+            ),
+        ))
+        .expect("fusion should evaluate")
+        .summary
+        .expect("aligned fusion should summarize");
+
+        let advisory = evaluate_drift_recalibration_advisory(
+            DriftRecalibrationAdvisoryRequest {
+                advisory_id: Some("drift-adv-001".to_string()),
+                evaluated_at: "2026-06-12T12:05:00Z".to_string(),
+                target_product: zone_soil_product_summary(
+                    Some(18.0),
+                    ZoneSoilProductFreshness::Fresh,
+                ),
+                neighbor_products: vec![neighbor_zone_product(
+                    "zone-nw-product",
+                    "zone-nw",
+                    46.0,
+                    ZoneSoilProductFreshness::Fresh,
+                )],
+                aerial_fusion: Some(fusion),
+                config: drift_config(true),
+            },
+            "generated-drift".to_string(),
+        )
+        .expect("drift advisory should evaluate");
+
+        assert_eq!(advisory.status, DriftRecalibrationAdvisoryStatus::Raised);
+        assert_eq!(
+            advisory.reason_code,
+            DriftRecalibrationAdvisoryReason::DriftDetected
+        );
+        assert_eq!(advisory.neighbor_reference_value, Some(46.0));
+        assert_eq!(advisory.neighbor_delta, Some(-28.0));
+        assert_eq!(advisory.aerial_normalized_delta, Some(-0.54));
+        assert!(advisory.uncertainty_lower > 0.0);
+        assert!(advisory.uncertainty_upper > advisory.uncertainty_lower);
+        assert_eq!(advisory.uncertainty_reason, "neighbor_and_aerial_reference");
+        assert!(advisory.requires_approval);
+        assert_eq!(
+            advisory.approval_status,
+            DriftRecalibrationApprovalStatus::PendingApproval
+        );
+        assert!(!advisory.recalibration_applied);
+        assert!(advisory
+            .evidence_refs
+            .contains(&"soil-product:zone-soil-001".to_string()));
+        assert!(advisory
+            .evidence_refs
+            .contains(&"soil-product:zone-nw-product".to_string()));
+        assert!(advisory
+            .evidence_refs
+            .contains(&"imagery:ndvi-zone-001".to_string()));
+    }
+
+    #[test]
+    fn drift_recalibration_advisory_is_feature_gated_and_inert() {
+        let advisory = evaluate_drift_recalibration_advisory(
+            DriftRecalibrationAdvisoryRequest {
+                advisory_id: Some("drift-adv-disabled".to_string()),
+                evaluated_at: "2026-06-12T12:05:00Z".to_string(),
+                target_product: zone_soil_product_summary(
+                    Some(18.0),
+                    ZoneSoilProductFreshness::Fresh,
+                ),
+                neighbor_products: vec![neighbor_zone_product(
+                    "zone-nw-product",
+                    "zone-nw",
+                    46.0,
+                    ZoneSoilProductFreshness::Fresh,
+                )],
+                aerial_fusion: None,
+                config: drift_config(false),
+            },
+            "generated-drift".to_string(),
+        )
+        .expect("disabled feature should return unavailable advisory");
+
+        assert_eq!(
+            advisory.status,
+            DriftRecalibrationAdvisoryStatus::Unavailable
+        );
+        assert_eq!(
+            advisory.reason_code,
+            DriftRecalibrationAdvisoryReason::FeatureDisabled
+        );
+        assert!(!advisory.recalibration_applied);
+        assert!(advisory.requires_approval);
+    }
+
+    #[test]
+    fn drift_recalibration_advisory_is_unavailable_for_missing_or_stale_reference() {
+        let missing = evaluate_drift_recalibration_advisory(
+            DriftRecalibrationAdvisoryRequest {
+                advisory_id: Some("drift-adv-missing".to_string()),
+                evaluated_at: "2026-06-12T12:05:00Z".to_string(),
+                target_product: zone_soil_product_summary(
+                    Some(18.0),
+                    ZoneSoilProductFreshness::Fresh,
+                ),
+                neighbor_products: Vec::new(),
+                aerial_fusion: None,
+                config: drift_config(true),
+            },
+            "generated-drift".to_string(),
+        )
+        .expect("missing references should return unavailable advisory");
+        assert_eq!(
+            missing.reason_code,
+            DriftRecalibrationAdvisoryReason::MissingReference
+        );
+        assert!(!missing.recalibration_applied);
+
+        let stale = evaluate_drift_recalibration_advisory(
+            DriftRecalibrationAdvisoryRequest {
+                advisory_id: Some("drift-adv-stale".to_string()),
+                evaluated_at: "2026-06-12T12:05:00Z".to_string(),
+                target_product: zone_soil_product_summary(
+                    Some(18.0),
+                    ZoneSoilProductFreshness::Fresh,
+                ),
+                neighbor_products: vec![neighbor_zone_product(
+                    "zone-stale-product",
+                    "zone-stale",
+                    45.0,
+                    ZoneSoilProductFreshness::Stale,
+                )],
+                aerial_fusion: None,
+                config: drift_config(true),
+            },
+            "generated-drift".to_string(),
+        )
+        .expect("stale reference should return unavailable advisory");
+        assert_eq!(stale.status, DriftRecalibrationAdvisoryStatus::Unavailable);
+        assert_eq!(
+            stale.reason_code,
+            DriftRecalibrationAdvisoryReason::StaleReference
+        );
+        assert!(!stale.recalibration_applied);
+    }
+
+    #[test]
     fn irrigation_trigger_emits_domain16_payload_for_fresh_low_moisture() {
         let evaluation = evaluate_irrigation_trigger(
             zone_moisture_product(21.4, 120, vec![], vec!["soil-iot:reading-001"]),
@@ -2336,6 +4211,115 @@ mod tests {
             raw_value: 34.5,
             gateway_ts: "2026-06-12T10:00:00Z".to_string(),
             received_at: "2026-06-12T10:00:03Z".to_string(),
+        }
+    }
+
+    fn soil_device(device_id: &str, zone_id: &str) -> super::SoilDeviceRecord {
+        let mut device = valid_device();
+        device.device_id = device_id.to_string();
+        device.zone_id = Some(zone_id.to_string());
+        device
+    }
+
+    fn validated_reading(
+        payload_id: &str,
+        device_id: &str,
+        zone_id: &str,
+        ts: &str,
+    ) -> ValidatedSoilReading {
+        ValidatedSoilReading {
+            payload_id: payload_id.to_string(),
+            device_id: device_id.to_string(),
+            metric: GatewayReadingMetric::SoilMoisturePercent,
+            raw_value: 34.5,
+            calibrated_value: 34.5,
+            ts: ts.to_string(),
+            received_at: ts.to_string(),
+            field_id: "field-001".to_string(),
+            zone_id: Some(zone_id.to_string()),
+            source_qa_flags: vec![],
+            qa_flags: vec![],
+            excluded_from_products: false,
+        }
+    }
+
+    fn validation_evidence_fixture_readings() -> Vec<super::GeolocatedSoilReading> {
+        let mut clean_raw = valid_gateway_record();
+        clean_raw.payload_id = "payload-clean".to_string();
+        clean_raw.raw_value = 34.5;
+        let clean = build_geolocated_soil_reading(&valid_device(), clean_raw)
+            .expect("clean reading should geolocate");
+
+        let mut out_of_range_raw = valid_gateway_record();
+        out_of_range_raw.payload_id = "payload-out-of-range".to_string();
+        out_of_range_raw.raw_value = 250.0;
+        let out_of_range = build_geolocated_soil_reading(&valid_device(), out_of_range_raw)
+            .expect("out-of-range reading should still geolocate");
+
+        vec![clean, out_of_range]
+    }
+
+    fn freshness_config() -> SoilCaptureFreshnessConfig {
+        SoilCaptureFreshnessConfig {
+            expected_interval_seconds: 300,
+            method_version: "soil-capture-freshness-v1".to_string(),
+        }
+    }
+
+    fn coverage_report(zones: Vec<SoilZoneCoverageRecord>) -> SoilCaptureFreshnessCoverageReport {
+        SoilCaptureFreshnessCoverageReport {
+            field_id: "field-001".to_string(),
+            evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+            method_version: "soil-capture-freshness-v1".to_string(),
+            devices: Vec::new(),
+            zones,
+        }
+    }
+
+    fn coverage_zone(
+        zone_id: &str,
+        device_count: usize,
+        fresh_device_count: usize,
+        stale_device_count: usize,
+        never_seen_device_count: usize,
+    ) -> SoilZoneCoverageRecord {
+        SoilZoneCoverageRecord {
+            field_id: "field-001".to_string(),
+            zone_id: zone_id.to_string(),
+            device_count,
+            fresh_device_count,
+            stale_device_count,
+            never_seen_device_count,
+            coverage_fraction: if device_count == 0 {
+                0.0
+            } else {
+                fresh_device_count as f64 / device_count as f64
+            },
+        }
+    }
+
+    fn zone_geometry(zone_id: &str) -> SoilZoneGeometry {
+        SoilZoneGeometry {
+            zone_id: zone_id.to_string(),
+            crs: "EPSG:4326".to_string(),
+            polygon: vec![vec![
+                GeoJsonCoordinate {
+                    lon: -121.50,
+                    lat: 38.58,
+                },
+                GeoJsonCoordinate {
+                    lon: -121.49,
+                    lat: 38.58,
+                },
+                GeoJsonCoordinate {
+                    lon: -121.49,
+                    lat: 38.59,
+                },
+                GeoJsonCoordinate {
+                    lon: -121.50,
+                    lat: 38.58,
+                },
+            ]],
         }
     }
 
@@ -2435,6 +4419,111 @@ mod tests {
             qa_flags,
             evidence_refs: evidence_refs.into_iter().map(ToOwned::to_owned).collect(),
             generated_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn zone_product_request(
+        metric: GatewayReadingMetric,
+        readings: Vec<ValidatedSoilReading>,
+    ) -> ZoneSoilProductRequest {
+        ZoneSoilProductRequest {
+            product_id: None,
+            field_id: "field-001".to_string(),
+            zone_id: "zone-ne".to_string(),
+            metric,
+            readings,
+            max_freshness_age_seconds: 300,
+            generated_at: "2026-06-12T12:00:00Z".to_string(),
+            method_version: "soil-zone-product-v1".to_string(),
+        }
+    }
+
+    fn zone_soil_product_summary(
+        mean_value: Option<f64>,
+        freshness: ZoneSoilProductFreshness,
+    ) -> ZoneSoilProductSummary {
+        ZoneSoilProductSummary {
+            product_id: "zone-soil-001".to_string(),
+            field_id: "field-001".to_string(),
+            zone_id: "zone-ne".to_string(),
+            metric: GatewayReadingMetric::SoilMoisturePercent,
+            mean_value,
+            min_value: mean_value,
+            max_value: mean_value,
+            sample_count: usize::from(mean_value.is_some()),
+            freshness,
+            freshness_age_seconds: 120,
+            method_version: "soil-zone-product-v1".to_string(),
+            evidence_refs: vec!["soil-iot:payload-moisture-001".to_string()],
+            excluded_payload_ids: Vec::new(),
+            generated_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn neighbor_zone_product(
+        product_id: &str,
+        zone_id: &str,
+        mean_value: f64,
+        freshness: ZoneSoilProductFreshness,
+    ) -> ZoneSoilProductSummary {
+        ZoneSoilProductSummary {
+            product_id: product_id.to_string(),
+            field_id: "field-001".to_string(),
+            zone_id: zone_id.to_string(),
+            metric: GatewayReadingMetric::SoilMoisturePercent,
+            mean_value: Some(mean_value),
+            min_value: Some(mean_value),
+            max_value: Some(mean_value),
+            sample_count: 1,
+            freshness,
+            freshness_age_seconds: 120,
+            method_version: "soil-zone-product-v1".to_string(),
+            evidence_refs: vec![format!("soil-iot:{product_id}:payload")],
+            excluded_payload_ids: Vec::new(),
+            generated_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn drift_config(enabled: bool) -> DriftRecalibrationAdvisoryConfig {
+        DriftRecalibrationAdvisoryConfig {
+            enabled,
+            min_neighbor_delta: 10.0,
+            min_aerial_normalized_delta: 0.25,
+            method_version: "soil-drift-advisory-v1".to_string(),
+        }
+    }
+
+    fn aerial_ndvi_product(
+        field_id: &str,
+        zone_id: &str,
+        crs: &str,
+        captured_at: &str,
+        mean_value: f64,
+    ) -> AerialIndexZoneProduct {
+        AerialIndexZoneProduct {
+            product_id: "ndvi-zone-001".to_string(),
+            field_id: field_id.to_string(),
+            zone_id: zone_id.to_string(),
+            index_name: "ndvi".to_string(),
+            mean_value,
+            captured_at: captured_at.to_string(),
+            crs: crs.to_string(),
+            evidence_refs: vec!["imagery:ndvi-zone-001".to_string()],
+        }
+    }
+
+    fn fusion_request(
+        soil_product: ZoneSoilProductSummary,
+        soil_crs: &str,
+        aerial_product: AerialIndexZoneProduct,
+    ) -> SoilAerialFusionRequest {
+        SoilAerialFusionRequest {
+            soil_product,
+            soil_crs: soil_crs.to_string(),
+            aerial_product,
+            max_temporal_gap_seconds: 900,
+            max_agreement_delta: 0.15,
+            method_version: "soil-aerial-fusion-v1".to_string(),
         }
     }
 

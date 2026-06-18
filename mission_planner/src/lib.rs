@@ -6,6 +6,7 @@ use std::{collections::HashMap, fmt, str::FromStr};
 use uuid::Uuid;
 
 pub mod abort_recovery;
+pub mod adaptive_replan;
 pub mod api;
 pub mod automated_failsafe;
 pub mod autonomous_execution;
@@ -15,6 +16,7 @@ pub mod flight_path;
 pub mod guarded_dispatch;
 pub mod mavlink_integration;
 pub mod mission_audit;
+pub mod mission_export;
 pub mod mission_optimizer;
 pub mod preflight_checklist;
 pub mod survey_template;
@@ -27,6 +29,11 @@ pub use abort_recovery::{
     abort_mission_with_recovery, evaluate_abort_recovery, AbortRecoveryAction,
     AbortRecoveryAuditEvent, AbortRecoveryCommand, AbortRecoveryConfig, AbortRecoveryContext,
     AbortRecoveryError, AbortRecoveryPlan, AbortTrigger,
+};
+pub use adaptive_replan::{
+    evaluate_adaptive_replan, AdaptiveReplanAuditEvent, AdaptiveReplanError,
+    AdaptiveReplanErrorCode, AdaptiveReplanOutcome, AdaptiveReplanProposal, AdaptiveReplanRequest,
+    AdaptiveReplanStatus,
 };
 pub use api::MissionApi;
 pub use automated_failsafe::{
@@ -56,6 +63,11 @@ pub use mission_audit::{
     MissionAuditTimeline, MissionAuditValidationReport, MissionReplay, MissionReplayCommand,
     MissionReplayCommandStatus, MissionReplayError, MissionReplayErrorCode, MissionReplayEvent,
     MissionReplayEventKind,
+};
+pub use mission_export::{
+    export_mission_plan_and_telemetry, validate_mission_export_schema, MissionExport,
+    MissionExportError, MissionExportErrorCode, MissionExportExtent, MissionExportRequest,
+    MissionExportValidation,
 };
 pub use mission_optimizer::{
     assert_mission_budget_allows_arming, evaluate_mission_budget, MissionBudgetConfig,

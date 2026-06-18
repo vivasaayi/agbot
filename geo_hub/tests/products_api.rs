@@ -2,6 +2,7 @@ use anyhow::Result;
 use axum::{
     body::{to_bytes, Body},
     http::{header, Request, StatusCode},
+    response::Response,
 };
 use geo_hub::state::AppState;
 use geo_hub::{db, server, HubConfig};
@@ -687,6 +688,234 @@ async fn scene_refresh_advisory_returns_empty_when_no_fresher_scene_exists() -> 
         .get("reason")
         .and_then(|value| value.as_str())
         .is_none());
+    assert!(advisories
+        .get("advisories")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| items.is_empty()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scene_change_advisory_summarizes_comparable_linked_scenes() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_advisory_field(&ctx, "change-field", "2026").await?;
+
+    let baseline_dir = ctx.data_root.join("scenes").join("change-baseline");
+    insert_advisory_scene(
+        &ctx,
+        "change-baseline",
+        Some("change-field"),
+        Some("2026"),
+        "2026-05-01T00:00:00Z",
+        Some(20.0),
+        &baseline_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+    let comparison_dir = ctx.data_root.join("scenes").join("change-comparison");
+    insert_advisory_scene(
+        &ctx,
+        "change-comparison",
+        Some("change-field"),
+        Some("2026"),
+        "2026-06-01T00:00:00Z",
+        Some(45.0),
+        &comparison_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/change-field/scene-change-advisories")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let advisories: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        advisories
+            .get("advisory_enabled")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    let item = advisories
+        .get("advisories")
+        .and_then(|value| value.as_array())
+        .and_then(|items| items.first())
+        .expect("change advisory should be emitted");
+    assert_eq!(
+        item.get("baseline_scene_id")
+            .and_then(|value| value.as_str()),
+        Some("change-baseline")
+    );
+    assert_eq!(
+        item.get("comparison_scene_id")
+            .and_then(|value| value.as_str()),
+        Some("change-comparison")
+    );
+    assert_eq!(
+        item.get("reason").and_then(|value| value.as_str()),
+        Some("aligned-common-extent")
+    );
+    assert_eq!(
+        item.get("confidence").and_then(|value| value.as_str()),
+        Some("medium")
+    );
+    assert_eq!(
+        item.get("coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(1.0)
+    );
+    assert_eq!(
+        item.get("change_score").and_then(|value| value.as_f64()),
+        Some(0.25)
+    );
+    assert!(item
+        .get("common_extent")
+        .is_some_and(|value| value.is_object()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scene_change_advisory_marks_spatial_mismatch_low_confidence() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_advisory_field(&ctx, "change-mismatch-field", "2026").await?;
+
+    let baseline_dir = ctx
+        .data_root
+        .join("scenes")
+        .join("change-mismatch-baseline");
+    insert_advisory_scene(
+        &ctx,
+        "change-mismatch-baseline",
+        Some("change-mismatch-field"),
+        Some("2026"),
+        "2026-05-01T00:00:00Z",
+        Some(20.0),
+        &baseline_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+    let comparison_dir = ctx
+        .data_root
+        .join("scenes")
+        .join("change-mismatch-comparison");
+    insert_advisory_scene(
+        &ctx,
+        "change-mismatch-comparison",
+        Some("change-mismatch-field"),
+        Some("2026"),
+        "2026-06-01T00:00:00Z",
+        Some(45.0),
+        &comparison_dir,
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:3857",
+            "bbox": {
+                "min_lon": -96.8,
+                "min_lat": 41.0,
+                "max_lon": -96.2,
+                "max_lat": 41.6
+            },
+            "geo_transform": [-96.8, 0.3, 0.0, 41.6, 0.0, -0.3],
+            "resolution": {
+                "x": 0.3,
+                "y": 0.3
+            }
+        }),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/change-mismatch-field/scene-change-advisories")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let advisories: serde_json::Value = serde_json::from_slice(&body)?;
+    let item = advisories
+        .get("advisories")
+        .and_then(|value| value.as_array())
+        .and_then(|items| items.first())
+        .expect("low-confidence advisory should be emitted");
+    assert_eq!(
+        item.get("confidence").and_then(|value| value.as_str()),
+        Some("low")
+    );
+    assert!(item
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.contains("spatial-ref-mismatch")));
+    assert!(item
+        .get("common_extent")
+        .is_some_and(|value| value.is_null()));
+    assert_eq!(
+        item.get("coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(0.0)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scene_change_advisory_returns_no_comparison_for_single_scene() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_advisory_field(&ctx, "change-single-field", "2026").await?;
+
+    let scene_dir = ctx.data_root.join("scenes").join("change-single");
+    insert_advisory_scene(
+        &ctx,
+        "change-single",
+        Some("change-single-field"),
+        Some("2026"),
+        "2026-05-01T00:00:00Z",
+        Some(20.0),
+        &scene_dir,
+        advisory_spatial_ref(),
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fields/change-single-field/scene-change-advisories")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let advisories: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(advisories
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.contains("single-linked-scene")));
     assert!(advisories
         .get("advisories")
         .and_then(|value| value.as_array())
@@ -3023,6 +3252,1092 @@ async fn marketplace_account_create_rejects_unknown_org_without_writing() -> Res
 }
 
 #[tokio::test]
+async fn marketplace_catalog_items_create_get_and_list_by_org() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/catalog/items")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "kind": "input",
+                        "category": "seed",
+                        "name": "Hybrid corn seed",
+                        "unit_of_measure": "bag",
+                        "owner_account_id": "supplier-001"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let item: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        item.get("item_id").and_then(|value| value.as_str()),
+        Some("seed-corn-001")
+    );
+    assert_eq!(
+        item.get("unit_of_measure").and_then(|value| value.as_str()),
+        Some("bag")
+    );
+
+    let fetched = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/catalog/items/seed-corn-001?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(fetched.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/catalog/items?org_id=org-alpha&kind=input")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(items.len(), 1);
+
+    let cross_tenant = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/catalog/items/seed-corn-001?org_id=org-beta")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_catalog_item_rejects_invalid_unit_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/catalog/items")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "kind": "input",
+                        "category": "seed",
+                        "name": "Hybrid corn seed",
+                        "unit_of_measure": "pallet",
+                        "owner_account_id": "supplier-001"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert!(response.status().is_client_error());
+
+    let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_catalog_items")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(item_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_portal_entry_is_visible_only_with_access_role() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "grower-001", "org-alpha", "grower").await?;
+    seed_marketplace_account_with_roles(
+        &ctx,
+        "viewer-001",
+        "org-alpha",
+        "grower",
+        &["portal:viewer"],
+    )
+    .await?;
+
+    let entry = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/marketplace-entry?org_id=org-alpha&account_id=grower-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(entry.status(), StatusCode::OK);
+    let body = to_bytes(entry.into_body(), 64 * 1024).await?;
+    let entry: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        entry.get("label").and_then(|value| value.as_str()),
+        Some("Marketplace")
+    );
+    assert_eq!(
+        entry.get("href").and_then(|value| value.as_str()),
+        Some("/marketplace?org_id=org-alpha")
+    );
+    assert_eq!(
+        entry.get("visible").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let forbidden = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/marketplace-entry?org_id=org-alpha&account_id=viewer-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_listings_publish_get_list_and_close() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+    seed_marketplace_catalog_item(&ctx, "seed-corn-001", "org-alpha", "supplier-001").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/listings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "listing_id": "listing-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "price": 125.0,
+                        "currency": "USD",
+                        "available_qty": 40.0,
+                        "window": {
+                            "from": "2026-06-14T09:00:00Z",
+                            "to": "2026-07-14T09:00:00Z"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let listing: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        listing.get("status").and_then(|value| value.as_str()),
+        Some("published")
+    );
+
+    let fetched = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/listings/listing-seed-corn-001?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(fetched.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/listings?org_id=org-alpha&status=published")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let listings: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(listings.len(), 1);
+
+    let close = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/listings/listing-seed-corn-001/close")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "org_id": "org-alpha" }).to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(close.status(), StatusCode::OK);
+    let body = to_bytes(close.into_body(), 64 * 1024).await?;
+    let closed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        closed.get("status").and_then(|value| value.as_str()),
+        Some("closed")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_listing_rejects_inverted_window_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+    seed_marketplace_catalog_item(&ctx, "seed-corn-001", "org-alpha", "supplier-001").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/listings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "listing_id": "listing-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "price": 125.0,
+                        "currency": "USD",
+                        "available_qty": 40.0,
+                        "window": {
+                            "from": "2026-07-14T09:00:00Z",
+                            "to": "2026-06-14T09:00:00Z"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let listing_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_listings")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(listing_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_inventory_create_list_reserve_fulfill_and_release() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+    seed_marketplace_catalog_item(&ctx, "seed-corn-001", "org-alpha", "supplier-001").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/inventory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "inventory_id": "inventory-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "on_hand": 40.0,
+                        "reserved": 0.0
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let reserve = marketplace_inventory_adjust(
+        &ctx,
+        "inventory-seed-corn-001",
+        "reserve",
+        "org-alpha",
+        25.0,
+    )
+    .await?;
+    assert_eq!(reserve.status(), StatusCode::OK);
+    let body = to_bytes(reserve.into_body(), 64 * 1024).await?;
+    let reserved: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        reserved.get("reserved").and_then(|value| value.as_f64()),
+        Some(25.0)
+    );
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/inventory?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let inventory: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(inventory.len(), 1);
+
+    let fulfill = marketplace_inventory_adjust(
+        &ctx,
+        "inventory-seed-corn-001",
+        "fulfill",
+        "org-alpha",
+        10.0,
+    )
+    .await?;
+    assert_eq!(fulfill.status(), StatusCode::OK);
+    let body = to_bytes(fulfill.into_body(), 64 * 1024).await?;
+    let fulfilled: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        fulfilled.get("on_hand").and_then(|value| value.as_f64()),
+        Some(30.0)
+    );
+    assert_eq!(
+        fulfilled.get("reserved").and_then(|value| value.as_f64()),
+        Some(15.0)
+    );
+
+    let release = marketplace_inventory_adjust(
+        &ctx,
+        "inventory-seed-corn-001",
+        "release",
+        "org-alpha",
+        15.0,
+    )
+    .await?;
+    assert_eq!(release.status(), StatusCode::OK);
+    let body = to_bytes(release.into_body(), 64 * 1024).await?;
+    let released: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        released.get("on_hand").and_then(|value| value.as_f64()),
+        Some(30.0)
+    );
+    assert_eq!(
+        released.get("reserved").and_then(|value| value.as_f64()),
+        Some(0.0)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_inventory_rejects_parallel_over_reserve_without_oversell() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_org(&ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(&ctx, "supplier-001", "org-alpha", "supplier").await?;
+    seed_marketplace_catalog_item(&ctx, "seed-corn-001", "org-alpha", "supplier-001").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/inventory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "inventory_id": "inventory-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "on_hand": 40.0,
+                        "reserved": 0.0
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (first, second) = tokio::join!(
+        marketplace_inventory_adjust(
+            &ctx,
+            "inventory-seed-corn-001",
+            "reserve",
+            "org-alpha",
+            30.0,
+        ),
+        marketplace_inventory_adjust(
+            &ctx,
+            "inventory-seed-corn-001",
+            "reserve",
+            "org-alpha",
+            30.0,
+        )
+    );
+    let statuses = [first?.status(), second?.status()];
+    assert!(statuses.contains(&StatusCode::OK));
+    assert!(statuses.contains(&StatusCode::BAD_REQUEST));
+
+    let row: (f64, f64) = sqlx::query_as(
+        "SELECT on_hand, reserved FROM marketplace_inventory WHERE inventory_id = ?1",
+    )
+    .bind("inventory-seed-corn-001")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.0, 40.0);
+    assert_eq!(row.1, 30.0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_orders_place_transition_and_audit() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/orders")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "order_id": "order-seed-corn-001",
+                        "org_id": "org-alpha",
+                        "listing_ref": "listing-seed-corn-001",
+                        "buyer_account_id": "buyer-001",
+                        "qty": 3.0
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let order: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        order.get("status").and_then(|value| value.as_str()),
+        Some("placed")
+    );
+    assert_eq!(
+        order.get("line_total").and_then(|value| value.as_f64()),
+        Some(375.0)
+    );
+
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "fulfilled").await?,
+        StatusCode::OK
+    );
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "closed").await?,
+        StatusCode::OK
+    );
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/orders?org_id=org-alpha&status=closed")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let orders: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(orders.len(), 1);
+
+    let audits = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/orders/order-seed-corn-001/audits?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(audits.status(), StatusCode::OK);
+    let body = to_bytes(audits.into_body(), 64 * 1024).await?;
+    let audits: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(audits.len(), 4);
+
+    let row: (f64, f64) = sqlx::query_as(
+        "SELECT on_hand, reserved FROM marketplace_inventory WHERE inventory_id = ?1",
+    )
+    .bind("inventory-seed-corn-001")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.0, 37.0);
+    assert_eq!(row.1, 0.0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_orders_reject_illegal_transition_without_state_change() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/orders")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "order_id": "order-seed-corn-001",
+                        "org_id": "org-alpha",
+                        "listing_ref": "listing-seed-corn-001",
+                        "buyer_account_id": "buyer-001",
+                        "qty": 3.0
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rejected = marketplace_order_transition(&ctx, "order-seed-corn-001", "closed").await?;
+    assert_eq!(rejected, StatusCode::BAD_REQUEST);
+
+    let row: (String, i64) = sqlx::query_as(
+        "SELECT status, (SELECT COUNT(*) FROM marketplace_order_audits WHERE order_id = ?1) \
+         FROM marketplace_orders WHERE order_id = ?1",
+    )
+    .bind("order-seed-corn-001")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.0, "placed");
+    assert_eq!(row.1, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_fulfillments_record_and_advance_confirmed_order() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+
+    let response =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "order-seed-corn-001", "org-alpha")
+            .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let fulfillment: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        fulfillment.get("status").and_then(|value| value.as_str()),
+        Some("pending")
+    );
+
+    let order_status: String =
+        sqlx::query_scalar("SELECT status FROM marketplace_orders WHERE order_id = ?1")
+            .bind("order-seed-corn-001")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(order_status, "fulfilled");
+
+    let transition = marketplace_fulfillment_transition(&ctx, "fulfillment-001", "shipped").await?;
+    assert_eq!(transition, StatusCode::OK);
+    let audits = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/fulfillments/fulfillment-001/audits?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(audits.status(), StatusCode::OK);
+    let body = to_bytes(audits.into_body(), 64 * 1024).await?;
+    let audits: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(audits.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_fulfillments_reject_cross_tenant_order_link() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+
+    let response =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "order-seed-corn-001", "org-beta")
+            .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let fulfillment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_fulfillments")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(fulfillment_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_fulfillments_reject_missing_order_without_write() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "missing-order", "org-alpha")
+            .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let fulfillment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_fulfillments")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(fulfillment_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_ratings_persist_and_aggregate_for_participants() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+    let fulfillment =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "order-seed-corn-001", "org-alpha")
+            .await?;
+    assert_eq!(fulfillment.status(), StatusCode::OK);
+
+    let rating = create_marketplace_rating(
+        &ctx,
+        "rating-order-001-buyer",
+        "order-seed-corn-001",
+        "buyer-001",
+        "supplier-001",
+        5.0,
+    )
+    .await?;
+    assert_eq!(rating.status(), StatusCode::OK);
+
+    let aggregate = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/ratings/accounts/supplier-001/aggregate?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(aggregate.status(), StatusCode::OK);
+    let body = to_bytes(aggregate.into_body(), 64 * 1024).await?;
+    let aggregate: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        aggregate
+            .get("rating_count")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        aggregate
+            .get("average_score")
+            .and_then(|value| value.as_f64()),
+        Some(5.0)
+    );
+
+    let duplicate = create_marketplace_rating(
+        &ctx,
+        "rating-order-001-buyer-2",
+        "order-seed-corn-001",
+        "buyer-001",
+        "supplier-001",
+        4.0,
+    )
+    .await?;
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_ratings_reject_non_participant_without_write() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+    let fulfillment =
+        create_marketplace_fulfillment(&ctx, "fulfillment-001", "order-seed-corn-001", "org-alpha")
+            .await?;
+    assert_eq!(fulfillment.status(), StatusCode::OK);
+
+    let rejected = create_marketplace_rating(
+        &ctx,
+        "rating-order-001-viewer",
+        "order-seed-corn-001",
+        "viewer-001",
+        "supplier-001",
+        4.0,
+    )
+    .await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rating_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_ratings")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(rating_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_demand_forecast_uses_field_and_product_evidence() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_demand_field(&ctx, "field-alpha", "org-alpha").await?;
+    seed_marketplace_demand_product(&ctx, "yield-map-001", "field-alpha", "yield_map").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/demand-forecasts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "forecast_id": "forecast-seed-001",
+                        "org_id": "org-alpha",
+                        "field_id": "field-alpha",
+                        "item_kind": "input",
+                        "horizon": "2026-season"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let forecast: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        forecast.get("status").and_then(|value| value.as_str()),
+        Some("ready")
+    );
+    assert!(forecast
+        .get("value")
+        .and_then(|value| value.as_f64())
+        .is_some_and(|value| value > 0.0));
+    assert!(forecast
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|refs| refs.iter().any(|value| value == "product:yield-map-001")));
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/demand-forecasts?org_id=org-alpha&field_id=field-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let forecasts: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(forecasts.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_demand_forecast_ai_includes_uncertainty() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_demand_field(&ctx, "field-alpha", "org-alpha").await?;
+    seed_marketplace_demand_product(&ctx, "health-ndvi-001", "field-alpha", "ndvi").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/demand-forecasts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "forecast_id": "forecast-produce-001",
+                        "org_id": "org-alpha",
+                        "field_id": "field-alpha",
+                        "item_kind": "produce",
+                        "horizon": "2026-season",
+                        "ai_assisted": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let forecast: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(forecast.get("uncertainty_band").is_some());
+    assert!(forecast
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|refs| refs.iter().any(|value| value == "product:health-ndvi-001")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_demand_forecast_returns_no_basis_without_evidence() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_demand_field(&ctx, "field-alpha", "org-alpha").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/demand-forecasts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "forecast_id": "forecast-empty-001",
+                        "org_id": "org-alpha",
+                        "field_id": "field-alpha",
+                        "item_kind": "input",
+                        "horizon": "2026-season"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let forecast: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        forecast.get("status").and_then(|value| value.as_str()),
+        Some("no_basis")
+    );
+    assert_eq!(forecast.get("value"), Some(&serde_json::Value::Null));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_org_report_aggregates_period_activity() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_marketplace_order_dependencies(&ctx).await?;
+    seed_marketplace_order(&ctx, "order-seed-corn-001", 3.0).await?;
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "confirmed").await?,
+        StatusCode::OK
+    );
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "fulfilled").await?,
+        StatusCode::OK
+    );
+    assert_eq!(
+        marketplace_order_transition(&ctx, "order-seed-corn-001", "closed").await?,
+        StatusCode::OK
+    );
+
+    let report = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/reports/org?org_id=org-alpha&from=2026-01-01T00:00:00Z&to=2026-12-31T23:59:59Z")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(report.status(), StatusCode::OK);
+    let body = to_bytes(report.into_body(), 64 * 1024).await?;
+    let report: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        report.get("sales_total").and_then(|value| value.as_f64()),
+        Some(375.0)
+    );
+    assert_eq!(
+        report
+            .get("source_order_ids")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len()),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .get("order_counts_by_status")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("status"))
+            .and_then(|value| value.as_str()),
+        Some("closed")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_org_report_empty_period_returns_zeroes() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let report = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/marketplace/reports/org?org_id=org-alpha&from=2026-01-01T00:00:00Z&to=2026-12-31T23:59:59Z")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(report.status(), StatusCode::OK);
+    let body = to_bytes(report.into_body(), 64 * 1024).await?;
+    let report: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        report.get("sales_total").and_then(|value| value.as_f64()),
+        Some(0.0)
+    );
+    assert_eq!(
+        report
+            .get("source_order_ids")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len()),
+        Some(0)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn sustainability_records_create_get_and_list_field_scoped() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -3208,6 +4523,1491 @@ async fn sustainability_record_create_rejects_unknown_field_or_season_without_wr
         .fetch_one(&ctx.pool)
         .await?;
     assert_eq!(record_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn carbon_footprints_compute_get_and_list_with_stable_hash() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_record(
+        &ctx,
+        "farm-carbon",
+        "field-carbon",
+        "season-2026",
+        "sustain-carbon-001",
+        "operation-carbon-001",
+    )
+    .await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/carbon-footprints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    carbon_footprint_payload("footprint-carbon-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("computed")
+    );
+    assert_eq!(
+        first.get("value_co2e").and_then(|value| value.as_f64()),
+        Some(168.8)
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/carbon-footprints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    carbon_footprint_payload("footprint-carbon-002", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/carbon-footprints/footprint-carbon-001?record_id=sustain-carbon-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/carbon-footprints?record_id=sustain-carbon-001&status=computed")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let footprints: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(footprints.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn carbon_footprint_missing_inputs_persists_insufficient_without_value() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_record(
+        &ctx,
+        "farm-carbon-missing",
+        "field-carbon-missing",
+        "season-2026",
+        "sustain-carbon-missing",
+        "operation-carbon-001",
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/carbon-footprints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    carbon_footprint_payload("footprint-carbon-missing", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let footprint: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        footprint.get("status").and_then(|value| value.as_str()),
+        Some("insufficient_inputs")
+    );
+    assert!(footprint
+        .get("value_co2e")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM carbon_footprints WHERE status = 'insufficient_inputs' AND value_co2e IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn biomass_estimates_compute_get_and_list_with_georeference() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_metric_record(
+        &ctx,
+        "farm-biomass",
+        "field-biomass",
+        "season-2026",
+        "sustain-biomass-001",
+        "operation-biomass-001",
+        "biomass",
+    )
+    .await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biomass-estimates")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biomass_estimate_payload("biomass-001", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("biomass_value").and_then(|value| value.as_f64()),
+        Some(48.0)
+    );
+    assert_eq!(
+        first.get("area").and_then(|value| value.as_f64()),
+        Some(200.0)
+    );
+    assert_eq!(
+        first.get("crs").and_then(|value| value.as_str()),
+        Some("EPSG:32614")
+    );
+    assert_eq!(
+        first
+            .get("extent")
+            .and_then(|value| value.get("max_lon"))
+            .and_then(|value| value.as_f64()),
+        Some(20.0)
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biomass-estimates")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biomass_estimate_payload("biomass-002", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/biomass-estimates/biomass-001?record_id=sustain-biomass-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/biomass-estimates?record_id=sustain-biomass-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let estimates: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(estimates.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn biomass_estimate_rejects_mismatched_georeference_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_metric_record(
+        &ctx,
+        "farm-biomass-mismatch",
+        "field-biomass-mismatch",
+        "season-2026",
+        "sustain-biomass-mismatch",
+        "operation-biomass-001",
+        "biomass",
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biomass-estimates")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biomass_estimate_payload("biomass-mismatch", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM biomass_estimates")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(stored_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_baselines_compare_get_and_list_with_stable_hash() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-baseline-2025",
+        "field-baseline",
+        "season-2025",
+        "operation-baseline",
+        "biomass",
+    )
+    .await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-current-2026",
+        "field-baseline",
+        "season-2026",
+        "operation-current",
+        "biomass",
+    )
+    .await?;
+
+    let baseline = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/baselines")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_baseline_payload("baseline-001").to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(baseline.status(), StatusCode::OK);
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/comparisons")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_comparison_payload(
+                        "comparison-001",
+                        "field-baseline",
+                        "sustain-current-2026",
+                        130.0,
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("compared")
+    );
+    assert_eq!(
+        first.get("delta").and_then(|value| value.as_f64()),
+        Some(30.0)
+    );
+    assert_eq!(
+        first.get("trend").and_then(|value| value.as_str()),
+        Some("increased")
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/comparisons")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_comparison_payload(
+                        "comparison-002",
+                        "field-baseline",
+                        "sustain-current-2026",
+                        130.0,
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/comparisons/comparison-001?field_id=field-baseline")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/comparisons?field_id=field-baseline&status=compared")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let comparisons: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(comparisons.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_comparison_without_baseline_persists_no_baseline_without_delta(
+) -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-current-nobaseline",
+        "field-nobaseline",
+        "season-2026",
+        "operation-current",
+        "biomass",
+    )
+    .await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/comparisons")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_comparison_payload(
+                        "comparison-nobaseline",
+                        "field-nobaseline",
+                        "sustain-current-nobaseline",
+                        130.0,
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let comparison: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        comparison.get("status").and_then(|value| value.as_str()),
+        Some("no_baseline")
+    );
+    assert!(comparison.get("delta").is_some_and(|value| value.is_null()));
+    assert!(comparison
+        .get("baseline_value")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sustainability_comparisons WHERE status = 'no_baseline' AND delta IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_mrv_trails_create_get_and_list_certification_ready() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_biomass_estimate_row(&ctx, "biomass-mrv-001", "sustain-biomass-mrv").await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/mrv-trails")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_mrv_payload("mrv-001", "biomass-mrv-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("output_ref").and_then(|value| value.as_str()),
+        Some("biomass-mrv-001")
+    );
+    assert_eq!(
+        first
+            .get("certification_ready")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    let rederived_hash = first
+        .get("rederived_result_hash")
+        .and_then(|value| value.as_str())
+        .expect("rederived hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/mrv-trails")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_mrv_payload("mrv-002", "biomass-mrv-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second
+            .get("rederived_result_hash")
+            .and_then(|value| value.as_str()),
+        Some(rederived_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/mrv-trails/mrv-001?output_ref=biomass-mrv-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/mrv-trails?output_ref=biomass-mrv-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let trails: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(trails.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_mrv_trail_rejects_incomplete_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_biomass_estimate_row(&ctx, "biomass-mrv-incomplete", "sustain-biomass-mrv").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/mrv-trails")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_mrv_payload("mrv-incomplete", "biomass-mrv-incomplete", false)
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sustainability_mrv_trails")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(stored_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_certification_packs_create_and_get_verifiable_bundle() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_biomass_estimate_row(&ctx, "biomass-cert-001", "sustain-biomass-cert").await?;
+
+    let mrv = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/mrv-trails")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_mrv_payload("mrv-cert-001", "biomass-cert-001", true)
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(mrv.status(), StatusCode::OK);
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/certification-packs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_certification_pack_payload(
+                        "cert-pack-001",
+                        "claim-regenerative-001",
+                        vec!["biomass-cert-001"],
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let pack: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        pack.get("claim_id").and_then(|value| value.as_str()),
+        Some("claim-regenerative-001")
+    );
+    assert_eq!(
+        pack.get("claimed_output_refs")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str()),
+        Some("biomass-cert-001")
+    );
+    assert_eq!(
+        pack.get("outputs")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.get("result_hash"))
+            .and_then(|value| value.as_str()),
+        Some("result-hash-biomass-001")
+    );
+    assert_eq!(
+        pack.get("mrv_trails")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.get("trail_id"))
+            .and_then(|value| value.as_str()),
+        Some("mrv-cert-001")
+    );
+    assert!(pack
+        .get("evidence_layer_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|values| values
+            .iter()
+            .any(|value| value.as_str() == Some("layer:ndvi-001"))));
+    let pack_hash = pack
+        .get("pack_hash")
+        .and_then(|value| value.as_str())
+        .expect("pack hash should be present")
+        .to_string();
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/certification-packs/cert-pack-001?claim_id=claim-regenerative-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = to_bytes(get.into_body(), 64 * 1024).await?;
+    let stored: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stored.get("pack_hash").and_then(|value| value.as_str()),
+        Some(pack_hash.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_certification_pack_rejects_missing_mrv_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_biomass_estimate_row(&ctx, "biomass-cert-missing-mrv", "sustain-biomass-cert").await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/certification-packs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_certification_pack_payload(
+                        "cert-pack-missing-mrv",
+                        "claim-missing-mrv",
+                        vec!["biomass-cert-missing-mrv"],
+                    )
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let stored_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sustainability_certification_packs")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(stored_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_field_exports_csv_geojson_and_pdf_summary() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-export", "field-export", "season-2026").await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-carbon-001",
+        "field-export",
+        "season-2026",
+        "operation-carbon-001",
+        "carbon_footprint",
+    )
+    .await?;
+    insert_sustainability_record_row(
+        &ctx,
+        "sustain-biomass-001",
+        "field-export",
+        "season-2026",
+        "operation-biomass-001",
+        "biomass",
+    )
+    .await?;
+
+    let carbon = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/carbon-footprints")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    carbon_footprint_payload("footprint-export-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(carbon.status(), StatusCode::OK);
+
+    let biomass = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biomass-estimates")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biomass_estimate_payload("biomass-export-001", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(biomass.status(), StatusCode::OK);
+    insert_sustainability_kpi_row(&ctx, "kpi-export-001", "field-export", "season-2026").await?;
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export/summary.csv?season_id=season-2026")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    assert_eq!(
+        csv_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(
+        csv_reader.headers()?.iter().collect::<Vec<_>>(),
+        vec![
+            "record_type",
+            "record_id",
+            "field_id",
+            "season_id",
+            "metric_ref",
+            "value",
+            "unit",
+            "status",
+            "crs",
+            "extent_json",
+            "method_version",
+            "evidence_refs",
+            "result_hash",
+            "computed_at"
+        ]
+    );
+    let rows = csv_reader.records().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|row| {
+        row.get(0) == Some("carbon_footprint")
+            && row.get(10) == Some("agbot-carbon-factors-v1")
+            && row
+                .get(11)
+                .is_some_and(|value| value.contains("input:fuel-log-001"))
+    }));
+    assert!(rows.iter().any(|row| {
+        row.get(0) == Some("biomass_estimate")
+            && row.get(8) == Some("EPSG:32614")
+            && row
+                .get(9)
+                .is_some_and(|value| value.contains("\"max_lon\":20.0"))
+    }));
+    assert!(rows.iter().any(|row| {
+        row.get(0) == Some("sustainability_kpi")
+            && row.get(10) == Some("sustainability.kpi.v1")
+            && row
+                .get(11)
+                .is_some_and(|value| value.contains("target:cover-2026"))
+    }));
+
+    let geojson_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export/summary.geojson?season_id=season-2026")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson
+            .pointer("/crs/properties/name")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:32614")
+    );
+    assert_eq!(
+        geojson.get("record_count").and_then(|value| value.as_u64()),
+        Some(3)
+    );
+    let features = geojson
+        .get("features")
+        .and_then(|value| value.as_array())
+        .expect("features should exist");
+    assert_eq!(features.len(), 3);
+    assert!(features.iter().any(|feature| {
+        feature
+            .pointer("/properties/record_type")
+            .and_then(|value| value.as_str())
+            == Some("biomass_estimate")
+            && feature
+                .pointer("/geometry/type")
+                .and_then(|value| value.as_str())
+                == Some("Polygon")
+    }));
+
+    let pdf_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export/summary.pdf?season_id=season-2026")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(pdf_response.status(), StatusCode::OK);
+    assert_eq!(
+        pdf_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/pdf")
+    );
+    let body = to_bytes(pdf_response.into_body(), 64 * 1024).await?;
+    let pdf = String::from_utf8_lossy(&body);
+    assert!(pdf.starts_with("%PDF-1.4"));
+    assert!(pdf.contains("biomass.canopy_ndvi.v1"));
+    assert!(pdf.contains("layer:ndvi-001"));
+    assert!(pdf.contains("sustainability.kpi.v1"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_sustainability_field_exports_valid_empty_artifacts() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(
+        &ctx,
+        "farm-export-empty",
+        "field-export-empty",
+        "season-2026",
+    )
+    .await?;
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export-empty/summary.csv")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(csv_reader.records().count(), 0);
+
+    let geojson_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export-empty/summary.geojson")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson.get("type").and_then(|value| value.as_str()),
+        Some("FeatureCollection")
+    );
+    assert_eq!(
+        geojson
+            .get("features")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        geojson.get("empty").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let pdf_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/exports/field/field-export-empty/summary.pdf")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(pdf_response.status(), StatusCode::OK);
+    let body = to_bytes(pdf_response.into_body(), 64 * 1024).await?;
+    let pdf = String::from_utf8_lossy(&body);
+    assert!(pdf.contains("empty: true"));
+    assert!(pdf.contains("No sustainability records were available"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn biodiversity_proxies_compute_get_and_list_georeferenced_metrics() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biodiversity-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biodiversity_proxy_payload("biodiversity-001", vec![0.1, 0.4, 0.6, 0.9])
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("computed")
+    );
+    assert_eq!(
+        first.get("cover_fraction").and_then(|value| value.as_f64()),
+        Some(0.75)
+    );
+    assert_eq!(
+        first.get("crs").and_then(|value| value.as_str()),
+        Some("EPSG:32614")
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biodiversity-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biodiversity_proxy_payload("biodiversity-002", vec![0.1, 0.4, 0.6, 0.9])
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/biodiversity-proxies/biodiversity-001?field_id=field-biodiversity")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/biodiversity-proxies?field_id=field-biodiversity&status=computed")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let proxies: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(proxies.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn biodiversity_proxy_uniform_grid_persists_no_signal_without_score() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/biodiversity-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    biodiversity_proxy_payload("biodiversity-nosignal", vec![0.4, 0.4, 0.4, 0.4])
+                        .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let proxy: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        proxy.get("status").and_then(|value| value.as_str()),
+        Some("no_signal")
+    );
+    assert!(proxy
+        .get("heterogeneity_score")
+        .is_some_and(|value| value.is_null()));
+    assert!(proxy
+        .get("cover_fraction")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM biodiversity_proxies WHERE status = 'no_signal' AND heterogeneity_score IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn soil_carbon_proxies_compute_get_and_list_with_uncertainty_band() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/soil-carbon-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    soil_carbon_proxy_payload("soil-carbon-001", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("computed")
+    );
+    let proxy_value = first
+        .get("proxy_value")
+        .and_then(|value| value.as_f64())
+        .expect("computed proxy value should be present");
+    let band = first
+        .get("uncertainty_band")
+        .expect("band should always be present for computed proxy");
+    assert!(band.get("low").and_then(|value| value.as_f64()) < Some(proxy_value));
+    assert!(band.get("high").and_then(|value| value.as_f64()) > Some(proxy_value));
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/soil-carbon-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    soil_carbon_proxy_payload("soil-carbon-002", true).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/soil-carbon-proxies/soil-carbon-001?field_id=field-soil-carbon")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/soil-carbon-proxies?field_id=field-soil-carbon&status=computed")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let proxies: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(proxies.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn soil_carbon_proxy_insufficient_evidence_persists_unavailable_without_band() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/soil-carbon-proxies")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    soil_carbon_proxy_payload("soil-carbon-insufficient", false).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let proxy: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        proxy.get("status").and_then(|value| value.as_str()),
+        Some("insufficient_evidence")
+    );
+    assert!(proxy
+        .get("proxy_value")
+        .is_some_and(|value| value.is_null()));
+    assert!(proxy
+        .get("uncertainty_band")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM soil_carbon_proxies WHERE status = 'insufficient_evidence' AND proxy_value IS NULL AND uncertainty_low IS NULL AND uncertainty_high IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_kpis_compute_get_and_list_with_stable_hash() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let first = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/kpis")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_kpi_payload("kpi-cover-001", Some(0.72)).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 64 * 1024).await?;
+    let first: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        first.get("status").and_then(|value| value.as_str()),
+        Some("on_track")
+    );
+    assert_eq!(
+        first.get("metric_ref").and_then(|value| value.as_str()),
+        Some("biodiversity:biodiversity-001")
+    );
+    let first_hash = first
+        .get("result_hash")
+        .and_then(|value| value.as_str())
+        .expect("hash should be present")
+        .to_string();
+
+    let second = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/kpis")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_kpi_payload("kpi-cover-002", Some(0.72)).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 64 * 1024).await?;
+    let second: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        second.get("result_hash").and_then(|value| value.as_str()),
+        Some(first_hash.as_str())
+    );
+
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/kpis/kpi-cover-001?field_id=field-sustainability-kpi")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(get.status(), StatusCode::OK);
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/sustainability/kpis?field_id=field-sustainability-kpi&season_id=season-2026&status=on_track")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let kpis: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(kpis.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustainability_kpi_no_data_persists_without_current_value() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/kpis")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    sustainability_kpi_payload("kpi-cover-nodata", None).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let kpi: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        kpi.get("status").and_then(|value| value.as_str()),
+        Some("no_data")
+    );
+    assert!(kpi
+        .get("current_value")
+        .is_some_and(|value| value.is_null()));
+
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sustainability_kpis WHERE status = 'no_data' AND current_value IS NULL",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stored_count, 1);
 
     Ok(())
 }
@@ -3400,6 +6200,1433 @@ async fn content_item_create_rejects_empty_body_without_writing() -> Result<()> 
 }
 
 #[tokio::test]
+async fn content_workflow_submit_and_publish_audits_transitions() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-workflow-001").await?;
+
+    let review = post_content_workflow(
+        &ctx,
+        "article-workflow-001",
+        json!({
+            "action": "submit_for_review",
+            "actor_id": "author-001",
+            "actor_role": "author"
+        }),
+    )
+    .await?;
+    assert_eq!(
+        review
+            .pointer("/content/status")
+            .and_then(|value| value.as_str()),
+        Some("in_review")
+    );
+    assert_eq!(
+        review
+            .pointer("/audit/from_status")
+            .and_then(|value| value.as_str()),
+        Some("draft")
+    );
+    assert_eq!(
+        review
+            .pointer("/audit/to_status")
+            .and_then(|value| value.as_str()),
+        Some("in_review")
+    );
+    assert_eq!(
+        review
+            .pointer("/audit/actor_id")
+            .and_then(|value| value.as_str()),
+        Some("author-001")
+    );
+
+    let publish = post_content_workflow(
+        &ctx,
+        "article-workflow-001",
+        json!({
+            "action": "publish",
+            "actor_id": "editor-001",
+            "actor_role": "editor"
+        }),
+    )
+    .await?;
+    assert_eq!(
+        publish
+            .pointer("/content/status")
+            .and_then(|value| value.as_str()),
+        Some("published")
+    );
+    assert_eq!(
+        publish
+            .pointer("/audit/from_status")
+            .and_then(|value| value.as_str()),
+        Some("in_review")
+    );
+    assert_eq!(
+        publish
+            .pointer("/audit/action")
+            .and_then(|value| value.as_str()),
+        Some("publish")
+    );
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cms_content_workflow_audits WHERE content_id = ?1",
+    )
+    .bind("article-workflow-001")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_workflow_denies_author_publish_and_skip_review() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-workflow-denied").await?;
+
+    let skip_review = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-workflow-denied/workflow?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "publish",
+                        "actor_id": "editor-001",
+                        "actor_role": "editor"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(skip_review.status(), StatusCode::BAD_REQUEST);
+
+    post_content_workflow(
+        &ctx,
+        "article-workflow-denied",
+        json!({
+            "action": "submit_for_review",
+            "actor_id": "author-001",
+            "actor_role": "author"
+        }),
+    )
+    .await?;
+
+    let author_publish = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-workflow-denied/workflow?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "publish",
+                        "actor_id": "author-001",
+                        "actor_role": "author"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(author_publish.status(), StatusCode::FORBIDDEN);
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM cms_contents WHERE content_id = ?1")
+            .bind("article-workflow-denied")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(status, "in_review");
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cms_content_workflow_audits WHERE content_id = ?1",
+    )
+    .bind("article-workflow-denied")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_workflow_scheduled_publish_stays_in_review_until_effective() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-workflow-scheduled").await?;
+    post_content_workflow(
+        &ctx,
+        "article-workflow-scheduled",
+        json!({
+            "action": "submit_for_review",
+            "actor_id": "author-001",
+            "actor_role": "author"
+        }),
+    )
+    .await?;
+
+    let scheduled = post_content_workflow(
+        &ctx,
+        "article-workflow-scheduled",
+        json!({
+            "action": "publish",
+            "actor_id": "editor-001",
+            "actor_role": "editor",
+            "scheduled_effective_at": "2999-01-01T00:00:00Z"
+        }),
+    )
+    .await?;
+    assert_eq!(
+        scheduled
+            .pointer("/content/status")
+            .and_then(|value| value.as_str()),
+        Some("in_review")
+    );
+    assert_eq!(
+        scheduled
+            .pointer("/audit/scheduled_effective_at")
+            .and_then(|value| value.as_str()),
+        Some("2999-01-01T00:00:00Z")
+    );
+
+    let row = sqlx::query(
+        "SELECT status, scheduled_effective_at FROM cms_contents c JOIN cms_content_workflow_audits a ON a.content_id = c.content_id WHERE c.content_id = ?1 AND a.action = 'publish'",
+    )
+    .bind("article-workflow-scheduled")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "in_review");
+    assert_eq!(
+        row.get::<Option<String>, _>("scheduled_effective_at")
+            .as_deref(),
+        Some("2999-01-01T00:00:00Z")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_permissions_resolve_editor_and_cross_org_scope() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let editor = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/permissions/resolve?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:editor")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(editor.status(), StatusCode::OK);
+    let body = to_bytes(editor.into_body(), 64 * 1024).await?;
+    let editor: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        editor.get("can_publish").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        editor.get("can_moderate").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let cross_org = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/permissions/resolve?org_id=org-alpha&actor_org_id=org-beta&role_refs=cms:editor")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::OK);
+    let body = to_bytes(cross_org.into_body(), 64 * 1024).await?;
+    let cross_org: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        cross_org
+            .get("can_publish")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        cross_org.get("can_read").and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_permissions_viewer_write_is_denied_and_audited() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-permission-denied").await?;
+
+    let denied = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-permission-denied/workflow?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "submit_for_review",
+                        "actor_id": "viewer-001",
+                        "actor_role": "viewer"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let row = sqlx::query(
+        "SELECT status, from_status, to_status, actor_id FROM cms_contents c JOIN cms_content_workflow_audits a ON a.content_id = c.content_id WHERE c.content_id = ?1",
+    )
+    .bind("article-permission-denied")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "draft");
+    assert_eq!(row.get::<String, _>("from_status"), "draft");
+    assert_eq!(row.get::<String, _>("to_status"), "draft");
+    assert_eq!(row.get::<String, _>("actor_id"), "viewer-001");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_search_returns_ranked_published_org_matches() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-a",
+        "Cover crop planning guide. Cover crop residue protects soil.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-b",
+        "Crop scouting guide with one cover note.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-draft",
+        "Cover crop draft should not appear.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-beta",
+        "Cover crop from another org should not leak.",
+        "org-beta",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-search-a", "org-alpha").await?;
+    publish_content_fixture(&ctx, "article-search-b", "org-alpha").await?;
+    publish_content_fixture(&ctx, "article-search-beta", "org-beta").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=cover%20crop")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0]
+            .get("content_id")
+            .and_then(|value| value.as_str()),
+        Some("article-search-a")
+    );
+    assert_eq!(
+        results[1]
+            .get("content_id")
+            .and_then(|value| value.as_str()),
+        Some("article-search-b")
+    );
+    assert!(results[0]
+        .get("score")
+        .and_then(|value| value.as_u64())
+        .zip(results[1].get("score").and_then(|value| value.as_u64()))
+        .is_some_and(|(first, second)| first > second));
+    assert!(results.iter().all(|result| {
+        result.get("org_id").and_then(|value| value.as_str()) == Some("org-alpha")
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_search_no_match_returns_empty_results() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-search-empty",
+        "Cover crop planning guide.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-search-empty", "org-alpha").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=irrigation")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert!(results.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_tags_persist_and_filter_by_taxonomy() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-tagged-001",
+        "Cover crop planning guide.",
+        "org-alpha",
+    )
+    .await?;
+
+    let apply = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-tagged-001/tags?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tags": [
+                            { "kind": "crop", "value": "corn" },
+                            { "kind": "topic", "value": "cover crops" }
+                        ],
+                        "suggested_by_ai": true,
+                        "editor_confirmed": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(apply.status(), StatusCode::OK);
+    let body = to_bytes(apply.into_body(), 64 * 1024).await?;
+    let tags: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(tags.len(), 2);
+    assert!(tags.iter().any(|tag| {
+        tag.get("kind").and_then(|value| value.as_str()) == Some("topic")
+            && tag.get("value").and_then(|value| value.as_str()) == Some("cover_crops")
+            && tag.get("source").and_then(|value| value.as_str())
+                == Some("ai_suggested_editor_confirmed")
+    }));
+
+    let list = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/tags?org_id=org-alpha&kind=topic&value=cover_crops")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("content_id").and_then(|value| value.as_str()),
+        Some("article-tagged-001")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_tags_reject_unconfirmed_ai_and_off_taxonomy_values() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture(&ctx, "article-tagged-reject").await?;
+
+    let unconfirmed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-tagged-reject/tags?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tags": [{ "kind": "topic", "value": "soil_health" }],
+                        "suggested_by_ai": true,
+                        "editor_confirmed": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(unconfirmed.status(), StatusCode::BAD_REQUEST);
+
+    let invalid = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-tagged-reject/tags?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tags": [{ "kind": "crop", "value": "dragonfruit" }],
+                        "suggested_by_ai": false,
+                        "editor_confirmed": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let tag_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cms_content_tags")
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(tag_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_portal_embed_lists_and_opens_published_org_items_read_only() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-a",
+        "Published portal cover crop guide.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-draft",
+        "Draft portal guide should not leak.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-beta",
+        "Other org published guide should not leak.",
+        "org-beta",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-portal-a", "org-alpha").await?;
+    publish_content_fixture(&ctx, "article-portal-beta", "org-beta").await?;
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let embed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        embed.get("read_only").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    let items = embed
+        .get("items")
+        .and_then(|value| value.as_array())
+        .expect("embed should include items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("content_id").and_then(|value| value.as_str()),
+        Some("article-portal-a")
+    );
+    assert_eq!(
+        items[0].get("read_only").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert!(items[0]
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|refs| refs
+            .iter()
+            .any(|reference| reference.as_str() == Some("content:article-portal-a"))));
+
+    let opened = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base/article-portal-a?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(opened.status(), StatusCode::OK);
+    let body = to_bytes(opened.into_body(), 64 * 1024).await?;
+    let opened: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        opened.get("content_id").and_then(|value| value.as_str()),
+        Some("article-portal-a")
+    );
+    assert_eq!(
+        opened.get("current_body").and_then(|value| value.as_str()),
+        Some("Published portal cover crop guide.")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_portal_embed_denies_unreadable_or_unpublished_direct_hits() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-visible",
+        "Published portal guide.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-hidden-draft",
+        "Draft portal guide should not leak.",
+        "org-alpha",
+    )
+    .await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-portal-hidden-foreign",
+        "Foreign portal guide should not leak.",
+        "org-beta",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-portal-visible", "org-alpha").await?;
+    publish_content_fixture(&ctx, "article-portal-hidden-foreign", "org-beta").await?;
+
+    let cross_org_reader = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base?org_id=org-alpha&actor_org_id=org-beta&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org_reader.status(), StatusCode::FORBIDDEN);
+
+    let draft = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base/article-portal-hidden-draft?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(draft.status(), StatusCode::NOT_FOUND);
+
+    let foreign = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base/article-portal-hidden-foreign?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_engagement_aggregates_reader_events_by_period() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-engagement-001",
+        "Published portal guide with engagement.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-engagement-001", "org-alpha").await?;
+
+    for (event_type, actor_id) in [
+        ("view", "grower-001"),
+        ("view", "grower-002"),
+        ("read", "grower-001"),
+        ("helpful_vote", "grower-001"),
+    ] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/content/items/article-engagement-001/engagement-events?org_id=org-alpha")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "event_type": event_type,
+                            "actor_id": actor_id,
+                            "period": "2026-06",
+                            "occurred_at": "2026-06-17T06:30:00Z"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let summary = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-engagement-001/engagement?org_id=org-alpha&period=2026-06")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = to_bytes(summary.into_body(), 64 * 1024).await?;
+    let summary: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        summary.get("views").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        summary.get("reads").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get("helpful_votes")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        summary.get("event_count").and_then(|value| value.as_u64()),
+        Some(4)
+    );
+    assert!(summary
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|refs| refs.iter().any(|reference| reference
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("content-engagement-event:")))));
+
+    let row = sqlx::query(
+        "SELECT views, reads, helpful_votes, event_count FROM cms_content_engagement_summaries WHERE content_id = ?1 AND org_id = ?2 AND period = ?3",
+    )
+    .bind("article-engagement-001")
+    .bind("org-alpha")
+    .bind("2026-06")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<i64, _>("views"), 2);
+    assert_eq!(row.get::<i64, _>("reads"), 1);
+    assert_eq!(row.get::<i64, _>("helpful_votes"), 1);
+    assert_eq!(row.get::<i64, _>("event_count"), 4);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_engagement_no_activity_persists_zero_summary() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-engagement-empty",
+        "Published guide with no activity.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-engagement-empty", "org-alpha").await?;
+
+    let summary = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-engagement-empty/engagement?org_id=org-alpha&period=2026-06")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = to_bytes(summary.into_body(), 64 * 1024).await?;
+    let summary: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        summary.get("views").and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        summary.get("reads").and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        summary
+            .get("helpful_votes")
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        summary.get("event_count").and_then(|value| value.as_u64()),
+        Some(0)
+    );
+
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT event_count FROM cms_content_engagement_summaries WHERE content_id = ?1 AND period = ?2",
+    )
+    .bind("article-engagement-empty")
+    .bind("2026-06")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(event_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_success_story_persists_and_reuses_search_and_embed() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/success-stories")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "content_id": "success-story-001",
+                        "author_id": "author-001",
+                        "org_id": "org-alpha",
+                        "body": "Cover crops increased soil organic matter for corn.",
+                        "fields": {
+                            "grower": "North Ridge Farm",
+                            "crop": "corn",
+                            "region": "midwest",
+                            "outcome_summary": "Soil organic matter improved after cover crop adoption.",
+                            "metrics": [{
+                                "metric": "soil organic matter",
+                                "value": "+0.4",
+                                "unit": "percentage_points",
+                                "evidence_ref": "kpi:soil-organic-matter"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = to_bytes(create.into_body(), 64 * 1024).await?;
+    let created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created
+            .pointer("/content/content_type")
+            .and_then(|value| value.as_str()),
+        Some("success_story")
+    );
+    assert_eq!(
+        created
+            .pointer("/success_story/crop")
+            .and_then(|value| value.as_str()),
+        Some("corn")
+    );
+
+    let fetched = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/success-stories/success-story-001?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(fetched.status(), StatusCode::OK);
+    let body = to_bytes(fetched.into_body(), 64 * 1024).await?;
+    let fetched: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        fetched
+            .pointer("/success_story/metrics/0/evidence_ref")
+            .and_then(|value| value.as_str()),
+        Some("kpi:soil-organic-matter")
+    );
+
+    publish_content_fixture(&ctx, "success-story-001", "org-alpha").await?;
+
+    let search = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=soil%20organic")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]
+            .get("content_id")
+            .and_then(|value| value.as_str()),
+        Some("success-story-001")
+    );
+    assert_eq!(
+        results[0]
+            .get("content_type")
+            .and_then(|value| value.as_str()),
+        Some("success_story")
+    );
+
+    let embed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(embed.status(), StatusCode::OK);
+    let body = to_bytes(embed.into_body(), 64 * 1024).await?;
+    let embed: serde_json::Value = serde_json::from_slice(&body)?;
+    let items = embed
+        .get("items")
+        .and_then(|value| value.as_array())
+        .expect("embed should include items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]
+            .get("content_type")
+            .and_then(|value| value.as_str()),
+        Some("success_story")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_success_story_rejects_missing_structured_field_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/success-stories")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "content_id": "success-story-invalid",
+                        "author_id": "author-001",
+                        "org_id": "org-alpha",
+                        "body": "Incomplete success story.",
+                        "fields": {
+                            "grower": "North Ridge Farm",
+                            "crop": "corn",
+                            "region": "midwest",
+                            "outcome_summary": " ",
+                            "metrics": [{
+                                "metric": "soil organic matter",
+                                "value": "+0.4",
+                                "unit": "percentage_points",
+                                "evidence_ref": "kpi:soil-organic-matter"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::BAD_REQUEST);
+
+    let content_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cms_contents WHERE content_id = ?1")
+            .bind("success-story-invalid")
+            .fetch_one(&ctx.pool)
+            .await?;
+    let story_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cms_success_stories WHERE content_id = ?1")
+            .bind("success-story-invalid")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(content_count, 0);
+    assert_eq!(story_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_community_contribution_submits_hidden_until_moderated() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let submit = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "contribution_id": "community-001",
+                        "org_id": "org-alpha",
+                        "contributor_id": "grower-001",
+                        "content_type": "post",
+                        "body": "Grower note about cover crops."
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(submit.status(), StatusCode::OK);
+    let body = to_bytes(submit.into_body(), 64 * 1024).await?;
+    let contribution: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        contribution.get("status").and_then(|value| value.as_str()),
+        Some("submitted")
+    );
+    assert!(contribution
+        .get("content_id")
+        .is_none_or(|value| value.is_null()));
+
+    let search = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=cover%20crops")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert!(results.is_empty());
+
+    let content_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cms_contents WHERE author_id = ?1")
+            .bind("grower-001")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(content_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_community_contribution_moderator_approval_creates_draft_and_audit() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    submit_community_contribution(&ctx, "community-approve").await?;
+
+    let approve = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions/community-approve/moderation?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "approve",
+                        "moderator_id": "editor-001",
+                        "actor_org_id": "org-alpha",
+                        "role_refs": ["cms:editor"],
+                        "reason": "Useful field note"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(approve.status(), StatusCode::OK);
+    let body = to_bytes(approve.into_body(), 64 * 1024).await?;
+    let result: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        result
+            .pointer("/contribution/status")
+            .and_then(|value| value.as_str()),
+        Some("approved")
+    );
+    let content_id = result
+        .pointer("/content/content/content_id")
+        .and_then(|value| value.as_str())
+        .expect("approval should create content");
+    assert_eq!(
+        result
+            .pointer("/content/content/status")
+            .and_then(|value| value.as_str()),
+        Some("draft")
+    );
+
+    let row = sqlx::query(
+        "SELECT c.status, c.author_id, q.status AS contribution_status FROM cms_contents c JOIN cms_community_contributions q ON q.content_id = c.content_id WHERE c.content_id = ?1",
+    )
+    .bind(content_id)
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "draft");
+    assert_eq!(row.get::<String, _>("author_id"), "grower-001");
+    assert_eq!(row.get::<String, _>("contribution_status"), "approved");
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cms_community_contribution_audits WHERE contribution_id = ?1 AND action = 'approve'",
+    )
+    .bind("community-approve")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    let search = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=cover%20crops")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert!(results.is_empty(), "approved draft must not be public");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_community_contribution_non_moderator_approval_is_denied() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    submit_community_contribution(&ctx, "community-denied").await?;
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions/community-denied/moderation?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "approve",
+                        "moderator_id": "viewer-001",
+                        "actor_org_id": "org-alpha",
+                        "role_refs": ["cms:viewer"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let row = sqlx::query(
+        "SELECT status, content_id FROM cms_community_contributions WHERE contribution_id = ?1",
+    )
+    .bind("community-denied")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "submitted");
+    assert_eq!(row.get::<Option<String>, _>("content_id"), None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_community_contribution_moderator_rejects_with_audit_without_content() -> Result<()>
+{
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    submit_community_contribution(&ctx, "community-reject").await?;
+
+    let reject = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions/community-reject/moderation?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "reject",
+                        "moderator_id": "editor-001",
+                        "actor_org_id": "org-alpha",
+                        "role_refs": ["cms:editor"],
+                        "reason": "Duplicate content"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(reject.status(), StatusCode::OK);
+    let body = to_bytes(reject.into_body(), 64 * 1024).await?;
+    let result: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        result
+            .pointer("/contribution/status")
+            .and_then(|value| value.as_str()),
+        Some("rejected")
+    );
+    assert!(result.get("content").is_none());
+
+    let row = sqlx::query(
+        "SELECT q.status, q.content_id, a.action, a.to_status, a.reason FROM cms_community_contributions q JOIN cms_community_contribution_audits a ON a.contribution_id = q.contribution_id WHERE q.contribution_id = ?1",
+    )
+    .bind("community-reject")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("status"), "rejected");
+    assert_eq!(row.get::<Option<String>, _>("content_id"), None);
+    assert_eq!(row.get::<String, _>("action"), "reject");
+    assert_eq!(row.get::<String, _>("to_status"), "rejected");
+    assert_eq!(
+        row.get::<Option<String>, _>("reason").as_deref(),
+        Some("Duplicate content")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_localization_serves_requested_published_locale() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-localized-fr",
+        "Canonical cover crop guide.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-localized-fr", "org-alpha").await?;
+
+    let create_locale = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-localized-fr/locales?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "locale": "fr-FR",
+                        "body": "Guide en francais sur les cultures de couverture.",
+                        "status": "published"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_locale.status(), StatusCode::OK);
+
+    let localized = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-localized-fr/localized?org_id=org-alpha&locale=fr_FR")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(localized.status(), StatusCode::OK);
+    let body = to_bytes(localized.into_body(), 64 * 1024).await?;
+    let localized: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        localized.get("locale").and_then(|value| value.as_str()),
+        Some("fr-fr")
+    );
+    assert_eq!(
+        localized.get("body").and_then(|value| value.as_str()),
+        Some("Guide en francais sur les cultures de couverture.")
+    );
+    assert_eq!(
+        localized
+            .get("fallback_used")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_localization_missing_locale_falls_back_to_canonical() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-localized-fallback",
+        "Canonical cover crop guide.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-localized-fallback", "org-alpha").await?;
+
+    let localized = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-localized-fallback/localized?org_id=org-alpha&locale=es-MX")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(localized.status(), StatusCode::OK);
+    let body = to_bytes(localized.into_body(), 64 * 1024).await?;
+    let localized: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        localized.get("locale").and_then(|value| value.as_str()),
+        Some("canonical")
+    );
+    assert_eq!(
+        localized.get("body").and_then(|value| value.as_str()),
+        Some("Canonical cover crop guide.")
+    );
+    assert_eq!(
+        localized
+            .get("fallback_used")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -3557,6 +7784,1791 @@ async fn collaboration_message_rejects_missing_channel_without_writing() -> Resu
         .fetch_one(&ctx.pool)
         .await?;
     assert_eq!(message_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_permissions_resolve_operator_and_cross_org_scope() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let operator = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/permissions/resolve?org_id=org-alpha&actor_org_id=org-alpha&role_refs=collab:operator")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(operator.status(), StatusCode::OK);
+    let body = to_bytes(operator.into_body(), 64 * 1024).await?;
+    let operator: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        operator.get("can_stream").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        operator
+            .get("can_dispatch")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/permissions/resolve?org_id=org-alpha&actor_org_id=org-beta&role_refs=collab:operator")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::OK);
+    let body = to_bytes(cross_org.into_body(), 64 * 1024).await?;
+    let cross_org: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        cross_org
+            .get("can_dispatch")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        cross_org
+            .get("can_stream")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_viewer_stream_and_dispatch_are_denied_and_audited() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    for action in ["stream", "dispatch"] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/collaboration/actions/authorize")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "org_id": "org-alpha",
+                            "actor_org_id": "org-alpha",
+                            "actor_id": "viewer-1",
+                            "role_refs": ["collab:viewer"],
+                            "action": action,
+                            "channel_id": "channel-001"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    let denied_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM collab_permission_audits
+        WHERE org_id = 'org-alpha'
+          AND actor_id = 'viewer-1'
+          AND allowed = 0
+          AND reason_code = 'role_not_permitted'
+          AND action IN ('stream', 'dispatch')
+        "#,
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(denied_count, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_viewer_post_is_denied_and_does_not_write_message() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-collab", "field-collab", "season-2026").await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "channel_id": "channel-viewer-denied",
+                        "org_id": "org-alpha",
+                        "field_ref": "field:field-collab",
+                        "member_account_ids": ["viewer-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let post = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-viewer-denied/messages?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "message_id": "message-viewer-denied",
+                        "author_id": "viewer-1",
+                        "body": "I should not post with viewer-only rights"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(post.status(), StatusCode::FORBIDDEN);
+
+    let message_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_messages WHERE message_id = 'message-viewer-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(message_count, 0);
+
+    let audit_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM collab_permission_audits
+        WHERE actor_id = 'viewer-1'
+          AND action = 'post'
+          AND permission = 'can_post'
+          AND allowed = 0
+        "#,
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_presence_expires_and_notifications_fan_out() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-collab", "field-collab", "season-2026").await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "channel_id": "channel-presence",
+                        "org_id": "org-alpha",
+                        "field_ref": "field:field-collab",
+                        "member_account_ids": ["user-a", "user-b"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let presence = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-presence/presence?org_id=org-alpha&actor_org_id=org-alpha&actor_id=user-a&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "account_id": "user-a",
+                        "state": "online",
+                        "last_seen": "2026-06-13T15:00:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(presence.status(), StatusCode::OK);
+
+    let notifications = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-presence/notifications?org_id=org-alpha&actor_org_id=org-alpha&actor_id=user-a&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "event_id": "event-presence-001",
+                        "event_type": "field_event",
+                        "source_ref": "field:field-collab",
+                        "body": "Scout event"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(notifications.status(), StatusCode::OK);
+    let body = to_bytes(notifications.into_body(), 64 * 1024).await?;
+    let notifications: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(notifications.len(), 2);
+    assert!(notifications.iter().all(|notification| {
+        notification
+            .get("delivery_state")
+            .and_then(|value| value.as_str())
+            == Some("delivered")
+    }));
+
+    let listed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/channels/channel-presence/presence?org_id=org-alpha&stale_before=2026-06-13T15:01:00Z")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body = to_bytes(listed.into_body(), 64 * 1024).await?;
+    let presence: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(
+        presence
+            .iter()
+            .find(
+                |record| record.get("account_id").and_then(|value| value.as_str())
+                    == Some("user-a")
+            )
+            .and_then(|record| record.get("state"))
+            .and_then(|value| value.as_str()),
+        Some("offline")
+    );
+
+    let notification_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_notifications WHERE event_id = 'event-presence-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(notification_count, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_stream_relays_frames_reconnects_and_denies_cross_org_viewer() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let start = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-001",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "source_ref": "camera:rgb-01",
+                        "latency_budget_ms": 500,
+                        "source_active": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(start.status(), StatusCode::OK);
+    let body = to_bytes(start.into_body(), 64 * 1024).await?;
+    let stream: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stream.get("state").and_then(|value| value.as_str()),
+        Some("live")
+    );
+
+    let frame = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams/stream-001/frames?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "frame_id": "frame-001",
+                        "captured_at": "2026-06-13T15:00:00Z",
+                        "relayed_at": "2026-06-13T15:00:00.250Z",
+                        "payload_ref": "camera-frame:001",
+                        "dropped": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(frame.status(), StatusCode::OK);
+    let body = to_bytes(frame.into_body(), 64 * 1024).await?;
+    let frame: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        frame
+            .pointer("/stream/state")
+            .and_then(|value| value.as_str()),
+        Some("live")
+    );
+    assert_eq!(
+        frame
+            .pointer("/frame/latency_ms")
+            .and_then(|value| value.as_u64()),
+        Some(250)
+    );
+    assert_eq!(
+        frame
+            .pointer("/frame/view_ref")
+            .and_then(|value| value.as_str()),
+        Some("view:stream-001:1")
+    );
+
+    let frames = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/streams/stream-001/frames?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(frames.status(), StatusCode::OK);
+    let body = to_bytes(frames.into_body(), 64 * 1024).await?;
+    let frames: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(frames.len(), 1);
+
+    let dropped = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams/stream-001/frames?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "frame_id": "frame-002",
+                        "captured_at": "2026-06-13T15:00:01Z",
+                        "relayed_at": "2026-06-13T15:00:01.100Z",
+                        "payload_ref": "camera-frame:002",
+                        "dropped": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(dropped.status(), StatusCode::OK);
+    let body = to_bytes(dropped.into_body(), 64 * 1024).await?;
+    let dropped: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        dropped
+            .pointer("/stream/state")
+            .and_then(|value| value.as_str()),
+        Some("reconnecting")
+    );
+    assert!(dropped.get("frame").is_none());
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/streams/stream-001/frames?org_id=org-alpha&actor_org_id=org-beta&actor_id=viewer-1&role_refs=collab:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::FORBIDDEN);
+
+    let persisted_state: String =
+        sqlx::query_scalar("SELECT state FROM collab_streams WHERE stream_id = 'stream-001'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(persisted_state, "reconnecting");
+    let persisted_frames: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_stream_frames WHERE stream_id = 'stream-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(persisted_frames, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_stream_rejects_unavailable_source_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let start = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-missing-source",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "source_ref": "camera:missing",
+                        "latency_budget_ms": 500,
+                        "source_active": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(start.status(), StatusCode::BAD_REQUEST);
+
+    let stream_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_streams WHERE stream_id = 'stream-missing-source'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stream_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_emergency_alert_fans_out_transitions_and_audits() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-collab", "field-collab", "season-2026").await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "channel_id": "channel-alerts",
+                        "org_id": "org-alpha",
+                        "field_ref": "field:field-collab",
+                        "member_account_ids": ["ops-1", "grower-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let raise = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-alerts/emergency-alerts?org_id=org-alpha&actor_org_id=org-alpha&actor_id=ops-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "alert_id": "alert-001",
+                        "source": "safety01",
+                        "severity": "critical",
+                        "trigger_ref": "01:geofence:breach-001",
+                        "body": "Geofence breach",
+                        "failed_recipient_account_ids": ["grower-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(raise.status(), StatusCode::OK);
+    let body = to_bytes(raise.into_body(), 64 * 1024).await?;
+    let raise: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        raise
+            .pointer("/alert/state")
+            .and_then(|value| value.as_str()),
+        Some("raised")
+    );
+    assert_eq!(
+        raise
+            .pointer("/deliveries")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(2)
+    );
+    assert!(raise
+        .pointer("/deliveries")
+        .and_then(|value| value.as_array())
+        .expect("deliveries should be array")
+        .iter()
+        .any(|delivery| {
+            delivery
+                .get("recipient_account_id")
+                .and_then(|value| value.as_str())
+                == Some("grower-1")
+                && delivery
+                    .get("delivery_state")
+                    .and_then(|value| value.as_str())
+                    == Some("retry_pending")
+                && delivery.get("retry_count").and_then(|value| value.as_u64()) == Some(1)
+        }));
+
+    let acknowledge = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/emergency-alerts/alert-001?org_id=org-alpha&actor_org_id=org-alpha&actor_id=ops-2&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "acknowledge",
+                        "actor_id": "ops-2"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(acknowledge.status(), StatusCode::OK);
+
+    let resolve = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/emergency-alerts/alert-001?org_id=org-alpha&actor_org_id=org-alpha&actor_id=ops-2&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "resolve",
+                        "actor_id": "ops-2"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(resolve.status(), StatusCode::OK);
+
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM collab_emergency_alerts WHERE alert_id = 'alert-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(state, "resolved");
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM collab_alert_audits WHERE alert_id = 'alert-001'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(audit_count, 3);
+    let retry_pending_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_alert_deliveries WHERE alert_id = 'alert-001' AND delivery_state = 'retry_pending' AND retry_count = 1",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(retry_pending_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_emergency_alert_viewer_is_denied_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-collab", "field-collab", "season-2026").await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "channel_id": "channel-alert-denied",
+                        "org_id": "org-alpha",
+                        "field_ref": "field:field-collab",
+                        "member_account_ids": ["viewer-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let raise = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-alert-denied/emergency-alerts?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "alert_id": "alert-denied",
+                        "source": "fleet12",
+                        "severity": "warning",
+                        "trigger_ref": "12:fleet:battery-low",
+                        "body": "Battery low"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(raise.status(), StatusCode::FORBIDDEN);
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_emergency_alerts WHERE alert_id = 'alert-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_session_records_replays_ordered_events_and_denies_cross_org() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let record = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions?actor_org_id=org-alpha&actor_id=ops-1&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "session-001",
+                        "org_id": "org-alpha",
+                        "events": [
+                            {
+                                "event_id": "event-alert",
+                                "kind": "alert",
+                                "occurred_at": "2026-06-13T15:00:03Z",
+                                "actor_id": "ops-1",
+                                "subject_ref": "alert:alert-001",
+                                "note": "alert raised"
+                            },
+                            {
+                                "event_id": "event-gap",
+                                "kind": "stream_gap",
+                                "occurred_at": "2026-06-13T15:00:02Z",
+                                "actor_id": "relay",
+                                "subject_ref": "stream:stream-001",
+                                "note": "dropped frame"
+                            },
+                            {
+                                "event_id": "event-frame",
+                                "kind": "stream_frame",
+                                "occurred_at": "2026-06-13T15:00:01Z",
+                                "actor_id": "camera:rgb-01",
+                                "subject_ref": "stream:stream-001:frame-001",
+                                "note": "frame relayed"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(record.status(), StatusCode::OK);
+
+    let replay = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/sessions/session-001/replay?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let body = to_bytes(replay.into_body(), 64 * 1024).await?;
+    let replay: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        replay
+            .pointer("/session/has_explicit_gap")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        replay
+            .pointer("/events/0/event_id")
+            .and_then(|value| value.as_str()),
+        Some("event-frame")
+    );
+    assert_eq!(
+        replay
+            .pointer("/events/1/kind")
+            .and_then(|value| value.as_str()),
+        Some("stream_gap")
+    );
+    assert_eq!(
+        replay
+            .pointer("/events/2/event_id")
+            .and_then(|value| value.as_str()),
+        Some("event-alert")
+    );
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/sessions/session-001/replay?org_id=org-alpha&actor_org_id=org-beta&actor_id=viewer-1&role_refs=collab:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::FORBIDDEN);
+
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_session_events WHERE session_id = 'session-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(event_count, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_remote_expert_annotation_persists_and_recovers_after_disconnect(
+) -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "expert-live-scene-001";
+    let scene_dir = tmp.path().join("expert-live-scene-001");
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(
+        &ctx,
+        scene_id,
+        &scene_dir,
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -96.7,
+                "min_lat": 41.1,
+                "max_lon": -96.2,
+                "max_lat": 41.4
+            },
+            "geo_transform": [-96.7, 0.05, 0.0, 41.4, 0.0, -0.05],
+            "resolution": {
+                "x": 0.05,
+                "y": 0.05
+            }
+        }),
+    )
+    .await?;
+
+    let session = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions?actor_org_id=org-alpha&actor_id=ops-1&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "session-expert-001",
+                        "org_id": "org-alpha",
+                        "events": [
+                            {
+                                "event_id": "event-start",
+                                "kind": "stream_frame",
+                                "occurred_at": "2026-06-13T15:00:00Z",
+                                "actor_id": "camera:rgb-01",
+                                "subject_ref": "stream:stream-expert-001:frame-001",
+                                "note": "session started"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(session.status(), StatusCode::OK);
+
+    let stream = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-expert-001",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "source_ref": "camera:rgb-01",
+                        "latency_budget_ms": 500,
+                        "source_active": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions/session-expert-001/annotations?org_id=org-alpha&actor_org_id=org-alpha&actor_id=expert-1&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "expert-1",
+                        "scene_id": scene_id,
+                        "stream_id": "stream-expert-001",
+                        "connection_active": false,
+                        "annotation": {
+                            "annotation_id": "expert-ann-001",
+                            "label": "Live stress area",
+                            "severity": "high",
+                            "geometry": {
+                                "type": "point",
+                                "coordinate": {
+                                    "longitude": -96.45,
+                                    "latitude": 41.25
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = to_bytes(create.into_body(), 64 * 1024).await?;
+    let created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created
+            .pointer("/annotation/author")
+            .and_then(|value| value.as_str()),
+        Some("expert-1")
+    );
+    assert_eq!(
+        created
+            .pointer("/link/recoverable")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/sessions/session-expert-001/annotations?org_id=org-alpha&actor_org_id=org-alpha&actor_id=team-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let annotations: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(annotations.len(), 1);
+    assert_eq!(
+        annotations[0]
+            .pointer("/annotation/annotation_id")
+            .and_then(|value| value.as_str()),
+        Some("expert-ann-001")
+    );
+
+    let stored_author: String =
+        sqlx::query_scalar("SELECT author FROM annotations WHERE annotation_id = 'expert-ann-001'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(stored_author, "expert-1");
+    let recoverable: i64 = sqlx::query_scalar(
+        "SELECT recoverable FROM collab_session_annotations WHERE annotation_id = 'expert-ann-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(recoverable, 1);
+    let replay = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/sessions/session-expert-001/replay?org_id=org-alpha&actor_org_id=org-alpha&actor_id=team-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let body = to_bytes(replay.into_body(), 64 * 1024).await?;
+    let replay: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        replay
+            .pointer("/session/event_count")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert!(replay
+        .pointer("/events")
+        .and_then(|value| value.as_array())
+        .expect("events should be array")
+        .iter()
+        .any(
+            |event| event.get("kind").and_then(|value| value.as_str()) == Some("annotation")
+                && event.get("note").and_then(|value| value.as_str())
+                    == Some("connection_lost_annotation_persisted")
+        ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_remote_expert_annotation_viewer_denied_without_session_mutation(
+) -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "expert-live-scene-denied";
+    let scene_dir = tmp.path().join("expert-live-scene-denied");
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(
+        &ctx,
+        scene_id,
+        &scene_dir,
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -96.7,
+                "min_lat": 41.1,
+                "max_lon": -96.2,
+                "max_lat": 41.4
+            },
+            "geo_transform": [-96.7, 0.05, 0.0, 41.4, 0.0, -0.05],
+            "resolution": {
+                "x": 0.05,
+                "y": 0.05
+            }
+        }),
+    )
+    .await?;
+
+    let session = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions?actor_org_id=org-alpha&actor_id=ops-1&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "session-expert-denied",
+                        "org_id": "org-alpha",
+                        "events": [
+                            {
+                                "event_id": "event-start-denied",
+                                "kind": "stream_frame",
+                                "occurred_at": "2026-06-13T15:00:00Z",
+                                "actor_id": "camera:rgb-01",
+                                "subject_ref": "stream:stream-expert-denied:frame-001",
+                                "note": "session started"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(session.status(), StatusCode::OK);
+
+    let stream = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-expert-denied",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "source_ref": "camera:rgb-01",
+                        "latency_budget_ms": 500,
+                        "source_active": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions/session-expert-denied/annotations?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "viewer-1",
+                        "scene_id": scene_id,
+                        "stream_id": "stream-expert-denied",
+                        "annotation": {
+                            "annotation_id": "expert-ann-denied",
+                            "label": "Should not persist",
+                            "geometry": {
+                                "type": "point",
+                                "coordinate": {
+                                    "longitude": -96.45,
+                                    "latitude": 41.25
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let annotation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM annotations WHERE annotation_id = 'expert-ann-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(annotation_count, 0);
+    let link_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_session_annotations WHERE session_id = 'session-expert-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(link_count, 0);
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT event_count FROM collab_sessions WHERE session_id = 'session-expert-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(event_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_operator_console_feed_scopes_streams_alerts_and_ended_state() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let live = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-console-live",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:console-live",
+                        "source_ref": "camera:rgb-01",
+                        "latency_budget_ms": 500,
+                        "source_active": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(live.status(), StatusCode::OK);
+
+    sqlx::query(
+        r#"
+        INSERT INTO collab_streams (
+            stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+            started_at, updated_at, evidence_refs_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind("stream-console-ended")
+    .bind("org-alpha")
+    .bind("mission:console-ended")
+    .bind("camera:rgb-02")
+    .bind("ended")
+    .bind(500_i64)
+    .bind("2026-06-13T15:00:00Z")
+    .bind("2026-06-13T15:02:00Z")
+    .bind(json!(["collab:stream:stream-console-ended"]).to_string())
+    .execute(&ctx.pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_streams (
+            stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+            started_at, updated_at, evidence_refs_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind("stream-console-foreign")
+    .bind("org-beta")
+    .bind("mission:console-foreign")
+    .bind("camera:rgb-03")
+    .bind("live")
+    .bind(500_i64)
+    .bind("2026-06-13T15:00:00Z")
+    .bind("2026-06-13T15:01:00Z")
+    .bind(json!(["collab:stream:stream-console-foreign"]).to_string())
+    .execute(&ctx.pool)
+    .await?;
+    for (alert_id, org_id, state) in [
+        ("alert-console-active", "org-alpha", "raised"),
+        ("alert-console-resolved", "org-alpha", "resolved"),
+        ("alert-console-foreign", "org-beta", "raised"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_emergency_alerts (
+                alert_id, org_id, channel_id, source, severity, trigger_ref,
+                body, state, raised_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        )
+        .bind(alert_id)
+        .bind(org_id)
+        .bind("channel-console")
+        .bind("01")
+        .bind("critical")
+        .bind("01:geofence")
+        .bind("Geofence breach")
+        .bind(state)
+        .bind("2026-06-13T15:01:00Z")
+        .bind("2026-06-13T15:01:00Z")
+        .execute(&ctx.pool)
+        .await?;
+    }
+
+    let feed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/operator-console/feed?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(feed.status(), StatusCode::OK);
+    let body = to_bytes(feed.into_body(), 64 * 1024).await?;
+    let feed: serde_json::Value = serde_json::from_slice(&body)?;
+    let streams = feed
+        .get("streams")
+        .and_then(|value| value.as_array())
+        .expect("streams should be array");
+    assert_eq!(streams.len(), 2);
+    assert!(streams.iter().any(|stream| {
+        stream.get("stream_id").and_then(|value| value.as_str()) == Some("stream-console-live")
+            && stream.get("state").and_then(|value| value.as_str()) == Some("live")
+    }));
+    assert!(streams.iter().any(|stream| {
+        stream.get("stream_id").and_then(|value| value.as_str()) == Some("stream-console-ended")
+            && stream.get("state").and_then(|value| value.as_str()) == Some("ended")
+    }));
+    assert!(!streams.iter().any(|stream| {
+        stream.get("stream_id").and_then(|value| value.as_str()) == Some("stream-console-foreign")
+    }));
+    let alerts = feed
+        .get("active_alerts")
+        .and_then(|value| value.as_array())
+        .expect("active alerts should be array");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(
+        alerts[0].get("alert_id").and_then(|value| value.as_str()),
+        Some("alert-console-active")
+    );
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/operator-console/feed?org_id=org-alpha&actor_org_id=org-beta&actor_id=operator-foreign&role_refs=collab:operator")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_portal_feed_is_read_only_and_denies_foreign_direct_hits() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    for (stream_id, org_id) in [
+        ("stream-portal-alpha", "org-alpha"),
+        ("stream-portal-beta", "org-beta"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_streams (
+                stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+                started_at, updated_at, evidence_refs_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+        )
+        .bind(stream_id)
+        .bind(org_id)
+        .bind(format!("mission:{stream_id}"))
+        .bind("camera:rgb-01")
+        .bind("live")
+        .bind(500_i64)
+        .bind("2026-06-13T15:00:00Z")
+        .bind("2026-06-13T15:01:00Z")
+        .bind(json!([format!("collab:stream:{stream_id}")]).to_string())
+        .execute(&ctx.pool)
+        .await?;
+    }
+    for (alert_id, org_id) in [
+        ("alert-portal-alpha", "org-alpha"),
+        ("alert-portal-beta", "org-beta"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_emergency_alerts (
+                alert_id, org_id, channel_id, source, severity, trigger_ref,
+                body, state, raised_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        )
+        .bind(alert_id)
+        .bind(org_id)
+        .bind("channel-portal")
+        .bind("12")
+        .bind("warning")
+        .bind("12:battery")
+        .bind("Battery warning")
+        .bind("raised")
+        .bind("2026-06-13T15:01:00Z")
+        .bind("2026-06-13T15:01:00Z")
+        .execute(&ctx.pool)
+        .await?;
+    }
+
+    let feed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/feed?org_id=org-alpha&actor_org_id=org-alpha&actor_id=member-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(feed.status(), StatusCode::OK);
+    let body = to_bytes(feed.into_body(), 64 * 1024).await?;
+    let feed: serde_json::Value = serde_json::from_slice(&body)?;
+    let streams = feed
+        .get("streams")
+        .and_then(|value| value.as_array())
+        .expect("streams should be array");
+    assert_eq!(streams.len(), 1);
+    assert_eq!(
+        streams[0].get("stream_id").and_then(|value| value.as_str()),
+        Some("stream-portal-alpha")
+    );
+    let alerts = feed
+        .get("active_alerts")
+        .and_then(|value| value.as_array())
+        .expect("active alerts should be array");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(
+        alerts[0].get("alert_id").and_then(|value| value.as_str()),
+        Some("alert-portal-alpha")
+    );
+
+    let stream = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/streams/stream-portal-alpha?org_id=org-alpha&actor_org_id=org-alpha&actor_id=member-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    let foreign_stream = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/streams/stream-portal-beta?org_id=org-alpha&actor_org_id=org-alpha&actor_id=member-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(foreign_stream.status(), StatusCode::NOT_FOUND);
+
+    let foreign_alert = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/alerts/alert-portal-beta?org_id=org-alpha&actor_org_id=org-alpha&actor_id=member-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(foreign_alert.status(), StatusCode::NOT_FOUND);
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/feed?org_id=org-alpha&actor_org_id=org-beta&actor_id=member-foreign&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_mission_edit_conflicts_and_dispatch_guardrails() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans?actor_org_id=org-alpha&actor_id=expert-1&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "plan_id": "plan-001",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "waypoints": [
+                            {
+                                "waypoint_id": "wp-1",
+                                "latitude": 42.35,
+                                "longitude": -71.08,
+                                "altitude_m": 32.0
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = to_bytes(create.into_body(), 64 * 1024).await?;
+    let plan: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        plan.get("version").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+
+    let edit = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-001/edits?org_id=org-alpha&actor_org_id=org-alpha&actor_id=expert-1&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "expert-1",
+                        "base_version": 1,
+                        "waypoint": {
+                            "waypoint_id": "wp-1",
+                            "latitude": 42.351,
+                            "longitude": -71.081,
+                            "altitude_m": 36.0
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(edit.status(), StatusCode::OK);
+    let body = to_bytes(edit.into_body(), 64 * 1024).await?;
+    let edit: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        edit.pointer("/plan/version")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        edit.pointer("/audit/decision")
+            .and_then(|value| value.as_str()),
+        Some("accepted")
+    );
+
+    let stale = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-001/edits?org_id=org-alpha&actor_org_id=org-alpha&actor_id=expert-2&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "expert-2",
+                        "base_version": 1,
+                        "waypoint": {
+                            "waypoint_id": "wp-1",
+                            "latitude": 42.5,
+                            "longitude": -71.2,
+                            "altitude_m": 40.0
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stale.status(), StatusCode::OK);
+    let body = to_bytes(stale.into_body(), 64 * 1024).await?;
+    let stale: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stale
+            .pointer("/plan/version")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        stale
+            .pointer("/audit/decision")
+            .and_then(|value| value.as_str()),
+        Some("rejected")
+    );
+    assert_eq!(
+        stale
+            .pointer("/audit/reason_code")
+            .and_then(|value| value.as_str()),
+        Some("version_conflict")
+    );
+
+    let allowed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-001/dispatch?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "operator-1",
+                        "guardrails": {
+                            "geofence_clear": true,
+                            "altitude_clear": true,
+                            "battery_clear": true,
+                            "abort_path_available": true
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let body = to_bytes(allowed.into_body(), 64 * 1024).await?;
+    let allowed: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        allowed.get("allowed").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let blocked = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-001/dispatch?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "operator-1",
+                        "guardrails": {
+                            "geofence_clear": false,
+                            "altitude_clear": true,
+                            "battery_clear": true,
+                            "abort_path_available": true
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(blocked.status(), StatusCode::OK);
+    let body = to_bytes(blocked.into_body(), 64 * 1024).await?;
+    let blocked: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        blocked.get("allowed").and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        blocked
+            .pointer("/blocking_guardrails/0")
+            .and_then(|value| value.as_str()),
+        Some("geofence")
+    );
+
+    let stored_version: i64 =
+        sqlx::query_scalar("SELECT version FROM collab_mission_plans WHERE plan_id = 'plan-001'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(stored_version, 2);
+    let edit_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_mission_edit_audits WHERE plan_id = 'plan-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(edit_audits, 2);
+    let dispatch_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_mission_dispatch_audits WHERE plan_id = 'plan-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(dispatch_audits, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_mission_viewer_dispatch_is_denied_without_dispatch_audit() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans?actor_org_id=org-alpha&actor_id=expert-1&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "plan_id": "plan-denied",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-denied",
+                        "waypoints": [
+                            {
+                                "waypoint_id": "wp-1",
+                                "latitude": 42.35,
+                                "longitude": -71.08,
+                                "altitude_m": 32.0
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/mission-plans/plan-denied/dispatch?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "viewer-1",
+                        "guardrails": {
+                            "geofence_clear": true,
+                            "altitude_clear": true,
+                            "battery_clear": true,
+                            "abort_path_available": true
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let dispatch_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_mission_dispatch_audits WHERE plan_id = 'plan-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(dispatch_audits, 0);
+    let permission_audits: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM collab_permission_audits
+        WHERE actor_id = 'viewer-1'
+          AND action = 'dispatch'
+          AND allowed = 0
+        "#,
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(permission_audits, 1);
 
     Ok(())
 }
@@ -3954,6 +9966,171 @@ async fn fleet_health_indicators_persist_timeseries_and_explicit_gaps() -> Resul
             .fetch_one(&ctx.pool)
             .await?;
     assert_eq!(backfilled_points, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fleet_health_ingests_tractor_health_and_blocks_overdue_service() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_tractor_registry_field(&ctx).await?;
+
+    let tractor_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tractors")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tractor_id": "tractor-health-001",
+                        "org_id": "org-alpha",
+                        "field_id": "field-tractor",
+                        "capabilities": ["sprayer"],
+                        "implement_ref": {
+                            "implement_id": "implement-sprayer-health",
+                            "implement_type": "sprayer",
+                            "working_width_m": 6.0
+                        },
+                        "status": "available"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(tractor_response.status(), StatusCode::OK);
+
+    let ingest_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tractors/tractor-health-001/fleet-health")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "vehicle_id": "ignored-by-path",
+                        "checked_at": "2026-06-12T13:00:00Z",
+                        "component": {
+                            "component_id": "tractor-hydraulic-pump-1",
+                            "component_type": "motor",
+                            "serial": "TRACTOR-PUMP-001",
+                            "airframe_id": null,
+                            "installed_at": "2026-06-01T10:00:00Z",
+                            "removed_at": null,
+                            "service_history": [],
+                            "flight_hours": 155.0,
+                            "cycles": 0,
+                            "duty_score": 12.0,
+                            "created_at": "2026-06-01T10:05:00Z",
+                            "updated_at": "2026-06-12T13:00:00Z"
+                        },
+                        "service_limit": {
+                            "component_id": "tractor-hydraulic-pump-1",
+                            "max_flight_hours": 150.0,
+                            "max_cycles": null,
+                            "max_duty_score": null
+                        },
+                        "health_verdict": {
+                            "component_id": "tractor-hydraulic-pump-1",
+                            "evaluated_at": "2026-06-12T12:30:00Z",
+                            "method_version": "fleet-health-thresholds-v1",
+                            "status": "ok",
+                            "reason_code": "all_indicators_within_threshold",
+                            "indicator": "motor_vibration",
+                            "threshold": 1.0,
+                            "value": 0.40,
+                            "freshness": "fresh",
+                            "evidence": [{
+                                "indicator": "motor_vibration",
+                                "value": 0.40,
+                                "threshold": 1.0,
+                                "status": "ok",
+                                "reason_code": "all_indicators_within_threshold",
+                                "sample_ts": "2026-06-12T12:29:00Z",
+                                "source_ref": "14:tractor-health-001:telemetry",
+                                "freshness": "fresh"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+    let body = to_bytes(ingest_response.into_body(), 128 * 1024).await?;
+    let integration: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        integration
+            .get("vehicle_id")
+            .and_then(|value| value.as_str()),
+        Some("tractor-health-001")
+    );
+    assert_eq!(
+        integration
+            .pointer("/component/airframe_id")
+            .and_then(|value| value.as_str()),
+        Some("tractor-health-001")
+    );
+    assert_eq!(
+        integration
+            .pointer("/readiness_decision/status")
+            .and_then(|value| value.as_str()),
+        Some("blocked")
+    );
+    assert_eq!(
+        integration
+            .pointer("/readiness_decision/blockers/0/reason_code")
+            .and_then(|value| value.as_str()),
+        Some("overdue_service_hours")
+    );
+    assert_eq!(
+        integration
+            .pointer("/dashboard/aircraft/0/status")
+            .and_then(|value| value.as_str()),
+        Some("blocked")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fleet-health/components?airframe_id=tractor-health-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let components: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(components.len(), 1);
+    assert_eq!(
+        components[0]
+            .get("component_id")
+            .and_then(|value| value.as_str()),
+        Some("tractor-hydraulic-pump-1")
+    );
+
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fleet_component_events WHERE component_id = ?1 AND event_type = ?2",
+    )
+    .bind("tractor-hydraulic-pump-1")
+    .bind("ground_vehicle_health_ingested")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(event_count, 1);
 
     Ok(())
 }
@@ -6437,6 +12614,172 @@ async fn crop_intelligence_inference_run_submit_status_and_result_roundtrip() ->
 }
 
 #[tokio::test]
+async fn crop_intelligence_inference_progress_streams_and_flags_stalls() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "crop-progress-scene";
+    seed_orthomosaic_publish_product(&ctx, scene_id, "orthomosaic").await?;
+    post_orthomosaic_publish_gate(&ctx, scene_id, "orthomosaic", "publishable").await?;
+
+    let submit = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/inference-runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "run_id": "crop-run-progress",
+                        "mosaic_ref": format!("{scene_id}:orthomosaic"),
+                        "field_id": "ortho-field-1",
+                        "season_id": "season-2026"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(submit.status(), StatusCode::OK);
+
+    for (tiles_done, observed_at) in [
+        (2_u64, "2026-06-13T15:01:00Z"),
+        (6_u64, "2026-06-13T15:02:00Z"),
+    ] {
+        let progress = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/crop-intelligence/inference-runs/crop-run-progress/progress")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "run_id": "ignored-client-run-id",
+                            "tiles_total": 10,
+                            "tiles_done": tiles_done,
+                            "stage": "tile_inference",
+                            "observed_at": observed_at
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(progress.status(), StatusCode::OK);
+    }
+
+    let listed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/crop-intelligence/inference-runs/crop-run-progress/progress")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body = to_bytes(listed.into_body(), 64 * 1024).await?;
+    let stream: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stream
+            .pointer("/events/0/tiles_done")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        stream
+            .pointer("/latest/coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(0.6)
+    );
+    assert_eq!(
+        stream
+            .pointer("/latest/stage")
+            .and_then(|value| value.as_str()),
+        Some("tile_inference")
+    );
+
+    let healthy = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/inference-runs/crop-run-progress/stall-check")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "detected_at": "2026-06-13T15:06:59Z",
+                        "stall_window_seconds": 300
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(healthy.status(), StatusCode::OK);
+    let body = to_bytes(healthy.into_body(), 64 * 1024).await?;
+    assert_eq!(String::from_utf8(body.to_vec())?, "null");
+
+    let stalled = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/inference-runs/crop-run-progress/stall-check")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "detected_at": "2026-06-13T15:07:00Z",
+                        "stall_window_seconds": 300
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stalled.status(), StatusCode::OK);
+    let body = to_bytes(stalled.into_body(), 64 * 1024).await?;
+    let stalled: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stalled.get("flagged").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        stalled
+            .get("last_progress_at")
+            .and_then(|value| value.as_str()),
+        Some("2026-06-13T15:02:00Z")
+    );
+
+    let progress_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crop_inference_progress WHERE run_id = 'crop-run-progress'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(progress_count, 2);
+    let stall_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crop_inference_stall_events WHERE run_id = 'crop-run-progress' AND flagged = 1",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stall_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn crop_intelligence_inference_run_rejects_unpublished_mosaic_without_writing() -> Result<()>
 {
     let tmp = TempDir::new()?;
@@ -7052,6 +13395,201 @@ async fn crop_intelligence_rejects_uncited_finding_emission() -> Result<()> {
 }
 
 #[tokio::test]
+async fn crop_intelligence_closed_loop_proposal_is_advisory_and_approval_gated() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let verified_finding = json!({
+        "finding_id": "finding-closed-loop-1",
+        "finding_type": "weed_mapping",
+        "field_id": "field-closed-loop",
+        "zone_id": "zone-a",
+        "detection_id": "weed:tile-1:1",
+        "label": "waterhemp",
+        "confidence": 0.86,
+        "evidence_tile_refs": ["tile-1"],
+        "evidence_refs": [
+            "detection:weed:tile-1:1",
+            "model:weed-detector@2026.06.1",
+            "tile:tile-1",
+            "verification:confirmed"
+        ],
+        "model_version": {
+            "model_id": "weed-detector",
+            "version": "2026.06.1"
+        },
+        "verification_state": "confirmed",
+        "zone_geometry": {
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -96.60,
+                "min_lat": 41.18,
+                "max_lon": -96.55,
+                "max_lat": 41.22
+            }
+        },
+        "emitted_at": "2026-06-12T15:00:00Z"
+    });
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/closed-loop-proposals")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "proposal_id": "proposal-closed-loop-1",
+                        "action": "refly_and_treatment",
+                        "findings": [verified_finding],
+                        "requested_by": "agronomist-7",
+                        "created_at": "2026-06-12T15:05:00Z",
+                        "confidence_floor": 0.75,
+                        "treatment_prescription_ref": "rx:weed:field-closed-loop"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let proposal: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        proposal.get("proposal_id").and_then(|value| value.as_str()),
+        Some("proposal-closed-loop-1")
+    );
+    assert_eq!(
+        proposal
+            .get("approval_status")
+            .and_then(|value| value.as_str()),
+        Some("pending")
+    );
+    assert_eq!(
+        proposal
+            .get("approval_required")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        proposal
+            .get("dispatch_authorized")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        proposal
+            .pointer("/refly_area/bbox/min_lon")
+            .and_then(|value| value.as_f64()),
+        Some(-96.60)
+    );
+    assert!(proposal
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .expect("proposal should cite evidence")
+        .iter()
+        .any(|value| value == "treatment_prescription:rx:weed:field-closed-loop"));
+
+    let stored_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/crop-intelligence/closed-loop-proposals/proposal-closed-loop-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stored_response.status(), StatusCode::OK);
+    let body = to_bytes(stored_response.into_body(), 64 * 1024).await?;
+    let stored: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stored
+            .get("dispatch_authorized")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    let mission_dispatch_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM collab_mission_dispatch_audits")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(mission_dispatch_count, 0);
+    let tractor_audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tractor_command_audits")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(tractor_audit_count, 0);
+
+    let refused = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/closed-loop-proposals")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "proposal_id": "proposal-closed-loop-refused",
+                        "action": "refly",
+                        "findings": [{
+                            "finding_id": "finding-unverified",
+                            "finding_type": "disease_detection",
+                            "field_id": "field-closed-loop",
+                            "detection_id": "disease:tile-2:1",
+                            "label": "northern_leaf_blight",
+                            "confidence": 0.62,
+                            "evidence_tile_refs": ["tile-2"],
+                            "evidence_refs": ["detection:disease:tile-2:1", "tile:tile-2"],
+                            "model_version": {
+                                "model_id": "lesion-detector",
+                                "version": "2026.06.1"
+                            },
+                            "verification_state": "unverified",
+                            "zone_geometry": {
+                                "crs": "EPSG:4326",
+                                "bbox": {
+                                    "min_lon": -96.50,
+                                    "min_lat": 41.10,
+                                    "max_lon": -96.45,
+                                    "max_lat": 41.15
+                                }
+                            },
+                            "emitted_at": "2026-06-12T15:00:00Z"
+                        }],
+                        "requested_by": "agronomist-7",
+                        "created_at": "2026-06-12T15:10:00Z",
+                        "confidence_floor": 0.75
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(refused.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("finding finding-unverified is not human verified"));
+    let proposal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crop_closed_loop_proposals WHERE proposal_id = 'proposal-closed-loop-refused'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(proposal_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn compliance_records_create_list_append_versions_and_refuse_delete() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -7550,6 +14088,300 @@ async fn compliance_audit_report_export_rejects_missing_mandatory_records() -> R
     let body = to_bytes(response.into_body(), 64 * 1024).await?;
     let message = String::from_utf8(body.to_vec())?;
     assert!(message.contains("missing mandatory compliance records: chemical_application"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn compliance_authority_exports_share_and_revoke_bounded_links() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_compliance_field(&ctx, "field-north", "org-alpha").await?;
+    seed_compliance_export_records(&ctx).await?;
+
+    let export_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/reports/authority-export")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "authority_format": "faa_remote_id",
+                        "report_id": "report-field-north",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:05:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application",
+                            "operator_certification",
+                            "authorization_decision"
+                        ],
+                        "residency_tag": "us",
+                        "storage_region": "us-east-1",
+                        "retention_class": "audit_evidence"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(export_response.status(), StatusCode::OK);
+    let body = to_bytes(export_response.into_body(), 128 * 1024).await?;
+    let export: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        export
+            .get("schema_version")
+            .and_then(|value| value.as_str()),
+        Some("compliance.authority_export.v1")
+    );
+    assert_eq!(
+        export
+            .get("authority_format")
+            .and_then(|value| value.as_str()),
+        Some("faa_remote_id")
+    );
+    assert_eq!(
+        export
+            .pointer("/payload/remote_id_logs/0/record_id")
+            .and_then(|value| value.as_str()),
+        Some("remote-log-1")
+    );
+    assert_eq!(
+        export.get("residency_tag").and_then(|value| value.as_str()),
+        Some("us")
+    );
+
+    let share_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/reports/authority-shares")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "share_id": "share-faa-1",
+                        "authority_format": "faa_remote_id",
+                        "report_id": "report-field-north",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:05:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application",
+                            "operator_certification",
+                            "authorization_decision"
+                        ],
+                        "residency_tag": "us",
+                        "storage_region": "us-east-1",
+                        "retention_class": "audit_evidence",
+                        "created_at": "2026-06-13T12:10:00Z",
+                        "expires_at": "2026-06-20T12:10:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(share_response.status(), StatusCode::OK);
+    let body = to_bytes(share_response.into_body(), 128 * 1024).await?;
+    let share: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        share.get("url_path").and_then(|value| value.as_str()),
+        Some("/api/compliance/authority-shares/share-faa-1")
+    );
+    assert_eq!(share.get("revoked_at"), Some(&serde_json::Value::Null));
+
+    let download = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/compliance/authority-shares/share-faa-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(download.status(), StatusCode::OK);
+
+    let revoke = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/authority-shares/share-faa-1/revoke")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor": "compliance-officer-1",
+                        "revoked_at": "2026-06-14T12:10:00Z"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(revoke.status(), StatusCode::OK);
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/compliance/authority-shares/share-faa-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM compliance_authority_share_events WHERE share_id = 'share-faa-1'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(events, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn compliance_regulation_assist_cites_records_and_refuses_authorization() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_compliance_field(&ctx, "field-north", "org-alpha").await?;
+    seed_compliance_export_records(&ctx).await?;
+
+    let summary_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/regulation-assist")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "assist_id": "assist-field-north",
+                        "intent": "summary",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:20:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application",
+                            "operator_certification",
+                            "authorization_decision"
+                        ],
+                        "rule_citations": [
+                            {
+                                "rule_ref": "rule:faa:remote-id",
+                                "title": "FAA Remote ID flight log submission"
+                            },
+                            {
+                                "rule_ref": "rule:state:pesticide-application",
+                                "title": "State pesticide application filing"
+                            }
+                        ],
+                        "feature_enabled": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(summary_response.status(), StatusCode::OK);
+    let body = to_bytes(summary_response.into_body(), 128 * 1024).await?;
+    let assist: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        assist.get("assist_id").and_then(|value| value.as_str()),
+        Some("assist-field-north")
+    );
+    assert_eq!(
+        assist
+            .get("can_authorize")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        assist
+            .get("can_clear_violation")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert!(assist
+        .get("source_record_refs")
+        .and_then(|value| value.as_array())
+        .expect("assist should cite source records")
+        .iter()
+        .any(|value| value == "compliance_record:remote-log-1@v1"));
+    assert!(assist
+        .get("rule_refs")
+        .and_then(|value| value.as_array())
+        .expect("assist should cite rules")
+        .iter()
+        .any(|value| value == "rule:faa:remote-id"));
+    assert!(assist
+        .get("summary")
+        .and_then(|value| value.as_str())
+        .expect("assist should summarize")
+        .contains("Deterministic gates remain authoritative"));
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/regulation-assist")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "assist_id": "assist-denied",
+                        "intent": "authorize_flight",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:25:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application",
+                            "operator_certification",
+                            "authorization_decision"
+                        ],
+                        "rule_citations": [
+                            {
+                                "rule_ref": "rule:faa:remote-id",
+                                "title": "FAA Remote ID flight log submission"
+                            }
+                        ],
+                        "feature_enabled": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(denied.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("use the deterministic gate"));
 
     Ok(())
 }
@@ -8079,6 +14911,7 @@ async fn acceptance_generate_and_retrieve_report() -> Result<()> {
                         "category": "irrigation",
                         "priority": "medium",
                         "status": "open",
+                        "evidence_refs": ["finding:09:retracted-zone"],
                         "annotation_ids": ["accept-ann-1"]
                     })
                     .to_string(),
@@ -8117,6 +14950,7 @@ async fn acceptance_generate_and_retrieve_report() -> Result<()> {
 
     let download_response = ctx
         .app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -8130,6 +14964,47 @@ async fn acceptance_generate_and_retrieve_report() -> Result<()> {
         .await
         .expect("router should handle request");
     assert_eq!(download_response.status(), StatusCode::OK);
+
+    let lineage_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/scenes/{}/reports/{}/lineage",
+                    fixture.scene_id, report_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(lineage_response.status(), StatusCode::OK);
+    let body = to_bytes(lineage_response.into_body(), 128 * 1024).await?;
+    let lineage_json: serde_json::Value = serde_json::from_slice(&body)?;
+    let artifact_ids = lineage_json
+        .get("records")
+        .and_then(|value| value.as_array())
+        .expect("lineage records should exist")
+        .iter()
+        .filter_map(|record| record.get("artifact_id").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    assert!(artifact_ids
+        .iter()
+        .any(|artifact_id| *artifact_id == format!("report:{report_id}")));
+    assert!(artifact_ids
+        .iter()
+        .any(|artifact_id| artifact_id.starts_with("scene:")));
+    assert!(artifact_ids.contains(&"annotation:accept-ann-1"));
+    assert!(artifact_ids
+        .iter()
+        .any(|artifact_id| artifact_id.starts_with("recommendation:")));
+    assert_eq!(
+        lineage_json
+            .pointer("/gaps/0/missing_artifact_id")
+            .and_then(|value| value.as_str()),
+        Some("finding:09:retracted-zone")
+    );
 
     Ok(())
 }
@@ -8773,6 +15648,40 @@ async fn recommendation_creation_rejects_dangling_annotation_reference() -> Resu
     assert_eq!(dangling_update_response.status(), StatusCode::BAD_REQUEST);
     let dangling_update_body = to_bytes(dangling_update_response.into_body(), 64 * 1024).await?;
     assert!(String::from_utf8_lossy(&dangling_update_body).contains("does not exist on this scene"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mobile_spa_serves_search_analyze_ui_with_error_surface() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/app")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 256 * 1024).await?;
+    let html = String::from_utf8_lossy(&body);
+
+    assert!(html.contains("/api/mobile/scenes/search"));
+    assert!(html.contains("/api/mobile/analyze"));
+    assert!(html.contains("renderSceneList(state.scenes)"));
+    assert!(html.contains("scene.cloud_cover"));
+    assert!(html.contains("formatSceneDate(scene.acquired_at)"));
+    assert!(html.contains("setStatus(error.message || \"Scene search failed.\", \"error\")"));
+    assert!(html.contains("setStatus(error.message || \"Analysis failed.\", \"error\")"));
+    assert!(html.contains("Server response is not valid JSON."));
 
     Ok(())
 }
@@ -9483,6 +16392,207 @@ async fn empty_recommendation_exports_are_schema_valid() -> Result<()> {
 }
 
 #[tokio::test]
+async fn field_record_bundle_exports_csv_and_geojson() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+    create_acceptance_annotation(&ctx, &fixture.scene_id).await?;
+
+    let recommendation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{}/recommendations", fixture.scene_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recommendation_id": "field-bundle-rec-1",
+                        "title": "Bundle irrigation check",
+                        "category": "irrigation",
+                        "priority": "high",
+                        "status": "open",
+                        "annotation_ids": ["accept-ann-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(recommendation_response.status(), StatusCode::OK);
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fields/{}/exports/records.csv",
+                    fixture.field_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    assert_eq!(
+        csv_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(
+        csv_reader.headers()?.iter().collect::<Vec<_>>(),
+        vec![
+            "record_type",
+            "record_id",
+            "scene_id",
+            "field_id",
+            "crs",
+            "title",
+            "label",
+            "status",
+            "priority",
+            "evidence_refs",
+            "annotation_ids",
+            "geometry_type",
+            "geometry_json",
+            "created_at",
+            "updated_at"
+        ]
+    );
+    let rows = csv_reader.records().collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get(0), Some("annotation"));
+    assert_eq!(rows[0].get(1), Some("accept-ann-1"));
+    assert_eq!(rows[0].get(3), Some(fixture.field_id.as_str()));
+    assert_eq!(rows[1].get(0), Some("recommendation"));
+    assert_eq!(rows[1].get(1), Some("field-bundle-rec-1"));
+    assert_eq!(rows[1].get(5), Some("Bundle irrigation check"));
+    assert_eq!(rows[1].get(10), Some("accept-ann-1"));
+
+    let geojson_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fields/{}/exports/records.geojson",
+                    fixture.field_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson
+            .pointer("/crs/properties/name")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    let features = geojson
+        .get("features")
+        .and_then(|value| value.as_array())
+        .expect("features should exist");
+    assert_eq!(features.len(), 3);
+    assert!(features.iter().any(|feature| {
+        feature
+            .pointer("/properties/field_id")
+            .and_then(|value| value.as_str())
+            == Some(fixture.field_id.as_str())
+    }));
+    assert!(features.iter().any(|feature| {
+        feature
+            .pointer("/properties/annotation_id")
+            .and_then(|value| value.as_str())
+            == Some("accept-ann-1")
+    }));
+    assert!(features.iter().any(|feature| {
+        feature
+            .pointer("/properties/recommendation_id")
+            .and_then(|value| value.as_str())
+            == Some("field-bundle-rec-1")
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_field_record_bundle_exports_valid_empty_records() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+
+    let csv_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fields/{}/exports/records.csv",
+                    fixture.field_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(csv_response.status(), StatusCode::OK);
+    let body = to_bytes(csv_response.into_body(), 64 * 1024).await?;
+    let mut csv_reader = csv::Reader::from_reader(body.as_ref());
+    assert_eq!(csv_reader.records().count(), 0);
+
+    let geojson_response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/fields/{}/exports/records.geojson",
+                    fixture.field_id
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(geojson_response.status(), StatusCode::OK);
+    let body = to_bytes(geojson_response.into_body(), 64 * 1024).await?;
+    let geojson: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        geojson.get("type").and_then(|value| value.as_str()),
+        Some("FeatureCollection")
+    );
+    assert_eq!(
+        geojson
+            .get("features")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        geojson
+            .pointer("/features/0/properties/field_id")
+            .and_then(|value| value.as_str()),
+        Some(fixture.field_id.as_str())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn layer_geotiff_export_round_trips_spatial_metadata() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
@@ -10037,7 +17147,6 @@ async fn scene_detail_returns_persisted_spatial_ref_roundtrip() -> Result<()> {
             "y": 0.05
         }
     });
-
     insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref.clone()).await?;
 
     let response = ctx
@@ -10095,6 +17204,21 @@ async fn list_layers_filters_and_returns_spatial_ref_metadata() -> Result<()> {
             "y": 0.05
         }
     });
+    insert_layer_field(
+        &ctx,
+        "field-alpha",
+        json!({
+            "crs": "EPSG:4326",
+            "coordinates": [
+                { "longitude": -96.7, "latitude": 41.1 },
+                { "longitude": -96.6, "latitude": 41.1 },
+                { "longitude": -96.6, "latitude": 41.2 },
+                { "longitude": -96.7, "latitude": 41.2 },
+                { "longitude": -96.7, "latitude": 41.1 }
+            ]
+        }),
+    )
+    .await?;
 
     let first_scene = "layer-scene-older";
     let first_dir = ctx.data_root.join("scenes").join(first_scene);
@@ -10123,7 +17247,7 @@ async fn list_layers_filters_and_returns_spatial_ref_metadata() -> Result<()> {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/layers?field_id=field-alpha&season_id=2026&product_kind=ndvi&page=1&page_size=1")
+                .uri("/api/layers?field_id=field-alpha&season_id=2026&product_kind=ndvi&page=1&page_size=1&stale_after_days=7")
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -10168,6 +17292,24 @@ async fn list_layers_filters_and_returns_spatial_ref_metadata() -> Result<()> {
     );
     assert_eq!(
         layers_json
+            .pointer("/layers/0/freshness/stale_after_days")
+            .and_then(|value| value.as_i64()),
+        Some(7)
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/freshness/field_coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(1.0)
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/freshness/field_coverage_status")
+            .and_then(|value| value.as_str()),
+        Some("full")
+    );
+    assert_eq!(
+        layers_json
             .pointer("/layers/0/source")
             .and_then(|value| value.as_str()),
         Some("landsat:/newer-source")
@@ -10196,6 +17338,82 @@ async fn list_layers_filters_and_returns_spatial_ref_metadata() -> Result<()> {
             .pointer("/layers/0/scene_id")
             .and_then(|value| value.as_str()),
         Some(first_scene)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_layers_reports_no_field_coverage_for_non_intersecting_extent() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    insert_layer_field(
+        &ctx,
+        "field-alpha",
+        json!({
+            "crs": "EPSG:4326",
+            "coordinates": [
+                { "longitude": -96.7, "latitude": 41.1 },
+                { "longitude": -96.6, "latitude": 41.1 },
+                { "longitude": -96.6, "latitude": 41.2 },
+                { "longitude": -96.7, "latitude": 41.2 },
+                { "longitude": -96.7, "latitude": 41.1 }
+            ]
+        }),
+    )
+    .await?;
+    let scene_id = "layer-scene-outside-field";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(
+        &ctx,
+        scene_id,
+        &scene_dir,
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -97.7,
+                "min_lat": 40.1,
+                "max_lon": -97.6,
+                "max_lat": 40.2
+            },
+            "geo_transform": [-97.7, 0.05, 0.0, 40.2, 0.0, -0.05],
+            "resolution": {
+                "x": 0.05,
+                "y": 0.05
+            }
+        }),
+    )
+    .await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/layers?field_id=field-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let layers_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/freshness/field_coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(0.0)
+    );
+    assert_eq!(
+        layers_json
+            .pointer("/layers/0/freshness/field_coverage_status")
+            .and_then(|value| value.as_str()),
+        Some("no_coverage")
     );
 
     Ok(())
@@ -10270,6 +17488,182 @@ async fn layer_metadata_endpoint_returns_asserted_spatial_ref() -> Result<()> {
             .and_then(|value| value.as_str()),
         Some("2026-05-01T00:00:00Z")
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_data_publish_lists_anonymized_layer_with_license_and_extent() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "open-data-scene";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    let spatial_ref = json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    });
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, spatial_ref).await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let publish = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/layers/{scene_id}/ndvi/open-data"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "license": "CC-BY-4.0",
+                        "attribution": "AGBot open data"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(publish.status(), StatusCode::OK);
+    let publish_body = to_bytes(publish.into_body(), 64 * 1024).await?;
+    let published: serde_json::Value = serde_json::from_slice(&publish_body)?;
+    assert_eq!(
+        published.get("license").and_then(|value| value.as_str()),
+        Some("CC-BY-4.0")
+    );
+    assert_eq!(
+        published
+            .pointer("/spatial_ref/bbox/min_lon")
+            .and_then(|value| value.as_f64()),
+        Some(-96.7)
+    );
+    assert!(published.get("field_id").is_none());
+    assert!(published.get("owner").is_none());
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/open-data/layers")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let catalog: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        catalog
+            .pointer("/layers/0/open_data_id")
+            .and_then(|value| value.as_str()),
+        Some("open-data:open-data-scene:ndvi")
+    );
+    assert_eq!(
+        catalog
+            .pointer("/layers/0/license")
+            .and_then(|value| value.as_str()),
+        Some("CC-BY-4.0")
+    );
+    assert_eq!(
+        catalog
+            .pointer("/layers/0/spatial_ref/crs")
+            .and_then(|value| value.as_str()),
+        Some("EPSG:4326")
+    );
+    assert!(
+        catalog.pointer("/layers/0/field_id").is_none(),
+        "catalog must not expose field identifiers"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_data_publish_refuses_missing_license() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "open-data-missing-license";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, layer_spatial_ref_json()).await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/layers/{scene_id}/ndvi/open-data"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "license": " ",
+                        "attribution": "AGBot open data"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("missinglicense"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_data_publish_refuses_deanonymizing_field_identifier() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "open-data-field-ref";
+    let scene_dir = ctx.data_root.join("scenes").join(scene_id);
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(&ctx, scene_id, &scene_dir, layer_spatial_ref_json()).await?;
+    link_scene_context(&ctx, scene_id, "field-alpha", "2026").await?;
+    insert_layer_product(&ctx, scene_id, "ndvi").await?;
+
+    let response = ctx
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/layers/{scene_id}/ndvi/open-data"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "license": "CC-BY-4.0",
+                        "attribution": "AGBot open data",
+                        "field_identifier": "field-alpha"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("fieldidentifierpresent"));
 
     Ok(())
 }
@@ -11018,6 +18412,428 @@ async fn seed_marketplace_org(ctx: &TestContext, farm_id: &str, org_id: &str) ->
     Ok(())
 }
 
+async fn seed_marketplace_account(
+    ctx: &TestContext,
+    account_id: &str,
+    org_id: &str,
+    party_type: &str,
+) -> Result<()> {
+    seed_marketplace_account_with_roles(
+        ctx,
+        account_id,
+        org_id,
+        party_type,
+        &["marketplace:seller"],
+    )
+    .await
+}
+
+async fn seed_marketplace_account_with_roles(
+    ctx: &TestContext,
+    account_id: &str,
+    org_id: &str,
+    party_type: &str,
+    role_refs: &[&str],
+) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/accounts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "account_id": account_id,
+                        "org_id": org_id,
+                        "party_type": party_type,
+                        "role_refs": role_refs
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_marketplace_catalog_item(
+    ctx: &TestContext,
+    item_id: &str,
+    org_id: &str,
+    owner_account_id: &str,
+) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/catalog/items")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "item_id": item_id,
+                        "org_id": org_id,
+                        "kind": "input",
+                        "category": "seed",
+                        "name": "Hybrid corn seed",
+                        "unit_of_measure": "bag",
+                        "owner_account_id": owner_account_id
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn marketplace_inventory_adjust(
+    ctx: &TestContext,
+    inventory_id: &str,
+    action: &str,
+    org_id: &str,
+    qty: f64,
+) -> Result<Response> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/marketplace/inventory/{inventory_id}/{action}"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "org_id": org_id,
+                        "qty": qty
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    Ok(response)
+}
+
+async fn seed_marketplace_order_dependencies(ctx: &TestContext) -> Result<()> {
+    seed_marketplace_org(ctx, "farm-market-alpha", "org-alpha").await?;
+    seed_marketplace_account(ctx, "supplier-001", "org-alpha", "supplier").await?;
+    seed_marketplace_account_with_roles(
+        ctx,
+        "buyer-001",
+        "org-alpha",
+        "grower",
+        &["marketplace:buyer"],
+    )
+    .await?;
+    seed_marketplace_catalog_item(ctx, "seed-corn-001", "org-alpha", "supplier-001").await?;
+
+    let listing = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/listings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "listing_id": "listing-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "price": 125.0,
+                        "currency": "USD",
+                        "available_qty": 40.0,
+                        "window": {
+                            "from": "2026-06-14T09:00:00Z",
+                            "to": "2026-07-14T09:00:00Z"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(listing.status(), StatusCode::OK);
+
+    let inventory = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/inventory")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "inventory_id": "inventory-seed-corn-001",
+                        "item_id": "seed-corn-001",
+                        "org_id": "org-alpha",
+                        "on_hand": 40.0,
+                        "reserved": 0.0
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(inventory.status(), StatusCode::OK);
+
+    Ok(())
+}
+
+async fn marketplace_order_transition(
+    ctx: &TestContext,
+    order_id: &str,
+    status: &str,
+) -> Result<StatusCode> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/marketplace/orders/{order_id}/transition"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "org_id": "org-alpha",
+                        "actor_id": "supplier-001",
+                        "status": status
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    Ok(response.status())
+}
+
+async fn seed_marketplace_order(ctx: &TestContext, order_id: &str, qty: f64) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/orders")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "order_id": order_id,
+                        "org_id": "org-alpha",
+                        "listing_ref": "listing-seed-corn-001",
+                        "buyer_account_id": "buyer-001",
+                        "qty": qty
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn create_marketplace_fulfillment(
+    ctx: &TestContext,
+    fulfillment_id: &str,
+    order_ref: &str,
+    org_id: &str,
+) -> Result<Response> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/fulfillments")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "fulfillment_id": fulfillment_id,
+                        "order_ref": order_ref,
+                        "org_id": org_id,
+                        "carrier_ref": "carrier:opaque",
+                        "tracking_ref": "tracking:opaque",
+                        "actor_id": "ops-001"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    Ok(response)
+}
+
+async fn marketplace_fulfillment_transition(
+    ctx: &TestContext,
+    fulfillment_id: &str,
+    status: &str,
+) -> Result<StatusCode> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/marketplace/fulfillments/{fulfillment_id}/transition"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "org_id": "org-alpha",
+                        "actor_id": "ops-001",
+                        "status": status
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    Ok(response.status())
+}
+
+async fn create_marketplace_rating(
+    ctx: &TestContext,
+    rating_id: &str,
+    order_ref: &str,
+    rater_account_id: &str,
+    ratee_account_id: &str,
+    score: f64,
+) -> Result<Response> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/marketplace/ratings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "rating_id": rating_id,
+                        "order_ref": order_ref,
+                        "rater_account_id": rater_account_id,
+                        "ratee_account_id": ratee_account_id,
+                        "score": score,
+                        "comment": "Reliable counterparty",
+                        "org_scope": "org-alpha"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    Ok(response)
+}
+
+async fn seed_marketplace_demand_field(
+    ctx: &TestContext,
+    field_id: &str,
+    org_id: &str,
+) -> Result<()> {
+    seed_marketplace_org(ctx, "farm-market-alpha", org_id).await?;
+    let field = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/fields")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "field_id": field_id,
+                        "farm_id": "farm-market-alpha",
+                        "owner": org_id,
+                        "name": "Demand Field",
+                        "crop": "corn",
+                        "season": "2026",
+                        "boundary": {
+                            "crs": "EPSG:4326",
+                            "coordinates": [
+                                { "longitude": -96.7, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.1 },
+                                { "longitude": -96.2, "latitude": 41.4 },
+                                { "longitude": -96.7, "latitude": 41.1 }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(field.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn seed_marketplace_demand_product(
+    ctx: &TestContext,
+    product_id: &str,
+    field_id: &str,
+    kind: &str,
+) -> Result<()> {
+    let scene_id = format!("scene-{product_id}");
+    sqlx::query(
+        r#"
+        INSERT INTO scenes (
+            scene_id, owner, sensor, acquired_at, data_path, metadata_json,
+            cloud_cover, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&scene_id)
+    .bind("org-alpha")
+    .bind("multispectral")
+    .bind("2026-06-15T09:00:00Z")
+    .bind(format!("/tmp/{scene_id}"))
+    .bind("{}")
+    .bind(0.0_f64)
+    .bind("2026-06-15T09:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO products (
+            product_id, scene_id, field_id, season_id, kind, path, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(product_id)
+    .bind(scene_id)
+    .bind(field_id)
+    .bind("2026")
+    .bind(kind)
+    .bind(format!("/tmp/{product_id}.tif"))
+    .bind("2026-06-15T09:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
+}
+
 async fn seed_sustainability_field(
     ctx: &TestContext,
     farm_id: &str,
@@ -11078,6 +18894,566 @@ async fn seed_sustainability_field(
         .expect("router should handle request");
     assert_eq!(field_response.status(), StatusCode::OK);
     Ok(())
+}
+
+async fn seed_sustainability_record(
+    ctx: &TestContext,
+    farm_id: &str,
+    field_id: &str,
+    season_id: &str,
+    record_id: &str,
+    operation_id: &str,
+) -> Result<()> {
+    seed_sustainability_metric_record(
+        ctx,
+        farm_id,
+        field_id,
+        season_id,
+        record_id,
+        operation_id,
+        "carbon_footprint",
+    )
+    .await
+}
+
+async fn seed_sustainability_metric_record(
+    ctx: &TestContext,
+    farm_id: &str,
+    field_id: &str,
+    season_id: &str,
+    record_id: &str,
+    operation_id: &str,
+    metric_type: &str,
+) -> Result<()> {
+    seed_sustainability_field(ctx, farm_id, field_id, season_id).await?;
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sustainability/records")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "record_id": record_id,
+                        "field_id": field_id,
+                        "season_id": season_id,
+                        "operation_id": operation_id,
+                        "metric_type": metric_type,
+                        "method_version": "carbon.identity.v1"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+fn carbon_footprint_payload(footprint_id: &str, include_required: bool) -> serde_json::Value {
+    let mut inputs = vec![
+        json!({
+            "kind": "diesel_liters",
+            "quantity": 10.0,
+            "unit": "liters",
+            "evidence_ref": "input:fuel-log-001"
+        }),
+        json!({
+            "kind": "fertilizer_nitrogen_kg",
+            "quantity": 20.0,
+            "unit": "kg_n",
+            "evidence_ref": "input:fertilizer-ticket-001"
+        }),
+        json!({
+            "kind": "electricity_kwh",
+            "quantity": 15.0,
+            "unit": "kwh",
+            "evidence_ref": "input:meter-001"
+        }),
+        json!({
+            "kind": "field_passes",
+            "quantity": 2.0,
+            "unit": "passes",
+            "evidence_ref": "input:coverage-log-001"
+        }),
+    ];
+    let mut factors = vec![
+        json!({
+            "input_kind": "diesel_liters",
+            "factor_kg_co2e_per_unit": 2.68,
+            "factor_ref": "factor:diesel:v1"
+        }),
+        json!({
+            "input_kind": "fertilizer_nitrogen_kg",
+            "factor_kg_co2e_per_unit": 6.3,
+            "factor_ref": "factor:nitrogen:v1"
+        }),
+        json!({
+            "input_kind": "electricity_kwh",
+            "factor_kg_co2e_per_unit": 0.4,
+            "factor_ref": "factor:electricity:v1"
+        }),
+        json!({
+            "input_kind": "field_passes",
+            "factor_kg_co2e_per_unit": 5.0,
+            "factor_ref": "factor:field-pass:v1"
+        }),
+    ];
+    if !include_required {
+        inputs.retain(|input| {
+            input.get("kind").and_then(|kind| kind.as_str()) != Some("field_passes")
+        });
+        factors.retain(|factor| {
+            factor.get("input_kind").and_then(|kind| kind.as_str()) != Some("field_passes")
+        });
+    }
+
+    json!({
+        "footprint_id": footprint_id,
+        "record_id": if include_required { "sustain-carbon-001" } else { "sustain-carbon-missing" },
+        "operation_id": "operation-carbon-001",
+        "inputs": inputs,
+        "factor_set": {
+            "version": "agbot-carbon-factors-v1",
+            "factors": factors
+        }
+    })
+}
+
+fn biomass_estimate_payload(estimate_id: &str, mismatched_extent: bool) -> serde_json::Value {
+    let index_spatial_ref = if mismatched_extent {
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:32614",
+            "bbox": {
+                "min_lon": 0.0,
+                "min_lat": 10.0,
+                "max_lon": 20.0,
+                "max_lat": 30.0
+            },
+            "geo_transform": [0.0, 10.0, 0.0, 30.0, 0.0, -10.0],
+            "resolution": { "x": 10.0, "y": 10.0 }
+        })
+    } else {
+        biomass_spatial_ref()
+    };
+
+    json!({
+        "estimate_id": estimate_id,
+        "record_id": if mismatched_extent { "sustain-biomass-mismatch" } else { "sustain-biomass-001" },
+        "canopy_layer": {
+            "layer_ref": "layer:canopy-height-001",
+            "width": 2,
+            "height": 2,
+            "values": [1.0, 2.0, 0.0, 4.0],
+            "spatial_ref": biomass_spatial_ref()
+        },
+        "vegetation_index_layer": {
+            "layer_ref": "layer:ndvi-001",
+            "width": 2,
+            "height": 2,
+            "values": [0.5, 0.25, 0.8, -0.1],
+            "spatial_ref": index_spatial_ref
+        },
+        "method_version": "biomass.canopy_ndvi.v1",
+        "biomass_coefficient": 0.48
+    })
+}
+
+fn biomass_spatial_ref() -> serde_json::Value {
+    json!({
+        "georeferenced": true,
+        "crs": "EPSG:32614",
+        "bbox": {
+            "min_lon": 0.0,
+            "min_lat": 0.0,
+            "max_lon": 20.0,
+            "max_lat": 20.0
+        },
+        "geo_transform": [0.0, 10.0, 0.0, 20.0, 0.0, -10.0],
+        "resolution": { "x": 10.0, "y": 10.0 }
+    })
+}
+
+async fn insert_sustainability_record_row(
+    ctx: &TestContext,
+    record_id: &str,
+    field_id: &str,
+    season_id: &str,
+    operation_id: &str,
+    metric_type: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_records (
+            record_id, field_id, season_id, operation_id, metric_type, method_version,
+            created_at, audit_id
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(record_id)
+    .bind(field_id)
+    .bind(season_id)
+    .bind(operation_id)
+    .bind(metric_type)
+    .bind("sustainability.fixture.v1")
+    .bind("2026-06-16T00:00:00Z")
+    .bind(format!("audit:{record_id}"))
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
+}
+
+fn sustainability_baseline_payload(baseline_id: &str) -> serde_json::Value {
+    json!({
+        "baseline_id": baseline_id,
+        "field_id": "field-baseline",
+        "season_id": "season-2025",
+        "metric_type": "biomass",
+        "metric_value": 100.0,
+        "source_record_id": "sustain-baseline-2025",
+        "method_version": "sustainability.baseline.v1",
+        "evidence_refs": ["biomass:baseline-2025"]
+    })
+}
+
+fn sustainability_comparison_payload(
+    comparison_id: &str,
+    field_id: &str,
+    current_source_record_id: &str,
+    current_value: f64,
+) -> serde_json::Value {
+    json!({
+        "comparison_id": comparison_id,
+        "field_id": field_id,
+        "baseline_season_id": "season-2025",
+        "current_season_id": "season-2026",
+        "metric_type": "biomass",
+        "current_value": current_value,
+        "current_source_record_id": current_source_record_id,
+        "method_version": "sustainability.baseline_compare.v1"
+    })
+}
+
+async fn insert_biomass_estimate_row(
+    ctx: &TestContext,
+    estimate_id: &str,
+    record_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO biomass_estimates (
+            estimate_id, record_id, biomass_value, area, crs, extent_json,
+            resolution_json, source_layer_refs_json, method_version, result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(estimate_id)
+    .bind(record_id)
+    .bind(48.0_f64)
+    .bind(200.0_f64)
+    .bind("EPSG:32614")
+    .bind(
+        json!({
+            "min_lon": 0.0,
+            "min_lat": 0.0,
+            "max_lon": 20.0,
+            "max_lat": 20.0
+        })
+        .to_string(),
+    )
+    .bind(json!({ "x": 10.0, "y": 10.0 }).to_string())
+    .bind(json!(["layer:canopy-height-001", "layer:ndvi-001"]).to_string())
+    .bind("biomass.canopy_ndvi.v1")
+    .bind("result-hash-biomass-001")
+    .bind("2026-06-17T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
+}
+
+fn sustainability_mrv_payload(
+    trail_id: &str,
+    output_ref: &str,
+    complete: bool,
+) -> serde_json::Value {
+    json!({
+        "trail_id": trail_id,
+        "output_ref": output_ref,
+        "output_kind": "biomass_estimate",
+        "input_layer_refs": if complete {
+            json!(["layer:canopy-height-001", "layer:ndvi-001"])
+        } else {
+            json!([])
+        },
+        "method": "biomass_canopy_ndvi",
+        "method_version": "biomass.canopy_ndvi.v1",
+        "crs": "EPSG:32614",
+        "extent": {
+            "min_lon": 0.0,
+            "min_lat": 0.0,
+            "max_lon": 20.0,
+            "max_lat": 20.0
+        },
+        "parameters": {
+            "biomass_coefficient": "0.48",
+            "source_record_id": "sustain-biomass-mrv"
+        },
+        "audit_id": "audit-biomass-mrv",
+        "result_hash": "result-hash-biomass-001"
+    })
+}
+
+fn biodiversity_proxy_payload(proxy_id: &str, values: Vec<f64>) -> serde_json::Value {
+    json!({
+        "proxy_id": proxy_id,
+        "field_id": "field-biodiversity",
+        "layer": {
+            "layer_ref": "layer:ndvi-biodiversity",
+            "width": 2,
+            "height": 2,
+            "values": values,
+            "spatial_ref": {
+                "georeferenced": true,
+                "crs": "EPSG:32614",
+                "bbox": {
+                    "min_lon": 0.0,
+                    "min_lat": 0.0,
+                    "max_lon": 20.0,
+                    "max_lat": 20.0
+                },
+                "geo_transform": [0.0, 10.0, 0.0, 20.0, 0.0, -10.0],
+                "resolution": { "x": 10.0, "y": 10.0 }
+            }
+        },
+        "method_version": "biodiversity.imagery_proxy.v1",
+        "cover_threshold": 0.3
+    })
+}
+
+fn soil_carbon_proxy_payload(proxy_id: &str, include_sufficient: bool) -> serde_json::Value {
+    json!({
+        "proxy_id": proxy_id,
+        "record_id": "sustain-soil-carbon-001",
+        "field_id": "field-soil-carbon",
+        "index_inputs": [{
+            "evidence_ref": "layer:ndvi-soil-carbon",
+            "value": 3.2,
+            "weight": 0.8
+        }],
+        "biomass_inputs": if include_sufficient {
+            json!([{
+                "evidence_ref": "biomass:estimate-001",
+                "value": 5.6,
+                "weight": 1.2
+            }])
+        } else {
+            json!([])
+        },
+        "practice_inputs": if include_sufficient {
+            json!([{
+                "practice_ref": "practice:cover-crop-2026",
+                "carbon_delta": 0.7
+            }])
+        } else {
+            json!([])
+        },
+        "method_version": "soil_carbon.proxy.v1"
+    })
+}
+
+fn sustainability_kpi_payload(kpi_id: &str, current_value: Option<f64>) -> serde_json::Value {
+    json!({
+        "kpi_id": kpi_id,
+        "field_id": "field-sustainability-kpi",
+        "season_id": "season-2026",
+        "metric_ref": "biodiversity:biodiversity-001",
+        "current_value": current_value,
+        "target_value": 0.8,
+        "direction": "higher_is_better",
+        "at_risk_fraction": 0.8,
+        "method_version": "sustainability.kpi.v1",
+        "evidence_refs": ["biodiversity:biodiversity-001", "target:cover-2026"]
+    })
+}
+
+async fn insert_sustainability_kpi_row(
+    ctx: &TestContext,
+    kpi_id: &str,
+    field_id: &str,
+    season_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO sustainability_kpis (
+            kpi_id, field_id, season_id, metric_ref, current_value, target_value,
+            direction, at_risk_fraction, status, evidence_refs_json, method_version,
+            result_hash, computed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+    )
+    .bind(kpi_id)
+    .bind(field_id)
+    .bind(season_id)
+    .bind("biodiversity:biodiversity-001")
+    .bind(0.72_f64)
+    .bind(0.8_f64)
+    .bind("higher_is_better")
+    .bind(0.8_f64)
+    .bind("on_track")
+    .bind(json!(["biodiversity:biodiversity-001", "target:cover-2026"]).to_string())
+    .bind("sustainability.kpi.v1")
+    .bind("result-hash-kpi-export")
+    .bind("2026-06-18T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
+}
+
+fn sustainability_certification_pack_payload(
+    pack_id: &str,
+    claim_id: &str,
+    claimed_output_refs: Vec<&str>,
+) -> serde_json::Value {
+    json!({
+        "pack_id": pack_id,
+        "claim_id": claim_id,
+        "claim_type": "regenerative_biomass_gain",
+        "field_id": "field-certification",
+        "season_id": "season-2026",
+        "claimed_output_refs": claimed_output_refs,
+        "method_version": "sustainability.certification_pack.v1"
+    })
+}
+
+async fn create_content_fixture(ctx: &TestContext, content_id: &str) -> Result<serde_json::Value> {
+    create_content_fixture_body(ctx, content_id, "First draft", "org-alpha").await
+}
+
+async fn create_content_fixture_body(
+    ctx: &TestContext,
+    content_id: &str,
+    body: &str,
+    org_id: &str,
+) -> Result<serde_json::Value> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "content_id": content_id,
+                        "content_type": "article",
+                        "author_id": "author-001",
+                        "org_id": org_id,
+                        "body": body
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    serde_json::from_slice(&body).map_err(Into::into)
+}
+
+async fn publish_content_fixture(ctx: &TestContext, content_id: &str, org_id: &str) -> Result<()> {
+    post_content_workflow_for_org(
+        ctx,
+        content_id,
+        org_id,
+        json!({
+            "action": "submit_for_review",
+            "actor_id": "author-001",
+            "actor_role": "author"
+        }),
+    )
+    .await?;
+    post_content_workflow_for_org(
+        ctx,
+        content_id,
+        org_id,
+        json!({
+            "action": "publish",
+            "actor_id": "editor-001",
+            "actor_role": "editor"
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn submit_community_contribution(ctx: &TestContext, contribution_id: &str) -> Result<()> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/community-contributions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "contribution_id": contribution_id,
+                        "org_id": "org-alpha",
+                        "contributor_id": "grower-001",
+                        "content_type": "post",
+                        "body": "Grower note about cover crops."
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn post_content_workflow(
+    ctx: &TestContext,
+    content_id: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value> {
+    post_content_workflow_for_org(ctx, content_id, "org-alpha", payload).await
+}
+
+async fn post_content_workflow_for_org(
+    ctx: &TestContext,
+    content_id: &str,
+    org_id: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/content/items/{content_id}/workflow?org_id={org_id}"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    serde_json::from_slice(&body).map_err(Into::into)
 }
 
 async fn register_test_component(
@@ -11788,6 +20164,24 @@ fn orthomosaic_tile_spatial_ref_json() -> serde_json::Value {
     })
 }
 
+fn layer_spatial_ref_json() -> serde_json::Value {
+    json!({
+        "georeferenced": true,
+        "crs": "EPSG:4326",
+        "bbox": {
+            "min_lon": -96.7,
+            "min_lat": 41.1,
+            "max_lon": -96.6,
+            "max_lat": 41.2
+        },
+        "geo_transform": [-96.7, 0.05, 0.0, 41.2, 0.0, -0.05],
+        "resolution": {
+            "x": 0.05,
+            "y": 0.05
+        }
+    })
+}
+
 fn advisory_spatial_ref() -> serde_json::Value {
     json!({
         "georeferenced": true,
@@ -12138,6 +20532,32 @@ async fn link_scene_context(
     .bind(scene_id)
     .execute(&ctx.pool)
     .await?;
+    Ok(())
+}
+
+async fn insert_layer_field(
+    ctx: &TestContext,
+    field_id: &str,
+    boundary_json: serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO fields (field_id, owner, name, season, boundary_json, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(field_id) DO UPDATE SET
+            boundary_json = excluded.boundary_json,
+            season = excluded.season
+        "#,
+    )
+    .bind(field_id)
+    .bind("org-alpha")
+    .bind(format!("{field_id} name"))
+    .bind("2026")
+    .bind(boundary_json.to_string())
+    .bind("2026-01-01T00:00:00Z")
+    .execute(&ctx.pool)
+    .await?;
+
     Ok(())
 }
 

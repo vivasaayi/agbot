@@ -1,5 +1,6 @@
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -200,6 +201,46 @@ pub struct ApplicationGeometry {
     pub coordinates: Vec<AirspaceCoordinate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitiveFeatureType {
+    Water,
+    Dwelling,
+    OrganicField,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensitiveBufferFeature {
+    pub feature_ref: String,
+    pub feature_type: SensitiveFeatureType,
+    pub geometry: ApplicationGeometry,
+    pub required_buffer_m: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SprayBufferDecisionStatus {
+    Compliant,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SprayBufferBlockReason {
+    BufferBreach,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SprayBufferComplianceDecision {
+    pub application_id: String,
+    pub checked_at: String,
+    pub status: SprayBufferDecisionStatus,
+    pub reason_code: Option<SprayBufferBlockReason>,
+    pub feature_ref: Option<String>,
+    pub required_buffer_m: Option<f64>,
+    pub actual_separation_m: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct OperatorCertificationRegistrationRequest {
     #[serde(default)]
@@ -360,6 +401,176 @@ pub struct EntryHarvestDecision {
     pub clear_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceCheckKind {
+    Authorization,
+    ReiPhi,
+    SprayBuffer,
+}
+
+impl ComplianceCheckKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComplianceCheckKind::Authorization => "authorization",
+            ComplianceCheckKind::ReiPhi => "rei_phi",
+            ComplianceCheckKind::SprayBuffer => "spray_buffer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceEvidenceInput {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceEvidenceRequest {
+    pub check_id: String,
+    pub check_kind: ComplianceCheckKind,
+    pub rule_version: String,
+    pub evaluated_at: String,
+    pub decision_status: String,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub input_refs: Vec<String>,
+    #[serde(default)]
+    pub raw_inputs: Vec<ComplianceEvidenceInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceEvidenceRecord {
+    pub check_id: String,
+    pub version: u32,
+    pub check_kind: ComplianceCheckKind,
+    pub rule_version: String,
+    pub evaluated_at: String,
+    pub decision_status: String,
+    pub reason_code: Option<String>,
+    pub input_refs: Vec<String>,
+    pub raw_inputs: Vec<ComplianceEvidenceInput>,
+    pub decision_hash: String,
+    pub prior_decision_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceAlertSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+impl ComplianceAlertSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComplianceAlertSeverity::Info => "info",
+            ComplianceAlertSeverity::Warning => "warning",
+            ComplianceAlertSeverity::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceAlertEvent {
+    pub source_domain: String,
+    pub event_type: String,
+    pub subject_ref: String,
+    pub severity_hint: ComplianceAlertSeverity,
+    pub evidence_refs: Vec<String>,
+    pub occurred_at: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceRecordSourceStatus {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceRecordSourceHealth {
+    pub source_ref: String,
+    pub status: ComplianceRecordSourceStatus,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceDeadlineRecord {
+    pub deadline_ref: String,
+    pub due_at: String,
+    pub evidence_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceAlertScheduleRequest {
+    pub checked_at: String,
+    pub lead_hours: i64,
+    #[serde(default)]
+    pub certifications: Vec<OperatorCertificationRecord>,
+    #[serde(default)]
+    pub clearance_windows: Vec<ReiPhiWindow>,
+    #[serde(default)]
+    pub filing_deadlines: Vec<ComplianceDeadlineRecord>,
+    #[serde(default)]
+    pub source_health: Vec<ComplianceRecordSourceHealth>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceRetentionClass {
+    FlightSafety,
+    ChemicalApplication,
+    AuditEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceRecordStoragePlan {
+    pub record_id: String,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplianceRetentionPolicyRule {
+    pub residency_tag: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub allowed_storage_regions: Vec<String>,
+    pub min_retention_days: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompliancePolicyDecisionStatus {
+    Allowed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompliancePolicyBlockReason {
+    ResidencyRegionMismatch,
+    RetentionPeriodActive,
+    MissingPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompliancePolicyDecision {
+    pub record_id: String,
+    pub checked_at: String,
+    pub status: CompliancePolicyDecisionStatus,
+    pub reason_code: Option<CompliancePolicyBlockReason>,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub min_retention_until: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CreateComplianceRecordRequest {
     #[serde(default)]
@@ -437,6 +648,124 @@ pub struct ComplianceAuditReport {
     pub records: Vec<ComplianceRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceAuthorityFormat {
+    FaaRemoteId,
+    StatePesticideApplication,
+}
+
+impl ComplianceAuthorityFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FaaRemoteId => "faa_remote_id",
+            Self::StatePesticideApplication => "state_pesticide_application",
+        }
+    }
+
+    fn required_record_type(self) -> ComplianceRecordType {
+        match self {
+            Self::FaaRemoteId => ComplianceRecordType::RemoteIdLog,
+            Self::StatePesticideApplication => ComplianceRecordType::ChemicalApplication,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuthorityExportRequest {
+    pub authority_format: ComplianceAuthorityFormat,
+    pub report: ComplianceAuditReport,
+    pub generated_at: String,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuthorityExportArtifact {
+    pub schema_version: String,
+    pub authority_format: ComplianceAuthorityFormat,
+    pub report_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub generated_at: String,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub content_type: String,
+    pub file_name: String,
+    pub included_record_ids: Vec<String>,
+    pub provenance_refs: Vec<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuthorityShareRequest {
+    pub share_id: String,
+    pub export: ComplianceAuthorityExportArtifact,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceAuthorityShareArtifact {
+    pub share_id: String,
+    pub report_id: String,
+    pub authority_format: ComplianceAuthorityFormat,
+    pub url_path: String,
+    pub created_at: String,
+    pub expires_at: String,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+    pub residency_tag: String,
+    pub storage_region: String,
+    pub retention_class: ComplianceRetentionClass,
+    pub revocable: bool,
+    pub export: ComplianceAuthorityExportArtifact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceRegulationAssistIntent {
+    Summary,
+    DraftFilingText,
+    AuthorizeFlight,
+    ClearViolation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceRuleCitation {
+    pub rule_ref: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceRegulationAssistRequest {
+    pub assist_id: String,
+    pub intent: ComplianceRegulationAssistIntent,
+    pub report: ComplianceAuditReport,
+    pub generated_at: String,
+    #[serde(default)]
+    pub rule_citations: Vec<ComplianceRuleCitation>,
+    pub feature_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceRegulationAssistOutput {
+    pub assist_id: String,
+    pub intent: ComplianceRegulationAssistIntent,
+    pub report_id: String,
+    pub generated_at: String,
+    pub summary: String,
+    pub draft_filing_text: String,
+    pub uncertainty_flag: bool,
+    pub uncertainty_reasons: Vec<String>,
+    pub source_record_refs: Vec<String>,
+    pub rule_refs: Vec<String>,
+    pub can_authorize: bool,
+    pub can_clear_violation: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComplianceAuditReportError {
     EmptyReportId,
@@ -489,6 +818,50 @@ impl std::fmt::Display for ComplianceAuditReportError {
 }
 
 impl std::error::Error for ComplianceAuditReportError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceAuthorityExportError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("residency_tag cannot be empty")]
+    EmptyResidencyTag,
+    #[error("storage_region cannot be empty")]
+    EmptyStorageRegion,
+    #[error("authority export requires at least one {record_type} record")]
+    MissingAuthorityRecord { record_type: ComplianceRecordType },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceAuthorityShareError {
+    #[error("share_id cannot be empty")]
+    EmptyShareId,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("expires_at cannot be empty")]
+    EmptyExpiresAt,
+    #[error("revoked_at cannot be empty")]
+    EmptyRevokedAt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceRegulationAssistError {
+    #[error("assist_id cannot be empty")]
+    EmptyAssistId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("rule citation ref cannot be empty")]
+    EmptyRuleRef,
+    #[error("rule citation title cannot be empty")]
+    EmptyRuleTitle,
+    #[error("regulation assist feature flag is disabled")]
+    FeatureDisabled,
+    #[error("regulation assist cannot authorize flights or clear violations; use the deterministic gate")]
+    DeterministicGateRequired,
+    #[error("regulation assist requires at least one rule citation")]
+    EmptyRuleCitations,
+    #[error("regulation assist requires source compliance records")]
+    EmptySourceRecords,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ComplianceRecordError {
@@ -662,6 +1035,84 @@ pub enum ReiPhiError {
     InvalidPhiDays,
 }
 
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SprayBufferComplianceError {
+    #[error("checked_at cannot be empty")]
+    EmptyCheckedAt,
+    #[error("sensitive feature_ref cannot be empty")]
+    EmptyFeatureRef,
+    #[error("required buffer must be finite and zero or greater")]
+    InvalidRequiredBuffer,
+    #[error("application geometry is invalid: {source}")]
+    InvalidApplicationGeometry {
+        #[source]
+        source: ComplianceRecordError,
+    },
+    #[error("sensitive feature geometry is invalid: {source}")]
+    InvalidFeatureGeometry {
+        #[source]
+        source: ComplianceRecordError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceEvidenceError {
+    #[error("check_id cannot be empty")]
+    EmptyCheckId,
+    #[error("rule_version cannot be empty")]
+    EmptyRuleVersion,
+    #[error("evaluated_at cannot be empty")]
+    EmptyEvaluatedAt,
+    #[error("decision_status cannot be empty")]
+    EmptyDecisionStatus,
+    #[error("reason_code cannot be empty")]
+    EmptyReasonCode,
+    #[error("raw input key cannot be empty")]
+    EmptyInputKey,
+    #[error("raw input value cannot be empty")]
+    EmptyInputValue,
+    #[error("input_refs cannot contain an empty value")]
+    EmptyInputRef,
+    #[error("compliance evidence is append-only; cannot overwrite version {version}")]
+    AppendOnlyOverwriteRefused { version: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceAlertScheduleError {
+    #[error("checked_at cannot be empty")]
+    EmptyCheckedAt,
+    #[error("lead_hours must be zero or greater")]
+    InvalidLeadHours,
+    #[error("timestamp is not valid RFC3339")]
+    InvalidTimestamp,
+    #[error("source_ref cannot be empty")]
+    EmptySourceRef,
+    #[error("deadline_ref cannot be empty")]
+    EmptyDeadlineRef,
+    #[error("deadline evidence_ref cannot be empty")]
+    EmptyDeadlineEvidenceRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompliancePolicyError {
+    #[error("record_id cannot be empty")]
+    EmptyRecordId,
+    #[error("residency_tag cannot be empty")]
+    EmptyResidencyTag,
+    #[error("storage_region cannot be empty")]
+    EmptyStorageRegion,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("checked_at cannot be empty")]
+    EmptyCheckedAt,
+    #[error("allowed_storage_regions cannot contain an empty value")]
+    EmptyAllowedStorageRegion,
+    #[error("min_retention_days must be zero or greater")]
+    InvalidMinRetentionDays,
+    #[error("timestamp is not valid RFC3339")]
+    InvalidTimestamp,
+}
+
 pub fn build_initial_compliance_record(
     request: CreateComplianceRecordRequest,
     generated_record_id: String,
@@ -809,6 +1260,247 @@ pub fn build_compliance_audit_report(
         record_type_counts,
         provenance_refs: provenance_refs.into_iter().collect(),
         records,
+    })
+}
+
+pub fn build_compliance_authority_export(
+    request: ComplianceAuthorityExportRequest,
+) -> Result<ComplianceAuthorityExportArtifact, ComplianceAuthorityExportError> {
+    let generated_at = normalize_authority_export_text(
+        request.generated_at,
+        ComplianceAuthorityExportError::EmptyGeneratedAt,
+    )?;
+    let residency_tag = normalize_authority_export_text(
+        request.residency_tag,
+        ComplianceAuthorityExportError::EmptyResidencyTag,
+    )?;
+    let storage_region = normalize_authority_export_text(
+        request.storage_region,
+        ComplianceAuthorityExportError::EmptyStorageRegion,
+    )?;
+    let required_record_type = request.authority_format.required_record_type();
+    let records = request
+        .report
+        .records
+        .iter()
+        .filter(|record| record.record_type == required_record_type)
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Err(ComplianceAuthorityExportError::MissingAuthorityRecord {
+            record_type: required_record_type,
+        });
+    }
+
+    let included_record_ids = records
+        .iter()
+        .map(|record| record.record_id.clone())
+        .collect::<Vec<_>>();
+    let payload_records = records
+        .iter()
+        .map(|record| {
+            json!({
+                "record_id": record.record_id,
+                "version": record.version,
+                "flight_id": record.flight_id,
+                "provenance_ref": record.provenance_ref,
+                "payload": record.payload,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = match request.authority_format {
+        ComplianceAuthorityFormat::FaaRemoteId => json!({
+            "authority": "faa",
+            "format": request.authority_format.as_str(),
+            "report_id": request.report.report_id,
+            "remote_id_logs": payload_records,
+        }),
+        ComplianceAuthorityFormat::StatePesticideApplication => json!({
+            "authority": "state_pesticide_regulator",
+            "format": request.authority_format.as_str(),
+            "report_id": request.report.report_id,
+            "chemical_applications": payload_records,
+        }),
+    };
+
+    Ok(ComplianceAuthorityExportArtifact {
+        schema_version: "compliance.authority_export.v1".to_string(),
+        authority_format: request.authority_format,
+        report_id: request.report.report_id.clone(),
+        org_id: request.report.org_id.clone(),
+        field_id: request.report.field_id.clone(),
+        generated_at,
+        residency_tag,
+        storage_region,
+        retention_class: request.retention_class,
+        content_type: "application/json".to_string(),
+        file_name: format!(
+            "{}-{}.json",
+            request.report.report_id,
+            request.authority_format.as_str()
+        ),
+        included_record_ids,
+        provenance_refs: request.report.provenance_refs.clone(),
+        payload,
+    })
+}
+
+pub fn build_compliance_authority_share(
+    request: ComplianceAuthorityShareRequest,
+) -> Result<ComplianceAuthorityShareArtifact, ComplianceAuthorityShareError> {
+    let share_id = normalize_authority_share_text(
+        request.share_id,
+        ComplianceAuthorityShareError::EmptyShareId,
+    )?;
+    let created_at = normalize_authority_share_text(
+        request.created_at,
+        ComplianceAuthorityShareError::EmptyCreatedAt,
+    )?;
+    let expires_at = normalize_authority_share_text(
+        request.expires_at,
+        ComplianceAuthorityShareError::EmptyExpiresAt,
+    )?;
+
+    Ok(ComplianceAuthorityShareArtifact {
+        url_path: format!("/api/compliance/authority-shares/{share_id}"),
+        share_id,
+        report_id: request.export.report_id.clone(),
+        authority_format: request.export.authority_format,
+        created_at,
+        expires_at,
+        revoked_at: None,
+        residency_tag: request.export.residency_tag.clone(),
+        storage_region: request.export.storage_region.clone(),
+        retention_class: request.export.retention_class,
+        revocable: true,
+        export: request.export,
+    })
+}
+
+pub fn revoke_compliance_authority_share(
+    mut share: ComplianceAuthorityShareArtifact,
+    revoked_at: String,
+) -> Result<ComplianceAuthorityShareArtifact, ComplianceAuthorityShareError> {
+    share.revoked_at = Some(normalize_authority_share_text(
+        revoked_at,
+        ComplianceAuthorityShareError::EmptyRevokedAt,
+    )?);
+    Ok(share)
+}
+
+pub fn build_compliance_regulation_assist(
+    request: ComplianceRegulationAssistRequest,
+) -> Result<ComplianceRegulationAssistOutput, ComplianceRegulationAssistError> {
+    if !request.feature_enabled {
+        return Err(ComplianceRegulationAssistError::FeatureDisabled);
+    }
+    match request.intent {
+        ComplianceRegulationAssistIntent::Summary
+        | ComplianceRegulationAssistIntent::DraftFilingText => {}
+        ComplianceRegulationAssistIntent::AuthorizeFlight
+        | ComplianceRegulationAssistIntent::ClearViolation => {
+            return Err(ComplianceRegulationAssistError::DeterministicGateRequired);
+        }
+    }
+
+    let assist_id = normalize_regulation_assist_text(
+        request.assist_id,
+        ComplianceRegulationAssistError::EmptyAssistId,
+    )?;
+    let generated_at = normalize_regulation_assist_text(
+        request.generated_at,
+        ComplianceRegulationAssistError::EmptyGeneratedAt,
+    )?;
+    if request.report.records.is_empty() {
+        return Err(ComplianceRegulationAssistError::EmptySourceRecords);
+    }
+    if request.rule_citations.is_empty() {
+        return Err(ComplianceRegulationAssistError::EmptyRuleCitations);
+    }
+
+    let mut rule_refs = Vec::new();
+    let mut rule_titles = Vec::new();
+    for citation in request.rule_citations {
+        let rule_ref = normalize_regulation_assist_text(
+            citation.rule_ref,
+            ComplianceRegulationAssistError::EmptyRuleRef,
+        )?;
+        let title = normalize_regulation_assist_text(
+            citation.title,
+            ComplianceRegulationAssistError::EmptyRuleTitle,
+        )?;
+        rule_refs.push(rule_ref);
+        rule_titles.push(title);
+    }
+    rule_refs.sort();
+    rule_refs.dedup();
+    rule_titles.sort();
+    rule_titles.dedup();
+
+    let mut source_record_refs = request
+        .report
+        .records
+        .iter()
+        .map(|record| format!("compliance_record:{}@v{}", record.record_id, record.version))
+        .collect::<Vec<_>>();
+    source_record_refs.sort();
+    source_record_refs.dedup();
+
+    let mut uncertainty_reasons = Vec::new();
+    for mandatory in [
+        ComplianceRecordType::RemoteIdLog,
+        ComplianceRecordType::ChemicalApplication,
+        ComplianceRecordType::OperatorCertification,
+        ComplianceRecordType::AuthorizationDecision,
+    ] {
+        if !request
+            .report
+            .record_type_counts
+            .contains_key(mandatory.as_str())
+        {
+            uncertainty_reasons.push(format!("missing_{}", mandatory.as_str()));
+        }
+    }
+    if rule_refs.is_empty() {
+        uncertainty_reasons.push("missing_rule_refs".to_string());
+    }
+    let uncertainty_flag = !uncertainty_reasons.is_empty();
+
+    let record_types = request
+        .report
+        .record_type_counts
+        .iter()
+        .map(|(record_type, count)| format!("{record_type}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let summary = format!(
+        "Compliance report {} for org {} field {} includes {} records ({}) and cites {} provenance refs. Deterministic gates remain authoritative.",
+        request.report.report_id,
+        request.report.org_id,
+        request.report.field_id,
+        request.report.record_count,
+        record_types,
+        request.report.provenance_refs.len()
+    );
+    let draft_filing_text = format!(
+        "Draft filing for {}: submit records [{}] with rule citations [{}]. This draft does not authorize operations or clear violations.",
+        request.report.field_id,
+        source_record_refs.join(", "),
+        rule_titles.join("; ")
+    );
+
+    Ok(ComplianceRegulationAssistOutput {
+        assist_id,
+        intent: request.intent,
+        report_id: request.report.report_id,
+        generated_at,
+        summary,
+        draft_filing_text,
+        uncertainty_flag,
+        uncertainty_reasons,
+        source_record_refs,
+        rule_refs,
+        can_authorize: false,
+        can_clear_violation: false,
     })
 }
 
@@ -1183,6 +1875,276 @@ pub fn airspace_zone_intersects_polygon(
     Ok(false)
 }
 
+pub fn evaluate_spray_buffer_compliance(
+    application: &ChemicalApplicationRecord,
+    sensitive_features: Vec<SensitiveBufferFeature>,
+    checked_at: String,
+) -> Result<SprayBufferComplianceDecision, SprayBufferComplianceError> {
+    let checked_at =
+        normalize_spray_buffer_text(checked_at, SprayBufferComplianceError::EmptyCheckedAt)?;
+    let application_geometry = validate_application_geometry(application.geometry.clone())
+        .map_err(|source| SprayBufferComplianceError::InvalidApplicationGeometry { source })?;
+    let application_extent = extent_from_coordinates(&application_geometry.coordinates);
+
+    let mut closest_breach = None::<(String, f64, f64)>;
+    for feature in sensitive_features {
+        let feature_ref = normalize_spray_buffer_text(
+            feature.feature_ref,
+            SprayBufferComplianceError::EmptyFeatureRef,
+        )?;
+        if !feature.required_buffer_m.is_finite() || feature.required_buffer_m < 0.0 {
+            return Err(SprayBufferComplianceError::InvalidRequiredBuffer);
+        }
+        let feature_geometry = validate_application_geometry(feature.geometry)
+            .map_err(|source| SprayBufferComplianceError::InvalidFeatureGeometry { source })?;
+        let feature_extent = extent_from_coordinates(&feature_geometry.coordinates);
+        let intersects = polygons_intersect(
+            &application_geometry.coordinates,
+            &feature_geometry.coordinates,
+        );
+        let separation_m = if intersects {
+            0.0
+        } else {
+            extent_separation_m(application_extent, feature_extent)
+        };
+        if separation_m < feature.required_buffer_m {
+            match &closest_breach {
+                Some((_, _, current_actual)) if *current_actual <= separation_m => {}
+                _ => {
+                    closest_breach = Some((feature_ref, feature.required_buffer_m, separation_m));
+                }
+            }
+        }
+    }
+
+    if let Some((feature_ref, required_buffer_m, actual_separation_m)) = closest_breach {
+        Ok(SprayBufferComplianceDecision {
+            application_id: application.application_id.clone(),
+            checked_at,
+            status: SprayBufferDecisionStatus::Blocked,
+            reason_code: Some(SprayBufferBlockReason::BufferBreach),
+            feature_ref: Some(feature_ref),
+            required_buffer_m: Some(required_buffer_m),
+            actual_separation_m: Some(actual_separation_m),
+        })
+    } else {
+        Ok(SprayBufferComplianceDecision {
+            application_id: application.application_id.clone(),
+            checked_at,
+            status: SprayBufferDecisionStatus::Compliant,
+            reason_code: None,
+            feature_ref: None,
+            required_buffer_m: None,
+            actual_separation_m: None,
+        })
+    }
+}
+
+pub fn build_compliance_evidence_record(
+    request: ComplianceEvidenceRequest,
+) -> Result<ComplianceEvidenceRecord, ComplianceEvidenceError> {
+    build_compliance_evidence_record_version(request, 1, None)
+}
+
+pub fn append_compliance_evidence_record(
+    latest: &ComplianceEvidenceRecord,
+    request: ComplianceEvidenceRequest,
+) -> Result<ComplianceEvidenceRecord, ComplianceEvidenceError> {
+    build_compliance_evidence_record_version(
+        request,
+        latest.version + 1,
+        Some(latest.decision_hash.clone()),
+    )
+}
+
+pub fn refuse_compliance_evidence_overwrite(
+    existing: &ComplianceEvidenceRecord,
+) -> ComplianceEvidenceError {
+    ComplianceEvidenceError::AppendOnlyOverwriteRefused {
+        version: existing.version,
+    }
+}
+
+pub fn schedule_compliance_alerts(
+    request: ComplianceAlertScheduleRequest,
+) -> Result<Vec<ComplianceAlertEvent>, ComplianceAlertScheduleError> {
+    let checked_at_text = normalize_alert_text(
+        request.checked_at,
+        ComplianceAlertScheduleError::EmptyCheckedAt,
+    )?;
+    if request.lead_hours < 0 {
+        return Err(ComplianceAlertScheduleError::InvalidLeadHours);
+    }
+    let checked_at = parse_alert_time(&checked_at_text)?;
+    let lead_until = checked_at + Duration::hours(request.lead_hours);
+    let mut events = Vec::new();
+
+    for certification in request.certifications {
+        let expires_at = parse_alert_time(&certification.expires_at)?;
+        if expires_at >= checked_at && expires_at <= lead_until {
+            events.push(compliance_alert_event(
+                "compliance.cert_expiring",
+                format!("operator_certification:{}", certification.cert_id),
+                ComplianceAlertSeverity::Warning,
+                vec![format!("certification:{}", certification.cert_id)],
+                checked_at_text.clone(),
+            ));
+        }
+    }
+
+    for window in request.clearance_windows {
+        if let Some(rei_clear_at) = &window.rei_clear_at {
+            let clear_at = parse_alert_time(rei_clear_at)?;
+            if clear_at >= checked_at && clear_at <= lead_until {
+                events.push(compliance_alert_event(
+                    "compliance.rei_clearance_due",
+                    format!("application:{}", window.application_id),
+                    ComplianceAlertSeverity::Info,
+                    vec![window.source_application_ref.clone()],
+                    checked_at_text.clone(),
+                ));
+            }
+        }
+        if let Some(phi_clear_at) = &window.phi_clear_at {
+            let clear_at = parse_alert_time(phi_clear_at)?;
+            if clear_at >= checked_at && clear_at <= lead_until {
+                events.push(compliance_alert_event(
+                    "compliance.phi_clearance_due",
+                    format!("application:{}", window.application_id),
+                    ComplianceAlertSeverity::Info,
+                    vec![window.source_application_ref],
+                    checked_at_text.clone(),
+                ));
+            }
+        }
+    }
+
+    for deadline in request.filing_deadlines {
+        let deadline_ref = normalize_alert_text(
+            deadline.deadline_ref,
+            ComplianceAlertScheduleError::EmptyDeadlineRef,
+        )?;
+        let evidence_ref = normalize_alert_text(
+            deadline.evidence_ref,
+            ComplianceAlertScheduleError::EmptyDeadlineEvidenceRef,
+        )?;
+        let due_at = parse_alert_time(&deadline.due_at)?;
+        if due_at >= checked_at && due_at <= lead_until {
+            events.push(compliance_alert_event(
+                "compliance.deadline_due",
+                format!("deadline:{deadline_ref}"),
+                ComplianceAlertSeverity::Warning,
+                vec![evidence_ref],
+                checked_at_text.clone(),
+            ));
+        }
+    }
+
+    for source in request.source_health {
+        let source_ref = normalize_alert_text(
+            source.source_ref,
+            ComplianceAlertScheduleError::EmptySourceRef,
+        )?;
+        parse_alert_time(&source.checked_at)?;
+        if source.status == ComplianceRecordSourceStatus::Unavailable {
+            events.push(compliance_alert_event(
+                "compliance.source_unavailable",
+                format!("source:{source_ref}"),
+                ComplianceAlertSeverity::Critical,
+                vec![format!("source:{source_ref}")],
+                checked_at_text.clone(),
+            ));
+        }
+    }
+
+    events.sort_by(|left, right| {
+        left.event_type
+            .cmp(&right.event_type)
+            .then_with(|| left.subject_ref.cmp(&right.subject_ref))
+            .then_with(|| left.idempotency_key.cmp(&right.idempotency_key))
+    });
+    Ok(events)
+}
+
+pub fn evaluate_compliance_record_storage(
+    plan: ComplianceRecordStoragePlan,
+    policies: &[ComplianceRetentionPolicyRule],
+    checked_at: String,
+) -> Result<CompliancePolicyDecision, CompliancePolicyError> {
+    let plan = normalize_storage_plan(plan)?;
+    let checked_at = normalize_policy_text(checked_at, CompliancePolicyError::EmptyCheckedAt)?;
+    parse_policy_time(&checked_at)?;
+    let Some(policy) = find_retention_policy(&plan, policies)? else {
+        return Ok(policy_decision(
+            plan,
+            checked_at,
+            CompliancePolicyDecisionStatus::Blocked,
+            Some(CompliancePolicyBlockReason::MissingPolicy),
+            None,
+        ));
+    };
+    let min_retention_until = min_retention_until(&plan.created_at, policy.min_retention_days)?;
+    if !policy
+        .allowed_storage_regions
+        .iter()
+        .any(|region| region == &plan.storage_region)
+    {
+        return Ok(policy_decision(
+            plan,
+            checked_at,
+            CompliancePolicyDecisionStatus::Blocked,
+            Some(CompliancePolicyBlockReason::ResidencyRegionMismatch),
+            Some(min_retention_until),
+        ));
+    }
+
+    Ok(policy_decision(
+        plan,
+        checked_at,
+        CompliancePolicyDecisionStatus::Allowed,
+        None,
+        Some(min_retention_until),
+    ))
+}
+
+pub fn evaluate_compliance_record_deletion(
+    plan: ComplianceRecordStoragePlan,
+    policies: &[ComplianceRetentionPolicyRule],
+    checked_at: String,
+) -> Result<CompliancePolicyDecision, CompliancePolicyError> {
+    let plan = normalize_storage_plan(plan)?;
+    let checked_at = normalize_policy_text(checked_at, CompliancePolicyError::EmptyCheckedAt)?;
+    let checked_at_time = parse_policy_time(&checked_at)?;
+    let Some(policy) = find_retention_policy(&plan, policies)? else {
+        return Ok(policy_decision(
+            plan,
+            checked_at,
+            CompliancePolicyDecisionStatus::Blocked,
+            Some(CompliancePolicyBlockReason::MissingPolicy),
+            None,
+        ));
+    };
+    let min_retention_until = min_retention_until(&plan.created_at, policy.min_retention_days)?;
+    let min_retention_time = parse_policy_time(&min_retention_until)?;
+    if checked_at_time < min_retention_time {
+        return Ok(policy_decision(
+            plan,
+            checked_at,
+            CompliancePolicyDecisionStatus::Blocked,
+            Some(CompliancePolicyBlockReason::RetentionPeriodActive),
+            Some(min_retention_until),
+        ));
+    }
+
+    Ok(policy_decision(
+        plan,
+        checked_at,
+        CompliancePolicyDecisionStatus::Allowed,
+        None,
+        Some(min_retention_until),
+    ))
+}
+
 pub fn airspace_zone_is_effective_at(zone: &AirspaceZoneRecord, at: Option<&str>) -> bool {
     let Some(at) = at.and_then(|value| normalize_optional_text(Some(value.to_string()))) else {
         return true;
@@ -1494,6 +2456,42 @@ fn normalize_required_report_text(
     }
 }
 
+fn normalize_authority_export_text(
+    value: String,
+    error: ComplianceAuthorityExportError,
+) -> Result<String, ComplianceAuthorityExportError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_authority_share_text(
+    value: String,
+    error: ComplianceAuthorityShareError,
+) -> Result<String, ComplianceAuthorityShareError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_regulation_assist_text(
+    value: String,
+    error: ComplianceRegulationAssistError,
+) -> Result<String, ComplianceRegulationAssistError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn normalize_required_airspace_text(
     value: String,
     error: AirspaceZoneError,
@@ -1677,6 +2675,350 @@ fn compute_airspace_extent(
     Ok(extent)
 }
 
+fn extent_from_coordinates(coordinates: &[AirspaceCoordinate]) -> AirspaceZoneExtent {
+    let mut extent = AirspaceZoneExtent {
+        min_lon: f64::INFINITY,
+        min_lat: f64::INFINITY,
+        max_lon: f64::NEG_INFINITY,
+        max_lat: f64::NEG_INFINITY,
+    };
+    for coordinate in coordinates {
+        extent.min_lon = extent.min_lon.min(coordinate.longitude);
+        extent.min_lat = extent.min_lat.min(coordinate.latitude);
+        extent.max_lon = extent.max_lon.max(coordinate.longitude);
+        extent.max_lat = extent.max_lat.max(coordinate.latitude);
+    }
+    extent
+}
+
+fn polygons_intersect(left: &[AirspaceCoordinate], right: &[AirspaceCoordinate]) -> bool {
+    if left
+        .iter()
+        .copied()
+        .any(|point| point_in_polygon(point, right))
+    {
+        return true;
+    }
+    if right
+        .iter()
+        .copied()
+        .any(|point| point_in_polygon(point, left))
+    {
+        return true;
+    }
+    for left_edge in left.windows(2) {
+        for right_edge in right.windows(2) {
+            if segments_intersect(left_edge[0], left_edge[1], right_edge[0], right_edge[1]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn extent_separation_m(left: AirspaceZoneExtent, right: AirspaceZoneExtent) -> f64 {
+    let lon_gap = if left.max_lon < right.min_lon {
+        right.min_lon - left.max_lon
+    } else if right.max_lon < left.min_lon {
+        left.min_lon - right.max_lon
+    } else {
+        0.0
+    };
+    let lat_gap = if left.max_lat < right.min_lat {
+        right.min_lat - left.max_lat
+    } else if right.max_lat < left.min_lat {
+        left.min_lat - right.max_lat
+    } else {
+        0.0
+    };
+    let mean_lat_rad =
+        ((left.min_lat + left.max_lat + right.min_lat + right.max_lat) / 4.0).to_radians();
+    let meters_per_degree_lon = 111_320.0 * mean_lat_rad.cos().abs().max(0.01);
+    let meters_per_degree_lat = 110_540.0;
+    let dx = lon_gap * meters_per_degree_lon;
+    let dy = lat_gap * meters_per_degree_lat;
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn normalize_spray_buffer_text(
+    value: String,
+    error: SprayBufferComplianceError,
+) -> Result<String, SprayBufferComplianceError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn build_compliance_evidence_record_version(
+    request: ComplianceEvidenceRequest,
+    version: u32,
+    prior_decision_hash: Option<String>,
+) -> Result<ComplianceEvidenceRecord, ComplianceEvidenceError> {
+    let check_id =
+        normalize_evidence_text(request.check_id, ComplianceEvidenceError::EmptyCheckId)?;
+    let rule_version = normalize_evidence_text(
+        request.rule_version,
+        ComplianceEvidenceError::EmptyRuleVersion,
+    )?;
+    let evaluated_at = normalize_evidence_text(
+        request.evaluated_at,
+        ComplianceEvidenceError::EmptyEvaluatedAt,
+    )?;
+    let decision_status = normalize_evidence_text(
+        request.decision_status,
+        ComplianceEvidenceError::EmptyDecisionStatus,
+    )?;
+    let reason_code = request
+        .reason_code
+        .map(|value| normalize_evidence_text(value, ComplianceEvidenceError::EmptyReasonCode))
+        .transpose()?;
+    let mut input_refs = Vec::new();
+    for input_ref in request.input_refs {
+        input_refs.push(normalize_evidence_text(
+            input_ref,
+            ComplianceEvidenceError::EmptyInputRef,
+        )?);
+    }
+    input_refs.sort();
+    input_refs.dedup();
+
+    let mut raw_inputs = Vec::new();
+    for input in request.raw_inputs {
+        raw_inputs.push(ComplianceEvidenceInput {
+            key: normalize_evidence_text(input.key, ComplianceEvidenceError::EmptyInputKey)?,
+            value: normalize_evidence_text(input.value, ComplianceEvidenceError::EmptyInputValue)?,
+        });
+    }
+    raw_inputs.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    raw_inputs.dedup();
+
+    let decision_hash = compliance_decision_hash(
+        request.check_kind,
+        &rule_version,
+        &decision_status,
+        reason_code.as_deref(),
+        &input_refs,
+        &raw_inputs,
+    );
+
+    Ok(ComplianceEvidenceRecord {
+        check_id,
+        version,
+        check_kind: request.check_kind,
+        rule_version,
+        evaluated_at,
+        decision_status,
+        reason_code,
+        input_refs,
+        raw_inputs,
+        decision_hash,
+        prior_decision_hash,
+    })
+}
+
+fn normalize_evidence_text(
+    value: String,
+    error: ComplianceEvidenceError,
+) -> Result<String, ComplianceEvidenceError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn compliance_decision_hash(
+    check_kind: ComplianceCheckKind,
+    rule_version: &str,
+    decision_status: &str,
+    reason_code: Option<&str>,
+    input_refs: &[String],
+    raw_inputs: &[ComplianceEvidenceInput],
+) -> String {
+    let mut canonical = String::new();
+    canonical.push_str("kind=");
+    canonical.push_str(check_kind.as_str());
+    canonical.push_str("\nrule_version=");
+    canonical.push_str(rule_version);
+    canonical.push_str("\ndecision_status=");
+    canonical.push_str(decision_status);
+    canonical.push_str("\nreason_code=");
+    canonical.push_str(reason_code.unwrap_or(""));
+    canonical.push_str("\ninput_refs=");
+    for input_ref in input_refs {
+        canonical.push_str(input_ref);
+        canonical.push('\u{1f}');
+    }
+    canonical.push_str("\nraw_inputs=");
+    for input in raw_inputs {
+        canonical.push_str(&input.key);
+        canonical.push('=');
+        canonical.push_str(&input.value);
+        canonical.push('\u{1f}');
+    }
+    format!("fnv1a64:{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn compliance_alert_event(
+    event_type: &str,
+    subject_ref: String,
+    severity_hint: ComplianceAlertSeverity,
+    mut evidence_refs: Vec<String>,
+    occurred_at: String,
+) -> ComplianceAlertEvent {
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let idempotency_key = format!(
+        "compliance:{}:{}:{}:{}",
+        event_type,
+        subject_ref,
+        occurred_at,
+        evidence_refs.join("|")
+    );
+    ComplianceAlertEvent {
+        source_domain: "compliance".to_string(),
+        event_type: event_type.to_string(),
+        subject_ref,
+        severity_hint,
+        evidence_refs,
+        occurred_at,
+        idempotency_key,
+    }
+}
+
+fn parse_alert_time(value: &str) -> Result<DateTime<Utc>, ComplianceAlertScheduleError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| ComplianceAlertScheduleError::InvalidTimestamp)
+}
+
+fn normalize_alert_text(
+    value: String,
+    error: ComplianceAlertScheduleError,
+) -> Result<String, ComplianceAlertScheduleError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn normalize_storage_plan(
+    plan: ComplianceRecordStoragePlan,
+) -> Result<ComplianceRecordStoragePlan, CompliancePolicyError> {
+    let record_id = normalize_policy_text(plan.record_id, CompliancePolicyError::EmptyRecordId)?;
+    let residency_tag =
+        normalize_policy_text(plan.residency_tag, CompliancePolicyError::EmptyResidencyTag)?;
+    let storage_region = normalize_policy_text(
+        plan.storage_region,
+        CompliancePolicyError::EmptyStorageRegion,
+    )?;
+    let created_at = normalize_policy_text(plan.created_at, CompliancePolicyError::EmptyCreatedAt)?;
+    parse_policy_time(&created_at)?;
+
+    Ok(ComplianceRecordStoragePlan {
+        record_id,
+        residency_tag,
+        storage_region,
+        retention_class: plan.retention_class,
+        created_at,
+    })
+}
+
+fn find_retention_policy(
+    plan: &ComplianceRecordStoragePlan,
+    policies: &[ComplianceRetentionPolicyRule],
+) -> Result<Option<ComplianceRetentionPolicyRule>, CompliancePolicyError> {
+    let mut matching_policy = None;
+    for policy in policies {
+        let residency_tag = normalize_policy_text(
+            policy.residency_tag.clone(),
+            CompliancePolicyError::EmptyResidencyTag,
+        )?;
+        if policy.min_retention_days < 0 {
+            return Err(CompliancePolicyError::InvalidMinRetentionDays);
+        }
+        let mut allowed_storage_regions = Vec::new();
+        for region in &policy.allowed_storage_regions {
+            allowed_storage_regions.push(normalize_policy_text(
+                region.clone(),
+                CompliancePolicyError::EmptyAllowedStorageRegion,
+            )?);
+        }
+        if residency_tag == plan.residency_tag && policy.retention_class == plan.retention_class {
+            matching_policy = Some(ComplianceRetentionPolicyRule {
+                residency_tag,
+                retention_class: policy.retention_class,
+                allowed_storage_regions,
+                min_retention_days: policy.min_retention_days,
+            });
+            break;
+        }
+    }
+    Ok(matching_policy)
+}
+
+fn min_retention_until(created_at: &str, min_days: i64) -> Result<String, CompliancePolicyError> {
+    Ok(format_rfc3339(
+        parse_policy_time(created_at)? + Duration::days(min_days),
+    ))
+}
+
+fn policy_decision(
+    plan: ComplianceRecordStoragePlan,
+    checked_at: String,
+    status: CompliancePolicyDecisionStatus,
+    reason_code: Option<CompliancePolicyBlockReason>,
+    min_retention_until: Option<String>,
+) -> CompliancePolicyDecision {
+    CompliancePolicyDecision {
+        record_id: plan.record_id,
+        checked_at,
+        status,
+        reason_code,
+        residency_tag: plan.residency_tag,
+        storage_region: plan.storage_region,
+        retention_class: plan.retention_class,
+        min_retention_until,
+    }
+}
+
+fn parse_policy_time(value: &str) -> Result<DateTime<Utc>, CompliancePolicyError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| CompliancePolicyError::InvalidTimestamp)
+}
+
+fn normalize_policy_text(
+    value: String,
+    error: CompliancePolicyError,
+) -> Result<String, CompliancePolicyError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn point_in_polygon(point: AirspaceCoordinate, polygon: &[AirspaceCoordinate]) -> bool {
     let mut inside = false;
     for edge in polygon.windows(2) {
@@ -1756,19 +3098,33 @@ mod tests {
     use super::{
         airspace_zone_contains_point, airspace_zone_intersects_polygon,
         append_compliance_record_version, build_airspace_zone_record,
-        build_compliance_audit_report, build_initial_compliance_record,
+        build_compliance_audit_report, build_compliance_authority_export,
+        build_compliance_authority_share, build_compliance_evidence_record,
+        build_compliance_regulation_assist, build_initial_compliance_record,
         build_operator_certification_record, check_operator_certification, compute_rei_phi_window,
+        evaluate_compliance_record_deletion, evaluate_compliance_record_storage,
         evaluate_entry_harvest_clearance, evaluate_preflight_authorization,
-        refuse_in_place_mutation, AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError,
-        AirspaceZoneIngestRequest, AppendComplianceRecordVersionRequest, ApplicationGeometry,
-        AuthorizationBlockReason, AuthorizationDecisionStatus, CertificationBlockReason,
-        CertificationStatus, ChemicalApplicationRecord, ComplianceAuditReportError,
-        ComplianceAuditReportRequest, ComplianceRecordError, ComplianceRecordPayload,
-        ComplianceRecordType, CreateComplianceRecordRequest, EntryHarvestAction,
-        EntryHarvestBlockReason, EntryHarvestDecisionStatus, IntervalWindowStatus,
-        OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
-        PreflightAuthorizationRequest, ProductLabelInterval, RemoteIdFlightLogRecord,
-        RemoteIdTrackPoint, TelemetryGapRecord,
+        evaluate_spray_buffer_compliance, refuse_compliance_evidence_overwrite,
+        refuse_in_place_mutation, revoke_compliance_authority_share, AirspaceCoordinate,
+        AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
+        AppendComplianceRecordVersionRequest, ApplicationGeometry, AuthorizationBlockReason,
+        AuthorizationDecisionStatus, CertificationBlockReason, CertificationStatus,
+        ChemicalApplicationRecord, ComplianceAlertScheduleRequest, ComplianceAlertSeverity,
+        ComplianceAuditReportError, ComplianceAuditReportRequest, ComplianceAuthorityExportError,
+        ComplianceAuthorityExportRequest, ComplianceAuthorityFormat,
+        ComplianceAuthorityShareRequest, ComplianceCheckKind, ComplianceDeadlineRecord,
+        ComplianceEvidenceError, ComplianceEvidenceInput, ComplianceEvidenceRequest,
+        CompliancePolicyBlockReason, CompliancePolicyDecisionStatus, ComplianceRecordError,
+        ComplianceRecordPayload, ComplianceRecordSourceHealth, ComplianceRecordSourceStatus,
+        ComplianceRecordStoragePlan, ComplianceRecordType, ComplianceRegulationAssistError,
+        ComplianceRegulationAssistIntent, ComplianceRegulationAssistRequest,
+        ComplianceRetentionClass, ComplianceRetentionPolicyRule, ComplianceRuleCitation,
+        CreateComplianceRecordRequest, EntryHarvestAction, EntryHarvestBlockReason,
+        EntryHarvestDecisionStatus, IntervalWindowStatus, OperatorCertificationRegistrationRequest,
+        PreflightAirspaceStatus, PreflightAuthorizationRequest, ProductLabelInterval,
+        RemoteIdFlightLogRecord, RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType,
+        SprayBufferBlockReason, SprayBufferComplianceError, SprayBufferDecisionStatus,
+        TelemetryGapRecord,
     };
 
     #[test]
@@ -2276,6 +3632,287 @@ mod tests {
     }
 
     #[test]
+    fn spray_buffer_compliance_allows_application_outside_required_buffers() {
+        let decision = evaluate_spray_buffer_compliance(
+            &chemical_application("app-1", application_square(0.0, 0.0, 0.001, 0.001)),
+            vec![sensitive_feature(
+                "water:creek-1",
+                SensitiveFeatureType::Water,
+                application_square(0.01, 0.0, 0.011, 0.001),
+                25.0,
+            )],
+            "2026-06-14T20:45:00Z".to_string(),
+        )
+        .expect("buffer check should run");
+
+        assert_eq!(decision.application_id, "app-1");
+        assert_eq!(decision.status, SprayBufferDecisionStatus::Compliant);
+        assert_eq!(decision.reason_code, None);
+        assert_eq!(decision.feature_ref, None);
+    }
+
+    #[test]
+    fn spray_buffer_compliance_blocks_water_buffer_breach_with_measured_separation() {
+        let decision = evaluate_spray_buffer_compliance(
+            &chemical_application("app-1", application_square(0.0, 0.0, 0.001, 0.001)),
+            vec![sensitive_feature(
+                "water:creek-1",
+                SensitiveFeatureType::Water,
+                application_square(0.0011, 0.0, 0.002, 0.001),
+                25.0,
+            )],
+            "2026-06-14T20:45:00Z".to_string(),
+        )
+        .expect("buffer check should run");
+
+        assert_eq!(decision.status, SprayBufferDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(SprayBufferBlockReason::BufferBreach)
+        );
+        assert_eq!(decision.feature_ref.as_deref(), Some("water:creek-1"));
+        assert_eq!(decision.required_buffer_m, Some(25.0));
+        assert!(
+            decision.actual_separation_m.expect("actual separation") < 25.0,
+            "separation should be inside required buffer"
+        );
+    }
+
+    #[test]
+    fn spray_buffer_compliance_refuses_feature_crs_mismatch() {
+        let error = evaluate_spray_buffer_compliance(
+            &chemical_application("app-1", application_square(0.0, 0.0, 0.001, 0.001)),
+            vec![SensitiveBufferFeature {
+                feature_ref: "water:creek-1".to_string(),
+                feature_type: SensitiveFeatureType::Water,
+                geometry: ApplicationGeometry {
+                    crs: "EPSG:3857".to_string(),
+                    coordinates: square(0.0011, 0.0, 0.002, 0.001),
+                },
+                required_buffer_m: 25.0,
+            }],
+            "2026-06-14T20:45:00Z".to_string(),
+        )
+        .expect_err("non-EPSG:4326 feature should be refused");
+
+        assert!(matches!(
+            error,
+            SprayBufferComplianceError::InvalidFeatureGeometry { .. }
+        ));
+    }
+
+    #[test]
+    fn compliance_evidence_rerun_produces_identical_decision_hash() {
+        let first = build_compliance_evidence_record(buffer_evidence_request("buffer.rules.v1"))
+            .expect("evidence should build");
+        let second = build_compliance_evidence_record(buffer_evidence_request("buffer.rules.v1"))
+            .expect("rerun evidence should build");
+
+        assert_eq!(first.decision_hash, second.decision_hash);
+        assert_eq!(first.reason_code.as_deref(), Some("buffer_breach"));
+        assert_eq!(first.raw_inputs[0].key, "actual_separation_m");
+        assert_eq!(
+            first.input_refs,
+            vec!["application:app-1", "feature:water:creek-1"]
+        );
+    }
+
+    #[test]
+    fn compliance_evidence_rule_version_change_appends_without_overwriting_prior() {
+        let first = build_compliance_evidence_record(buffer_evidence_request("buffer.rules.v1"))
+            .expect("evidence should build");
+        let second = super::append_compliance_evidence_record(
+            &first,
+            buffer_evidence_request("buffer.rules.v2"),
+        )
+        .expect("new rule version should append");
+
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 2);
+        assert_eq!(
+            second.prior_decision_hash.as_deref(),
+            Some(first.decision_hash.as_str())
+        );
+        assert_ne!(first.decision_hash, second.decision_hash);
+        assert_eq!(first.rule_version, "buffer.rules.v1");
+        assert_eq!(second.rule_version, "buffer.rules.v2");
+    }
+
+    #[test]
+    fn compliance_evidence_refuses_in_place_overwrite() {
+        let first = build_compliance_evidence_record(buffer_evidence_request("buffer.rules.v1"))
+            .expect("evidence should build");
+        let error = refuse_compliance_evidence_overwrite(&first);
+
+        assert_eq!(
+            error,
+            ComplianceEvidenceError::AppendOnlyOverwriteRefused { version: 1 }
+        );
+    }
+
+    #[test]
+    fn compliance_alert_scheduler_emits_cert_expiry_with_evidence_ref() {
+        let events = super::schedule_compliance_alerts(ComplianceAlertScheduleRequest {
+            checked_at: "2026-06-14T12:00:00Z".to_string(),
+            lead_hours: 48,
+            certifications: vec![operator_cert(
+                "cert-107-valid",
+                "operator-17",
+                "part-107",
+                "2026-01-01T00:00:00Z",
+                "2026-06-16T11:00:00Z",
+            )],
+            clearance_windows: Vec::new(),
+            filing_deadlines: Vec::new(),
+            source_health: Vec::new(),
+        })
+        .expect("scheduler should run");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_domain, "compliance");
+        assert_eq!(events[0].event_type, "compliance.cert_expiring");
+        assert_eq!(
+            events[0].subject_ref,
+            "operator_certification:cert-107-valid"
+        );
+        assert_eq!(events[0].severity_hint, ComplianceAlertSeverity::Warning);
+        assert_eq!(
+            events[0].evidence_refs,
+            vec!["certification:cert-107-valid"]
+        );
+    }
+
+    #[test]
+    fn compliance_alert_scheduler_surfaces_unavailable_record_source() {
+        let events = super::schedule_compliance_alerts(ComplianceAlertScheduleRequest {
+            checked_at: "2026-06-14T12:00:00Z".to_string(),
+            lead_hours: 24,
+            certifications: Vec::new(),
+            clearance_windows: Vec::new(),
+            filing_deadlines: Vec::new(),
+            source_health: vec![ComplianceRecordSourceHealth {
+                source_ref: "state-pesticide-registry".to_string(),
+                status: ComplianceRecordSourceStatus::Unavailable,
+                checked_at: "2026-06-14T12:00:00Z".to_string(),
+            }],
+        })
+        .expect("scheduler should run");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "compliance.source_unavailable");
+        assert_eq!(events[0].subject_ref, "source:state-pesticide-registry");
+        assert_eq!(events[0].severity_hint, ComplianceAlertSeverity::Critical);
+        assert_eq!(
+            events[0].evidence_refs,
+            vec!["source:state-pesticide-registry"]
+        );
+    }
+
+    #[test]
+    fn compliance_alert_scheduler_ignores_deadlines_outside_lead_window() {
+        let events = super::schedule_compliance_alerts(ComplianceAlertScheduleRequest {
+            checked_at: "2026-06-14T12:00:00Z".to_string(),
+            lead_hours: 24,
+            certifications: Vec::new(),
+            clearance_windows: Vec::new(),
+            filing_deadlines: vec![ComplianceDeadlineRecord {
+                deadline_ref: "state-filing-1".to_string(),
+                due_at: "2026-06-17T12:00:00Z".to_string(),
+                evidence_ref: "compliance:record:chem-app-1".to_string(),
+            }],
+            source_health: Vec::new(),
+        })
+        .expect("scheduler should run");
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn compliance_policy_allows_record_storage_in_residency_region() {
+        let decision = evaluate_compliance_record_storage(
+            storage_plan(
+                "record-1",
+                "us",
+                "us-east-1",
+                ComplianceRetentionClass::AuditEvidence,
+            ),
+            &[retention_policy(
+                "us",
+                ComplianceRetentionClass::AuditEvidence,
+                &["us-east-1"],
+                365,
+            )],
+            "2026-06-14T12:00:00Z".to_string(),
+        )
+        .expect("storage policy should evaluate");
+
+        assert_eq!(decision.status, CompliancePolicyDecisionStatus::Allowed);
+        assert_eq!(decision.reason_code, None);
+        assert_eq!(decision.residency_tag, "us");
+        assert_eq!(decision.storage_region, "us-east-1");
+        assert_eq!(
+            decision.min_retention_until.as_deref(),
+            Some("2027-06-14T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn compliance_policy_blocks_storage_in_wrong_residency_region() {
+        let decision = evaluate_compliance_record_storage(
+            storage_plan(
+                "record-1",
+                "us",
+                "eu-central-1",
+                ComplianceRetentionClass::AuditEvidence,
+            ),
+            &[retention_policy(
+                "us",
+                ComplianceRetentionClass::AuditEvidence,
+                &["us-east-1"],
+                365,
+            )],
+            "2026-06-14T12:00:00Z".to_string(),
+        )
+        .expect("storage policy should evaluate");
+
+        assert_eq!(decision.status, CompliancePolicyDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(CompliancePolicyBlockReason::ResidencyRegionMismatch)
+        );
+    }
+
+    #[test]
+    fn compliance_policy_refuses_deletion_before_minimum_retention() {
+        let decision = evaluate_compliance_record_deletion(
+            storage_plan(
+                "record-chem-app-1",
+                "us",
+                "us-east-1",
+                ComplianceRetentionClass::ChemicalApplication,
+            ),
+            &[retention_policy(
+                "us",
+                ComplianceRetentionClass::ChemicalApplication,
+                &["us-east-1"],
+                30,
+            )],
+            "2026-06-20T12:00:00Z".to_string(),
+        )
+        .expect("deletion policy should evaluate");
+
+        assert_eq!(decision.status, CompliancePolicyDecisionStatus::Blocked);
+        assert_eq!(
+            decision.reason_code,
+            Some(CompliancePolicyBlockReason::RetentionPeriodActive)
+        );
+        assert_eq!(
+            decision.min_retention_until.as_deref(),
+            Some("2026-07-14T12:00:00Z")
+        );
+    }
+
+    #[test]
     fn in_place_mutation_is_refused() {
         let error = refuse_in_place_mutation("delete");
 
@@ -2485,6 +4122,212 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authority_export_adapts_validated_report_to_specific_layout() {
+        let report = complete_audit_report();
+
+        let export = build_compliance_authority_export(ComplianceAuthorityExportRequest {
+            authority_format: ComplianceAuthorityFormat::FaaRemoteId,
+            report,
+            generated_at: "2026-06-13T12:05:00Z".to_string(),
+            residency_tag: "us".to_string(),
+            storage_region: "us-east-1".to_string(),
+            retention_class: ComplianceRetentionClass::AuditEvidence,
+        })
+        .expect("remote ID authority export should build from the report");
+
+        assert_eq!(export.schema_version, "compliance.authority_export.v1");
+        assert_eq!(
+            export.authority_format,
+            ComplianceAuthorityFormat::FaaRemoteId
+        );
+        assert_eq!(export.file_name, "report-field-north-faa_remote_id.json");
+        assert_eq!(export.included_record_ids, vec!["remote-log-1".to_string()]);
+        assert_eq!(export.residency_tag, "us");
+        assert_eq!(
+            export
+                .payload
+                .pointer("/remote_id_logs/0/record_id")
+                .and_then(|value| value.as_str()),
+            Some("remote-log-1")
+        );
+        assert!(export
+            .provenance_refs
+            .contains(&"provenance:remote-id/remote-log-1/v1".to_string()));
+    }
+
+    #[test]
+    fn authority_export_refuses_format_without_required_record() {
+        let report = build_compliance_audit_report(ComplianceAuditReportRequest {
+            report_id: "report-field-north".to_string(),
+            org_id: "org-alpha".to_string(),
+            field_id: "field-north".to_string(),
+            generated_at: "2026-06-13T12:00:00Z".to_string(),
+            records: vec![compliance_record(
+                "remote-log-1",
+                ComplianceRecordType::RemoteIdLog,
+                Some("flight-77"),
+                "provenance:remote-id/remote-log-1/v1",
+                Some(ComplianceRecordPayload::RemoteIdFlightLog(remote_id_log())),
+            )],
+            mandatory_record_types: vec![ComplianceRecordType::RemoteIdLog],
+        })
+        .expect("remote-only report should build");
+
+        let error = build_compliance_authority_export(ComplianceAuthorityExportRequest {
+            authority_format: ComplianceAuthorityFormat::StatePesticideApplication,
+            report,
+            generated_at: "2026-06-13T12:05:00Z".to_string(),
+            residency_tag: "us".to_string(),
+            storage_region: "us-east-1".to_string(),
+            retention_class: ComplianceRetentionClass::AuditEvidence,
+        })
+        .expect_err("state pesticide export requires chemical applications");
+
+        assert_eq!(
+            error,
+            ComplianceAuthorityExportError::MissingAuthorityRecord {
+                record_type: ComplianceRecordType::ChemicalApplication
+            }
+        );
+    }
+
+    #[test]
+    fn authority_share_is_bounded_and_revocable() {
+        let export = build_compliance_authority_export(ComplianceAuthorityExportRequest {
+            authority_format: ComplianceAuthorityFormat::StatePesticideApplication,
+            report: complete_audit_report(),
+            generated_at: "2026-06-13T12:05:00Z".to_string(),
+            residency_tag: "us".to_string(),
+            storage_region: "us-east-1".to_string(),
+            retention_class: ComplianceRetentionClass::AuditEvidence,
+        })
+        .expect("authority export should build");
+
+        let share = build_compliance_authority_share(ComplianceAuthorityShareRequest {
+            share_id: "share-state-1".to_string(),
+            export,
+            created_at: "2026-06-13T12:10:00Z".to_string(),
+            expires_at: "2026-06-20T12:10:00Z".to_string(),
+        })
+        .expect("share artifact should build");
+
+        assert_eq!(
+            share.url_path,
+            "/api/compliance/authority-shares/share-state-1"
+        );
+        assert_eq!(share.residency_tag, "us");
+        assert!(share.revocable);
+        assert_eq!(share.revoked_at, None);
+
+        let revoked = revoke_compliance_authority_share(share, "2026-06-14T12:10:00Z".to_string())
+            .expect("share should revoke with audit timestamp");
+        assert_eq!(revoked.revoked_at.as_deref(), Some("2026-06-14T12:10:00Z"));
+    }
+
+    #[test]
+    fn regulation_assist_summarizes_records_with_citations_and_uncertainty() {
+        let output = build_compliance_regulation_assist(ComplianceRegulationAssistRequest {
+            assist_id: "assist-1".to_string(),
+            intent: ComplianceRegulationAssistIntent::Summary,
+            report: complete_audit_report(),
+            generated_at: "2026-06-13T12:20:00Z".to_string(),
+            rule_citations: vec![
+                ComplianceRuleCitation {
+                    rule_ref: "rule:faa:remote-id".to_string(),
+                    title: "FAA Remote ID flight log submission".to_string(),
+                },
+                ComplianceRuleCitation {
+                    rule_ref: "rule:state:pesticide-application".to_string(),
+                    title: "State pesticide application filing".to_string(),
+                },
+            ],
+            feature_enabled: true,
+        })
+        .expect("assist should summarize deterministic records");
+
+        assert_eq!(output.assist_id, "assist-1");
+        assert_eq!(output.report_id, "report-field-north");
+        assert!(!output.can_authorize);
+        assert!(!output.can_clear_violation);
+        assert!(output
+            .summary
+            .contains("Deterministic gates remain authoritative"));
+        assert!(output
+            .draft_filing_text
+            .contains("does not authorize operations or clear violations"));
+        assert!(output
+            .source_record_refs
+            .contains(&"compliance_record:remote-log-1@v1".to_string()));
+        assert!(output.rule_refs.contains(&"rule:faa:remote-id".to_string()));
+        assert!(
+            output.uncertainty_flag,
+            "minimal report lacks all default mandatory record classes"
+        );
+        assert!(output
+            .uncertainty_reasons
+            .contains(&"missing_operator_certification".to_string()));
+    }
+
+    #[test]
+    fn regulation_assist_refuses_authorization_or_clearance_attempts() {
+        let error = build_compliance_regulation_assist(ComplianceRegulationAssistRequest {
+            assist_id: "assist-denied".to_string(),
+            intent: ComplianceRegulationAssistIntent::AuthorizeFlight,
+            report: complete_audit_report(),
+            generated_at: "2026-06-13T12:20:00Z".to_string(),
+            rule_citations: vec![ComplianceRuleCitation {
+                rule_ref: "rule:faa:remote-id".to_string(),
+                title: "FAA Remote ID flight log submission".to_string(),
+            }],
+            feature_enabled: true,
+        })
+        .expect_err("assist must not authorize flights");
+
+        assert_eq!(
+            error,
+            ComplianceRegulationAssistError::DeterministicGateRequired
+        );
+    }
+
+    fn complete_audit_report() -> super::ComplianceAuditReport {
+        build_compliance_audit_report(ComplianceAuditReportRequest {
+            report_id: "report-field-north".to_string(),
+            org_id: "org-alpha".to_string(),
+            field_id: "field-north".to_string(),
+            generated_at: "2026-06-13T12:00:00Z".to_string(),
+            records: vec![
+                compliance_record(
+                    "remote-log-1",
+                    ComplianceRecordType::RemoteIdLog,
+                    Some("flight-77"),
+                    "provenance:remote-id/remote-log-1/v1",
+                    Some(ComplianceRecordPayload::RemoteIdFlightLog(remote_id_log())),
+                ),
+                compliance_record(
+                    "chem-app-1",
+                    ComplianceRecordType::ChemicalApplication,
+                    None,
+                    "provenance:application/chem-app-1/v1",
+                    Some(ComplianceRecordPayload::ChemicalApplication(
+                        chemical_application(
+                            "chem-app-1",
+                            ApplicationGeometry {
+                                crs: "EPSG:4326".to_string(),
+                                coordinates: square_zone(),
+                            },
+                        ),
+                    )),
+                ),
+            ],
+            mandatory_record_types: vec![
+                ComplianceRecordType::RemoteIdLog,
+                ComplianceRecordType::ChemicalApplication,
+            ],
+        })
+        .expect("complete audit report should build")
+    }
+
     fn compliance_record(
         record_id: &str,
         record_type: ComplianceRecordType,
@@ -2567,6 +4410,128 @@ mod tests {
             units: "L/ha".to_string(),
             operator_id: "operator-17".to_string(),
         }
+    }
+
+    fn chemical_application(
+        application_id: &str,
+        geometry: ApplicationGeometry,
+    ) -> ChemicalApplicationRecord {
+        ChemicalApplicationRecord {
+            application_id: application_id.to_string(),
+            product: "Example Herbicide".to_string(),
+            epa_or_label_ref: "EPA-12345-LBL".to_string(),
+            field_id: "field-north".to_string(),
+            geometry,
+            applied_at: "2026-06-12T13:00:00Z".to_string(),
+            rate: 1.75,
+            units: "L/ha".to_string(),
+            operator_id: "operator-17".to_string(),
+        }
+    }
+
+    fn sensitive_feature(
+        feature_ref: &str,
+        feature_type: SensitiveFeatureType,
+        geometry: ApplicationGeometry,
+        required_buffer_m: f64,
+    ) -> SensitiveBufferFeature {
+        SensitiveBufferFeature {
+            feature_ref: feature_ref.to_string(),
+            feature_type,
+            geometry,
+            required_buffer_m,
+        }
+    }
+
+    fn buffer_evidence_request(rule_version: &str) -> ComplianceEvidenceRequest {
+        ComplianceEvidenceRequest {
+            check_id: "buffer-check:app-1".to_string(),
+            check_kind: ComplianceCheckKind::SprayBuffer,
+            rule_version: rule_version.to_string(),
+            evaluated_at: "2026-06-14T21:03:00Z".to_string(),
+            decision_status: "blocked".to_string(),
+            reason_code: Some("buffer_breach".to_string()),
+            input_refs: vec![
+                "feature:water:creek-1".to_string(),
+                "application:app-1".to_string(),
+            ],
+            raw_inputs: vec![
+                ComplianceEvidenceInput {
+                    key: "required_buffer_m".to_string(),
+                    value: "25.000".to_string(),
+                },
+                ComplianceEvidenceInput {
+                    key: "actual_separation_m".to_string(),
+                    value: "11.132".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn storage_plan(
+        record_id: &str,
+        residency_tag: &str,
+        storage_region: &str,
+        retention_class: ComplianceRetentionClass,
+    ) -> ComplianceRecordStoragePlan {
+        ComplianceRecordStoragePlan {
+            record_id: record_id.to_string(),
+            residency_tag: residency_tag.to_string(),
+            storage_region: storage_region.to_string(),
+            retention_class,
+            created_at: "2026-06-14T12:00:00Z".to_string(),
+        }
+    }
+
+    fn retention_policy(
+        residency_tag: &str,
+        retention_class: ComplianceRetentionClass,
+        regions: &[&str],
+        min_retention_days: i64,
+    ) -> ComplianceRetentionPolicyRule {
+        ComplianceRetentionPolicyRule {
+            residency_tag: residency_tag.to_string(),
+            retention_class,
+            allowed_storage_regions: regions.iter().map(|region| (*region).to_string()).collect(),
+            min_retention_days,
+        }
+    }
+
+    fn application_square(
+        min_lon: f64,
+        min_lat: f64,
+        max_lon: f64,
+        max_lat: f64,
+    ) -> ApplicationGeometry {
+        ApplicationGeometry {
+            crs: "EPSG:4326".to_string(),
+            coordinates: square(min_lon, min_lat, max_lon, max_lat),
+        }
+    }
+
+    fn square(min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) -> Vec<AirspaceCoordinate> {
+        vec![
+            AirspaceCoordinate {
+                longitude: min_lon,
+                latitude: min_lat,
+            },
+            AirspaceCoordinate {
+                longitude: max_lon,
+                latitude: min_lat,
+            },
+            AirspaceCoordinate {
+                longitude: max_lon,
+                latitude: max_lat,
+            },
+            AirspaceCoordinate {
+                longitude: min_lon,
+                latitude: max_lat,
+            },
+            AirspaceCoordinate {
+                longitude: min_lon,
+                latitude: min_lat,
+            },
+        ]
     }
 
     fn preflight_request(

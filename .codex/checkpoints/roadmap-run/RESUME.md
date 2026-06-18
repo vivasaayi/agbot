@@ -1,20 +1,208 @@
 # Roadmap Run — Resume
 
 - **Run ID**: run-02-sim
-- **Roadmap hash**: cb56fee9f4f727af1f60940dc5c344585277d996
-- **Last implementation commit**: 86a594d (`batch-20260614060726`)
-- **Latest checkpoint commit**: 86a594d (`batch-20260614060726`)
-- **Current batch**: `batch-20260614060726` — STORIES `07-14` and `07-17`
-- **Completed feature rows**: 306 committed; 1 tests_passed; 1 skipped; 1 blocked; 189 pending in this run.
-- **Blocker**: None
+- **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
+- **Last implementation commit**: 83a77b4 (`batch-20260618100014`)
+- **Latest checkpoint commit**: f5b67cf
+- **Current batch**: none
+- **Completed feature rows**: 494 committed; 0 tests_passed; 2 skipped; 2 blocked; 0 pending in this run.
+- **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
 
-- `cargo fmt --all --check` — pass
-- `cargo test -p post_processor --lib` — pass (77 tests)
-- `cargo test -p lidar_mapper --lib` — pass (36 tests)
-- `cargo test -p geo_hub --test products_api` — pass (104 tests)
+- `cargo test -p shared biodiversity_proxy` — pass
+- `cargo test -p geo_hub biodiversity_proxy` — pass
+- `cargo test -p geo_hub biodiversity_proxies` — pass
+- `cargo check -p geo_hub` — pass
+- `19-06` — committed as biodiversity imagery proxy with georeferenced heterogeneity/cover metrics, uncertainty, source layer evidence, stable hashes, persisted list/get API, and explicit no-signal results for degenerate imagery
+- `cargo test -p shared soil_carbon` — pass
+- `cargo test -p geo_hub soil_carbon` — pass
+- `cargo check -p geo_hub` — pass
+- `19-07` — committed as soil-carbon proxy with weighted index/biomass/practice evidence, explicit uncertainty band for computed outputs, stable hashes, persisted list/get API, and explicit unavailable results for insufficient evidence
+- `cargo test -p shared sustainability_kpi --lib` — pass
+- `cargo test -p geo_hub --test products_api sustainability_kpis_compute_get_and_list_with_stable_hash` — pass
+- `cargo test -p geo_hub --test products_api sustainability_kpi_no_data_persists_without_current_value` — pass
+- `cargo check -p geo_hub` — pass
+- `19-08` — committed as sustainability KPI tracking with deterministic target status, no-data handling for missing source values, evidence-cited hashes, persisted list/get API, and real MRV KPI output-ref validation
+- `cargo test -p shared sustainability_certification_pack --lib` — pass
+- `cargo test -p geo_hub --test products_api sustainability_certification_pack` — pass
+- `cargo check -p geo_hub` — pass
+- `19-09` — verified as certification evidence packs with shared completeness gates, persisted Geo Hub create/get API coverage, evidence layer/audit/MRV bundle assertions, and missing-MRV refusal without write
+- `cargo test -p geo_hub --test products_api sustainability_field_exports` — pass
+- `cargo test -p shared sustainability_export --lib` — pass (0 matching tests; shared crate compiled with export structs)
+- `cargo check -p geo_hub` — pass
+- `19-10` — verified as field sustainability export/reporting with CSV row parity, GeoJSON CRS/extent features, PDF method/evidence citations, and valid empty-field artifacts
+- `cargo test -p shared content_workflow --lib` — pass
+- `cargo test -p geo_hub --test products_api content_workflow` — pass
+- `cargo check -p geo_hub` — pass
+- `20-02` — verified as authoring/editorial workflow with draft → review → publish transitions, audit rows with actor/timestamp, non-editor publish denial, skip-review refusal, and future scheduled publish staying in review
+- `cargo test -p shared content_permissions --lib` — pass
+- `cargo test -p geo_hub --test products_api content_permissions` — pass
+- `cargo test -p geo_hub --test products_api content_workflow` — pass
+- `cargo check -p geo_hub` — pass
+- `20-03` — verified as CMS permission resolution from org-scoped role refs, editor publish capability, cross-org no-access resolution, and viewer workflow write denial with audit
+- `cargo test -p shared content_search --lib` — pass
+- `cargo test -p geo_hub --test products_api content_search` — pass
+- `cargo check -p geo_hub` — pass
+- `20-04` — verified as published-only content search with deterministic term ranking, org scoping, draft exclusion, result article links, and empty no-match results
+- `cargo test -p shared content_taxonomy --lib` — pass
+- `cargo test -p geo_hub --test products_api content_tags` — pass
+- `cargo check -p geo_hub` — pass
+- `20-05` — verified as controlled crop/region/topic taxonomy tagging, editor-confirmed AI suggestions only, tag-filtered content retrieval, and off-taxonomy rejection
+- `cargo test -p shared content_portal_embed --lib` — pass
+- `cargo test -p geo_hub --test products_api content_portal_embed` — pass
+- `cargo test -p geo_hub --test products_api content_` — pass
+- `cargo check -p geo_hub` — pass
+- `20-06` — committed as read-only grower portal knowledge-base embedding with same-org `cms:viewer` visibility, published-only list/open routes, evidence refs, and 403/404 non-leakage for cross-org readers, drafts, and foreign content
+- `cargo test -p shared content_engagement --lib` — pass
+- `cargo test -p geo_hub --test products_api content_engagement` — pass
+- `cargo test -p geo_hub --test products_api content_` — pass
+- `cargo check -p geo_hub` — pass
+- `20-07` — committed as content engagement analytics with persisted view/read/helpful-vote events, deterministic per-period summary rows, evidence refs, and zero summaries for published items with no activity
+- `cargo test -p shared success_story --lib` — pass
+- `cargo test -p geo_hub --test products_api content_success_story` — pass
+- `cargo test -p geo_hub --test products_api content_` — pass
+- `cargo check -p geo_hub` — pass
+- `20-08` — committed as structured success-story publishing with `success_story` content type, required grower/crop/region/outcome/metrics validation, structured sidecar persistence, editorial workflow reuse, search visibility, portal embed reuse, and missing-field refusal without writes
+- `cargo test -p shared community_contribution --lib` — pass
+- `cargo test -p shared moderator_approval --lib` — pass
+- `cargo test -p geo_hub --test products_api content_community_contribution` — pass
+- `cargo test -p geo_hub --test products_api content_` — pass
+- `cargo check -p geo_hub` — pass
+- `20-09` — committed as community contribution moderation with submitted queue persistence, hidden/unpublished submissions, moderator-only approval/rejection through `cms:editor`, audited decisions, approved contributions converted to draft CMS content for the standard publish flow, and non-moderator denial leaving the queue item submitted
+- `cargo test -p shared content_localization --lib` — pass
+- `cargo test -p geo_hub --test products_api content_localization` — pass
+- `cargo test -p geo_hub --test products_api content_` — pass
+- `cargo check -p geo_hub` — pass
+- `20-10` — committed as locale-tagged content variants with per-locale status, published requested-locale serving, deterministic missing-locale fallback to canonical published content, locale evidence refs, and persisted API coverage
+- `cargo test -p shared collaboration_permissions_are_role_and_tenant_scoped --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-02` — committed as tenant-scoped collaboration permission resolution with operator stream/dispatch grants, viewer stream/dispatch/post denials, denied-action audit rows, and no unauthorized message writes
+- `cargo test -p shared collaboration_presence_expires_and_notifications_fan_out_to_channel_members --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-03` — committed as collaboration presence and notifications with online heartbeat persistence, stale heartbeat expiry to offline, channel-member notification fan-out, delivered-state persistence, and tenant-scoped channel checks
+- `cargo test -p shared collaboration_stream_starts_relays_and_reconnects_on_drop --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_stream` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-04` — committed as live stream lifecycle with active camera-source start, persisted stream state, latency-bounded frame relay with encode/relay/view refs, authorized viewer frame listing, drop-to-reconnecting handling, cross-org viewer denial, and source-unavailable no-write
+- `cargo test -p shared collaboration_emergency_alert_fans_out_and_transitions_with_audit --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_emergency_alert` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-05` — committed as emergency alert lifecycle with `01`/`12` source refs, channel fan-out, retry-pending delivery failure records, raise/acknowledge/resolve audit trail, operator-only alert permission, and viewer denial without writes
+- `cargo test -p shared collaboration_session_replay_orders_events_and_preserves_gaps --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_session` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-06` — committed as immutable session recording and replay with deterministic event ordering, actor/timestamp/subject refs, explicit stream-gap representation, persisted events, and cross-org replay denial
+- `cargo fmt` — pass
+- `cargo test -p shared collaboration_mission_edit_conflicts_and_dispatch_guardrails_are_audited --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_mission` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-07` — committed as collaborative mission planning with optimistic waypoint version checks, accepted edit persistence, stale edit rejection audits, dispatch guardrail evidence for geofence/altitude/battery/abort path, blocked dispatch audit persistence, and viewer dispatch denial before dispatch audit writes
+- `cargo fmt` — pass
+- `cargo test -p shared collaboration_session_annotation_link_scopes_visibility_and_recovery --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_remote_expert_annotation` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-08` — committed as remote-expert live-scene annotation through the canonical `08` annotation store, with session/org visibility links, expert attribution, non-ended stream validation, replay event recovery for lost connections, and viewer denial without annotation/session mutation
+- `cargo fmt` — pass
+- `cargo test -p shared collaboration_operator_console_feed_filters_org_and_preserves_stream_state --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_operator_console_feed` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-09` — committed as operator-console collaboration feed with org-scoped streams, active raised/acknowledged alerts, foreign stream/alert exclusion, cross-org permission denial, and ended streams surfaced as `ended` rather than stale live
+- `cargo fmt` — pass
+- `cargo test -p geo_hub --test products_api collaboration_portal_feed` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-10` — committed as read-only grower portal collaboration feed with member-scoped stream/alert visibility, direct same-org stream access, direct foreign stream/alert 404 non-leakage, and cross-org feed denial
+- `cargo fmt` — pass
+- `cargo test -p orthomosaic refly_suggestion` — pass
+- `cargo check -p orthomosaic` — pass
+- `22-17` — committed as advisory-only model-assisted re-fly suggestion from deterministic orthomosaic QA, with cited coverage gap/quality metrics, bounded re-fly area, pending operator approval, no auto-dispatch, and no proposal for passing mosaics
+- `cargo fmt` — pass
+- `cargo test -p crop_intelligence inference_run_progress --lib` — pass
+- `cargo test -p crop_intelligence inference_run_stall --lib` — pass
+- `cargo test -p geo_hub --test products_api crop_intelligence_inference_progress` — pass
+- `cargo test -p geo_hub --test products_api crop_intelligence_` — pass
+- `cargo check -p crop_intelligence` — pass
+- `cargo check -p geo_hub` — pass
+- `23-04` — committed as crop inference run progress observability with timestamped tile progress, coverage fractions, persisted progress streams, stall detection after the configured no-progress window, and API coverage for non-stalled and flagged stalled runs
+- `cargo fmt` — pass
+- `cargo test -p crop_intelligence closed_loop --lib` — pass
+- `cargo test -p crop_intelligence proposal --lib` — pass
+- `cargo test -p geo_hub --test products_api crop_intelligence_closed_loop` — pass
+- `cargo test -p geo_hub --test products_api crop_intelligence_` — pass
+- `cargo check -p crop_intelligence` — pass
+- `cargo check -p geo_hub` — pass
+- `23-16` — committed as advisory, approval-gated crop closed-loop proposals with bounded re-fly areas, treatment prescription references, cited verified finding evidence, persisted create/get API, unverified/low-confidence refusal, and no mission or tractor dispatch side effects
+- `cargo fmt` — pass
+- `cargo test -p compliance authority --lib` — pass
+- `cargo test -p geo_hub --test products_api compliance_authority` — pass
+- `cargo test -p geo_hub --test products_api compliance_` — pass
+- `cargo check -p compliance` — pass
+- `cargo check -p geo_hub` — pass
+- `24-13` — committed as per-authority compliance export/share with FAA Remote ID and state pesticide adapters, validated record-set filtering, residency/retention metadata, persisted bounded share links, revoked-link denial, and share create/access/revoke audit rows
+- `cargo fmt` — pass
+- `cargo test -p compliance regulation_assist --lib` — pass
+- `cargo test -p compliance assist --lib` — pass
+- `cargo test -p geo_hub --test products_api compliance_regulation_assist` — pass
+- `cargo test -p geo_hub --test products_api compliance_` — pass
+- `cargo check -p compliance` — pass
+- `cargo check -p geo_hub` — pass
+- `24-14` — committed as evidence-gated regulation-summary assist with deterministic source-record/rule citations, uncertainty flags, feature gating, non-authorizing output flags, and explicit refusal to authorize flights or clear violations
+- `cargo fmt` — pass
+- `cargo test -p fleet_health ground_vehicle --lib` — pass
+- `cargo test -p geo_hub --test products_api fleet_health_ingests_tractor_health` — pass
+- `cargo test -p geo_hub --test products_api fleet_health_` — pass
+- `cargo check -p fleet_health` — pass
+- `cargo check -p geo_hub` — pass
+- `25-11` — committed as tractor/ground-vehicle fleet-health integration with shared component/verdict/readiness/dashboard contracts, tractor existence validation, persisted component registry rows, overdue-service field-ops blocking, and ground-vehicle ingestion event evidence
+- `cargo fmt` — pass
+- `cargo test -p fleet_health predictive_maintenance_schedule --lib` — pass
+- `cargo check -p fleet_health` — pass
+- `25-13` — verified as predictive maintenance scheduling with RUL-range service windows, uncertainty summary/evidence, required FLEET-TECH approval, work-order opening on approval, and explicit no-dispatch/no-verdict-clearance safety gates
+- `cargo fmt` — pass
+- `cargo test -p copilot proactive_closed_loop --lib` — pass
+- `cargo check -p copilot` — pass
+- `26-12` — verified as proactive closed-loop copilot advisory with high-severity change-event evidence resolution, cited deterministic advisory text, audit-sink write before surfacing, approval-gated draft action, unresolved-evidence skip, and no action execution without approval
+- `cargo fmt` — pass
+- `cargo test -p soil_iot coverage_gap --lib` — pass
+- `cargo check -p soil_iot` — pass
+- `27-14` — verified as soil IoT network coverage gap exports with per-zone coverage summaries, zero-fresh-device CSV/GeoJSON gap artifacts, CRS-preserving polygons, valid empty fully-covered exports, and missing-gap-geometry refusal
+- `cargo fmt` — pass
+- `cargo test -p soil_iot drift_recalibration --lib` — pass
+- `cargo check -p soil_iot` — pass
+- `27-15` — verified as soil IoT drift/recalibration advisory with feature gating, fresh validated target and neighbor/aerial reference requirements, uncertainty bounds, cited soil/fusion evidence, pending approval, and no automatic recalibration
+- `cargo fmt` — pass
+- `cargo test -p alerting adaptive_aggregation --lib` — pass
+- `cargo check -p alerting` — pass
+- `29-16` — verified as adaptive alert aggregation advisory with recorded alert history and dedup evidence, flapping/storm signal thresholds, uncertainty bounds, feature/history gating, pending approval, and no automatic suppression of critical alerts
+- `cargo fmt` — pass
+- `cargo test -p plugin_sdk registry --lib` — pass
+- `cargo check -p plugin_sdk` — pass
+- `31-14` — verified as plugin registry browse/install with manifest version/capability catalog metadata, local manifest validation, host API re-check before registration/download authorization, disabled-by-default registration, explicit capability review, and incompatible-entry refusal without registration
+- `cargo fmt` — pass
+- `cargo test -p interop trimble --lib` — pass
+- `cargo check -p interop` — pass
+- `32-11` — verified as Trimble connector boundary import with mock endpoint, CRS/unit validation, field-boundary record creation in the target CRS, retry/backoff on endpoint timeout, and timeout surfacing without imported results
+- `cargo fmt` — pass
+- `cargo test -p interop migration --lib` — pass
+- `cargo check -p interop` — pass
+- `32-13` — verified as platform migration round-trip with mock source pulls for boundaries and prescriptions, reuse of validated import/export paths, reconciliation counts/areas/CRS, and invalid item reporting as unmigrated with discrepancy flagged
+- `cargo fmt` — pass
+- `cargo test -p interop certification --lib` — pass
+- `cargo check -p interop` — pass
+- `32-14` — verified as round-trip fidelity certification suite for vector GeoJSON, raster GeoTIFF, prescription Shapefile, and TaskData, with named certification rows and explicit CRS-dropping regression failure
+- `cargo test -p post_processor index_trend --lib` — pass
+- `cargo check -p post_processor` — pass with existing warnings
+- `05-21` — stale tests-passed checkpoint row revalidated and normalized to committed with historical implementation commit `a9ca52b`
 
 ## Next action
 
-- Select and claim next pending feature(s) per roadmap priority order.
+- No pending, claimed, in-progress, or tests-passed feature rows remain; only blocked/skipped rows remain.

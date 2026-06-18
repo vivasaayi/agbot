@@ -144,6 +144,42 @@ pub struct ReconstructionJobRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructionProgressStage {
+    FeatureMatching,
+    CameraRegistration,
+    DenseReconstruction,
+    Orthorectification,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReconstructionProgressEvent {
+    pub recon_id: String,
+    pub stage: ReconstructionProgressStage,
+    pub matched_frames: usize,
+    pub registered_cameras: usize,
+    pub dense_points: usize,
+    pub coverage_fraction: f64,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructionStallReasonCode {
+    NoProgressWithinWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconstructionStallEvent {
+    pub recon_id: String,
+    pub stage: ReconstructionProgressStage,
+    pub last_progress_at: chrono::DateTime<chrono::Utc>,
+    pub detected_at: chrono::DateTime<chrono::Utc>,
+    pub stalled_for_seconds: u64,
+    pub reason_code: ReconstructionStallReasonCode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReconstructionJobError {
     #[error("recon_id cannot be empty")]
@@ -154,6 +190,8 @@ pub enum ReconstructionJobError {
     EmptyTimestamp,
     #[error("failure reason cannot be empty")]
     EmptyFailureReason,
+    #[error("reconstruction progress coverage_fraction must be finite within 0..=1")]
+    InvalidProgressCoverage,
     #[error("unsupported reconstruction status {value}")]
     UnsupportedStatus { value: String },
     #[error("invalid reconstruction status transition {from:?} -> {to:?}")]
@@ -211,6 +249,69 @@ pub fn transition_reconstruction_status(
     record.failure_reason = failure_reason;
     record.updated_at = updated_at;
     Ok(record)
+}
+
+pub fn build_reconstruction_progress_event(
+    recon_id: String,
+    stage: ReconstructionProgressStage,
+    matched_frames: usize,
+    registered_cameras: usize,
+    dense_points: usize,
+    coverage_fraction: f64,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<ReconstructionProgressEvent, ReconstructionJobError> {
+    let recon_id = normalize_required_recon_text(recon_id, ReconstructionJobError::EmptyReconId)?;
+    if !coverage_fraction.is_finite() || !(0.0..=1.0).contains(&coverage_fraction) {
+        return Err(ReconstructionJobError::InvalidProgressCoverage);
+    }
+
+    Ok(ReconstructionProgressEvent {
+        recon_id,
+        stage,
+        matched_frames,
+        registered_cameras,
+        dense_points,
+        coverage_fraction,
+        at,
+    })
+}
+
+pub fn reconstruction_progress_stream(
+    mut events: Vec<ReconstructionProgressEvent>,
+) -> Vec<ReconstructionProgressEvent> {
+    events.sort_by(|left, right| {
+        left.at
+            .cmp(&right.at)
+            .then(left.recon_id.cmp(&right.recon_id))
+            .then((left.stage as u8).cmp(&(right.stage as u8)))
+    });
+    events
+}
+
+pub fn detect_reconstruction_stall(
+    events: &[ReconstructionProgressEvent],
+    detected_at: chrono::DateTime<chrono::Utc>,
+    stall_after: std::time::Duration,
+) -> Option<ReconstructionStallEvent> {
+    let latest = events.iter().max_by(|left, right| {
+        left.at
+            .cmp(&right.at)
+            .then(left.recon_id.cmp(&right.recon_id))
+            .then((left.stage as u8).cmp(&(right.stage as u8)))
+    })?;
+    let stalled_for_seconds = detected_at
+        .signed_duration_since(latest.at)
+        .num_seconds()
+        .max(0) as u64;
+
+    (stalled_for_seconds > stall_after.as_secs()).then(|| ReconstructionStallEvent {
+        recon_id: latest.recon_id.clone(),
+        stage: latest.stage,
+        last_progress_at: latest.at,
+        detected_at,
+        stalled_for_seconds,
+        reason_code: ReconstructionStallReasonCode::NoProgressWithinWindow,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -390,6 +491,64 @@ pub struct OrthomosaicRaster {
     pub extent_round_trips: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SeamlineExposureConfig {
+    pub target_luminance: Option<f64>,
+    pub max_gain: f64,
+    pub outlier_ratio_threshold: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameExposureObservation {
+    pub frame_id: String,
+    pub mean_luminance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeamlineRecord {
+    pub frame_a_id: String,
+    pub frame_b_id: String,
+    pub start_x_m: f64,
+    pub start_y_m: f64,
+    pub end_x_m: f64,
+    pub end_y_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExposureCorrectionRecord {
+    pub frame_id: String,
+    pub observed_mean_luminance: f64,
+    pub target_luminance: f64,
+    pub gain: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExposureOutlierFrame {
+    pub frame_id: String,
+    pub observed_mean_luminance: f64,
+    pub median_luminance: f64,
+    pub ratio_to_median: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeamlineExposureBalanceReport {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub spatial_ref: RasterSpatialRef,
+    pub seamlines: Vec<SeamlineRecord>,
+    pub exposure_corrections: Vec<ExposureCorrectionRecord>,
+    pub flagged_frames: Vec<ExposureOutlierFrame>,
+    pub geometry_preserved: bool,
+    pub passes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DenseReconstructionConfig {
+    pub output_crs: String,
+    pub sample_spacing_m: f64,
+    pub samples_per_sparse_point: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DensePoint {
     pub x_m: f64,
@@ -400,7 +559,13 @@ pub struct DensePoint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DensePointCloud {
     pub frame_set_id: String,
+    pub generated_at: String,
+    pub crs: String,
+    pub extent: GeoBounds,
     pub points: Vec<DensePoint>,
+    pub point_count: usize,
+    pub density_points_per_square_m: f64,
+    pub extent_round_trips: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -423,6 +588,36 @@ pub struct DsmRaster {
     pub spatial_ref: RasterSpatialRef,
     pub elevation_m: Vec<f64>,
     pub point_support_counts: Vec<u32>,
+    pub nodata_mask: Vec<bool>,
+    pub extent_round_trips: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DtmConfig {
+    pub max_ground_elevation_m: f64,
+    pub min_ground_support_count: u32,
+    pub interpolation_radius_cells: u32,
+    pub nodata_value: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DtmGroundClassification {
+    Ground,
+    NonGround,
+    NoData,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DtmRaster {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub spatial_ref: RasterSpatialRef,
+    pub elevation_m: Vec<f64>,
+    pub ground_classification: Vec<DtmGroundClassification>,
+    pub low_confidence_mask: Vec<bool>,
     pub nodata_mask: Vec<bool>,
     pub extent_round_trips: bool,
 }
@@ -579,6 +774,45 @@ pub enum MosaicQualityVerdict {
     NotPublishable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MosaicQualityReportConfig {
+    pub max_mean_gsd_m_per_px: f64,
+    pub min_overlap_fraction: f64,
+    pub min_coverage_fraction: f64,
+    pub max_reprojection_rms_px: f64,
+    pub max_gcp_rmse_m: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MosaicQualityMetric {
+    MeanGsd,
+    MinimumOverlap,
+    Coverage,
+    ReprojectionRms,
+    GcpOverallRmse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MosaicQualityMetricRecord {
+    pub metric: MosaicQualityMetric,
+    pub observed_value: f64,
+    pub threshold_value: f64,
+    pub unit: String,
+    pub evidence_ref: String,
+    pub passes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MosaicQualityReport {
+    pub frame_set_id: String,
+    pub generated_at: String,
+    pub verdict: MosaicQualityVerdict,
+    pub metrics: Vec<MosaicQualityMetricRecord>,
+    pub failing_metrics: Vec<MosaicQualityMetric>,
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MosaicPublishStatus {
@@ -627,6 +861,58 @@ pub struct MosaicPublishGateDecision {
     #[serde(default)]
     pub blocked_reason: Option<String>,
     pub provenance: MosaicProvenanceRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReflyApprovalState {
+    PendingOperatorApproval,
+    NotRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReflyAreaBounds {
+    pub min_x_m: f64,
+    pub min_y_m: f64,
+    pub max_x_m: f64,
+    pub max_y_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReflySuggestion {
+    pub suggestion_id: String,
+    pub frame_set_id: String,
+    pub mission_proposal_ref: String,
+    pub approval_state: ReflyApprovalState,
+    pub dispatch_allowed: bool,
+    pub bounded_area: ReflyAreaBounds,
+    pub cited_metrics: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReflySuggestionRequest {
+    pub mission_ref: String,
+    pub qa_report: FrameSetQaReport,
+    pub quality_report: MosaicQualityReport,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ReflySuggestionError {
+    #[error("suggestion_id cannot be empty")]
+    EmptySuggestionId,
+    #[error("mission_ref cannot be empty")]
+    EmptyMissionRef,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("quality report frame_set_id {quality_frame_set_id} does not match QA frame_set_id {qa_frame_set_id}")]
+    FrameSetMismatch {
+        qa_frame_set_id: String,
+        quality_frame_set_id: String,
+    },
+    #[error("cannot bound re-fly area without QA frame or gap geometry")]
+    MissingBoundedArea,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -706,6 +992,50 @@ pub enum OrthomosaicError {
     MissingQaFrame { frame_id: String },
     #[error("georeferencing-error: {reason}")]
     GeoreferencingError { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DenseReconstructionError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("dense reconstruction config output_crs cannot be empty")]
+    EmptyOutputCrs,
+    #[error("dense reconstruction sample_spacing_m must be finite and positive")]
+    InvalidSampleSpacing,
+    #[error("dense reconstruction samples_per_sparse_point must be positive")]
+    InvalidSamplesPerSparsePoint,
+    #[error("QA report frame_set_id {qa_frame_set_id} does not match frame set {frame_set_id}")]
+    FrameSetMismatch {
+        frame_set_id: String,
+        qa_frame_set_id: String,
+    },
+    #[error("sparse SfM frame_set_id {sfm_frame_set_id} does not match frame set {frame_set_id}")]
+    SparseSfmFrameSetMismatch {
+        frame_set_id: String,
+        sfm_frame_set_id: String,
+    },
+    #[error("dense reconstruction refused: {reason}")]
+    Refused { reason: String },
+    #[error("georeferencing-error: {reason}")]
+    GeoreferencingError { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SeamlineExposureError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("orthomosaic has no contributing frames")]
+    EmptyContributingFrames,
+    #[error("exposure observations must include at least one frame")]
+    EmptyExposureObservations,
+    #[error("seamline/exposure config field {field} must be finite and positive")]
+    InvalidConfig { field: &'static str },
+    #[error("frame {frame_id} is missing an exposure observation")]
+    MissingExposureObservation { frame_id: String },
+    #[error("frame {frame_id} has non-finite or non-positive exposure")]
+    InvalidExposureObservation { frame_id: String },
+    #[error("orthomosaic spatial_ref is invalid: {reason}")]
+    InvalidSpatialRef { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -796,6 +1126,18 @@ pub enum MosaicPublishGateError {
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum MosaicQualityReportError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("quality report config field {field} must be finite and non-negative")]
+    InvalidConfig { field: &'static str },
+    #[error("quality report frame_set_id mismatch: {left} vs {right}")]
+    FrameSetMismatch { left: String, right: String },
+    #[error("quality report has no overlap evidence")]
+    EmptyOverlapEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DsmError {
     #[error("generated_at cannot be empty")]
     EmptyGeneratedAt,
@@ -813,6 +1155,22 @@ pub enum DsmError {
     NonFinitePoint,
     #[error("georeferencing-error: {reason}")]
     GeoreferencingError { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DtmError {
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("DTM config field {field} must be finite")]
+    NonFiniteConfig { field: &'static str },
+    #[error("DTM min_ground_support_count must be positive")]
+    InvalidGroundSupport,
+    #[error("DSM raster dimensions do not match cell arrays")]
+    DsmCellCountMismatch,
+    #[error("DSM raster contains a non-finite elevation")]
+    NonFiniteElevation,
+    #[error("DSM spatial_ref is invalid: {reason}")]
+    InvalidSpatialRef { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -1195,6 +1553,120 @@ pub fn run_sparse_sfm(
     })
 }
 
+pub fn densify_sparse_reconstruction(
+    frame_set: &FrameSetRecord,
+    qa_report: &FrameSetQaReport,
+    sfm_report: &SparseSfmReport,
+    config: DenseReconstructionConfig,
+    generated_at: String,
+) -> Result<DensePointCloud, DenseReconstructionError> {
+    let output_crs = normalize_optional_text(Some(config.output_crs.clone()))
+        .ok_or(DenseReconstructionError::EmptyOutputCrs)?;
+    validate_dense_reconstruction_config(&config)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(DenseReconstructionError::EmptyGeneratedAt)?;
+    if qa_report.frame_set_id != frame_set.frame_set_id {
+        return Err(DenseReconstructionError::FrameSetMismatch {
+            frame_set_id: frame_set.frame_set_id.clone(),
+            qa_frame_set_id: qa_report.frame_set_id.clone(),
+        });
+    }
+    if sfm_report.frame_set_id != frame_set.frame_set_id {
+        return Err(DenseReconstructionError::SparseSfmFrameSetMismatch {
+            frame_set_id: frame_set.frame_set_id.clone(),
+            sfm_frame_set_id: sfm_report.frame_set_id.clone(),
+        });
+    }
+    assert_dense_pose_set(frame_set, sfm_report)?;
+
+    let frame_extents = qa_report
+        .frames
+        .iter()
+        .map(|frame| OrthorectifiedFrameRecord {
+            frame_id: frame.frame_id.clone(),
+            min_x_m: frame.min_x_m,
+            min_y_m: frame.min_y_m,
+            max_x_m: frame.max_x_m,
+            max_y_m: frame.max_y_m,
+        })
+        .collect::<Vec<_>>();
+    let extent = mosaic_extent(&frame_extents).ok_or_else(|| {
+        DenseReconstructionError::GeoreferencingError {
+            reason: "empty_dense_extent".to_string(),
+        }
+    })?;
+    let area_square_m = rect_area_square_m(extent);
+    if area_square_m <= 0.0 {
+        return Err(DenseReconstructionError::GeoreferencingError {
+            reason: "non_positive_dense_extent".to_string(),
+        });
+    }
+
+    let mut points = Vec::new();
+    for sparse_point in &sfm_report.sparse_points {
+        for sample_index in 0..config.samples_per_sparse_point {
+            let offset = dense_sample_offset(
+                sample_index,
+                config.samples_per_sparse_point,
+                config.sample_spacing_m,
+            );
+            let x_m = clamp_f64(
+                sparse_point.ground_x_m + offset.0,
+                extent.min_x,
+                extent.max_x,
+            );
+            let y_m = clamp_f64(
+                sparse_point.ground_y_m + offset.1,
+                extent.min_y,
+                extent.max_y,
+            );
+            points.push(DensePoint {
+                x_m,
+                y_m,
+                z_m: sparse_point.elevation_m,
+            });
+        }
+    }
+    points.sort_by(|left, right| {
+        left.x_m
+            .partial_cmp(&right.x_m)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.y_m
+                    .partial_cmp(&right.y_m)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                left.z_m
+                    .partial_cmp(&right.z_m)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let point_count = points.len();
+    if point_count == 0 {
+        return Err(DenseReconstructionError::Refused {
+            reason: "empty_dense_point_cloud".to_string(),
+        });
+    }
+
+    Ok(DensePointCloud {
+        frame_set_id: frame_set.frame_set_id.clone(),
+        generated_at,
+        crs: output_crs,
+        extent: GeoBounds {
+            min_lat: extent.min_y,
+            min_lon: extent.min_x,
+            max_lat: extent.max_y,
+            max_lon: extent.max_x,
+        },
+        points,
+        point_count,
+        density_points_per_square_m: point_count as f64 / area_square_m,
+        extent_round_trips: true,
+    })
+}
+
 pub fn run_orthorectified_mosaic(
     frame_set: &FrameSetRecord,
     qa_report: &FrameSetQaReport,
@@ -1298,6 +1770,93 @@ pub fn run_orthorectified_mosaic(
     })
 }
 
+pub fn balance_mosaic_seamlines_and_exposure(
+    mosaic: &OrthomosaicRaster,
+    observations: Vec<FrameExposureObservation>,
+    config: SeamlineExposureConfig,
+    generated_at: String,
+) -> Result<SeamlineExposureBalanceReport, SeamlineExposureError> {
+    validate_seamline_exposure_config(&config)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(SeamlineExposureError::EmptyGeneratedAt)?;
+    if mosaic.contributing_frames.is_empty() {
+        return Err(SeamlineExposureError::EmptyContributingFrames);
+    }
+    if observations.is_empty() {
+        return Err(SeamlineExposureError::EmptyExposureObservations);
+    }
+    let spatial_ref =
+        assert_raster_spatial_ref(Some(&mosaic.spatial_ref), mosaic.width_px, mosaic.height_px)
+            .map_err(|error| SeamlineExposureError::InvalidSpatialRef {
+                reason: error.to_string(),
+            })?;
+
+    let exposure_by_frame = normalize_exposure_observations(observations)?;
+    for frame in &mosaic.contributing_frames {
+        if !exposure_by_frame.contains_key(frame.frame_id.as_str()) {
+            return Err(SeamlineExposureError::MissingExposureObservation {
+                frame_id: frame.frame_id.clone(),
+            });
+        }
+    }
+
+    let mut luminance_values = mosaic
+        .contributing_frames
+        .iter()
+        .map(|frame| exposure_by_frame[frame.frame_id.as_str()])
+        .collect::<Vec<_>>();
+    luminance_values
+        .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let median_luminance = median_sorted(&luminance_values);
+    let target_luminance = config.target_luminance.unwrap_or(median_luminance);
+    let flagged_frames = mosaic
+        .contributing_frames
+        .iter()
+        .filter_map(|frame| {
+            let observed = exposure_by_frame[frame.frame_id.as_str()];
+            let ratio_to_median = exposure_ratio(observed, median_luminance);
+            (ratio_to_median > config.outlier_ratio_threshold).then(|| ExposureOutlierFrame {
+                frame_id: frame.frame_id.clone(),
+                observed_mean_luminance: observed,
+                median_luminance,
+                ratio_to_median,
+            })
+        })
+        .collect::<Vec<_>>();
+    let flagged_frame_ids = flagged_frames
+        .iter()
+        .map(|frame| frame.frame_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let mut exposure_corrections = mosaic
+        .contributing_frames
+        .iter()
+        .filter(|frame| !flagged_frame_ids.contains(frame.frame_id.as_str()))
+        .map(|frame| {
+            let observed = exposure_by_frame[frame.frame_id.as_str()];
+            ExposureCorrectionRecord {
+                frame_id: frame.frame_id.clone(),
+                observed_mean_luminance: observed,
+                target_luminance,
+                gain: (target_luminance / observed).min(config.max_gain),
+            }
+        })
+        .collect::<Vec<_>>();
+    exposure_corrections.sort_by(|left, right| left.frame_id.cmp(&right.frame_id));
+    let passes = flagged_frame_ids.is_empty();
+
+    Ok(SeamlineExposureBalanceReport {
+        frame_set_id: mosaic.frame_set_id.clone(),
+        generated_at,
+        spatial_ref,
+        seamlines: compute_seamlines(&mosaic.contributing_frames),
+        exposure_corrections,
+        flagged_frames,
+        geometry_preserved: true,
+        passes,
+    })
+}
+
 pub fn generate_dsm(
     cloud: &DensePointCloud,
     config: DsmConfig,
@@ -1380,6 +1939,90 @@ pub fn generate_dsm(
         spatial_ref,
         elevation_m,
         point_support_counts,
+        nodata_mask,
+        extent_round_trips: true,
+    })
+}
+
+pub fn derive_dtm_from_dsm(
+    dsm: &DsmRaster,
+    config: DtmConfig,
+    generated_at: String,
+) -> Result<DtmRaster, DtmError> {
+    validate_dtm_config(&config)?;
+    let generated_at =
+        normalize_optional_text(Some(generated_at)).ok_or(DtmError::EmptyGeneratedAt)?;
+    let cell_count = dsm.width_px as usize * dsm.height_px as usize;
+    if dsm.elevation_m.len() != cell_count
+        || dsm.point_support_counts.len() != cell_count
+        || dsm.nodata_mask.len() != cell_count
+    {
+        return Err(DtmError::DsmCellCountMismatch);
+    }
+    if dsm
+        .elevation_m
+        .iter()
+        .zip(dsm.nodata_mask.iter())
+        .any(|(elevation, nodata)| !*nodata && !elevation.is_finite())
+    {
+        return Err(DtmError::NonFiniteElevation);
+    }
+    let spatial_ref =
+        assert_raster_spatial_ref(Some(&dsm.spatial_ref), dsm.width_px, dsm.height_px).map_err(
+            |error| DtmError::InvalidSpatialRef {
+                reason: error.to_string(),
+            },
+        )?;
+
+    let mut elevation_m = vec![config.nodata_value; cell_count];
+    let mut ground_classification = vec![DtmGroundClassification::NoData; cell_count];
+    let mut low_confidence_mask = vec![true; cell_count];
+    let mut nodata_mask = vec![true; cell_count];
+    let ground_indices = dsm
+        .elevation_m
+        .iter()
+        .enumerate()
+        .filter_map(|(index, elevation)| {
+            let is_ground = !dsm.nodata_mask[index]
+                && dsm.point_support_counts[index] >= config.min_ground_support_count
+                && *elevation <= config.max_ground_elevation_m;
+            is_ground.then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    for index in 0..cell_count {
+        if dsm.nodata_mask[index] {
+            continue;
+        }
+        if ground_indices.contains(&index) {
+            elevation_m[index] = dsm.elevation_m[index];
+            ground_classification[index] = DtmGroundClassification::Ground;
+            low_confidence_mask[index] = false;
+            nodata_mask[index] = false;
+            continue;
+        }
+
+        ground_classification[index] = DtmGroundClassification::NonGround;
+        if let Some(ground_index) = nearest_ground_index(
+            index,
+            &ground_indices,
+            dsm.width_px,
+            config.interpolation_radius_cells,
+        ) {
+            elevation_m[index] = dsm.elevation_m[ground_index];
+            nodata_mask[index] = false;
+        }
+    }
+
+    Ok(DtmRaster {
+        frame_set_id: dsm.frame_set_id.clone(),
+        generated_at,
+        width_px: dsm.width_px,
+        height_px: dsm.height_px,
+        spatial_ref,
+        elevation_m,
+        ground_classification,
+        low_confidence_mask,
         nodata_mask,
         extent_round_trips: true,
     })
@@ -1515,6 +2158,95 @@ pub fn register_ground_control_points(
     })
 }
 
+pub fn build_mosaic_quality_report(
+    qa_report: &FrameSetQaReport,
+    reprojection_report: &ReprojectionErrorReport,
+    gcp_report: &GcpAccuracyReport,
+    config: MosaicQualityReportConfig,
+    generated_at: String,
+) -> Result<MosaicQualityReport, MosaicQualityReportError> {
+    validate_mosaic_quality_report_config(config)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(MosaicQualityReportError::EmptyGeneratedAt)?;
+    assert_quality_frame_set_match(&qa_report.frame_set_id, &reprojection_report.frame_set_id)?;
+    assert_quality_frame_set_match(&qa_report.frame_set_id, &gcp_report.frame_set_id)?;
+    let min_overlap = qa_report
+        .overlaps
+        .iter()
+        .map(|overlap| overlap.overlap_fraction)
+        .reduce(f64::min)
+        .ok_or(MosaicQualityReportError::EmptyOverlapEvidence)?;
+
+    let metrics = vec![
+        quality_metric(
+            MosaicQualityMetric::MeanGsd,
+            qa_report.mean_gsd_m_per_px,
+            config.max_mean_gsd_m_per_px,
+            "m_per_px",
+            "frame_set_qa:mean_gsd",
+            qa_report.mean_gsd_m_per_px <= config.max_mean_gsd_m_per_px,
+        ),
+        quality_metric(
+            MosaicQualityMetric::MinimumOverlap,
+            min_overlap,
+            config.min_overlap_fraction,
+            "fraction",
+            "frame_set_qa:overlap",
+            min_overlap >= config.min_overlap_fraction,
+        ),
+        quality_metric(
+            MosaicQualityMetric::Coverage,
+            qa_report.coverage_fraction,
+            config.min_coverage_fraction,
+            "fraction",
+            "frame_set_qa:coverage",
+            qa_report.coverage_fraction >= config.min_coverage_fraction && qa_report.passes,
+        ),
+        quality_metric(
+            MosaicQualityMetric::ReprojectionRms,
+            reprojection_report.overall_rms_error_px,
+            config.max_reprojection_rms_px,
+            "px",
+            "reprojection_report:overall_rms",
+            reprojection_report.overall_rms_error_px <= config.max_reprojection_rms_px
+                && reprojection_report.passes,
+        ),
+        quality_metric(
+            MosaicQualityMetric::GcpOverallRmse,
+            gcp_report.overall_rmse_m,
+            config.max_gcp_rmse_m,
+            "m",
+            "gcp_accuracy:overall_rmse",
+            gcp_report.overall_rmse_m <= config.max_gcp_rmse_m,
+        ),
+    ];
+    let failing_metrics = metrics
+        .iter()
+        .filter(|metric| !metric.passes)
+        .map(|metric| metric.metric)
+        .collect::<Vec<_>>();
+    let verdict = if failing_metrics.is_empty() {
+        MosaicQualityVerdict::Publishable
+    } else {
+        MosaicQualityVerdict::NotPublishable
+    };
+    let evidence_refs = metrics
+        .iter()
+        .map(|metric| metric.evidence_ref.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    Ok(MosaicQualityReport {
+        frame_set_id: qa_report.frame_set_id.clone(),
+        generated_at,
+        verdict,
+        metrics,
+        failing_metrics,
+        evidence_refs,
+    })
+}
+
 pub fn build_tiled_output_handoff(
     request: TiledOutputHandoffRequest,
 ) -> Result<TiledOutputHandoff, TiledOutputHandoffError> {
@@ -1600,6 +2332,93 @@ pub fn evaluate_mosaic_publish_gate(
         downstream_consumers,
         blocked_reason,
         provenance,
+    })
+}
+
+pub fn suggest_refly_mission(
+    request: ReflySuggestionRequest,
+    generated_suggestion_id: String,
+    generated_at: String,
+) -> Result<Option<ReflySuggestion>, ReflySuggestionError> {
+    let suggestion_id = normalize_optional_text(Some(generated_suggestion_id))
+        .ok_or(ReflySuggestionError::EmptySuggestionId)?;
+    let mission_ref = normalize_optional_text(Some(request.mission_ref))
+        .ok_or(ReflySuggestionError::EmptyMissionRef)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(ReflySuggestionError::EmptyGeneratedAt)?;
+    if request.qa_report.frame_set_id != request.quality_report.frame_set_id {
+        return Err(ReflySuggestionError::FrameSetMismatch {
+            qa_frame_set_id: request.qa_report.frame_set_id,
+            quality_frame_set_id: request.quality_report.frame_set_id,
+        });
+    }
+    if request.qa_report.passes
+        && request.quality_report.verdict == MosaicQualityVerdict::Publishable
+        && request.quality_report.failing_metrics.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let bounded_area = refly_bounds_from_gaps_or_frames(&request.qa_report)
+        .ok_or(ReflySuggestionError::MissingBoundedArea)?;
+    let mut cited_metrics = request
+        .quality_report
+        .metrics
+        .iter()
+        .filter(|metric| !metric.passes)
+        .map(|metric| format!("{:?}:{}", metric.metric, metric.evidence_ref))
+        .collect::<Vec<_>>();
+    for gap in &request.qa_report.gap_regions {
+        cited_metrics.push(format!("{:?}:gap_region", gap.reason_code));
+    }
+    cited_metrics.sort();
+    cited_metrics.dedup();
+    let mut evidence_refs = request.quality_report.evidence_refs.clone();
+    evidence_refs.push(format!("frame_set_qa:{}", request.qa_report.frame_set_id));
+    evidence_refs.sort();
+    evidence_refs.dedup();
+
+    Ok(Some(ReflySuggestion {
+        suggestion_id: suggestion_id.clone(),
+        frame_set_id: request.qa_report.frame_set_id,
+        mission_proposal_ref: format!("{mission_ref}:refly:{suggestion_id}"),
+        approval_state: ReflyApprovalState::PendingOperatorApproval,
+        dispatch_allowed: false,
+        bounded_area,
+        cited_metrics,
+        evidence_refs,
+        generated_at,
+    }))
+}
+
+fn refly_bounds_from_gaps_or_frames(qa_report: &FrameSetQaReport) -> Option<ReflyAreaBounds> {
+    let mut bounds = qa_report
+        .gap_regions
+        .iter()
+        .map(|gap| ReflyAreaBounds {
+            min_x_m: gap.min_x_m,
+            min_y_m: gap.min_y_m,
+            max_x_m: gap.max_x_m,
+            max_y_m: gap.max_y_m,
+        })
+        .collect::<Vec<_>>();
+    if bounds.is_empty() {
+        bounds = qa_report
+            .frames
+            .iter()
+            .map(|frame| ReflyAreaBounds {
+                min_x_m: frame.min_x_m,
+                min_y_m: frame.min_y_m,
+                max_x_m: frame.max_x_m,
+                max_y_m: frame.max_y_m,
+            })
+            .collect();
+    }
+    bounds.into_iter().reduce(|left, right| ReflyAreaBounds {
+        min_x_m: left.min_x_m.min(right.min_x_m),
+        min_y_m: left.min_y_m.min(right.min_y_m),
+        max_x_m: left.max_x_m.max(right.max_x_m),
+        max_y_m: left.max_y_m.max(right.max_y_m),
     })
 }
 
@@ -1811,11 +2630,78 @@ fn validate_sparse_sfm_config(config: SparseSfmConfig) -> Result<(), SparseSfmEr
     Ok(())
 }
 
+fn validate_dense_reconstruction_config(
+    config: &DenseReconstructionConfig,
+) -> Result<(), DenseReconstructionError> {
+    if !config.sample_spacing_m.is_finite() || config.sample_spacing_m <= 0.0 {
+        return Err(DenseReconstructionError::InvalidSampleSpacing);
+    }
+    if config.samples_per_sparse_point == 0 {
+        return Err(DenseReconstructionError::InvalidSamplesPerSparsePoint);
+    }
+
+    Ok(())
+}
+
 fn validate_mosaic_resolution(resolution_m_per_px: f64) -> Result<(), OrthomosaicError> {
     if resolution_m_per_px.is_finite() && resolution_m_per_px > 0.0 {
         Ok(())
     } else {
         Err(OrthomosaicError::InvalidResolution)
+    }
+}
+
+fn validate_seamline_exposure_config(
+    config: &SeamlineExposureConfig,
+) -> Result<(), SeamlineExposureError> {
+    if config
+        .target_luminance
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        return Err(SeamlineExposureError::InvalidConfig {
+            field: "target_luminance",
+        });
+    }
+    if !config.max_gain.is_finite() || config.max_gain <= 0.0 {
+        return Err(SeamlineExposureError::InvalidConfig { field: "max_gain" });
+    }
+    if !config.outlier_ratio_threshold.is_finite() || config.outlier_ratio_threshold <= 1.0 {
+        return Err(SeamlineExposureError::InvalidConfig {
+            field: "outlier_ratio_threshold",
+        });
+    }
+
+    Ok(())
+}
+
+fn assert_dense_pose_set(
+    frame_set: &FrameSetRecord,
+    sfm_report: &SparseSfmReport,
+) -> Result<(), DenseReconstructionError> {
+    if !sfm_report.passes_reprojection_threshold
+        || sfm_report.cameras.len() != frame_set.frames.len()
+        || sfm_report.sparse_points.is_empty()
+    {
+        return Err(DenseReconstructionError::Refused {
+            reason: "unsolved_pose_set".to_string(),
+        });
+    }
+
+    let solved_frames = sfm_report
+        .cameras
+        .iter()
+        .map(|camera| camera.frame_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if frame_set
+        .frames
+        .iter()
+        .all(|frame| solved_frames.contains(frame.frame_id.as_str()))
+    {
+        Ok(())
+    } else {
+        Err(DenseReconstructionError::Refused {
+            reason: "unsolved_pose_set".to_string(),
+        })
     }
 }
 
@@ -1868,6 +2754,85 @@ fn mosaic_extent(frames: &[OrthorectifiedFrameRecord]) -> Option<Rect> {
     (extent.area() > 0.0).then_some(extent)
 }
 
+fn compute_seamlines(frames: &[OrthorectifiedFrameRecord]) -> Vec<SeamlineRecord> {
+    let mut seamlines = Vec::new();
+    for (left_index, left) in frames.iter().enumerate() {
+        for right in frames.iter().skip(left_index + 1) {
+            let overlap_min_x = left.min_x_m.max(right.min_x_m);
+            let overlap_max_x = left.max_x_m.min(right.max_x_m);
+            let overlap_min_y = left.min_y_m.max(right.min_y_m);
+            let overlap_max_y = left.max_y_m.min(right.max_y_m);
+            if overlap_min_x < overlap_max_x && overlap_min_y < overlap_max_y {
+                let seam_x = (overlap_min_x + overlap_max_x) / 2.0;
+                seamlines.push(SeamlineRecord {
+                    frame_a_id: left.frame_id.clone(),
+                    frame_b_id: right.frame_id.clone(),
+                    start_x_m: seam_x,
+                    start_y_m: overlap_min_y,
+                    end_x_m: seam_x,
+                    end_y_m: overlap_max_y,
+                });
+            }
+        }
+    }
+    seamlines.sort_by(|left, right| {
+        left.frame_a_id
+            .cmp(&right.frame_a_id)
+            .then(left.frame_b_id.cmp(&right.frame_b_id))
+    });
+    seamlines
+}
+
+fn normalize_exposure_observations(
+    observations: Vec<FrameExposureObservation>,
+) -> Result<BTreeMap<String, f64>, SeamlineExposureError> {
+    let mut exposure_by_frame = BTreeMap::new();
+    for observation in observations {
+        let frame_id = normalize_optional_text(Some(observation.frame_id)).ok_or_else(|| {
+            SeamlineExposureError::MissingExposureObservation {
+                frame_id: String::new(),
+            }
+        })?;
+        if !observation.mean_luminance.is_finite() || observation.mean_luminance <= 0.0 {
+            return Err(SeamlineExposureError::InvalidExposureObservation { frame_id });
+        }
+        exposure_by_frame.insert(frame_id, observation.mean_luminance);
+    }
+    Ok(exposure_by_frame)
+}
+
+fn median_sorted(values: &[f64]) -> f64 {
+    values[(values.len() - 1) / 2]
+}
+
+fn exposure_ratio(observed: f64, median: f64) -> f64 {
+    if observed >= median {
+        observed / median
+    } else {
+        median / observed
+    }
+}
+
+fn rect_area_square_m(rect: Rect) -> f64 {
+    (rect.max_x - rect.min_x).max(0.0) * (rect.max_y - rect.min_y).max(0.0)
+}
+
+fn dense_sample_offset(index: usize, sample_count: usize, spacing_m: f64) -> (f64, f64) {
+    if sample_count == 1 {
+        return (0.0, 0.0);
+    }
+    let centered = index as f64 - (sample_count - 1) as f64 / 2.0;
+    let axis = if index % 2 == 0 { 1.0 } else { -1.0 };
+    (
+        centered * spacing_m,
+        axis * centered.abs() * spacing_m * 0.5,
+    )
+}
+
+fn clamp_f64(value: f64, min: f64, max: f64) -> f64 {
+    value.max(min).min(max)
+}
+
 fn validate_dsm_config(config: &DsmConfig) -> Result<(), DsmError> {
     if !config.resolution_m_per_px.is_finite() || config.resolution_m_per_px <= 0.0 {
         return Err(DsmError::InvalidResolution);
@@ -1889,6 +2854,42 @@ fn validate_dsm_config(config: &DsmConfig) -> Result<(), DsmError> {
     Ok(())
 }
 
+fn validate_dtm_config(config: &DtmConfig) -> Result<(), DtmError> {
+    for (field, value) in [
+        ("max_ground_elevation_m", config.max_ground_elevation_m),
+        ("nodata_value", config.nodata_value),
+    ] {
+        if !value.is_finite() {
+            return Err(DtmError::NonFiniteConfig { field });
+        }
+    }
+    if config.min_ground_support_count == 0 {
+        return Err(DtmError::InvalidGroundSupport);
+    }
+    Ok(())
+}
+
+fn nearest_ground_index(
+    index: usize,
+    ground_indices: &[usize],
+    width_px: u32,
+    radius_cells: u32,
+) -> Option<usize> {
+    let width = width_px as i64;
+    let x = index as i64 % width;
+    let y = index as i64 / width;
+    ground_indices
+        .iter()
+        .filter_map(|candidate| {
+            let candidate_x = *candidate as i64 % width;
+            let candidate_y = *candidate as i64 / width;
+            let distance = (candidate_x - x).abs().max((candidate_y - y).abs());
+            (distance <= radius_cells as i64).then_some((*candidate, distance))
+        })
+        .min_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))
+        .map(|(candidate, _)| candidate)
+}
+
 fn validate_reprojection_report_config(
     config: ReprojectionReportConfig,
 ) -> Result<(), ReprojectionReportError> {
@@ -1902,6 +2903,52 @@ fn validate_reprojection_report_config(
         }
     }
     Ok(())
+}
+
+fn validate_mosaic_quality_report_config(
+    config: MosaicQualityReportConfig,
+) -> Result<(), MosaicQualityReportError> {
+    for (field, value) in [
+        ("max_mean_gsd_m_per_px", config.max_mean_gsd_m_per_px),
+        ("min_overlap_fraction", config.min_overlap_fraction),
+        ("min_coverage_fraction", config.min_coverage_fraction),
+        ("max_reprojection_rms_px", config.max_reprojection_rms_px),
+        ("max_gcp_rmse_m", config.max_gcp_rmse_m),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(MosaicQualityReportError::InvalidConfig { field });
+        }
+    }
+    Ok(())
+}
+
+fn assert_quality_frame_set_match(left: &str, right: &str) -> Result<(), MosaicQualityReportError> {
+    if left == right {
+        Ok(())
+    } else {
+        Err(MosaicQualityReportError::FrameSetMismatch {
+            left: left.to_string(),
+            right: right.to_string(),
+        })
+    }
+}
+
+fn quality_metric(
+    metric: MosaicQualityMetric,
+    observed_value: f64,
+    threshold_value: f64,
+    unit: &str,
+    evidence_ref: &str,
+    passes: bool,
+) -> MosaicQualityMetricRecord {
+    MosaicQualityMetricRecord {
+        metric,
+        observed_value,
+        threshold_value,
+        unit: unit.to_string(),
+        evidence_ref: evidence_ref.to_string(),
+        passes,
+    }
 }
 
 fn gcp_residual(
@@ -2499,16 +3546,23 @@ fn validate_imu(imu: &CameraImuPose) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_frame_set_record, build_reconstruction_job, build_reprojection_error_report,
-        build_tiled_output_handoff, generate_dsm, run_feature_matching, run_frame_set_qa,
+        balance_mosaic_seamlines_and_exposure, build_frame_set_record, build_mosaic_quality_report,
+        build_reconstruction_job, build_reconstruction_progress_event,
+        build_reprojection_error_report, build_tiled_output_handoff, densify_sparse_reconstruction,
+        derive_dtm_from_dsm, detect_reconstruction_stall, generate_dsm,
+        reconstruction_progress_stream, run_feature_matching, run_frame_set_qa,
         run_orthorectified_mosaic, run_sparse_sfm, transition_reconstruction_status, CameraExif,
-        CameraImuPose, DensePoint, DensePointCloud, DsmConfig, FeatureMatchingConfig,
-        FieldCoverageExtent, FrameIngestRequest, FrameQaReasonCode, FrameSetIngestError,
-        FrameSetIngestRequest, FrameSetQaConfig, GcpMarkedImagePoint, GcpRegistrationError,
-        GcpRegistrationRequest, GcpSurveyedCoordinate, GroundControlPoint, MosaicProvenanceRecord,
-        MosaicPublishGateRequest, MosaicPublishStatus, MosaicQualityVerdict, OrthomosaicConfig,
-        OrthomosaicError, ReconstructionJobError, ReconstructionJobRequest, ReconstructionStatus,
-        ReprojectionReportConfig, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
+        CameraImuPose, DensePoint, DensePointCloud, DenseReconstructionConfig,
+        DenseReconstructionError, DsmConfig, DtmConfig, DtmGroundClassification,
+        FeatureMatchingConfig, FieldCoverageExtent, FrameExposureObservation, FrameIngestRequest,
+        FrameQaReasonCode, FrameSetIngestError, FrameSetIngestRequest, FrameSetQaConfig,
+        GcpAccuracyReport, GcpMarkedImagePoint, GcpRegistrationError, GcpRegistrationRequest,
+        GcpSurveyedCoordinate, GroundControlPoint, MosaicProvenanceRecord,
+        MosaicPublishGateRequest, MosaicPublishStatus, MosaicQualityMetric,
+        MosaicQualityReportConfig, MosaicQualityVerdict, OrthomosaicConfig, OrthomosaicError,
+        ReconstructionJobError, ReconstructionJobRequest, ReconstructionProgressStage,
+        ReconstructionStallReasonCode, ReconstructionStatus, ReprojectionReportConfig,
+        SeamlineExposureConfig, SparseSfmConfig, SparseSfmError, SparseSfmFailureReason,
         TiledOutputHandoffError, TiledOutputHandoffRequest, TiledRasterProductRequest,
     };
     use shared::schemas::{
@@ -2701,6 +3755,84 @@ mod tests {
                 from: ReconstructionStatus::Queued,
                 to: ReconstructionStatus::Completed
             }
+        );
+    }
+
+    #[test]
+    fn reconstruction_progress_stream_orders_stage_counts_with_coverage() {
+        let later = build_reconstruction_progress_event(
+            " recon-001 ".to_string(),
+            ReconstructionProgressStage::CameraRegistration,
+            12,
+            8,
+            0,
+            0.42,
+            dt("2026-06-01T12:10:10Z"),
+        )
+        .expect("later progress event builds");
+        let earlier = build_reconstruction_progress_event(
+            "recon-001".to_string(),
+            ReconstructionProgressStage::FeatureMatching,
+            12,
+            0,
+            0,
+            0.18,
+            dt("2026-06-01T12:10:00Z"),
+        )
+        .expect("earlier progress event builds");
+
+        let stream = reconstruction_progress_stream(vec![later, earlier]);
+
+        assert_eq!(
+            stream[0].stage,
+            ReconstructionProgressStage::FeatureMatching
+        );
+        assert_eq!(stream[0].matched_frames, 12);
+        assert_eq!(stream[0].coverage_fraction, 0.18);
+        assert_eq!(
+            stream[1].stage,
+            ReconstructionProgressStage::CameraRegistration
+        );
+        assert_eq!(stream[1].registered_cameras, 8);
+        assert_eq!(stream[1].coverage_fraction, 0.42);
+    }
+
+    #[test]
+    fn reconstruction_progress_stall_is_flagged_after_window() {
+        let event = build_reconstruction_progress_event(
+            "recon-001".to_string(),
+            ReconstructionProgressStage::DenseReconstruction,
+            12,
+            12,
+            40_000,
+            0.70,
+            dt("2026-06-01T12:10:00Z"),
+        )
+        .expect("progress event builds");
+
+        let healthy = detect_reconstruction_stall(
+            std::slice::from_ref(&event),
+            dt("2026-06-01T12:10:20Z"),
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(healthy, None);
+
+        let stalled = detect_reconstruction_stall(
+            &[event],
+            dt("2026-06-01T12:10:45Z"),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("stalled event should be flagged");
+
+        assert_eq!(stalled.recon_id, "recon-001");
+        assert_eq!(
+            stalled.stage,
+            ReconstructionProgressStage::DenseReconstruction
+        );
+        assert_eq!(stalled.stalled_for_seconds, 45);
+        assert_eq!(
+            stalled.reason_code,
+            ReconstructionStallReasonCode::NoProgressWithinWindow
         );
     }
 
@@ -2917,6 +4049,61 @@ mod tests {
     }
 
     #[test]
+    fn dense_reconstruction_produces_point_cloud_with_crs_extent_and_density() {
+        let (frame_set, qa, sfm) = solved_sfm_fixture();
+
+        let cloud = densify_sparse_reconstruction(
+            &frame_set,
+            &qa,
+            &sfm,
+            dense_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect("solved sparse SfM should densify");
+
+        assert_eq!(cloud.frame_set_id, "frame-set-qa");
+        assert_eq!(cloud.generated_at, "2026-06-01T12:04:00Z");
+        assert_eq!(cloud.crs, "EPSG:32614");
+        assert_eq!(
+            cloud.point_count,
+            sfm.sparse_points.len() * dense_config().samples_per_sparse_point
+        );
+        assert_eq!(cloud.point_count, cloud.points.len());
+        assert!(cloud.density_points_per_square_m > 0.0);
+        assert!(cloud.extent_round_trips);
+        assert_close(cloud.extent.min_lon, -75.0);
+        assert_close(cloud.extent.max_lon, 135.0);
+        assert!(cloud.points.iter().all(|point| {
+            point.x_m >= cloud.extent.min_lon
+                && point.x_m <= cloud.extent.max_lon
+                && point.y_m >= cloud.extent.min_lat
+                && point.y_m <= cloud.extent.max_lat
+        }));
+    }
+
+    #[test]
+    fn dense_reconstruction_refuses_unconverged_sparse_reconstruction() {
+        let (frame_set, qa, mut sfm) = solved_sfm_fixture();
+        sfm.passes_reprojection_threshold = false;
+
+        let error = densify_sparse_reconstruction(
+            &frame_set,
+            &qa,
+            &sfm,
+            dense_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect_err("unconverged sparse SfM must not densify");
+
+        assert_eq!(
+            error,
+            DenseReconstructionError::Refused {
+                reason: "unsolved_pose_set".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn orthorectified_mosaic_round_trips_georeferenced_extent() {
         let (frame_set, qa, sfm) = solved_sfm_fixture();
 
@@ -2965,6 +4152,67 @@ mod tests {
     }
 
     #[test]
+    fn seamline_exposure_balancing_preserves_georeferencing() {
+        let (frame_set, qa, sfm) = solved_sfm_fixture();
+        let mosaic = run_orthorectified_mosaic(
+            &frame_set,
+            &qa,
+            &sfm,
+            mosaic_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect("mosaic should build");
+
+        let report = balance_mosaic_seamlines_and_exposure(
+            &mosaic,
+            vec![exposure("frame-001", 100.0), exposure("frame-002", 120.0)],
+            seamline_config(),
+            "2026-06-01T12:04:30Z".to_string(),
+        )
+        .expect("balancing should report seamlines and gains");
+
+        assert_eq!(report.frame_set_id, "frame-set-qa");
+        assert_eq!(report.spatial_ref, mosaic.spatial_ref);
+        assert!(report.geometry_preserved);
+        assert!(report.passes);
+        assert_eq!(report.flagged_frames, vec![]);
+        assert_eq!(report.seamlines.len(), 1);
+        assert_eq!(report.seamlines[0].frame_a_id, "frame-001");
+        assert_eq!(report.seamlines[0].frame_b_id, "frame-002");
+        assert_close(report.exposure_corrections[0].gain, 1.1);
+        assert_close(report.exposure_corrections[1].gain, 110.0 / 120.0);
+    }
+
+    #[test]
+    fn seamline_exposure_balancing_flags_extreme_exposure_frame() {
+        let (frame_set, qa, sfm) = solved_sfm_fixture();
+        let mosaic = run_orthorectified_mosaic(
+            &frame_set,
+            &qa,
+            &sfm,
+            mosaic_config(),
+            "2026-06-01T12:04:00Z".to_string(),
+        )
+        .expect("mosaic should build");
+
+        let report = balance_mosaic_seamlines_and_exposure(
+            &mosaic,
+            vec![exposure("frame-001", 100.0), exposure("frame-002", 500.0)],
+            seamline_config(),
+            "2026-06-01T12:04:30Z".to_string(),
+        )
+        .expect("extreme exposure should be flagged in the report");
+
+        assert!(!report.passes);
+        assert_eq!(report.flagged_frames.len(), 1);
+        assert_eq!(report.flagged_frames[0].frame_id, "frame-002");
+        assert!(report.flagged_frames[0].ratio_to_median > 2.0);
+        assert_eq!(report.exposure_corrections.len(), 1);
+        assert_eq!(report.exposure_corrections[0].frame_id, "frame-001");
+        assert_eq!(report.spatial_ref, mosaic.spatial_ref);
+    }
+
+    #[test]
     fn dsm_generation_rasterizes_dense_points_with_geospatial_round_trip() {
         let dsm = generate_dsm(
             &dense_cloud_fixture(),
@@ -3001,6 +4249,61 @@ mod tests {
         assert_eq!(dsm.point_support_counts[2], 0);
         assert_eq!(dsm.elevation_m[1], dsm_config().nodata_value);
         assert_eq!(dsm.elevation_m[2], dsm_config().nodata_value);
+    }
+
+    #[test]
+    fn dtm_derivation_filters_ground_and_preserves_geospatial_extent() {
+        let dsm = generate_dsm(
+            &dense_cloud_fixture(),
+            dsm_config(),
+            "2026-06-01T12:05:00Z".to_string(),
+        )
+        .expect("DSM should generate");
+
+        let dtm = derive_dtm_from_dsm(&dsm, dtm_config(), "2026-06-01T12:05:30Z".to_string())
+            .expect("DTM should derive from DSM");
+
+        assert_eq!(dtm.frame_set_id, "frame-set-qa");
+        assert_eq!(dtm.width_px, dsm.width_px);
+        assert_eq!(dtm.height_px, dsm.height_px);
+        assert_eq!(dtm.spatial_ref, dsm.spatial_ref);
+        assert!(dtm.extent_round_trips);
+        assert_eq!(
+            dtm.ground_classification[3],
+            DtmGroundClassification::Ground
+        );
+        assert_close(dtm.elevation_m[3], 90.0);
+        assert!(!dtm.nodata_mask[0]);
+        assert!(dtm.low_confidence_mask[0]);
+        assert_eq!(
+            dtm.ground_classification[0],
+            DtmGroundClassification::NonGround
+        );
+    }
+
+    #[test]
+    fn dtm_derivation_marks_canopy_only_cells_low_confidence_nodata() {
+        let dsm = generate_dsm(
+            &canopy_only_dense_cloud_fixture(),
+            dsm_config(),
+            "2026-06-01T12:05:00Z".to_string(),
+        )
+        .expect("DSM should generate");
+
+        let dtm = derive_dtm_from_dsm(&dsm, dtm_config(), "2026-06-01T12:05:30Z".to_string())
+            .expect("DTM should derive without fabricating ground");
+
+        assert!(dtm.nodata_mask[0]);
+        assert!(dtm.low_confidence_mask[0]);
+        assert_eq!(
+            dtm.ground_classification[0],
+            DtmGroundClassification::NonGround
+        );
+        assert_eq!(dtm.elevation_m[0], dtm_config().nodata_value);
+        assert!(dtm
+            .ground_classification
+            .iter()
+            .all(|class| *class != DtmGroundClassification::Ground));
     }
 
     #[test]
@@ -3106,6 +4409,148 @@ mod tests {
                 actual_crs: "EPSG:4326".to_string()
             }
         );
+    }
+
+    #[test]
+    fn mosaic_quality_report_assembles_publishable_metrics_with_evidence_refs() {
+        let qa = passing_qa_report();
+        let reprojection = passing_reprojection_report();
+        let gcp = passing_gcp_report();
+
+        let report = build_mosaic_quality_report(
+            &qa,
+            &reprojection,
+            &gcp,
+            mosaic_quality_config(),
+            "2026-06-01T12:08:00Z".to_string(),
+        )
+        .expect("quality report should assemble");
+
+        assert_eq!(report.frame_set_id, "frame-set-qa");
+        assert_eq!(report.verdict, MosaicQualityVerdict::Publishable);
+        assert_eq!(report.metrics.len(), 5);
+        assert!(report.failing_metrics.is_empty());
+        assert!(report
+            .metrics
+            .iter()
+            .any(|metric| metric.metric == MosaicQualityMetric::Coverage
+                && metric.observed_value == 1.0
+                && metric.passes));
+        assert_eq!(
+            report.evidence_refs,
+            vec![
+                "frame_set_qa:coverage".to_string(),
+                "frame_set_qa:mean_gsd".to_string(),
+                "frame_set_qa:overlap".to_string(),
+                "gcp_accuracy:overall_rmse".to_string(),
+                "reprojection_report:overall_rms".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mosaic_quality_report_marks_not_publishable_when_any_metric_fails() {
+        let mut qa = passing_qa_report();
+        qa.coverage_fraction = 0.72;
+        qa.passes = false;
+        let report = build_mosaic_quality_report(
+            &qa,
+            &passing_reprojection_report(),
+            &passing_gcp_report(),
+            mosaic_quality_config(),
+            "2026-06-01T12:08:00Z".to_string(),
+        )
+        .expect("quality report should assemble failing verdict");
+
+        assert_eq!(report.verdict, MosaicQualityVerdict::NotPublishable);
+        assert_eq!(report.failing_metrics, vec![MosaicQualityMetric::Coverage]);
+        let json = serde_json::to_value(&report).expect("report should serialize");
+        assert_eq!(json["verdict"], "not_publishable");
+        assert_eq!(json["metrics"].as_array().expect("metrics array").len(), 5);
+        assert_eq!(json["failing_metrics"][0], "coverage");
+    }
+
+    #[test]
+    fn refly_suggestion_cites_gap_metric_and_requires_approval() {
+        let mut qa = passing_qa_report();
+        qa.coverage_fraction = 0.72;
+        qa.passes = false;
+        qa.gap_regions.push(super::FrameSetQaGapRegion {
+            min_x_m: 10.0,
+            min_y_m: -5.0,
+            max_x_m: 30.0,
+            max_y_m: 15.0,
+            reason_code: FrameQaReasonCode::InsufficientCoverage,
+            frame_a_id: None,
+            frame_b_id: None,
+        });
+        let quality = build_mosaic_quality_report(
+            &qa,
+            &passing_reprojection_report(),
+            &passing_gcp_report(),
+            mosaic_quality_config(),
+            "2026-06-01T12:08:00Z".to_string(),
+        )
+        .expect("quality report should assemble failing verdict");
+
+        let suggestion = super::suggest_refly_mission(
+            super::ReflySuggestionRequest {
+                mission_ref: "mission:ortho-001".to_string(),
+                qa_report: qa,
+                quality_report: quality,
+            },
+            "suggestion-001".to_string(),
+            "2026-06-01T12:09:00Z".to_string(),
+        )
+        .expect("suggestion should evaluate")
+        .expect("coverage gap should produce suggestion");
+
+        assert_eq!(suggestion.frame_set_id, "frame-set-qa");
+        assert_eq!(
+            suggestion.approval_state,
+            super::ReflyApprovalState::PendingOperatorApproval
+        );
+        assert!(!suggestion.dispatch_allowed);
+        assert_eq!(
+            suggestion.mission_proposal_ref,
+            "mission:ortho-001:refly:suggestion-001"
+        );
+        assert_eq!(suggestion.bounded_area.min_x_m, 10.0);
+        assert_eq!(suggestion.bounded_area.max_x_m, 30.0);
+        assert!(suggestion
+            .cited_metrics
+            .iter()
+            .any(|metric| metric.contains("Coverage")));
+        assert!(suggestion
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence == "frame_set_qa:frame-set-qa"));
+    }
+
+    #[test]
+    fn refly_suggestion_is_absent_for_passing_mosaic() {
+        let qa = passing_qa_report();
+        let quality = build_mosaic_quality_report(
+            &qa,
+            &passing_reprojection_report(),
+            &passing_gcp_report(),
+            mosaic_quality_config(),
+            "2026-06-01T12:08:00Z".to_string(),
+        )
+        .expect("quality report should pass");
+
+        let suggestion = super::suggest_refly_mission(
+            super::ReflySuggestionRequest {
+                mission_ref: "mission:ortho-001".to_string(),
+                qa_report: qa,
+                quality_report: quality,
+            },
+            "suggestion-001".to_string(),
+            "2026-06-01T12:09:00Z".to_string(),
+        )
+        .expect("suggestion should evaluate");
+
+        assert!(suggestion.is_none());
     }
 
     #[test]
@@ -3283,6 +4728,29 @@ mod tests {
         }
     }
 
+    fn seamline_config() -> SeamlineExposureConfig {
+        SeamlineExposureConfig {
+            target_luminance: Some(110.0),
+            max_gain: 3.0,
+            outlier_ratio_threshold: 2.0,
+        }
+    }
+
+    fn exposure(frame_id: &str, mean_luminance: f64) -> FrameExposureObservation {
+        FrameExposureObservation {
+            frame_id: frame_id.to_string(),
+            mean_luminance,
+        }
+    }
+
+    fn dense_config() -> DenseReconstructionConfig {
+        DenseReconstructionConfig {
+            output_crs: "EPSG:32614".to_string(),
+            sample_spacing_m: 2.0,
+            samples_per_sparse_point: 3,
+        }
+    }
+
     fn solved_sfm_fixture() -> (
         super::FrameSetRecord,
         super::FrameSetQaReport,
@@ -3319,25 +4787,67 @@ mod tests {
     }
 
     fn dense_cloud_fixture() -> DensePointCloud {
+        let points = vec![
+            DensePoint {
+                x_m: 5.0,
+                y_m: 15.0,
+                z_m: 100.0,
+            },
+            DensePoint {
+                x_m: 6.0,
+                y_m: 16.0,
+                z_m: 102.0,
+            },
+            DensePoint {
+                x_m: 15.0,
+                y_m: 5.0,
+                z_m: 90.0,
+            },
+        ];
         DensePointCloud {
             frame_set_id: "frame-set-qa".to_string(),
-            points: vec![
-                DensePoint {
-                    x_m: 5.0,
-                    y_m: 15.0,
-                    z_m: 100.0,
-                },
-                DensePoint {
-                    x_m: 6.0,
-                    y_m: 16.0,
-                    z_m: 102.0,
-                },
-                DensePoint {
-                    x_m: 15.0,
-                    y_m: 5.0,
-                    z_m: 90.0,
-                },
-            ],
+            generated_at: "2026-06-01T12:04:00Z".to_string(),
+            crs: "EPSG:32614".to_string(),
+            extent: GeoBounds {
+                min_lat: 0.0,
+                min_lon: 0.0,
+                max_lat: 20.0,
+                max_lon: 20.0,
+            },
+            point_count: points.len(),
+            density_points_per_square_m: points.len() as f64 / 400.0,
+            extent_round_trips: true,
+            points,
+        }
+    }
+
+    fn canopy_only_dense_cloud_fixture() -> DensePointCloud {
+        let points = vec![
+            DensePoint {
+                x_m: 5.0,
+                y_m: 15.0,
+                z_m: 140.0,
+            },
+            DensePoint {
+                x_m: 6.0,
+                y_m: 16.0,
+                z_m: 142.0,
+            },
+        ];
+        DensePointCloud {
+            frame_set_id: "frame-set-qa".to_string(),
+            generated_at: "2026-06-01T12:04:00Z".to_string(),
+            crs: "EPSG:32614".to_string(),
+            extent: GeoBounds {
+                min_lat: 0.0,
+                min_lon: 0.0,
+                max_lat: 20.0,
+                max_lon: 20.0,
+            },
+            point_count: points.len(),
+            density_points_per_square_m: points.len() as f64 / 400.0,
+            extent_round_trips: true,
+            points,
         }
     }
 
@@ -3353,12 +4863,70 @@ mod tests {
         }
     }
 
+    fn dtm_config() -> DtmConfig {
+        DtmConfig {
+            max_ground_elevation_m: 95.0,
+            min_ground_support_count: 1,
+            interpolation_radius_cells: 2,
+            nodata_value: -9999.0,
+        }
+    }
+
     fn reprojection_config() -> ReprojectionReportConfig {
         ReprojectionReportConfig {
             max_overall_rms_error_px: 0.5,
             max_camera_error_px: 0.5,
             max_point_error_px: 0.5,
         }
+    }
+
+    fn mosaic_quality_config() -> MosaicQualityReportConfig {
+        MosaicQualityReportConfig {
+            max_mean_gsd_m_per_px: 0.2,
+            min_overlap_fraction: 0.3,
+            min_coverage_fraction: 0.9,
+            max_reprojection_rms_px: 0.5,
+            max_gcp_rmse_m: 5.0,
+        }
+    }
+
+    fn passing_qa_report() -> super::FrameSetQaReport {
+        let frame_set = qa_frame_set(vec![
+            qa_frame("frame-001", 0.0, "2026-06-01T12:00:00Z"),
+            qa_frame("frame-002", 60.0, "2026-06-01T12:00:05Z"),
+        ]);
+        run_frame_set_qa(
+            &frame_set,
+            field_extent(-75.0, -50.0, 135.0, 50.0),
+            qa_config(),
+            "2026-06-01T12:01:00Z".to_string(),
+        )
+        .expect("QA should pass")
+    }
+
+    fn passing_reprojection_report() -> super::ReprojectionErrorReport {
+        let (_, _, sfm) = solved_sfm_fixture();
+        build_reprojection_error_report(
+            &sfm,
+            reprojection_config(),
+            "2026-06-01T12:06:00Z".to_string(),
+        )
+        .expect("reprojection should pass")
+    }
+
+    fn passing_gcp_report() -> GcpAccuracyReport {
+        super::register_ground_control_points(gcp_request(vec![gcp(
+            "GCP-1",
+            "EPSG:32614",
+            100.0,
+            200.0,
+            10.0,
+            vec![
+                marked("frame-001", 101.0, 202.0, 12.0),
+                marked("frame-002", 99.0, 198.0, 8.0),
+            ],
+        )]))
+        .expect("GCP should pass")
     }
 
     fn gcp_request(gcps: Vec<GroundControlPoint>) -> GcpRegistrationRequest {
@@ -3466,6 +5034,12 @@ mod tests {
                 software_version: " agbot-orthomosaic 0.1.0 ".to_string(),
             },
         }
+    }
+
+    fn dt(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
     }
 
     fn meters_per_degree_lon(latitude: f64) -> f64 {

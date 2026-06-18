@@ -5,7 +5,9 @@
 #include "agbot_flight_sim/FaultInjection.hpp"
 #include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/HudTelemetry.hpp"
+#include "agbot_flight_sim/LabeledSyntheticDataset.hpp"
 #include "agbot_flight_sim/LidarSimulator.hpp"
+#include "agbot_flight_sim/LocationScenario.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/MissionPreview.hpp"
 #include "agbot_flight_sim/MissionValidation.hpp"
@@ -28,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -885,6 +888,75 @@ void test_scene_synthesis_marks_missing_source_coverage_unpopulated() {
     assert(manifest.to_json().find("missing_source_coverage") != std::string::npos);
 }
 
+void test_location_scenario_loads_flyable_georeferenced_mission() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    agbot::flight_sim::LocationScenarioRequest request;
+    request.center = center;
+    request.area_km2 = 4.0;
+    request.scene_seed = 20260222;
+
+    const auto manifest = agbot::flight_sim::load_location_scenario(request);
+    const auto repeat = agbot::flight_sim::load_location_scenario(request);
+
+    assert(manifest.flyable);
+    assert(manifest.gaps.empty());
+    assert(manifest.contract_version == agbot::flight_sim::kTwinContractVersion);
+    assert(manifest.mission.home_geo.has_value());
+    assert(std::abs(manifest.mission.home_geo->latitude - center.latitude) < 1e-9);
+    assert(std::abs(manifest.mission.home_geo->longitude - center.longitude) < 1e-9);
+    assert(manifest.mission.waypoints.size() >= 5);
+    assert(manifest.mission.waypoints[1].geo.has_value());
+    assert(manifest.terrain_profile.asserted);
+    assert(manifest.terrain_profile.contains(center));
+    assert(!manifest.terrain_tiles.empty());
+    assert(manifest.map_textures.assert_alignment(0.01).ok);
+    assert(manifest.scene.status == agbot::flight_sim::SceneSynthesisStatus::Ready);
+    assert(manifest.scenario_hash == repeat.scenario_hash);
+    assert(manifest.to_json() == repeat.to_json());
+
+    const GeoCoordinate waypoint_geo = manifest.mission.waypoints[1].geo.value();
+    const agbot::flight_sim::Vec3 local = agbot::flight_sim::local_from_geo(waypoint_geo, center);
+    const GeoCoordinate round_tripped = agbot::flight_sim::geo_from_local(local, center);
+    assert(std::abs(round_tripped.latitude - waypoint_geo.latitude) < 1e-7);
+    assert(std::abs(round_tripped.longitude - waypoint_geo.longitude) < 1e-7);
+    assert(manifest.terrain_profile.contains(round_tripped));
+
+    DroneSimulation simulation(manifest.mission);
+    simulation.arm();
+    for (int step = 0; step < 120 && !simulation.is_complete(); ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+    assert(simulation.state().armed);
+    assert(simulation.state().mode != DroneMode::Idle);
+}
+
+void test_location_scenario_reports_partial_gaps_for_unreachable_sources() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    agbot::flight_sim::LocationScenarioRequest request;
+    request.center = center;
+    request.area_km2 = 4.0;
+    request.scene_seed = 20260222;
+    request.mark_tiles_unavailable = true;
+    request.mark_features_unavailable = true;
+
+    const auto manifest = agbot::flight_sim::load_location_scenario(request);
+
+    assert(manifest.flyable);
+    assert(manifest.has_gap("tile_source_unreachable"));
+    assert(manifest.has_gap("feature_source_unreachable"));
+    assert(!manifest.terrain_tiles.empty());
+    assert(manifest.terrain_tiles[0].state == agbot::flight_sim::TerrainTileState::FlatFallback);
+    assert(manifest.map_textures.has_state(agbot::flight_sim::MapTextureTileState::TileUnavailable));
+    assert(manifest.scene.status == agbot::flight_sim::SceneSynthesisStatus::Unpopulated);
+    assert(manifest.scenario_hash.size() == 64);
+
+    const std::string json = manifest.to_json();
+    assert(json.find("\"scenario_hash\":\"") != std::string::npos);
+    assert(json.find("\"gaps\":[\"tile_source_unreachable\",\"feature_source_unreachable\"]") != std::string::npos);
+    assert(json.find("\"state\":\"flat_fallback\"") != std::string::npos);
+    assert(json.find("\"state\":\"tile_unavailable\"") != std::string::npos);
+}
+
 agbot::flight_sim::SceneSynthesisManifest test_scene_manifest_for_camera(
     const agbot::flight_sim::TerrainProfile& profile) {
     agbot::flight_sim::SceneSynthesisInput input;
@@ -954,6 +1026,104 @@ void test_ray_traced_camera_reports_no_scene_coverage_outside_extent() {
     assert(frame.pixels.empty());
     assert(frame.reason.find("outside scene extent") != std::string::npos);
     assert(frame.to_json().find("\"status\":\"no_scene_coverage\"") != std::string::npos);
+}
+
+void test_labeled_synthetic_dataset_exports_masks_from_scene_geometry() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    const auto profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 16);
+    const auto scene = test_scene_manifest_for_camera(profile);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {0.0, 30.0, 0.0};
+    state.mission_time_s = 12.5;
+    agbot::flight_sim::RayTracedCameraConfig config;
+    config.width = 5;
+    config.height = 5;
+    config.horizontal_fov_deg = 20.0;
+    config.vertical_fov_deg = 20.0;
+    const auto frame = agbot::flight_sim::raytrace_camera_frame(state, profile, scene, config);
+    const auto manifest = agbot::flight_sim::export_labeled_synthetic_dataset(
+        {frame},
+        scene,
+        "scenario-02-23",
+        20260223);
+    const auto repeat = agbot::flight_sim::export_labeled_synthetic_dataset(
+        {frame},
+        scene,
+        "scenario-02-23",
+        20260223);
+
+    assert(manifest.exported_frame_count() == 1);
+    assert(manifest.excluded_frame_count() == 0);
+    assert(manifest.dataset_id == repeat.dataset_id);
+    assert(manifest.to_json() == repeat.to_json());
+    assert(manifest.class_id_for("equipment_shed") != std::numeric_limits<std::uint16_t>::max());
+    assert(manifest.class_id_for("terrain") == 0);
+    assert(manifest.object_poses.size() == scene.objects.size());
+    assert(manifest.object_poses[0].object_id == scene.objects[0].object_id);
+
+    const auto& labeled_frame = manifest.frames.front();
+    assert(labeled_frame.scenario_hash == "scenario-02-23");
+    assert(labeled_frame.scene_hash == scene.scene_hash);
+    assert(labeled_frame.camera_pose_m.x == state.position.x);
+    assert(labeled_frame.class_mask.size() == frame.pixels.size());
+    assert(labeled_frame.depth_m.size() == frame.pixels.size());
+    assert(labeled_frame.label_hash.size() == 64);
+
+    for (std::size_t index = 0; index < frame.pixels.size(); ++index) {
+        const auto& pixel = frame.pixels[index];
+        assert(labeled_frame.class_mask[index] == manifest.class_id_for(pixel.class_name));
+        assert(std::abs(labeled_frame.depth_m[index] - pixel.depth_m) < 1e-9);
+        assert(labeled_frame.object_ids[index] == pixel.object_id);
+        if (!pixel.object_id.empty()) {
+            const auto found = std::find_if(scene.objects.begin(), scene.objects.end(), [&](const auto& object) {
+                return object.object_id == pixel.object_id;
+            });
+            assert(found != scene.objects.end());
+            assert(found->class_name == pixel.class_name);
+            assert(found->placement_seed == pixel.object_seed);
+        }
+    }
+
+    const std::string json = manifest.to_json();
+    assert(json.find("\"dataset_id\":\"") != std::string::npos);
+    assert(json.find("\"class_mask\":[") != std::string::npos);
+    assert(json.find("\"depth_m\":[") != std::string::npos);
+    assert(json.find("\"object_poses\":[") != std::string::npos);
+}
+
+void test_labeled_synthetic_dataset_excludes_unlinked_frames() {
+    const GeoCoordinate center {40.0005, -96.0005, 0.0};
+    const GeoBounds bounds = GeoBounds::from_center(center, 120.0);
+    const auto profile = agbot::flight_sim::terrain_profile_for_bounds(bounds, 16);
+    const auto scene = test_scene_manifest_for_camera(profile);
+
+    agbot::flight_sim::DroneState state;
+    state.position = {0.0, 30.0, 0.0};
+    agbot::flight_sim::RayTracedCameraConfig config;
+    config.width = 3;
+    config.height = 3;
+    auto valid = agbot::flight_sim::raytrace_camera_frame(state, profile, scene, config);
+    auto missing_scene = valid;
+    missing_scene.scene_hash.clear();
+    auto missing_pose = valid;
+    missing_pose.pose.x = std::numeric_limits<double>::quiet_NaN();
+
+    const auto manifest = agbot::flight_sim::export_labeled_synthetic_dataset(
+        {valid, missing_scene, missing_pose},
+        scene,
+        "scenario-02-23",
+        20260223);
+
+    assert(manifest.exported_frame_count() == 1);
+    assert(manifest.excluded_frame_count() == 2);
+    assert(manifest.exclusions[0].frame_index == 1);
+    assert(manifest.exclusions[0].reason == "missing_scene_linkage");
+    assert(manifest.exclusions[1].frame_index == 2);
+    assert(manifest.exclusions[1].reason == "missing_pose");
+    assert(manifest.to_json().find("\"reason\":\"missing_scene_linkage\"") != std::string::npos);
+    assert(manifest.to_json().find("\"reason\":\"missing_pose\"") != std::string::npos);
 }
 
 std::vector<agbot::flight_sim::RayTracedFrame> test_stream_frames(
@@ -1134,7 +1304,7 @@ void test_lidar_flat_fallback_terrain_covers_offset_mission_footprint() {
 agbot::flight_sim::RunConfig unit_run_config() {
     agbot::flight_sim::RunConfig config;
     config.seed = 42;
-    config.timestep_s = 1.0 / 60.0;
+    config.timestep_s = 0.016667;
     config.record_interval_s = 0.25;
     config.max_time_s = 600.0;
     return config;
@@ -1655,6 +1825,38 @@ void test_twin_contract_version_compatibility() {
     assert(!agbot::flight_sim::is_compatible_contract_version("1.0.0", "not-semver"));
 }
 
+// Story 02-13: the canonical runner reads one mission format and emits the
+// TwinContractV1 telemetry fields from the shared TelemetryRecorder formatter.
+void test_canonical_runner_mission_and_telemetry_follow_twin_contract() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto& schema = agbot::flight_sim::twin_contract_v1_schema();
+
+    assert(result.manifest.contract_version == agbot::flight_sim::kTwinContractVersion);
+    assert(schema.has_capability("shared_command_telemetry_contract"));
+    assert(result.trace_jsonl.find("\"contract_version\":\"1.0.0\"") != std::string::npos);
+    assert(result.trace_jsonl.find("\"command_id\":\"simulation_state\"") != std::string::npos);
+    assert(result.trace_jsonl.find("\"attitude\":{\"x\":") != std::string::npos);
+    assert(result.trace_jsonl.find("\"armed\":") != std::string::npos);
+
+    const std::vector<std::string> required_fields = {
+        "contract_version",
+        "command_id",
+        "time_s",
+        "mode",
+        "position",
+        "velocity",
+        "attitude",
+        "battery_percent",
+        "target_waypoint_index",
+        "armed",
+    };
+    for (const auto& field : required_fields) {
+        assert(schema.type_has_field("TelemetryV1", field));
+        assert(result.trace_jsonl.find("\"" + field + "\"") != std::string::npos);
+    }
+}
+
 void test_trace_diff_reports_divergent_field() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
@@ -1686,6 +1888,13 @@ void test_deterministic_runner_matches_golden() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     const auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
 
+    if (result.trace_jsonl != golden) {
+        const auto diff = agbot::flight_sim::diff_trace_text(golden, result.trace_jsonl);
+        std::cerr << "unit golden mismatch at step " << diff.step_index
+                  << " field " << diff.field_path
+                  << ": left=" << diff.left_value
+                  << " right=" << diff.right_value << "\n";
+    }
     assert(result.trace_jsonl == golden);
 }
 
@@ -1904,8 +2113,12 @@ int main() {
     test_missing_map_texture_tile_is_marked_unavailable_fallback();
     test_scene_synthesis_manifest_is_seeded_and_georeferenced();
     test_scene_synthesis_marks_missing_source_coverage_unpopulated();
+    test_location_scenario_loads_flyable_georeferenced_mission();
+    test_location_scenario_reports_partial_gaps_for_unreachable_sources();
     test_ray_traced_camera_projects_scene_object_with_reproducible_depth();
     test_ray_traced_camera_reports_no_scene_coverage_outside_extent();
+    test_labeled_synthetic_dataset_exports_masks_from_scene_geometry();
+    test_labeled_synthetic_dataset_excludes_unlinked_frames();
     test_telemetry_video_stream_sends_decodable_aligned_frames_to_collector();
     test_telemetry_video_stream_buffers_when_collector_unreachable();
     test_builds_terrain_mesh_from_heightmap();
@@ -1932,6 +2145,7 @@ int main() {
     test_twin_contract_v1_schema_covers_required_types();
     test_twin_contract_matches_shared_command_telemetry_fixture();
     test_twin_contract_version_compatibility();
+    test_canonical_runner_mission_and_telemetry_follow_twin_contract();
     test_trace_diff_reports_divergent_field();
     test_deterministic_runner_matches_golden();
     test_fnv1a64_is_stable_and_distinct();

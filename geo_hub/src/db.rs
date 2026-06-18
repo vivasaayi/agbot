@@ -256,6 +256,11 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             qa_report_ref TEXT,
             provenance_hash TEXT,
             downstream_consumers_json TEXT,
+            open_data_license TEXT,
+            open_data_attribution TEXT,
+            open_data_anonymized INTEGER,
+            open_data_refusal_reason TEXT,
+            open_data_published_at TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(scene_id) REFERENCES scenes(scene_id) ON DELETE CASCADE,
             UNIQUE(scene_id, kind)
@@ -366,6 +371,46 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         "products",
         "downstream_consumers_json",
         "ALTER TABLE products ADD COLUMN downstream_consumers_json TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_license",
+        "ALTER TABLE products ADD COLUMN open_data_license TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_attribution",
+        "ALTER TABLE products ADD COLUMN open_data_attribution TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_anonymized",
+        "ALTER TABLE products ADD COLUMN open_data_anonymized INTEGER",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_refusal_reason",
+        "ALTER TABLE products ADD COLUMN open_data_refusal_reason TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        pool,
+        "products",
+        "open_data_published_at",
+        "ALTER TABLE products ADD COLUMN open_data_published_at TEXT",
     )
     .await?;
 
@@ -891,6 +936,162 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS marketplace_catalog_items (
+            item_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            category TEXT NOT NULL,
+            name TEXT NOT NULL,
+            unit_of_measure TEXT NOT NULL,
+            owner_account_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_listings (
+            listing_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            price REAL NOT NULL,
+            currency TEXT NOT NULL,
+            available_qty REAL NOT NULL,
+            window_from TEXT NOT NULL,
+            window_to TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_inventory (
+            inventory_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            on_hand REAL NOT NULL,
+            reserved REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_orders (
+            order_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            listing_ref TEXT NOT NULL,
+            buyer_account_id TEXT NOT NULL,
+            qty REAL NOT NULL,
+            line_total REAL NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_order_audits (
+            audit_id TEXT PRIMARY KEY,
+            order_id TEXT NOT NULL,
+            from_status TEXT,
+            to_status TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_demand_forecasts (
+            forecast_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            item_kind TEXT NOT NULL,
+            horizon TEXT NOT NULL,
+            value REAL,
+            evidence_refs_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            uncertainty_low REAL,
+            uncertainty_high REAL,
+            method TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_fulfillments (
+            fulfillment_id TEXT PRIMARY KEY,
+            order_ref TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            carrier_ref TEXT NOT NULL,
+            tracking_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_fulfillment_audits (
+            audit_id TEXT PRIMARY KEY,
+            fulfillment_id TEXT NOT NULL,
+            from_status TEXT,
+            to_status TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_ratings (
+            rating_id TEXT PRIMARY KEY,
+            order_ref TEXT NOT NULL,
+            rater_account_id TEXT NOT NULL,
+            ratee_account_id TEXT NOT NULL,
+            score REAL NOT NULL,
+            comment TEXT,
+            org_scope TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(order_ref, rater_account_id)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS sustainability_records (
             record_id TEXT PRIMARY KEY,
             field_id TEXT NOT NULL,
@@ -900,6 +1101,198 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             method_version TEXT NOT NULL,
             created_at TEXT NOT NULL,
             audit_id TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS carbon_footprints (
+            footprint_id TEXT PRIMARY KEY,
+            record_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            value_co2e REAL,
+            inputs_json TEXT NOT NULL,
+            factor_set_version TEXT NOT NULL,
+            factors_json TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS biomass_estimates (
+            estimate_id TEXT PRIMARY KEY,
+            record_id TEXT NOT NULL,
+            biomass_value REAL NOT NULL,
+            area REAL NOT NULL,
+            crs TEXT NOT NULL,
+            extent_json TEXT NOT NULL,
+            resolution_json TEXT NOT NULL,
+            source_layer_refs_json TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sustainability_baselines (
+            baseline_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            metric_type TEXT NOT NULL,
+            metric_value REAL NOT NULL,
+            source_record_id TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sustainability_comparisons (
+            comparison_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            baseline_season_id TEXT NOT NULL,
+            current_season_id TEXT NOT NULL,
+            metric_type TEXT NOT NULL,
+            baseline_value REAL,
+            current_value REAL NOT NULL,
+            delta REAL,
+            trend TEXT NOT NULL,
+            status TEXT NOT NULL,
+            baseline_source_record_id TEXT,
+            current_source_record_id TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            compared_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sustainability_mrv_trails (
+            trail_id TEXT PRIMARY KEY,
+            output_ref TEXT NOT NULL,
+            output_kind TEXT NOT NULL,
+            input_layer_refs_json TEXT NOT NULL,
+            method TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            crs TEXT NOT NULL,
+            extent_json TEXT NOT NULL,
+            parameters_json TEXT NOT NULL,
+            audit_id TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            rederived_result_hash TEXT NOT NULL,
+            certification_ready INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS biodiversity_proxies (
+            proxy_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            heterogeneity_score REAL,
+            cover_fraction REAL,
+            uncertainty REAL NOT NULL,
+            status TEXT NOT NULL,
+            crs TEXT NOT NULL,
+            extent_json TEXT NOT NULL,
+            source_layer_refs_json TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS soil_carbon_proxies (
+            proxy_id TEXT PRIMARY KEY,
+            record_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            proxy_value REAL,
+            uncertainty_low REAL,
+            uncertainty_high REAL,
+            status TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sustainability_kpis (
+            kpi_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            metric_ref TEXT NOT NULL,
+            current_value REAL,
+            target_value REAL NOT NULL,
+            direction TEXT NOT NULL,
+            at_risk_fraction REAL NOT NULL,
+            status TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sustainability_certification_packs (
+            pack_id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL,
+            claim_type TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            claimed_output_refs_json TEXT NOT NULL,
+            outputs_json TEXT NOT NULL,
+            evidence_layer_refs_json TEXT NOT NULL,
+            mrv_trails_json TEXT NOT NULL,
+            audit_ids_json TEXT NOT NULL,
+            result_hash TEXT NOT NULL,
+            pack_hash TEXT NOT NULL,
+            method_version TEXT NOT NULL,
+            created_at TEXT NOT NULL
         );
         "#,
     )
@@ -930,6 +1323,141 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             content_id TEXT NOT NULL,
             body TEXT NOT NULL,
             created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_content_workflow_audits (
+            audit_id TEXT PRIMARY KEY,
+            content_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_role TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            scheduled_effective_at TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_content_tags (
+            content_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL,
+            applied_at TEXT NOT NULL,
+            PRIMARY KEY (content_id, kind, value)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_success_stories (
+            content_id TEXT PRIMARY KEY,
+            grower TEXT NOT NULL,
+            crop TEXT NOT NULL,
+            region TEXT NOT NULL,
+            outcome_summary TEXT NOT NULL,
+            metrics_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_content_locale_variants (
+            content_id TEXT NOT NULL,
+            locale TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            body TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (content_id, locale)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_community_contributions (
+            contribution_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            contributor_id TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            body TEXT NOT NULL,
+            status TEXT NOT NULL,
+            content_id TEXT,
+            submitted_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_community_contribution_audits (
+            audit_id TEXT PRIMARY KEY,
+            contribution_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            moderator_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            reason TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_content_engagement_events (
+            event_id TEXT PRIMARY KEY,
+            content_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            period TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cms_content_engagement_summaries (
+            content_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            period TEXT NOT NULL,
+            views INTEGER NOT NULL,
+            reads INTEGER NOT NULL,
+            helpful_votes INTEGER NOT NULL,
+            event_count INTEGER NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            computed_at TEXT NOT NULL,
+            PRIMARY KEY (content_id, org_id, period)
         );
         "#,
     )
@@ -973,6 +1501,258 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             org_id TEXT NOT NULL,
             actor_id TEXT NOT NULL,
             event_type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_permission_audits (
+            audit_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            actor_org_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            permission TEXT NOT NULL,
+            allowed INTEGER NOT NULL,
+            reason_code TEXT NOT NULL,
+            channel_id TEXT,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_presence (
+            org_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (channel_id, account_id)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_notifications (
+            notification_id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            recipient_account_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            body TEXT NOT NULL,
+            delivery_state TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_streams (
+            stream_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            mission_ref TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            state TEXT NOT NULL,
+            latency_budget_ms INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_stream_frames (
+            frame_id TEXT PRIMARY KEY,
+            stream_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            captured_at TEXT NOT NULL,
+            relayed_at TEXT NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            payload_ref TEXT NOT NULL,
+            encoded_ref TEXT NOT NULL,
+            relay_ref TEXT NOT NULL,
+            view_ref TEXT NOT NULL,
+            dropped INTEGER NOT NULL,
+            FOREIGN KEY(stream_id) REFERENCES collab_streams(stream_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_emergency_alerts (
+            alert_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            trigger_ref TEXT NOT NULL,
+            body TEXT NOT NULL,
+            state TEXT NOT NULL,
+            raised_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_alert_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            alert_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            recipient_account_id TEXT NOT NULL,
+            delivery_state TEXT NOT NULL,
+            retry_count INTEGER NOT NULL,
+            last_attempt_at TEXT NOT NULL,
+            FOREIGN KEY(alert_id) REFERENCES collab_emergency_alerts(alert_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_alert_audits (
+            audit_id TEXT PRIMARY KEY,
+            alert_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            from_state TEXT NOT NULL,
+            to_state TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            FOREIGN KEY(alert_id) REFERENCES collab_emergency_alerts(alert_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_sessions (
+            session_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            event_count INTEGER NOT NULL,
+            has_explicit_gap INTEGER NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_session_events (
+            event_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            subject_ref TEXT NOT NULL,
+            note TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES collab_sessions(session_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_session_annotations (
+            link_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            scene_id TEXT NOT NULL,
+            annotation_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            visible INTEGER NOT NULL,
+            recoverable INTEGER NOT NULL,
+            occurred_at TEXT NOT NULL,
+            UNIQUE(session_id, annotation_id),
+            FOREIGN KEY(session_id) REFERENCES collab_sessions(session_id) ON DELETE CASCADE,
+            FOREIGN KEY(annotation_id) REFERENCES annotations(annotation_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_mission_plans (
+            plan_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            mission_ref TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            waypoints_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_mission_edit_audits (
+            audit_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            mission_ref TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            waypoint_id TEXT NOT NULL,
+            base_version INTEGER NOT NULL,
+            resulting_version INTEGER NOT NULL,
+            decision TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_mission_dispatch_audits (
+            audit_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            mission_ref TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            allowed INTEGER NOT NULL,
+            blocking_guardrails_json TEXT NOT NULL,
             occurred_at TEXT NOT NULL
         );
         "#,
@@ -1058,6 +1838,39 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
             failure_reason_code TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS crop_inference_progress (
+            progress_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            tiles_total INTEGER NOT NULL,
+            tiles_done INTEGER NOT NULL,
+            coverage_fraction REAL NOT NULL,
+            stage TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES crop_inference_runs(run_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS crop_inference_stall_events (
+            stall_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            last_progress_at TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            stall_window_seconds INTEGER NOT NULL,
+            flagged INTEGER NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES crop_inference_runs(run_id) ON DELETE CASCADE
         );
         "#,
     )
@@ -1278,6 +2091,28 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS crop_closed_loop_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            approval_status TEXT NOT NULL,
+            approval_required INTEGER NOT NULL,
+            dispatch_authorized INTEGER NOT NULL,
+            confidence_floor REAL NOT NULL,
+            refly_area_json TEXT,
+            treatment_prescription_ref TEXT,
+            findings_json TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS compliance_records (
             record_id TEXT NOT NULL,
             version INTEGER NOT NULL,
@@ -1311,6 +2146,60 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         CREATE TABLE IF NOT EXISTS compliance_record_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             record_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor TEXT,
+            created_at TEXT NOT NULL,
+            details TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS compliance_authority_exports (
+            export_id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            authority_format TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            residency_tag TEXT NOT NULL,
+            storage_region TEXT NOT NULL,
+            retention_class TEXT NOT NULL,
+            export_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS compliance_authority_shares (
+            share_id TEXT PRIMARY KEY,
+            export_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            authority_format TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            residency_tag TEXT NOT NULL,
+            storage_region TEXT NOT NULL,
+            retention_class TEXT NOT NULL,
+            share_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS compliance_authority_share_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_id TEXT NOT NULL,
             event_type TEXT NOT NULL,
             actor TEXT,
             created_at TEXT NOT NULL,
@@ -1624,8 +2513,179 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_catalog_items_org_kind
+        ON marketplace_catalog_items(org_id, kind, category);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_catalog_items_owner
+        ON marketplace_catalog_items(owner_account_id, org_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_listings_org_status
+        ON marketplace_listings(org_id, status, item_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_inventory_org_item
+        ON marketplace_inventory(org_id, item_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_orders_org_status
+        ON marketplace_orders(org_id, status, listing_ref);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_order_audits_order
+        ON marketplace_order_audits(order_id, occurred_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_demand_forecasts_org_field
+        ON marketplace_demand_forecasts(org_id, field_id, horizon);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_fulfillments_org_order
+        ON marketplace_fulfillments(org_id, order_ref, status);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_fulfillment_audits_fulfillment
+        ON marketplace_fulfillment_audits(fulfillment_id, occurred_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_marketplace_ratings_ratee_org
+        ON marketplace_ratings(ratee_account_id, org_scope, order_ref);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_sustainability_records_field_season
         ON sustainability_records(field_id, season_id, metric_type);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_carbon_footprints_record_operation
+        ON carbon_footprints(record_id, operation_id, status);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_biomass_estimates_record
+        ON biomass_estimates(record_id, computed_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_baselines_field_metric
+        ON sustainability_baselines(field_id, season_id, metric_type);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_comparisons_field_status
+        ON sustainability_comparisons(field_id, status, compared_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_mrv_trails_output
+        ON sustainability_mrv_trails(output_ref, output_kind, created_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_biodiversity_proxies_field_status
+        ON biodiversity_proxies(field_id, status, computed_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_soil_carbon_proxies_field_status
+        ON soil_carbon_proxies(field_id, status, computed_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_kpis_field_status
+        ON sustainability_kpis(field_id, season_id, status, computed_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sustainability_certification_packs_claim
+        ON sustainability_certification_packs(claim_id, claim_type, created_at);
         "#,
     )
     .execute(pool)
@@ -1653,6 +2713,24 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_cms_content_versions_content
         ON cms_content_versions(content_id, created_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_cms_community_contributions_org_status
+        ON cms_community_contributions(org_id, status);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_cms_content_engagement_events_scope
+        ON cms_content_engagement_events(content_id, org_id, period);
         "#,
     )
     .execute(pool)

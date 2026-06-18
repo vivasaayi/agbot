@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,6 +56,43 @@ pub struct MetricDefinition {
     pub unit: String,
     pub kind: MetricKind,
     pub expected_cadence: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeriesFreshnessState {
+    Fresh,
+    Stale,
+    NoBaseline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeriesCadenceHealthConfig {
+    pub expected_cadence_days: u32,
+    pub stale_after_days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeriesGap {
+    pub from_t: String,
+    pub to_t: String,
+    pub observed_gap_days: u32,
+    pub expected_cadence_days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeriesCadenceHealth {
+    pub entity_ref: String,
+    pub metric: String,
+    pub evaluated_at: String,
+    pub last_seen: Option<String>,
+    pub age_days: Option<u32>,
+    pub expected_cadence_days: u32,
+    pub stale_after_days: u32,
+    pub state: SeriesFreshnessState,
+    pub point_count: usize,
+    pub gap_count: usize,
+    pub gaps: Vec<SeriesGap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -183,6 +221,51 @@ pub struct RasterChangeResult {
     pub delta_values: Vec<Option<f64>>,
     pub change_mask: Vec<bool>,
     pub changed_cell_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RasterChangeNormalizationMethod {
+    PercentOfEarlier,
+    ZScore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizedChangeOutcome {
+    ValidChange,
+    NoValidChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedRasterChangeConfig {
+    pub method: RasterChangeNormalizationMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variance: Option<f64>,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedRasterChangeResult {
+    pub normalized_raster_ref: String,
+    pub delta_raster_ref: String,
+    pub alignment_ref: String,
+    pub alignment_proof_ref: String,
+    pub crs: String,
+    pub extent: GeoExtent,
+    pub resolution: RasterResolution,
+    pub grid_columns: u32,
+    pub grid_rows: u32,
+    pub method: RasterChangeNormalizationMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variance: Option<f64>,
+    pub method_version: String,
+    pub normalized_values: Vec<Option<f64>>,
+    pub valid_cell_count: u32,
+    pub excluded_cell_count: u32,
+    pub outcome: NormalizedChangeOutcome,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -342,11 +425,217 @@ pub struct ChangeEvent {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeMissionProposalKind {
+    TargetedRefly,
+    Treatment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeMissionDispatchState {
+    PendingApproval,
+    ReadyForDispatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeMissionApproval {
+    pub approved_by: String,
+    pub approved_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosedLoopChangeHookConfig {
+    pub severity_threshold: f64,
+    pub proposal_kind: ChangeMissionProposalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ChangeMissionApproval>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeMissionProposal {
+    pub proposal_ref: String,
+    pub zone_ref: String,
+    pub metric: String,
+    pub proposal_kind: ChangeMissionProposalKind,
+    pub severity_score: f64,
+    pub magnitude: f64,
+    pub approval_required: bool,
+    pub approved: bool,
+    pub dispatch_state: ChangeMissionDispatchState,
+    pub dispatched: bool,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosedLoopChangeHookResult {
+    #[serde(default)]
+    pub proposals: Vec<ChangeMissionProposal>,
+    #[serde(default)]
+    pub dispatched_mission_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangeEventDerivationInput {
     pub change: RasterChangeResult,
     pub trend: ZonalTrendResult,
     pub baseline: RollingBaselineResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeReproducibilityRequest {
+    pub source_pair: ChangeSourcePair,
+    pub alignment_evidence: RasterAlignmentEvidence,
+    pub alignment_proof: AlignmentGuardProof,
+    pub change: RasterChangeResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_change: Option<NormalizedRasterChangeResult>,
+    #[serde(default)]
+    pub events: Vec<ChangeEvent>,
+    pub change_config: RasterChangeConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_config: Option<NormalizedRasterChangeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_config: Option<ChangeEventConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeSourcePair {
+    pub earlier_source_ref: String,
+    pub later_source_ref: String,
+    pub earlier_raster_ref: String,
+    pub later_raster_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeReproducibilityReport {
+    pub schema_version: String,
+    pub source_pair: ChangeSourcePair,
+    pub alignment_ref: String,
+    pub alignment_proof_ref: String,
+    pub change_method_version: String,
+    pub absolute_threshold: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_method_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_magnitude_threshold: Option<f64>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub output_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScalarConsumerMetricRegistration {
+    pub consumer_domain: String,
+    pub metric: String,
+    pub unit: String,
+    pub expected_cadence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalarConsumerPoint {
+    pub consumer_domain: String,
+    pub entity_ref: String,
+    pub metric: String,
+    pub unit: String,
+    pub t: String,
+    pub value: f64,
+    pub source_ref: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalarConsumerEvaluationRequest {
+    #[serde(default)]
+    pub registrations: Vec<ScalarConsumerMetricRegistration>,
+    #[serde(default)]
+    pub points: Vec<ScalarConsumerPoint>,
+    pub target: ZonalTrendTarget,
+    pub trend_config: ZonalTrendConfig,
+    pub baseline_config: RollingBaselineConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalarConsumerEvaluation {
+    pub registered_metric_count: usize,
+    pub appended_point_count: usize,
+    pub trend: ZonalTrendResult,
+    pub baseline: RollingBaselineResult,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetCarbonConsumerEvaluationRequest {
+    #[serde(default)]
+    pub registrations: Vec<ScalarConsumerMetricRegistration>,
+    #[serde(default)]
+    pub points: Vec<ScalarConsumerPoint>,
+    pub fleet_target: ZonalTrendTarget,
+    pub fleet_trend_config: ZonalTrendConfig,
+    pub fleet_baseline_config: RollingBaselineConfig,
+    pub carbon_target: SeasonalComparisonTarget,
+    pub carbon_config: SeasonalComparisonConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetCarbonConsumerEvaluation {
+    pub registered_metric_count: usize,
+    pub appended_point_count: usize,
+    pub fleet_rul_trend: ZonalTrendResult,
+    pub fleet_anomaly: RollingBaselineResult,
+    pub carbon_seasonal_change: SeasonalComparisonResult,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntheticSeriesMethod {
+    TrendProjection,
+    LinearInterpolation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForecastGapFillRequest {
+    pub metric: MetricDefinition,
+    #[serde(default)]
+    pub observed_points: Vec<SeriesPoint>,
+    pub target: ZonalTrendTarget,
+    pub trend_config: ZonalTrendConfig,
+    #[serde(default)]
+    pub forecast_timestamps: Vec<String>,
+    #[serde(default)]
+    pub gap_fill_timestamps: Vec<String>,
+    pub uncertainty_band: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyntheticSeriesPoint {
+    pub entity_ref: String,
+    pub metric: String,
+    pub unit: String,
+    pub t: String,
+    pub value: f64,
+    pub uncertainty_band: f64,
+    pub synthetic: bool,
+    pub method: SyntheticSeriesMethod,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForecastGapFillResult {
+    pub trend: ZonalTrendResult,
+    #[serde(default)]
+    pub forecast_points: Vec<SyntheticSeriesPoint>,
+    #[serde(default)]
+    pub gap_fill_points: Vec<SyntheticSeriesPoint>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -508,6 +797,8 @@ pub enum TimeSeriesError {
     EmptyUnit,
     #[error("expected cadence cannot be empty for {metric}")]
     EmptyExpectedCadence { metric: String },
+    #[error("cadence health config requires expected_cadence_days and stale_after_days greater than zero")]
+    InvalidCadenceHealthConfig,
     #[error("timestamp cannot be empty")]
     EmptyTimestamp,
     #[error("source_ref cannot be empty")]
@@ -587,6 +878,14 @@ pub enum TimeSeriesError {
     InvalidChangeConfig,
     #[error("raster change inputs must match alignment evidence and proof")]
     ChangeAlignmentMismatch,
+    #[error("normalized_raster_ref cannot be empty")]
+    EmptyNormalizedRasterRef,
+    #[error("normalized change method_version cannot be empty")]
+    EmptyNormalizedChangeMethodVersion,
+    #[error("normalized change config is invalid for the selected method")]
+    InvalidNormalizedChangeConfig,
+    #[error("normalized change input grid must match the raster change result")]
+    NormalizedChangeInputMismatch,
     #[error("aligned raster grid cell count does not match dimensions")]
     InvalidRasterCellCount,
     #[error("aligned raster grid values must be finite when present")]
@@ -627,6 +926,30 @@ pub enum TimeSeriesError {
     },
     #[error("change event config must have finite non-negative threshold")]
     InvalidChangeEventConfig,
+    #[error("closed-loop change hook config must have a finite non-negative severity threshold")]
+    InvalidClosedLoopChangeHookConfig,
+    #[error("change reproducibility source product is missing: {source_ref}")]
+    MissingChangeSourceProduct { source_ref: String },
+    #[error("change reproducibility inputs do not match the retained change outputs")]
+    ChangeReproducibilityInputMismatch,
+    #[error("change reproducibility hash input could not be serialized")]
+    ChangeReproducibilitySerializationFailed,
+    #[error("consumer_domain cannot be empty")]
+    EmptyConsumerDomain,
+    #[error("scalar consumer evaluation requires at least one metric registration")]
+    EmptyScalarConsumerRegistrations,
+    #[error("scalar consumer evaluation requires at least one point")]
+    EmptyScalarConsumerPoints,
+    #[error("synthetic series request requires at least one forecast or gap-fill timestamp")]
+    EmptySyntheticSeriesTargets,
+    #[error("synthetic series uncertainty_band must be finite and non-negative")]
+    InvalidSyntheticSeriesConfig,
+    #[error("gap-fill for {entity_ref}/{metric} at {timestamp} requires bounding real points")]
+    GapFillRequiresBoundingPoints {
+        entity_ref: String,
+        metric: String,
+        timestamp: String,
+    },
     #[error("export CRS cannot be empty")]
     EmptyExportCrs,
     #[error("change zone export CRS mismatch: expected {expected_crs}, got {actual_crs}")]
@@ -1136,6 +1459,310 @@ pub fn derive_ranked_change_events(
     Ok(events)
 }
 
+pub fn draft_closed_loop_change_proposals(
+    events: Vec<ChangeEvent>,
+    config: ClosedLoopChangeHookConfig,
+) -> Result<ClosedLoopChangeHookResult, TimeSeriesError> {
+    if !config.severity_threshold.is_finite() || config.severity_threshold < 0.0 {
+        return Err(TimeSeriesError::InvalidClosedLoopChangeHookConfig);
+    }
+
+    let approved = config.approval.is_some();
+    let dispatch_state = if approved {
+        ChangeMissionDispatchState::ReadyForDispatch
+    } else {
+        ChangeMissionDispatchState::PendingApproval
+    };
+
+    let mut proposals = Vec::new();
+    for event in events
+        .into_iter()
+        .filter(|event| event.severity_score >= config.severity_threshold)
+    {
+        let proposal_ref = format!(
+            "proposal:{}:{}:{}",
+            event.zone_ref, event.metric, event.since_date
+        );
+        proposals.push(ChangeMissionProposal {
+            proposal_ref,
+            zone_ref: event.zone_ref.clone(),
+            metric: event.metric.clone(),
+            proposal_kind: config.proposal_kind,
+            severity_score: event.severity_score,
+            magnitude: event.magnitude,
+            approval_required: true,
+            approved,
+            dispatch_state,
+            dispatched: false,
+            evidence_refs: event.evidence_refs.clone(),
+            summary: format!("{}; approval required before dispatch", event.summary),
+        });
+    }
+
+    Ok(ClosedLoopChangeHookResult {
+        proposals,
+        dispatched_mission_refs: Vec::new(),
+    })
+}
+
+pub fn build_change_reproducibility_report(
+    request: ChangeReproducibilityRequest,
+) -> Result<ChangeReproducibilityReport, TimeSeriesError> {
+    let source_pair = normalize_change_source_pair(request.source_pair.clone())?;
+    let change_config = normalize_change_config(request.change_config.clone())?;
+    validate_reproducibility_inputs(&request, &source_pair, &change_config)?;
+
+    let normalized_config = request
+        .normalized_config
+        .clone()
+        .map(normalize_normalized_change_config)
+        .transpose()?;
+    let event_config = request
+        .event_config
+        .map(normalize_change_event_config)
+        .transpose()?;
+    let output_hash = change_reproducibility_hash(&request, &source_pair)?;
+    let mut evidence_refs = BTreeSet::new();
+    evidence_refs.insert(source_pair.earlier_source_ref.clone());
+    evidence_refs.insert(source_pair.later_source_ref.clone());
+    evidence_refs.insert(request.alignment_evidence.alignment_ref.clone());
+    evidence_refs.insert(request.alignment_proof.alignment_proof_ref.clone());
+    evidence_refs.insert(request.change.delta_raster_ref.clone());
+    evidence_refs.insert(request.change.mask_raster_ref.clone());
+    if let Some(normalized) = &request.normalized_change {
+        evidence_refs.insert(normalized.normalized_raster_ref.clone());
+    }
+    for event in &request.events {
+        for evidence_ref in &event.evidence_refs {
+            evidence_refs.insert(evidence_ref.clone());
+        }
+    }
+
+    Ok(ChangeReproducibilityReport {
+        schema_version: "timeseries.change_reproducibility.v1".to_string(),
+        source_pair,
+        alignment_ref: request.alignment_evidence.alignment_ref,
+        alignment_proof_ref: request.alignment_proof.alignment_proof_ref,
+        change_method_version: change_config.method_version,
+        absolute_threshold: change_config.absolute_threshold,
+        normalized_method_version: normalized_config.map(|config| config.method_version),
+        event_magnitude_threshold: event_config.map(|config| config.magnitude_threshold),
+        evidence_refs: evidence_refs.into_iter().collect(),
+        output_hash,
+    })
+}
+
+pub fn evaluate_scalar_consumer_series(
+    request: ScalarConsumerEvaluationRequest,
+) -> Result<ScalarConsumerEvaluation, TimeSeriesError> {
+    let (engine, registered_metric_count, appended_point_count) =
+        build_scalar_consumer_engine(request.registrations, request.points)?;
+
+    let trend = engine.compute_zonal_trend(request.target.clone(), request.trend_config)?;
+    let baseline = engine.compute_rolling_baseline(request.target, request.baseline_config)?;
+    let mut evidence_refs = Vec::new();
+    for reference in trend.evidence_refs.iter().chain(&baseline.evidence_refs) {
+        push_unique(&mut evidence_refs, reference.clone());
+    }
+
+    Ok(ScalarConsumerEvaluation {
+        registered_metric_count,
+        appended_point_count,
+        trend,
+        baseline,
+        evidence_refs,
+    })
+}
+
+pub fn evaluate_fleet_carbon_consumers(
+    request: FleetCarbonConsumerEvaluationRequest,
+) -> Result<FleetCarbonConsumerEvaluation, TimeSeriesError> {
+    let (engine, registered_metric_count, appended_point_count) =
+        build_scalar_consumer_engine(request.registrations, request.points)?;
+
+    let fleet_rul_trend =
+        engine.compute_zonal_trend(request.fleet_target.clone(), request.fleet_trend_config)?;
+    let fleet_anomaly =
+        engine.compute_rolling_baseline(request.fleet_target, request.fleet_baseline_config)?;
+    let carbon_seasonal_change =
+        engine.compute_seasonal_comparison(request.carbon_target, request.carbon_config)?;
+
+    let mut evidence_refs = Vec::new();
+    for reference in fleet_rul_trend
+        .evidence_refs
+        .iter()
+        .chain(&fleet_anomaly.evidence_refs)
+        .chain(&carbon_seasonal_change.evidence_refs)
+    {
+        push_unique(&mut evidence_refs, reference.clone());
+    }
+
+    Ok(FleetCarbonConsumerEvaluation {
+        registered_metric_count,
+        appended_point_count,
+        fleet_rul_trend,
+        fleet_anomaly,
+        carbon_seasonal_change,
+        evidence_refs,
+    })
+}
+
+pub fn build_forecast_gap_fill(
+    request: ForecastGapFillRequest,
+) -> Result<ForecastGapFillResult, TimeSeriesError> {
+    if request.forecast_timestamps.is_empty() && request.gap_fill_timestamps.is_empty() {
+        return Err(TimeSeriesError::EmptySyntheticSeriesTargets);
+    }
+    if !request.uncertainty_band.is_finite() || request.uncertainty_band < 0.0 {
+        return Err(TimeSeriesError::InvalidSyntheticSeriesConfig);
+    }
+
+    let mut engine = TimeSeriesEngine::default();
+    engine.register_metric(request.metric)?;
+    for point in request.observed_points {
+        engine.append(point)?;
+    }
+
+    let trend = engine.compute_zonal_trend(request.target.clone(), request.trend_config)?;
+    let unit = trend.unit.clone();
+    let first_day = timestamp_day_index(&trend.points_used[0].t)?;
+    let mut forecast_points = Vec::new();
+    for timestamp in request.forecast_timestamps {
+        let timestamp = normalize_required_text(timestamp, TimeSeriesError::EmptyTimestamp)?;
+        let day_offset = (timestamp_day_index(&timestamp)? - first_day) as f64;
+        forecast_points.push(SyntheticSeriesPoint {
+            entity_ref: trend.entity_ref.clone(),
+            metric: trend.metric.clone(),
+            unit: unit.clone(),
+            t: timestamp,
+            value: trend.intercept + trend.slope_per_day * day_offset,
+            uncertainty_band: request.uncertainty_band,
+            synthetic: true,
+            method: SyntheticSeriesMethod::TrendProjection,
+            evidence_refs: trend.evidence_refs.clone(),
+        });
+    }
+
+    let mut gap_fill_points = Vec::new();
+    for timestamp in request.gap_fill_timestamps {
+        let timestamp = normalize_required_text(timestamp, TimeSeriesError::EmptyTimestamp)?;
+        let (value, evidence_refs) = interpolate_gap_value(
+            &trend.points_used,
+            &trend.entity_ref,
+            &trend.metric,
+            &timestamp,
+        )?;
+        gap_fill_points.push(SyntheticSeriesPoint {
+            entity_ref: trend.entity_ref.clone(),
+            metric: trend.metric.clone(),
+            unit: unit.clone(),
+            t: timestamp,
+            value,
+            uncertainty_band: request.uncertainty_band,
+            synthetic: true,
+            method: SyntheticSeriesMethod::LinearInterpolation,
+            evidence_refs,
+        });
+    }
+
+    let mut evidence_refs = Vec::new();
+    for reference in &trend.evidence_refs {
+        push_unique(&mut evidence_refs, reference.clone());
+    }
+    for point in forecast_points.iter().chain(&gap_fill_points) {
+        for reference in &point.evidence_refs {
+            push_unique(&mut evidence_refs, reference.clone());
+        }
+    }
+
+    Ok(ForecastGapFillResult {
+        trend,
+        forecast_points,
+        gap_fill_points,
+        evidence_refs,
+    })
+}
+
+pub fn evaluate_series_cadence_health(
+    points: &[SeriesPoint],
+    entity_ref: String,
+    metric: String,
+    evaluated_at: String,
+    config: SeriesCadenceHealthConfig,
+) -> Result<SeriesCadenceHealth, TimeSeriesError> {
+    let entity_ref = normalize_required_text(entity_ref, TimeSeriesError::EmptyEntityRef)?;
+    let metric = normalize_required_text(metric, TimeSeriesError::EmptyMetric)?;
+    let evaluated_at = normalize_required_text(evaluated_at, TimeSeriesError::EmptyTimestamp)?;
+    if config.expected_cadence_days == 0 || config.stale_after_days == 0 {
+        return Err(TimeSeriesError::InvalidCadenceHealthConfig);
+    }
+    let evaluated_day = timestamp_day_index(&evaluated_at)?;
+    let mut scoped = points
+        .iter()
+        .filter(|point| point.entity_ref == entity_ref && point.metric == metric)
+        .cloned()
+        .collect::<Vec<_>>();
+    scoped.sort_by(|left, right| left.t.cmp(&right.t));
+
+    if scoped.is_empty() {
+        return Ok(SeriesCadenceHealth {
+            entity_ref,
+            metric,
+            evaluated_at,
+            last_seen: None,
+            age_days: None,
+            expected_cadence_days: config.expected_cadence_days,
+            stale_after_days: config.stale_after_days,
+            state: SeriesFreshnessState::NoBaseline,
+            point_count: 0,
+            gap_count: 0,
+            gaps: Vec::new(),
+        });
+    }
+
+    let mut gaps = Vec::new();
+    for pair in scoped.windows(2) {
+        let from = &pair[0];
+        let to = &pair[1];
+        let observed_gap_days =
+            (timestamp_day_index(&to.t)? - timestamp_day_index(&from.t)?).max(0) as u32;
+        if observed_gap_days > config.expected_cadence_days {
+            gaps.push(SeriesGap {
+                from_t: from.t.clone(),
+                to_t: to.t.clone(),
+                observed_gap_days,
+                expected_cadence_days: config.expected_cadence_days,
+            });
+        }
+    }
+
+    let last_seen = scoped
+        .last()
+        .expect("non-empty scoped series checked above")
+        .t
+        .clone();
+    let age_days = (evaluated_day - timestamp_day_index(&last_seen)?).max(0) as u32;
+    let state = if age_days > config.stale_after_days {
+        SeriesFreshnessState::Stale
+    } else {
+        SeriesFreshnessState::Fresh
+    };
+
+    Ok(SeriesCadenceHealth {
+        entity_ref,
+        metric,
+        evaluated_at,
+        last_seen: Some(last_seen),
+        age_days: Some(age_days),
+        expected_cadence_days: config.expected_cadence_days,
+        stale_after_days: config.stale_after_days,
+        state,
+        point_count: scoped.len(),
+        gap_count: gaps.len(),
+        gaps,
+    })
+}
+
 pub fn export_series_csv(points: &[SeriesPoint]) -> Result<SeriesCsvExport, TimeSeriesError> {
     let mut csv = "entity_ref,metric,t,unit,value,source_ref,created_at\n".to_string();
     for point in points {
@@ -1614,6 +2241,86 @@ pub fn compute_aligned_raster_change(
     })
 }
 
+pub fn normalize_raster_change(
+    change: &RasterChangeResult,
+    earlier: &AlignedRasterGrid,
+    config: NormalizedRasterChangeConfig,
+    generated_normalized_raster_ref: String,
+) -> Result<NormalizedRasterChangeResult, TimeSeriesError> {
+    let normalized_raster_ref = normalize_required_text(
+        generated_normalized_raster_ref,
+        TimeSeriesError::EmptyNormalizedRasterRef,
+    )?;
+    let config = normalize_normalized_change_config(config)?;
+    validate_raster_change_result(change)?;
+    validate_aligned_grid(earlier)?;
+    validate_normalized_change_inputs(change, earlier)?;
+
+    let denominator = match config.method {
+        RasterChangeNormalizationMethod::PercentOfEarlier => None,
+        RasterChangeNormalizationMethod::ZScore => config.variance.map(f64::sqrt),
+    };
+    let mut normalized_values = Vec::with_capacity(change.delta_values.len());
+    let mut valid_cell_count = 0_u32;
+    let mut excluded_cell_count = 0_u32;
+
+    for (delta, earlier_value) in change.delta_values.iter().zip(&earlier.values) {
+        let normalized = match (delta, earlier_value) {
+            (Some(delta), Some(earlier_value)) => {
+                let denominator = denominator.unwrap_or(*earlier_value);
+                if denominator == 0.0 {
+                    None
+                } else {
+                    let value = delta / denominator;
+                    if value.is_finite() {
+                        Some(value)
+                    } else {
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        if normalized.is_some() {
+            valid_cell_count += 1;
+        } else {
+            excluded_cell_count += 1;
+        }
+        normalized_values.push(normalized);
+    }
+
+    let outcome = if valid_cell_count == 0 {
+        NormalizedChangeOutcome::NoValidChange
+    } else {
+        NormalizedChangeOutcome::ValidChange
+    };
+
+    Ok(NormalizedRasterChangeResult {
+        normalized_raster_ref,
+        delta_raster_ref: change.delta_raster_ref.clone(),
+        alignment_ref: change.alignment_ref.clone(),
+        alignment_proof_ref: change.alignment_proof_ref.clone(),
+        crs: change.crs.clone(),
+        extent: change.extent,
+        resolution: change.resolution,
+        grid_columns: change.grid_columns,
+        grid_rows: change.grid_rows,
+        method: config.method,
+        variance: config.variance,
+        method_version: config.method_version,
+        normalized_values,
+        valid_cell_count,
+        excluded_cell_count,
+        outcome,
+        evidence_refs: vec![
+            change.delta_raster_ref.clone(),
+            change.alignment_ref.clone(),
+            change.alignment_proof_ref.clone(),
+        ],
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SeriesKey {
     entity_ref: String,
@@ -1713,6 +2420,65 @@ fn normalize_change_config(
     })
 }
 
+fn normalize_change_source_pair(
+    source_pair: ChangeSourcePair,
+) -> Result<ChangeSourcePair, TimeSeriesError> {
+    let earlier_source_ref = normalize_required_text(
+        source_pair.earlier_source_ref,
+        TimeSeriesError::MissingChangeSourceProduct {
+            source_ref: "earlier_source_ref".to_string(),
+        },
+    )?;
+    let later_source_ref = normalize_required_text(
+        source_pair.later_source_ref,
+        TimeSeriesError::MissingChangeSourceProduct {
+            source_ref: "later_source_ref".to_string(),
+        },
+    )?;
+    Ok(ChangeSourcePair {
+        earlier_source_ref,
+        later_source_ref,
+        earlier_raster_ref: normalize_required_text(
+            source_pair.earlier_raster_ref,
+            TimeSeriesError::EmptyRasterRef,
+        )?,
+        later_raster_ref: normalize_required_text(
+            source_pair.later_raster_ref,
+            TimeSeriesError::EmptyRasterRef,
+        )?,
+    })
+}
+
+fn normalize_normalized_change_config(
+    config: NormalizedRasterChangeConfig,
+) -> Result<NormalizedRasterChangeConfig, TimeSeriesError> {
+    let method_version = normalize_required_text(
+        config.method_version,
+        TimeSeriesError::EmptyNormalizedChangeMethodVersion,
+    )?;
+    match config.method {
+        RasterChangeNormalizationMethod::PercentOfEarlier => {
+            if config.variance.is_some() {
+                return Err(TimeSeriesError::InvalidNormalizedChangeConfig);
+            }
+        }
+        RasterChangeNormalizationMethod::ZScore => {
+            let Some(variance) = config.variance else {
+                return Err(TimeSeriesError::InvalidNormalizedChangeConfig);
+            };
+            if !variance.is_finite() || variance <= 0.0 {
+                return Err(TimeSeriesError::InvalidNormalizedChangeConfig);
+            }
+        }
+    }
+
+    Ok(NormalizedRasterChangeConfig {
+        method: config.method,
+        variance: config.variance,
+        method_version,
+    })
+}
+
 fn normalize_metric_definition(
     mut definition: MetricDefinition,
 ) -> Result<MetricDefinition, TimeSeriesError> {
@@ -1725,6 +2491,88 @@ fn normalize_metric_definition(
         },
     )?;
     Ok(definition)
+}
+
+fn build_scalar_consumer_engine(
+    registrations: Vec<ScalarConsumerMetricRegistration>,
+    points: Vec<ScalarConsumerPoint>,
+) -> Result<(TimeSeriesEngine, usize, usize), TimeSeriesError> {
+    if registrations.is_empty() {
+        return Err(TimeSeriesError::EmptyScalarConsumerRegistrations);
+    }
+    if points.is_empty() {
+        return Err(TimeSeriesError::EmptyScalarConsumerPoints);
+    }
+
+    let mut engine = TimeSeriesEngine::default();
+    let registered_metric_count = registrations.len();
+    for registration in registrations {
+        let registration = normalize_scalar_consumer_registration(registration)?;
+        engine.register_metric(MetricDefinition {
+            metric: registration.metric,
+            unit: registration.unit,
+            kind: MetricKind::Scalar,
+            expected_cadence: registration.expected_cadence,
+        })?;
+    }
+
+    let mut appended_point_count = 0;
+    for point in points {
+        let point = normalize_scalar_consumer_point(point)?;
+        engine.append(SeriesPoint {
+            entity_ref: point.entity_ref,
+            metric: point.metric,
+            unit: point.unit,
+            t: point.t,
+            value: SeriesValue::Scalar { value: point.value },
+            source_ref: point.source_ref,
+            created_at: point.created_at,
+        })?;
+        appended_point_count += 1;
+    }
+
+    Ok((engine, registered_metric_count, appended_point_count))
+}
+
+fn normalize_scalar_consumer_registration(
+    registration: ScalarConsumerMetricRegistration,
+) -> Result<ScalarConsumerMetricRegistration, TimeSeriesError> {
+    Ok(ScalarConsumerMetricRegistration {
+        consumer_domain: normalize_required_text(
+            registration.consumer_domain,
+            TimeSeriesError::EmptyConsumerDomain,
+        )?,
+        metric: normalize_required_text(registration.metric, TimeSeriesError::EmptyMetric)?,
+        unit: normalize_required_text(registration.unit, TimeSeriesError::EmptyUnit)?,
+        expected_cadence: normalize_required_text(
+            registration.expected_cadence,
+            TimeSeriesError::EmptyExpectedCadence {
+                metric: "scalar_consumer".to_string(),
+            },
+        )?,
+    })
+}
+
+fn normalize_scalar_consumer_point(
+    point: ScalarConsumerPoint,
+) -> Result<ScalarConsumerPoint, TimeSeriesError> {
+    if !point.value.is_finite() {
+        return Err(TimeSeriesError::InvalidScalarValue);
+    }
+
+    Ok(ScalarConsumerPoint {
+        consumer_domain: normalize_required_text(
+            point.consumer_domain,
+            TimeSeriesError::EmptyConsumerDomain,
+        )?,
+        entity_ref: normalize_required_text(point.entity_ref, TimeSeriesError::EmptyEntityRef)?,
+        metric: normalize_required_text(point.metric, TimeSeriesError::EmptyMetric)?,
+        unit: normalize_required_text(point.unit, TimeSeriesError::EmptyUnit)?,
+        t: normalize_required_text(point.t, TimeSeriesError::EmptyTimestamp)?,
+        value: point.value,
+        source_ref: normalize_required_text(point.source_ref, TimeSeriesError::EmptySourceRef)?,
+        created_at: normalize_required_text(point.created_at, TimeSeriesError::EmptyCreatedAt)?,
+    })
 }
 
 fn normalize_product_ingest(
@@ -1821,6 +2669,57 @@ fn metric_kind_for_value(value: &SeriesValue) -> MetricKind {
         SeriesValue::Scalar { .. } => MetricKind::Scalar,
         SeriesValue::Raster(_) => MetricKind::Raster,
     }
+}
+
+fn interpolate_gap_value(
+    points: &[SeriesPoint],
+    entity_ref: &str,
+    metric: &str,
+    timestamp: &str,
+) -> Result<(f64, Vec<String>), TimeSeriesError> {
+    let target_day = timestamp_day_index(timestamp)?;
+    let mut samples = Vec::with_capacity(points.len());
+    for point in points {
+        samples.push((
+            timestamp_day_index(&point.t)?,
+            point,
+            scalar_value_from_point(point)?,
+        ));
+    }
+    samples.sort_by_key(|(day, _, _)| *day);
+
+    let previous = samples
+        .iter()
+        .rev()
+        .find(|(day, _, _)| *day < target_day)
+        .copied();
+    let next = samples
+        .iter()
+        .find(|(day, _, _)| *day > target_day)
+        .copied();
+    let (
+        Some((previous_day, previous_point, previous_value)),
+        Some((next_day, next_point, next_value)),
+    ) = (previous, next)
+    else {
+        return Err(TimeSeriesError::GapFillRequiresBoundingPoints {
+            entity_ref: entity_ref.to_string(),
+            metric: metric.to_string(),
+            timestamp: timestamp.to_string(),
+        });
+    };
+
+    let span = (next_day - previous_day) as f64;
+    let offset = (target_day - previous_day) as f64;
+    let ratio = offset / span;
+    let value = previous_value + (next_value - previous_value) * ratio;
+    Ok((
+        value,
+        vec![
+            previous_point.source_ref.clone(),
+            next_point.source_ref.clone(),
+        ],
+    ))
 }
 
 fn timestamp_day_index(timestamp: &str) -> Result<i64, TimeSeriesError> {
@@ -2005,6 +2904,112 @@ fn validate_raster_change_result(change: &RasterChangeResult) -> Result<(), Time
         return Err(TimeSeriesError::InvalidRasterCellValue);
     }
     Ok(())
+}
+
+fn validate_normalized_change_inputs(
+    change: &RasterChangeResult,
+    earlier: &AlignedRasterGrid,
+) -> Result<(), TimeSeriesError> {
+    let matches = earlier.alignment_ref == change.alignment_ref
+        && earlier.crs == change.crs
+        && earlier.extent == change.extent
+        && earlier.resolution == change.resolution
+        && earlier.grid_columns == change.grid_columns
+        && earlier.grid_rows == change.grid_rows
+        && earlier.values.len() == change.delta_values.len();
+
+    if matches {
+        Ok(())
+    } else {
+        Err(TimeSeriesError::NormalizedChangeInputMismatch)
+    }
+}
+
+fn validate_reproducibility_inputs(
+    request: &ChangeReproducibilityRequest,
+    source_pair: &ChangeSourcePair,
+    change_config: &RasterChangeConfig,
+) -> Result<(), TimeSeriesError> {
+    validate_raster_change_result(&request.change)?;
+    let aligned = request.alignment_evidence.alignment_ref == request.change.alignment_ref
+        && request.alignment_proof.alignment_proof_ref == request.change.alignment_proof_ref
+        && request.alignment_evidence.entity_ref == request.alignment_proof.entity_ref
+        && request.alignment_evidence.metric == request.alignment_proof.metric
+        && request.alignment_evidence.earlier_t == request.alignment_proof.earlier_t
+        && request.alignment_evidence.later_t == request.alignment_proof.later_t;
+    let source_matches = request.alignment_evidence.earlier_source_ref
+        == source_pair.earlier_source_ref
+        && request.alignment_evidence.later_source_ref == source_pair.later_source_ref
+        && request.alignment_evidence.earlier_raster_ref == source_pair.earlier_raster_ref
+        && request.alignment_evidence.later_raster_ref == source_pair.later_raster_ref
+        && request.alignment_proof.earlier_raster_ref == source_pair.earlier_raster_ref
+        && request.alignment_proof.later_raster_ref == source_pair.later_raster_ref;
+    let change_params_match = request.change.absolute_threshold == change_config.absolute_threshold
+        && request.change.method_version == change_config.method_version;
+    let grid_matches = request.alignment_evidence.target_crs == request.change.crs
+        && request.alignment_evidence.aligned_extent == request.change.extent
+        && request.alignment_evidence.grid_columns == request.change.grid_columns
+        && request.alignment_evidence.grid_rows == request.change.grid_rows;
+
+    if !(aligned && source_matches && change_params_match && grid_matches) {
+        return Err(TimeSeriesError::ChangeReproducibilityInputMismatch);
+    }
+    if let Some(normalized) = &request.normalized_change {
+        if normalized.delta_raster_ref != request.change.delta_raster_ref
+            || normalized.alignment_ref != request.change.alignment_ref
+            || normalized.alignment_proof_ref != request.change.alignment_proof_ref
+            || normalized.crs != request.change.crs
+            || normalized.extent != request.change.extent
+            || normalized.grid_columns != request.change.grid_columns
+            || normalized.grid_rows != request.change.grid_rows
+        {
+            return Err(TimeSeriesError::ChangeReproducibilityInputMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn change_reproducibility_hash(
+    request: &ChangeReproducibilityRequest,
+    source_pair: &ChangeSourcePair,
+) -> Result<String, TimeSeriesError> {
+    #[derive(Serialize)]
+    struct HashInput<'a> {
+        source_pair: &'a ChangeSourcePair,
+        alignment_evidence: &'a RasterAlignmentEvidence,
+        alignment_proof: &'a AlignmentGuardProof,
+        change: &'a RasterChangeResult,
+        normalized_change: &'a Option<NormalizedRasterChangeResult>,
+        events: &'a [ChangeEvent],
+        change_config: &'a RasterChangeConfig,
+        normalized_config: &'a Option<NormalizedRasterChangeConfig>,
+        event_config: &'a Option<ChangeEventConfig>,
+    }
+
+    let bytes = serde_json::to_vec(&HashInput {
+        source_pair,
+        alignment_evidence: &request.alignment_evidence,
+        alignment_proof: &request.alignment_proof,
+        change: &request.change,
+        normalized_change: &request.normalized_change,
+        events: &request.events,
+        change_config: &request.change_config,
+        normalized_config: &request.normalized_config,
+        event_config: &request.event_config,
+    })
+    .map_err(|_| TimeSeriesError::ChangeReproducibilitySerializationFailed)?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{}", to_hex(&digest)))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn validate_compare_view_inputs(
@@ -2384,17 +3389,26 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        align_raster_pair, build_compare_view_feed, compare_view_refusal_from_guard,
-        compute_aligned_raster_change, derive_ranked_change_events, export_change_mask_geotiff,
-        export_change_zones_geojson, export_series_csv, guard_coregisterable_pair,
-        AlignedRasterGrid, AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason,
-        ChangeEvent, ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection,
-        ChangeEventReasonCode, ChangeZoneExportFeature, ChangeZonePolygon, GeoExtent,
-        MetricDefinition, MetricKind, RasterAlignmentConfig, RasterAlignmentEvidence,
-        RasterChangeConfig, RasterChangeResult, RasterResolution, RasterSeriesValue,
-        RollingBaselineConfig, SeasonalComparisonConfig, SeasonalComparisonTarget, SeriesPoint,
-        SeriesProductIngest, SeriesQuery, SeriesValue, TimeRange, TimeSeriesEngine,
-        TimeSeriesError, TimeSeriesStore, TrendDirection, ZonalTrendConfig, ZonalTrendTarget,
+        align_raster_pair, build_change_reproducibility_report, build_compare_view_feed,
+        build_forecast_gap_fill, compare_view_refusal_from_guard, compute_aligned_raster_change,
+        derive_ranked_change_events, draft_closed_loop_change_proposals,
+        evaluate_fleet_carbon_consumers, evaluate_scalar_consumer_series,
+        evaluate_series_cadence_health, export_change_mask_geotiff, export_change_zones_geojson,
+        export_series_csv, guard_coregisterable_pair, normalize_raster_change, AlignedRasterGrid,
+        AlignmentGuardConfig, AlignmentGuardProof, AlignmentRefusalReason, ChangeEvent,
+        ChangeEventConfig, ChangeEventDerivationInput, ChangeEventDirection, ChangeEventReasonCode,
+        ChangeMissionApproval, ChangeMissionDispatchState, ChangeMissionProposalKind,
+        ChangeReproducibilityRequest, ChangeSourcePair, ChangeZoneExportFeature, ChangeZonePolygon,
+        ClosedLoopChangeHookConfig, FleetCarbonConsumerEvaluationRequest, ForecastGapFillRequest,
+        GeoExtent, MetricDefinition, MetricKind, NormalizedChangeOutcome,
+        NormalizedRasterChangeConfig, RasterAlignmentConfig, RasterAlignmentEvidence,
+        RasterChangeConfig, RasterChangeNormalizationMethod, RasterChangeResult, RasterResolution,
+        RasterSeriesValue, RollingBaselineConfig, ScalarConsumerEvaluationRequest,
+        ScalarConsumerMetricRegistration, ScalarConsumerPoint, SeasonalComparisonConfig,
+        SeasonalComparisonTarget, SeriesCadenceHealthConfig, SeriesFreshnessState, SeriesPoint,
+        SeriesProductIngest, SeriesQuery, SeriesValue, SyntheticSeriesMethod, TimeRange,
+        TimeSeriesEngine, TimeSeriesError, TimeSeriesStore, TrendDirection, ZonalTrendConfig,
+        ZonalTrendTarget,
     };
 
     #[test]
@@ -2503,6 +3517,65 @@ mod tests {
     }
 
     #[test]
+    fn series_cadence_health_reports_freshness_and_gaps() {
+        let points = vec![
+            scalar_point("field:alpha", "ndvi_mean", "2026-06-01T10:00:00Z", 0.62),
+            scalar_point("field:alpha", "ndvi_mean", "2026-06-03T10:00:00Z", 0.58),
+            scalar_point("field:alpha", "ndvi_mean", "2026-06-04T10:00:00Z", 0.57),
+        ];
+
+        let health = evaluate_series_cadence_health(
+            &points,
+            "field:alpha".to_string(),
+            "ndvi_mean".to_string(),
+            "2026-06-05T10:00:00Z".to_string(),
+            cadence_config(),
+        )
+        .expect("cadence health should evaluate");
+
+        assert_eq!(health.state, SeriesFreshnessState::Fresh);
+        assert_eq!(health.last_seen.as_deref(), Some("2026-06-04T10:00:00Z"));
+        assert_eq!(health.age_days, Some(1));
+        assert_eq!(health.point_count, 3);
+        assert_eq!(health.gap_count, 1);
+        assert_eq!(health.gaps[0].from_t, "2026-06-01T10:00:00Z");
+        assert_eq!(health.gaps[0].to_t, "2026-06-03T10:00:00Z");
+        assert_eq!(health.gaps[0].observed_gap_days, 2);
+    }
+
+    #[test]
+    fn series_cadence_health_marks_stale_and_no_baseline() {
+        let points = vec![scalar_point(
+            "field:alpha",
+            "ndvi_mean",
+            "2026-06-01T10:00:00Z",
+            0.62,
+        )];
+        let stale = evaluate_series_cadence_health(
+            &points,
+            "field:alpha".to_string(),
+            "ndvi_mean".to_string(),
+            "2026-06-05T10:00:00Z".to_string(),
+            cadence_config(),
+        )
+        .expect("stale cadence health should evaluate");
+        assert_eq!(stale.state, SeriesFreshnessState::Stale);
+        assert_eq!(stale.age_days, Some(4));
+
+        let empty = evaluate_series_cadence_health(
+            &points,
+            "field:alpha".to_string(),
+            "soil_moisture".to_string(),
+            "2026-06-05T10:00:00Z".to_string(),
+            cadence_config(),
+        )
+        .expect("empty cadence health should evaluate");
+        assert_eq!(empty.state, SeriesFreshnessState::NoBaseline);
+        assert_eq!(empty.last_seen, None);
+        assert_eq!(empty.point_count, 0);
+    }
+
+    #[test]
     fn reusable_api_appends_queries_and_lists_metrics_with_pagination() {
         let mut engine = TimeSeriesEngine::default();
         engine
@@ -2584,6 +3657,307 @@ mod tests {
         assert!(page.no_series);
         assert!(page.points.is_empty());
         assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn scalar_consumer_integrations_trend_weather_water_drought_and_soil_points() {
+        let evaluation = evaluate_scalar_consumer_series(ScalarConsumerEvaluationRequest {
+            registrations: scalar_consumer_registrations(),
+            points: vec![
+                consumer_point(
+                    "weather",
+                    "field:alpha",
+                    "weather_temperature_c",
+                    "celsius",
+                    "2026-06-10T10:00:00Z",
+                    23.0,
+                ),
+                consumer_point(
+                    "water",
+                    "field:alpha",
+                    "water_balance_mm",
+                    "millimeter",
+                    "2026-06-10T10:00:00Z",
+                    -12.0,
+                ),
+                consumer_point(
+                    "drought",
+                    "field:alpha",
+                    "drought_spi",
+                    "index",
+                    "2026-06-10T10:00:00Z",
+                    -0.7,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-01T10:00:00Z",
+                    32.0,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-08T10:00:00Z",
+                    28.0,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-15T10:00:00Z",
+                    21.0,
+                ),
+            ],
+            target: ZonalTrendTarget {
+                entity_ref: "field:alpha:zone:NE".to_string(),
+                metric: "soil_moisture_percent".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32614".to_string(),
+                range: TimeRange::default(),
+            },
+            trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            baseline_config: RollingBaselineConfig {
+                window_points: 2,
+                anomaly_band: 5.0,
+            },
+        })
+        .expect("scalar consumers should evaluate on shared engine");
+
+        assert_eq!(evaluation.registered_metric_count, 4);
+        assert_eq!(evaluation.appended_point_count, 6);
+        assert_eq!(evaluation.trend.direction, TrendDirection::Decreasing);
+        assert!(evaluation.trend.slope_per_day < 0.0);
+        assert_eq!(evaluation.baseline.zone_ref, "zone:NE");
+        assert!(evaluation.baseline.anomaly);
+        assert!((evaluation.baseline.delta_from_baseline - -9.0).abs() < 0.000001);
+        assert!(evaluation
+            .evidence_refs
+            .contains(&"soil_iot:soil_moisture_percent:2026-06-15T10:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn scalar_consumer_incompatible_unit_is_refused() {
+        let error = evaluate_scalar_consumer_series(ScalarConsumerEvaluationRequest {
+            registrations: scalar_consumer_registrations(),
+            points: vec![
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "fraction",
+                    "2026-06-01T10:00:00Z",
+                    0.32,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-08T10:00:00Z",
+                    28.0,
+                ),
+                consumer_point(
+                    "soil_iot",
+                    "field:alpha:zone:NE",
+                    "soil_moisture_percent",
+                    "percent",
+                    "2026-06-15T10:00:00Z",
+                    21.0,
+                ),
+            ],
+            target: ZonalTrendTarget {
+                entity_ref: "field:alpha:zone:NE".to_string(),
+                metric: "soil_moisture_percent".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32614".to_string(),
+                range: TimeRange::default(),
+            },
+            trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            baseline_config: RollingBaselineConfig {
+                window_points: 2,
+                anomaly_band: 5.0,
+            },
+        })
+        .expect_err("unit mismatch should be refused");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::MetricUnitMismatch {
+                metric: "soil_moisture_percent".to_string(),
+                expected_unit: "percent".to_string(),
+                actual_unit: "fraction".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn fleet_health_and_carbon_consumers_reuse_shared_trend_and_seasonal_logic() {
+        let evaluation = evaluate_fleet_carbon_consumers(FleetCarbonConsumerEvaluationRequest {
+            registrations: fleet_carbon_consumer_registrations(),
+            points: vec![
+                consumer_point(
+                    "fleet_health",
+                    "drone:hawk-7:motor:left-front",
+                    "remaining_useful_life_hours",
+                    "hour",
+                    "2026-06-01T10:00:00Z",
+                    120.0,
+                ),
+                consumer_point(
+                    "fleet_health",
+                    "drone:hawk-7:motor:left-front",
+                    "remaining_useful_life_hours",
+                    "hour",
+                    "2026-06-08T10:00:00Z",
+                    98.0,
+                ),
+                consumer_point(
+                    "fleet_health",
+                    "drone:hawk-7:motor:left-front",
+                    "remaining_useful_life_hours",
+                    "hour",
+                    "2026-06-15T10:00:00Z",
+                    70.0,
+                ),
+                consumer_point(
+                    "carbon",
+                    "field:alpha:zone:NE",
+                    "carbon_stock_tonnes_per_ha",
+                    "tonne_per_hectare",
+                    "2024-06-14T10:00:00Z",
+                    46.0,
+                ),
+                consumer_point(
+                    "carbon",
+                    "field:alpha:zone:NE",
+                    "carbon_stock_tonnes_per_ha",
+                    "tonne_per_hectare",
+                    "2025-06-15T10:00:00Z",
+                    50.0,
+                ),
+                consumer_point(
+                    "carbon",
+                    "field:alpha:zone:NE",
+                    "carbon_stock_tonnes_per_ha",
+                    "tonne_per_hectare",
+                    "2026-06-15T10:00:00Z",
+                    56.0,
+                ),
+            ],
+            fleet_target: fleet_rul_target(),
+            fleet_trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            fleet_baseline_config: RollingBaselineConfig {
+                window_points: 2,
+                anomaly_band: 20.0,
+            },
+            carbon_target: SeasonalComparisonTarget {
+                entity_ref: "field:alpha:zone:NE".to_string(),
+                metric: "carbon_stock_tonnes_per_ha".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32614".to_string(),
+                current_t: "2026-06-15T10:00:00Z".to_string(),
+            },
+            carbon_config: SeasonalComparisonConfig {
+                min_seasonal_points: 2,
+                day_of_year_tolerance: 1,
+            },
+        })
+        .expect("fleet and carbon consumers should evaluate on shared engine");
+
+        assert_eq!(evaluation.registered_metric_count, 2);
+        assert_eq!(evaluation.appended_point_count, 6);
+        assert_eq!(
+            evaluation.fleet_rul_trend.direction,
+            TrendDirection::Decreasing
+        );
+        assert!(evaluation.fleet_rul_trend.slope_per_day < 0.0);
+        assert!(evaluation.fleet_anomaly.anomaly);
+        assert!((evaluation.fleet_anomaly.delta_from_baseline - -39.0).abs() < 0.000001);
+        assert_eq!(evaluation.carbon_seasonal_change.seasonal_points.len(), 2);
+        assert!(
+            (evaluation
+                .carbon_seasonal_change
+                .delta_from_seasonal_baseline
+                - 8.0)
+                .abs()
+                < 0.000001
+        );
+        assert!(evaluation.evidence_refs.contains(
+            &"fleet_health:remaining_useful_life_hours:2026-06-15T10:00:00Z".to_string()
+        ));
+        assert!(evaluation
+            .evidence_refs
+            .contains(&"carbon:carbon_stock_tonnes_per_ha:2026-06-15T10:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn fleet_carbon_consumers_refuse_insufficient_fleet_history() {
+        let error = evaluate_fleet_carbon_consumers(FleetCarbonConsumerEvaluationRequest {
+            registrations: fleet_carbon_consumer_registrations(),
+            points: vec![
+                consumer_point(
+                    "fleet_health",
+                    "drone:hawk-7:motor:left-front",
+                    "remaining_useful_life_hours",
+                    "hour",
+                    "2026-06-15T10:00:00Z",
+                    70.0,
+                ),
+                consumer_point(
+                    "carbon",
+                    "field:alpha:zone:NE",
+                    "carbon_stock_tonnes_per_ha",
+                    "tonne_per_hectare",
+                    "2026-06-15T10:00:00Z",
+                    56.0,
+                ),
+            ],
+            fleet_target: fleet_rul_target(),
+            fleet_trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            fleet_baseline_config: RollingBaselineConfig {
+                window_points: 2,
+                anomaly_band: 20.0,
+            },
+            carbon_target: SeasonalComparisonTarget {
+                entity_ref: "field:alpha:zone:NE".to_string(),
+                metric: "carbon_stock_tonnes_per_ha".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32614".to_string(),
+                current_t: "2026-06-15T10:00:00Z".to_string(),
+            },
+            carbon_config: SeasonalComparisonConfig {
+                min_seasonal_points: 2,
+                day_of_year_tolerance: 1,
+            },
+        })
+        .expect_err("insufficient fleet history should be refused");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::InsufficientTrendHistory {
+                entity_ref: "drone:hawk-7:motor:left-front".to_string(),
+                metric: "remaining_useful_life_hours".to_string(),
+                observed_points: 1,
+                required_points: 3
+            }
+        );
     }
 
     #[test]
@@ -2877,6 +4251,113 @@ mod tests {
     }
 
     #[test]
+    fn forecast_and_gap_fill_return_synthetic_points_with_uncertainty() {
+        let result = build_forecast_gap_fill(ForecastGapFillRequest {
+            metric: metric_definition("ndvi_mean", "index", MetricKind::Scalar),
+            observed_points: vec![
+                scalar_point_with_unit(
+                    "field:alpha",
+                    "ndvi_mean",
+                    "index",
+                    "2026-06-10T10:00:00Z",
+                    0.60,
+                ),
+                scalar_point_with_unit(
+                    "field:alpha",
+                    "ndvi_mean",
+                    "index",
+                    "2026-06-12T10:00:00Z",
+                    0.70,
+                ),
+                scalar_point_with_unit(
+                    "field:alpha",
+                    "ndvi_mean",
+                    "index",
+                    "2026-06-14T10:00:00Z",
+                    0.80,
+                ),
+            ],
+            target: ZonalTrendTarget {
+                entity_ref: "field:alpha".to_string(),
+                metric: "ndvi_mean".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32610".to_string(),
+                range: TimeRange::default(),
+            },
+            trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            forecast_timestamps: vec!["2026-06-16T10:00:00Z".to_string()],
+            gap_fill_timestamps: vec!["2026-06-11T10:00:00Z".to_string()],
+            uncertainty_band: 0.08,
+        })
+        .expect("enough observations should produce synthetic outputs");
+
+        assert_eq!(result.trend.direction, TrendDirection::Increasing);
+        assert_eq!(result.forecast_points.len(), 1);
+        let forecast = &result.forecast_points[0];
+        assert!(forecast.synthetic);
+        assert_eq!(forecast.method, SyntheticSeriesMethod::TrendProjection);
+        assert_eq!(forecast.uncertainty_band, 0.08);
+        assert!((forecast.value - 0.90).abs() < 0.000001);
+        assert_eq!(forecast.evidence_refs.len(), 3);
+
+        assert_eq!(result.gap_fill_points.len(), 1);
+        let gap_fill = &result.gap_fill_points[0];
+        assert!(gap_fill.synthetic);
+        assert_eq!(gap_fill.method, SyntheticSeriesMethod::LinearInterpolation);
+        assert_eq!(gap_fill.uncertainty_band, 0.08);
+        assert!((gap_fill.value - 0.65).abs() < 0.000001);
+        assert_eq!(
+            gap_fill.evidence_refs,
+            vec![
+                "source:field:alpha:ndvi_mean:2026-06-10T10:00:00Z",
+                "source:field:alpha:ndvi_mean:2026-06-12T10:00:00Z"
+            ]
+        );
+    }
+
+    #[test]
+    fn forecast_refuses_insufficient_history_without_synthetic_points() {
+        let error = build_forecast_gap_fill(ForecastGapFillRequest {
+            metric: metric_definition("ndvi_mean", "index", MetricKind::Scalar),
+            observed_points: vec![scalar_point_with_unit(
+                "field:alpha",
+                "ndvi_mean",
+                "index",
+                "2026-06-10T10:00:00Z",
+                0.60,
+            )],
+            target: ZonalTrendTarget {
+                entity_ref: "field:alpha".to_string(),
+                metric: "ndvi_mean".to_string(),
+                zone_ref: "zone:NE".to_string(),
+                zone_crs: "EPSG:32610".to_string(),
+                range: TimeRange::default(),
+            },
+            trend_config: ZonalTrendConfig {
+                min_points: 3,
+                flat_slope_epsilon: 0.001,
+            },
+            forecast_timestamps: vec!["2026-06-16T10:00:00Z".to_string()],
+            gap_fill_timestamps: Vec::new(),
+            uncertainty_band: 0.08,
+        })
+        .expect_err("one observation cannot produce a forecast");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::InsufficientTrendHistory {
+                entity_ref: "field:alpha".to_string(),
+                metric: "ndvi_mean".to_string(),
+                observed_points: 1,
+                required_points: 3
+            }
+        );
+    }
+
+    #[test]
     fn ranked_change_events_cite_mask_trend_zone_and_baseline_evidence() {
         let engine = seeded_baseline_engine();
         let trend = engine
@@ -2982,6 +4463,132 @@ mod tests {
         .expect("change event derivation should run");
 
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn closed_loop_hook_drafts_approval_gated_refly_from_ranked_change_event() {
+        let events = sample_ranked_change_events();
+        let result = draft_closed_loop_change_proposals(
+            events,
+            ClosedLoopChangeHookConfig {
+                severity_threshold: 0.10,
+                proposal_kind: ChangeMissionProposalKind::TargetedRefly,
+                approval: None,
+            },
+        )
+        .expect("proposal hook should run");
+
+        assert_eq!(result.proposals.len(), 1);
+        assert!(result.dispatched_mission_refs.is_empty());
+        let proposal = &result.proposals[0];
+        assert_eq!(proposal.zone_ref, "zone:NE");
+        assert_eq!(proposal.metric, "ndvi_mean");
+        assert_eq!(
+            proposal.proposal_kind,
+            ChangeMissionProposalKind::TargetedRefly
+        );
+        assert!(proposal.approval_required);
+        assert!(!proposal.approved);
+        assert_eq!(
+            proposal.dispatch_state,
+            ChangeMissionDispatchState::PendingApproval
+        );
+        assert!(!proposal.dispatched);
+        assert!(proposal
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == "alignment:field-alpha:ndvi"));
+    }
+
+    #[test]
+    fn closed_loop_hook_never_dispatches_without_or_with_approval() {
+        let without_approval = draft_closed_loop_change_proposals(
+            sample_ranked_change_events(),
+            ClosedLoopChangeHookConfig {
+                severity_threshold: 0.10,
+                proposal_kind: ChangeMissionProposalKind::Treatment,
+                approval: None,
+            },
+        )
+        .expect("proposal hook should run");
+        assert!(without_approval.dispatched_mission_refs.is_empty());
+        assert!(!without_approval.proposals[0].dispatched);
+
+        let with_approval = draft_closed_loop_change_proposals(
+            sample_ranked_change_events(),
+            ClosedLoopChangeHookConfig {
+                severity_threshold: 0.10,
+                proposal_kind: ChangeMissionProposalKind::Treatment,
+                approval: Some(ChangeMissionApproval {
+                    approved_by: "operator:casey".to_string(),
+                    approved_at: "2026-06-15T12:00:00Z".to_string(),
+                }),
+            },
+        )
+        .expect("proposal hook should run");
+
+        assert!(with_approval.dispatched_mission_refs.is_empty());
+        assert!(with_approval.proposals[0].approved);
+        assert_eq!(
+            with_approval.proposals[0].dispatch_state,
+            ChangeMissionDispatchState::ReadyForDispatch
+        );
+        assert!(!with_approval.proposals[0].dispatched);
+    }
+
+    #[test]
+    fn change_reproducibility_report_hashes_identical_reruns() {
+        let request = change_reproducibility_request();
+        let first = build_change_reproducibility_report(request.clone())
+            .expect("completed change job should produce reproducibility report");
+        let second = build_change_reproducibility_report(request)
+            .expect("same completed change job should hash identically");
+
+        assert_eq!(first.schema_version, "timeseries.change_reproducibility.v1");
+        assert_eq!(first.output_hash, second.output_hash);
+        assert!(first.output_hash.starts_with("sha256:"));
+        assert_eq!(
+            first.source_pair.earlier_source_ref,
+            "source:field:alpha:ndvi_raster:2026-06-10T10:00:00Z"
+        );
+        assert_eq!(
+            first.source_pair.later_source_ref,
+            "source:field:alpha:ndvi_raster:2026-06-12T10:00:00Z"
+        );
+        assert_eq!(first.alignment_ref, "alignment:field-alpha:ndvi");
+        assert_eq!(
+            first.alignment_proof_ref,
+            "alignment-proof:field-alpha:ndvi"
+        );
+        assert_eq!(first.change_method_version, "delta-mask-v1");
+        assert_eq!(first.absolute_threshold, 0.10);
+        assert_eq!(
+            first.normalized_method_version.as_deref(),
+            Some("normalized-change-v1")
+        );
+        assert_eq!(first.event_magnitude_threshold, Some(0.10));
+        assert!(first
+            .evidence_refs
+            .contains(&"change:field-alpha:delta".to_string()));
+        assert!(first
+            .evidence_refs
+            .contains(&"change:field-alpha:normalized".to_string()));
+    }
+
+    #[test]
+    fn change_reproducibility_report_refuses_missing_source_product() {
+        let mut request = change_reproducibility_request();
+        request.source_pair.earlier_source_ref = " ".to_string();
+
+        let error = build_change_reproducibility_report(request)
+            .expect_err("missing source product should block reproducibility");
+
+        assert_eq!(
+            error,
+            TimeSeriesError::MissingChangeSourceProduct {
+                source_ref: "earlier_source_ref".to_string()
+            }
+        );
     }
 
     #[test]
@@ -3458,6 +5065,129 @@ mod tests {
     }
 
     #[test]
+    fn normalized_change_percent_excludes_nodata_and_zero_denominators() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier_grid = aligned_grid_values(
+            &evidence,
+            &evidence.aligned_earlier_ref,
+            vec![Some(0.25), Some(0.0), Some(0.75), Some(1.0)],
+        );
+        let later_grid = aligned_grid_values(
+            &evidence,
+            &evidence.aligned_later_ref,
+            vec![Some(0.50), Some(0.10), None, Some(0.50)],
+        );
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier_grid,
+            &later_grid,
+            change_config(0.10),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("aligned rasters should produce change outputs");
+
+        let normalized = normalize_raster_change(
+            &change,
+            &earlier_grid,
+            normalized_change_config(RasterChangeNormalizationMethod::PercentOfEarlier, None),
+            "change:field-alpha:normalized".to_string(),
+        )
+        .expect("percent normalization should run");
+
+        assert_eq!(
+            normalized.method,
+            RasterChangeNormalizationMethod::PercentOfEarlier
+        );
+        assert_eq!(normalized.outcome, NormalizedChangeOutcome::ValidChange);
+        assert_eq!(normalized.valid_cell_count, 2);
+        assert_eq!(normalized.excluded_cell_count, 2);
+        assert_eq!(
+            normalized.normalized_values,
+            vec![Some(1.0), None, None, Some(-0.5)]
+        );
+        assert_eq!(normalized.crs, change.crs);
+        assert_eq!(normalized.extent, change.extent);
+        assert!(normalized
+            .evidence_refs
+            .contains(&"change:field-alpha:delta".to_string()));
+    }
+
+    #[test]
+    fn normalized_change_zscore_records_variance_method() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier_grid = aligned_grid(&evidence, &evidence.aligned_earlier_ref, [0.70; 4]);
+        let later_grid = aligned_grid(
+            &evidence,
+            &evidence.aligned_later_ref,
+            [0.45, 0.48, 0.70, 0.70],
+        );
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier_grid,
+            &later_grid,
+            change_config(0.10),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("aligned rasters should produce change outputs");
+
+        let normalized = normalize_raster_change(
+            &change,
+            &earlier_grid,
+            normalized_change_config(RasterChangeNormalizationMethod::ZScore, Some(0.04)),
+            "change:field-alpha:zscore".to_string(),
+        )
+        .expect("z-score normalization should run");
+
+        assert_eq!(normalized.method, RasterChangeNormalizationMethod::ZScore);
+        assert_eq!(normalized.variance, Some(0.04));
+        assert_eq!(normalized.valid_cell_count, 4);
+        assert!((normalized.normalized_values[0].unwrap() + 1.25).abs() < 0.000001);
+        assert!((normalized.normalized_values[1].unwrap() + 1.10).abs() < 0.000001);
+    }
+
+    #[test]
+    fn normalized_change_all_nodata_returns_no_valid_change() {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier_grid = aligned_grid_values(
+            &evidence,
+            &evidence.aligned_earlier_ref,
+            vec![None, None, None, None],
+        );
+        let later_grid = aligned_grid_values(
+            &evidence,
+            &evidence.aligned_later_ref,
+            vec![None, None, None, None],
+        );
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier_grid,
+            &later_grid,
+            change_config(0.10),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("all-nodata aligned rasters should produce empty change outputs");
+
+        let normalized = normalize_raster_change(
+            &change,
+            &earlier_grid,
+            normalized_change_config(RasterChangeNormalizationMethod::PercentOfEarlier, None),
+            "change:field-alpha:normalized".to_string(),
+        )
+        .expect("all-nodata normalization should return an explicit outcome");
+
+        assert_eq!(normalized.outcome, NormalizedChangeOutcome::NoValidChange);
+        assert_eq!(normalized.valid_cell_count, 0);
+        assert_eq!(normalized.excluded_cell_count, 4);
+        assert_eq!(normalized.normalized_values, vec![None, None, None, None]);
+    }
+
+    #[test]
     fn series_csv_export_carries_entity_metric_time_value_and_empty_header() {
         let export = export_series_csv(&[
             scalar_point("field:alpha", "ndvi_mean", "2026-06-10T10:00:00Z", 0.68),
@@ -3616,6 +5346,13 @@ mod tests {
         scalar_point_with_unit(entity_ref, metric, "index", t, value)
     }
 
+    fn cadence_config() -> SeriesCadenceHealthConfig {
+        SeriesCadenceHealthConfig {
+            expected_cadence_days: 1,
+            stale_after_days: 2,
+        }
+    }
+
     fn scalar_point_with_unit(
         entity_ref: &str,
         metric: &str,
@@ -3724,6 +5461,85 @@ mod tests {
         .expect("sample drop should produce change result")
     }
 
+    fn change_reproducibility_request() -> ChangeReproducibilityRequest {
+        let (evidence, proof) = aligned_pair_evidence_and_proof();
+        let earlier = aligned_grid(&evidence, &evidence.aligned_earlier_ref, [0.70; 4]);
+        let later = aligned_grid(
+            &evidence,
+            &evidence.aligned_later_ref,
+            [0.45, 0.48, 0.70, 0.70],
+        );
+        let change = compute_aligned_raster_change(
+            &proof,
+            &evidence,
+            &earlier,
+            &later,
+            change_config(0.10),
+            "change:field-alpha:delta".to_string(),
+            "change:field-alpha:mask".to_string(),
+        )
+        .expect("sample drop should produce change result");
+        let normalized = normalize_raster_change(
+            &change,
+            &earlier,
+            normalized_change_config(RasterChangeNormalizationMethod::PercentOfEarlier, None),
+            "change:field-alpha:normalized".to_string(),
+        )
+        .expect("sample drop should normalize");
+        let engine = seeded_baseline_engine();
+        let trend = engine
+            .compute_zonal_trend(
+                trend_target_2026(),
+                ZonalTrendConfig {
+                    min_points: 3,
+                    flat_slope_epsilon: 0.001,
+                },
+            )
+            .expect("trend should compute");
+        let baseline = engine
+            .compute_rolling_baseline(
+                trend_target_2026(),
+                RollingBaselineConfig {
+                    window_points: 2,
+                    anomaly_band: 0.10,
+                },
+            )
+            .expect("baseline should compute");
+        let event_config = ChangeEventConfig {
+            magnitude_threshold: 0.10,
+            min_changed_cells: 1,
+        };
+        let events = derive_ranked_change_events(
+            vec![ChangeEventDerivationInput {
+                change: change.clone(),
+                trend,
+                baseline,
+            }],
+            event_config,
+        )
+        .expect("change event derivation should run");
+
+        ChangeReproducibilityRequest {
+            source_pair: ChangeSourcePair {
+                earlier_source_ref: evidence.earlier_source_ref.clone(),
+                later_source_ref: evidence.later_source_ref.clone(),
+                earlier_raster_ref: evidence.earlier_raster_ref.clone(),
+                later_raster_ref: evidence.later_raster_ref.clone(),
+            },
+            alignment_evidence: evidence,
+            alignment_proof: proof,
+            change,
+            normalized_change: Some(normalized),
+            events,
+            change_config: change_config(0.10),
+            normalized_config: Some(normalized_change_config(
+                RasterChangeNormalizationMethod::PercentOfEarlier,
+                None,
+            )),
+            event_config: Some(event_config),
+        }
+    }
+
     fn sample_change_event() -> ChangeEvent {
         ChangeEvent {
             zone_ref: "zone-ne".to_string(),
@@ -3739,6 +5555,100 @@ mod tests {
                 "change:field-alpha:mask".to_string(),
             ],
             summary: "ndvi_mean dropped 0.18 in zone-ne since 2026-06-01T10:00:00Z".to_string(),
+        }
+    }
+
+    fn scalar_consumer_registrations() -> Vec<ScalarConsumerMetricRegistration> {
+        vec![
+            consumer_registration("weather", "weather_temperature_c", "celsius"),
+            consumer_registration("water", "water_balance_mm", "millimeter"),
+            consumer_registration("drought", "drought_spi", "index"),
+            consumer_registration("soil_iot", "soil_moisture_percent", "percent"),
+        ]
+    }
+
+    fn fleet_carbon_consumer_registrations() -> Vec<ScalarConsumerMetricRegistration> {
+        vec![
+            consumer_registration("fleet_health", "remaining_useful_life_hours", "hour"),
+            consumer_registration("carbon", "carbon_stock_tonnes_per_ha", "tonne_per_hectare"),
+        ]
+    }
+
+    fn fleet_rul_target() -> ZonalTrendTarget {
+        ZonalTrendTarget {
+            entity_ref: "drone:hawk-7:motor:left-front".to_string(),
+            metric: "remaining_useful_life_hours".to_string(),
+            zone_ref: "component:left-front-motor".to_string(),
+            zone_crs: "asset-local".to_string(),
+            range: TimeRange::default(),
+        }
+    }
+
+    fn sample_ranked_change_events() -> Vec<ChangeEvent> {
+        let engine = seeded_baseline_engine();
+        let trend = engine
+            .compute_zonal_trend(
+                trend_target_2026(),
+                ZonalTrendConfig {
+                    min_points: 3,
+                    flat_slope_epsilon: 0.001,
+                },
+            )
+            .expect("trend should compute");
+        let baseline = engine
+            .compute_rolling_baseline(
+                trend_target_2026(),
+                RollingBaselineConfig {
+                    window_points: 2,
+                    anomaly_band: 0.10,
+                },
+            )
+            .expect("baseline should compute");
+
+        derive_ranked_change_events(
+            vec![ChangeEventDerivationInput {
+                change: sample_drop_change_result(),
+                trend,
+                baseline,
+            }],
+            ChangeEventConfig {
+                magnitude_threshold: 0.10,
+                min_changed_cells: 1,
+            },
+        )
+        .expect("change event derivation should run")
+    }
+
+    fn consumer_registration(
+        consumer_domain: &str,
+        metric: &str,
+        unit: &str,
+    ) -> ScalarConsumerMetricRegistration {
+        ScalarConsumerMetricRegistration {
+            consumer_domain: consumer_domain.to_string(),
+            metric: metric.to_string(),
+            unit: unit.to_string(),
+            expected_cadence: "per_observation".to_string(),
+        }
+    }
+
+    fn consumer_point(
+        consumer_domain: &str,
+        entity_ref: &str,
+        metric: &str,
+        unit: &str,
+        t: &str,
+        value: f64,
+    ) -> ScalarConsumerPoint {
+        ScalarConsumerPoint {
+            consumer_domain: consumer_domain.to_string(),
+            entity_ref: entity_ref.to_string(),
+            metric: metric.to_string(),
+            unit: unit.to_string(),
+            t: t.to_string(),
+            value,
+            source_ref: format!("{consumer_domain}:{metric}:{t}"),
+            created_at: t.to_string(),
         }
     }
 
@@ -3853,6 +5763,14 @@ mod tests {
         raster_ref: &str,
         values: [f64; 4],
     ) -> AlignedRasterGrid {
+        aligned_grid_values(evidence, raster_ref, values.into_iter().map(Some).collect())
+    }
+
+    fn aligned_grid_values(
+        evidence: &RasterAlignmentEvidence,
+        raster_ref: &str,
+        values: Vec<Option<f64>>,
+    ) -> AlignedRasterGrid {
         AlignedRasterGrid {
             raster_ref: raster_ref.to_string(),
             alignment_ref: evidence.alignment_ref.clone(),
@@ -3861,7 +5779,7 @@ mod tests {
             resolution: RasterResolution { x: 1.0, y: 1.0 },
             grid_columns: evidence.grid_columns,
             grid_rows: evidence.grid_rows,
-            values: values.into_iter().map(Some).collect(),
+            values,
         }
     }
 
@@ -3869,6 +5787,17 @@ mod tests {
         RasterChangeConfig {
             absolute_threshold,
             method_version: "delta-mask-v1".to_string(),
+        }
+    }
+
+    fn normalized_change_config(
+        method: RasterChangeNormalizationMethod,
+        variance: Option<f64>,
+    ) -> NormalizedRasterChangeConfig {
+        NormalizedRasterChangeConfig {
+            method,
+            variance,
+            method_version: "normalized-change-v1".to_string(),
         }
     }
 }

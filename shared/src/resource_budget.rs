@@ -31,6 +31,7 @@ pub enum EdgeResourceAction {
     Throttle,
     Shed,
     BackpressureWrites,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +72,78 @@ pub struct EdgeResourceEvaluation {
     pub alerts: Vec<FleetAlertRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeThermalEnergyKind {
+    Thermal,
+    Energy,
+}
+
+impl EdgeThermalEnergyKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            EdgeThermalEnergyKind::Thermal => "thermal",
+            EdgeThermalEnergyKind::Energy => "energy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeThermalEnergyBudget {
+    pub node_id: String,
+    pub max_temperature_c: f64,
+    pub min_battery_percent: f64,
+    pub throttle_at_fraction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeThermalEnergySnapshot {
+    pub node_id: String,
+    #[serde(default)]
+    pub temperature_c: Option<f64>,
+    #[serde(default)]
+    pub battery_remaining_percent: Option<f64>,
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeThermalEnergyControl {
+    pub kind: EdgeThermalEnergyKind,
+    pub action: EdgeResourceAction,
+    pub metric_name: String,
+    pub observed_value: Option<f64>,
+    pub threshold_value: Option<f64>,
+    pub severity: Option<FleetAlertSeverity>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeThermalEnergyHeartbeatState {
+    pub thermal_state: EdgeResourceAction,
+    pub energy_state: EdgeResourceAction,
+    pub thermal_available: bool,
+    pub energy_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeThermalEnergyEvaluation {
+    pub node_id: String,
+    pub at: DateTime<Utc>,
+    pub controls: Vec<EdgeThermalEnergyControl>,
+    pub heartbeat_state: EdgeThermalEnergyHeartbeatState,
+    pub metrics: Vec<FleetMetricSample>,
+    pub alerts: Vec<FleetAlertRecord>,
+}
+
+impl EdgeThermalEnergyEvaluation {
+    pub fn control_for(&self, kind: EdgeThermalEnergyKind) -> &EdgeThermalEnergyControl {
+        self.controls
+            .iter()
+            .find(|control| control.kind == kind)
+            .expect("thermal energy evaluation should include every control")
+    }
+}
+
 impl EdgeResourceEvaluation {
     pub fn control_for(&self, resource: EdgeResourceKind) -> &EdgeResourceControl {
         self.controls
@@ -94,10 +167,92 @@ pub enum EdgeResourceBudgetError {
     InvalidDiskLimit,
     #[error("edge resource budget throttle_at_fraction must be > 0 and <= 1")]
     InvalidThrottleFraction,
+    #[error("edge thermal budget max_temperature_c must be positive and finite")]
+    InvalidThermalLimit,
+    #[error("edge energy budget min_battery_percent must be finite in the range 0..=100")]
+    InvalidBatteryReserve,
     #[error("edge resource snapshot field {field} must be finite")]
     NonFiniteSnapshotValue { field: &'static str },
     #[error(transparent)]
     Observability(#[from] ObservabilityError),
+}
+
+pub fn evaluate_edge_thermal_energy_budget(
+    budget: &EdgeThermalEnergyBudget,
+    snapshot: &EdgeThermalEnergySnapshot,
+) -> Result<EdgeThermalEnergyEvaluation, EdgeResourceBudgetError> {
+    let node_id = normalize_node_id(&budget.node_id)?;
+    let snapshot_node_id = normalize_node_id(&snapshot.node_id)?;
+    if snapshot_node_id != node_id {
+        return Err(EdgeResourceBudgetError::NodeIdMismatch {
+            expected: node_id,
+            actual: snapshot_node_id,
+        });
+    }
+    validate_thermal_energy_budget(budget)?;
+    validate_thermal_energy_snapshot(snapshot)?;
+
+    let thermal_control = evaluate_optional_upper_limit(
+        EdgeThermalEnergyKind::Thermal,
+        "temperature_c",
+        snapshot.temperature_c,
+        budget.max_temperature_c,
+        budget.throttle_at_fraction,
+        "thermal budget unavailable",
+        "temperature is approaching the configured thermal budget; throttle workload",
+        "temperature exceeds the configured thermal budget; shed lower-priority workload",
+    );
+    let energy_control = evaluate_optional_lower_limit(
+        EdgeThermalEnergyKind::Energy,
+        "battery_remaining_percent",
+        snapshot.battery_remaining_percent,
+        budget.min_battery_percent,
+        budget.throttle_at_fraction,
+    );
+    let controls = vec![thermal_control, energy_control];
+
+    let context = ObservabilityContext::new(&node_id, None)?;
+    let metrics = controls
+        .iter()
+        .filter_map(|control| {
+            control.observed_value.map(|observed| {
+                thermal_energy_metric(
+                    &context,
+                    &control.metric_name,
+                    observed,
+                    snapshot.at,
+                    control.kind,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let alerts = controls
+        .iter()
+        .filter_map(|control| build_thermal_energy_alert(&node_id, control, snapshot.at))
+        .collect();
+    let heartbeat_state = EdgeThermalEnergyHeartbeatState {
+        thermal_state: controls
+            .iter()
+            .find(|control| control.kind == EdgeThermalEnergyKind::Thermal)
+            .map(|control| control.action)
+            .unwrap_or(EdgeResourceAction::Unavailable),
+        energy_state: controls
+            .iter()
+            .find(|control| control.kind == EdgeThermalEnergyKind::Energy)
+            .map(|control| control.action)
+            .unwrap_or(EdgeResourceAction::Unavailable),
+        thermal_available: snapshot.temperature_c.is_some(),
+        energy_available: snapshot.battery_remaining_percent.is_some(),
+    };
+
+    Ok(EdgeThermalEnergyEvaluation {
+        node_id,
+        at: snapshot.at,
+        controls,
+        heartbeat_state,
+        metrics,
+        alerts,
+    })
 }
 
 pub fn evaluate_edge_resource_budget(
@@ -269,6 +424,116 @@ fn evaluate_disk_free_budget(
     }
 }
 
+fn evaluate_optional_upper_limit(
+    kind: EdgeThermalEnergyKind,
+    metric_name: &str,
+    observed_value: Option<f64>,
+    max_value: f64,
+    throttle_at_fraction: f64,
+    unavailable_reason: &str,
+    throttle_reason: &str,
+    shed_reason: &str,
+) -> EdgeThermalEnergyControl {
+    let Some(observed_value) = observed_value else {
+        return unavailable_control(kind, metric_name, unavailable_reason);
+    };
+    let throttle_threshold = max_value * throttle_at_fraction;
+    if observed_value >= max_value {
+        return EdgeThermalEnergyControl {
+            kind,
+            action: EdgeResourceAction::Shed,
+            metric_name: metric_name.to_string(),
+            observed_value: Some(observed_value),
+            threshold_value: Some(max_value),
+            severity: Some(FleetAlertSeverity::Critical),
+            reason: shed_reason.to_string(),
+        };
+    }
+    if observed_value >= throttle_threshold {
+        return EdgeThermalEnergyControl {
+            kind,
+            action: EdgeResourceAction::Throttle,
+            metric_name: metric_name.to_string(),
+            observed_value: Some(observed_value),
+            threshold_value: Some(throttle_threshold),
+            severity: Some(FleetAlertSeverity::Warning),
+            reason: throttle_reason.to_string(),
+        };
+    }
+    EdgeThermalEnergyControl {
+        kind,
+        action: EdgeResourceAction::Admit,
+        metric_name: metric_name.to_string(),
+        observed_value: Some(observed_value),
+        threshold_value: Some(throttle_threshold),
+        severity: None,
+        reason: "thermal signal is within configured budget".to_string(),
+    }
+}
+
+fn evaluate_optional_lower_limit(
+    kind: EdgeThermalEnergyKind,
+    metric_name: &str,
+    observed_value: Option<f64>,
+    min_value: f64,
+    throttle_at_fraction: f64,
+) -> EdgeThermalEnergyControl {
+    let Some(observed_value) = observed_value else {
+        return unavailable_control(kind, metric_name, "energy budget unavailable");
+    };
+    let warning_threshold = min_value / throttle_at_fraction;
+    if observed_value <= min_value {
+        return EdgeThermalEnergyControl {
+            kind,
+            action: EdgeResourceAction::Shed,
+            metric_name: metric_name.to_string(),
+            observed_value: Some(observed_value),
+            threshold_value: Some(min_value),
+            severity: Some(FleetAlertSeverity::Critical),
+            reason: "battery reserve is below the configured energy budget; shed lower-priority workload"
+                .to_string(),
+        };
+    }
+    if observed_value <= warning_threshold {
+        return EdgeThermalEnergyControl {
+            kind,
+            action: EdgeResourceAction::Throttle,
+            metric_name: metric_name.to_string(),
+            observed_value: Some(observed_value),
+            threshold_value: Some(warning_threshold),
+            severity: Some(FleetAlertSeverity::Warning),
+            reason:
+                "battery reserve is approaching the configured energy budget; throttle workload"
+                    .to_string(),
+        };
+    }
+    EdgeThermalEnergyControl {
+        kind,
+        action: EdgeResourceAction::Admit,
+        metric_name: metric_name.to_string(),
+        observed_value: Some(observed_value),
+        threshold_value: Some(warning_threshold),
+        severity: None,
+        reason: "energy signal is within configured budget".to_string(),
+    }
+}
+
+fn unavailable_control(
+    kind: EdgeThermalEnergyKind,
+    metric_name: &str,
+    reason: &str,
+) -> EdgeThermalEnergyControl {
+    EdgeThermalEnergyControl {
+        kind,
+        action: EdgeResourceAction::Unavailable,
+        metric_name: metric_name.to_string(),
+        observed_value: None,
+        threshold_value: None,
+        severity: None,
+        reason: reason.to_string(),
+    }
+}
+
 fn build_budget_alert(
     node_id: &str,
     control: &EdgeResourceControl,
@@ -303,6 +568,40 @@ fn build_budget_alert(
     })
 }
 
+fn build_thermal_energy_alert(
+    node_id: &str,
+    control: &EdgeThermalEnergyControl,
+    evaluated_at: DateTime<Utc>,
+) -> Option<FleetAlertRecord> {
+    let severity = control.severity?;
+    let observed_value = control.observed_value?;
+    let threshold_value = control.threshold_value?;
+    let comparator = match control.kind {
+        EdgeThermalEnergyKind::Thermal => FleetAlertComparator::GreaterThanOrEqual,
+        EdgeThermalEnergyKind::Energy => FleetAlertComparator::LessThanOrEqual,
+    };
+
+    Some(FleetAlertRecord {
+        alert_id: format!(
+            "fleet-alert:{node_id}:thermal_energy_budget:{}",
+            control.metric_name
+        ),
+        node_id: node_id.to_string(),
+        correlation_id: None,
+        kind: FleetAlertKind::ResourceBudget,
+        severity,
+        route: FleetAlertRoute::OperatorConsole,
+        evidence: FleetAlertEvidence {
+            metric_name: control.metric_name.clone(),
+            observed_value,
+            threshold_value,
+            comparator,
+        },
+        message: control.reason.clone(),
+        evaluated_at,
+    })
+}
+
 fn budget_metric(
     context: &ObservabilityContext,
     name: &str,
@@ -314,6 +613,22 @@ fn budget_metric(
     FleetMetricSample::new(context, name, value, unit, at)?
         .with_label("category", "resource_budget")?
         .with_label("resource", resource.as_str())
+}
+
+fn thermal_energy_metric(
+    context: &ObservabilityContext,
+    name: &str,
+    value: f64,
+    at: DateTime<Utc>,
+    kind: EdgeThermalEnergyKind,
+) -> Result<FleetMetricSample, ObservabilityError> {
+    let unit = match kind {
+        EdgeThermalEnergyKind::Thermal => "celsius",
+        EdgeThermalEnergyKind::Energy => "percent",
+    };
+    FleetMetricSample::new(context, name, value, unit, at)?
+        .with_label("category", "thermal_energy_budget")?
+        .with_label("resource", kind.as_str())
 }
 
 fn validate_budget(budget: &EdgeResourceBudget) -> Result<(), EdgeResourceBudgetError> {
@@ -336,6 +651,27 @@ fn validate_budget(budget: &EdgeResourceBudget) -> Result<(), EdgeResourceBudget
     Ok(())
 }
 
+fn validate_thermal_energy_budget(
+    budget: &EdgeThermalEnergyBudget,
+) -> Result<(), EdgeResourceBudgetError> {
+    if !budget.max_temperature_c.is_finite() || budget.max_temperature_c <= 0.0 {
+        return Err(EdgeResourceBudgetError::InvalidThermalLimit);
+    }
+    if !budget.min_battery_percent.is_finite()
+        || budget.min_battery_percent < 0.0
+        || budget.min_battery_percent > 100.0
+    {
+        return Err(EdgeResourceBudgetError::InvalidBatteryReserve);
+    }
+    if !budget.throttle_at_fraction.is_finite()
+        || budget.throttle_at_fraction <= 0.0
+        || budget.throttle_at_fraction > 1.0
+    {
+        return Err(EdgeResourceBudgetError::InvalidThrottleFraction);
+    }
+    Ok(())
+}
+
 fn validate_snapshot(snapshot: &EdgeResourceSnapshot) -> Result<(), EdgeResourceBudgetError> {
     if !snapshot.cpu_usage_percent.is_finite() {
         return Err(EdgeResourceBudgetError::NonFiniteSnapshotValue {
@@ -345,6 +681,28 @@ fn validate_snapshot(snapshot: &EdgeResourceSnapshot) -> Result<(), EdgeResource
     if !snapshot.disk_free_gb.is_finite() {
         return Err(EdgeResourceBudgetError::NonFiniteSnapshotValue {
             field: "disk_free_gb",
+        });
+    }
+    Ok(())
+}
+
+fn validate_thermal_energy_snapshot(
+    snapshot: &EdgeThermalEnergySnapshot,
+) -> Result<(), EdgeResourceBudgetError> {
+    if snapshot
+        .temperature_c
+        .is_some_and(|value| !value.is_finite())
+    {
+        return Err(EdgeResourceBudgetError::NonFiniteSnapshotValue {
+            field: "temperature_c",
+        });
+    }
+    if snapshot
+        .battery_remaining_percent
+        .is_some_and(|value| !value.is_finite())
+    {
+        return Err(EdgeResourceBudgetError::NonFiniteSnapshotValue {
+            field: "battery_remaining_percent",
         });
     }
     Ok(())
@@ -370,8 +728,9 @@ fn disk_pressure_ratio(disk_free_gb: f64, min_disk_free_gb: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluate_edge_resource_budget, EdgeResourceAction, EdgeResourceBudget, EdgeResourceKind,
-        EdgeResourceSnapshot,
+        evaluate_edge_resource_budget, evaluate_edge_thermal_energy_budget, EdgeResourceAction,
+        EdgeResourceBudget, EdgeResourceKind, EdgeResourceSnapshot, EdgeThermalEnergyBudget,
+        EdgeThermalEnergyKind, EdgeThermalEnergySnapshot,
     };
     use crate::fleet_alerts::{FleetAlertKind, FleetAlertSeverity};
 
@@ -440,6 +799,88 @@ mod tests {
         assert_eq!(evaluation.alerts[0].severity, FleetAlertSeverity::Critical);
         assert_eq!(evaluation.alerts[0].evidence.observed_value, 5.5);
         assert_eq!(evaluation.alerts[0].evidence.threshold_value, 6.0);
+    }
+
+    #[test]
+    fn edge_thermal_energy_budget_throttles_on_thermal_signal_and_reports_heartbeat_state() {
+        let budget = EdgeThermalEnergyBudget {
+            node_id: "edge-jetson-thermal".to_string(),
+            max_temperature_c: 80.0,
+            min_battery_percent: 25.0,
+            throttle_at_fraction: 0.90,
+        };
+        let snapshot = EdgeThermalEnergySnapshot {
+            node_id: "edge-jetson-thermal".to_string(),
+            temperature_c: Some(73.0),
+            battery_remaining_percent: Some(64.0),
+            at: dt("2026-06-15T00:15:00Z"),
+        };
+
+        let evaluation = evaluate_edge_thermal_energy_budget(&budget, &snapshot)
+            .expect("thermal energy budget should evaluate");
+
+        let thermal = evaluation.control_for(EdgeThermalEnergyKind::Thermal);
+        assert_eq!(thermal.action, EdgeResourceAction::Throttle);
+        assert_eq!(thermal.metric_name, "temperature_c");
+        assert_eq!(thermal.observed_value, Some(73.0));
+        assert_eq!(thermal.threshold_value, Some(72.0));
+        assert_eq!(thermal.severity, Some(FleetAlertSeverity::Warning));
+        assert_eq!(
+            evaluation.control_for(EdgeThermalEnergyKind::Energy).action,
+            EdgeResourceAction::Admit
+        );
+        assert_eq!(
+            evaluation.heartbeat_state.thermal_state,
+            EdgeResourceAction::Throttle
+        );
+        assert!(evaluation.heartbeat_state.thermal_available);
+        assert_eq!(evaluation.alerts.len(), 1);
+        assert_eq!(evaluation.alerts[0].kind, FleetAlertKind::ResourceBudget);
+        assert_eq!(evaluation.alerts[0].evidence.metric_name, "temperature_c");
+        assert!(evaluation
+            .metrics
+            .iter()
+            .any(|metric| metric.name == "temperature_c"
+                && metric.unit == "celsius"
+                && metric
+                    .labels
+                    .iter()
+                    .any(|label| label.0 == "category" && label.1 == "thermal_energy_budget")));
+    }
+
+    #[test]
+    fn edge_thermal_energy_budget_reports_missing_thermal_sensor_unavailable_not_faked() {
+        let budget = EdgeThermalEnergyBudget {
+            node_id: "edge-pi-no-thermal".to_string(),
+            max_temperature_c: 78.0,
+            min_battery_percent: 20.0,
+            throttle_at_fraction: 0.85,
+        };
+        let snapshot = EdgeThermalEnergySnapshot {
+            node_id: "edge-pi-no-thermal".to_string(),
+            temperature_c: None,
+            battery_remaining_percent: Some(80.0),
+            at: dt("2026-06-15T00:16:00Z"),
+        };
+
+        let evaluation = evaluate_edge_thermal_energy_budget(&budget, &snapshot)
+            .expect("missing thermal sensor should be represented");
+
+        let thermal = evaluation.control_for(EdgeThermalEnergyKind::Thermal);
+        assert_eq!(thermal.action, EdgeResourceAction::Unavailable);
+        assert_eq!(thermal.reason, "thermal budget unavailable");
+        assert_eq!(thermal.observed_value, None);
+        assert_eq!(thermal.threshold_value, None);
+        assert!(!evaluation.heartbeat_state.thermal_available);
+        assert_eq!(
+            evaluation.heartbeat_state.thermal_state,
+            EdgeResourceAction::Unavailable
+        );
+        assert!(!evaluation
+            .metrics
+            .iter()
+            .any(|metric| metric.name == "temperature_c"));
+        assert!(evaluation.alerts.is_empty());
     }
 
     fn dt(value: &str) -> chrono::DateTime<chrono::Utc> {

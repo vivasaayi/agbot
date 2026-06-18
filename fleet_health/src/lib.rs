@@ -1,4 +1,11 @@
 use serde::{Deserialize, Serialize};
+use shared::{
+    fleet_alerts::{
+        FleetAlertComparator, FleetAlertEvidence, FleetAlertKind, FleetAlertRecord,
+        FleetAlertRoute, FleetAlertSeverity,
+    },
+    schemas::{FleetNodeHealthState, FleetVersionInventory},
+};
 use timeseries::{SeriesPoint, SeriesValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +65,74 @@ pub struct ServiceHistoryEntry {
     pub action: String,
     #[serde(default)]
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceWorkOrderSeverity {
+    Routine,
+    Degraded,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceWorkOrderStatus {
+    Open,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaintenancePartUsage {
+    pub part_id: String,
+    pub quantity: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OpenMaintenanceWorkOrderRequest {
+    #[serde(default)]
+    pub wo_id: Option<String>,
+    #[serde(default)]
+    pub component_id: String,
+    #[serde(default)]
+    pub reason: String,
+    pub severity: MaintenanceWorkOrderSeverity,
+    #[serde(default)]
+    pub opened_at: String,
+    #[serde(default)]
+    pub technician: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CloseMaintenanceWorkOrderRequest {
+    #[serde(default)]
+    pub closed_at: String,
+    #[serde(default)]
+    pub technician: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub parts: Vec<MaintenancePartUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceWorkOrder {
+    pub wo_id: String,
+    pub component_id: String,
+    pub reason: String,
+    pub severity: MaintenanceWorkOrderSeverity,
+    pub status: MaintenanceWorkOrderStatus,
+    pub opened_at: String,
+    pub closed_at: Option<String>,
+    pub technician: String,
+    pub parts: Vec<MaintenancePartUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceWorkOrderCloseResult {
+    pub component: FleetComponentRecord,
+    pub work_order: MaintenanceWorkOrder,
+    pub service_history_entry: ServiceHistoryEntry,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -147,6 +222,7 @@ pub struct HealthTelemetryGap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetHealthIndicator {
+    BatteryCycleCount,
     BatteryInternalResistance,
     MotorVibration,
     EscTemperature,
@@ -155,6 +231,7 @@ pub enum FleetHealthIndicator {
 impl FleetHealthIndicator {
     pub fn as_str(self) -> &'static str {
         match self {
+            FleetHealthIndicator::BatteryCycleCount => "battery_cycle_count",
             FleetHealthIndicator::BatteryInternalResistance => {
                 "battery_internal_resistance_milliohm"
             }
@@ -165,6 +242,7 @@ impl FleetHealthIndicator {
 
     pub fn unit(self) -> &'static str {
         match self {
+            FleetHealthIndicator::BatteryCycleCount => "cycles",
             FleetHealthIndicator::BatteryInternalResistance => "milliohm",
             FleetHealthIndicator::MotorVibration => "g",
             FleetHealthIndicator::EscTemperature => "celsius",
@@ -177,6 +255,7 @@ impl std::str::FromStr for FleetHealthIndicator {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "battery_cycle_count" | "battery_cycles" => Ok(Self::BatteryCycleCount),
             "battery_internal_resistance_milliohm" | "battery_internal_resistance" => {
                 Ok(Self::BatteryInternalResistance)
             }
@@ -248,6 +327,303 @@ impl FleetHealthIndicatorSample {
 pub struct FleetHealthIndicatorDerivation {
     pub samples: Vec<FleetHealthIndicatorSample>,
     pub gaps: Vec<HealthTelemetryGap>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BatteryHealthTrendConfig {
+    pub max_cycles: u32,
+    pub resistance_degraded_at_milliohm: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatteryHealthTrendReport {
+    pub component_id: String,
+    pub evaluated_at: String,
+    pub cycle_count: u32,
+    pub max_cycles: u32,
+    pub latest_internal_resistance_milliohm: f64,
+    pub resistance_sample_count: usize,
+    pub status: ComponentHealthVerdictStatus,
+    pub evidence: Vec<HealthVerdictEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HealthDegradationDetectionConfig {
+    pub min_history_points: usize,
+    pub recent_window_points: usize,
+    pub min_adverse_slope_per_day: f64,
+    pub min_adverse_delta: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct HealthDegradationDetectionRequest {
+    #[serde(default)]
+    pub component_id: String,
+    #[serde(default)]
+    pub evaluated_at: String,
+    #[serde(default)]
+    pub method_version: String,
+    pub indicator: FleetHealthIndicator,
+    #[serde(default)]
+    pub samples: Vec<FleetHealthIndicatorSample>,
+    pub config: HealthDegradationDetectionConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthDegradationDetectionStatus {
+    Stable,
+    DegradationDetected,
+    InsufficientHistory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthDegradationReasonCode {
+    WithinTrendBand,
+    SustainedAdverseSlope,
+    DriftExceeded,
+    InsufficientHistory,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthDegradationEvent {
+    pub component_id: String,
+    pub indicator: FleetHealthIndicator,
+    pub reason_code: HealthDegradationReasonCode,
+    pub window_start: String,
+    pub window_end: String,
+    pub slope_per_day: f64,
+    pub delta: f64,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthDegradationDetectionReport {
+    pub component_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub indicator: FleetHealthIndicator,
+    pub status: HealthDegradationDetectionStatus,
+    pub reason_code: HealthDegradationReasonCode,
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+    pub slope_per_day: Option<f64>,
+    pub delta: Option<f64>,
+    pub evidence_refs: Vec<String>,
+    pub event: Option<HealthDegradationEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeMetricTrendSample {
+    pub node_id: String,
+    pub metric_name: String,
+    pub value: f64,
+    pub ts: String,
+    pub source_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PredictiveMaintenanceAdvisoryRequest {
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub evaluated_at: String,
+    #[serde(default)]
+    pub method_version: String,
+    #[serde(default)]
+    pub metric_name: String,
+    #[serde(default)]
+    pub samples: Vec<NodeMetricTrendSample>,
+    pub config: HealthDegradationDetectionConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveMaintenanceAdvisoryStatus {
+    Raised,
+    NotRaised,
+    InsufficientHistory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveMaintenanceAdvisoryReason {
+    UpwardMetricTrend,
+    StableMetricTrend,
+    InsufficientHistory,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictiveMaintenanceAdvisory {
+    pub node_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub metric_name: String,
+    pub status: PredictiveMaintenanceAdvisoryStatus,
+    pub reason_code: PredictiveMaintenanceAdvisoryReason,
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+    pub slope_per_day: Option<f64>,
+    pub delta: Option<f64>,
+    pub evidence_refs: Vec<String>,
+    pub requires_approval: bool,
+    pub auto_action_taken: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RemainingUsefulLifeRequest {
+    #[serde(default)]
+    pub component_id: String,
+    #[serde(default)]
+    pub evaluated_at: String,
+    #[serde(default)]
+    pub method_version: String,
+    #[serde(default)]
+    pub enabled: bool,
+    pub trend_report: HealthDegradationDetectionReport,
+    pub readiness_decision: FleetReadinessDecision,
+    pub current_value: f64,
+    pub failure_threshold: f64,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemainingUsefulLifeStatus {
+    Available,
+    Unavailable,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemainingUsefulLifeReasonCode {
+    TrendBasedEstimate,
+    FeatureDisabled,
+    InsufficientHistory,
+    StaleOrMissingTrend,
+    NonDegradingTrend,
+    InvalidTrend,
+    ReadinessGateBlocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemainingUsefulLifeEstimate {
+    pub component_id: String,
+    pub evaluated_at: String,
+    pub method_version: String,
+    pub status: RemainingUsefulLifeStatus,
+    pub reason_code: RemainingUsefulLifeReasonCode,
+    pub indicator: FleetHealthIndicator,
+    pub expected_days: Option<f64>,
+    pub lower_days: Option<f64>,
+    pub upper_days: Option<f64>,
+    pub confidence: f64,
+    pub evidence_refs: Vec<String>,
+    pub readiness_status: FleetReadinessDecisionStatus,
+}
+
+impl RemainingUsefulLifeEstimate {
+    fn with_status(mut self, status: RemainingUsefulLifeStatus) -> Self {
+        self.status = status;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PredictiveMaintenanceScheduleRequest {
+    #[serde(default)]
+    pub proposal_id: Option<String>,
+    #[serde(default)]
+    pub generated_at: String,
+    pub rul_estimate: RemainingUsefulLifeEstimate,
+    pub severity: MaintenanceWorkOrderSeverity,
+    #[serde(default)]
+    pub requested_by: String,
+    #[serde(default)]
+    pub authorize_dispatch: bool,
+    #[serde(default)]
+    pub clear_existing_verdict: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveMaintenanceScheduleApprovalStatus {
+    PendingFleetTechApproval,
+    Approved,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictiveMaintenanceScheduleProposal {
+    pub proposal_id: String,
+    pub component_id: String,
+    pub generated_at: String,
+    pub requested_by: String,
+    pub severity: MaintenanceWorkOrderSeverity,
+    pub window_start: String,
+    pub window_end: String,
+    pub expected_service_at: String,
+    pub uncertainty_lower_days: f64,
+    pub uncertainty_expected_days: f64,
+    pub uncertainty_upper_days: f64,
+    pub confidence: f64,
+    pub uncertainty_summary: String,
+    pub evidence_refs: Vec<String>,
+    pub requires_fleet_tech_approval: bool,
+    pub approval_status: PredictiveMaintenanceScheduleApprovalStatus,
+    pub dispatch_authorized: bool,
+    pub clears_verdict: bool,
+    pub readiness_status: FleetReadinessDecisionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PredictiveMaintenanceScheduleApprovalRequest {
+    #[serde(default)]
+    pub approved_by: String,
+    #[serde(default)]
+    pub approved_at: String,
+    #[serde(default)]
+    pub generated_wo_id: String,
+    #[serde(default)]
+    pub authorize_dispatch: bool,
+    #[serde(default)]
+    pub clear_existing_verdict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovedPredictiveMaintenanceSchedule {
+    pub proposal: PredictiveMaintenanceScheduleProposal,
+    pub work_order: MaintenanceWorkOrder,
+    pub dispatch_authorized: bool,
+    pub clears_verdict: bool,
+    pub readiness_status: FleetReadinessDecisionStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthEvidenceSubjectKind {
+    ComponentVerdict,
+    DegradationEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthEvidenceInputRef {
+    pub ref_kind: String,
+    pub ref_id: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthEvidenceRecord {
+    pub record_id: String,
+    pub subject_kind: HealthEvidenceSubjectKind,
+    pub component_id: String,
+    pub method_version: String,
+    pub reason_code: String,
+    pub recorded_at: String,
+    pub input_refs: Vec<HealthEvidenceInputRef>,
+    pub decision_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +748,7 @@ pub enum FleetReadinessBlockReason {
     StaleHealthData,
     CriticalHealthVerdict,
     BatteryHealthBelowThreshold,
+    OpenCriticalWorkOrder,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -486,6 +863,57 @@ pub struct OtaRolloutDecision {
     pub evaluated_node_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RolloutStrategyAdvisoryRequest {
+    #[serde(default)]
+    pub rollout_id: String,
+    #[serde(default)]
+    pub requested_at: String,
+    pub target_version: OtaArtifactVersion,
+    pub inventory: FleetVersionInventory,
+    #[serde(default)]
+    pub health_reports: Vec<OtaNodeHealthReport>,
+    #[serde(default)]
+    pub canary_size: usize,
+    #[serde(default)]
+    pub staged_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutStrategyAdvisoryStatus {
+    Suggested,
+    InsufficientState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutStrategyAdvisoryReason {
+    StrategyDerivedFromFleetState,
+    EmptyInventory,
+    MissingHealthState,
+    NoHealthyCandidates,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutStrategyStep {
+    pub stage: OtaRolloutStage,
+    pub node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutStrategyAdvisory {
+    pub rollout_id: String,
+    pub requested_at: String,
+    pub target_version: OtaArtifactVersion,
+    pub status: RolloutStrategyAdvisoryStatus,
+    pub reason_code: RolloutStrategyAdvisoryReason,
+    pub proposed_steps: Vec<RolloutStrategyStep>,
+    pub evidence_refs: Vec<String>,
+    pub requires_approval: bool,
+    pub auto_started: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RolloutControlAction {
@@ -558,6 +986,128 @@ pub struct RolloutControlDecision {
     pub status: RolloutControlStatus,
     pub reason_code: RolloutControlReason,
     pub audit: RolloutControlAuditRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetOperationsFeedSource {
+    Inventory,
+    Health,
+    Alerts,
+    Rollouts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetOperationsFeedSourceStatus {
+    Current,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetOperationsFeedSourceState {
+    pub source: FleetOperationsFeedSource,
+    pub status: FleetOperationsFeedSourceStatus,
+    pub observed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetOperationsRolloutFeedState {
+    Advancing,
+    HaltedRolledBack,
+    Refused,
+    Started,
+    Paused,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetOperationsRolloutFeedEntry {
+    pub rollout_id: String,
+    pub stage: OtaRolloutStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub state: FleetOperationsRolloutFeedState,
+    pub reason_code: String,
+    pub updated_at: String,
+    pub evaluated_node_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetOperationsDashboardFeed {
+    pub generated_at: String,
+    pub inventory: FleetVersionInventory,
+    #[serde(default)]
+    pub alerts: Vec<FleetAlertRecord>,
+    #[serde(default)]
+    pub rollouts: Vec<FleetOperationsRolloutFeedEntry>,
+    #[serde(default)]
+    pub sources: Vec<FleetOperationsFeedSourceState>,
+    #[serde(default)]
+    pub source_gaps: Vec<FleetOperationsFeedSourceState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FleetHealthDashboardRequest {
+    #[serde(default)]
+    pub generated_at: String,
+    #[serde(default)]
+    pub components: Vec<FleetComponentRecord>,
+    #[serde(default)]
+    pub readiness_decisions: Vec<FleetReadinessDecision>,
+    #[serde(default)]
+    pub health_verdicts: Vec<ComponentHealthVerdict>,
+    #[serde(default)]
+    pub degradation_reports: Vec<HealthDegradationDetectionReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetHealthDashboardAircraftStatus {
+    Ready,
+    Blocked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetHealthDashboardAircraft {
+    pub airframe_id: String,
+    pub status: FleetHealthDashboardAircraftStatus,
+    pub readiness_status: FleetReadinessDecisionStatus,
+    pub worst_component_id: Option<String>,
+    pub worst_component_status: Option<ComponentHealthVerdictStatus>,
+    pub stale_health: bool,
+    pub blocker_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetHealthDashboard {
+    pub generated_at: String,
+    pub aircraft: Vec<FleetHealthDashboardAircraft>,
+    pub alerts: Vec<FleetAlertRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct GroundVehicleHealthIngestRequest {
+    #[serde(default)]
+    pub vehicle_id: String,
+    #[serde(default)]
+    pub checked_at: String,
+    pub component: FleetComponentRecord,
+    pub service_limit: ComponentServiceLimit,
+    pub health_verdict: ComponentHealthVerdict,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroundVehicleHealthIntegration {
+    pub vehicle_id: String,
+    pub component: FleetComponentRecord,
+    pub health_verdict: ComponentHealthVerdict,
+    pub readiness_decision: FleetReadinessDecision,
+    pub dashboard: FleetHealthDashboard,
 }
 
 impl FleetReadinessDecision {
@@ -633,10 +1183,36 @@ pub enum FleetHealthError {
     EmptyHealthIndicatorSamples,
     #[error("health threshold set cannot be empty")]
     EmptyHealthThresholds,
+    #[error("battery trend requires at least one internal-resistance sample")]
+    EmptyBatteryResistanceSamples,
     #[error("health threshold method_version cannot be empty")]
     EmptyHealthMethodVersion,
+    #[error("health degradation detection config must have at least two points and finite positive slope/delta thresholds")]
+    InvalidHealthDegradationConfig,
+    #[error("health evidence record_id cannot be empty")]
+    EmptyHealthEvidenceRecordId,
+    #[error("health evidence input ref_kind cannot be empty")]
+    EmptyHealthEvidenceRefKind,
+    #[error("health evidence input ref_id cannot be empty")]
+    EmptyHealthEvidenceRefId,
     #[error("telemetry value must be finite")]
     InvalidTelemetryValue,
+    #[error("telemetry sample timestamp is invalid: {value}")]
+    InvalidTelemetryTimestamp { value: String },
+    #[error("health evidence record {record_id} already exists with a different decision hash")]
+    HealthEvidenceOverwriteRefused { record_id: String },
+    #[error("remaining useful life confidence must be finite and in the range 0.0..=1.0")]
+    InvalidRemainingUsefulLifeConfidence,
+    #[error("predictive maintenance schedule proposal_id cannot be empty")]
+    EmptyMaintenanceScheduleProposalId,
+    #[error("predictive maintenance schedule requires an available RUL range")]
+    RemainingUsefulLifeUnavailableForScheduling,
+    #[error("predictive maintenance schedule window must be finite, non-negative, and ordered lower <= expected <= upper")]
+    InvalidMaintenanceScheduleWindow,
+    #[error(
+        "predictive maintenance scheduling cannot authorize dispatch or clear a health verdict"
+    )]
+    PredictiveMaintenanceAutoActionRefused,
     #[error(
         "health threshold must be finite, non-negative, and ordered watch <= degraded <= critical"
     )]
@@ -650,6 +1226,8 @@ pub enum FleetHealthError {
     },
     #[error("service limit must have a component_id and at least one finite non-negative limit")]
     InvalidServiceLimit { component_id: String },
+    #[error("battery trend requires a battery component")]
+    BatteryTrendRequiresBattery { component_id: String },
     #[error("battery current must be finite and non-zero")]
     InvalidBatteryCurrent,
     #[error("telemetry gap timestamp cannot be empty")]
@@ -666,6 +1244,16 @@ pub enum FleetHealthError {
     EmptyServiceTechnician,
     #[error("service action cannot be empty")]
     EmptyServiceAction,
+    #[error("work_order_id cannot be empty")]
+    EmptyWorkOrderId,
+    #[error("work order reason cannot be empty")]
+    EmptyWorkOrderReason,
+    #[error("work order part_id cannot be empty")]
+    EmptyPartId,
+    #[error("work order part quantity must be greater than zero")]
+    InvalidPartQuantity,
+    #[error("work order {wo_id} is already closed")]
+    WorkOrderAlreadyClosed { wo_id: String },
     #[error("unsupported fleet component type {value}")]
     UnsupportedComponentType { value: String },
     #[error("unsupported fleet health indicator {value}")]
@@ -890,6 +1478,633 @@ pub fn derive_health_indicators(
     Ok(FleetHealthIndicatorDerivation { samples, gaps })
 }
 
+pub fn evaluate_battery_health_trend(
+    component: &FleetComponentRecord,
+    samples: Vec<FleetHealthIndicatorSample>,
+    config: BatteryHealthTrendConfig,
+    evaluated_at: String,
+) -> Result<BatteryHealthTrendReport, FleetHealthError> {
+    if component.component_type != FleetComponentType::Battery {
+        return Err(FleetHealthError::BatteryTrendRequiresBattery {
+            component_id: component.component_id.clone(),
+        });
+    }
+    let component_id = normalize_required_text(
+        component.component_id.clone(),
+        FleetHealthError::EmptyComponentId,
+    )?;
+    let evaluated_at = normalize_required_text(evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    if config.max_cycles == 0 {
+        return Err(FleetHealthError::InvalidServiceLimit {
+            component_id: component_id.clone(),
+        });
+    }
+    if !config.resistance_degraded_at_milliohm.is_finite()
+        || config.resistance_degraded_at_milliohm < 0.0
+    {
+        return Err(FleetHealthError::InvalidHealthThreshold {
+            indicator: FleetHealthIndicator::BatteryInternalResistance,
+        });
+    }
+
+    let mut resistance_samples = Vec::new();
+    for sample in samples {
+        let sample_component_id =
+            normalize_required_text(sample.component_id, FleetHealthError::EmptyComponentId)?;
+        if sample_component_id != component_id {
+            return Err(FleetHealthError::IndicatorComponentMismatch {
+                component_id: component_id.clone(),
+                sample_component_id,
+            });
+        }
+        if sample.indicator != FleetHealthIndicator::BatteryInternalResistance {
+            continue;
+        }
+        validate_finite(sample.value)?;
+        resistance_samples.push(FleetHealthIndicatorSample {
+            component_id: sample_component_id,
+            indicator: sample.indicator,
+            value: sample.value,
+            ts: normalize_required_text(sample.ts, FleetHealthError::EmptyTelemetryTimestamp)?,
+            source_ref: normalize_required_text(
+                sample.source_ref,
+                FleetHealthError::EmptySourceRef,
+            )?,
+            created_at: sample.created_at,
+            freshness: sample.freshness,
+        });
+    }
+    if resistance_samples.is_empty() {
+        return Err(FleetHealthError::EmptyBatteryResistanceSamples);
+    }
+    resistance_samples.sort_by(|left, right| left.ts.cmp(&right.ts));
+    let latest_resistance = resistance_samples
+        .last()
+        .expect("non-empty resistance samples checked above");
+
+    let cycle_status = if component.cycles > config.max_cycles {
+        ComponentHealthVerdictStatus::Degraded
+    } else {
+        ComponentHealthVerdictStatus::Ok
+    };
+    let resistance_status = if latest_resistance.value >= config.resistance_degraded_at_milliohm {
+        ComponentHealthVerdictStatus::Degraded
+    } else {
+        ComponentHealthVerdictStatus::Ok
+    };
+    let cycle_reason = if cycle_status == ComponentHealthVerdictStatus::Degraded {
+        HealthVerdictReasonCode::DegradedThresholdExceeded
+    } else {
+        HealthVerdictReasonCode::AllIndicatorsWithinThreshold
+    };
+    let resistance_reason = if resistance_status == ComponentHealthVerdictStatus::Degraded {
+        HealthVerdictReasonCode::DegradedThresholdExceeded
+    } else {
+        HealthVerdictReasonCode::AllIndicatorsWithinThreshold
+    };
+    let evidence = vec![
+        HealthVerdictEvidence {
+            indicator: FleetHealthIndicator::BatteryCycleCount,
+            value: component.cycles as f64,
+            threshold: config.max_cycles as f64,
+            status: cycle_status,
+            reason_code: cycle_reason,
+            sample_ts: component.updated_at.clone(),
+            source_ref: format!("component:{}", component.component_id),
+            freshness: HealthIndicatorFreshness::Fresh,
+        },
+        HealthVerdictEvidence {
+            indicator: FleetHealthIndicator::BatteryInternalResistance,
+            value: latest_resistance.value,
+            threshold: config.resistance_degraded_at_milliohm,
+            status: resistance_status,
+            reason_code: resistance_reason,
+            sample_ts: latest_resistance.ts.clone(),
+            source_ref: latest_resistance.source_ref.clone(),
+            freshness: latest_resistance.freshness,
+        },
+    ];
+    let status = evidence
+        .iter()
+        .max_by(|left, right| compare_verdict_evidence(left, right))
+        .map(|evidence| evidence.status)
+        .unwrap_or(ComponentHealthVerdictStatus::Ok);
+
+    Ok(BatteryHealthTrendReport {
+        component_id,
+        evaluated_at,
+        cycle_count: component.cycles,
+        max_cycles: config.max_cycles,
+        latest_internal_resistance_milliohm: latest_resistance.value,
+        resistance_sample_count: resistance_samples.len(),
+        status,
+        evidence,
+    })
+}
+
+pub fn detect_health_indicator_degradation(
+    request: HealthDegradationDetectionRequest,
+) -> Result<HealthDegradationDetectionReport, FleetHealthError> {
+    let component_id =
+        normalize_required_text(request.component_id, FleetHealthError::EmptyComponentId)?;
+    let evaluated_at =
+        normalize_required_text(request.evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    let method_version = normalize_required_text(
+        request.method_version,
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    validate_degradation_config(request.config)?;
+
+    let mut normalized = Vec::new();
+    for sample in request.samples {
+        let sample_component_id =
+            normalize_required_text(sample.component_id, FleetHealthError::EmptyComponentId)?;
+        if sample_component_id != component_id {
+            return Err(FleetHealthError::IndicatorComponentMismatch {
+                component_id,
+                sample_component_id,
+            });
+        }
+        if sample.indicator != request.indicator {
+            continue;
+        }
+        validate_finite(sample.value)?;
+        let sample_ts =
+            normalize_required_text(sample.ts, FleetHealthError::EmptyTelemetryTimestamp)?;
+        let parsed_ts = parse_health_sample_timestamp(&sample_ts)?;
+        let source_ref =
+            normalize_required_text(sample.source_ref, FleetHealthError::EmptySourceRef)?;
+        normalized.push(ParsedHealthIndicatorSample {
+            sample: FleetHealthIndicatorSample {
+                component_id: sample_component_id,
+                indicator: sample.indicator,
+                value: sample.value,
+                ts: sample_ts,
+                source_ref,
+                created_at: sample.created_at,
+                freshness: sample.freshness,
+            },
+            parsed_ts,
+        });
+    }
+    normalized.sort_by(|left, right| {
+        left.parsed_ts
+            .cmp(&right.parsed_ts)
+            .then_with(|| left.sample.source_ref.cmp(&right.sample.source_ref))
+    });
+
+    if normalized.len() < request.config.min_history_points {
+        return Ok(HealthDegradationDetectionReport {
+            component_id,
+            evaluated_at,
+            method_version,
+            indicator: request.indicator,
+            status: HealthDegradationDetectionStatus::InsufficientHistory,
+            reason_code: HealthDegradationReasonCode::InsufficientHistory,
+            window_start: None,
+            window_end: None,
+            slope_per_day: None,
+            delta: None,
+            evidence_refs: vec![],
+            event: None,
+        });
+    }
+
+    let recent_start = normalized.len() - request.config.recent_window_points;
+    let window = &normalized[recent_start..];
+    let window_start = window
+        .first()
+        .expect("validated recent window has at least two samples")
+        .sample
+        .ts
+        .clone();
+    let window_end = window
+        .last()
+        .expect("validated recent window has at least two samples")
+        .sample
+        .ts
+        .clone();
+    let slope_per_day = linear_slope_per_day(window);
+    let delta = window
+        .last()
+        .expect("validated recent window has at least two samples")
+        .sample
+        .value
+        - window
+            .first()
+            .expect("validated recent window has at least two samples")
+            .sample
+            .value;
+    let evidence_refs = sorted_unique_evidence_refs(window);
+    let reason_code = if slope_per_day >= request.config.min_adverse_slope_per_day {
+        HealthDegradationReasonCode::SustainedAdverseSlope
+    } else if delta >= request.config.min_adverse_delta {
+        HealthDegradationReasonCode::DriftExceeded
+    } else {
+        HealthDegradationReasonCode::WithinTrendBand
+    };
+    let status = if reason_code == HealthDegradationReasonCode::WithinTrendBand {
+        HealthDegradationDetectionStatus::Stable
+    } else {
+        HealthDegradationDetectionStatus::DegradationDetected
+    };
+    let event = if status == HealthDegradationDetectionStatus::DegradationDetected {
+        Some(HealthDegradationEvent {
+            component_id: component_id.clone(),
+            indicator: request.indicator,
+            reason_code,
+            window_start: window_start.clone(),
+            window_end: window_end.clone(),
+            slope_per_day,
+            delta,
+            evidence_refs: evidence_refs.clone(),
+        })
+    } else {
+        None
+    };
+
+    Ok(HealthDegradationDetectionReport {
+        component_id,
+        evaluated_at,
+        method_version,
+        indicator: request.indicator,
+        status,
+        reason_code,
+        window_start: Some(window_start),
+        window_end: Some(window_end),
+        slope_per_day: Some(slope_per_day),
+        delta: Some(delta),
+        evidence_refs,
+        event,
+    })
+}
+
+pub fn evaluate_predictive_maintenance_advisory(
+    request: PredictiveMaintenanceAdvisoryRequest,
+) -> Result<PredictiveMaintenanceAdvisory, FleetHealthError> {
+    let node_id = normalize_required_text(request.node_id, FleetHealthError::EmptyFleetNodeId)?;
+    let evaluated_at =
+        normalize_required_text(request.evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    let method_version = normalize_required_text(
+        request.method_version,
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    let metric_name = normalize_required_text(
+        request.metric_name,
+        FleetHealthError::EmptyHealthEvidenceRefKind,
+    )?;
+    validate_degradation_config(request.config)?;
+
+    let mut normalized = Vec::new();
+    for sample in request.samples {
+        let sample_node_id =
+            normalize_required_text(sample.node_id, FleetHealthError::EmptyFleetNodeId)?;
+        if sample_node_id != node_id {
+            continue;
+        }
+        let sample_metric = normalize_required_text(
+            sample.metric_name,
+            FleetHealthError::EmptyHealthEvidenceRefKind,
+        )?;
+        if sample_metric != metric_name {
+            continue;
+        }
+        validate_finite(sample.value)?;
+        let sample_ts =
+            normalize_required_text(sample.ts, FleetHealthError::EmptyTelemetryTimestamp)?;
+        let parsed_ts = parse_health_sample_timestamp(&sample_ts)?;
+        let source_ref =
+            normalize_required_text(sample.source_ref, FleetHealthError::EmptySourceRef)?;
+        normalized.push(ParsedNodeMetricSample {
+            sample: NodeMetricTrendSample {
+                node_id: sample_node_id,
+                metric_name: sample_metric,
+                value: sample.value,
+                ts: sample_ts,
+                source_ref,
+            },
+            parsed_ts,
+        });
+    }
+    normalized.sort_by(|left, right| {
+        left.parsed_ts
+            .cmp(&right.parsed_ts)
+            .then_with(|| left.sample.source_ref.cmp(&right.sample.source_ref))
+    });
+
+    if normalized.len() < request.config.min_history_points {
+        return Ok(PredictiveMaintenanceAdvisory {
+            node_id,
+            evaluated_at,
+            method_version,
+            metric_name,
+            status: PredictiveMaintenanceAdvisoryStatus::InsufficientHistory,
+            reason_code: PredictiveMaintenanceAdvisoryReason::InsufficientHistory,
+            window_start: None,
+            window_end: None,
+            slope_per_day: None,
+            delta: None,
+            evidence_refs: Vec::new(),
+            requires_approval: true,
+            auto_action_taken: false,
+        });
+    }
+
+    let window_len = request
+        .config
+        .recent_window_points
+        .min(normalized.len())
+        .max(2);
+    let window = &normalized[normalized.len() - window_len..];
+    let first = &window[0];
+    let last = &window[window.len() - 1];
+    let elapsed_days = last
+        .parsed_ts
+        .signed_duration_since(first.parsed_ts)
+        .num_seconds()
+        .max(1) as f64
+        / 86_400.0;
+    let delta = last.sample.value - first.sample.value;
+    let slope_per_day = delta / elapsed_days;
+    let trend_detected = slope_per_day >= request.config.min_adverse_slope_per_day
+        && delta >= request.config.min_adverse_delta;
+    let evidence_refs = window
+        .iter()
+        .map(|sample| {
+            format!(
+                "metric:{}:{}:{}:{}:{:.6}",
+                node_id,
+                metric_name,
+                sample.sample.ts,
+                sample.sample.source_ref,
+                sample.sample.value
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Ok(PredictiveMaintenanceAdvisory {
+        node_id,
+        evaluated_at,
+        method_version,
+        metric_name,
+        status: if trend_detected {
+            PredictiveMaintenanceAdvisoryStatus::Raised
+        } else {
+            PredictiveMaintenanceAdvisoryStatus::NotRaised
+        },
+        reason_code: if trend_detected {
+            PredictiveMaintenanceAdvisoryReason::UpwardMetricTrend
+        } else {
+            PredictiveMaintenanceAdvisoryReason::StableMetricTrend
+        },
+        window_start: Some(first.sample.ts.clone()),
+        window_end: Some(last.sample.ts.clone()),
+        slope_per_day: Some(slope_per_day),
+        delta: Some(delta),
+        evidence_refs,
+        requires_approval: true,
+        auto_action_taken: false,
+    })
+}
+
+pub fn estimate_remaining_useful_life(
+    request: RemainingUsefulLifeRequest,
+) -> Result<RemainingUsefulLifeEstimate, FleetHealthError> {
+    let component_id =
+        normalize_required_text(request.component_id, FleetHealthError::EmptyComponentId)?;
+    let evaluated_at =
+        normalize_required_text(request.evaluated_at, FleetHealthError::EmptyCreatedAt)?;
+    let method_version = normalize_required_text(
+        request.method_version,
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    validate_finite(request.current_value)?;
+    validate_finite(request.failure_threshold)?;
+    validate_confidence(request.confidence)?;
+    if request.trend_report.component_id != component_id {
+        return Err(FleetHealthError::IndicatorComponentMismatch {
+            component_id,
+            sample_component_id: request.trend_report.component_id,
+        });
+    }
+    if !request.enabled {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::FeatureDisabled,
+            request.confidence,
+            vec![],
+            request.readiness_decision.status,
+        ));
+    }
+    if request.readiness_decision.status == FleetReadinessDecisionStatus::Blocked {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::ReadinessGateBlocked,
+            request.confidence,
+            request.trend_report.evidence_refs,
+            request.readiness_decision.status,
+        )
+        .with_status(RemainingUsefulLifeStatus::Refused));
+    }
+    if request.trend_report.status == HealthDegradationDetectionStatus::InsufficientHistory {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::InsufficientHistory,
+            request.confidence,
+            vec![],
+            request.readiness_decision.status,
+        ));
+    }
+    if request.trend_report.evidence_refs.is_empty()
+        || request.trend_report.slope_per_day.is_none()
+        || request.trend_report.delta.is_none()
+    {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::StaleOrMissingTrend,
+            request.confidence,
+            request.trend_report.evidence_refs,
+            request.readiness_decision.status,
+        ));
+    }
+    if request.trend_report.status != HealthDegradationDetectionStatus::DegradationDetected {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::NonDegradingTrend,
+            request.confidence,
+            request.trend_report.evidence_refs,
+            request.readiness_decision.status,
+        ));
+    }
+    let slope_per_day = request
+        .trend_report
+        .slope_per_day
+        .expect("slope presence checked above");
+    if slope_per_day <= 0.0 || request.current_value >= request.failure_threshold {
+        return Ok(rul_unavailable(
+            component_id,
+            evaluated_at,
+            method_version,
+            request.trend_report.indicator,
+            RemainingUsefulLifeReasonCode::InvalidTrend,
+            request.confidence,
+            request.trend_report.evidence_refs,
+            request.readiness_decision.status,
+        ));
+    }
+
+    let expected_days = (request.failure_threshold - request.current_value) / slope_per_day;
+    let uncertainty = (1.0 - request.confidence).max(0.0);
+    let lower_days = (expected_days * (1.0 - uncertainty)).max(0.0);
+    let upper_days = expected_days * (1.0 + uncertainty);
+
+    Ok(RemainingUsefulLifeEstimate {
+        component_id,
+        evaluated_at,
+        method_version,
+        status: RemainingUsefulLifeStatus::Available,
+        reason_code: RemainingUsefulLifeReasonCode::TrendBasedEstimate,
+        indicator: request.trend_report.indicator,
+        expected_days: Some(expected_days),
+        lower_days: Some(lower_days),
+        upper_days: Some(upper_days),
+        confidence: request.confidence,
+        evidence_refs: request.trend_report.evidence_refs,
+        readiness_status: request.readiness_decision.status,
+    })
+}
+
+pub fn propose_predictive_maintenance_schedule(
+    request: PredictiveMaintenanceScheduleRequest,
+    generated_proposal_id: String,
+) -> Result<PredictiveMaintenanceScheduleProposal, FleetHealthError> {
+    if request.authorize_dispatch || request.clear_existing_verdict {
+        return Err(FleetHealthError::PredictiveMaintenanceAutoActionRefused);
+    }
+
+    let proposal_id = match request.proposal_id {
+        Some(proposal_id) => normalize_required_text(
+            proposal_id,
+            FleetHealthError::EmptyMaintenanceScheduleProposalId,
+        )?,
+        None => normalize_required_text(
+            generated_proposal_id,
+            FleetHealthError::EmptyMaintenanceScheduleProposalId,
+        )?,
+    };
+    let generated_at =
+        normalize_required_text(request.generated_at, FleetHealthError::EmptyCreatedAt)?;
+    let generated_at_ts = parse_health_sample_timestamp(&generated_at)?;
+    let requested_by = normalize_required_text(
+        request.requested_by,
+        FleetHealthError::EmptyServiceTechnician,
+    )?;
+    let rul = request.rul_estimate;
+    if rul.status != RemainingUsefulLifeStatus::Available {
+        return Err(FleetHealthError::RemainingUsefulLifeUnavailableForScheduling);
+    }
+    let lower_days = rul
+        .lower_days
+        .ok_or(FleetHealthError::RemainingUsefulLifeUnavailableForScheduling)?;
+    let expected_days = rul
+        .expected_days
+        .ok_or(FleetHealthError::RemainingUsefulLifeUnavailableForScheduling)?;
+    let upper_days = rul
+        .upper_days
+        .ok_or(FleetHealthError::RemainingUsefulLifeUnavailableForScheduling)?;
+    validate_maintenance_schedule_window(lower_days, expected_days, upper_days)?;
+    validate_confidence(rul.confidence)?;
+
+    let window_start = add_days_to_timestamp(generated_at_ts, lower_days)?;
+    let expected_service_at = add_days_to_timestamp(generated_at_ts, expected_days)?;
+    let window_end = add_days_to_timestamp(generated_at_ts, upper_days)?;
+    let uncertainty_summary = format!(
+        "RUL {:.2}-{:.2} days (expected {:.2}, confidence {:.0}%)",
+        lower_days,
+        upper_days,
+        expected_days,
+        rul.confidence * 100.0
+    );
+
+    Ok(PredictiveMaintenanceScheduleProposal {
+        proposal_id,
+        component_id: rul.component_id,
+        generated_at,
+        requested_by,
+        severity: request.severity,
+        window_start,
+        window_end,
+        expected_service_at,
+        uncertainty_lower_days: lower_days,
+        uncertainty_expected_days: expected_days,
+        uncertainty_upper_days: upper_days,
+        confidence: rul.confidence,
+        uncertainty_summary,
+        evidence_refs: rul.evidence_refs,
+        requires_fleet_tech_approval: true,
+        approval_status: PredictiveMaintenanceScheduleApprovalStatus::PendingFleetTechApproval,
+        dispatch_authorized: false,
+        clears_verdict: false,
+        readiness_status: rul.readiness_status,
+    })
+}
+
+pub fn approve_predictive_maintenance_schedule(
+    mut proposal: PredictiveMaintenanceScheduleProposal,
+    request: PredictiveMaintenanceScheduleApprovalRequest,
+) -> Result<ApprovedPredictiveMaintenanceSchedule, FleetHealthError> {
+    if request.authorize_dispatch || request.clear_existing_verdict {
+        return Err(FleetHealthError::PredictiveMaintenanceAutoActionRefused);
+    }
+    let approved_by = normalize_required_text(
+        request.approved_by,
+        FleetHealthError::EmptyServiceTechnician,
+    )?;
+    let approved_at =
+        normalize_required_text(request.approved_at, FleetHealthError::EmptyCreatedAt)?;
+    let generated_wo_id =
+        normalize_required_text(request.generated_wo_id, FleetHealthError::EmptyWorkOrderId)?;
+
+    proposal.approval_status = PredictiveMaintenanceScheduleApprovalStatus::Approved;
+    let work_order = open_maintenance_work_order(
+        OpenMaintenanceWorkOrderRequest {
+            wo_id: None,
+            component_id: proposal.component_id.clone(),
+            reason: format!(
+                "predictive maintenance schedule {}; uncertainty {}",
+                proposal.proposal_id, proposal.uncertainty_summary
+            ),
+            severity: proposal.severity,
+            opened_at: approved_at,
+            technician: approved_by,
+        },
+        generated_wo_id,
+    )?;
+
+    Ok(ApprovedPredictiveMaintenanceSchedule {
+        readiness_status: proposal.readiness_status,
+        proposal,
+        work_order,
+        dispatch_authorized: false,
+        clears_verdict: false,
+    })
+}
+
 pub fn evaluate_component_health_verdict(
     request: ComponentHealthVerdictRequest,
 ) -> Result<ComponentHealthVerdict, FleetHealthError> {
@@ -975,6 +2190,156 @@ pub fn evaluate_component_health_verdict(
         freshness,
         evidence,
     })
+}
+
+pub fn build_health_verdict_evidence_record(
+    record_id: String,
+    verdict: &ComponentHealthVerdict,
+    recorded_at: String,
+) -> Result<HealthEvidenceRecord, FleetHealthError> {
+    let record_id =
+        normalize_required_text(record_id, FleetHealthError::EmptyHealthEvidenceRecordId)?;
+    let component_id = normalize_required_text(
+        verdict.component_id.clone(),
+        FleetHealthError::EmptyComponentId,
+    )?;
+    let method_version = normalize_required_text(
+        verdict.method_version.clone(),
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    let recorded_at = normalize_required_text(recorded_at, FleetHealthError::EmptyCreatedAt)?;
+    let mut input_refs = verdict
+        .evidence
+        .iter()
+        .map(|evidence| {
+            health_evidence_input_ref(
+                format!("indicator:{}", evidence.indicator.as_str()),
+                evidence.source_ref.clone(),
+                Some(format!(
+                    "value={:.12}|threshold={:.12}|sample_ts={}|freshness={}",
+                    evidence.value,
+                    evidence.threshold,
+                    evidence.sample_ts,
+                    evidence.freshness.as_str()
+                )),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    input_refs.sort_by(|left, right| {
+        left.ref_kind
+            .cmp(&right.ref_kind)
+            .then_with(|| left.ref_id.cmp(&right.ref_id))
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    let reason_code = health_verdict_reason_code(verdict.reason_code).to_string();
+    let decision_hash = health_evidence_decision_hash(
+        HealthEvidenceSubjectKind::ComponentVerdict,
+        &component_id,
+        &method_version,
+        &reason_code,
+        &input_refs,
+    );
+
+    Ok(HealthEvidenceRecord {
+        record_id,
+        subject_kind: HealthEvidenceSubjectKind::ComponentVerdict,
+        component_id,
+        method_version,
+        reason_code,
+        recorded_at,
+        input_refs,
+        decision_hash,
+    })
+}
+
+pub fn build_degradation_event_evidence_record(
+    record_id: String,
+    report: &HealthDegradationDetectionReport,
+    recorded_at: String,
+) -> Result<HealthEvidenceRecord, FleetHealthError> {
+    let record_id =
+        normalize_required_text(record_id, FleetHealthError::EmptyHealthEvidenceRecordId)?;
+    let component_id = normalize_required_text(
+        report.component_id.clone(),
+        FleetHealthError::EmptyComponentId,
+    )?;
+    let method_version = normalize_required_text(
+        report.method_version.clone(),
+        FleetHealthError::EmptyHealthMethodVersion,
+    )?;
+    let recorded_at = normalize_required_text(recorded_at, FleetHealthError::EmptyCreatedAt)?;
+    let reason_code = health_degradation_reason_code(report.reason_code).to_string();
+    let mut input_refs = report
+        .evidence_refs
+        .iter()
+        .map(|source_ref| {
+            health_evidence_input_ref(
+                format!("indicator_window:{}", report.indicator.as_str()),
+                source_ref.clone(),
+                Some(format!(
+                    "window_start={}|window_end={}|slope_per_day={:.12}|delta={:.12}",
+                    report.window_start.as_deref().unwrap_or(""),
+                    report.window_end.as_deref().unwrap_or(""),
+                    report.slope_per_day.unwrap_or(0.0),
+                    report.delta.unwrap_or(0.0)
+                )),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    input_refs.sort_by(|left, right| {
+        left.ref_kind
+            .cmp(&right.ref_kind)
+            .then_with(|| left.ref_id.cmp(&right.ref_id))
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    let decision_hash = health_evidence_decision_hash(
+        HealthEvidenceSubjectKind::DegradationEvent,
+        &component_id,
+        &method_version,
+        &reason_code,
+        &input_refs,
+    );
+
+    Ok(HealthEvidenceRecord {
+        record_id,
+        subject_kind: HealthEvidenceSubjectKind::DegradationEvent,
+        component_id,
+        method_version,
+        reason_code,
+        recorded_at,
+        input_refs,
+        decision_hash,
+    })
+}
+
+pub fn append_health_evidence_record(
+    records: &mut Vec<HealthEvidenceRecord>,
+    record: HealthEvidenceRecord,
+) -> Result<HealthEvidenceRecord, FleetHealthError> {
+    if let Some(existing) = records
+        .iter()
+        .find(|existing| existing.record_id == record.record_id)
+    {
+        refuse_health_evidence_overwrite(existing, &record)?;
+        return Ok(existing.clone());
+    }
+    records.push(record.clone());
+    Ok(record)
+}
+
+pub fn refuse_health_evidence_overwrite(
+    existing: &HealthEvidenceRecord,
+    replacement: &HealthEvidenceRecord,
+) -> Result<(), FleetHealthError> {
+    if existing.record_id == replacement.record_id
+        && existing.decision_hash != replacement.decision_hash
+    {
+        Err(FleetHealthError::HealthEvidenceOverwriteRefused {
+            record_id: existing.record_id.clone(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 pub fn evaluate_fleet_readiness(
@@ -1083,6 +2448,152 @@ pub fn evaluate_fleet_readiness(
         blockers,
         component_count: installed_components.len(),
         verdict_count: request.health_verdicts.len(),
+    })
+}
+
+pub fn open_maintenance_work_order(
+    request: OpenMaintenanceWorkOrderRequest,
+    generated_wo_id: String,
+) -> Result<MaintenanceWorkOrder, FleetHealthError> {
+    let wo_id = match request.wo_id {
+        Some(wo_id) => normalize_required_text(wo_id, FleetHealthError::EmptyWorkOrderId)?,
+        None => normalize_required_text(generated_wo_id, FleetHealthError::EmptyWorkOrderId)?,
+    };
+
+    Ok(MaintenanceWorkOrder {
+        wo_id,
+        component_id: normalize_required_text(
+            request.component_id,
+            FleetHealthError::EmptyComponentId,
+        )?,
+        reason: normalize_required_text(request.reason, FleetHealthError::EmptyWorkOrderReason)?,
+        severity: request.severity,
+        status: MaintenanceWorkOrderStatus::Open,
+        opened_at: normalize_required_text(request.opened_at, FleetHealthError::EmptyCreatedAt)?,
+        closed_at: None,
+        technician: normalize_required_text(
+            request.technician,
+            FleetHealthError::EmptyServiceTechnician,
+        )?,
+        parts: Vec::new(),
+    })
+}
+
+pub fn close_maintenance_work_order(
+    component: &FleetComponentRecord,
+    work_order: &MaintenanceWorkOrder,
+    request: CloseMaintenanceWorkOrderRequest,
+    updated_at: String,
+) -> Result<MaintenanceWorkOrderCloseResult, FleetHealthError> {
+    if work_order.status == MaintenanceWorkOrderStatus::Closed {
+        return Err(FleetHealthError::WorkOrderAlreadyClosed {
+            wo_id: work_order.wo_id.clone(),
+        });
+    }
+    let component_id = normalize_required_text(
+        component.component_id.clone(),
+        FleetHealthError::EmptyComponentId,
+    )?;
+    if work_order.component_id != component_id {
+        return Err(FleetHealthError::IndicatorComponentMismatch {
+            component_id,
+            sample_component_id: work_order.component_id.clone(),
+        });
+    }
+
+    let closed_at = normalize_required_text(request.closed_at, FleetHealthError::EmptyCreatedAt)?;
+    let technician =
+        normalize_required_text(request.technician, FleetHealthError::EmptyServiceTechnician)?;
+    let action = normalize_required_text(request.action, FleetHealthError::EmptyServiceAction)?;
+    let parts = normalize_work_order_parts(request.parts)?;
+    let service_history_entry = ServiceHistoryEntry {
+        service_id: work_order.wo_id.clone(),
+        performed_at: closed_at.clone(),
+        technician: technician.clone(),
+        action: action.clone(),
+        notes: Some(format_work_order_parts_note(&work_order.reason, &parts)),
+    };
+    let mut updated_component = component.clone();
+    updated_component
+        .service_history
+        .push(service_history_entry.clone());
+    updated_component.updated_at =
+        normalize_required_text(updated_at, FleetHealthError::EmptyCreatedAt)?;
+    let mut closed_work_order = work_order.clone();
+    closed_work_order.status = MaintenanceWorkOrderStatus::Closed;
+    closed_work_order.closed_at = Some(closed_at);
+    closed_work_order.technician = technician;
+    closed_work_order.parts = parts;
+
+    Ok(MaintenanceWorkOrderCloseResult {
+        component: updated_component,
+        work_order: closed_work_order,
+        service_history_entry,
+    })
+}
+
+pub fn evaluate_fleet_readiness_with_work_orders(
+    request: FleetReadinessRequest,
+    work_orders: &[MaintenanceWorkOrder],
+) -> Result<FleetReadinessDecision, FleetHealthError> {
+    let mut decision = evaluate_fleet_readiness(request)?;
+    for work_order in work_orders {
+        if work_order.status == MaintenanceWorkOrderStatus::Open
+            && work_order.severity == MaintenanceWorkOrderSeverity::Critical
+            && decision
+                .blockers
+                .iter()
+                .all(|blocker| blocker.component_ref.as_deref() != Some(&work_order.component_id))
+        {
+            decision.blockers.push(readiness_blocker(
+                FleetReadinessBlockReason::OpenCriticalWorkOrder,
+                Some(work_order.component_id.clone()),
+                None,
+                None,
+                None,
+            ));
+        }
+    }
+    decision.status = if decision.blockers.is_empty() {
+        FleetReadinessDecisionStatus::Permitted
+    } else {
+        FleetReadinessDecisionStatus::Blocked
+    };
+    Ok(decision)
+}
+
+pub fn integrate_ground_vehicle_health(
+    request: GroundVehicleHealthIngestRequest,
+) -> Result<GroundVehicleHealthIntegration, FleetHealthError> {
+    let vehicle_id =
+        normalize_required_text(request.vehicle_id, FleetHealthError::EmptyAirframeId)?;
+    let checked_at = normalize_required_text(request.checked_at, FleetHealthError::EmptyCreatedAt)?;
+    let mut component = request.component;
+    component.airframe_id = Some(vehicle_id.clone());
+    component.removed_at = None;
+    let service_limit = request.service_limit;
+    let health_verdict = request.health_verdict;
+    let readiness_decision = evaluate_fleet_readiness(FleetReadinessRequest {
+        airframe_id: vehicle_id.clone(),
+        checked_at: checked_at.clone(),
+        installed_components: vec![component.clone()],
+        service_limits: vec![service_limit],
+        health_verdicts: vec![health_verdict.clone()],
+    })?;
+    let dashboard = build_fleet_health_dashboard(FleetHealthDashboardRequest {
+        generated_at: checked_at,
+        components: vec![component.clone()],
+        readiness_decisions: vec![readiness_decision.clone()],
+        health_verdicts: vec![health_verdict.clone()],
+        degradation_reports: Vec::new(),
+    })?;
+
+    Ok(GroundVehicleHealthIntegration {
+        vehicle_id,
+        component,
+        health_verdict,
+        readiness_decision,
+        dashboard,
     })
 }
 
@@ -1211,6 +2722,124 @@ pub fn evaluate_ota_rollout(
     ))
 }
 
+pub fn suggest_rollout_strategy(
+    request: RolloutStrategyAdvisoryRequest,
+) -> Result<RolloutStrategyAdvisory, FleetHealthError> {
+    let rollout_id = normalize_required_text(request.rollout_id, FleetHealthError::EmptyRolloutId)?;
+    let requested_at =
+        normalize_required_text(request.requested_at, FleetHealthError::EmptyCreatedAt)?;
+    let target_version = normalize_ota_artifact_version(request.target_version)?;
+    let active_nodes = request
+        .inventory
+        .entries
+        .iter()
+        .filter(|entry| !entry.maintenance)
+        .collect::<Vec<_>>();
+
+    if active_nodes.is_empty() {
+        return Ok(rollout_strategy_result(
+            rollout_id,
+            requested_at,
+            target_version,
+            RolloutStrategyAdvisoryStatus::InsufficientState,
+            RolloutStrategyAdvisoryReason::EmptyInventory,
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+
+    let mut evidence_refs = Vec::new();
+    let mut candidates = Vec::new();
+    for entry in active_nodes {
+        let Some(health_state) = entry.health_state else {
+            return Ok(rollout_strategy_result(
+                rollout_id,
+                requested_at,
+                target_version,
+                RolloutStrategyAdvisoryStatus::InsufficientState,
+                RolloutStrategyAdvisoryReason::MissingHealthState,
+                Vec::new(),
+                evidence_refs,
+            ));
+        };
+        let Some(report) = request
+            .health_reports
+            .iter()
+            .find(|report| report.node_id == entry.node_id)
+        else {
+            return Ok(rollout_strategy_result(
+                rollout_id,
+                requested_at,
+                target_version,
+                RolloutStrategyAdvisoryStatus::InsufficientState,
+                RolloutStrategyAdvisoryReason::MissingHealthState,
+                Vec::new(),
+                evidence_refs,
+            ));
+        };
+        evidence_refs.push(format!(
+            "inventory:{}:health:{:?}:version:{}",
+            entry.node_id,
+            health_state,
+            entry.version.as_deref().unwrap_or("unknown")
+        ));
+        evidence_refs.push(format!(
+            "ota_health:{}:{:?}:{}",
+            report.node_id, report.status, report.checked_at
+        ));
+        if health_state == FleetNodeHealthState::Fresh
+            && report.status == ComponentHealthVerdictStatus::Ok
+            && report.blocking_alerts.is_empty()
+        {
+            candidates.push(entry.node_id.clone());
+        }
+    }
+    candidates.sort();
+
+    if candidates.is_empty() {
+        return Ok(rollout_strategy_result(
+            rollout_id,
+            requested_at,
+            target_version,
+            RolloutStrategyAdvisoryStatus::InsufficientState,
+            RolloutStrategyAdvisoryReason::NoHealthyCandidates,
+            Vec::new(),
+            evidence_refs,
+        ));
+    }
+
+    let canary_size = request.canary_size.max(1).min(candidates.len());
+    let staged_size = request.staged_size.max(1);
+    let canary_end = canary_size;
+    let staged_end = (canary_end + staged_size).min(candidates.len());
+    let mut proposed_steps = vec![RolloutStrategyStep {
+        stage: OtaRolloutStage::Canary,
+        node_ids: candidates[..canary_end].to_vec(),
+    }];
+    if staged_end > canary_end {
+        proposed_steps.push(RolloutStrategyStep {
+            stage: OtaRolloutStage::Staged,
+            node_ids: candidates[canary_end..staged_end].to_vec(),
+        });
+    }
+    if staged_end < candidates.len() {
+        proposed_steps.push(RolloutStrategyStep {
+            stage: OtaRolloutStage::Fleet,
+            node_ids: candidates[staged_end..].to_vec(),
+        });
+    }
+
+    Ok(rollout_strategy_result(
+        rollout_id,
+        requested_at,
+        target_version,
+        RolloutStrategyAdvisoryStatus::Suggested,
+        RolloutStrategyAdvisoryReason::StrategyDerivedFromFleetState,
+        proposed_steps,
+        evidence_refs,
+    ))
+}
+
 pub fn apply_rollout_control(
     request: RolloutControlRequest,
 ) -> Result<RolloutControlDecision, FleetHealthError> {
@@ -1269,6 +2898,287 @@ pub fn apply_rollout_control(
         reason_code,
         audit,
     })
+}
+
+pub fn build_fleet_operations_dashboard_feed(
+    generated_at: impl Into<String>,
+    inventory: FleetVersionInventory,
+    alerts: Vec<FleetAlertRecord>,
+    rollout_decisions: Vec<OtaRolloutDecision>,
+    rollout_controls: Vec<RolloutControlDecision>,
+    sources: Vec<FleetOperationsFeedSourceState>,
+) -> FleetOperationsDashboardFeed {
+    let mut rollouts = rollout_decisions
+        .into_iter()
+        .map(rollout_decision_feed_entry)
+        .chain(rollout_controls.into_iter().map(rollout_control_feed_entry))
+        .collect::<Vec<_>>();
+    rollouts.sort_by(|left, right| {
+        left.rollout_id
+            .cmp(&right.rollout_id)
+            .then(left.updated_at.cmp(&right.updated_at))
+            .then(left.reason_code.cmp(&right.reason_code))
+    });
+    let source_gaps = sources
+        .iter()
+        .filter(|source| source.status == FleetOperationsFeedSourceStatus::Unavailable)
+        .cloned()
+        .collect();
+
+    FleetOperationsDashboardFeed {
+        generated_at: generated_at.into(),
+        inventory,
+        alerts,
+        rollouts,
+        sources,
+        source_gaps,
+    }
+}
+
+pub fn build_fleet_health_dashboard(
+    request: FleetHealthDashboardRequest,
+) -> Result<FleetHealthDashboard, FleetHealthError> {
+    let generated_at =
+        normalize_required_text(request.generated_at, FleetHealthError::EmptyCreatedAt)?;
+    let evaluated_at = parse_health_sample_timestamp(&generated_at)?;
+    let mut aircraft = request
+        .readiness_decisions
+        .iter()
+        .map(|decision| {
+            let component_ids = request
+                .components
+                .iter()
+                .filter(|component| component.airframe_id.as_deref() == Some(&decision.airframe_id))
+                .map(|component| component.component_id.as_str())
+                .collect::<Vec<_>>();
+            let verdicts = request
+                .health_verdicts
+                .iter()
+                .filter(|verdict| component_ids.contains(&verdict.component_id.as_str()))
+                .collect::<Vec<_>>();
+            let worst = verdicts
+                .iter()
+                .max_by(|left, right| {
+                    left.status
+                        .severity_rank()
+                        .cmp(&right.status.severity_rank())
+                        .then_with(|| left.component_id.cmp(&right.component_id))
+                })
+                .copied();
+            let stale_health =
+                decision.blockers.iter().any(|blocker| {
+                    blocker.reason_code == FleetReadinessBlockReason::StaleHealthData
+                }) || verdicts
+                    .iter()
+                    .any(|verdict| verdict.freshness == HealthIndicatorFreshness::Stale)
+                    || verdicts.is_empty();
+            let status = if stale_health {
+                FleetHealthDashboardAircraftStatus::Unknown
+            } else if decision.status == FleetReadinessDecisionStatus::Permitted {
+                FleetHealthDashboardAircraftStatus::Ready
+            } else {
+                FleetHealthDashboardAircraftStatus::Blocked
+            };
+            FleetHealthDashboardAircraft {
+                airframe_id: decision.airframe_id.clone(),
+                status,
+                readiness_status: decision.status,
+                worst_component_id: worst.map(|verdict| verdict.component_id.clone()),
+                worst_component_status: worst.map(|verdict| verdict.status),
+                stale_health,
+                blocker_count: decision.blockers.len(),
+            }
+        })
+        .collect::<Vec<_>>();
+    aircraft.sort_by(|left, right| left.airframe_id.cmp(&right.airframe_id));
+
+    let mut alerts = Vec::new();
+    for verdict in &request.health_verdicts {
+        if verdict.status.severity_rank() >= ComponentHealthVerdictStatus::Degraded.severity_rank()
+        {
+            alerts.push(fleet_health_verdict_alert(
+                verdict,
+                &request.components,
+                evaluated_at,
+            ));
+        }
+    }
+    for report in &request.degradation_reports {
+        if report.status == HealthDegradationDetectionStatus::DegradationDetected {
+            alerts.push(fleet_health_degradation_alert(
+                report,
+                &request.components,
+                evaluated_at,
+            ));
+        }
+    }
+    alerts.sort_by(|left, right| left.alert_id.cmp(&right.alert_id));
+
+    Ok(FleetHealthDashboard {
+        generated_at,
+        aircraft,
+        alerts,
+    })
+}
+
+pub fn fleet_operations_source_current(
+    source: FleetOperationsFeedSource,
+    observed_at: impl Into<String>,
+) -> FleetOperationsFeedSourceState {
+    FleetOperationsFeedSourceState {
+        source,
+        status: FleetOperationsFeedSourceStatus::Current,
+        observed_at: observed_at.into(),
+        message: None,
+    }
+}
+
+pub fn fleet_operations_source_unavailable(
+    source: FleetOperationsFeedSource,
+    observed_at: impl Into<String>,
+    message: impl Into<String>,
+) -> FleetOperationsFeedSourceState {
+    FleetOperationsFeedSourceState {
+        source,
+        status: FleetOperationsFeedSourceStatus::Unavailable,
+        observed_at: observed_at.into(),
+        message: Some(message.into()),
+    }
+}
+
+fn rollout_decision_feed_entry(decision: OtaRolloutDecision) -> FleetOperationsRolloutFeedEntry {
+    FleetOperationsRolloutFeedEntry {
+        rollout_id: decision.rollout_id,
+        stage: decision.current_stage,
+        version: None,
+        state: match decision.status {
+            OtaRolloutDecisionStatus::Advance => FleetOperationsRolloutFeedState::Advancing,
+            OtaRolloutDecisionStatus::HaltedRolledBack => {
+                FleetOperationsRolloutFeedState::HaltedRolledBack
+            }
+            OtaRolloutDecisionStatus::Refused => FleetOperationsRolloutFeedState::Refused,
+        },
+        reason_code: ota_rollout_reason_code(decision.reason_code).to_string(),
+        updated_at: decision.evaluated_at,
+        evaluated_node_count: decision.evaluated_node_count,
+    }
+}
+
+fn rollout_control_feed_entry(decision: RolloutControlDecision) -> FleetOperationsRolloutFeedEntry {
+    FleetOperationsRolloutFeedEntry {
+        rollout_id: decision.rollout_id,
+        stage: decision.stage,
+        version: Some(decision.version),
+        state: match decision.status {
+            RolloutControlStatus::Started => FleetOperationsRolloutFeedState::Started,
+            RolloutControlStatus::Paused => FleetOperationsRolloutFeedState::Paused,
+            RolloutControlStatus::Aborted => FleetOperationsRolloutFeedState::Aborted,
+            RolloutControlStatus::Refused => FleetOperationsRolloutFeedState::Refused,
+        },
+        reason_code: rollout_control_reason_code(decision.reason_code).to_string(),
+        updated_at: decision.requested_at,
+        evaluated_node_count: 0,
+    }
+}
+
+fn ota_rollout_reason_code(reason: OtaRolloutDecisionReason) -> &'static str {
+    match reason {
+        OtaRolloutDecisionReason::StageHealthy => "stage_healthy",
+        OtaRolloutDecisionReason::HealthRegression => "health_regression",
+        OtaRolloutDecisionReason::MissingSignedRollbackTarget => "missing_signed_rollback_target",
+        OtaRolloutDecisionReason::UnsignedTargetVersion => "unsigned_target_version",
+        OtaRolloutDecisionReason::MissingStageNode => "missing_stage_node",
+        OtaRolloutDecisionReason::MissingHealthReport => "missing_health_report",
+    }
+}
+
+fn rollout_control_reason_code(reason: RolloutControlReason) -> &'static str {
+    match reason {
+        RolloutControlReason::StartedByOperator => "started_by_operator",
+        RolloutControlReason::PausedByOperator => "paused_by_operator",
+        RolloutControlReason::AbortedByOperator => "aborted_by_operator",
+        RolloutControlReason::SimulationValidationRequired => "simulation_validation_required",
+    }
+}
+
+fn fleet_health_verdict_alert(
+    verdict: &ComponentHealthVerdict,
+    components: &[FleetComponentRecord],
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+) -> FleetAlertRecord {
+    let airframe_id = airframe_for_component(components, &verdict.component_id);
+    let indicator = verdict
+        .indicator
+        .map(FleetHealthIndicator::as_str)
+        .unwrap_or("unknown_indicator");
+    let reason_code = health_verdict_reason_code(verdict.reason_code);
+    FleetAlertRecord {
+        alert_id: format!(
+            "fleet-health:{}:{}:{}",
+            verdict.component_id, indicator, reason_code
+        ),
+        node_id: airframe_id,
+        correlation_id: Some(format!("component:{}", verdict.component_id)),
+        kind: FleetAlertKind::FleetHealth,
+        severity: if verdict.status == ComponentHealthVerdictStatus::Critical {
+            FleetAlertSeverity::Critical
+        } else {
+            FleetAlertSeverity::Warning
+        },
+        route: FleetAlertRoute::OperatorConsole,
+        evidence: FleetAlertEvidence {
+            metric_name: indicator.to_string(),
+            observed_value: verdict.value.unwrap_or(0.0),
+            threshold_value: verdict.threshold.unwrap_or(0.0),
+            comparator: FleetAlertComparator::GreaterThanOrEqual,
+        },
+        message: format!(
+            "component {} health verdict {:?}: {}",
+            verdict.component_id, verdict.status, reason_code
+        ),
+        evaluated_at,
+    }
+}
+
+fn fleet_health_degradation_alert(
+    report: &HealthDegradationDetectionReport,
+    components: &[FleetComponentRecord],
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+) -> FleetAlertRecord {
+    let airframe_id = airframe_for_component(components, &report.component_id);
+    let reason_code = health_degradation_reason_code(report.reason_code);
+    FleetAlertRecord {
+        alert_id: format!(
+            "fleet-health:{}:{}:{}",
+            report.component_id,
+            report.indicator.as_str(),
+            reason_code
+        ),
+        node_id: airframe_id,
+        correlation_id: Some(format!("component:{}", report.component_id)),
+        kind: FleetAlertKind::FleetHealth,
+        severity: FleetAlertSeverity::Warning,
+        route: FleetAlertRoute::OperatorConsole,
+        evidence: FleetAlertEvidence {
+            metric_name: format!("{}_slope_per_day", report.indicator.as_str()),
+            observed_value: report.slope_per_day.unwrap_or(0.0),
+            threshold_value: 0.0,
+            comparator: FleetAlertComparator::GreaterThanOrEqual,
+        },
+        message: format!(
+            "component {} degradation event: {}",
+            report.component_id, reason_code
+        ),
+        evaluated_at,
+    }
+}
+
+fn airframe_for_component(components: &[FleetComponentRecord], component_id: &str) -> String {
+    components
+        .iter()
+        .find(|component| component.component_id == component_id)
+        .and_then(|component| component.airframe_id.clone())
+        .unwrap_or_else(|| format!("component:{component_id}"))
 }
 
 pub fn component_event(
@@ -1365,6 +3275,28 @@ fn ota_decision(
     }
 }
 
+fn rollout_strategy_result(
+    rollout_id: String,
+    requested_at: String,
+    target_version: OtaArtifactVersion,
+    status: RolloutStrategyAdvisoryStatus,
+    reason_code: RolloutStrategyAdvisoryReason,
+    proposed_steps: Vec<RolloutStrategyStep>,
+    evidence_refs: Vec<String>,
+) -> RolloutStrategyAdvisory {
+    RolloutStrategyAdvisory {
+        rollout_id,
+        requested_at,
+        target_version,
+        status,
+        reason_code,
+        proposed_steps,
+        evidence_refs,
+        requires_approval: true,
+        auto_started: false,
+    }
+}
+
 fn normalize_health_telemetry_sample(
     sample: HealthTelemetrySample,
 ) -> Result<HealthTelemetrySample, FleetHealthError> {
@@ -1408,11 +3340,235 @@ fn has_later_gap(gaps: &[HealthTelemetryGap], component_id: &str, sample_ts: &st
         .any(|gap| gap.component_id == component_id && gap.started_at.as_str() > sample_ts)
 }
 
+struct ParsedHealthIndicatorSample {
+    sample: FleetHealthIndicatorSample,
+    parsed_ts: chrono::DateTime<chrono::Utc>,
+}
+
+struct ParsedNodeMetricSample {
+    sample: NodeMetricTrendSample,
+    parsed_ts: chrono::DateTime<chrono::Utc>,
+}
+
+fn validate_degradation_config(
+    config: HealthDegradationDetectionConfig,
+) -> Result<(), FleetHealthError> {
+    let valid_window = config.min_history_points >= 2
+        && config.recent_window_points >= 2
+        && config.recent_window_points <= config.min_history_points;
+    let valid_thresholds = config.min_adverse_slope_per_day.is_finite()
+        && config.min_adverse_delta.is_finite()
+        && config.min_adverse_slope_per_day > 0.0
+        && config.min_adverse_delta > 0.0;
+
+    if valid_window && valid_thresholds {
+        Ok(())
+    } else {
+        Err(FleetHealthError::InvalidHealthDegradationConfig)
+    }
+}
+
+fn validate_maintenance_schedule_window(
+    lower_days: f64,
+    expected_days: f64,
+    upper_days: f64,
+) -> Result<(), FleetHealthError> {
+    let valid = lower_days.is_finite()
+        && expected_days.is_finite()
+        && upper_days.is_finite()
+        && lower_days >= 0.0
+        && expected_days >= lower_days
+        && upper_days >= expected_days;
+    if valid {
+        Ok(())
+    } else {
+        Err(FleetHealthError::InvalidMaintenanceScheduleWindow)
+    }
+}
+
+fn add_days_to_timestamp(
+    timestamp: chrono::DateTime<chrono::Utc>,
+    days: f64,
+) -> Result<String, FleetHealthError> {
+    if !days.is_finite() || days < 0.0 {
+        return Err(FleetHealthError::InvalidMaintenanceScheduleWindow);
+    }
+    let seconds = (days * 86_400.0).round();
+    if seconds < 0.0 || seconds > i64::MAX as f64 {
+        return Err(FleetHealthError::InvalidMaintenanceScheduleWindow);
+    }
+    let scheduled = timestamp
+        .checked_add_signed(chrono::Duration::seconds(seconds as i64))
+        .ok_or(FleetHealthError::InvalidMaintenanceScheduleWindow)?;
+    Ok(scheduled.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+fn parse_health_sample_timestamp(
+    value: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, FleetHealthError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+        .map_err(|_| FleetHealthError::InvalidTelemetryTimestamp {
+            value: value.to_string(),
+        })
+}
+
+fn linear_slope_per_day(window: &[ParsedHealthIndicatorSample]) -> f64 {
+    let first_ts = window
+        .first()
+        .expect("slope requires non-empty window")
+        .parsed_ts;
+    let xs = window.iter().map(|point| {
+        point
+            .parsed_ts
+            .signed_duration_since(first_ts)
+            .num_seconds() as f64
+            / 86_400.0
+    });
+    let ys = window.iter().map(|point| point.sample.value);
+    let count = window.len() as f64;
+    let mean_x = xs.clone().sum::<f64>() / count;
+    let mean_y = ys.clone().sum::<f64>() / count;
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    for point in window {
+        let x = point
+            .parsed_ts
+            .signed_duration_since(first_ts)
+            .num_seconds() as f64
+            / 86_400.0;
+        let y = point.sample.value;
+        numerator += (x - mean_x) * (y - mean_y);
+        denominator += (x - mean_x) * (x - mean_x);
+    }
+    if denominator == 0.0 {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+fn sorted_unique_evidence_refs(window: &[ParsedHealthIndicatorSample]) -> Vec<String> {
+    let mut refs = window
+        .iter()
+        .map(|point| point.sample.source_ref.clone())
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn health_evidence_input_ref(
+    ref_kind: String,
+    ref_id: String,
+    value: Option<String>,
+) -> Result<HealthEvidenceInputRef, FleetHealthError> {
+    Ok(HealthEvidenceInputRef {
+        ref_kind: normalize_required_text(ref_kind, FleetHealthError::EmptyHealthEvidenceRefKind)?,
+        ref_id: normalize_required_text(ref_id, FleetHealthError::EmptyHealthEvidenceRefId)?,
+        value,
+    })
+}
+
+fn health_verdict_reason_code(reason_code: HealthVerdictReasonCode) -> &'static str {
+    match reason_code {
+        HealthVerdictReasonCode::AllIndicatorsWithinThreshold => "all_indicators_within_threshold",
+        HealthVerdictReasonCode::WatchThresholdExceeded => "watch_threshold_exceeded",
+        HealthVerdictReasonCode::DegradedThresholdExceeded => "degraded_threshold_exceeded",
+        HealthVerdictReasonCode::CriticalThresholdExceeded => "critical_threshold_exceeded",
+    }
+}
+
+fn health_degradation_reason_code(reason_code: HealthDegradationReasonCode) -> &'static str {
+    match reason_code {
+        HealthDegradationReasonCode::WithinTrendBand => "within_trend_band",
+        HealthDegradationReasonCode::SustainedAdverseSlope => "sustained_adverse_slope",
+        HealthDegradationReasonCode::DriftExceeded => "drift_exceeded",
+        HealthDegradationReasonCode::InsufficientHistory => "insufficient_history",
+    }
+}
+
+fn health_evidence_decision_hash(
+    subject_kind: HealthEvidenceSubjectKind,
+    component_id: &str,
+    method_version: &str,
+    reason_code: &str,
+    input_refs: &[HealthEvidenceInputRef],
+) -> String {
+    let mut canonical = String::new();
+    canonical.push_str(health_evidence_subject_kind(subject_kind));
+    canonical.push('|');
+    canonical.push_str(component_id);
+    canonical.push('|');
+    canonical.push_str(method_version);
+    canonical.push('|');
+    canonical.push_str(reason_code);
+    for input_ref in input_refs {
+        canonical.push('|');
+        canonical.push_str(&input_ref.ref_kind);
+        canonical.push('=');
+        canonical.push_str(&input_ref.ref_id);
+        canonical.push('=');
+        canonical.push_str(input_ref.value.as_deref().unwrap_or(""));
+    }
+    format!("{:016x}", fnv1a64(canonical.as_bytes()))
+}
+
+fn health_evidence_subject_kind(subject_kind: HealthEvidenceSubjectKind) -> &'static str {
+    match subject_kind {
+        HealthEvidenceSubjectKind::ComponentVerdict => "component_verdict",
+        HealthEvidenceSubjectKind::DegradationEvent => "degradation_event",
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn validate_finite(value: f64) -> Result<(), FleetHealthError> {
     if value.is_finite() {
         Ok(())
     } else {
         Err(FleetHealthError::InvalidTelemetryValue)
+    }
+}
+
+fn validate_confidence(value: f64) -> Result<(), FleetHealthError> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(FleetHealthError::InvalidRemainingUsefulLifeConfidence)
+    }
+}
+
+fn rul_unavailable(
+    component_id: String,
+    evaluated_at: String,
+    method_version: String,
+    indicator: FleetHealthIndicator,
+    reason_code: RemainingUsefulLifeReasonCode,
+    confidence: f64,
+    evidence_refs: Vec<String>,
+    readiness_status: FleetReadinessDecisionStatus,
+) -> RemainingUsefulLifeEstimate {
+    RemainingUsefulLifeEstimate {
+        component_id,
+        evaluated_at,
+        method_version,
+        status: RemainingUsefulLifeStatus::Unavailable,
+        reason_code,
+        indicator,
+        expected_days: None,
+        lower_days: None,
+        upper_days: None,
+        confidence,
+        evidence_refs,
+        readiness_status,
     }
 }
 
@@ -1584,6 +3740,38 @@ fn normalize_service_history_entry(
     })
 }
 
+fn normalize_work_order_parts(
+    parts: Vec<MaintenancePartUsage>,
+) -> Result<Vec<MaintenancePartUsage>, FleetHealthError> {
+    parts
+        .into_iter()
+        .map(|part| {
+            if part.quantity == 0 {
+                return Err(FleetHealthError::InvalidPartQuantity);
+            }
+            Ok(MaintenancePartUsage {
+                part_id: normalize_required_text(part.part_id, FleetHealthError::EmptyPartId)?,
+                quantity: part.quantity,
+            })
+        })
+        .collect()
+}
+
+fn format_work_order_parts_note(reason: &str, parts: &[MaintenancePartUsage]) -> String {
+    if parts.is_empty() {
+        return format!("work_order_reason={reason};parts=none");
+    }
+    let mut rendered_parts = parts
+        .iter()
+        .map(|part| format!("{}x{}", part.part_id, part.quantity))
+        .collect::<Vec<_>>();
+    rendered_parts.sort();
+    format!(
+        "work_order_reason={reason};parts={}",
+        rendered_parts.join(",")
+    )
+}
+
 fn normalize_required_text(
     value: String,
     error: FleetHealthError,
@@ -1621,20 +3809,51 @@ fn validate_nonnegative_finite(
 #[cfg(test)]
 mod tests {
     use super::{
-        accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
-        build_component_record, component_event, derive_health_indicators,
-        evaluate_component_health_verdict, evaluate_fleet_readiness, evaluate_ota_rollout,
-        install_component, ComponentHealthVerdict, ComponentHealthVerdictRequest,
+        accrue_component_duty, append_health_evidence_record, apply_rollout_control,
+        approve_predictive_maintenance_schedule, build_component_duty_accruals,
+        build_component_record, build_degradation_event_evidence_record,
+        build_fleet_health_dashboard, build_fleet_operations_dashboard_feed,
+        build_health_verdict_evidence_record, close_maintenance_work_order, component_event,
+        derive_health_indicators, detect_health_indicator_degradation,
+        estimate_remaining_useful_life, evaluate_battery_health_trend,
+        evaluate_component_health_verdict, evaluate_fleet_readiness,
+        evaluate_fleet_readiness_with_work_orders, evaluate_ota_rollout,
+        evaluate_predictive_maintenance_advisory, fleet_operations_source_current,
+        fleet_operations_source_unavailable, install_component, integrate_ground_vehicle_health,
+        open_maintenance_work_order, propose_predictive_maintenance_schedule,
+        refuse_health_evidence_overwrite, suggest_rollout_strategy, BatteryHealthTrendConfig,
+        CloseMaintenanceWorkOrderRequest, ComponentHealthVerdict, ComponentHealthVerdictRequest,
         ComponentHealthVerdictStatus, ComponentServiceLimit, DutyAccrualRequest,
-        FleetComponentRecord, FleetComponentType, FleetHealthError, FleetHealthIndicator,
-        FleetReadinessBlockReason, FleetReadinessDecisionStatus, FleetReadinessRequest,
-        HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
-        HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
-        InstallComponentRequest, OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
+        FleetComponentRecord, FleetComponentType, FleetHealthDashboardAircraftStatus,
+        FleetHealthDashboardRequest, FleetHealthError, FleetHealthIndicator,
+        FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
+        FleetOperationsRolloutFeedState, FleetReadinessBlockReason, FleetReadinessDecision,
+        FleetReadinessDecisionStatus, FleetReadinessRequest, GroundVehicleHealthIngestRequest,
+        HealthDegradationDetectionConfig, HealthDegradationDetectionRequest,
+        HealthDegradationDetectionStatus, HealthDegradationReasonCode, HealthEvidenceRecord,
+        HealthEvidenceSubjectKind, HealthIndicatorFreshness, HealthIndicatorThreshold,
+        HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
+        InstallComponentRequest, MaintenancePartUsage, MaintenanceWorkOrderSeverity,
+        MaintenanceWorkOrderStatus, NodeMetricTrendSample, OpenMaintenanceWorkOrderRequest,
+        OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
         OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
-        RegisterComponentRequest, RolloutControlAction, RolloutControlReason,
-        RolloutControlRequest, RolloutControlStatus, ServiceHistoryEntry,
+        PredictiveMaintenanceAdvisoryReason, PredictiveMaintenanceAdvisoryRequest,
+        PredictiveMaintenanceAdvisoryStatus, PredictiveMaintenanceScheduleApprovalRequest,
+        PredictiveMaintenanceScheduleApprovalStatus, PredictiveMaintenanceScheduleRequest,
+        RegisterComponentRequest, RemainingUsefulLifeReasonCode, RemainingUsefulLifeRequest,
+        RemainingUsefulLifeStatus, RolloutControlAction, RolloutControlReason,
+        RolloutControlRequest, RolloutControlStatus, RolloutStrategyAdvisoryReason,
+        RolloutStrategyAdvisoryRequest, RolloutStrategyAdvisoryStatus, ServiceHistoryEntry,
         TelemetryHealthIndicatorRequest,
+    };
+    use shared::fleet_alerts::{
+        FleetAlertComparator, FleetAlertEvidence, FleetAlertKind, FleetAlertRecord,
+        FleetAlertRoute, FleetAlertSeverity,
+    };
+    use shared::schemas::{
+        FleetNodeComponentHealth, FleetNodeComponentStatus, FleetNodeHealthState,
+        FleetNodeInventoryEntry, FleetNodeKind, FleetNodeRuntimeMode, FleetNodeStatus,
+        FleetVersionInventory,
     };
     use timeseries::SeriesValue;
 
@@ -1908,6 +4127,770 @@ mod tests {
     }
 
     #[test]
+    fn battery_cycle_count_and_resistance_trend_tracks_completed_discharge() {
+        let component =
+            component_for_readiness("battery-pack-001", FleetComponentType::Battery, 0.0, 0, 0.0);
+        let accruals = build_component_duty_accruals(
+            DutyAccrualRequest {
+                session_id: "session-001".to_string(),
+                airframe_id: "airframe-1".to_string(),
+                flight_hours: 0.6,
+                cycles: 1,
+                duty_score: 0.4,
+                ended_at: "2026-06-12T12:10:00Z".to_string(),
+            },
+            &[component.component_id.clone()],
+        )
+        .expect("battery discharge cycle should accrue");
+        let updated =
+            accrue_component_duty(&component, &accruals[0], "2026-06-12T12:10:00Z".to_string())
+                .expect("battery cycle total should update");
+        let derived = derive_health_indicators(TelemetryHealthIndicatorRequest {
+            source_ref: "telemetry:session-001".to_string(),
+            created_at: "2026-06-12T12:20:00Z".to_string(),
+            samples: vec![HealthTelemetrySample {
+                component_id: "battery-pack-001".to_string(),
+                component_type: FleetComponentType::Battery,
+                ts: "2026-06-12T12:09:00Z".to_string(),
+                battery_open_circuit_voltage_v: Some(16.8),
+                battery_voltage_v: Some(16.24),
+                battery_current_a: Some(28.0),
+                motor_vibration_g: None,
+                esc_temperature_c: None,
+            }],
+            telemetry_gaps: vec![],
+        })
+        .expect("resistance sample should derive from telemetry");
+
+        let trend = evaluate_battery_health_trend(
+            &updated,
+            derived.samples,
+            BatteryHealthTrendConfig {
+                max_cycles: 200,
+                resistance_degraded_at_milliohm: 60.0,
+            },
+            "2026-06-12T12:30:00Z".to_string(),
+        )
+        .expect("battery trend should evaluate");
+
+        assert_eq!(trend.component_id, "battery-pack-001");
+        assert_eq!(trend.cycle_count, 1);
+        assert_eq!(trend.resistance_sample_count, 1);
+        assert!((trend.latest_internal_resistance_milliohm - 20.0).abs() < 1e-9);
+        assert_eq!(trend.status, ComponentHealthVerdictStatus::Ok);
+        assert_eq!(
+            trend.evidence[0].indicator,
+            FleetHealthIndicator::BatteryCycleCount
+        );
+        assert_eq!(
+            trend.evidence[1].indicator,
+            FleetHealthIndicator::BatteryInternalResistance
+        );
+    }
+
+    #[test]
+    fn battery_trend_flags_degraded_pack_over_cycle_limit_with_evidence() {
+        let component = component_for_readiness(
+            "battery-pack-001",
+            FleetComponentType::Battery,
+            80.0,
+            201,
+            70.0,
+        );
+        let trend = evaluate_battery_health_trend(
+            &component,
+            vec![indicator_sample(
+                "battery-pack-001",
+                FleetHealthIndicator::BatteryInternalResistance,
+                31.0,
+            )],
+            BatteryHealthTrendConfig {
+                max_cycles: 200,
+                resistance_degraded_at_milliohm: 60.0,
+            },
+            "2026-06-12T12:30:00Z".to_string(),
+        )
+        .expect("battery trend should evaluate");
+
+        assert_eq!(trend.status, ComponentHealthVerdictStatus::Degraded);
+        let cycle_evidence = trend
+            .evidence
+            .iter()
+            .find(|item| item.indicator == FleetHealthIndicator::BatteryCycleCount)
+            .expect("cycle evidence should be present");
+        assert_eq!(cycle_evidence.value, 201.0);
+        assert_eq!(cycle_evidence.threshold, 200.0);
+        assert_eq!(
+            cycle_evidence.reason_code,
+            HealthVerdictReasonCode::DegradedThresholdExceeded
+        );
+    }
+
+    #[test]
+    fn degradation_detector_keeps_stable_series_without_event() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.21,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-15T00:00:00Z",
+                "telemetry:mission-003",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.22,
+                "2026-06-22T00:00:00Z",
+                "telemetry:mission-004",
+            ),
+        ]))
+        .expect("stable series should evaluate");
+
+        assert_eq!(report.status, HealthDegradationDetectionStatus::Stable);
+        assert_eq!(
+            report.reason_code,
+            HealthDegradationReasonCode::WithinTrendBand
+        );
+        assert!(report.event.is_none());
+        assert!(report.slope_per_day.expect("slope should be present") < 0.02);
+    }
+
+    #[test]
+    fn degradation_detector_raises_event_for_sustained_adverse_slope() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.35,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-15T00:00:00Z",
+                "telemetry:mission-003",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.65,
+                "2026-06-22T00:00:00Z",
+                "telemetry:mission-004",
+            ),
+        ]))
+        .expect("degrading series should evaluate");
+
+        assert_eq!(
+            report.status,
+            HealthDegradationDetectionStatus::DegradationDetected
+        );
+        assert_eq!(
+            report.reason_code,
+            HealthDegradationReasonCode::SustainedAdverseSlope
+        );
+        let event = report.event.expect("event should be raised");
+        assert_eq!(event.window_start, "2026-06-01T00:00:00Z");
+        assert_eq!(event.window_end, "2026-06-22T00:00:00Z");
+        assert!(event.slope_per_day >= 0.02);
+        assert_eq!(
+            event.evidence_refs,
+            vec![
+                "telemetry:mission-001".to_string(),
+                "telemetry:mission-002".to_string(),
+                "telemetry:mission-003".to_string(),
+                "telemetry:mission-004".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn degradation_detector_surfaces_insufficient_history_without_trend() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+        ]))
+        .expect("insufficient history should be reported, not errored");
+
+        assert_eq!(
+            report.status,
+            HealthDegradationDetectionStatus::InsufficientHistory
+        );
+        assert_eq!(
+            report.reason_code,
+            HealthDegradationReasonCode::InsufficientHistory
+        );
+        assert!(report.event.is_none());
+        assert!(report.slope_per_day.is_none());
+        assert!(report.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn predictive_maintenance_advisory_flags_node_and_cites_metric_trend() {
+        let advisory = evaluate_predictive_maintenance_advisory(predictive_advisory_request(vec![
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.01,
+                "2026-06-01T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.04,
+                "2026-06-08T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.09,
+                "2026-06-15T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.16,
+                "2026-06-22T00:00:00Z",
+            ),
+        ]))
+        .expect("advisory should evaluate");
+
+        assert_eq!(advisory.status, PredictiveMaintenanceAdvisoryStatus::Raised);
+        assert_eq!(
+            advisory.reason_code,
+            PredictiveMaintenanceAdvisoryReason::UpwardMetricTrend
+        );
+        assert_eq!(advisory.node_id, "edge-1");
+        assert_eq!(advisory.metric_name, "heartbeat_error_rate");
+        assert!(advisory.slope_per_day.expect("slope should be present") > 0.006);
+        assert!(advisory.delta.expect("delta should be present") >= 0.15);
+        assert_eq!(advisory.evidence_refs.len(), 4);
+        assert!(advisory
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("metric:edge-1:heartbeat_error_rate")));
+    }
+
+    #[test]
+    fn predictive_maintenance_advisory_does_not_flag_stable_metrics() {
+        let advisory = evaluate_predictive_maintenance_advisory(predictive_advisory_request(vec![
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.020,
+                "2026-06-01T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.021,
+                "2026-06-08T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.019,
+                "2026-06-15T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.020,
+                "2026-06-22T00:00:00Z",
+            ),
+        ]))
+        .expect("stable advisory should evaluate");
+
+        assert_eq!(
+            advisory.status,
+            PredictiveMaintenanceAdvisoryStatus::NotRaised
+        );
+        assert_eq!(
+            advisory.reason_code,
+            PredictiveMaintenanceAdvisoryReason::StableMetricTrend
+        );
+        assert!(!advisory.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn predictive_maintenance_advisory_is_advisory_only_without_auto_action() {
+        let advisory = evaluate_predictive_maintenance_advisory(predictive_advisory_request(vec![
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.01,
+                "2026-06-01T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.05,
+                "2026-06-08T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.11,
+                "2026-06-15T00:00:00Z",
+            ),
+            node_metric_sample_at(
+                "edge-1",
+                "heartbeat_error_rate",
+                0.20,
+                "2026-06-22T00:00:00Z",
+            ),
+        ]))
+        .expect("advisory should evaluate");
+
+        assert_eq!(advisory.status, PredictiveMaintenanceAdvisoryStatus::Raised);
+        assert!(advisory.requires_approval);
+        assert!(!advisory.auto_action_taken);
+    }
+
+    #[test]
+    fn health_verdict_evidence_rerun_produces_identical_hash() {
+        let verdict = evaluate_component_health_verdict(ComponentHealthVerdictRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T12:30:00Z".to_string(),
+            method_version: "fleet-health-thresholds-v1".to_string(),
+            samples: vec![indicator_sample(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                1.2,
+            )],
+            thresholds: vec![threshold(
+                FleetHealthIndicator::MotorVibration,
+                0.6,
+                1.0,
+                1.5,
+            )],
+        })
+        .expect("verdict should evaluate");
+
+        let first = build_health_verdict_evidence_record(
+            "health-evidence:motor-001:thresholds-v1".to_string(),
+            &verdict,
+            "2026-06-22T12:31:00Z".to_string(),
+        )
+        .expect("evidence should build");
+        let second = build_health_verdict_evidence_record(
+            "health-evidence:motor-001:thresholds-v1".to_string(),
+            &verdict,
+            "2026-06-22T12:45:00Z".to_string(),
+        )
+        .expect("rerun evidence should build");
+
+        assert_eq!(first.decision_hash, second.decision_hash);
+        assert_eq!(first.reason_code, "degraded_threshold_exceeded");
+        assert_eq!(
+            first.subject_kind,
+            HealthEvidenceSubjectKind::ComponentVerdict
+        );
+        assert_eq!(first.input_refs.len(), 1);
+    }
+
+    #[test]
+    fn health_evidence_appends_method_version_change_without_overwriting_prior() {
+        let old_verdict = component_verdict(
+            "motor-001",
+            ComponentHealthVerdictStatus::Watch,
+            HealthIndicatorFreshness::Fresh,
+        );
+        let mut new_verdict = component_verdict(
+            "motor-001",
+            ComponentHealthVerdictStatus::Degraded,
+            HealthIndicatorFreshness::Fresh,
+        );
+        new_verdict.method_version = "fleet-health-thresholds-v2".to_string();
+        let first = build_health_verdict_evidence_record(
+            "health-evidence:motor-001:thresholds-v1".to_string(),
+            &old_verdict,
+            "2026-06-22T12:31:00Z".to_string(),
+        )
+        .expect("old evidence should build");
+        let second = build_health_verdict_evidence_record(
+            "health-evidence:motor-001:thresholds-v2".to_string(),
+            &new_verdict,
+            "2026-06-22T13:31:00Z".to_string(),
+        )
+        .expect("new evidence should build");
+
+        let mut records = Vec::new();
+        append_health_evidence_record(&mut records, first.clone())
+            .expect("first append should work");
+        append_health_evidence_record(&mut records, second.clone())
+            .expect("new method append should work");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].method_version, "fleet-health-thresholds-v1");
+        assert_eq!(records[1].method_version, "fleet-health-thresholds-v2");
+        assert_ne!(records[0].decision_hash, records[1].decision_hash);
+    }
+
+    #[test]
+    fn health_evidence_refuses_in_place_overwrite() {
+        let existing = health_evidence_record("health-evidence:motor-001", "hash-a");
+        let replacement = health_evidence_record("health-evidence:motor-001", "hash-b");
+        let error = refuse_health_evidence_overwrite(&existing, &replacement)
+            .expect_err("different hash under same record id should be refused");
+
+        assert_eq!(
+            error,
+            FleetHealthError::HealthEvidenceOverwriteRefused {
+                record_id: "health-evidence:motor-001".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn degradation_event_evidence_retains_series_window_refs() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.35,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-15T00:00:00Z",
+                "telemetry:mission-003",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.65,
+                "2026-06-22T00:00:00Z",
+                "telemetry:mission-004",
+            ),
+        ]))
+        .expect("degradation report should evaluate");
+        let evidence = build_degradation_event_evidence_record(
+            "health-evidence:motor-001:degradation-v1".to_string(),
+            &report,
+            "2026-06-22T12:31:00Z".to_string(),
+        )
+        .expect("degradation evidence should build");
+
+        assert_eq!(
+            evidence.subject_kind,
+            HealthEvidenceSubjectKind::DegradationEvent
+        );
+        assert_eq!(evidence.reason_code, "sustained_adverse_slope");
+        assert_eq!(evidence.input_refs.len(), 4);
+        assert!(evidence.input_refs[0]
+            .value
+            .as_deref()
+            .expect("window value should be present")
+            .contains("window_start=2026-06-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn rul_estimate_returns_range_with_confidence_and_evidence() {
+        let report = degrading_trend_report();
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: report,
+            readiness_decision: permitted_readiness_decision(),
+            current_value: 0.65,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should estimate");
+
+        assert_eq!(estimate.status, RemainingUsefulLifeStatus::Available);
+        assert_eq!(
+            estimate.reason_code,
+            RemainingUsefulLifeReasonCode::TrendBasedEstimate
+        );
+        assert!(estimate.expected_days.expect("expected days") > 20.0);
+        assert!(estimate.lower_days.expect("lower days") < estimate.expected_days.unwrap());
+        assert!(estimate.upper_days.expect("upper days") > estimate.expected_days.unwrap());
+        assert_eq!(estimate.confidence, 0.80);
+        assert_eq!(estimate.evidence_refs.len(), 4);
+    }
+
+    #[test]
+    fn rul_estimate_is_unavailable_for_insufficient_history() {
+        let report = detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+        ]))
+        .expect("insufficient history should evaluate");
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: report,
+            readiness_decision: permitted_readiness_decision(),
+            current_value: 0.50,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should return unavailable");
+
+        assert_eq!(estimate.status, RemainingUsefulLifeStatus::Unavailable);
+        assert_eq!(
+            estimate.reason_code,
+            RemainingUsefulLifeReasonCode::InsufficientHistory
+        );
+        assert!(estimate.expected_days.is_none());
+        assert!(estimate.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn rul_estimate_refuses_to_clear_blocked_readiness_gate() {
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: degrading_trend_report(),
+            readiness_decision: blocked_readiness_decision(),
+            current_value: 0.65,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should refuse advisory clearance");
+
+        assert_eq!(estimate.status, RemainingUsefulLifeStatus::Refused);
+        assert_eq!(
+            estimate.reason_code,
+            RemainingUsefulLifeReasonCode::ReadinessGateBlocked
+        );
+        assert_eq!(
+            estimate.readiness_status,
+            FleetReadinessDecisionStatus::Blocked
+        );
+        assert!(estimate.expected_days.is_none());
+    }
+
+    #[test]
+    fn predictive_maintenance_schedule_proposes_window_with_uncertainty_and_approval_gate() {
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: degrading_trend_report(),
+            readiness_decision: permitted_readiness_decision(),
+            current_value: 0.65,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should estimate");
+
+        let proposal = propose_predictive_maintenance_schedule(
+            PredictiveMaintenanceScheduleRequest {
+                proposal_id: Some("sched-001".to_string()),
+                generated_at: "2026-06-22T16:00:00Z".to_string(),
+                rul_estimate: estimate,
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                requested_by: "planner-1".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: false,
+            },
+            "generated-sched".to_string(),
+        )
+        .expect("schedule proposal should build");
+
+        assert_eq!(proposal.proposal_id, "sched-001");
+        assert_eq!(proposal.component_id, "motor-001");
+        assert_eq!(
+            proposal.approval_status,
+            PredictiveMaintenanceScheduleApprovalStatus::PendingFleetTechApproval
+        );
+        assert!(proposal.requires_fleet_tech_approval);
+        assert!(!proposal.dispatch_authorized);
+        assert!(!proposal.clears_verdict);
+        assert!(proposal.window_start < proposal.expected_service_at);
+        assert!(proposal.expected_service_at < proposal.window_end);
+        assert!(proposal.uncertainty_summary.contains("RUL"));
+        assert!(proposal.uncertainty_summary.contains("confidence 80%"));
+        assert!(proposal.uncertainty_lower_days < proposal.uncertainty_expected_days);
+        assert!(proposal.uncertainty_expected_days < proposal.uncertainty_upper_days);
+        assert_eq!(proposal.evidence_refs.len(), 4);
+    }
+
+    #[test]
+    fn approved_predictive_maintenance_schedule_opens_work_order_without_dispatch_authority() {
+        let proposal = propose_predictive_maintenance_schedule(
+            PredictiveMaintenanceScheduleRequest {
+                proposal_id: Some("sched-001".to_string()),
+                generated_at: "2026-06-22T16:00:00Z".to_string(),
+                rul_estimate: estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+                    component_id: "motor-001".to_string(),
+                    evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+                    method_version: "fleet-rul-v1".to_string(),
+                    enabled: true,
+                    trend_report: degrading_trend_report(),
+                    readiness_decision: permitted_readiness_decision(),
+                    current_value: 0.65,
+                    failure_threshold: 1.25,
+                    confidence: 0.80,
+                })
+                .expect("rul should estimate"),
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                requested_by: "planner-1".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: false,
+            },
+            "generated-sched".to_string(),
+        )
+        .expect("schedule proposal should build");
+
+        let approved = approve_predictive_maintenance_schedule(
+            proposal,
+            PredictiveMaintenanceScheduleApprovalRequest {
+                approved_by: "fleet-tech-1".to_string(),
+                approved_at: "2026-06-22T17:00:00Z".to_string(),
+                generated_wo_id: "wo-predictive-001".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: false,
+            },
+        )
+        .expect("approval should open work order");
+
+        assert_eq!(
+            approved.proposal.approval_status,
+            PredictiveMaintenanceScheduleApprovalStatus::Approved
+        );
+        assert_eq!(approved.work_order.wo_id, "wo-predictive-001");
+        assert_eq!(approved.work_order.status, MaintenanceWorkOrderStatus::Open);
+        assert!(approved.work_order.reason.contains("uncertainty RUL"));
+        assert!(!approved.dispatch_authorized);
+        assert!(!approved.clears_verdict);
+        assert_eq!(
+            approved.readiness_status,
+            FleetReadinessDecisionStatus::Permitted
+        );
+    }
+
+    #[test]
+    fn predictive_maintenance_schedule_refuses_auto_dispatch_or_verdict_clearance() {
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: degrading_trend_report(),
+            readiness_decision: permitted_readiness_decision(),
+            current_value: 0.65,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should estimate");
+
+        let proposal_error = propose_predictive_maintenance_schedule(
+            PredictiveMaintenanceScheduleRequest {
+                proposal_id: Some("sched-001".to_string()),
+                generated_at: "2026-06-22T16:00:00Z".to_string(),
+                rul_estimate: estimate.clone(),
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                requested_by: "planner-1".to_string(),
+                authorize_dispatch: true,
+                clear_existing_verdict: false,
+            },
+            "generated-sched".to_string(),
+        )
+        .expect_err("proposal should not authorize dispatch");
+        assert_eq!(
+            proposal_error,
+            FleetHealthError::PredictiveMaintenanceAutoActionRefused
+        );
+
+        let proposal = propose_predictive_maintenance_schedule(
+            PredictiveMaintenanceScheduleRequest {
+                proposal_id: Some("sched-001".to_string()),
+                generated_at: "2026-06-22T16:00:00Z".to_string(),
+                rul_estimate: estimate,
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                requested_by: "planner-1".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: false,
+            },
+            "generated-sched".to_string(),
+        )
+        .expect("schedule proposal should build");
+        let approval_error = approve_predictive_maintenance_schedule(
+            proposal,
+            PredictiveMaintenanceScheduleApprovalRequest {
+                approved_by: "fleet-tech-1".to_string(),
+                approved_at: "2026-06-22T17:00:00Z".to_string(),
+                generated_wo_id: "wo-predictive-001".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: true,
+            },
+        )
+        .expect_err("approval should not clear verdicts");
+
+        assert_eq!(
+            approval_error,
+            FleetHealthError::PredictiveMaintenanceAutoActionRefused
+        );
+    }
+
+    #[test]
     fn component_verdict_is_ok_when_indicators_are_within_thresholds() {
         let verdict = evaluate_component_health_verdict(ComponentHealthVerdictRequest {
             component_id: "battery-pack-001".to_string(),
@@ -2089,6 +5072,47 @@ mod tests {
     }
 
     #[test]
+    fn ground_vehicle_health_uses_shared_readiness_contract() {
+        let integration = integrate_ground_vehicle_health(GroundVehicleHealthIngestRequest {
+            vehicle_id: "tractor-001".to_string(),
+            checked_at: "2026-06-12T13:00:00Z".to_string(),
+            component: component_for_readiness(
+                "tractor-hydraulic-pump-1",
+                FleetComponentType::Motor,
+                155.0,
+                0,
+                12.0,
+            ),
+            service_limit: service_limit("tractor-hydraulic-pump-1", Some(150.0), None, None),
+            health_verdict: component_verdict(
+                "tractor-hydraulic-pump-1",
+                ComponentHealthVerdictStatus::Ok,
+                HealthIndicatorFreshness::Fresh,
+            ),
+        })
+        .expect("tractor health should integrate through readiness");
+
+        assert_eq!(integration.vehicle_id, "tractor-001");
+        assert_eq!(
+            integration.component.airframe_id.as_deref(),
+            Some("tractor-001")
+        );
+        assert_eq!(
+            integration.readiness_decision.status,
+            FleetReadinessDecisionStatus::Blocked
+        );
+        assert_eq!(
+            integration.readiness_decision.blockers[0].reason_code,
+            FleetReadinessBlockReason::OverdueServiceHours
+        );
+        assert_eq!(integration.dashboard.aircraft.len(), 1);
+        assert_eq!(
+            integration.dashboard.aircraft[0].status,
+            FleetHealthDashboardAircraftStatus::Blocked
+        );
+    }
+
+    #[test]
     fn readiness_hard_blocks_active_critical_health_verdict() {
         let decision = evaluate_fleet_readiness(readiness_request(
             vec![component_for_readiness(
@@ -2214,6 +5238,267 @@ mod tests {
     }
 
     #[test]
+    fn work_order_close_records_parts_and_updates_service_history() {
+        let component =
+            component_for_readiness("motor-001", FleetComponentType::Motor, 10.0, 0, 4.0);
+        let work_order = open_maintenance_work_order(
+            OpenMaintenanceWorkOrderRequest {
+                wo_id: Some("wo-001".to_string()),
+                component_id: "motor-001".to_string(),
+                reason: "motor vibration above degraded threshold".to_string(),
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                opened_at: "2026-06-22T13:00:00Z".to_string(),
+                technician: "tech-1".to_string(),
+            },
+            "generated-wo".to_string(),
+        )
+        .expect("work order should open");
+        let closed = close_maintenance_work_order(
+            &component,
+            &work_order,
+            CloseMaintenanceWorkOrderRequest {
+                closed_at: "2026-06-22T15:00:00Z".to_string(),
+                technician: "tech-2".to_string(),
+                action: "replaced motor bearing".to_string(),
+                parts: vec![MaintenancePartUsage {
+                    part_id: "bearing-kit-22".to_string(),
+                    quantity: 1,
+                }],
+            },
+            "2026-06-22T15:01:00Z".to_string(),
+        )
+        .expect("work order should close");
+
+        assert_eq!(closed.work_order.status, MaintenanceWorkOrderStatus::Closed);
+        assert_eq!(closed.work_order.parts[0].part_id, "bearing-kit-22");
+        assert_eq!(closed.component.service_history.len(), 1);
+        assert_eq!(closed.component.service_history[0].service_id, "wo-001");
+        assert_eq!(
+            closed.component.service_history[0].action,
+            "replaced motor bearing"
+        );
+        assert!(closed.component.service_history[0]
+            .notes
+            .as_deref()
+            .expect("parts note should be present")
+            .contains("bearing-kit-22x1"));
+    }
+
+    #[test]
+    fn open_critical_work_order_keeps_readiness_blocked_until_closed() {
+        let component =
+            component_for_readiness("motor-001", FleetComponentType::Motor, 10.0, 0, 4.0);
+        let request = readiness_request(
+            vec![component],
+            vec![service_limit("motor-001", Some(100.0), None, Some(50.0))],
+            vec![component_verdict(
+                "motor-001",
+                ComponentHealthVerdictStatus::Ok,
+                HealthIndicatorFreshness::Fresh,
+            )],
+        );
+        let work_order = open_maintenance_work_order(
+            OpenMaintenanceWorkOrderRequest {
+                wo_id: Some("wo-critical-001".to_string()),
+                component_id: "motor-001".to_string(),
+                reason: "propulsion critical inspection".to_string(),
+                severity: MaintenanceWorkOrderSeverity::Critical,
+                opened_at: "2026-06-22T13:00:00Z".to_string(),
+                technician: "tech-1".to_string(),
+            },
+            "generated-wo".to_string(),
+        )
+        .expect("critical work order should open");
+
+        let blocked = evaluate_fleet_readiness_with_work_orders(request.clone(), &[work_order])
+            .expect("readiness should evaluate");
+        assert_eq!(blocked.status, FleetReadinessDecisionStatus::Blocked);
+        assert_eq!(
+            blocked.blockers[0].reason_code,
+            FleetReadinessBlockReason::OpenCriticalWorkOrder
+        );
+
+        let permitted = evaluate_fleet_readiness_with_work_orders(request, &[])
+            .expect("readiness should evaluate after closure");
+        assert_eq!(permitted.status, FleetReadinessDecisionStatus::Permitted);
+    }
+
+    #[test]
+    fn work_order_rejects_zero_quantity_part() {
+        let component =
+            component_for_readiness("motor-001", FleetComponentType::Motor, 10.0, 0, 4.0);
+        let work_order = open_maintenance_work_order(
+            OpenMaintenanceWorkOrderRequest {
+                wo_id: Some("wo-001".to_string()),
+                component_id: "motor-001".to_string(),
+                reason: "motor vibration above degraded threshold".to_string(),
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                opened_at: "2026-06-22T13:00:00Z".to_string(),
+                technician: "tech-1".to_string(),
+            },
+            "generated-wo".to_string(),
+        )
+        .expect("work order should open");
+
+        let error = close_maintenance_work_order(
+            &component,
+            &work_order,
+            CloseMaintenanceWorkOrderRequest {
+                closed_at: "2026-06-22T15:00:00Z".to_string(),
+                technician: "tech-2".to_string(),
+                action: "attempted parts update".to_string(),
+                parts: vec![MaintenancePartUsage {
+                    part_id: "bearing-kit-22".to_string(),
+                    quantity: 0,
+                }],
+            },
+            "2026-06-22T15:01:00Z".to_string(),
+        )
+        .expect_err("zero quantity part should be rejected");
+
+        assert_eq!(error, FleetHealthError::InvalidPartQuantity);
+    }
+
+    #[test]
+    fn fleet_health_dashboard_surfaces_readiness_and_worst_component() {
+        let components = vec![
+            component_for_readiness(
+                "battery-pack-001",
+                FleetComponentType::Battery,
+                10.0,
+                10,
+                4.0,
+            ),
+            component_for_readiness("motor-001", FleetComponentType::Motor, 10.0, 0, 4.0),
+        ];
+        let verdicts = vec![
+            component_verdict(
+                "battery-pack-001",
+                ComponentHealthVerdictStatus::Ok,
+                HealthIndicatorFreshness::Fresh,
+            ),
+            component_verdict(
+                "motor-001",
+                ComponentHealthVerdictStatus::Degraded,
+                HealthIndicatorFreshness::Fresh,
+            ),
+        ];
+        let readiness = evaluate_fleet_readiness(readiness_request(
+            components.clone(),
+            vec![
+                service_limit("battery-pack-001", Some(100.0), Some(200), Some(100.0)),
+                service_limit("motor-001", Some(100.0), None, Some(100.0)),
+            ],
+            verdicts.clone(),
+        ))
+        .expect("readiness should evaluate");
+
+        let dashboard = build_fleet_health_dashboard(FleetHealthDashboardRequest {
+            generated_at: "2026-06-22T16:00:00Z".to_string(),
+            components,
+            readiness_decisions: vec![readiness],
+            health_verdicts: verdicts,
+            degradation_reports: vec![],
+        })
+        .expect("dashboard should build");
+
+        assert_eq!(dashboard.aircraft.len(), 1);
+        assert_eq!(
+            dashboard.aircraft[0].status,
+            FleetHealthDashboardAircraftStatus::Ready
+        );
+        assert_eq!(
+            dashboard.aircraft[0].worst_component_id.as_deref(),
+            Some("motor-001")
+        );
+        assert_eq!(
+            dashboard.aircraft[0].worst_component_status,
+            Some(ComponentHealthVerdictStatus::Degraded)
+        );
+    }
+
+    #[test]
+    fn fleet_health_dashboard_emits_alert_for_critical_component() {
+        let components = vec![component_for_readiness(
+            "motor-001",
+            FleetComponentType::Motor,
+            10.0,
+            0,
+            4.0,
+        )];
+        let verdicts = vec![component_verdict(
+            "motor-001",
+            ComponentHealthVerdictStatus::Critical,
+            HealthIndicatorFreshness::Fresh,
+        )];
+        let readiness = evaluate_fleet_readiness(readiness_request(
+            components.clone(),
+            vec![service_limit("motor-001", Some(100.0), None, Some(100.0))],
+            verdicts.clone(),
+        ))
+        .expect("readiness should evaluate");
+
+        let dashboard = build_fleet_health_dashboard(FleetHealthDashboardRequest {
+            generated_at: "2026-06-22T16:00:00Z".to_string(),
+            components,
+            readiness_decisions: vec![readiness],
+            health_verdicts: verdicts,
+            degradation_reports: vec![],
+        })
+        .expect("dashboard should build");
+
+        assert_eq!(dashboard.alerts.len(), 1);
+        assert_eq!(dashboard.alerts[0].kind, FleetAlertKind::FleetHealth);
+        assert_eq!(dashboard.alerts[0].severity, FleetAlertSeverity::Critical);
+        assert_eq!(dashboard.alerts[0].node_id, "airframe-1");
+        assert_eq!(
+            dashboard.alerts[0].evidence.metric_name,
+            FleetHealthIndicator::MotorVibration.as_str()
+        );
+    }
+
+    #[test]
+    fn fleet_health_dashboard_marks_stale_aircraft_unknown_not_ready() {
+        let components = vec![component_for_readiness(
+            "motor-001",
+            FleetComponentType::Motor,
+            10.0,
+            0,
+            4.0,
+        )];
+        let verdicts = vec![component_verdict(
+            "motor-001",
+            ComponentHealthVerdictStatus::Ok,
+            HealthIndicatorFreshness::Stale,
+        )];
+        let readiness = evaluate_fleet_readiness(readiness_request(
+            components.clone(),
+            vec![service_limit("motor-001", Some(100.0), None, Some(100.0))],
+            verdicts.clone(),
+        ))
+        .expect("readiness should evaluate");
+
+        let dashboard = build_fleet_health_dashboard(FleetHealthDashboardRequest {
+            generated_at: "2026-06-22T16:00:00Z".to_string(),
+            components,
+            readiness_decisions: vec![readiness],
+            health_verdicts: verdicts,
+            degradation_reports: vec![],
+        })
+        .expect("dashboard should build");
+
+        assert_eq!(
+            dashboard.aircraft[0].status,
+            FleetHealthDashboardAircraftStatus::Unknown
+        );
+        assert!(dashboard.aircraft[0].stale_health);
+        assert_ne!(
+            dashboard.aircraft[0].status,
+            FleetHealthDashboardAircraftStatus::Ready
+        );
+    }
+
+    #[test]
     fn ota_rollout_advances_canary_when_health_and_alerts_are_clear() {
         let decision = evaluate_ota_rollout(ota_rollout_request(
             OtaRolloutStage::Canary,
@@ -2299,6 +5584,89 @@ mod tests {
     }
 
     #[test]
+    fn rollout_strategy_advisory_groups_healthy_nodes_and_cites_state() {
+        let advisory = suggest_rollout_strategy(rollout_strategy_request(
+            rollout_inventory(vec![
+                rollout_inventory_entry("node-a", Some(FleetNodeHealthState::Fresh), false),
+                rollout_inventory_entry("node-b", Some(FleetNodeHealthState::Fresh), false),
+                rollout_inventory_entry("node-c", Some(FleetNodeHealthState::Fresh), false),
+                rollout_inventory_entry("node-d", Some(FleetNodeHealthState::Fresh), false),
+            ]),
+            vec![
+                ota_health("node-a", ComponentHealthVerdictStatus::Ok, vec![]),
+                ota_health("node-b", ComponentHealthVerdictStatus::Ok, vec![]),
+                ota_health("node-c", ComponentHealthVerdictStatus::Ok, vec![]),
+                ota_health("node-d", ComponentHealthVerdictStatus::Ok, vec![]),
+            ],
+        ))
+        .expect("strategy should evaluate");
+
+        assert_eq!(advisory.status, RolloutStrategyAdvisoryStatus::Suggested);
+        assert_eq!(
+            advisory.reason_code,
+            RolloutStrategyAdvisoryReason::StrategyDerivedFromFleetState
+        );
+        assert_eq!(advisory.proposed_steps.len(), 3);
+        assert_eq!(advisory.proposed_steps[0].stage, OtaRolloutStage::Canary);
+        assert_eq!(advisory.proposed_steps[0].node_ids, vec!["node-a"]);
+        assert_eq!(advisory.proposed_steps[1].stage, OtaRolloutStage::Staged);
+        assert_eq!(
+            advisory.proposed_steps[1].node_ids,
+            vec!["node-b", "node-c"]
+        );
+        assert_eq!(advisory.proposed_steps[2].stage, OtaRolloutStage::Fleet);
+        assert_eq!(advisory.proposed_steps[2].node_ids, vec!["node-d"]);
+        assert!(advisory
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("inventory:node-a")));
+        assert!(advisory
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.contains("ota_health:node-a")));
+    }
+
+    #[test]
+    fn rollout_strategy_advisory_is_proposal_only_and_never_auto_starts() {
+        let advisory = suggest_rollout_strategy(rollout_strategy_request(
+            rollout_inventory(vec![rollout_inventory_entry(
+                "node-a",
+                Some(FleetNodeHealthState::Fresh),
+                false,
+            )]),
+            vec![ota_health(
+                "node-a",
+                ComponentHealthVerdictStatus::Ok,
+                vec![],
+            )],
+        ))
+        .expect("strategy should evaluate");
+
+        assert_eq!(advisory.status, RolloutStrategyAdvisoryStatus::Suggested);
+        assert!(advisory.requires_approval);
+        assert!(!advisory.auto_started);
+    }
+
+    #[test]
+    fn rollout_strategy_advisory_reports_insufficient_state_when_health_missing() {
+        let advisory = suggest_rollout_strategy(rollout_strategy_request(
+            rollout_inventory(vec![rollout_inventory_entry("node-a", None, false)]),
+            vec![],
+        ))
+        .expect("strategy should evaluate");
+
+        assert_eq!(
+            advisory.status,
+            RolloutStrategyAdvisoryStatus::InsufficientState
+        );
+        assert_eq!(
+            advisory.reason_code,
+            RolloutStrategyAdvisoryReason::MissingHealthState
+        );
+        assert!(advisory.proposed_steps.is_empty());
+    }
+
+    #[test]
     fn rollout_control_pause_takes_effect_and_records_audit() {
         let decision = apply_rollout_control(rollout_control_request(
             RolloutControlAction::Pause,
@@ -2353,6 +5721,163 @@ mod tests {
         assert_eq!(decision.audit.result, RolloutControlStatus::Refused);
     }
 
+    #[test]
+    fn fleet_operations_feed_reflects_inventory_alerts_and_rollout_state() {
+        let rollout = evaluate_ota_rollout(ota_rollout_request(
+            OtaRolloutStage::Canary,
+            Some(signed_version("agbot-edge", "1.9.0")),
+            vec![ota_node("node-canary-1", OtaRolloutStage::Canary)],
+            vec![ota_health(
+                "node-canary-1",
+                ComponentHealthVerdictStatus::Ok,
+                vec![],
+            )],
+        ))
+        .expect("rollout should evaluate");
+        let control = apply_rollout_control(rollout_control_request(
+            RolloutControlAction::Start,
+            true,
+            true,
+        ))
+        .expect("control action should evaluate");
+
+        let feed = build_fleet_operations_dashboard_feed(
+            "2026-06-12T13:01:00Z",
+            sample_fleet_inventory(),
+            vec![sample_fleet_alert()],
+            vec![rollout],
+            vec![control],
+            vec![
+                fleet_operations_source_current(
+                    FleetOperationsFeedSource::Inventory,
+                    "2026-06-12T13:00:59Z",
+                ),
+                fleet_operations_source_current(
+                    FleetOperationsFeedSource::Alerts,
+                    "2026-06-12T13:00:58Z",
+                ),
+                fleet_operations_source_current(
+                    FleetOperationsFeedSource::Rollouts,
+                    "2026-06-12T13:00:57Z",
+                ),
+            ],
+        );
+
+        assert_eq!(feed.inventory.entries[0].node_id, "node-canary-1");
+        assert_eq!(feed.alerts[0].node_id, "node-canary-1");
+        assert!(feed.source_gaps.is_empty());
+        assert!(feed.rollouts.iter().any(|rollout| rollout.state
+            == FleetOperationsRolloutFeedState::Advancing
+            && rollout.reason_code == "stage_healthy"));
+        assert!(feed.rollouts.iter().any(|rollout| rollout.state
+            == FleetOperationsRolloutFeedState::Started
+            && rollout.version.as_deref() == Some("2.0.0")));
+    }
+
+    #[test]
+    fn fleet_operations_feed_surfaces_unavailable_source_gap() {
+        let feed = build_fleet_operations_dashboard_feed(
+            "2026-06-12T13:02:00Z",
+            sample_fleet_inventory(),
+            vec![],
+            vec![],
+            vec![],
+            vec![fleet_operations_source_unavailable(
+                FleetOperationsFeedSource::Alerts,
+                "2026-06-12T13:01:59Z",
+                "alert store unavailable",
+            )],
+        );
+
+        assert_eq!(feed.alerts.len(), 0);
+        assert_eq!(feed.source_gaps.len(), 1);
+        assert_eq!(
+            feed.source_gaps[0].source,
+            FleetOperationsFeedSource::Alerts
+        );
+        assert_eq!(
+            feed.source_gaps[0].status,
+            FleetOperationsFeedSourceStatus::Unavailable
+        );
+        assert_eq!(
+            feed.source_gaps[0].message.as_deref(),
+            Some("alert store unavailable")
+        );
+    }
+
+    fn sample_fleet_inventory() -> FleetVersionInventory {
+        FleetVersionInventory {
+            entries: vec![FleetNodeInventoryEntry {
+                node_id: "node-canary-1".to_string(),
+                owner_org_id: "org-ops".to_string(),
+                kind: FleetNodeKind::Drone,
+                runtime_mode: FleetNodeRuntimeMode::Flight,
+                status: FleetNodeStatus::Enrolled,
+                maintenance: false,
+                version: Some("agbot-edge 2.0.0".to_string()),
+                config_version: Some(4),
+                components: vec![FleetNodeComponentStatus {
+                    component: "flight-controller".to_string(),
+                    health: FleetNodeComponentHealth::Ok,
+                    message: None,
+                }],
+                capabilities: vec!["ota".to_string(), "multispectral".to_string()],
+                health_state: Some(FleetNodeHealthState::Fresh),
+                heartbeat_age_seconds: Some(4),
+            }],
+        }
+    }
+
+    fn rollout_inventory(entries: Vec<FleetNodeInventoryEntry>) -> FleetVersionInventory {
+        FleetVersionInventory { entries }
+    }
+
+    fn rollout_inventory_entry(
+        node_id: &str,
+        health_state: Option<FleetNodeHealthState>,
+        maintenance: bool,
+    ) -> FleetNodeInventoryEntry {
+        FleetNodeInventoryEntry {
+            node_id: node_id.to_string(),
+            owner_org_id: "org-ops".to_string(),
+            kind: FleetNodeKind::Drone,
+            runtime_mode: FleetNodeRuntimeMode::Flight,
+            status: if maintenance {
+                FleetNodeStatus::Maintenance
+            } else {
+                FleetNodeStatus::Enrolled
+            },
+            maintenance,
+            version: Some("agbot-edge 2.0.0".to_string()),
+            config_version: Some(4),
+            components: Vec::new(),
+            capabilities: vec!["ota".to_string()],
+            health_state,
+            heartbeat_age_seconds: health_state.map(|_| 5),
+        }
+    }
+
+    fn sample_fleet_alert() -> FleetAlertRecord {
+        FleetAlertRecord {
+            alert_id: "fleet-alert:node-canary-1:low_disk".to_string(),
+            node_id: "node-canary-1".to_string(),
+            correlation_id: Some("rollout-2026-06-12".to_string()),
+            kind: FleetAlertKind::LowDisk,
+            severity: FleetAlertSeverity::Warning,
+            route: FleetAlertRoute::OperatorConsole,
+            evidence: FleetAlertEvidence {
+                metric_name: "disk_free_gb".to_string(),
+                observed_value: 8.0,
+                threshold_value: 10.0,
+                comparator: FleetAlertComparator::LessThanOrEqual,
+            },
+            message: "disk free capacity is below threshold".to_string(),
+            evaluated_at: chrono::DateTime::parse_from_rfc3339("2026-06-12T13:00:30Z")
+                .expect("valid timestamp")
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
     fn indicator_sample(
         component_id: &str,
         indicator: FleetHealthIndicator,
@@ -2366,6 +5891,150 @@ mod tests {
             source_ref: "telemetry:session-001".to_string(),
             created_at: "2026-06-12T12:20:00Z".to_string(),
             freshness: HealthIndicatorFreshness::Fresh,
+        }
+    }
+
+    fn indicator_sample_at(
+        component_id: &str,
+        indicator: FleetHealthIndicator,
+        value: f64,
+        ts: &str,
+        source_ref: &str,
+    ) -> super::FleetHealthIndicatorSample {
+        super::FleetHealthIndicatorSample {
+            component_id: component_id.to_string(),
+            indicator,
+            value,
+            ts: ts.to_string(),
+            source_ref: source_ref.to_string(),
+            created_at: "2026-06-22T12:20:00Z".to_string(),
+            freshness: HealthIndicatorFreshness::Fresh,
+        }
+    }
+
+    fn degradation_request(
+        samples: Vec<super::FleetHealthIndicatorSample>,
+    ) -> HealthDegradationDetectionRequest {
+        HealthDegradationDetectionRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T12:30:00Z".to_string(),
+            method_version: "fleet-health-degradation-v1".to_string(),
+            indicator: FleetHealthIndicator::MotorVibration,
+            samples,
+            config: HealthDegradationDetectionConfig {
+                min_history_points: 4,
+                recent_window_points: 4,
+                min_adverse_slope_per_day: 0.02,
+                min_adverse_delta: 0.30,
+            },
+        }
+    }
+
+    fn node_metric_sample_at(
+        node_id: &str,
+        metric_name: &str,
+        value: f64,
+        ts: &str,
+    ) -> NodeMetricTrendSample {
+        NodeMetricTrendSample {
+            node_id: node_id.to_string(),
+            metric_name: metric_name.to_string(),
+            value,
+            ts: ts.to_string(),
+            source_ref: format!("heartbeat:{node_id}:{ts}"),
+        }
+    }
+
+    fn predictive_advisory_request(
+        samples: Vec<NodeMetricTrendSample>,
+    ) -> PredictiveMaintenanceAdvisoryRequest {
+        PredictiveMaintenanceAdvisoryRequest {
+            node_id: "edge-1".to_string(),
+            evaluated_at: "2026-06-22T12:35:00Z".to_string(),
+            method_version: "fleet-node-maintenance-advisory-v1".to_string(),
+            metric_name: "heartbeat_error_rate".to_string(),
+            samples,
+            config: HealthDegradationDetectionConfig {
+                min_history_points: 4,
+                recent_window_points: 4,
+                min_adverse_slope_per_day: 0.006,
+                min_adverse_delta: 0.10,
+            },
+        }
+    }
+
+    fn degrading_trend_report() -> super::HealthDegradationDetectionReport {
+        detect_health_indicator_degradation(degradation_request(vec![
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.20,
+                "2026-06-01T00:00:00Z",
+                "telemetry:mission-001",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.35,
+                "2026-06-08T00:00:00Z",
+                "telemetry:mission-002",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.50,
+                "2026-06-15T00:00:00Z",
+                "telemetry:mission-003",
+            ),
+            indicator_sample_at(
+                "motor-001",
+                FleetHealthIndicator::MotorVibration,
+                0.65,
+                "2026-06-22T00:00:00Z",
+                "telemetry:mission-004",
+            ),
+        ]))
+        .expect("degrading trend should evaluate")
+    }
+
+    fn permitted_readiness_decision() -> FleetReadinessDecision {
+        FleetReadinessDecision {
+            airframe_id: "airframe-1".to_string(),
+            checked_at: "2026-06-22T15:30:00Z".to_string(),
+            status: FleetReadinessDecisionStatus::Permitted,
+            blockers: vec![],
+            component_count: 1,
+            verdict_count: 1,
+        }
+    }
+
+    fn blocked_readiness_decision() -> FleetReadinessDecision {
+        FleetReadinessDecision {
+            airframe_id: "airframe-1".to_string(),
+            checked_at: "2026-06-22T15:30:00Z".to_string(),
+            status: FleetReadinessDecisionStatus::Blocked,
+            blockers: vec![super::FleetReadinessBlocker {
+                reason_code: FleetReadinessBlockReason::CriticalHealthVerdict,
+                component_ref: Some("motor-001".to_string()),
+                indicator: Some(FleetHealthIndicator::MotorVibration),
+                observed_value: Some(1.8),
+                threshold: Some(1.5),
+            }],
+            component_count: 1,
+            verdict_count: 1,
+        }
+    }
+
+    fn health_evidence_record(record_id: &str, decision_hash: &str) -> HealthEvidenceRecord {
+        HealthEvidenceRecord {
+            record_id: record_id.to_string(),
+            subject_kind: HealthEvidenceSubjectKind::ComponentVerdict,
+            component_id: "motor-001".to_string(),
+            method_version: "fleet-health-thresholds-v1".to_string(),
+            reason_code: "degraded_threshold_exceeded".to_string(),
+            recorded_at: "2026-06-22T12:31:00Z".to_string(),
+            input_refs: vec![],
+            decision_hash: decision_hash.to_string(),
         }
     }
 
@@ -2430,6 +6099,21 @@ mod tests {
             requested_at: "2026-06-12T14:00:00Z".to_string(),
             simulation_validated,
             targets_flight_nodes,
+        }
+    }
+
+    fn rollout_strategy_request(
+        inventory: FleetVersionInventory,
+        health_reports: Vec<OtaNodeHealthReport>,
+    ) -> RolloutStrategyAdvisoryRequest {
+        RolloutStrategyAdvisoryRequest {
+            rollout_id: "rollout-2026-06-22".to_string(),
+            requested_at: "2026-06-22T18:00:00Z".to_string(),
+            target_version: signed_version("agbot-edge", "2.1.0"),
+            inventory,
+            health_reports,
+            canary_size: 1,
+            staged_size: 2,
         }
     }
 

@@ -1016,6 +1016,7 @@ pub struct CursorMapState {
 #[derive(Resource)]
 pub struct AnnotationOverlayState {
     pub items: Vec<AnnotationRecord>,
+    pub suggestions: SuggestedAnnotationState,
     pub selected_annotation_id: Option<String>,
     pub hovered_annotation_id: Option<String>,
     pub failed_commits: Vec<PendingAnnotationCommit>,
@@ -1038,6 +1039,38 @@ pub struct AnnotationOverlayState {
     pub show_high: bool,
     pub show_critical: bool,
     pub show_other: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SuggestedAnnotationState {
+    pub feature_enabled: bool,
+    pub unavailable_reason: Option<String>,
+    pub suggestions: Vec<SuggestedAnnotation>,
+    pub rejected_finding_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdvisorFindingZone {
+    pub finding_id: String,
+    pub label: String,
+    pub severity: String,
+    pub geometry: AnnotationGeometry,
+    pub evidence_refs: Vec<String>,
+    pub uncertainty: f32,
+    pub crs: Option<String>,
+    pub georeferenced: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuggestedAnnotation {
+    pub suggestion_id: String,
+    pub finding_id: String,
+    pub label: String,
+    pub severity: String,
+    pub geometry: AnnotationGeometry,
+    pub evidence_refs: Vec<String>,
+    pub uncertainty: f32,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1073,6 +1106,7 @@ impl Default for AnnotationOverlayState {
     fn default() -> Self {
         Self {
             items: Vec::new(),
+            suggestions: SuggestedAnnotationState::default(),
             selected_annotation_id: None,
             hovered_annotation_id: None,
             failed_commits: Vec::new(),
@@ -1097,6 +1131,104 @@ impl Default for AnnotationOverlayState {
             show_other: true,
         }
     }
+}
+
+pub fn load_suggested_annotations_from_findings(
+    annotations: &mut AnnotationOverlayState,
+    findings: &[AdvisorFindingZone],
+    feature_enabled: bool,
+) {
+    annotations.suggestions.feature_enabled = feature_enabled;
+    annotations.suggestions.suggestions.clear();
+    annotations.suggestions.unavailable_reason = None;
+
+    if !feature_enabled {
+        annotations.suggestions.unavailable_reason =
+            Some("suggested annotations feature flag disabled".to_string());
+        return;
+    }
+    if findings.is_empty() {
+        return;
+    }
+    if let Some(finding) = findings
+        .iter()
+        .find(|finding| !finding.georeferenced || finding.crs.as_deref() != Some("EPSG:4326"))
+    {
+        annotations.suggestions.unavailable_reason = Some(format!(
+            "finding {} unavailable: asserted georeferencing required",
+            finding.finding_id
+        ));
+        return;
+    }
+
+    annotations.suggestions.suggestions = findings
+        .iter()
+        .filter(|finding| {
+            !annotations
+                .suggestions
+                .rejected_finding_ids
+                .contains(&finding.finding_id)
+        })
+        .map(|finding| SuggestedAnnotation {
+            suggestion_id: format!("suggestion:{}", finding.finding_id),
+            finding_id: finding.finding_id.clone(),
+            label: finding.label.clone(),
+            severity: finding.severity.clone(),
+            geometry: finding.geometry.clone(),
+            evidence_refs: finding.evidence_refs.clone(),
+            uncertainty: finding.uncertainty,
+            note: format!(
+                "Suggested from advisor finding {}; evidence: {}; uncertainty: {:.2}",
+                finding.finding_id,
+                finding.evidence_refs.join(", "),
+                finding.uncertainty
+            ),
+        })
+        .collect();
+}
+
+pub fn reject_suggested_annotation(
+    annotations: &mut AnnotationOverlayState,
+    finding_id: &str,
+) -> bool {
+    let before = annotations.suggestions.suggestions.len();
+    annotations
+        .suggestions
+        .suggestions
+        .retain(|suggestion| suggestion.finding_id != finding_id);
+    let removed = annotations.suggestions.suggestions.len() != before;
+    if removed {
+        annotations
+            .suggestions
+            .rejected_finding_ids
+            .insert(finding_id.to_string());
+    }
+    removed
+}
+
+pub fn confirm_suggested_annotation(
+    annotations: &AnnotationOverlayState,
+    finding_id: &str,
+    field_id: Option<String>,
+    author: String,
+    audit_id: String,
+) -> Option<AnnotationCommitPayload> {
+    annotations
+        .suggestions
+        .suggestions
+        .iter()
+        .find(|suggestion| suggestion.finding_id == finding_id)
+        .map(|suggestion| AnnotationCommitPayload {
+            annotation_id: Some(format!("advisor-{}", suggestion.finding_id)),
+            field_id,
+            label: suggestion.label.clone(),
+            note: Some(suggestion.note.clone()),
+            severity: Some(suggestion.severity.clone()),
+            geometry: suggestion.geometry.clone(),
+            author,
+            crs: "EPSG:4326".to_string(),
+            audit_id,
+        })
 }
 
 #[derive(Resource)]
@@ -1133,7 +1265,135 @@ impl Default for RecommendationOverlayState {
 #[derive(Resource, Default)]
 pub struct ReportOverlayState {
     pub items: Vec<ReportRecord>,
+    pub zones: Vec<ReportZoneOverlay>,
     pub draft_title: String,
+    pub last_overlay_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportFindingZone {
+    pub report_id: String,
+    pub finding_id: String,
+    pub zone_id: String,
+    pub crs: String,
+    pub coordinates: Vec<GeoPoint>,
+    pub reason: String,
+    pub priority: RecommendationPriority,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportZoneOverlay {
+    pub report_id: String,
+    pub finding_id: String,
+    pub zone_id: String,
+    pub crs: String,
+    pub coordinates: Vec<GeoPoint>,
+    pub world_polygon: Vec<Vec2>,
+    pub reason: String,
+    pub priority: RecommendationPriority,
+    pub label: String,
+}
+
+pub fn build_report_result_overlay(
+    report: &ReportRecord,
+    zones: &[ReportFindingZone],
+    active_layer: &LayerPlacement,
+) -> Result<Vec<ReportZoneOverlay>> {
+    let report_id = normalize_viewer_text(&report.report_id)
+        .ok_or_else(|| anyhow::anyhow!("report_id is required for report overlay"))?;
+    if zones.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    zones
+        .iter()
+        .map(|zone| build_report_zone_overlay(&report_id, zone, active_layer))
+        .collect()
+}
+
+fn build_report_zone_overlay(
+    report_id: &str,
+    zone: &ReportFindingZone,
+    active_layer: &LayerPlacement,
+) -> Result<ReportZoneOverlay> {
+    if normalize_viewer_text(&zone.report_id).as_deref() != Some(report_id) {
+        anyhow::bail!(
+            "report zone {} belongs to report {}, not {}",
+            zone.zone_id,
+            zone.report_id,
+            report_id
+        );
+    }
+    let finding_id = normalize_viewer_text(&zone.finding_id)
+        .ok_or_else(|| anyhow::anyhow!("report zone finding_id is required"))?;
+    let zone_id = normalize_viewer_text(&zone.zone_id)
+        .ok_or_else(|| anyhow::anyhow!("report zone zone_id is required"))?;
+    let zone_crs = normalize_viewer_text(&zone.crs)
+        .ok_or_else(|| anyhow::anyhow!("report zone {zone_id} CRS is required"))?;
+    if zone_crs != active_layer.crs {
+        anyhow::bail!(
+            "report zone {zone_id} CRS mismatch: active layer {} != zone {}",
+            active_layer.crs,
+            zone_crs
+        );
+    }
+    if zone.coordinates.len() < 3 {
+        anyhow::bail!("report zone {zone_id} requires at least three polygon coordinates");
+    }
+    let reason = normalize_viewer_text(&zone.reason)
+        .ok_or_else(|| anyhow::anyhow!("report zone {zone_id} reason is required"))?;
+    let world_polygon = zone
+        .coordinates
+        .iter()
+        .map(|point| report_zone_point_to_world(&active_layer.extent, point))
+        .collect::<Result<Vec<_>>>()?;
+    let label = format!(
+        "{}: {}",
+        recommendation_priority_label(zone.priority),
+        reason
+    );
+
+    Ok(ReportZoneOverlay {
+        report_id: report_id.to_string(),
+        finding_id,
+        zone_id,
+        crs: zone_crs,
+        coordinates: zone.coordinates.clone(),
+        world_polygon,
+        reason,
+        priority: zone.priority,
+        label,
+    })
+}
+
+fn report_zone_point_to_world(extent: &SceneExtent, point: &GeoPoint) -> Result<Vec2> {
+    if !point.longitude.is_finite() || !point.latitude.is_finite() {
+        anyhow::bail!("report zone coordinate must be finite");
+    }
+    let center_lon = (extent.min_lon + extent.max_lon) / 2.0;
+    let center_lat = (extent.min_lat + extent.max_lat) / 2.0;
+    Ok(Vec2::new(
+        ((point.longitude - center_lon) as f32) * MAP_UNITS_PER_DEGREE,
+        ((point.latitude - center_lat) as f32) * MAP_UNITS_PER_DEGREE,
+    ))
+}
+
+fn recommendation_priority_label(priority: RecommendationPriority) -> &'static str {
+    match priority {
+        RecommendationPriority::Low => "low",
+        RecommendationPriority::Medium => "medium",
+        RecommendationPriority::High => "high",
+        RecommendationPriority::Critical => "critical",
+    }
+}
+
+fn normalize_viewer_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 #[derive(Resource, Debug, Clone, PartialEq)]
@@ -1533,19 +1793,23 @@ pub fn ensure_scene_id(config: &TileConfig, action: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_manifest_layer_placement, capture_saved_view, export_snapshot,
-        layer_metadata_readout, load_view_from_json, manifest_world_dimensions, open_compare_mode,
-        product_legend_for_kind, product_placement_for_manifest, restore_saved_view,
-        save_view_to_json, select_catalog_scene, set_compare_divider, summarize_tile_presences,
-        switch_active_product, sync_compare_shared_view, AnnotationOverlayState, CompareLayout,
-        FieldCatalogState, FieldSceneSummary, MapViewState, RecommendationOverlayState,
-        ReportOverlayState, SceneExtent, SceneGeospatialMetadata, SceneManifest,
-        SceneManifestState, SceneProduct, TileConfig, TileId, TilePresence, TileRenderState,
-        TileStatus, ViewerState, DEFAULT_PRODUCT_KIND, DEFAULT_TILE_ZOOM,
+        assert_manifest_layer_placement, build_report_result_overlay, capture_saved_view,
+        confirm_suggested_annotation, export_snapshot, layer_metadata_readout,
+        load_suggested_annotations_from_findings, load_view_from_json, manifest_world_dimensions,
+        open_compare_mode, product_legend_for_kind, product_placement_for_manifest,
+        reject_suggested_annotation, restore_saved_view, save_view_to_json, select_catalog_scene,
+        set_compare_divider, summarize_tile_presences, switch_active_product,
+        sync_compare_shared_view, AdvisorFindingZone, AnnotationOverlayState, CompareLayout,
+        FieldCatalogState, FieldSceneSummary, LayerPlacement, MapViewState,
+        RecommendationOverlayState, ReportFindingZone, ReportOverlayState, SceneExtent,
+        SceneGeospatialMetadata, SceneManifest, SceneManifestState, SceneProduct, TileConfig,
+        TileId, TilePresence, TileRenderState, TileStatus, ViewerState, DEFAULT_PRODUCT_KIND,
+        DEFAULT_TILE_ZOOM,
     };
     use bevy::prelude::Vec2;
     use shared::schemas::{
-        GeoBounds, RasterResolution, RasterSpatialRef, RecommendationPriority, RecommendationStatus,
+        AnnotationGeometry, GeoBounds, GeoPoint, RasterResolution, RasterSpatialRef,
+        RecommendationPriority, RecommendationStatus, ReportFormat, ReportRecord, ReportVisibility,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -2208,6 +2472,42 @@ mod tests {
     }
 
     #[test]
+    fn report_result_overlay_builds_zone_labels_and_world_polygon() {
+        let overlay = build_report_result_overlay(
+            &sample_report_record(),
+            &[sample_report_zone("EPSG:4326")],
+            &sample_layer_placement(),
+        )
+        .expect("matching CRS report zone should overlay");
+
+        assert_eq!(overlay.len(), 1);
+        assert_eq!(overlay[0].report_id, "report-1");
+        assert_eq!(overlay[0].finding_id, "finding:09:stress-ne-zone");
+        assert_eq!(overlay[0].zone_id, "zone-ne");
+        assert_eq!(overlay[0].crs, "EPSG:4326");
+        assert_eq!(
+            overlay[0].label,
+            "high: NDVI decline aligned with water stress"
+        );
+        assert_eq!(overlay[0].world_polygon.len(), 4);
+        assert_eq!(overlay[0].world_polygon[0], Vec2::new(-4000.0, 1000.0));
+    }
+
+    #[test]
+    fn report_result_overlay_refuses_zone_crs_mismatch() {
+        let err = build_report_result_overlay(
+            &sample_report_record(),
+            &[sample_report_zone("EPSG:3857")],
+            &sample_layer_placement(),
+        )
+        .expect_err("mismatched CRS must not draw");
+
+        assert!(err.to_string().contains("CRS mismatch"));
+        assert!(err.to_string().contains("EPSG:4326"));
+        assert!(err.to_string().contains("EPSG:3857"));
+    }
+
+    #[test]
     fn saved_view_round_trip_restores_scene_product_camera_and_overlays() {
         let manifest = sample_manifest_state();
         let mut config = TileConfig {
@@ -2330,6 +2630,144 @@ mod tests {
     }
 
     #[test]
+    fn advisor_findings_load_as_uncommitted_annotation_suggestions() {
+        let mut annotations = AnnotationOverlayState::default();
+        let finding = AdvisorFindingZone {
+            finding_id: "finding-09-stress-ne".to_string(),
+            label: "Nitrogen stress candidate".to_string(),
+            severity: "high".to_string(),
+            geometry: AnnotationGeometry::Polygon {
+                coordinates: vec![
+                    GeoPoint {
+                        longitude: -96.4,
+                        latitude: 41.2,
+                    },
+                    GeoPoint {
+                        longitude: -96.3,
+                        latitude: 41.2,
+                    },
+                    GeoPoint {
+                        longitude: -96.3,
+                        latitude: 41.3,
+                    },
+                    GeoPoint {
+                        longitude: -96.4,
+                        latitude: 41.2,
+                    },
+                ],
+            },
+            evidence_refs: vec!["finding:09:stress-ne-zone".to_string()],
+            uncertainty: 0.22,
+            crs: Some("EPSG:4326".to_string()),
+            georeferenced: true,
+        };
+
+        load_suggested_annotations_from_findings(&mut annotations, &[finding], true);
+
+        assert!(annotations.items.is_empty());
+        assert!(annotations.suggestions.unavailable_reason.is_none());
+        assert_eq!(annotations.suggestions.suggestions.len(), 1);
+        let suggestion = &annotations.suggestions.suggestions[0];
+        assert_eq!(suggestion.finding_id, "finding-09-stress-ne");
+        assert_eq!(suggestion.severity, "high");
+        assert!(suggestion
+            .note
+            .contains("evidence: finding:09:stress-ne-zone"));
+
+        let payload = confirm_suggested_annotation(
+            &annotations,
+            "finding-09-stress-ne",
+            Some("field-alpha".to_string()),
+            "operator-ag".to_string(),
+            "audit-suggestion-1".to_string(),
+        )
+        .expect("operator confirmation should build a write-back payload");
+        assert_eq!(payload.field_id.as_deref(), Some("field-alpha"));
+        assert_eq!(payload.label, "Nitrogen stress candidate");
+        assert_eq!(payload.severity.as_deref(), Some("high"));
+        assert_eq!(payload.crs, "EPSG:4326");
+        assert!(annotations.items.is_empty());
+    }
+
+    #[test]
+    fn ungeoreferenced_findings_disable_annotation_suggestions() {
+        let mut annotations = AnnotationOverlayState::default();
+        let finding = AdvisorFindingZone {
+            finding_id: "finding-09-floating".to_string(),
+            label: "Unplaced anomaly".to_string(),
+            severity: "medium".to_string(),
+            geometry: AnnotationGeometry::Point {
+                coordinate: GeoPoint {
+                    longitude: -96.4,
+                    latitude: 41.2,
+                },
+            },
+            evidence_refs: vec!["finding:09:floating".to_string()],
+            uncertainty: 0.7,
+            crs: None,
+            georeferenced: false,
+        };
+
+        load_suggested_annotations_from_findings(&mut annotations, &[finding], true);
+
+        assert!(annotations.suggestions.suggestions.is_empty());
+        assert!(annotations
+            .suggestions
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("asserted georeferencing required")));
+        assert!(confirm_suggested_annotation(
+            &annotations,
+            "finding-09-floating",
+            None,
+            "operator-ag".to_string(),
+            "audit-none".to_string(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn rejecting_suggested_annotation_removes_without_writeback() {
+        let mut annotations = AnnotationOverlayState::default();
+        let finding = AdvisorFindingZone {
+            finding_id: "finding-09-low".to_string(),
+            label: "Low vigor".to_string(),
+            severity: "low".to_string(),
+            geometry: AnnotationGeometry::Point {
+                coordinate: GeoPoint {
+                    longitude: -96.4,
+                    latitude: 41.2,
+                },
+            },
+            evidence_refs: vec!["finding:09:low".to_string()],
+            uncertainty: 0.1,
+            crs: Some("EPSG:4326".to_string()),
+            georeferenced: true,
+        };
+
+        load_suggested_annotations_from_findings(&mut annotations, &[finding], true);
+        assert!(reject_suggested_annotation(
+            &mut annotations,
+            "finding-09-low"
+        ));
+
+        assert!(annotations.suggestions.suggestions.is_empty());
+        assert!(annotations
+            .suggestions
+            .rejected_finding_ids
+            .contains("finding-09-low"));
+        assert!(annotations.items.is_empty());
+        assert!(confirm_suggested_annotation(
+            &annotations,
+            "finding-09-low",
+            None,
+            "operator-ag".to_string(),
+            "audit-reject".to_string(),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn snapshot_export_marks_ungeoreferenced_state() {
         let mut manifest = sample_manifest_state();
         manifest.geospatial.georeferenced = false;
@@ -2402,6 +2840,65 @@ mod tests {
             }),
             geo_transform: Some([-89.5, 0.01, 0.0, 41.0, 0.0, -0.02]),
             resolution: Some(RasterResolution { x: 0.01, y: 0.02 }),
+        }
+    }
+
+    fn sample_layer_placement() -> LayerPlacement {
+        LayerPlacement {
+            crs: "EPSG:4326".to_string(),
+            extent: sample_extent(),
+            resolution: RasterResolution { x: 0.01, y: 0.02 },
+            world_dimensions: Vec2::new(10_000.0, 10_000.0),
+        }
+    }
+
+    fn sample_report_zone(crs: &str) -> ReportFindingZone {
+        ReportFindingZone {
+            report_id: "report-1".to_string(),
+            finding_id: "finding:09:stress-ne-zone".to_string(),
+            zone_id: "zone-ne".to_string(),
+            crs: crs.to_string(),
+            coordinates: vec![
+                GeoPoint {
+                    longitude: -89.4,
+                    latitude: 40.6,
+                },
+                GeoPoint {
+                    longitude: -89.1,
+                    latitude: 40.6,
+                },
+                GeoPoint {
+                    longitude: -89.1,
+                    latitude: 40.9,
+                },
+                GeoPoint {
+                    longitude: -89.4,
+                    latitude: 40.9,
+                },
+            ],
+            reason: "NDVI decline aligned with water stress".to_string(),
+            priority: RecommendationPriority::High,
+        }
+    }
+
+    fn sample_report_record() -> ReportRecord {
+        ReportRecord {
+            report_id: "report-1".to_string(),
+            scene_id: "scene-1".to_string(),
+            field_id: Some("field-1".to_string()),
+            season_id: Some("season-2026".to_string()),
+            org_id: "org-a".to_string(),
+            generated_by: "advisor-1".to_string(),
+            source_refs: vec!["finding:09:stress-ne-zone".to_string()],
+            title: "North Field report".to_string(),
+            format: ReportFormat::Html,
+            artifact_path: "/tmp/report-1.html".to_string(),
+            artifact_uri: "s3://reports/report-1.html".to_string(),
+            download_url: "/api/scenes/scene-1/reports/report-1".to_string(),
+            visibility: ReportVisibility::Org,
+            annotation_count: 1,
+            recommendation_count: 1,
+            created_at: "2026-06-12T10:00:00Z".to_string(),
         }
     }
 

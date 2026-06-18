@@ -59,6 +59,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/tractors/:tractor_id", get(routes::get_tractor))
         .route(
+            "/api/tractors/:tractor_id/fleet-health",
+            post(routes::ingest_tractor_fleet_health),
+        )
+        .route(
             "/api/tractors/:tractor_id/motion-commands/validate",
             post(routes::validate_tractor_motion_command),
         )
@@ -124,6 +128,15 @@ pub fn build_router(state: AppState) -> Router {
             put(routes::update_crop_inference_run_status),
         )
         .route(
+            "/api/crop-intelligence/inference-runs/:run_id/progress",
+            get(routes::list_crop_inference_run_progress)
+                .post(routes::record_crop_inference_run_progress),
+        )
+        .route(
+            "/api/crop-intelligence/inference-runs/:run_id/stall-check",
+            post(routes::check_crop_inference_run_stall),
+        )
+        .route(
             "/api/crop-intelligence/inference-runs/:run_id/result",
             get(routes::get_crop_inference_run_result),
         )
@@ -140,6 +153,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::emit_crop_detection_finding),
         )
         .route(
+            "/api/crop-intelligence/closed-loop-proposals",
+            post(routes::create_crop_closed_loop_proposal),
+        )
+        .route(
+            "/api/crop-intelligence/closed-loop-proposals/:proposal_id",
+            get(routes::get_crop_closed_loop_proposal),
+        )
+        .route(
             "/api/crop-intelligence/inference-requests/validate",
             post(routes::validate_crop_model_for_inference),
         )
@@ -154,6 +175,26 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/compliance/reports/export",
             post(routes::export_compliance_audit_report),
+        )
+        .route(
+            "/api/compliance/reports/authority-export",
+            post(routes::export_compliance_authority_report),
+        )
+        .route(
+            "/api/compliance/reports/authority-shares",
+            post(routes::create_compliance_authority_share),
+        )
+        .route(
+            "/api/compliance/authority-shares/:share_id",
+            get(routes::get_compliance_authority_share),
+        )
+        .route(
+            "/api/compliance/authority-shares/:share_id/revoke",
+            post(routes::revoke_compliance_authority_share_route),
+        )
+        .route(
+            "/api/compliance/regulation-assist",
+            post(routes::run_compliance_regulation_assist),
         )
         .route(
             "/api/compliance/records/:record_id/versions",
@@ -241,6 +282,104 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::update_marketplace_account_status),
         )
         .route(
+            "/api/marketplace/catalog/items",
+            get(routes::list_marketplace_catalog_items)
+                .post(routes::create_marketplace_catalog_item),
+        )
+        .route(
+            "/api/marketplace/catalog/items/:item_id",
+            get(routes::get_marketplace_catalog_item),
+        )
+        .route(
+            "/api/portal/marketplace-entry",
+            get(routes::get_marketplace_portal_entry),
+        )
+        .route(
+            "/api/marketplace/listings",
+            get(routes::list_marketplace_listings).post(routes::publish_marketplace_listing),
+        )
+        .route(
+            "/api/marketplace/listings/:listing_id",
+            get(routes::get_marketplace_listing),
+        )
+        .route(
+            "/api/marketplace/listings/:listing_id/close",
+            post(routes::close_marketplace_listing),
+        )
+        .route(
+            "/api/marketplace/inventory",
+            get(routes::list_marketplace_inventory).post(routes::upsert_marketplace_inventory),
+        )
+        .route(
+            "/api/marketplace/inventory/:inventory_id",
+            get(routes::get_marketplace_inventory),
+        )
+        .route(
+            "/api/marketplace/inventory/:inventory_id/reserve",
+            post(routes::reserve_marketplace_inventory_endpoint),
+        )
+        .route(
+            "/api/marketplace/inventory/:inventory_id/fulfill",
+            post(routes::fulfill_marketplace_inventory_endpoint),
+        )
+        .route(
+            "/api/marketplace/inventory/:inventory_id/release",
+            post(routes::release_marketplace_inventory_endpoint),
+        )
+        .route(
+            "/api/marketplace/orders",
+            get(routes::list_marketplace_orders).post(routes::place_marketplace_order),
+        )
+        .route(
+            "/api/marketplace/orders/:order_id",
+            get(routes::get_marketplace_order),
+        )
+        .route(
+            "/api/marketplace/orders/:order_id/transition",
+            post(routes::transition_marketplace_order),
+        )
+        .route(
+            "/api/marketplace/orders/:order_id/audits",
+            get(routes::list_marketplace_order_audits),
+        )
+        .route(
+            "/api/marketplace/fulfillments",
+            get(routes::list_marketplace_fulfillments).post(routes::create_marketplace_fulfillment),
+        )
+        .route(
+            "/api/marketplace/fulfillments/:fulfillment_id",
+            get(routes::get_marketplace_fulfillment),
+        )
+        .route(
+            "/api/marketplace/fulfillments/:fulfillment_id/transition",
+            post(routes::transition_marketplace_fulfillment),
+        )
+        .route(
+            "/api/marketplace/fulfillments/:fulfillment_id/audits",
+            get(routes::list_marketplace_fulfillment_audits),
+        )
+        .route(
+            "/api/marketplace/ratings",
+            get(routes::list_marketplace_ratings).post(routes::create_marketplace_rating),
+        )
+        .route(
+            "/api/marketplace/ratings/accounts/:account_id/aggregate",
+            get(routes::get_marketplace_rating_aggregate),
+        )
+        .route(
+            "/api/marketplace/demand-forecasts",
+            get(routes::list_marketplace_demand_forecasts)
+                .post(routes::create_marketplace_demand_forecast),
+        )
+        .route(
+            "/api/marketplace/demand-forecasts/:forecast_id",
+            get(routes::get_marketplace_demand_forecast),
+        )
+        .route(
+            "/api/marketplace/reports/org",
+            get(routes::get_marketplace_org_report),
+        )
+        .route(
             "/api/sustainability/records",
             get(routes::list_sustainability_records).post(routes::create_sustainability_record),
         )
@@ -249,8 +388,107 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_sustainability_record),
         )
         .route(
+            "/api/sustainability/carbon-footprints",
+            get(routes::list_carbon_footprints).post(routes::create_carbon_footprint),
+        )
+        .route(
+            "/api/sustainability/carbon-footprints/:footprint_id",
+            get(routes::get_carbon_footprint),
+        )
+        .route(
+            "/api/sustainability/biomass-estimates",
+            get(routes::list_biomass_estimates).post(routes::create_biomass_estimate),
+        )
+        .route(
+            "/api/sustainability/biomass-estimates/:estimate_id",
+            get(routes::get_biomass_estimate),
+        )
+        .route(
+            "/api/sustainability/baselines",
+            get(routes::list_sustainability_baselines)
+                .post(routes::create_sustainability_baseline_record),
+        )
+        .route(
+            "/api/sustainability/comparisons",
+            get(routes::list_sustainability_comparisons)
+                .post(routes::create_sustainability_comparison),
+        )
+        .route(
+            "/api/sustainability/comparisons/:comparison_id",
+            get(routes::get_sustainability_comparison),
+        )
+        .route(
+            "/api/sustainability/mrv-trails",
+            get(routes::list_sustainability_mrv_trails)
+                .post(routes::create_sustainability_mrv_trail_record),
+        )
+        .route(
+            "/api/sustainability/mrv-trails/:trail_id",
+            get(routes::get_sustainability_mrv_trail),
+        )
+        .route(
+            "/api/sustainability/biodiversity-proxies",
+            get(routes::list_biodiversity_proxies).post(routes::create_biodiversity_proxy),
+        )
+        .route(
+            "/api/sustainability/biodiversity-proxies/:proxy_id",
+            get(routes::get_biodiversity_proxy),
+        )
+        .route(
+            "/api/sustainability/soil-carbon-proxies",
+            get(routes::list_soil_carbon_proxies).post(routes::create_soil_carbon_proxy),
+        )
+        .route(
+            "/api/sustainability/soil-carbon-proxies/:proxy_id",
+            get(routes::get_soil_carbon_proxy),
+        )
+        .route(
+            "/api/sustainability/kpis",
+            get(routes::list_sustainability_kpis).post(routes::create_sustainability_kpi),
+        )
+        .route(
+            "/api/sustainability/kpis/:kpi_id",
+            get(routes::get_sustainability_kpi),
+        )
+        .route(
+            "/api/sustainability/certification-packs",
+            post(routes::create_sustainability_certification_pack),
+        )
+        .route(
+            "/api/sustainability/certification-packs/:pack_id",
+            get(routes::get_sustainability_certification_pack),
+        )
+        .route(
+            "/api/sustainability/exports/field/:field_id/summary.csv",
+            get(routes::export_sustainability_field_csv),
+        )
+        .route(
+            "/api/sustainability/exports/field/:field_id/summary.geojson",
+            get(routes::export_sustainability_field_geojson),
+        )
+        .route(
+            "/api/sustainability/exports/field/:field_id/summary.pdf",
+            get(routes::export_sustainability_field_pdf),
+        )
+        .route(
             "/api/content/items",
             get(routes::list_content_items).post(routes::create_content_item),
+        )
+        .route(
+            "/api/content/success-stories",
+            post(routes::create_success_story_item),
+        )
+        .route(
+            "/api/content/success-stories/:content_id",
+            get(routes::get_success_story_item),
+        )
+        .route(
+            "/api/content/community-contributions",
+            post(routes::create_community_contribution_route),
+        )
+        .route(
+            "/api/content/community-contributions/:contribution_id/moderation",
+            post(routes::moderate_community_contribution_route),
         )
         .route(
             "/api/content/items/:content_id",
@@ -259,6 +497,44 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/content/items/:content_id/versions",
             post(routes::append_content_item_version),
+        )
+        .route(
+            "/api/content/items/:content_id/workflow",
+            post(routes::transition_content_item_workflow),
+        )
+        .route(
+            "/api/content/items/:content_id/tags",
+            post(routes::apply_content_item_tags),
+        )
+        .route(
+            "/api/content/items/:content_id/engagement-events",
+            post(routes::create_content_engagement_event_route),
+        )
+        .route(
+            "/api/content/items/:content_id/engagement",
+            get(routes::get_content_engagement_summary),
+        )
+        .route(
+            "/api/content/items/:content_id/locales",
+            post(routes::create_content_locale_variant_route),
+        )
+        .route(
+            "/api/content/items/:content_id/localized",
+            get(routes::get_localized_content_item),
+        )
+        .route(
+            "/api/content/permissions/resolve",
+            get(routes::resolve_content_permissions_route),
+        )
+        .route("/api/content/search", get(routes::search_content_items))
+        .route("/api/content/tags", get(routes::list_content_items_by_tag))
+        .route(
+            "/api/portal/knowledge-base",
+            get(routes::list_portal_knowledge_base),
+        )
+        .route(
+            "/api/portal/knowledge-base/:content_id",
+            get(routes::get_portal_knowledge_base_item),
         )
         .route(
             "/api/collaboration/channels",
@@ -271,6 +547,81 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/collaboration/channels/:channel_id/messages",
             post(routes::post_collaboration_message),
+        )
+        .route(
+            "/api/collaboration/channels/:channel_id/presence",
+            get(routes::list_collaboration_presence)
+                .post(routes::update_collaboration_presence_route),
+        )
+        .route(
+            "/api/collaboration/channels/:channel_id/notifications",
+            post(routes::create_collaboration_notifications),
+        )
+        .route(
+            "/api/collaboration/channels/:channel_id/emergency-alerts",
+            post(routes::raise_collaboration_emergency_alert_route),
+        )
+        .route(
+            "/api/collaboration/emergency-alerts/:alert_id",
+            post(routes::transition_collaboration_emergency_alert_route),
+        )
+        .route(
+            "/api/collaboration/sessions",
+            post(routes::record_collaboration_session_route),
+        )
+        .route(
+            "/api/collaboration/sessions/:session_id/replay",
+            get(routes::replay_collaboration_session_route),
+        )
+        .route(
+            "/api/collaboration/sessions/:session_id/annotations",
+            get(routes::list_collaboration_session_annotations_route)
+                .post(routes::create_collaboration_session_annotation_route),
+        )
+        .route(
+            "/api/collaboration/operator-console/feed",
+            get(routes::collaboration_operator_console_feed_route),
+        )
+        .route(
+            "/api/collaboration/portal/feed",
+            get(routes::collaboration_portal_feed_route),
+        )
+        .route(
+            "/api/collaboration/portal/streams/:stream_id",
+            get(routes::collaboration_portal_stream_route),
+        )
+        .route(
+            "/api/collaboration/portal/alerts/:alert_id",
+            get(routes::collaboration_portal_alert_route),
+        )
+        .route(
+            "/api/collaboration/mission-plans",
+            post(routes::create_collaboration_mission_plan_route),
+        )
+        .route(
+            "/api/collaboration/mission-plans/:plan_id/edits",
+            post(routes::edit_collaboration_mission_plan_route),
+        )
+        .route(
+            "/api/collaboration/mission-plans/:plan_id/dispatch",
+            post(routes::dispatch_collaboration_mission_plan_route),
+        )
+        .route(
+            "/api/collaboration/streams",
+            post(routes::start_collaboration_stream_route),
+        )
+        .route(
+            "/api/collaboration/streams/:stream_id/frames",
+            get(routes::list_collaboration_stream_frames)
+                .post(routes::relay_collaboration_stream_frame_route),
+        )
+        .route(
+            "/api/collaboration/permissions/resolve",
+            get(routes::resolve_collaboration_permissions_route),
+        )
+        .route(
+            "/api/collaboration/actions/authorize",
+            post(routes::authorize_collaboration_action_route),
         )
         .route(
             "/api/time-series/points",
@@ -354,11 +705,20 @@ pub fn build_router(state: AppState) -> Router {
             "/api/fields/:field_id/scene-refresh-advisories",
             get(routes::list_field_scene_refresh_advisories),
         )
+        .route(
+            "/api/fields/:field_id/scene-change-advisories",
+            get(routes::list_field_scene_change_advisories),
+        )
         .route("/api/scenes", get(routes::list_scenes))
         .route("/api/layers", get(routes::list_layers))
+        .route("/api/open-data/layers", get(routes::list_open_data_layers))
         .route(
             "/api/layers/:scene_id/:kind",
             get(routes::get_layer_metadata),
+        )
+        .route(
+            "/api/layers/:scene_id/:kind/open-data",
+            post(routes::publish_open_data_layer),
         )
         .route(
             "/api/layers/:scene_id/:kind/export/geotiff",
@@ -389,6 +749,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_scene_reports).post(routes::generate_scene_report),
         )
         .route(
+            "/api/scenes/:scene_id/reports/:report_id/lineage",
+            get(routes::get_scene_report_lineage),
+        )
+        .route(
             "/api/scenes/:scene_id/reports/:report_id",
             get(routes::download_scene_report),
         )
@@ -403,6 +767,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/report-shares/:share_token",
             get(routes::download_shared_report),
+        )
+        .route(
+            "/api/fields/:field_id/exports/records.csv",
+            get(routes::export_field_records_csv),
+        )
+        .route(
+            "/api/fields/:field_id/exports/records.geojson",
+            get(routes::export_field_records_geojson),
         )
         .route(
             "/api/scenes/:scene_id/exports/annotations.csv",

@@ -1743,6 +1743,16 @@ fn render_reports_panel(
         }
     }
     ui.separator();
+    if !reports.zones.is_empty() {
+        ui.label(format!("Overlay zones: {}", reports.zones.len()));
+        for zone in reports.zones.iter().take(4) {
+            ui.small(format!("{} • {}", zone.zone_id, zone.label));
+        }
+        ui.separator();
+    }
+    if let Some(error) = reports.last_overlay_error.as_deref() {
+        ui.colored_label(egui::Color32::from_rgb(180, 48, 48), error);
+    }
     if reports.items.is_empty() {
         ui.label("No reports generated for this scene");
         return;

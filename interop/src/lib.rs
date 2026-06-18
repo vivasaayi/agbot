@@ -1,5 +1,9 @@
+use provenance::{
+    ActorIdentity, ArtifactKind, AuditAction, AuditEntry, AuditLedger, LineageLedger,
+    LineageRecord, ProvenanceError, ProvenanceParameters,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use shared::schemas::{
     assert_raster_spatial_ref, validate_field_boundary, FarmFieldEntityStatus, FieldBoundary,
     FieldBoundaryValidationError, FieldRecord, GeoBounds, GeoPoint, RasterResolution,
@@ -48,6 +52,12 @@ pub struct InteropExtent {
     pub min_y: f64,
     pub max_x: f64,
     pub max_y: f64,
+}
+
+impl InteropExtent {
+    pub fn area(self) -> f64 {
+        (self.max_x - self.min_x).abs() * (self.max_y - self.min_y).abs()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -145,10 +155,68 @@ pub struct FieldBoundaryImportRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldBoundaryImportReport {
     pub field: FieldRecord,
+    pub format: ImportFormat,
     pub source_filename: String,
     pub source_crs: String,
     pub target_crs: String,
     pub feature_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BulkFieldBoundaryImportRequest {
+    pub rows: Vec<FieldBoundaryImportRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BulkImportRowStatus {
+    Imported,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BulkFieldBoundaryImportRowReport {
+    pub row: usize,
+    pub status: BulkImportRowStatus,
+    pub field_id: Option<String>,
+    pub source_filename: Option<String>,
+    pub source_crs: Option<String>,
+    pub target_crs: Option<String>,
+    pub feature_count: Option<usize>,
+    pub reason_code: Option<InteropRejectionReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BulkFieldBoundaryImportReport {
+    pub rows: Vec<BulkFieldBoundaryImportRowReport>,
+    pub imported: Vec<FieldBoundaryImportReport>,
+    pub success_count: usize,
+    pub failure_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportLineageEmissionRequest {
+    pub import_artifact_id: String,
+    pub operator: String,
+    pub actor: ActorIdentity,
+    pub imported_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportLineageEmission {
+    pub record: LineageRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportRejectionAuditRequest {
+    pub action_ref: String,
+    pub operator: String,
+    pub actor: ActorIdentity,
+    pub occurred_at: String,
+    pub source_filename: String,
+    pub format: ImportFormat,
+    pub target_crs: String,
+    pub error: InteropError,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,6 +248,51 @@ pub struct PrescriptionShapefileFiles {
     pub shx: Vec<u8>,
     pub dbf: Vec<u8>,
     pub prj: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingsShapefileFiles {
+    pub shp: Vec<u8>,
+    pub shx: Vec<u8>,
+    pub dbf: Vec<u8>,
+    pub prj: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingsExportFeature {
+    pub finding_id: String,
+    pub zone_id: String,
+    pub reason: String,
+    pub priority: String,
+    pub area_m2: f64,
+    pub centroid: InteropCoordinate,
+    pub crs: String,
+    pub polygon: Vec<InteropCoordinate>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingsExportRequest {
+    pub export_id: String,
+    pub crs: String,
+    pub findings: Vec<FindingsExportFeature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingsGeoJsonExport {
+    pub export_id: String,
+    pub crs: String,
+    pub feature_count: usize,
+    pub exported_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingsShapefileExport {
+    pub export_id: String,
+    pub crs: String,
+    pub feature_count: usize,
+    pub extent: Option<InteropExtent>,
+    pub files: FindingsShapefileFiles,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -274,6 +387,259 @@ pub struct JohnDeerePrescriptionPushReport {
     pub backoff_millis: Vec<u64>,
     pub zone_count: usize,
     pub unit_designator: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClimateFieldViewPrescriptionPushRequest {
+    pub remote_field_id: String,
+    pub prescription: PrescriptionShapefileRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClimateFieldViewRetryPolicy {
+    pub max_attempts: usize,
+    #[serde(default)]
+    pub backoff_millis: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClimateFieldViewUploadPayload {
+    pub remote_field_id: String,
+    pub prescription_id: String,
+    pub crs: String,
+    pub unit_code: String,
+    pub zone_count: usize,
+    pub rates: Vec<f64>,
+    pub files: PrescriptionShapefileFiles,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClimateFieldViewRemoteReceipt {
+    pub remote_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClimateFieldViewEndpointError {
+    pub message: String,
+}
+
+impl ClimateFieldViewEndpointError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub trait ClimateFieldViewConnectorEndpoint {
+    fn push_prescription(
+        &mut self,
+        payload: ClimateFieldViewUploadPayload,
+    ) -> Result<ClimateFieldViewRemoteReceipt, ClimateFieldViewEndpointError>;
+
+    fn wait_backoff(&mut self, _millis: u64) {}
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClimateFieldViewPrescriptionPushReport {
+    pub remote_id: String,
+    pub attempts: usize,
+    pub backoff_millis: Vec<u64>,
+    pub zone_count: usize,
+    pub unit_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrimbleRetryPolicy {
+    pub max_attempts: usize,
+    #[serde(default)]
+    pub backoff_millis: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrimbleBoundaryImportRequest {
+    pub farm_id: Option<String>,
+    pub org_id: String,
+    pub owner: String,
+    pub target_crs: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrimbleBoundary {
+    pub remote_boundary_id: String,
+    pub field_id: String,
+    pub name: String,
+    pub crs: String,
+    pub coordinate_unit: String,
+    pub boundary: Vec<InteropCoordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrimbleEndpointError {
+    pub message: String,
+    pub timed_out: bool,
+}
+
+impl TrimbleEndpointError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            timed_out: false,
+        }
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            timed_out: true,
+        }
+    }
+}
+
+pub trait TrimbleConnectorEndpoint {
+    fn pull_boundaries(&mut self) -> Result<Vec<TrimbleBoundary>, TrimbleEndpointError>;
+
+    fn wait_backoff(&mut self, _millis: u64) {}
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrimbleBoundaryImportReport {
+    pub attempts: usize,
+    pub backoff_millis: Vec<u64>,
+    pub imported: Vec<FieldBoundaryImportReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformMigrationEndpointError {
+    pub message: String,
+}
+
+impl PlatformMigrationEndpointError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub trait PlatformMigrationSource {
+    fn pull_boundary_imports(
+        &mut self,
+    ) -> Result<Vec<FieldBoundaryImportRequest>, PlatformMigrationEndpointError>;
+
+    fn pull_prescriptions(
+        &mut self,
+    ) -> Result<Vec<PrescriptionShapefileRequest>, PlatformMigrationEndpointError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMigrationItemKind {
+    Boundary,
+    Prescription,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformMigrationUnmigratedItem {
+    pub item_ref: String,
+    pub kind: PlatformMigrationItemKind,
+    pub reason: InteropRejectionReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlatformMigrationReconciliation {
+    pub source_boundary_count: usize,
+    pub imported_boundary_count: usize,
+    pub source_prescription_count: usize,
+    pub imported_prescription_count: usize,
+    pub source_area: f64,
+    pub imported_area: f64,
+    pub source_crs: Vec<String>,
+    pub imported_crs: Vec<String>,
+    pub discrepancy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlatformMigrationReport {
+    pub boundaries: Vec<FieldBoundaryImportReport>,
+    pub prescriptions: Vec<PrescriptionShapefileReport>,
+    pub unmigrated: Vec<PlatformMigrationUnmigratedItem>,
+    pub reconciliation: PlatformMigrationReconciliation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoundTripCertificationRequest {
+    pub vector_cases: Vec<VectorCertificationCase>,
+    pub raster_products: Vec<RasterProduct>,
+    pub prescriptions: Vec<PrescriptionShapefileRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorCertificationCase {
+    pub case_id: String,
+    pub payload: ImportPayload,
+    pub target_crs: String,
+    #[serde(default)]
+    pub injected_exported_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundTripCertificationKind {
+    Vector,
+    RasterGeoTiff,
+    PrescriptionShapefile,
+    PrescriptionTaskData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundTripCertificationStatus {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundTripDivergence {
+    ValidationFailed {
+        reason: InteropRejectionReason,
+    },
+    CrsMismatch {
+        expected: String,
+        actual: String,
+    },
+    ExtentDrift {
+        drift: f64,
+        tolerance: f64,
+    },
+    FeatureCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    RasterShapeMismatch {
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoundTripCertificationRow {
+    pub case_id: String,
+    pub kind: RoundTripCertificationKind,
+    pub format: ImportFormat,
+    pub status: RoundTripCertificationStatus,
+    pub divergence: Option<RoundTripDivergence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoundTripCertificationReport {
+    pub rows: Vec<RoundTripCertificationRow>,
+    pub passed_count: usize,
+    pub failed_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -398,6 +764,60 @@ pub enum JohnDeereConnectorError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ClimateFieldViewConnectorError {
+    EmptyRemoteFieldId,
+    EmptyRemoteId,
+    EndpointFailed {
+        attempts: usize,
+        message: String,
+    },
+    UnsupportedPrescriptionCrs {
+        crs: String,
+    },
+    UnsupportedUnit {
+        unit: String,
+    },
+    MixedUnits {
+        expected_unit: String,
+        actual_unit: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrimbleConnectorError {
+    EmptyFieldId,
+    EmptyRemoteBoundaryId,
+    EndpointFailed {
+        attempts: usize,
+        message: String,
+    },
+    EndpointTimeout {
+        attempts: usize,
+        message: String,
+    },
+    UnsupportedBoundaryCrs {
+        remote_boundary_id: String,
+        crs: String,
+    },
+    UnsupportedBoundaryUnit {
+        remote_boundary_id: String,
+        unit: String,
+        crs: String,
+    },
+    InvalidBoundaryGeometry {
+        remote_boundary_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMigrationError {
+    EndpointFailed { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InteropRejectionReason {
     ParseError,
     MissingCrs,
@@ -425,6 +845,15 @@ pub enum InteropRejectionReason {
     },
     JohnDeereConnector {
         reason: JohnDeereConnectorError,
+    },
+    ClimateFieldViewConnector {
+        reason: ClimateFieldViewConnectorError,
+    },
+    TrimbleConnector {
+        reason: TrimbleConnectorError,
+    },
+    PlatformMigration {
+        reason: PlatformMigrationError,
     },
 }
 
@@ -487,6 +916,301 @@ pub fn round_trip_vector_layer(
         max_coordinate_drift,
         exported_bytes,
     })
+}
+
+pub fn certify_round_trip_fidelity(
+    request: RoundTripCertificationRequest,
+) -> RoundTripCertificationReport {
+    let mut rows = Vec::new();
+    for case in request.vector_cases {
+        rows.push(certify_vector_case(case));
+    }
+    for product in request.raster_products {
+        rows.push(certify_raster_case(product));
+    }
+    for prescription in request.prescriptions {
+        rows.push(certify_prescription_shapefile_case(prescription.clone()));
+        rows.push(certify_prescription_taskdata_case(prescription));
+    }
+
+    let passed_count = rows
+        .iter()
+        .filter(|row| row.status == RoundTripCertificationStatus::Passed)
+        .count();
+    let failed_count = rows.len() - passed_count;
+    RoundTripCertificationReport {
+        rows,
+        passed_count,
+        failed_count,
+    }
+}
+
+fn certify_vector_case(case: VectorCertificationCase) -> RoundTripCertificationRow {
+    let case_id = normalize_optional_text(&case.case_id).unwrap_or_else(|| "vector".to_string());
+    let format = case.payload.format;
+    let imported = match validate_and_reproject_import(
+        case.payload,
+        CrsTransform {
+            target_crs: case.target_crs,
+        },
+    ) {
+        Ok(imported) => imported,
+        Err(error) => {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::Vector,
+                format,
+                validation_divergence(error),
+            );
+        }
+    };
+    let exported_bytes = match case.injected_exported_bytes {
+        Some(bytes) => bytes,
+        None => match export_geojson(&imported) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return certification_failed(
+                    case_id,
+                    RoundTripCertificationKind::Vector,
+                    format,
+                    validation_divergence(error),
+                );
+            }
+        },
+    };
+    let round_tripped = match validate_and_reproject_import(
+        ImportPayload {
+            format: ImportFormat::GeoJson,
+            filename: format!("{case_id}-round-trip.geojson"),
+            bytes: exported_bytes,
+        },
+        CrsTransform {
+            target_crs: imported.target_crs.clone(),
+        },
+    ) {
+        Ok(round_tripped) => round_tripped,
+        Err(error) => {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::Vector,
+                format,
+                validation_divergence(error),
+            );
+        }
+    };
+    if imported.target_crs != round_tripped.target_crs {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::Vector,
+            format,
+            RoundTripDivergence::CrsMismatch {
+                expected: imported.target_crs,
+                actual: round_tripped.target_crs,
+            },
+        );
+    }
+    if imported.feature_count != round_tripped.feature_count {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::Vector,
+            format,
+            RoundTripDivergence::FeatureCountMismatch {
+                expected: imported.feature_count,
+                actual: round_tripped.feature_count,
+            },
+        );
+    }
+    let drift = extent_drift(imported.extent, round_tripped.extent);
+    if drift > GEOMETRY_EPSILON {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::Vector,
+            format,
+            RoundTripDivergence::ExtentDrift {
+                drift,
+                tolerance: GEOMETRY_EPSILON,
+            },
+        );
+    }
+    certification_passed(case_id, RoundTripCertificationKind::Vector, format)
+}
+
+fn certify_raster_case(product: RasterProduct) -> RoundTripCertificationRow {
+    let case_id =
+        normalize_optional_text(&product.product_id).unwrap_or_else(|| "raster".to_string());
+    let exported = match export_raster_geotiff(product.clone()) {
+        Ok(exported) => exported,
+        Err(error) => {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::RasterGeoTiff,
+                ImportFormat::GeoTiff,
+                validation_divergence(error),
+            );
+        }
+    };
+    let reopened = match reopen_raster_geotiff(&exported.exported_bytes) {
+        Ok(reopened) => reopened,
+        Err(error) => {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::RasterGeoTiff,
+                ImportFormat::GeoTiff,
+                validation_divergence(error),
+            );
+        }
+    };
+    if product.width != reopened.width || product.height != reopened.height {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::RasterGeoTiff,
+            ImportFormat::GeoTiff,
+            RoundTripDivergence::RasterShapeMismatch {
+                expected_width: product.width,
+                expected_height: product.height,
+                actual_width: reopened.width,
+                actual_height: reopened.height,
+            },
+        );
+    }
+    let expected_crs = product.spatial_ref.crs.clone().unwrap_or_default();
+    let actual_crs = reopened.spatial_ref.crs.clone().unwrap_or_default();
+    if expected_crs != actual_crs {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::RasterGeoTiff,
+            ImportFormat::GeoTiff,
+            RoundTripDivergence::CrsMismatch {
+                expected: expected_crs,
+                actual: actual_crs,
+            },
+        );
+    }
+    let expected_extent = product
+        .spatial_ref
+        .bbox
+        .as_ref()
+        .map(interop_extent_from_bounds);
+    let actual_extent = reopened
+        .spatial_ref
+        .bbox
+        .as_ref()
+        .map(interop_extent_from_bounds);
+    if let (Some(expected), Some(actual)) = (expected_extent, actual_extent) {
+        let drift = extent_drift(expected, actual);
+        if drift > GEOMETRY_EPSILON {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::RasterGeoTiff,
+                ImportFormat::GeoTiff,
+                RoundTripDivergence::ExtentDrift {
+                    drift,
+                    tolerance: GEOMETRY_EPSILON,
+                },
+            );
+        }
+    }
+    certification_passed(
+        case_id,
+        RoundTripCertificationKind::RasterGeoTiff,
+        ImportFormat::GeoTiff,
+    )
+}
+
+fn certify_prescription_shapefile_case(
+    prescription: PrescriptionShapefileRequest,
+) -> RoundTripCertificationRow {
+    let case_id = normalize_optional_text(&prescription.prescription_id)
+        .unwrap_or_else(|| "prescription-shapefile".to_string());
+    match export_prescription_shapefile(prescription) {
+        Ok(_) => certification_passed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionShapefile,
+            ImportFormat::GeoJson,
+        ),
+        Err(error) => certification_failed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionShapefile,
+            ImportFormat::GeoJson,
+            validation_divergence(error),
+        ),
+    }
+}
+
+fn certify_prescription_taskdata_case(
+    prescription: PrescriptionShapefileRequest,
+) -> RoundTripCertificationRow {
+    let case_id = normalize_optional_text(&prescription.prescription_id)
+        .map(|id| format!("{id}:taskdata"))
+        .unwrap_or_else(|| "prescription-taskdata".to_string());
+    match export_prescription_taskdata(prescription) {
+        Ok(report) if report.validation.valid => certification_passed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionTaskData,
+            ImportFormat::GeoJson,
+        ),
+        Ok(_) => certification_failed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionTaskData,
+            ImportFormat::GeoJson,
+            RoundTripDivergence::ValidationFailed {
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::InvalidTaskDataSchema {
+                        reason: "TaskData validation returned invalid".to_string(),
+                    },
+                },
+            },
+        ),
+        Err(error) => certification_failed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionTaskData,
+            ImportFormat::GeoJson,
+            validation_divergence(error),
+        ),
+    }
+}
+
+fn certification_passed(
+    case_id: String,
+    kind: RoundTripCertificationKind,
+    format: ImportFormat,
+) -> RoundTripCertificationRow {
+    RoundTripCertificationRow {
+        case_id,
+        kind,
+        format,
+        status: RoundTripCertificationStatus::Passed,
+        divergence: None,
+    }
+}
+
+fn certification_failed(
+    case_id: String,
+    kind: RoundTripCertificationKind,
+    format: ImportFormat,
+    divergence: RoundTripDivergence,
+) -> RoundTripCertificationRow {
+    RoundTripCertificationRow {
+        case_id,
+        kind,
+        format,
+        status: RoundTripCertificationStatus::Failed,
+        divergence: Some(divergence),
+    }
+}
+
+fn validation_divergence(error: InteropError) -> RoundTripDivergence {
+    let InteropError::Rejected { reason, .. } = error;
+    RoundTripDivergence::ValidationFailed { reason }
+}
+
+fn interop_extent_from_bounds(bounds: &GeoBounds) -> InteropExtent {
+    InteropExtent {
+        min_x: bounds.min_lon,
+        min_y: bounds.min_lat,
+        max_x: bounds.max_lon,
+        max_y: bounds.max_lat,
+    }
 }
 
 pub fn validate_geopackage_layers(
@@ -597,6 +1321,71 @@ pub fn export_raster_geotiff(product: RasterProduct) -> Result<RasterGeoTiffRepo
     })
 }
 
+pub fn export_findings_geojson(
+    request: FindingsExportRequest,
+) -> Result<FindingsGeoJsonExport, InteropError> {
+    let normalized = normalize_findings_export_request(request)?;
+    let features = normalized
+        .findings
+        .iter()
+        .map(finding_geojson_feature)
+        .collect::<Vec<_>>();
+    let mut crs_properties = Map::new();
+    crs_properties.insert("name".to_string(), Value::String(normalized.crs.clone()));
+    let mut crs = Map::new();
+    crs.insert("type".to_string(), Value::String("name".to_string()));
+    crs.insert("properties".to_string(), Value::Object(crs_properties));
+    let mut document = Map::new();
+    document.insert(
+        "type".to_string(),
+        Value::String("FeatureCollection".to_string()),
+    );
+    document.insert("crs".to_string(), Value::Object(crs));
+    document.insert("features".to_string(), Value::Array(features));
+    let exported_bytes = serde_json::to_vec(&Value::Object(document))
+        .map_err(|_| rejected(&normalized.export_id, InteropRejectionReason::ParseError))?;
+    Ok(FindingsGeoJsonExport {
+        export_id: normalized.export_id,
+        crs: normalized.crs,
+        feature_count: normalized.findings.len(),
+        exported_bytes,
+    })
+}
+
+pub fn export_findings_shapefile(
+    request: FindingsExportRequest,
+) -> Result<FindingsShapefileExport, InteropError> {
+    let normalized = normalize_findings_export_request(request)?;
+    let extent = findings_extent(&normalized.findings);
+    let shape_extent = extent.unwrap_or(InteropExtent {
+        min_x: 0.0,
+        min_y: 0.0,
+        max_x: 0.0,
+        max_y: 0.0,
+    });
+    let record_contents = normalized
+        .findings
+        .iter()
+        .map(|finding| {
+            let extent = extent_from_coordinates(&finding.polygon).expect("finding is normalized");
+            polygon_shapefile_record_content(&finding.polygon, extent)
+        })
+        .collect::<Vec<_>>();
+    let files = FindingsShapefileFiles {
+        shp: write_shp_bytes(shape_extent, &record_contents),
+        shx: write_shx_bytes(shape_extent, &record_contents),
+        dbf: write_findings_dbf(&normalized.findings),
+        prj: projection_wkt(&normalized.crs).into_bytes(),
+    };
+    Ok(FindingsShapefileExport {
+        export_id: normalized.export_id,
+        crs: normalized.crs,
+        feature_count: normalized.findings.len(),
+        extent,
+        files,
+    })
+}
+
 pub fn reopen_raster_geotiff(bytes: &[u8]) -> Result<RasterProduct, InteropError> {
     let payload = bytes
         .strip_prefix(GEOTIFF_METADATA_MAGIC)
@@ -617,6 +1406,7 @@ pub fn import_field_boundary(
     request: FieldBoundaryImportRequest,
 ) -> Result<FieldBoundaryImportReport, InteropError> {
     let source_filename = normalized_filename(request.payload.filename.clone());
+    let format = request.payload.format;
     let imported = validate_and_reproject_import(
         request.payload,
         CrsTransform {
@@ -678,11 +1468,110 @@ pub fn import_field_boundary(
 
     Ok(FieldBoundaryImportReport {
         field,
+        format,
         source_filename,
         source_crs: imported.source_crs,
         target_crs: imported.target_crs,
         feature_count: imported.feature_count,
     })
+}
+
+pub fn bulk_import_field_boundaries(
+    request: BulkFieldBoundaryImportRequest,
+) -> BulkFieldBoundaryImportReport {
+    let mut rows = Vec::with_capacity(request.rows.len());
+    let mut imported = Vec::new();
+    for (index, row_request) in request.rows.into_iter().enumerate() {
+        let row = index + 1;
+        let requested_field_id = row_request.field_id.clone();
+        let requested_target_crs = normalize_crs(&row_request.target_crs)
+            .or_else(|| normalize_optional_text(&row_request.target_crs));
+        match import_field_boundary(row_request) {
+            Ok(report) => {
+                rows.push(BulkFieldBoundaryImportRowReport {
+                    row,
+                    status: BulkImportRowStatus::Imported,
+                    field_id: Some(report.field.field_id.clone()),
+                    source_filename: Some(report.source_filename.clone()),
+                    source_crs: Some(report.source_crs.clone()),
+                    target_crs: Some(report.target_crs.clone()),
+                    feature_count: Some(report.feature_count),
+                    reason_code: None,
+                });
+                imported.push(report);
+            }
+            Err(InteropError::Rejected { filename, reason }) => {
+                rows.push(BulkFieldBoundaryImportRowReport {
+                    row,
+                    status: BulkImportRowStatus::Failed,
+                    field_id: normalize_optional_text(&requested_field_id),
+                    source_filename: Some(filename),
+                    source_crs: None,
+                    target_crs: requested_target_crs,
+                    feature_count: None,
+                    reason_code: Some(reason),
+                });
+            }
+        }
+    }
+    let success_count = imported.len();
+    let failure_count = rows.len().saturating_sub(success_count);
+    BulkFieldBoundaryImportReport {
+        rows,
+        imported,
+        success_count,
+        failure_count,
+    }
+}
+
+pub fn emit_import_lineage(
+    ledger: &mut LineageLedger,
+    report: &FieldBoundaryImportReport,
+    request: ImportLineageEmissionRequest,
+) -> Result<ImportLineageEmission, ProvenanceError> {
+    let parameters = ProvenanceParameters::from_json(json!({
+        "source_filename": report.source_filename,
+        "format": report.format,
+        "source_crs": report.source_crs,
+        "target_crs": report.target_crs,
+        "feature_count": report.feature_count,
+        "operator": request.operator,
+        "field_id": report.field.field_id,
+    }));
+    let record = ledger.record_lineage(LineageRecord {
+        artifact_id: request.import_artifact_id,
+        kind: ArtifactKind::Product,
+        inputs: Vec::new(),
+        method: "import.field_boundary".to_string(),
+        parameters,
+        operator: request.operator,
+        actor: request.actor,
+        created_at: request.imported_at,
+    })?;
+    Ok(ImportLineageEmission { record })
+}
+
+pub fn record_import_rejection(
+    audit_ledger: &mut AuditLedger,
+    request: ImportRejectionAuditRequest,
+) -> Result<AuditEntry, ProvenanceError> {
+    let target_crs =
+        normalize_crs(&request.target_crs).unwrap_or_else(|| request.target_crs.trim().to_string());
+    let action = AuditAction {
+        action_ref: request.action_ref,
+        action_kind: "import.field_boundary.rejected".to_string(),
+        artifact_ref: None,
+        payload: ProvenanceParameters::from_json(json!({
+            "source_filename": normalized_filename(request.source_filename),
+            "format": request.format,
+            "target_crs": target_crs,
+            "operator": request.operator,
+            "rejection_reason": interop_error_reason_value(&request.error),
+            "error": interop_error_value(&request.error),
+        })),
+        occurred_at: request.occurred_at,
+    };
+    audit_ledger.append_action(request.actor, action)
 }
 
 pub fn export_prescription_shapefile(
@@ -960,6 +1849,78 @@ pub fn push_john_deere_prescription(
     ))
 }
 
+pub fn push_climate_fieldview_prescription(
+    endpoint: &mut impl ClimateFieldViewConnectorEndpoint,
+    request: ClimateFieldViewPrescriptionPushRequest,
+    retry_policy: ClimateFieldViewRetryPolicy,
+) -> Result<ClimateFieldViewPrescriptionPushReport, InteropError> {
+    let remote_field_id =
+        normalize_prescription_text(&request.remote_field_id).ok_or_else(|| {
+            climate_fieldview_rejected(ClimateFieldViewConnectorError::EmptyRemoteFieldId)
+        })?;
+    let prescription = normalize_prescription_request(request.prescription)?;
+    validate_climate_fieldview_prescription_crs(&prescription.field_crs)?;
+    let unit_code = climate_fieldview_unit_code(&prescription)?;
+    let rates = prescription
+        .zones
+        .iter()
+        .map(|zone| zone.rate)
+        .collect::<Vec<_>>();
+    let files = write_prescription_shapefile_bundle(
+        &prescription.field_crs,
+        prescription.field_extent,
+        &prescription.zones,
+    );
+    let payload = ClimateFieldViewUploadPayload {
+        remote_field_id,
+        prescription_id: prescription.prescription_id,
+        crs: prescription.field_crs,
+        unit_code: unit_code.clone(),
+        zone_count: prescription.zones.len(),
+        rates,
+        files,
+    };
+    let max_attempts = retry_policy.max_attempts.max(1);
+    let mut backoff_millis = Vec::new();
+    let mut last_error = None::<ClimateFieldViewEndpointError>;
+
+    for attempt in 1..=max_attempts {
+        match endpoint.push_prescription(payload.clone()) {
+            Ok(receipt) => {
+                let remote_id =
+                    normalize_prescription_text(&receipt.remote_id).ok_or_else(|| {
+                        climate_fieldview_rejected(ClimateFieldViewConnectorError::EmptyRemoteId)
+                    })?;
+                return Ok(ClimateFieldViewPrescriptionPushReport {
+                    remote_id,
+                    attempts: attempt,
+                    backoff_millis,
+                    zone_count: payload.zone_count,
+                    unit_code,
+                });
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < max_attempts {
+                    let backoff = fieldview_backoff_for_attempt(&retry_policy, attempt);
+                    endpoint.wait_backoff(backoff);
+                    backoff_millis.push(backoff);
+                }
+            }
+        }
+    }
+
+    let message = last_error
+        .map(|error| error.message)
+        .unwrap_or_else(|| "endpoint failed".to_string());
+    Err(climate_fieldview_rejected(
+        ClimateFieldViewConnectorError::EndpointFailed {
+            attempts: max_attempts,
+            message,
+        },
+    ))
+}
+
 pub fn pull_john_deere_boundaries(
     endpoint: &mut impl JohnDeereConnectorEndpoint,
 ) -> Result<JohnDeereBoundaryPullReport, InteropError> {
@@ -974,6 +1935,143 @@ pub fn pull_john_deere_boundaries(
         mapped.push(map_john_deere_boundary(boundary)?);
     }
     Ok(JohnDeereBoundaryPullReport { boundaries: mapped })
+}
+
+pub fn import_trimble_boundaries(
+    endpoint: &mut impl TrimbleConnectorEndpoint,
+    request: TrimbleBoundaryImportRequest,
+    retry_policy: TrimbleRetryPolicy,
+) -> Result<TrimbleBoundaryImportReport, InteropError> {
+    let max_attempts = retry_policy.max_attempts.max(1);
+    let mut backoff_millis = Vec::new();
+    let mut last_error = None::<TrimbleEndpointError>;
+
+    for attempt in 1..=max_attempts {
+        match endpoint.pull_boundaries() {
+            Ok(boundaries) => {
+                let mut imported = Vec::with_capacity(boundaries.len());
+                for boundary in boundaries {
+                    imported.push(import_trimble_boundary(boundary, &request)?);
+                }
+                return Ok(TrimbleBoundaryImportReport {
+                    attempts: attempt,
+                    backoff_millis,
+                    imported,
+                });
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < max_attempts {
+                    let backoff = trimble_backoff_for_attempt(&retry_policy, attempt);
+                    endpoint.wait_backoff(backoff);
+                    backoff_millis.push(backoff);
+                }
+            }
+        }
+    }
+
+    let error = last_error.unwrap_or_else(|| TrimbleEndpointError::new("endpoint failed"));
+    if error.timed_out {
+        Err(trimble_rejected(TrimbleConnectorError::EndpointTimeout {
+            attempts: max_attempts,
+            message: error.message,
+        }))
+    } else {
+        Err(trimble_rejected(TrimbleConnectorError::EndpointFailed {
+            attempts: max_attempts,
+            message: error.message,
+        }))
+    }
+}
+
+pub fn migrate_platform_round_trip(
+    source: &mut impl PlatformMigrationSource,
+) -> Result<PlatformMigrationReport, InteropError> {
+    let boundary_requests = source.pull_boundary_imports().map_err(|error| {
+        platform_migration_rejected(PlatformMigrationError::EndpointFailed {
+            message: error.message,
+        })
+    })?;
+    let prescription_requests = source.pull_prescriptions().map_err(|error| {
+        platform_migration_rejected(PlatformMigrationError::EndpointFailed {
+            message: error.message,
+        })
+    })?;
+
+    let mut boundaries = Vec::new();
+    let mut prescriptions = Vec::new();
+    let mut unmigrated = Vec::new();
+    let mut source_area = 0.0;
+    let mut imported_area = 0.0;
+    let mut source_crs = BTreeSet::new();
+    let mut imported_crs = BTreeSet::new();
+
+    for request in boundary_requests.iter().cloned() {
+        let item_ref = normalized_filename(request.payload.filename.clone());
+        match import_field_boundary(request) {
+            Ok(report) => {
+                let area = report.field.area_ha.unwrap_or(0.0);
+                source_area += area;
+                imported_area += area;
+                source_crs.insert(report.source_crs.clone());
+                imported_crs.insert(report.target_crs.clone());
+                boundaries.push(report);
+            }
+            Err(error) => {
+                unmigrated.push(platform_unmigrated_item(
+                    item_ref,
+                    PlatformMigrationItemKind::Boundary,
+                    error,
+                ));
+            }
+        }
+    }
+
+    for request in prescription_requests.iter().cloned() {
+        let item_ref = normalized_filename(request.prescription_id.clone());
+        match export_prescription_shapefile(request) {
+            Ok(report) => {
+                let area = report.extent.area();
+                source_area += area;
+                imported_area += area;
+                source_crs.insert(report.field_crs.clone());
+                imported_crs.insert(report.field_crs.clone());
+                prescriptions.push(report);
+            }
+            Err(error) => {
+                unmigrated.push(platform_unmigrated_item(
+                    item_ref,
+                    PlatformMigrationItemKind::Prescription,
+                    error,
+                ));
+            }
+        }
+    }
+
+    let discrepancy = !unmigrated.is_empty()
+        || boundary_requests.len() != boundaries.len()
+        || prescription_requests.len() != prescriptions.len()
+        || (source_area - imported_area).abs() > GEOMETRY_EPSILON
+        || source_crs != imported_crs;
+    let imported_boundary_count = boundaries.len();
+    let imported_prescription_count = prescriptions.len();
+
+    Ok(PlatformMigrationReport {
+        boundaries,
+        prescriptions,
+        unmigrated,
+        reconciliation: PlatformMigrationReconciliation {
+            source_boundary_count: boundary_requests.len(),
+            imported_boundary_count,
+            source_prescription_count: prescription_requests.len(),
+            imported_prescription_count,
+            source_area,
+            imported_area,
+            source_crs: source_crs.into_iter().collect(),
+            imported_crs: imported_crs.into_iter().collect(),
+            discrepancy,
+        },
+    })
 }
 
 fn export_geojson(imported: &InteropImportResult) -> Result<Vec<u8>, InteropError> {
@@ -1047,6 +2145,55 @@ fn geometry_to_geojson(geometry: &ReprojectedGeometry) -> Value {
     Value::Object(object)
 }
 
+fn finding_geojson_feature(finding: &FindingsExportFeature) -> Value {
+    let mut properties = Map::new();
+    properties.insert(
+        "finding_id".to_string(),
+        Value::String(finding.finding_id.clone()),
+    );
+    properties.insert(
+        "zone_id".to_string(),
+        Value::String(finding.zone_id.clone()),
+    );
+    properties.insert("reason".to_string(), Value::String(finding.reason.clone()));
+    properties.insert(
+        "priority".to_string(),
+        Value::String(finding.priority.clone()),
+    );
+    properties.insert("area_m2".to_string(), Value::from(finding.area_m2));
+    properties.insert("centroid_x".to_string(), Value::from(finding.centroid.x));
+    properties.insert("centroid_y".to_string(), Value::from(finding.centroid.y));
+    properties.insert("crs".to_string(), Value::String(finding.crs.clone()));
+    properties.insert(
+        "evidence_refs".to_string(),
+        Value::Array(
+            finding
+                .evidence_refs
+                .iter()
+                .map(|value| Value::String(value.clone()))
+                .collect(),
+        ),
+    );
+    let mut geometry = Map::new();
+    geometry.insert("type".to_string(), Value::String("Polygon".to_string()));
+    geometry.insert(
+        "coordinates".to_string(),
+        Value::Array(vec![Value::Array(
+            finding
+                .polygon
+                .iter()
+                .map(|coordinate| coordinate_to_geojson(*coordinate))
+                .collect(),
+        )]),
+    );
+    let mut feature = Map::new();
+    feature.insert("type".to_string(), Value::String("Feature".to_string()));
+    feature.insert("id".to_string(), Value::String(finding.finding_id.clone()));
+    feature.insert("geometry".to_string(), Value::Object(geometry));
+    feature.insert("properties".to_string(), Value::Object(properties));
+    Value::Object(feature)
+}
+
 fn coordinate_to_geojson(coordinate: InteropCoordinate) -> Value {
     Value::Array(vec![Value::from(coordinate.x), Value::from(coordinate.y)])
 }
@@ -1083,6 +2230,75 @@ fn validate_raster_product(
     }
     assert_raster_spatial_ref(Some(&product.spatial_ref), product.width, product.height)
         .map_err(|error| raster_spatial_ref_rejection(filename, error))
+}
+
+fn normalize_findings_export_request(
+    mut request: FindingsExportRequest,
+) -> Result<FindingsExportRequest, InteropError> {
+    let export_id = normalized_filename(request.export_id.clone());
+    request.export_id = export_id.clone();
+    request.crs = normalize_crs(&request.crs)
+        .ok_or_else(|| rejected(&export_id, InteropRejectionReason::MissingCrs))?;
+    reject_unsupported_crs(&export_id, &request.crs)?;
+    for finding in &mut request.findings {
+        finding.finding_id = normalize_optional_text(&finding.finding_id)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::InvalidGeometry))?;
+        finding.zone_id = normalize_optional_text(&finding.zone_id)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::InvalidGeometry))?;
+        finding.reason = normalize_optional_text(&finding.reason)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::InvalidGeometry))?;
+        finding.priority = normalize_optional_text(&finding.priority)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::InvalidGeometry))?;
+        finding.crs = normalize_crs(&finding.crs)
+            .ok_or_else(|| rejected(&export_id, InteropRejectionReason::MissingCrs))?;
+        if finding.crs != request.crs {
+            return Err(rejected(
+                &export_id,
+                InteropRejectionReason::UnsupportedCrs {
+                    crs: finding.crs.clone(),
+                },
+            ));
+        }
+        if !finding.area_m2.is_finite()
+            || finding.area_m2 < 0.0
+            || !finding.centroid.x.is_finite()
+            || !finding.centroid.y.is_finite()
+        {
+            return Err(rejected(
+                &export_id,
+                InteropRejectionReason::InvalidGeometry,
+            ));
+        }
+        finding.evidence_refs = finding
+            .evidence_refs
+            .iter()
+            .filter_map(|value| normalize_optional_text(value))
+            .collect();
+        if finding.polygon.len() < 4
+            || finding
+                .polygon
+                .iter()
+                .any(|coordinate| !coordinate.x.is_finite() || !coordinate.y.is_finite())
+            || finding.polygon.first() != finding.polygon.last()
+            || extent_from_coordinates(&finding.polygon).is_none()
+        {
+            return Err(rejected(
+                &export_id,
+                InteropRejectionReason::InvalidGeometry,
+            ));
+        }
+    }
+    Ok(request)
+}
+
+fn findings_extent(findings: &[FindingsExportFeature]) -> Option<InteropExtent> {
+    let mut builder = ExtentBuilder::default();
+    for finding in findings {
+        for coordinate in &finding.polygon {
+            builder.observe(*coordinate);
+        }
+    }
+    builder.finish()
 }
 
 fn raster_spatial_ref_rejection(filename: &str, error: RasterSpatialRefError) -> InteropError {
@@ -1184,6 +2400,24 @@ fn backoff_for_attempt(policy: &JohnDeereRetryPolicy, attempt: usize) -> u64 {
         .unwrap_or(0)
 }
 
+fn fieldview_backoff_for_attempt(policy: &ClimateFieldViewRetryPolicy, attempt: usize) -> u64 {
+    policy
+        .backoff_millis
+        .get(attempt.saturating_sub(1))
+        .copied()
+        .or_else(|| policy.backoff_millis.last().copied())
+        .unwrap_or(0)
+}
+
+fn trimble_backoff_for_attempt(policy: &TrimbleRetryPolicy, attempt: usize) -> u64 {
+    policy
+        .backoff_millis
+        .get(attempt.saturating_sub(1))
+        .copied()
+        .or_else(|| policy.backoff_millis.last().copied())
+        .unwrap_or(0)
+}
+
 fn validate_john_deere_prescription_crs(crs: &str) -> Result<(), InteropError> {
     if matches!(crs, WGS84 | WEB_MERCATOR) {
         return Ok(());
@@ -1193,6 +2427,46 @@ fn validate_john_deere_prescription_crs(crs: &str) -> Result<(), InteropError> {
             crs: crs.to_string(),
         },
     ))
+}
+
+fn validate_climate_fieldview_prescription_crs(crs: &str) -> Result<(), InteropError> {
+    if crs == WGS84 {
+        return Ok(());
+    }
+    Err(climate_fieldview_rejected(
+        ClimateFieldViewConnectorError::UnsupportedPrescriptionCrs {
+            crs: crs.to_string(),
+        },
+    ))
+}
+
+fn climate_fieldview_unit_code(
+    prescription: &NormalizedPrescription,
+) -> Result<String, InteropError> {
+    let first_unit = prescription
+        .zones
+        .first()
+        .map(|zone| zone.unit.as_str())
+        .unwrap_or("");
+    for zone in &prescription.zones {
+        if zone.unit != first_unit {
+            return Err(climate_fieldview_rejected(
+                ClimateFieldViewConnectorError::MixedUnits {
+                    expected_unit: first_unit.to_string(),
+                    actual_unit: zone.unit.clone(),
+                },
+            ));
+        }
+    }
+    match first_unit {
+        "kg_ha" => Ok("KG_HA".to_string()),
+        "l_ha" => Ok("L_HA".to_string()),
+        other => Err(climate_fieldview_rejected(
+            ClimateFieldViewConnectorError::UnsupportedUnit {
+                unit: other.to_string(),
+            },
+        )),
+    }
 }
 
 fn map_john_deere_boundary(
@@ -1244,6 +2518,118 @@ fn map_john_deere_boundary(
         feature_count: 1,
         boundary: ring,
     })
+}
+
+fn import_trimble_boundary(
+    boundary: TrimbleBoundary,
+    request: &TrimbleBoundaryImportRequest,
+) -> Result<FieldBoundaryImportReport, InteropError> {
+    let remote_boundary_id = normalize_prescription_text(&boundary.remote_boundary_id)
+        .ok_or_else(|| trimble_rejected(TrimbleConnectorError::EmptyRemoteBoundaryId))?;
+    let field_id = normalize_prescription_text(&boundary.field_id)
+        .ok_or_else(|| trimble_rejected(TrimbleConnectorError::EmptyFieldId))?;
+    let source_crs = normalize_crs(&boundary.crs).ok_or_else(|| {
+        trimble_rejected(TrimbleConnectorError::UnsupportedBoundaryCrs {
+            remote_boundary_id: remote_boundary_id.clone(),
+            crs: boundary.crs.clone(),
+        })
+    })?;
+    let target_crs = normalize_crs(&request.target_crs).ok_or_else(|| {
+        trimble_rejected(TrimbleConnectorError::UnsupportedBoundaryCrs {
+            remote_boundary_id: remote_boundary_id.clone(),
+            crs: request.target_crs.clone(),
+        })
+    })?;
+    if !matches!(source_crs.as_str(), WGS84 | WEB_MERCATOR) || source_crs != target_crs {
+        return Err(trimble_rejected(
+            TrimbleConnectorError::UnsupportedBoundaryCrs {
+                remote_boundary_id,
+                crs: boundary.crs,
+            },
+        ));
+    }
+    validate_trimble_boundary_unit(&remote_boundary_id, &source_crs, &boundary.coordinate_unit)?;
+
+    let ring = normalize_prescription_ring(&boundary.boundary).ok_or_else(|| {
+        trimble_rejected(TrimbleConnectorError::InvalidBoundaryGeometry {
+            remote_boundary_id: remote_boundary_id.clone(),
+        })
+    })?;
+    if polygon_area(&ring) <= GEOMETRY_EPSILON || ring_self_intersects_coordinates(&ring) {
+        return Err(trimble_rejected(
+            TrimbleConnectorError::InvalidBoundaryGeometry {
+                remote_boundary_id: remote_boundary_id.clone(),
+            },
+        ));
+    }
+    let field_boundary = FieldBoundary {
+        coordinates: ring
+            .iter()
+            .map(|coordinate| GeoPoint {
+                longitude: coordinate.x,
+                latitude: coordinate.y,
+            })
+            .collect(),
+        crs: Some(target_crs.clone()),
+    };
+    let validated = validate_field_boundary(&field_boundary).map_err(|_| {
+        trimble_rejected(TrimbleConnectorError::InvalidBoundaryGeometry {
+            remote_boundary_id: remote_boundary_id.clone(),
+        })
+    })?;
+    let source_filename = format!("trimble:{remote_boundary_id}");
+    let field = FieldRecord {
+        farm_id: request.farm_id.clone(),
+        field_id,
+        org_id: request.org_id.clone(),
+        owner: request.owner.clone(),
+        name: normalize_prescription_text(&boundary.name).unwrap_or_else(|| "<unnamed>".to_string()),
+        area_ha: Some(validated.area_ha),
+        crop: None,
+        season: None,
+        notes: Some(format!(
+            "imported from Trimble {remote_boundary_id}; source_crs={source_crs}; target_crs={target_crs}; unit={}",
+            boundary.coordinate_unit
+        )),
+        boundary: validated.boundary,
+        extent: validated.extent,
+        status: FarmFieldEntityStatus::Active,
+        created_at: request.created_at.clone(),
+        updated_at: request.created_at.clone(),
+    };
+
+    Ok(FieldBoundaryImportReport {
+        field,
+        format: ImportFormat::GeoJson,
+        source_filename,
+        source_crs,
+        target_crs,
+        feature_count: 1,
+    })
+}
+
+fn validate_trimble_boundary_unit(
+    remote_boundary_id: &str,
+    crs: &str,
+    unit: &str,
+) -> Result<(), InteropError> {
+    let unit = normalize_prescription_text(unit).unwrap_or_default();
+    let valid = match crs {
+        WGS84 => matches!(unit.as_str(), "degree" | "degrees"),
+        WEB_MERCATOR => matches!(unit.as_str(), "meter" | "meters" | "metre" | "metres"),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(trimble_rejected(
+            TrimbleConnectorError::UnsupportedBoundaryUnit {
+                remote_boundary_id: remote_boundary_id.to_string(),
+                unit,
+                crs: crs.to_string(),
+            },
+        ))
+    }
 }
 
 fn normalize_prescription_zone(
@@ -1493,6 +2879,44 @@ fn write_prescription_dbf(zones: &[NormalizedPrescriptionZone]) -> Vec<u8> {
             fields[1].decimal_count,
         ));
         bytes.extend_from_slice(&dbf_character_value(&zone.unit, fields[2].length));
+    }
+    bytes.push(0x1A);
+    bytes
+}
+
+fn write_findings_dbf(findings: &[FindingsExportFeature]) -> Vec<u8> {
+    let fields = [
+        DbfField::character("FINDING_ID", 40),
+        DbfField::character("ZONE_ID", 32),
+        DbfField::character("REASON", 32),
+        DbfField::character("PRIORITY", 16),
+        DbfField::character("CRS", 24),
+    ];
+    let header_len = 32 + fields.len() * 32 + 1;
+    let record_len = 1 + fields
+        .iter()
+        .map(|field| field.length as usize)
+        .sum::<usize>();
+    let mut bytes = vec![0u8; 32];
+    bytes[0] = 0x03;
+    bytes[1] = 126;
+    bytes[2] = 6;
+    bytes[3] = 13;
+    bytes[4..8].copy_from_slice(&(findings.len() as u32).to_le_bytes());
+    bytes[8..10].copy_from_slice(&(header_len as u16).to_le_bytes());
+    bytes[10..12].copy_from_slice(&(record_len as u16).to_le_bytes());
+    for field in &fields {
+        bytes.extend_from_slice(&field.descriptor());
+    }
+    bytes.push(0x0D);
+
+    for finding in findings {
+        bytes.push(b' ');
+        bytes.extend_from_slice(&dbf_character_value(&finding.finding_id, fields[0].length));
+        bytes.extend_from_slice(&dbf_character_value(&finding.zone_id, fields[1].length));
+        bytes.extend_from_slice(&dbf_character_value(&finding.reason, fields[2].length));
+        bytes.extend_from_slice(&dbf_character_value(&finding.priority, fields[3].length));
+        bytes.extend_from_slice(&dbf_character_value(&finding.crs, fields[4].length));
     }
     bytes.push(0x1A);
     bytes
@@ -2160,6 +3584,40 @@ fn john_deere_rejected(reason: JohnDeereConnectorError) -> InteropError {
     )
 }
 
+fn climate_fieldview_rejected(reason: ClimateFieldViewConnectorError) -> InteropError {
+    rejected(
+        "climate-fieldview",
+        InteropRejectionReason::ClimateFieldViewConnector { reason },
+    )
+}
+
+fn trimble_rejected(reason: TrimbleConnectorError) -> InteropError {
+    rejected(
+        "trimble",
+        InteropRejectionReason::TrimbleConnector { reason },
+    )
+}
+
+fn platform_migration_rejected(reason: PlatformMigrationError) -> InteropError {
+    rejected(
+        "platform-migration",
+        InteropRejectionReason::PlatformMigration { reason },
+    )
+}
+
+fn platform_unmigrated_item(
+    item_ref: String,
+    kind: PlatformMigrationItemKind,
+    error: InteropError,
+) -> PlatformMigrationUnmigratedItem {
+    let InteropError::Rejected { reason, .. } = error;
+    PlatformMigrationUnmigratedItem {
+        item_ref,
+        kind,
+        reason,
+    }
+}
+
 fn parse_geojson_and_reproject(
     filename: &str,
     bytes: &[u8],
@@ -2382,7 +3840,9 @@ fn extract_geojson_crs(document: &Value) -> Option<String> {
 }
 
 fn reject_unsupported_crs(filename: &str, crs: &str) -> Result<(), InteropError> {
-    if crs.to_ascii_uppercase().contains("OBLIQUE") || !matches!(crs, WGS84 | WEB_MERCATOR) {
+    if crs.to_ascii_uppercase().contains("OBLIQUE")
+        || !(matches!(crs, WGS84 | WEB_MERCATOR) || epsg_utm_wkt(crs).is_some())
+    {
         return Err(rejected(
             filename,
             InteropRejectionReason::UnsupportedCrs {
@@ -2396,6 +3856,11 @@ fn reject_unsupported_crs(filename: &str, crs: &str) -> Result<(), InteropError>
 fn normalize_crs(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_ascii_uppercase())
+}
+
+fn normalize_optional_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn normalized_filename(filename: String) -> String {
@@ -2412,6 +3877,18 @@ fn rejected(filename: &str, reason: InteropRejectionReason) -> InteropError {
         filename: filename.to_string(),
         reason,
     }
+}
+
+fn interop_error_reason_value(error: &InteropError) -> Value {
+    match error {
+        InteropError::Rejected { reason, .. } => {
+            serde_json::to_value(reason).unwrap_or_else(|_| Value::String("unknown".to_string()))
+        }
+    }
+}
+
+fn interop_error_value(error: &InteropError) -> Value {
+    serde_json::to_value(error).unwrap_or_else(|_| Value::String(error.to_string()))
 }
 
 #[derive(Debug, Default)]
@@ -2455,17 +3932,30 @@ impl ExtentBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_prescription_shapefile, export_prescription_taskdata, export_raster_geotiff,
-        import_field_boundary, pull_john_deere_boundaries, push_john_deere_prescription,
+        certify_round_trip_fidelity, emit_import_lineage, export_findings_geojson,
+        export_findings_shapefile, export_prescription_shapefile, export_prescription_taskdata,
+        export_raster_geotiff, import_field_boundary, import_trimble_boundaries,
+        migrate_platform_round_trip, pull_john_deere_boundaries,
+        push_climate_fieldview_prescription, push_john_deere_prescription, record_import_rejection,
         reopen_raster_geotiff, round_trip_vector_layer, validate_and_reproject_import,
-        validate_geopackage_layers, validate_taskdata_xml, CrsTransform,
-        FieldBoundaryImportRequest, FieldBoundaryRejectionReason, ImportFormat, ImportPayload,
-        InteropCoordinate, InteropError, InteropExtent, InteropRejectionReason, JohnDeereBoundary,
-        JohnDeereConnectorEndpoint, JohnDeereConnectorError, JohnDeereEndpointError,
-        JohnDeerePrescriptionPushRequest, JohnDeereRetryPolicy, JohnDeereUploadPayload,
-        PrescriptionField, PrescriptionRejectionReason, PrescriptionShapefileRequest,
-        PrescriptionZone, RasterProduct, RemotePrescriptionReceipt, ReprojectedGeometry,
+        validate_geopackage_layers, validate_taskdata_xml, BulkFieldBoundaryImportRequest,
+        BulkImportRowStatus, ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
+        ClimateFieldViewEndpointError, ClimateFieldViewPrescriptionPushRequest,
+        ClimateFieldViewRemoteReceipt, ClimateFieldViewRetryPolicy, ClimateFieldViewUploadPayload,
+        CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason,
+        FindingsExportFeature, FindingsExportRequest, ImportFormat, ImportLineageEmissionRequest,
+        ImportPayload, ImportRejectionAuditRequest, InteropCoordinate, InteropError, InteropExtent,
+        InteropRejectionReason, JohnDeereBoundary, JohnDeereConnectorEndpoint,
+        JohnDeereConnectorError, JohnDeereEndpointError, JohnDeerePrescriptionPushRequest,
+        JohnDeereRetryPolicy, JohnDeereUploadPayload, PlatformMigrationEndpointError,
+        PlatformMigrationItemKind, PlatformMigrationSource, PrescriptionField,
+        PrescriptionRejectionReason, PrescriptionShapefileRequest, PrescriptionZone, RasterProduct,
+        RemotePrescriptionReceipt, ReprojectedGeometry, RoundTripCertificationKind,
+        RoundTripCertificationRequest, RoundTripCertificationStatus, RoundTripDivergence,
+        TrimbleBoundary, TrimbleBoundaryImportRequest, TrimbleConnectorEndpoint,
+        TrimbleConnectorError, TrimbleEndpointError, TrimbleRetryPolicy, VectorCertificationCase,
     };
+    use provenance::{ActorIdentity, ActorKind, AuditLedger, AuditOutcome, LineageLedger};
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
 
     #[test]
@@ -2643,6 +4133,75 @@ mod tests {
     }
 
     #[test]
+    fn findings_geojson_export_preserves_crs_and_schema() {
+        let report = export_findings_geojson(findings_request(vec![finding_feature("finding-1")]))
+            .expect("findings GeoJSON should export");
+        let document: serde_json::Value =
+            serde_json::from_slice(&report.exported_bytes).expect("GeoJSON should parse");
+
+        assert_eq!(report.crs, "EPSG:32614");
+        assert_eq!(report.feature_count, 1);
+        assert_eq!(document["type"], "FeatureCollection");
+        assert_eq!(
+            document
+                .pointer("/crs/properties/name")
+                .and_then(|value| value.as_str()),
+            Some("EPSG:32614")
+        );
+        assert_eq!(
+            document.pointer("/features/0/properties/finding_id"),
+            Some(&serde_json::json!("finding-1"))
+        );
+        assert_eq!(
+            document.pointer("/features/0/geometry/type"),
+            Some(&serde_json::json!("Polygon"))
+        );
+    }
+
+    #[test]
+    fn findings_shapefile_export_writes_consistent_bundle() {
+        let report =
+            export_findings_shapefile(findings_request(vec![finding_feature("finding-1")]))
+                .expect("findings shapefile should export");
+
+        assert_eq!(report.crs, "EPSG:32614");
+        assert_eq!(report.feature_count, 1);
+        assert_eq!(report.extent.expect("extent").min_x, 500_000.0);
+        assert_shapefile_files_consistent(
+            &report.files.shp,
+            &report.files.shx,
+            &report.files.dbf,
+            &report.files.prj,
+            1,
+        );
+    }
+
+    #[test]
+    fn empty_findings_exports_are_valid_empty_geojson_and_shapefile() {
+        let geojson =
+            export_findings_geojson(findings_request(Vec::new())).expect("empty GeoJSON exports");
+        let document: serde_json::Value =
+            serde_json::from_slice(&geojson.exported_bytes).expect("GeoJSON should parse");
+        assert_eq!(geojson.feature_count, 0);
+        assert!(document["features"]
+            .as_array()
+            .expect("features")
+            .is_empty());
+
+        let shapefile = export_findings_shapefile(findings_request(Vec::new()))
+            .expect("empty shapefile exports");
+        assert_eq!(shapefile.feature_count, 0);
+        assert_eq!(shapefile.extent, None);
+        assert_shapefile_files_consistent(
+            &shapefile.files.shp,
+            &shapefile.files.shx,
+            &shapefile.files.dbf,
+            &shapefile.files.prj,
+            0,
+        );
+    }
+
+    #[test]
     fn field_boundary_import_creates_field_record_with_area_and_source_crs() {
         let report = import_field_boundary(FieldBoundaryImportRequest {
             payload: ImportPayload {
@@ -2661,6 +4220,7 @@ mod tests {
         .expect("valid boundary should import");
 
         assert_eq!(report.source_filename, "field-alpha-boundary.geojson");
+        assert_eq!(report.format, ImportFormat::GeoJson);
         assert_eq!(report.source_crs, "EPSG:4326");
         assert_eq!(report.target_crs, "EPSG:4326");
         assert_eq!(report.feature_count, 1);
@@ -2677,6 +4237,181 @@ mod tests {
         assert!(report.field.area_ha.expect("area should be set") > 0.0);
         assert_eq!(report.field.extent.min_lon, -121.0);
         assert_eq!(report.field.extent.max_lon, -120.99);
+    }
+
+    #[test]
+    fn import_lineage_emission_records_source_format_crs_operator_and_feature_count() {
+        let report = import_field_boundary(FieldBoundaryImportRequest {
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: "field-alpha-boundary.geojson".to_string(),
+                bytes: valid_geojson("EPSG:4326").as_bytes().to_vec(),
+            },
+            target_crs: "EPSG:4326".to_string(),
+            field_id: "field-alpha".to_string(),
+            farm_id: Some("farm-alpha".to_string()),
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            name: "North Block".to_string(),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        })
+        .expect("valid boundary should import");
+        let mut ledger = LineageLedger::default();
+        let emission = emit_import_lineage(
+            &mut ledger,
+            &report,
+            ImportLineageEmissionRequest {
+                import_artifact_id: "import:field-alpha-boundary".to_string(),
+                operator: "ops-alpha".to_string(),
+                actor: ops_actor(),
+                imported_at: "2026-06-12T14:01:00Z".to_string(),
+            },
+        )
+        .expect("import lineage should emit");
+
+        assert_eq!(ledger.artifact_count(), 1);
+        assert_eq!(emission.record.artifact_id, "import:field-alpha-boundary");
+        assert_eq!(emission.record.method, "import.field_boundary");
+        assert_eq!(emission.record.operator, "ops-alpha");
+        let parameters = emission.record.parameters.as_json();
+        assert_eq!(
+            parameters["source_filename"],
+            "field-alpha-boundary.geojson"
+        );
+        assert_eq!(parameters["format"], "geo_json");
+        assert_eq!(parameters["source_crs"], "EPSG:4326");
+        assert_eq!(parameters["target_crs"], "EPSG:4326");
+        assert_eq!(parameters["feature_count"], 1);
+        assert_eq!(parameters["operator"], "ops-alpha");
+    }
+
+    #[test]
+    fn rejected_import_records_rejection_event_without_success_lineage() {
+        let error = import_field_boundary(FieldBoundaryImportRequest {
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: "bowtie-boundary.geojson".to_string(),
+                bytes: bowtie_geojson("EPSG:4326").as_bytes().to_vec(),
+            },
+            target_crs: "EPSG:4326".to_string(),
+            field_id: "field-bowtie".to_string(),
+            farm_id: None,
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            name: "Invalid Bowtie".to_string(),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        })
+        .expect_err("invalid boundary should reject");
+        let lineage = LineageLedger::default();
+        let mut audit = AuditLedger::default();
+        let entry = record_import_rejection(
+            &mut audit,
+            ImportRejectionAuditRequest {
+                action_ref: "import:bowtie-boundary:rejected".to_string(),
+                operator: "ops-alpha".to_string(),
+                actor: ops_actor(),
+                occurred_at: "2026-06-12T14:01:00Z".to_string(),
+                source_filename: " bowtie-boundary.geojson ".to_string(),
+                format: ImportFormat::GeoJson,
+                target_crs: "EPSG:4326".to_string(),
+                error,
+            },
+        )
+        .expect("rejection audit entry should append");
+
+        assert_eq!(lineage.artifact_count(), 0);
+        assert_eq!(audit.entries().len(), 1);
+        assert_eq!(entry.outcome, AuditOutcome::Accepted);
+        assert_eq!(entry.action.action_kind, "import.field_boundary.rejected");
+        assert_eq!(
+            entry.action.payload.as_json()["source_filename"],
+            "bowtie-boundary.geojson"
+        );
+        assert_eq!(entry.action.payload.as_json()["format"], "geo_json");
+        assert_eq!(entry.action.payload.as_json()["target_crs"], "EPSG:4326");
+        assert_eq!(
+            entry.action.payload.as_json()["rejection_reason"],
+            serde_json::json!({
+                "invalid_field_boundary": {
+                    "reason": "self_intersection"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn bulk_boundary_import_reports_each_row_and_keeps_valid_imports() {
+        let report = super::bulk_import_field_boundaries(BulkFieldBoundaryImportRequest {
+            rows: vec![
+                field_boundary_import_request(
+                    "field-alpha",
+                    "field-alpha-boundary.geojson",
+                    valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                ),
+                field_boundary_import_request(
+                    "field-broken",
+                    "field-broken.geojson",
+                    b"{not-json".to_vec(),
+                ),
+                field_boundary_import_request(
+                    "field-beta",
+                    "field-beta-boundary.geojson",
+                    valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                ),
+            ],
+        });
+
+        assert_eq!(report.success_count, 2);
+        assert_eq!(report.failure_count, 1);
+        assert_eq!(report.imported.len(), 2);
+        assert_eq!(report.rows.len(), 3);
+        assert_eq!(report.rows[0].row, 1);
+        assert_eq!(report.rows[0].status, BulkImportRowStatus::Imported);
+        assert_eq!(report.rows[0].field_id.as_deref(), Some("field-alpha"));
+        assert_eq!(
+            report.rows[0].source_filename.as_deref(),
+            Some("field-alpha-boundary.geojson")
+        );
+        assert_eq!(report.rows[1].row, 2);
+        assert_eq!(report.rows[1].status, BulkImportRowStatus::Failed);
+        assert_eq!(report.rows[1].field_id.as_deref(), Some("field-broken"));
+        assert_eq!(
+            report.rows[1].reason_code,
+            Some(InteropRejectionReason::ParseError)
+        );
+        assert_eq!(report.rows[2].row, 3);
+        assert_eq!(report.rows[2].status, BulkImportRowStatus::Imported);
+        assert_eq!(report.imported[1].field.field_id, "field-beta");
+    }
+
+    #[test]
+    fn bulk_boundary_import_continues_after_reason_coded_boundary_failure() {
+        let report = super::bulk_import_field_boundaries(BulkFieldBoundaryImportRequest {
+            rows: vec![
+                field_boundary_import_request(
+                    "field-bowtie",
+                    "bowtie-boundary.geojson",
+                    bowtie_geojson("EPSG:4326").as_bytes().to_vec(),
+                ),
+                field_boundary_import_request(
+                    "field-alpha",
+                    "field-alpha-boundary.geojson",
+                    valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                ),
+            ],
+        });
+
+        assert_eq!(report.success_count, 1);
+        assert_eq!(report.failure_count, 1);
+        assert_eq!(report.rows[0].status, BulkImportRowStatus::Failed);
+        assert_eq!(
+            report.rows[0].reason_code,
+            Some(InteropRejectionReason::InvalidFieldBoundary {
+                reason: FieldBoundaryRejectionReason::SelfIntersection
+            })
+        );
+        assert_eq!(report.rows[1].status, BulkImportRowStatus::Imported);
+        assert_eq!(report.imported[0].field.field_id, "field-alpha");
     }
 
     #[test]
@@ -3206,6 +4941,255 @@ mod tests {
         );
     }
 
+    #[test]
+    fn climate_fieldview_connector_pushes_prescription_with_mapping() {
+        let mut endpoint = FakeClimateFieldViewEndpoint::new().with_push_success("cfv-rx-001");
+
+        let report = push_climate_fieldview_prescription(
+            &mut endpoint,
+            ClimateFieldViewPrescriptionPushRequest {
+                remote_field_id: "cfv-field-alpha".to_string(),
+                prescription: john_deere_prescription_request(),
+            },
+            ClimateFieldViewRetryPolicy {
+                max_attempts: 1,
+                backoff_millis: Vec::new(),
+            },
+        )
+        .expect("FieldView connector should upload");
+
+        assert_eq!(report.remote_id, "cfv-rx-001");
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.unit_code, "KG_HA");
+        assert_eq!(endpoint.uploads.len(), 1);
+        let payload = endpoint.uploads.last().expect("payload should be sent");
+        assert_eq!(payload.remote_field_id, "cfv-field-alpha");
+        assert_eq!(payload.prescription_id, "rx-alpha-2026");
+        assert_eq!(payload.crs, "EPSG:4326");
+        assert_eq!(payload.zone_count, 2);
+        assert_eq!(payload.rates, vec![32.5, 12.25]);
+        assert!(!payload.files.shp.is_empty());
+        assert!(!payload.files.dbf.is_empty());
+        assert!(String::from_utf8(payload.files.prj.clone())
+            .expect("prj should be utf8")
+            .contains("WGS_1984"));
+    }
+
+    #[test]
+    fn climate_fieldview_connector_refuses_unsupported_crs_before_upload() {
+        let mut endpoint = FakeClimateFieldViewEndpoint::new().with_push_success("cfv-rx-001");
+
+        let error = push_climate_fieldview_prescription(
+            &mut endpoint,
+            ClimateFieldViewPrescriptionPushRequest {
+                remote_field_id: "cfv-field-alpha".to_string(),
+                prescription: prescription_request(),
+            },
+            ClimateFieldViewRetryPolicy {
+                max_attempts: 1,
+                backoff_millis: Vec::new(),
+            },
+        )
+        .expect_err("unsupported FieldView CRS should refuse before upload");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "climate-fieldview".to_string(),
+                reason: InteropRejectionReason::ClimateFieldViewConnector {
+                    reason: ClimateFieldViewConnectorError::UnsupportedPrescriptionCrs {
+                        crs: "EPSG:32614".to_string(),
+                    }
+                }
+            }
+        );
+        assert!(endpoint.uploads.is_empty());
+    }
+
+    #[test]
+    fn trimble_connector_imports_boundary_with_valid_crs_and_units() {
+        let mut endpoint = FakeTrimbleEndpoint::new().with_boundary(trimble_boundary());
+
+        let report = import_trimble_boundaries(
+            &mut endpoint,
+            trimble_import_request(),
+            TrimbleRetryPolicy {
+                max_attempts: 2,
+                backoff_millis: vec![100],
+            },
+        )
+        .expect("valid Trimble boundary should import");
+
+        assert_eq!(report.attempts, 1);
+        assert!(report.backoff_millis.is_empty());
+        assert_eq!(endpoint.pull_attempts, 1);
+        assert_eq!(report.imported.len(), 1);
+        let imported = &report.imported[0];
+        assert_eq!(imported.source_filename, "trimble:trimble-boundary-alpha");
+        assert_eq!(imported.source_crs, "EPSG:4326");
+        assert_eq!(imported.target_crs, "EPSG:4326");
+        assert_eq!(imported.field.field_id, "field-alpha");
+        assert_eq!(imported.field.org_id, "org-alpha");
+        assert_eq!(imported.field.boundary.crs.as_deref(), Some("EPSG:4326"));
+        assert!(imported.field.area_ha.expect("area should be computed") > 0.0);
+        assert!(imported
+            .field
+            .notes
+            .as_deref()
+            .expect("notes should cite Trimble")
+            .contains("unit=degree"));
+    }
+
+    #[test]
+    fn trimble_connector_retries_timeout_and_surfaces_without_half_import() {
+        let mut endpoint = FakeTrimbleEndpoint::new()
+            .with_timeout("request timed out")
+            .with_timeout("request timed out again");
+
+        let error = import_trimble_boundaries(
+            &mut endpoint,
+            trimble_import_request(),
+            TrimbleRetryPolicy {
+                max_attempts: 2,
+                backoff_millis: vec![75],
+            },
+        )
+        .expect_err("exhausted Trimble timeout should surface");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "trimble".to_string(),
+                reason: InteropRejectionReason::TrimbleConnector {
+                    reason: TrimbleConnectorError::EndpointTimeout {
+                        attempts: 2,
+                        message: "request timed out again".to_string(),
+                    }
+                }
+            }
+        );
+        assert_eq!(endpoint.pull_attempts, 2);
+        assert_eq!(endpoint.backoffs, vec![75]);
+    }
+
+    #[test]
+    fn platform_migration_reconciles_imported_boundaries_and_prescriptions() {
+        let mut source = FakeMigrationSource::new()
+            .with_boundary(field_boundary_import_request(
+                "field-alpha",
+                "field-alpha-boundary.geojson",
+                valid_geojson("EPSG:4326").as_bytes().to_vec(),
+            ))
+            .with_prescription(john_deere_prescription_request());
+
+        let report = migrate_platform_round_trip(&mut source).expect("migration should reconcile");
+
+        assert_eq!(source.boundary_pulls, 1);
+        assert_eq!(source.prescription_pulls, 1);
+        assert_eq!(report.boundaries.len(), 1);
+        assert_eq!(report.prescriptions.len(), 1);
+        assert!(report.unmigrated.is_empty());
+        assert_eq!(report.reconciliation.source_boundary_count, 1);
+        assert_eq!(report.reconciliation.imported_boundary_count, 1);
+        assert_eq!(report.reconciliation.source_prescription_count, 1);
+        assert_eq!(report.reconciliation.imported_prescription_count, 1);
+        assert_eq!(report.reconciliation.source_crs, vec!["EPSG:4326"]);
+        assert_eq!(report.reconciliation.imported_crs, vec!["EPSG:4326"]);
+        assert!(
+            (report.reconciliation.source_area - report.reconciliation.imported_area).abs()
+                <= super::GEOMETRY_EPSILON
+        );
+        assert!(!report.reconciliation.discrepancy);
+    }
+
+    #[test]
+    fn platform_migration_flags_invalid_items_as_unmigrated() {
+        let mut source = FakeMigrationSource::new()
+            .with_boundary(field_boundary_import_request(
+                "field-bowtie",
+                "bowtie-boundary.geojson",
+                bowtie_geojson("EPSG:4326").as_bytes().to_vec(),
+            ))
+            .with_prescription(john_deere_prescription_request());
+
+        let report = migrate_platform_round_trip(&mut source)
+            .expect("migration should continue after invalid item");
+
+        assert_eq!(report.boundaries.len(), 0);
+        assert_eq!(report.prescriptions.len(), 1);
+        assert_eq!(report.unmigrated.len(), 1);
+        assert_eq!(report.unmigrated[0].item_ref, "bowtie-boundary.geojson");
+        assert_eq!(
+            report.unmigrated[0].kind,
+            PlatformMigrationItemKind::Boundary
+        );
+        assert_eq!(
+            report.unmigrated[0].reason,
+            InteropRejectionReason::InvalidFieldBoundary {
+                reason: FieldBoundaryRejectionReason::SelfIntersection
+            }
+        );
+        assert_eq!(report.reconciliation.source_boundary_count, 1);
+        assert_eq!(report.reconciliation.imported_boundary_count, 0);
+        assert!(report.reconciliation.discrepancy);
+    }
+
+    #[test]
+    fn round_trip_certification_passes_for_supported_formats() {
+        let report = certify_round_trip_fidelity(RoundTripCertificationRequest {
+            vector_cases: vec![vector_certification_case(
+                "geojson-field-alpha",
+                valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                None,
+            )],
+            raster_products: vec![raster_product()],
+            prescriptions: vec![john_deere_prescription_request()],
+        });
+
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(report.passed_count, 4);
+        assert!(report
+            .rows
+            .iter()
+            .any(|row| row.kind == RoundTripCertificationKind::Vector));
+        assert!(report
+            .rows
+            .iter()
+            .any(|row| row.kind == RoundTripCertificationKind::RasterGeoTiff));
+        assert!(report
+            .rows
+            .iter()
+            .any(|row| row.kind == RoundTripCertificationKind::PrescriptionShapefile));
+        assert!(report
+            .rows
+            .iter()
+            .any(|row| row.kind == RoundTripCertificationKind::PrescriptionTaskData));
+    }
+
+    #[test]
+    fn round_trip_certification_names_crs_dropping_regression() {
+        let report = certify_round_trip_fidelity(RoundTripCertificationRequest {
+            vector_cases: vec![vector_certification_case(
+                "geojson-crs-drop",
+                valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                Some(geojson_without_crs().as_bytes().to_vec()),
+            )],
+            raster_products: Vec::new(),
+            prescriptions: Vec::new(),
+        });
+
+        assert_eq!(report.passed_count, 0);
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(report.rows[0].case_id, "geojson-crs-drop");
+        assert_eq!(report.rows[0].status, RoundTripCertificationStatus::Failed);
+        assert_eq!(
+            report.rows[0].divergence,
+            Some(RoundTripDivergence::ValidationFailed {
+                reason: InteropRejectionReason::MissingCrs
+            })
+        );
+    }
+
     #[derive(Default)]
     struct FakeJohnDeereEndpoint {
         push_results: Vec<Result<RemotePrescriptionReceipt, JohnDeereEndpointError>>,
@@ -3256,6 +5240,123 @@ mod tests {
 
         fn wait_backoff(&mut self, millis: u64) {
             self.backoffs.push(millis);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeClimateFieldViewEndpoint {
+        push_results: Vec<Result<ClimateFieldViewRemoteReceipt, ClimateFieldViewEndpointError>>,
+        uploads: Vec<ClimateFieldViewUploadPayload>,
+        backoffs: Vec<u64>,
+    }
+
+    impl FakeClimateFieldViewEndpoint {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_push_success(mut self, remote_id: &str) -> Self {
+            self.push_results.push(Ok(ClimateFieldViewRemoteReceipt {
+                remote_id: remote_id.to_string(),
+            }));
+            self
+        }
+    }
+
+    impl ClimateFieldViewConnectorEndpoint for FakeClimateFieldViewEndpoint {
+        fn push_prescription(
+            &mut self,
+            payload: ClimateFieldViewUploadPayload,
+        ) -> Result<ClimateFieldViewRemoteReceipt, ClimateFieldViewEndpointError> {
+            self.uploads.push(payload);
+            if self.push_results.is_empty() {
+                return Err(ClimateFieldViewEndpointError::new(
+                    "no fake response configured",
+                ));
+            }
+            self.push_results.remove(0)
+        }
+
+        fn wait_backoff(&mut self, millis: u64) {
+            self.backoffs.push(millis);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeTrimbleEndpoint {
+        pull_results: Vec<Result<Vec<TrimbleBoundary>, TrimbleEndpointError>>,
+        pull_attempts: usize,
+        backoffs: Vec<u64>,
+    }
+
+    impl FakeTrimbleEndpoint {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_boundary(mut self, boundary: TrimbleBoundary) -> Self {
+            self.pull_results.push(Ok(vec![boundary]));
+            self
+        }
+
+        fn with_timeout(mut self, message: &str) -> Self {
+            self.pull_results
+                .push(Err(TrimbleEndpointError::timeout(message)));
+            self
+        }
+    }
+
+    impl TrimbleConnectorEndpoint for FakeTrimbleEndpoint {
+        fn pull_boundaries(&mut self) -> Result<Vec<TrimbleBoundary>, TrimbleEndpointError> {
+            self.pull_attempts += 1;
+            if self.pull_results.is_empty() {
+                return Err(TrimbleEndpointError::new("no fake response configured"));
+            }
+            self.pull_results.remove(0)
+        }
+
+        fn wait_backoff(&mut self, millis: u64) {
+            self.backoffs.push(millis);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeMigrationSource {
+        boundaries: Vec<FieldBoundaryImportRequest>,
+        prescriptions: Vec<PrescriptionShapefileRequest>,
+        boundary_pulls: usize,
+        prescription_pulls: usize,
+    }
+
+    impl FakeMigrationSource {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_boundary(mut self, boundary: FieldBoundaryImportRequest) -> Self {
+            self.boundaries.push(boundary);
+            self
+        }
+
+        fn with_prescription(mut self, prescription: PrescriptionShapefileRequest) -> Self {
+            self.prescriptions.push(prescription);
+            self
+        }
+    }
+
+    impl PlatformMigrationSource for FakeMigrationSource {
+        fn pull_boundary_imports(
+            &mut self,
+        ) -> Result<Vec<FieldBoundaryImportRequest>, PlatformMigrationEndpointError> {
+            self.boundary_pulls += 1;
+            Ok(self.boundaries.clone())
+        }
+
+        fn pull_prescriptions(
+            &mut self,
+        ) -> Result<Vec<PrescriptionShapefileRequest>, PlatformMigrationEndpointError> {
+            self.prescription_pulls += 1;
+            Ok(self.prescriptions.clone())
         }
     }
 
@@ -3313,6 +5414,44 @@ mod tests {
         }
     }
 
+    fn trimble_import_request() -> TrimbleBoundaryImportRequest {
+        TrimbleBoundaryImportRequest {
+            farm_id: Some("farm-alpha".to_string()),
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            target_crs: "EPSG:4326".to_string(),
+            created_at: "2026-06-12T15:00:00Z".to_string(),
+        }
+    }
+
+    fn trimble_boundary() -> TrimbleBoundary {
+        TrimbleBoundary {
+            remote_boundary_id: "trimble-boundary-alpha".to_string(),
+            field_id: "field-alpha".to_string(),
+            name: "North Block".to_string(),
+            crs: "EPSG:4326".to_string(),
+            coordinate_unit: "degree".to_string(),
+            boundary: rectangle(-121.0, 39.0, -120.99, 39.01),
+        }
+    }
+
+    fn vector_certification_case(
+        case_id: &str,
+        bytes: Vec<u8>,
+        injected_exported_bytes: Option<Vec<u8>>,
+    ) -> VectorCertificationCase {
+        VectorCertificationCase {
+            case_id: case_id.to_string(),
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: format!("{case_id}.geojson"),
+                bytes,
+            },
+            target_crs: "EPSG:4326".to_string(),
+            injected_exported_bytes,
+        }
+    }
+
     fn rectangle(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<InteropCoordinate> {
         vec![
             InteropCoordinate { x: min_x, y: max_y },
@@ -3325,6 +5464,28 @@ mod tests {
 
     fn dbf_record_count(bytes: &[u8]) -> u32 {
         u32::from_le_bytes(bytes[4..8].try_into().expect("dbf count bytes"))
+    }
+
+    fn assert_shapefile_files_consistent(
+        shp: &[u8],
+        shx: &[u8],
+        dbf: &[u8],
+        prj: &[u8],
+        records: u32,
+    ) {
+        assert_eq!(be_i32(shp, 24) as usize * 2, shp.len());
+        assert_eq!(be_i32(shx, 24) as usize * 2, shx.len());
+        assert_eq!(le_i32(shp, 32), 5);
+        assert_eq!(le_i32(shx, 32), 5);
+        assert_eq!(shx.len(), 100 + records as usize * 8);
+        assert_eq!(dbf_record_count(dbf), records);
+        assert!(String::from_utf8_lossy(prj).contains("WGS") || !prj.is_empty());
+        let dbf_header_len = le_u16(dbf, 8) as usize;
+        let dbf_record_len = le_u16(dbf, 10) as usize;
+        assert_eq!(
+            dbf.len(),
+            dbf_header_len + dbf_record_len * records as usize + 1
+        );
     }
 
     fn assert_shapefile_bundle_consistent(files: &super::PrescriptionShapefileFiles, records: u32) {
@@ -3353,6 +5514,52 @@ mod tests {
             shp_offset_words += 4 + content_length_words;
         }
         assert_eq!(shp_offset_words as usize * 2, files.shp.len());
+    }
+
+    fn findings_request(findings: Vec<FindingsExportFeature>) -> FindingsExportRequest {
+        FindingsExportRequest {
+            export_id: "findings-export".to_string(),
+            crs: "EPSG:32614".to_string(),
+            findings,
+        }
+    }
+
+    fn finding_feature(finding_id: &str) -> FindingsExportFeature {
+        FindingsExportFeature {
+            finding_id: finding_id.to_string(),
+            zone_id: "zone-1".to_string(),
+            reason: "below_absolute_threshold".to_string(),
+            priority: "high".to_string(),
+            area_m2: 3_000.0,
+            centroid: InteropCoordinate {
+                x: 500_010.0,
+                y: 4_500_015.0,
+            },
+            crs: "EPSG:32614".to_string(),
+            polygon: vec![
+                InteropCoordinate {
+                    x: 500_000.0,
+                    y: 4_500_020.0,
+                },
+                InteropCoordinate {
+                    x: 500_020.0,
+                    y: 4_500_020.0,
+                },
+                InteropCoordinate {
+                    x: 500_020.0,
+                    y: 4_500_010.0,
+                },
+                InteropCoordinate {
+                    x: 500_000.0,
+                    y: 4_500_010.0,
+                },
+                InteropCoordinate {
+                    x: 500_000.0,
+                    y: 4_500_020.0,
+                },
+            ],
+            evidence_refs: vec!["zone:zone-1".to_string(), "layer:ndvi".to_string()],
+        }
     }
 
     fn first_shp_polygon(bytes: &[u8]) -> Vec<InteropCoordinate> {
@@ -3420,6 +5627,27 @@ mod tests {
         )
     }
 
+    fn geojson_without_crs() -> String {
+        r#"{
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"field_id": "alpha"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-121.0, 39.0],
+                        [-120.99, 39.0],
+                        [-120.99, 39.01],
+                        [-121.0, 39.01],
+                        [-121.0, 39.0]
+                    ]]
+                }
+            }]
+        }"#
+        .to_string()
+    }
+
     fn bowtie_geojson(crs: &str) -> String {
         format!(
             r#"{{
@@ -3444,6 +5672,34 @@ mod tests {
                 }}]
             }}"#
         )
+    }
+
+    fn field_boundary_import_request(
+        field_id: &str,
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> FieldBoundaryImportRequest {
+        FieldBoundaryImportRequest {
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: filename.to_string(),
+                bytes,
+            },
+            target_crs: "EPSG:4326".to_string(),
+            field_id: field_id.to_string(),
+            farm_id: Some("farm-alpha".to_string()),
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            name: field_id.to_string(),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+        }
+    }
+
+    fn ops_actor() -> ActorIdentity {
+        ActorIdentity {
+            actor_id: "ops-alpha".to_string(),
+            actor_kind: ActorKind::Operator,
+        }
     }
 
     fn raster_product() -> RasterProduct {

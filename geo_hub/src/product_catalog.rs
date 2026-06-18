@@ -77,6 +77,11 @@ pub async fn publish_product(
             qa_report_ref = NULL,
             provenance_hash = NULL,
             downstream_consumers_json = NULL,
+            open_data_license = NULL,
+            open_data_attribution = NULL,
+            open_data_anonymized = NULL,
+            open_data_refusal_reason = NULL,
+            open_data_published_at = NULL,
             created_at = datetime('now')
         "#,
     )
@@ -196,6 +201,11 @@ pub async fn publish_georeferenced_product(
             qa_report_ref = NULL,
             provenance_hash = NULL,
             downstream_consumers_json = NULL,
+            open_data_license = NULL,
+            open_data_attribution = NULL,
+            open_data_anonymized = NULL,
+            open_data_refusal_reason = NULL,
+            open_data_published_at = NULL,
             created_at = datetime('now')
         "#,
     )

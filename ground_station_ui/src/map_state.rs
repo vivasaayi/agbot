@@ -155,6 +155,14 @@ impl BasemapLayer {
         samples: &[FlightPathSample],
         mission_overlay: Option<&MissionOverlayInput>,
     ) -> Self {
+        Self::from_path_mission_and_captures(samples, mission_overlay, &[])
+    }
+
+    pub fn from_path_mission_and_captures(
+        samples: &[FlightPathSample],
+        mission_overlay: Option<&MissionOverlayInput>,
+        capture_events: &[CaptureEventInput],
+    ) -> Self {
         let mut projected_points: Vec<ProjectedPoint> = samples
             .iter()
             .map(|sample| project_wgs84_to_web_mercator(&sample.gps_position()))
@@ -163,6 +171,12 @@ impl BasemapLayer {
         if let Some(mission_overlay) = mission_overlay {
             projected_points.extend(mission_overlay.projected_source_points());
         }
+        projected_points.extend(
+            capture_events
+                .iter()
+                .filter_map(|event| event.position.as_ref())
+                .map(project_wgs84_to_web_mercator),
+        );
 
         Self {
             layer_id: "ground-station-basemap".to_string(),
@@ -301,6 +315,30 @@ pub struct MapPathPoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CaptureEventInput {
+    pub capture_event_id: String,
+    pub timeline_entry_id: String,
+    pub captured_at: DateTime<Utc>,
+    pub position: Option<GpsCoords>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CaptureMapMarker {
+    pub capture_event_id: String,
+    pub timeline_entry_id: String,
+    pub captured_at: DateTime<Utc>,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude_m: f64,
+    pub source_crs: String,
+    pub map_crs: String,
+    pub x_m: f64,
+    pub y_m: f64,
+    pub x_px: f64,
+    pub y_px: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MissionMapOverlay {
     pub mission_id: Uuid,
     pub waypoints: Vec<MissionWaypointOverlay>,
@@ -360,6 +398,8 @@ pub struct MapRenderState {
     pub basemap: BasemapLayer,
     pub current_position: Option<MapPathPoint>,
     pub flight_path: Vec<MapPathPoint>,
+    pub capture_markers: Vec<CaptureMapMarker>,
+    pub unmapped_capture_event_ids: Vec<String>,
     pub mission_overlay: Option<MissionMapOverlay>,
     pub geofence_breach: Option<GeofenceBreach>,
     pub overlay_assertions: Vec<OverlayAssertion>,
@@ -374,7 +414,16 @@ impl MapRenderState {
         samples: &[FlightPathSample],
         mission_overlay: Option<&MissionOverlayInput>,
     ) -> Self {
-        let basemap = BasemapLayer::from_path_and_mission(samples, mission_overlay);
+        Self::from_flight_path_mission_and_captures(samples, mission_overlay, &[])
+    }
+
+    pub fn from_flight_path_mission_and_captures(
+        samples: &[FlightPathSample],
+        mission_overlay: Option<&MissionOverlayInput>,
+        capture_events: &[CaptureEventInput],
+    ) -> Self {
+        let basemap =
+            BasemapLayer::from_path_mission_and_captures(samples, mission_overlay, capture_events);
         let telemetry_overlay = MapOverlayLayer::new(
             "telemetry-flight-path",
             WEB_MERCATOR_CRS,
@@ -388,6 +437,15 @@ impl MapRenderState {
             .map(|sample| MapPathPoint::from_sample(sample, &basemap))
             .collect();
         let current_position = flight_path.last().cloned();
+        let capture_markers = capture_events
+            .iter()
+            .filter_map(|event| CaptureMapMarker::from_input(event, &basemap))
+            .collect::<Vec<_>>();
+        let unmapped_capture_event_ids = capture_events
+            .iter()
+            .filter(|event| event.position.is_none())
+            .map(|event| event.capture_event_id.clone())
+            .collect::<Vec<_>>();
         let rendered_mission_overlay =
             mission_overlay.map(|overlay| MissionMapOverlay::from_input(overlay, &basemap));
         let geofence_breach = rendered_mission_overlay.as_ref().and_then(|overlay| {
@@ -413,15 +471,42 @@ impl MapRenderState {
         if let Some(overlay) = &rendered_mission_overlay {
             overlay_assertions.extend(overlay.assertions(&basemap));
         }
+        if !capture_markers.is_empty() {
+            overlay_assertions.push(assert_projected_overlay("capture-markers", &basemap));
+        }
 
         Self {
             basemap,
             current_position,
             flight_path,
+            capture_markers,
+            unmapped_capture_event_ids,
             mission_overlay: rendered_mission_overlay,
             geofence_breach,
             overlay_assertions,
         }
+    }
+}
+
+impl CaptureMapMarker {
+    fn from_input(input: &CaptureEventInput, basemap: &BasemapLayer) -> Option<Self> {
+        let position = input.position.as_ref()?;
+        let projected = project_wgs84_to_web_mercator(position);
+        let (x_px, y_px) = project_to_canvas(&projected, basemap);
+        Some(Self {
+            capture_event_id: input.capture_event_id.clone(),
+            timeline_entry_id: input.timeline_entry_id.clone(),
+            captured_at: input.captured_at,
+            latitude: position.latitude,
+            longitude: position.longitude,
+            altitude_m: position.altitude,
+            source_crs: WGS84_CRS.to_string(),
+            map_crs: basemap.crs.clone(),
+            x_m: projected.x_m,
+            y_m: projected.y_m,
+            x_px,
+            y_px,
+        })
     }
 }
 

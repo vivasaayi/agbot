@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -60,6 +60,16 @@ pub struct AlertCandidateRecord {
     pub occurred_at: String,
     pub idempotency_key: String,
     pub accepted_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertIdempotencyDecision {
+    pub idempotency_key: String,
+    pub alert_candidate_id: String,
+    pub first_seen_at: String,
+    pub reemitted_at: String,
+    pub duplicate_count: usize,
+    pub decision: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -227,6 +237,20 @@ pub struct AlertSeverityClassification {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertMessageTemplate {
+    pub template_id: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderedAlertMessage {
+    pub template_id: String,
+    pub alert_id: String,
+    pub message: String,
+    pub variables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlertDedupKey {
     pub source_domain: String,
     pub subject_ref: String,
@@ -275,7 +299,74 @@ pub struct AlertDedupResult {
     pub bypassed_alert_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveAggregationAdvisoryConfig {
+    pub enabled: bool,
+    pub min_history_alerts: usize,
+    pub flapping_occurrence_threshold: usize,
+    pub storm_subject_threshold: usize,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AdaptiveAggregationAdvisoryRequest {
+    #[serde(default)]
+    pub advisory_id: Option<String>,
+    #[serde(default)]
+    pub evaluated_at: String,
+    #[serde(default)]
+    pub fired_alerts: Vec<FiredAlertRecord>,
+    #[serde(default)]
+    pub dedup_summaries: Vec<AlertDedupSummary>,
+    pub config: AdaptiveAggregationAdvisoryConfig,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveAggregationAdvisoryStatus {
+    Raised,
+    NotRaised,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveAggregationAdvisoryReason {
+    FeatureDisabled,
+    InsufficientHistory,
+    FlappingSource,
+    EmergingStorm,
+    NoStormPattern,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveAggregationApprovalStatus {
+    PendingApproval,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveAggregationAdvisory {
+    pub advisory_id: String,
+    pub evaluated_at: String,
+    pub status: AdaptiveAggregationAdvisoryStatus,
+    pub reason_code: AdaptiveAggregationAdvisoryReason,
+    pub recommendation: Option<String>,
+    pub observed_alert_count: usize,
+    pub max_occurrence_count: usize,
+    pub affected_subject_count: usize,
+    pub uncertainty_lower: f64,
+    pub uncertainty_upper: f64,
+    pub uncertainty_reason: String,
+    pub evidence_refs: Vec<String>,
+    pub requires_approval: bool,
+    pub approval_status: AdaptiveAggregationApprovalStatus,
+    pub auto_suppression_applied: bool,
+    pub critical_alerts_auto_suppressed: bool,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertChannel {
     InApp,
@@ -293,6 +384,21 @@ impl AlertChannel {
             AlertChannel::Sms => "sms",
             AlertChannel::Webhook => "webhook",
             AlertChannel::Push => "push",
+        }
+    }
+}
+
+impl FromStr for AlertChannel {
+    type Err = AlertingError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "in_app" => Ok(AlertChannel::InApp),
+            "email" => Ok(AlertChannel::Email),
+            "sms" => Ok(AlertChannel::Sms),
+            "webhook" => Ok(AlertChannel::Webhook),
+            "push" => Ok(AlertChannel::Push),
+            other => Err(AlertingError::InvalidChannel(other.to_string())),
         }
     }
 }
@@ -336,6 +442,36 @@ pub struct AlertRoutingOutcome {
     pub default_operator_used: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertQuietHours {
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertUserPreference {
+    pub recipient_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiet_hours: Option<AlertQuietHours>,
+    #[serde(default)]
+    pub channel_preferences: Vec<AlertChannel>,
+    pub min_severity: AlertSeverityHint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertPreferenceDecision {
+    pub alert_id: String,
+    pub recipient_id: String,
+    pub deliver_immediately: bool,
+    pub deferred: bool,
+    pub suppressed: bool,
+    pub quiet_hours_active: bool,
+    pub quiet_hours_overridden: bool,
+    #[serde(default)]
+    pub selected_channels: Vec<AlertChannel>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertLifecycleState {
@@ -370,6 +506,34 @@ pub struct AlertLifecycleAction {
     pub state: AlertLifecycleState,
     pub transition: Option<AlertLifecycleTransition>,
     pub idempotent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertEscalationPolicy {
+    pub policy_id: String,
+    pub ack_window_seconds: u64,
+    pub escalation_chain: Vec<AlertRecipient>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertEscalationAuditRecord {
+    pub alert_id: String,
+    pub policy_id: String,
+    pub from_recipient_id: String,
+    pub to_recipient_id: String,
+    pub escalated_at: String,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertEscalationOutcome {
+    pub escalated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_recipient: Option<AlertRecipient>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AlertEscalationAuditRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,6 +594,28 @@ pub struct TrackedDelivery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelDeliveryRecord {
+    pub requested_channel: AlertChannel,
+    pub delivery_channel: AlertChannel,
+    pub fallback_used: bool,
+    pub tracked_delivery: TrackedDelivery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnroutableDeliveryOutcome {
+    pub alert_id: String,
+    pub recipient_id: String,
+    pub requested_channel: AlertChannel,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiChannelDeliveryResult {
+    pub deliveries: Vec<ChannelDeliveryRecord>,
+    pub unroutable: Vec<UnroutableDeliveryOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InAppFeedItem {
     pub recipient_id: String,
     pub alert_id: String,
@@ -479,6 +665,8 @@ pub struct RuleEvaluationOutcome {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AlertEventBackbone {
     candidates: Vec<AlertCandidateRecord>,
+    idempotency_index: BTreeMap<String, usize>,
+    idempotency_decisions: Vec<AlertIdempotencyDecision>,
     rejected_event_count: u32,
 }
 
@@ -520,6 +708,16 @@ pub enum AlertingError {
     EmptyFiredAt,
     #[error("explanation cannot be empty")]
     EmptyExplanation,
+    #[error("template_id cannot be empty")]
+    EmptyTemplateId,
+    #[error("template body cannot be empty")]
+    EmptyTemplateBody,
+    #[error("template variable cannot be empty")]
+    EmptyTemplateVariable,
+    #[error("template variable {variable} is missing from alert evidence")]
+    MissingTemplateVariable { variable: String },
+    #[error("template variable {variable} is not closed")]
+    UnclosedTemplateVariable { variable: String },
     #[error("severity metric cannot be empty")]
     EmptySeverityMetric,
     #[error("severity method_version cannot be empty")]
@@ -564,16 +762,34 @@ pub enum AlertingError {
         previous_at: String,
         attempted_at: String,
     },
+    #[error("escalation policy_id cannot be empty")]
+    EmptyEscalationPolicyId,
+    #[error("escalation policy requires ack_window_seconds > 0 and a non-empty chain")]
+    InvalidEscalationPolicy,
+    #[error("invalid escalation timestamp {0}")]
+    InvalidEscalationTimestamp(String),
     #[error("severity evidence must be finite with warning <= critical <= emergency thresholds")]
     InvalidSeverityEvidence,
     #[error("dedup window requires non-empty window_start <= window_end")]
     InvalidDedupWindow,
+    #[error("adaptive aggregation advisory_id cannot be empty")]
+    EmptyAdaptiveAggregationAdvisoryId,
+    #[error("adaptive aggregation evaluated_at cannot be empty")]
+    EmptyAdaptiveAggregationEvaluatedAt,
+    #[error("adaptive aggregation method_version cannot be empty")]
+    EmptyAdaptiveAggregationMethodVersion,
+    #[error("adaptive aggregation thresholds must be greater than zero")]
+    InvalidAdaptiveAggregationConfig,
     #[error("retry policy requires max_attempts > 0 and bounded positive backoff")]
     InvalidRetryPolicy,
     #[error("invalid alert severity {0}")]
     InvalidSeverity(String),
     #[error("invalid alert rule status {0}")]
     InvalidRuleStatus(String),
+    #[error("invalid alert channel {0}")]
+    InvalidChannel(String),
+    #[error("quiet hours must use HH:MM start/end values")]
+    InvalidQuietHours,
 }
 
 pub trait SourceAdapter {
@@ -590,6 +806,33 @@ impl SourceAdapter for AlertEventBackbone {
     fn emit(&mut self, event: AlertEvent) -> Result<AlertCandidateRecord, AlertingError> {
         match normalize_event(event) {
             Ok(event) => {
+                if let Some(index) = self.idempotency_index.get(&event.idempotency_key).copied() {
+                    let candidate = &mut self.candidates[index];
+                    let first_seen_at = candidate.accepted_at.clone();
+                    candidate.occurred_at = event.occurred_at.clone();
+                    candidate.accepted_at = event.occurred_at.clone();
+                    for evidence_ref in event.evidence_refs {
+                        if !candidate.evidence_refs.contains(&evidence_ref) {
+                            candidate.evidence_refs.push(evidence_ref);
+                        }
+                    }
+                    candidate.evidence_refs.sort();
+                    let duplicate_count = self
+                        .idempotency_decisions
+                        .iter()
+                        .filter(|decision| decision.idempotency_key == candidate.idempotency_key)
+                        .count()
+                        + 1;
+                    self.idempotency_decisions.push(AlertIdempotencyDecision {
+                        idempotency_key: candidate.idempotency_key.clone(),
+                        alert_candidate_id: candidate.alert_candidate_id.clone(),
+                        first_seen_at,
+                        reemitted_at: candidate.accepted_at.clone(),
+                        duplicate_count,
+                        decision: "collapsed_to_existing_candidate".to_string(),
+                    });
+                    return Ok(candidate.clone());
+                }
                 let candidate = AlertCandidateRecord {
                     alert_candidate_id: format!(
                         "alert-candidate-{number:06}",
@@ -604,6 +847,8 @@ impl SourceAdapter for AlertEventBackbone {
                     idempotency_key: event.idempotency_key,
                     accepted_at: event.occurred_at,
                 };
+                self.idempotency_index
+                    .insert(candidate.idempotency_key.clone(), self.candidates.len());
                 self.candidates.push(candidate.clone());
                 Ok(candidate)
             }
@@ -709,6 +954,10 @@ impl ChannelAdapter for MockChannelAdapter {
 impl AlertEventBackbone {
     pub fn list_candidates(&self) -> Vec<AlertCandidateRecord> {
         self.candidates.clone()
+    }
+
+    pub fn list_idempotency_decisions(&self) -> Vec<AlertIdempotencyDecision> {
+        self.idempotency_decisions.clone()
     }
 
     pub fn rejected_event_count(&self) -> u32 {
@@ -1036,6 +1285,26 @@ pub fn classify_alert_severity(
     })
 }
 
+pub fn render_alert_message_template(
+    template: AlertMessageTemplate,
+    alert: &FiredAlertRecord,
+    evidence: BTreeMap<String, String>,
+) -> Result<RenderedAlertMessage, AlertingError> {
+    let template_id =
+        normalize_required_text(template.template_id, AlertingError::EmptyTemplateId)?;
+    let body = normalize_required_text(template.body, AlertingError::EmptyTemplateBody)?;
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    let values = alert_template_values(&alert, evidence)?;
+    let (message, variables) = render_template_body(&body, &values)?;
+
+    Ok(RenderedAlertMessage {
+        template_id,
+        alert_id: alert.alert_id,
+        message,
+        variables,
+    })
+}
+
 pub fn compute_alert_dedup_key(alert: &FiredAlertRecord) -> Result<AlertDedupKey, AlertingError> {
     let alert = normalize_fired_alert_record(alert.clone())?;
     Ok(AlertDedupKey {
@@ -1109,6 +1378,158 @@ pub fn deduplicate_alert_stream(
     Ok(result)
 }
 
+pub fn evaluate_adaptive_aggregation_advisory(
+    request: AdaptiveAggregationAdvisoryRequest,
+    generated_advisory_id: String,
+) -> Result<AdaptiveAggregationAdvisory, AlertingError> {
+    let advisory_id = normalize_optional_text(request.advisory_id)
+        .or_else(|| normalize_optional_text(Some(generated_advisory_id)))
+        .ok_or(AlertingError::EmptyAdaptiveAggregationAdvisoryId)?;
+    let evaluated_at = normalize_required_text(
+        request.evaluated_at,
+        AlertingError::EmptyAdaptiveAggregationEvaluatedAt,
+    )?;
+    let method_version = normalize_required_text(
+        request.config.method_version,
+        AlertingError::EmptyAdaptiveAggregationMethodVersion,
+    )?;
+    if request.config.min_history_alerts == 0
+        || request.config.flapping_occurrence_threshold == 0
+        || request.config.storm_subject_threshold == 0
+    {
+        return Err(AlertingError::InvalidAdaptiveAggregationConfig);
+    }
+
+    let fired_alerts = request
+        .fired_alerts
+        .into_iter()
+        .map(normalize_fired_alert_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let observed_alert_count = fired_alerts.len();
+    let mut evidence_refs = alert_history_evidence_refs(&fired_alerts);
+    for summary in &request.dedup_summaries {
+        evidence_refs.insert(format!("dedup-key:{}", summary.dedup_key.stable_key()));
+        evidence_refs.insert(format!("surfaced-alert:{}", summary.surfaced_alert_id));
+        for alert_id in &summary.suppressed_alert_ids {
+            evidence_refs.insert(format!("suppressed-alert:{alert_id}"));
+        }
+    }
+
+    if !request.config.enabled {
+        return Ok(adaptive_advisory_result(
+            advisory_id,
+            evaluated_at,
+            AdaptiveAggregationAdvisoryStatus::Unavailable,
+            AdaptiveAggregationAdvisoryReason::FeatureDisabled,
+            None,
+            observed_alert_count,
+            0,
+            0,
+            0.0,
+            0.0,
+            "feature_disabled",
+            evidence_refs,
+            method_version,
+        ));
+    }
+    if observed_alert_count < request.config.min_history_alerts
+        || request.dedup_summaries.is_empty()
+    {
+        return Ok(adaptive_advisory_result(
+            advisory_id,
+            evaluated_at,
+            AdaptiveAggregationAdvisoryStatus::Unavailable,
+            AdaptiveAggregationAdvisoryReason::InsufficientHistory,
+            None,
+            observed_alert_count,
+            0,
+            0,
+            0.0,
+            0.0,
+            "insufficient_history",
+            evidence_refs,
+            method_version,
+        ));
+    }
+
+    let max_occurrence_count = request
+        .dedup_summaries
+        .iter()
+        .map(|summary| summary.occurrence_count)
+        .max()
+        .unwrap_or(0);
+    let affected_subject_count = request
+        .dedup_summaries
+        .iter()
+        .map(|summary| summary.dedup_key.subject_ref.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let flapping = max_occurrence_count >= request.config.flapping_occurrence_threshold;
+    let storm = affected_subject_count >= request.config.storm_subject_threshold
+        && request
+            .dedup_summaries
+            .iter()
+            .filter(|summary| summary.occurrence_count > 1)
+            .count()
+            >= request.config.storm_subject_threshold;
+    let signal_strength = if flapping {
+        max_occurrence_count as f64 / request.config.flapping_occurrence_threshold as f64
+    } else if storm {
+        affected_subject_count as f64 / request.config.storm_subject_threshold as f64
+    } else {
+        0.0
+    };
+    let uncertainty_padding = if observed_alert_count >= request.config.min_history_alerts * 2 {
+        0.10
+    } else {
+        0.25
+    };
+
+    if flapping || storm {
+        let reason_code = if flapping {
+            AdaptiveAggregationAdvisoryReason::FlappingSource
+        } else {
+            AdaptiveAggregationAdvisoryReason::EmergingStorm
+        };
+        let recommendation = if flapping {
+            "Review aggregation window and source health for repeated alerts before changing suppression rules."
+        } else {
+            "Review storm aggregation thresholds across affected subjects before changing routing rules."
+        };
+        return Ok(adaptive_advisory_result(
+            advisory_id,
+            evaluated_at,
+            AdaptiveAggregationAdvisoryStatus::Raised,
+            reason_code,
+            Some(recommendation.to_string()),
+            observed_alert_count,
+            max_occurrence_count,
+            affected_subject_count,
+            (signal_strength - uncertainty_padding).max(0.0),
+            signal_strength + uncertainty_padding,
+            "dedup_history_signal",
+            evidence_refs,
+            method_version,
+        ));
+    }
+
+    Ok(adaptive_advisory_result(
+        advisory_id,
+        evaluated_at,
+        AdaptiveAggregationAdvisoryStatus::NotRaised,
+        AdaptiveAggregationAdvisoryReason::NoStormPattern,
+        None,
+        observed_alert_count,
+        max_occurrence_count,
+        affected_subject_count,
+        0.0,
+        uncertainty_padding,
+        "below_advisory_threshold",
+        evidence_refs,
+        method_version,
+    ))
+}
+
 pub fn route_alert_to_recipients(
     alert: &FiredAlertRecord,
     rules: &[AlertRoutingRule],
@@ -1167,6 +1588,79 @@ pub fn route_alert_to_recipients(
         decisions,
         unrouted: false,
         default_operator_used: false,
+    })
+}
+
+pub fn evaluate_alert_preference(
+    alert: &FiredAlertRecord,
+    preference: AlertUserPreference,
+    evaluated_at: String,
+) -> Result<AlertPreferenceDecision, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    let preference = normalize_user_preference(preference)?;
+    let evaluated_minute = minute_of_day_from_timestamp(&evaluated_at)?;
+    let alert_channels = alert_channels_from_strings(&alert.channels)?;
+    let selected_channels = if preference.channel_preferences.is_empty() {
+        alert_channels
+    } else {
+        alert_channels
+            .into_iter()
+            .filter(|channel| preference.channel_preferences.contains(channel))
+            .collect::<Vec<_>>()
+    };
+
+    if severity_rank(alert.severity) < severity_rank(preference.min_severity) {
+        return Ok(AlertPreferenceDecision {
+            alert_id: alert.alert_id,
+            recipient_id: preference.recipient_id,
+            deliver_immediately: false,
+            deferred: false,
+            suppressed: true,
+            quiet_hours_active: false,
+            quiet_hours_overridden: false,
+            selected_channels,
+            reason: "alert severity is below recipient minimum severity".to_string(),
+        });
+    }
+
+    let quiet_hours_active = preference
+        .quiet_hours
+        .as_ref()
+        .map(|quiet_hours| quiet_hours_contains(quiet_hours, evaluated_minute))
+        .transpose()?
+        .unwrap_or(false);
+    let overrides_quiet_hours = matches!(
+        alert.severity,
+        AlertSeverityHint::Critical | AlertSeverityHint::Emergency
+    );
+    if quiet_hours_active && !overrides_quiet_hours {
+        return Ok(AlertPreferenceDecision {
+            alert_id: alert.alert_id,
+            recipient_id: preference.recipient_id,
+            deliver_immediately: false,
+            deferred: true,
+            suppressed: false,
+            quiet_hours_active: true,
+            quiet_hours_overridden: false,
+            selected_channels,
+            reason: "quiet hours active for non-critical alert".to_string(),
+        });
+    }
+
+    Ok(AlertPreferenceDecision {
+        alert_id: alert.alert_id,
+        recipient_id: preference.recipient_id,
+        deliver_immediately: true,
+        deferred: false,
+        suppressed: false,
+        quiet_hours_active,
+        quiet_hours_overridden: quiet_hours_active && overrides_quiet_hours,
+        selected_channels,
+        reason: if quiet_hours_active && overrides_quiet_hours {
+            "critical or emergency alert overrides quiet hours".to_string()
+        } else {
+            "recipient preference allows immediate delivery".to_string()
+        },
     })
 }
 
@@ -1259,7 +1753,57 @@ pub fn auto_resolve_alert(
     }
 }
 
-pub fn deliver_alert<A: ChannelAdapter>(
+pub fn evaluate_no_ack_escalation(
+    alert: &FiredAlertRecord,
+    lifecycle: &AlertLifecycleRecord,
+    policy: AlertEscalationPolicy,
+    current_recipient_id: String,
+    evaluated_at: String,
+) -> Result<AlertEscalationOutcome, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    validate_lifecycle_record(lifecycle)?;
+    let policy = normalize_escalation_policy(policy)?;
+    let current_recipient_id =
+        normalize_required_text(current_recipient_id, AlertingError::EmptyRecipientId)?;
+    let evaluated_at =
+        normalize_required_text(evaluated_at, AlertingError::EmptyLifecycleTimestamp)?;
+
+    if lifecycle.alert_id != alert.alert_id
+        || !matches!(lifecycle.state, AlertLifecycleState::Fired)
+    {
+        return Ok(no_escalation());
+    }
+
+    let fired_at_seconds = escalation_timestamp_seconds(&lifecycle.fired_at)?;
+    let evaluated_at_seconds = escalation_timestamp_seconds(&evaluated_at)?;
+    if evaluated_at_seconds.saturating_sub(fired_at_seconds) <= policy.ack_window_seconds as i64 {
+        return Ok(no_escalation());
+    }
+
+    let next_recipient = next_escalation_recipient(&policy.escalation_chain, &current_recipient_id);
+    let Some(next_recipient) = next_recipient else {
+        return Ok(no_escalation());
+    };
+
+    Ok(AlertEscalationOutcome {
+        escalated: true,
+        next_recipient: Some(next_recipient.clone()),
+        audit: Some(AlertEscalationAuditRecord {
+            alert_id: alert.alert_id.clone(),
+            policy_id: policy.policy_id.clone(),
+            from_recipient_id: current_recipient_id,
+            to_recipient_id: next_recipient.recipient_id.clone(),
+            escalated_at: evaluated_at,
+            reason: format!(
+                "alert {} remained unacknowledged for more than {} seconds",
+                alert.alert_id, policy.ack_window_seconds
+            ),
+            evidence_refs: alert.evidence_refs.clone(),
+        }),
+    })
+}
+
+pub fn deliver_alert<A: ChannelAdapter + ?Sized>(
     adapter: &mut A,
     alert: &FiredAlertRecord,
     recipient: AlertRecipient,
@@ -1269,7 +1813,7 @@ pub fn deliver_alert<A: ChannelAdapter>(
     Ok(adapter.send(&alert, &recipient))
 }
 
-pub fn run_tracked_delivery<A: ChannelAdapter>(
+pub fn run_tracked_delivery<A: ChannelAdapter + ?Sized>(
     adapter: &mut A,
     alert: &FiredAlertRecord,
     recipient: AlertRecipient,
@@ -1355,6 +1899,73 @@ pub fn run_tracked_delivery<A: ChannelAdapter>(
     Err(AlertingError::InvalidRetryPolicy)
 }
 
+pub fn alert_channels_from_strings(
+    channels: &[String],
+) -> Result<Vec<AlertChannel>, AlertingError> {
+    channels
+        .iter()
+        .map(|channel| AlertChannel::from_str(channel))
+        .collect()
+}
+
+pub fn deliver_alert_multi_channel(
+    adapters: &mut [&mut dyn ChannelAdapter],
+    alert: &FiredAlertRecord,
+    recipient: AlertRecipient,
+    requested_channels: Vec<AlertChannel>,
+    fallback_channel: Option<AlertChannel>,
+    policy: DeliveryRetryPolicy,
+) -> Result<MultiChannelDeliveryResult, AlertingError> {
+    let alert = normalize_fired_alert_record(alert.clone())?;
+    let recipient = normalize_alert_recipient(recipient)?;
+    let policy = normalize_retry_policy(policy)?;
+    let mut result = MultiChannelDeliveryResult::default();
+
+    for requested_channel in requested_channels {
+        let (delivery_channel, fallback_used) =
+            if adapter_index_for_channel(adapters, requested_channel).is_some() {
+                (requested_channel, false)
+            } else if let Some(fallback_channel) = fallback_channel {
+                if adapter_index_for_channel(adapters, fallback_channel).is_some() {
+                    (fallback_channel, true)
+                } else {
+                    result.unroutable.push(unroutable_delivery(
+                        &alert,
+                        &recipient,
+                        requested_channel,
+                        "requested and fallback channels are unconfigured",
+                    ));
+                    continue;
+                }
+            } else {
+                result.unroutable.push(unroutable_delivery(
+                    &alert,
+                    &recipient,
+                    requested_channel,
+                    "requested channel is unconfigured",
+                ));
+                continue;
+            };
+
+        let adapter_index = adapter_index_for_channel(adapters, delivery_channel)
+            .expect("adapter availability checked above");
+        let tracked_delivery = run_tracked_delivery(
+            &mut *adapters[adapter_index],
+            &alert,
+            recipient.clone(),
+            policy.clone(),
+        )?;
+        result.deliveries.push(ChannelDeliveryRecord {
+            requested_channel,
+            delivery_channel,
+            fallback_used,
+            tracked_delivery,
+        });
+    }
+
+    Ok(result)
+}
+
 fn normalize_event(event: AlertEvent) -> Result<AlertEvent, AlertingError> {
     Ok(AlertEvent {
         source_domain: normalize_required_text(
@@ -1403,6 +2014,78 @@ fn normalize_severity_evidence(
         emergency_threshold: evidence.emergency_threshold,
         method_version,
     })
+}
+
+fn alert_template_values(
+    alert: &FiredAlertRecord,
+    evidence: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, AlertingError> {
+    let mut values = BTreeMap::from([
+        ("alert_id".to_string(), alert.alert_id.clone()),
+        ("matched_rule_id".to_string(), alert.matched_rule_id.clone()),
+        (
+            "source_event_ref".to_string(),
+            alert.source_event_ref.clone(),
+        ),
+        ("source_domain".to_string(), alert.source_domain.clone()),
+        ("event_type".to_string(), alert.event_type.clone()),
+        ("subject_ref".to_string(), alert.subject_ref.clone()),
+        ("severity".to_string(), alert.severity.as_str().to_string()),
+        ("channels".to_string(), alert.channels.join(",")),
+        ("fired_at".to_string(), alert.fired_at.clone()),
+        ("explanation".to_string(), alert.explanation.clone()),
+        ("evidence_refs".to_string(), alert.evidence_refs.join(",")),
+    ]);
+    if let Some(field_id) = &alert.field_id {
+        values.insert("field_id".to_string(), field_id.clone());
+    }
+    for (key, value) in evidence {
+        let key = normalize_required_text(key, AlertingError::EmptyTemplateVariable)?;
+        let value = normalize_required_text(
+            value,
+            AlertingError::MissingTemplateVariable {
+                variable: key.clone(),
+            },
+        )?;
+        values.insert(key, value);
+    }
+    Ok(values)
+}
+
+fn render_template_body(
+    body: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<(String, Vec<String>), AlertingError> {
+    let mut rendered = String::with_capacity(body.len());
+    let mut variables = Vec::new();
+    let mut rest = body;
+
+    while let Some(start) = rest.find("{{") {
+        rendered.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            return Err(AlertingError::UnclosedTemplateVariable {
+                variable: after_open.trim().to_string(),
+            });
+        };
+        let variable = after_open[..end].trim();
+        if variable.is_empty() {
+            return Err(AlertingError::EmptyTemplateVariable);
+        }
+        let value = values
+            .get(variable)
+            .ok_or_else(|| AlertingError::MissingTemplateVariable {
+                variable: variable.to_string(),
+            })?;
+        rendered.push_str(value);
+        variables.push(variable.to_string());
+        rest = &after_open[end + 2..];
+    }
+
+    rendered.push_str(rest);
+    variables.sort();
+    variables.dedup();
+    Ok((rendered, variables))
 }
 
 fn normalize_dedup_window(window: AlertDedupWindow) -> Result<AlertDedupWindow, AlertingError> {
@@ -1480,6 +2163,86 @@ fn normalize_retry_policy(
     }
 
     Ok(policy)
+}
+
+fn normalize_user_preference(
+    preference: AlertUserPreference,
+) -> Result<AlertUserPreference, AlertingError> {
+    Ok(AlertUserPreference {
+        recipient_id: normalize_required_text(
+            preference.recipient_id,
+            AlertingError::EmptyRecipientId,
+        )?,
+        quiet_hours: preference.quiet_hours,
+        channel_preferences: preference.channel_preferences,
+        min_severity: preference.min_severity,
+    })
+}
+
+fn severity_rank(severity: AlertSeverityHint) -> u8 {
+    match severity {
+        AlertSeverityHint::Info => 0,
+        AlertSeverityHint::Warning => 1,
+        AlertSeverityHint::Critical => 2,
+        AlertSeverityHint::Emergency => 3,
+    }
+}
+
+fn quiet_hours_contains(
+    quiet_hours: &AlertQuietHours,
+    evaluated_minute: u32,
+) -> Result<bool, AlertingError> {
+    let start = quiet_hour_minute(&quiet_hours.start)?;
+    let end = quiet_hour_minute(&quiet_hours.end)?;
+    Ok(if start <= end {
+        evaluated_minute >= start && evaluated_minute < end
+    } else {
+        evaluated_minute >= start || evaluated_minute < end
+    })
+}
+
+fn minute_of_day_from_timestamp(timestamp: &str) -> Result<u32, AlertingError> {
+    let time = timestamp
+        .get(11..16)
+        .ok_or(AlertingError::InvalidQuietHours)?;
+    quiet_hour_minute(time)
+}
+
+fn quiet_hour_minute(value: &str) -> Result<u32, AlertingError> {
+    if value.len() != 5 || value.as_bytes().get(2) != Some(&b':') {
+        return Err(AlertingError::InvalidQuietHours);
+    }
+    let hour = value[0..2]
+        .parse::<u32>()
+        .map_err(|_| AlertingError::InvalidQuietHours)?;
+    let minute = value[3..5]
+        .parse::<u32>()
+        .map_err(|_| AlertingError::InvalidQuietHours)?;
+    if hour > 23 || minute > 59 {
+        return Err(AlertingError::InvalidQuietHours);
+    }
+    Ok(hour * 60 + minute)
+}
+
+fn normalize_escalation_policy(
+    policy: AlertEscalationPolicy,
+) -> Result<AlertEscalationPolicy, AlertingError> {
+    let policy_id =
+        normalize_required_text(policy.policy_id, AlertingError::EmptyEscalationPolicyId)?;
+    if policy.ack_window_seconds == 0 || policy.escalation_chain.is_empty() {
+        return Err(AlertingError::InvalidEscalationPolicy);
+    }
+    let escalation_chain = policy
+        .escalation_chain
+        .into_iter()
+        .map(normalize_alert_recipient)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(AlertEscalationPolicy {
+        policy_id,
+        ack_window_seconds: policy.ack_window_seconds,
+        escalation_chain,
+    })
 }
 
 fn severity_from_evidence_or_rule(
@@ -1737,6 +2500,108 @@ fn delivery_id(
     )
 }
 
+fn no_escalation() -> AlertEscalationOutcome {
+    AlertEscalationOutcome {
+        escalated: false,
+        next_recipient: None,
+        audit: None,
+    }
+}
+
+fn next_escalation_recipient(
+    chain: &[AlertRecipient],
+    current_recipient_id: &str,
+) -> Option<AlertRecipient> {
+    let current_index = chain
+        .iter()
+        .position(|recipient| recipient.recipient_id == current_recipient_id);
+    match current_index {
+        Some(index) => chain.get(index + 1).cloned(),
+        None => chain.first().cloned(),
+    }
+}
+
+fn escalation_timestamp_seconds(timestamp: &str) -> Result<i64, AlertingError> {
+    let invalid = || AlertingError::InvalidEscalationTimestamp(timestamp.to_string());
+    let date = timestamp.get(0..10).ok_or_else(invalid)?;
+    let time = timestamp.get(11..19).ok_or_else(invalid)?;
+    if timestamp.as_bytes().get(10) != Some(&b'T') {
+        return Err(invalid());
+    }
+    let year = date[0..4].parse::<i32>().map_err(|_| invalid())?;
+    let month = date[5..7].parse::<u32>().map_err(|_| invalid())?;
+    let day = date[8..10].parse::<u32>().map_err(|_| invalid())?;
+    let hour = time[0..2].parse::<u32>().map_err(|_| invalid())?;
+    let minute = time[3..5].parse::<u32>().map_err(|_| invalid())?;
+    let second = time[6..8].parse::<u32>().map_err(|_| invalid())?;
+    if date.as_bytes().get(4) != Some(&b'-')
+        || date.as_bytes().get(7) != Some(&b'-')
+        || time.as_bytes().get(2) != Some(&b':')
+        || time.as_bytes().get(5) != Some(&b':')
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > escalation_days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(invalid());
+    }
+
+    Ok(escalation_days_from_civil(year, month, day) * 86_400
+        + i64::from(hour) * 3_600
+        + i64::from(minute) * 60
+        + i64::from(second))
+}
+
+fn escalation_days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if escalation_is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn escalation_is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn escalation_days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    i64::from(era * 146_097 + day_of_era - 719_468)
+}
+
+fn adapter_index_for_channel(
+    adapters: &[&mut dyn ChannelAdapter],
+    channel: AlertChannel,
+) -> Option<usize> {
+    adapters
+        .iter()
+        .position(|adapter| adapter.channel() == channel)
+}
+
+fn unroutable_delivery(
+    alert: &FiredAlertRecord,
+    recipient: &AlertRecipient,
+    requested_channel: AlertChannel,
+    reason: &str,
+) -> UnroutableDeliveryOutcome {
+    UnroutableDeliveryOutcome {
+        alert_id: alert.alert_id.clone(),
+        recipient_id: recipient.recipient_id.clone(),
+        requested_channel,
+        reason: reason.to_string(),
+    }
+}
+
 fn single_alert_summary(
     dedup_key: AlertDedupKey,
     alert: &FiredAlertRecord,
@@ -1775,6 +2640,53 @@ fn aggregation_summary_text(summary: &AlertDedupSummary) -> String {
         summary.first_fired_at,
         summary.last_fired_at
     )
+}
+
+fn alert_history_evidence_refs(alerts: &[FiredAlertRecord]) -> BTreeSet<String> {
+    alerts
+        .iter()
+        .flat_map(|alert| {
+            std::iter::once(format!("alert-history:{}", alert.alert_id))
+                .chain(alert.evidence_refs.iter().cloned())
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adaptive_advisory_result(
+    advisory_id: String,
+    evaluated_at: String,
+    status: AdaptiveAggregationAdvisoryStatus,
+    reason_code: AdaptiveAggregationAdvisoryReason,
+    recommendation: Option<String>,
+    observed_alert_count: usize,
+    max_occurrence_count: usize,
+    affected_subject_count: usize,
+    uncertainty_lower: f64,
+    uncertainty_upper: f64,
+    uncertainty_reason: &str,
+    evidence_refs: BTreeSet<String>,
+    method_version: String,
+) -> AdaptiveAggregationAdvisory {
+    AdaptiveAggregationAdvisory {
+        advisory_id,
+        evaluated_at,
+        status,
+        reason_code,
+        recommendation,
+        observed_alert_count,
+        max_occurrence_count,
+        affected_subject_count,
+        uncertainty_lower,
+        uncertainty_upper,
+        uncertainty_reason: uncertainty_reason.to_string(),
+        evidence_refs: evidence_refs.into_iter().collect(),
+        requires_approval: true,
+        approval_status: AdaptiveAggregationApprovalStatus::PendingApproval,
+        auto_suppression_applied: false,
+        critical_alerts_auto_suppressed: false,
+        method_version,
+    }
 }
 
 fn validate_alert_rule_record(rule: &AlertRuleRecord) -> Result<(), AlertingError> {
@@ -1829,18 +2741,27 @@ fn field_id_from_subject_ref(subject_ref: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        acknowledge_alert, auto_resolve_alert, build_alert_rule_record,
-        build_alert_rule_subscription, classify_alert_severity, compute_alert_dedup_key,
-        deduplicate_alert_stream, deliver_alert, evaluate_alert_rules,
-        evaluate_managed_alert_rules, filter_alert_history, open_alert_lifecycle, resolve_alert,
-        route_alert_to_recipients, run_tracked_delivery, transition_alert_rule_status,
-        version_alert_rule_record, AlertChannel, AlertDedupWindow, AlertEvent, AlertEventBackbone,
-        AlertHistoryQuery, AlertLifecycleRecord, AlertLifecycleState, AlertRecipient,
+        acknowledge_alert, alert_channels_from_strings, auto_resolve_alert,
+        build_alert_rule_record, build_alert_rule_subscription, classify_alert_severity,
+        compute_alert_dedup_key, deduplicate_alert_stream, deliver_alert,
+        deliver_alert_multi_channel, evaluate_adaptive_aggregation_advisory,
+        evaluate_alert_preference, evaluate_alert_rules, evaluate_managed_alert_rules,
+        evaluate_no_ack_escalation, filter_alert_history, open_alert_lifecycle,
+        render_alert_message_template, resolve_alert, route_alert_to_recipients,
+        run_tracked_delivery, transition_alert_rule_status, version_alert_rule_record,
+        AdaptiveAggregationAdvisoryConfig, AdaptiveAggregationAdvisoryReason,
+        AdaptiveAggregationAdvisoryRequest, AdaptiveAggregationAdvisoryStatus,
+        AdaptiveAggregationApprovalStatus, AlertChannel, AlertDedupWindow, AlertEscalationPolicy,
+        AlertEvent, AlertEventBackbone, AlertHistoryQuery, AlertLifecycleRecord,
+        AlertLifecycleState, AlertMessageTemplate, AlertQuietHours, AlertRecipient,
         AlertRoutingRule, AlertRule, AlertRuleCreateRequest, AlertRuleStatus,
-        AlertRuleStatusUpdateRequest, AlertRuleSubscriptionCreateRequest, AlertRuleUpdateRequest,
-        AlertSeverityEvidence, AlertSeverityHint, AlertingError, DeliveryRetryPolicy,
-        DeliveryState, DeliveryStatus, InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
+        AlertRuleStatusUpdateRequest, AlertRuleSubscriptionCreateRequest,
+        AlertRuleSubscriptionRecord, AlertRuleUpdateRequest, AlertSeverityEvidence,
+        AlertSeverityHint, AlertUserPreference, AlertingError, DeliveryRetryPolicy, DeliveryState,
+        DeliveryStatus, InAppChannelAdapter, MockChannelAdapter, SourceAdapter,
     };
 
     #[test]
@@ -1859,6 +2780,42 @@ mod tests {
         );
         assert_eq!(backbone.list_candidates().len(), 1);
         assert_eq!(backbone.rejected_event_count(), 0);
+    }
+
+    #[test]
+    fn source_adapter_collapses_reemitted_event_by_idempotency_key() {
+        let mut backbone = AlertEventBackbone::default();
+        let first = backbone
+            .emit(sensor_health_event())
+            .expect("first event should be accepted");
+        let mut reemit = sensor_health_event();
+        reemit.occurred_at = "2026-06-12T10:01:00Z".to_string();
+        reemit
+            .evidence_refs
+            .push("reading:soil-probe-001:retry".to_string());
+
+        let second = backbone
+            .emit(reemit)
+            .expect("duplicate idempotency key should be accepted");
+
+        assert_eq!(first.alert_candidate_id, second.alert_candidate_id);
+        assert_eq!(backbone.list_candidates().len(), 1);
+        let candidate = &backbone.list_candidates()[0];
+        assert_eq!(candidate.occurred_at, "2026-06-12T10:01:00Z");
+        assert_eq!(
+            candidate.evidence_refs,
+            vec![
+                "reading:soil-probe-001:latest".to_string(),
+                "reading:soil-probe-001:retry".to_string()
+            ]
+        );
+        let decisions = backbone.list_idempotency_decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].decision,
+            "collapsed_to_existing_candidate".to_string()
+        );
+        assert_eq!(decisions[0].duplicate_count, 1);
     }
 
     #[test]
@@ -1938,6 +2895,80 @@ mod tests {
 
         assert!(outcome.fired_alerts.is_empty());
         assert_eq!(outcome.non_match_count, 1);
+    }
+
+    #[test]
+    fn alert_template_renders_from_alert_and_evidence_fields() {
+        let alert = fired_alert(
+            "alert-sensor-stale-001",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:02:00Z",
+        );
+        let mut evidence = BTreeMap::new();
+        evidence.insert("metric".to_string(), "soil_probe_age_minutes".to_string());
+        evidence.insert("observed_value".to_string(), "74".to_string());
+        evidence.insert("threshold".to_string(), "60".to_string());
+
+        let rendered = render_alert_message_template(
+            AlertMessageTemplate {
+                template_id: "sensor-stale-critical-v1".to_string(),
+                body: "{{severity}} {{event_type}} for {{field_id}}: {{metric}}={{observed_value}} over {{threshold}} at {{fired_at}}".to_string(),
+            },
+            &alert,
+            evidence,
+        )
+        .expect("complete evidence should render");
+
+        assert_eq!(rendered.template_id, "sensor-stale-critical-v1");
+        assert_eq!(rendered.alert_id, "alert-sensor-stale-001");
+        assert_eq!(
+            rendered.message,
+            "critical sensor_stale for field-alpha: soil_probe_age_minutes=74 over 60 at 2026-06-12T10:02:00Z"
+        );
+        assert_eq!(
+            rendered.variables,
+            vec![
+                "event_type".to_string(),
+                "field_id".to_string(),
+                "fired_at".to_string(),
+                "metric".to_string(),
+                "observed_value".to_string(),
+                "severity".to_string(),
+                "threshold".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn alert_template_missing_evidence_field_fails_without_partial_message() {
+        let alert = fired_alert(
+            "alert-sensor-stale-001",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:02:00Z",
+        );
+        let mut evidence = BTreeMap::new();
+        evidence.insert("metric".to_string(), "soil_probe_age_minutes".to_string());
+
+        let error = render_alert_message_template(
+            AlertMessageTemplate {
+                template_id: "sensor-stale-critical-v1".to_string(),
+                body: "{{severity}} {{metric}} over {{threshold}}".to_string(),
+            },
+            &alert,
+            evidence,
+        )
+        .expect_err("missing template variable should refuse render");
+
+        assert_eq!(
+            error,
+            AlertingError::MissingTemplateVariable {
+                variable: "threshold".to_string()
+            }
+        );
     }
 
     #[test]
@@ -2285,6 +3316,161 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_aggregation_advisory_flags_flapping_source_with_uncertainty() {
+        let alerts = (0..6)
+            .map(|index| {
+                fired_alert(
+                    &format!("alert-flap-{index:03}"),
+                    "27-soil-iot-sensor-network",
+                    Some("field-alpha"),
+                    AlertSeverityHint::Warning,
+                    &format!("2026-06-12T10:0{index}:00Z"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let dedup = deduplicate_alert_stream(&alerts, dedup_window())
+            .expect("flapping stream should deduplicate");
+
+        let advisory = evaluate_adaptive_aggregation_advisory(
+            AdaptiveAggregationAdvisoryRequest {
+                advisory_id: Some("adaptive-adv-001".to_string()),
+                evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+                fired_alerts: alerts,
+                dedup_summaries: dedup.summaries,
+                config: adaptive_config(true),
+            },
+            "generated-advisory".to_string(),
+        )
+        .expect("adaptive advisory should evaluate");
+
+        assert_eq!(advisory.status, AdaptiveAggregationAdvisoryStatus::Raised);
+        assert_eq!(
+            advisory.reason_code,
+            AdaptiveAggregationAdvisoryReason::FlappingSource
+        );
+        assert_eq!(advisory.observed_alert_count, 6);
+        assert_eq!(advisory.max_occurrence_count, 6);
+        assert!(advisory.uncertainty_lower > 0.0);
+        assert!(advisory.uncertainty_upper > advisory.uncertainty_lower);
+        assert!(advisory
+            .recommendation
+            .as_deref()
+            .is_some_and(|text| text.contains("Review aggregation window")));
+        assert!(advisory.requires_approval);
+        assert_eq!(
+            advisory.approval_status,
+            AdaptiveAggregationApprovalStatus::PendingApproval
+        );
+        assert!(!advisory.auto_suppression_applied);
+        assert!(!advisory.critical_alerts_auto_suppressed);
+        assert!(advisory
+            .evidence_refs
+            .contains(&"alert-history:alert-flap-000".to_string()));
+        assert!(advisory
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("dedup-key:")));
+    }
+
+    #[test]
+    fn adaptive_aggregation_advisory_is_gated_until_history_exists() {
+        let disabled = evaluate_adaptive_aggregation_advisory(
+            AdaptiveAggregationAdvisoryRequest {
+                advisory_id: Some("adaptive-disabled".to_string()),
+                evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+                fired_alerts: vec![fired_alert(
+                    "alert-disabled-001",
+                    "27-soil-iot-sensor-network",
+                    Some("field-alpha"),
+                    AlertSeverityHint::Warning,
+                    "2026-06-12T10:00:00Z",
+                )],
+                dedup_summaries: Vec::new(),
+                config: adaptive_config(false),
+            },
+            "generated-advisory".to_string(),
+        )
+        .expect("disabled advisory should be unavailable");
+        assert_eq!(
+            disabled.reason_code,
+            AdaptiveAggregationAdvisoryReason::FeatureDisabled
+        );
+        assert!(!disabled.auto_suppression_applied);
+
+        let insufficient = evaluate_adaptive_aggregation_advisory(
+            AdaptiveAggregationAdvisoryRequest {
+                advisory_id: Some("adaptive-insufficient".to_string()),
+                evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+                fired_alerts: vec![fired_alert(
+                    "alert-short-history",
+                    "27-soil-iot-sensor-network",
+                    Some("field-alpha"),
+                    AlertSeverityHint::Warning,
+                    "2026-06-12T10:00:00Z",
+                )],
+                dedup_summaries: Vec::new(),
+                config: adaptive_config(true),
+            },
+            "generated-advisory".to_string(),
+        )
+        .expect("insufficient history should be unavailable");
+        assert_eq!(
+            insufficient.status,
+            AdaptiveAggregationAdvisoryStatus::Unavailable
+        );
+        assert_eq!(
+            insufficient.reason_code,
+            AdaptiveAggregationAdvisoryReason::InsufficientHistory
+        );
+        assert!(!insufficient.auto_suppression_applied);
+    }
+
+    #[test]
+    fn adaptive_aggregation_advisory_never_auto_suppresses_critical_alerts() {
+        let alerts = vec![
+            fired_alert(
+                "alert-critical-001",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Critical,
+                "2026-06-12T10:00:00Z",
+            ),
+            fired_alert(
+                "alert-critical-002",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Critical,
+                "2026-06-12T10:01:00Z",
+            ),
+            fired_alert(
+                "alert-critical-003",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Critical,
+                "2026-06-12T10:02:00Z",
+            ),
+        ];
+        let dedup = deduplicate_alert_stream(&alerts, dedup_window())
+            .expect("critical stream should evaluate dedup");
+
+        let advisory = evaluate_adaptive_aggregation_advisory(
+            AdaptiveAggregationAdvisoryRequest {
+                advisory_id: Some("adaptive-critical".to_string()),
+                evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+                fired_alerts: alerts,
+                dedup_summaries: dedup.summaries,
+                config: adaptive_config(true),
+            },
+            "generated-advisory".to_string(),
+        )
+        .expect("critical history should still evaluate advisory");
+
+        assert!(!advisory.auto_suppression_applied);
+        assert!(!advisory.critical_alerts_auto_suppressed);
+        assert!(advisory.requires_approval);
+    }
+
+    #[test]
     fn in_app_delivery_records_outcome_and_feed_item() {
         let alert = fired_alert(
             "alert-in-app",
@@ -2424,6 +3610,114 @@ mod tests {
             DeliveryState::Failed
         );
         assert_eq!(tracked.transitions.last().unwrap().backoff_seconds, None);
+    }
+
+    #[test]
+    fn multi_channel_delivery_fans_out_email_and_sms_from_subscription() {
+        let alert = fired_alert(
+            "alert-multi-channel",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let subscription = AlertRuleSubscriptionRecord {
+            subscription_id: "sub-ag-001".to_string(),
+            rule_id: "rule-sensor-stale-critical".to_string(),
+            recipient_id: "ag-001".to_string(),
+            recipient_role: "agronomist".to_string(),
+            channels: vec!["email".to_string(), "sms".to_string()],
+            created_at: "2026-06-12T09:00:00Z".to_string(),
+        };
+        let requested_channels = alert_channels_from_strings(&subscription.channels)
+            .expect("subscription channels should parse");
+        let mut email = MockChannelAdapter::succeeding(AlertChannel::Email);
+        let mut sms = MockChannelAdapter::succeeding(AlertChannel::Sms);
+        let mut adapters: Vec<&mut dyn super::ChannelAdapter> = vec![&mut email, &mut sms];
+
+        let result = deliver_alert_multi_channel(
+            &mut adapters,
+            &alert,
+            role_recipient(&subscription.recipient_id, &subscription.recipient_role),
+            requested_channels,
+            None,
+            retry_policy(),
+        )
+        .expect("multi-channel delivery should run");
+
+        assert_eq!(result.deliveries.len(), 2);
+        assert!(result.unroutable.is_empty());
+        assert_eq!(result.deliveries[0].requested_channel, AlertChannel::Email);
+        assert_eq!(result.deliveries[0].delivery_channel, AlertChannel::Email);
+        assert_eq!(
+            result.deliveries[0].tracked_delivery.final_state,
+            DeliveryState::Delivered
+        );
+        assert_eq!(result.deliveries[1].requested_channel, AlertChannel::Sms);
+        assert_eq!(result.deliveries[1].delivery_channel, AlertChannel::Sms);
+        assert_eq!(
+            result.deliveries[1].tracked_delivery.final_state,
+            DeliveryState::Delivered
+        );
+        assert_eq!(email.recorded_outcomes().len(), 1);
+        assert_eq!(sms.recorded_outcomes().len(), 1);
+    }
+
+    #[test]
+    fn unconfigured_channel_uses_fallback_or_records_unroutable() {
+        let alert = fired_alert(
+            "alert-unconfigured-channel",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut in_app = InAppChannelAdapter::default();
+        let mut fallback_adapters: Vec<&mut dyn super::ChannelAdapter> = vec![&mut in_app];
+
+        let fallback_result = deliver_alert_multi_channel(
+            &mut fallback_adapters,
+            &alert,
+            alert_recipient("ops-001"),
+            vec![AlertChannel::Webhook],
+            Some(AlertChannel::InApp),
+            retry_policy(),
+        )
+        .expect("fallback delivery should run");
+
+        assert_eq!(fallback_result.deliveries.len(), 1);
+        assert!(fallback_result.unroutable.is_empty());
+        assert_eq!(
+            fallback_result.deliveries[0].requested_channel,
+            AlertChannel::Webhook
+        );
+        assert_eq!(
+            fallback_result.deliveries[0].delivery_channel,
+            AlertChannel::InApp
+        );
+        assert!(fallback_result.deliveries[0].fallback_used);
+        assert_eq!(in_app.feed_for("ops-001").len(), 1);
+
+        let mut no_adapters: Vec<&mut dyn super::ChannelAdapter> = Vec::new();
+        let unroutable_result = deliver_alert_multi_channel(
+            &mut no_adapters,
+            &alert,
+            alert_recipient("ops-001"),
+            vec![AlertChannel::Push],
+            None,
+            retry_policy(),
+        )
+        .expect("unroutable outcome should be recorded");
+
+        assert!(unroutable_result.deliveries.is_empty());
+        assert_eq!(unroutable_result.unroutable.len(), 1);
+        assert_eq!(
+            unroutable_result.unroutable[0].requested_channel,
+            AlertChannel::Push
+        );
+        assert!(unroutable_result.unroutable[0]
+            .reason
+            .contains("unconfigured"));
     }
 
     #[test]
@@ -2587,6 +3881,57 @@ mod tests {
     }
 
     #[test]
+    fn quiet_hours_defer_warning_alert_and_record_decision() {
+        let alert = fired_alert(
+            "alert-quiet-warning",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Warning,
+            "2026-06-12T22:15:00Z",
+        );
+
+        let decision = evaluate_alert_preference(
+            &alert,
+            quiet_hours_preference(AlertSeverityHint::Info),
+            "2026-06-12T22:15:00Z".to_string(),
+        )
+        .expect("quiet-hours preference should evaluate");
+
+        assert!(!decision.deliver_immediately);
+        assert!(decision.deferred);
+        assert!(!decision.suppressed);
+        assert!(decision.quiet_hours_active);
+        assert!(!decision.quiet_hours_overridden);
+        assert_eq!(decision.selected_channels, vec![AlertChannel::InApp]);
+        assert!(decision.reason.contains("quiet hours"));
+    }
+
+    #[test]
+    fn emergency_alert_overrides_quiet_hours_for_immediate_delivery() {
+        let alert = fired_alert(
+            "alert-quiet-emergency",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Emergency,
+            "2026-06-12T22:15:00Z",
+        );
+
+        let decision = evaluate_alert_preference(
+            &alert,
+            quiet_hours_preference(AlertSeverityHint::Info),
+            "2026-06-12T22:15:00Z".to_string(),
+        )
+        .expect("emergency preference should evaluate");
+
+        assert!(decision.deliver_immediately);
+        assert!(!decision.deferred);
+        assert!(!decision.suppressed);
+        assert!(decision.quiet_hours_active);
+        assert!(decision.quiet_hours_overridden);
+        assert!(decision.reason.contains("overrides quiet hours"));
+    }
+
+    #[test]
     fn lifecycle_records_acknowledgement_and_resolution_with_actor_timestamp() {
         let alert = fired_alert(
             "alert-lifecycle",
@@ -2738,6 +4083,72 @@ mod tests {
     }
 
     #[test]
+    fn no_ack_escalation_routes_to_next_recipient_and_audits() {
+        let alert = fired_alert(
+            "alert-escalate",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let lifecycle = open_alert_lifecycle(&alert).expect("fired alert should open lifecycle");
+
+        let outcome = evaluate_no_ack_escalation(
+            &alert,
+            &lifecycle,
+            escalation_policy(),
+            "ops-001".to_string(),
+            "2026-06-12T10:06:00Z".to_string(),
+        )
+        .expect("past-window unacknowledged alert should evaluate");
+
+        assert!(outcome.escalated);
+        assert_eq!(
+            outcome.next_recipient,
+            Some(role_recipient("ops-lead", "operator"))
+        );
+        let audit = outcome.audit.expect("escalation should be audited");
+        assert_eq!(audit.alert_id, "alert-escalate");
+        assert_eq!(audit.policy_id, "policy-critical-no-ack");
+        assert_eq!(audit.from_recipient_id, "ops-001");
+        assert_eq!(audit.to_recipient_id, "ops-lead");
+        assert_eq!(audit.escalated_at, "2026-06-12T10:06:00Z");
+        assert_eq!(audit.evidence_refs, alert.evidence_refs);
+    }
+
+    #[test]
+    fn acknowledgement_within_window_stops_escalation_chain() {
+        let alert = fired_alert(
+            "alert-ack-stops-escalation",
+            "27-soil-iot-sensor-network",
+            Some("field-alpha"),
+            AlertSeverityHint::Critical,
+            "2026-06-12T10:00:00Z",
+        );
+        let mut lifecycle =
+            open_alert_lifecycle(&alert).expect("fired alert should open lifecycle");
+        acknowledge_alert(
+            &mut lifecycle,
+            "ops-001".to_string(),
+            "2026-06-12T10:03:00Z".to_string(),
+        )
+        .expect("ack within window should succeed");
+
+        let outcome = evaluate_no_ack_escalation(
+            &alert,
+            &lifecycle,
+            escalation_policy(),
+            "ops-001".to_string(),
+            "2026-06-12T10:06:00Z".to_string(),
+        )
+        .expect("acknowledged alert should evaluate without escalation");
+
+        assert!(!outcome.escalated);
+        assert_eq!(outcome.next_recipient, None);
+        assert_eq!(outcome.audit, None);
+    }
+
+    #[test]
     fn lifecycle_rejects_transition_before_fired_or_previous_transition_time() {
         let alert = fired_alert(
             "alert-non-monotonic",
@@ -2870,6 +4281,16 @@ mod tests {
         }
     }
 
+    fn adaptive_config(enabled: bool) -> AdaptiveAggregationAdvisoryConfig {
+        AdaptiveAggregationAdvisoryConfig {
+            enabled,
+            min_history_alerts: 3,
+            flapping_occurrence_threshold: 4,
+            storm_subject_threshold: 3,
+            method_version: "adaptive-aggregation-v1".to_string(),
+        }
+    }
+
     fn alert_recipient(recipient_id: &str) -> AlertRecipient {
         AlertRecipient {
             recipient_id: recipient_id.to_string(),
@@ -2907,6 +4328,29 @@ mod tests {
             max_attempts: 3,
             base_backoff_seconds: 5,
             max_backoff_seconds: 20,
+        }
+    }
+
+    fn escalation_policy() -> AlertEscalationPolicy {
+        AlertEscalationPolicy {
+            policy_id: "policy-critical-no-ack".to_string(),
+            ack_window_seconds: 300,
+            escalation_chain: vec![
+                role_recipient("ops-001", "operator"),
+                role_recipient("ops-lead", "operator"),
+            ],
+        }
+    }
+
+    fn quiet_hours_preference(min_severity: AlertSeverityHint) -> AlertUserPreference {
+        AlertUserPreference {
+            recipient_id: "ops-001".to_string(),
+            quiet_hours: Some(AlertQuietHours {
+                start: "22:00".to_string(),
+                end: "06:00".to_string(),
+            }),
+            channel_preferences: vec![AlertChannel::InApp],
+            min_severity,
         }
     }
 }

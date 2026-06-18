@@ -1,6 +1,9 @@
-use crate::{FlightPathSample, MapRenderState, MissionOverlayInput, DEFAULT_FLIGHT_PATH_LIMIT};
+use crate::{
+    CaptureEventInput, FlightPathSample, MapRenderState, MissionOverlayInput,
+    DEFAULT_FLIGHT_PATH_LIMIT,
+};
 use serde::Serialize;
-use shared::schemas::{Telemetry, WebSocketMessage};
+use shared::schemas::{GpsCoords, Telemetry, WebSocketMessage};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -92,11 +95,13 @@ pub enum CaptureEventKind {
     NdviProcessed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CaptureEvent {
+    pub capture_event_id: String,
     pub event_type: CaptureEventKind,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub summary: String,
+    pub position: Option<GpsCoords>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -109,6 +114,37 @@ pub struct MissionStatusSnapshot {
 pub struct SystemStatusSnapshot {
     pub status: String,
     pub message: String,
+    pub severity: SystemAlertSeverity,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+    pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemAlertSeverity {
+    Info,
+    Warn,
+    Critical,
+}
+
+impl SystemAlertSeverity {
+    fn rank_desc(self) -> u8 {
+        match self {
+            Self::Critical => 3,
+            Self::Warn => 2,
+            Self::Info => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SystemAlertPanelEntry {
+    pub status: String,
+    pub message: String,
+    pub severity: SystemAlertSeverity,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+    pub acknowledged: bool,
+    pub visually_distinct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -198,30 +234,36 @@ impl MessageDispatchState {
             WebSocketMessage::LidarUpdate { scan } => {
                 self.lidar_scan_point_counts.push(scan.points.len());
                 self.append_capture_event(CaptureEvent {
+                    capture_event_id: format!("lidar:{}", scan.scan_id),
                     event_type: CaptureEventKind::Lidar,
                     timestamp: scan.timestamp,
                     summary: format!("LiDAR scan: {} points", scan.points.len()),
+                    position: None,
                 });
                 MessageRoute::LidarUpdate
             }
             WebSocketMessage::ImageCaptured { image } => {
                 self.captured_image_ids.push(image.image_id);
                 self.append_capture_event(CaptureEvent {
+                    capture_event_id: format!("image:{}", image.image_id),
                     event_type: CaptureEventKind::ImageCaptured,
                     timestamp: image.metadata.timestamp,
                     summary: format!("Image captured: {}", image.image_id),
+                    position: image.metadata.gps_position.clone(),
                 });
                 MessageRoute::ImageCaptured
             }
             WebSocketMessage::NdviProcessed { result } => {
                 self.ndvi_means.push(result.mean_ndvi);
                 self.append_capture_event(CaptureEvent {
+                    capture_event_id: format!("ndvi:{}", result.output_path),
                     event_type: CaptureEventKind::NdviProcessed,
                     timestamp: result.timestamp,
                     summary: format!(
                         "NDVI processed: mean {:.3}, vegetation {:.1}%",
                         result.mean_ndvi, result.vegetation_percentage
                     ),
+                    position: None,
                 });
                 MessageRoute::NdviProcessed
             }
@@ -229,6 +271,9 @@ impl MessageDispatchState {
                 self.system_statuses.push(SystemStatusSnapshot {
                     status: status.clone(),
                     message: message.clone(),
+                    severity: system_alert_severity(status),
+                    received_at,
+                    acknowledged: false,
                 });
                 MessageRoute::SystemStatus
             }
@@ -301,10 +346,48 @@ impl MessageDispatchState {
     }
 
     pub fn map_render_state(&self) -> MapRenderState {
-        MapRenderState::from_flight_path_and_mission(
+        let capture_events = self
+            .capture_events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| CaptureEventInput {
+                capture_event_id: event.capture_event_id.clone(),
+                timeline_entry_id: format!("capture-timeline:{index}"),
+                captured_at: event.timestamp,
+                position: event.position.clone(),
+            })
+            .collect::<Vec<_>>();
+        MapRenderState::from_flight_path_mission_and_captures(
             &self.flight_path,
             self.mission_overlay.as_ref(),
+            &capture_events,
         )
+    }
+
+    pub fn system_alert_panel(&self) -> Vec<SystemAlertPanelEntry> {
+        let mut alerts = self
+            .system_statuses
+            .iter()
+            .map(|status| SystemAlertPanelEntry {
+                status: status.status.clone(),
+                message: status.message.clone(),
+                severity: status.severity,
+                received_at: status.received_at,
+                acknowledged: status.acknowledged,
+                visually_distinct: status.severity == SystemAlertSeverity::Critical
+                    && !status.acknowledged,
+            })
+            .collect::<Vec<_>>();
+
+        alerts.sort_by(|left, right| {
+            right
+                .severity
+                .rank_desc()
+                .cmp(&left.severity.rank_desc())
+                .then(right.received_at.cmp(&left.received_at))
+                .then(left.message.cmp(&right.message))
+        });
+        alerts
     }
 
     pub fn set_mission_overlay(&mut self, mission_overlay: MissionOverlayInput) {
@@ -363,6 +446,14 @@ fn age_seconds(
     now.signed_duration_since(last_update_at)
         .num_seconds()
         .max(0) as u64
+}
+
+fn system_alert_severity(status: &str) -> SystemAlertSeverity {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "info" | "ok" | "healthy" | "nominal" => SystemAlertSeverity::Info,
+        "critical" | "error" | "fatal" | "emergency" => SystemAlertSeverity::Critical,
+        "warn" | "warning" | _ => SystemAlertSeverity::Warn,
+    }
 }
 
 pub fn shared_message_dispatch_state() -> SharedMessageDispatchState {
@@ -682,6 +773,57 @@ mod tests {
     }
 
     #[test]
+    fn geolocated_capture_events_project_to_map_markers_with_timeline_links() {
+        let image_id = Uuid::new_v4();
+        let mut state = MessageDispatchState::default();
+        let image = sample_image(image_id);
+
+        state.dispatch_message(&WebSocketMessage::ImageCaptured { image });
+
+        let timeline = state.capture_events(None);
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(
+            timeline[0].position.as_ref().map(|gps| gps.latitude),
+            Some(42.0)
+        );
+        let map_state = state.map_render_state();
+        assert_eq!(map_state.capture_markers.len(), 1);
+        let marker = &map_state.capture_markers[0];
+        assert_eq!(marker.capture_event_id, format!("image:{image_id}"));
+        assert_eq!(marker.timeline_entry_id, "capture-timeline:0");
+        assert_eq!(marker.latitude, 42.0);
+        assert_eq!(marker.longitude, -71.0);
+        assert!(marker.x_px >= 0.0 && marker.x_px <= map_state.basemap.width_px as f64);
+        assert!(marker.y_px >= 0.0 && marker.y_px <= map_state.basemap.height_px as f64);
+        assert!(map_state
+            .overlay_assertions
+            .iter()
+            .any(|assertion| assertion.overlay_id == "capture-markers" && assertion.accepted));
+    }
+
+    #[test]
+    fn capture_events_without_position_stay_timeline_only() {
+        let image_id = Uuid::new_v4();
+        let mut state = MessageDispatchState::default();
+        let mut image = sample_image(image_id);
+        image.metadata.gps_position = None;
+        let lidar = sample_lidar_scan();
+        let lidar_id = lidar.scan_id;
+
+        state.dispatch_message(&WebSocketMessage::ImageCaptured { image });
+        state.dispatch_message(&WebSocketMessage::LidarUpdate { scan: lidar });
+
+        let timeline = state.capture_events(None);
+        assert_eq!(timeline.len(), 2);
+        let map_state = state.map_render_state();
+        assert!(map_state.capture_markers.is_empty());
+        assert_eq!(
+            map_state.unmapped_capture_event_ids,
+            vec![format!("lidar:{lidar_id}"), format!("image:{image_id}")]
+        );
+    }
+
+    #[test]
     fn capture_timeline_orders_filters_and_evicts_oldest_events() {
         let image_id = Uuid::new_v4();
         let mut state = MessageDispatchState::with_capture_event_limit(2);
@@ -705,6 +847,42 @@ mod tests {
         let lidar_events = state.capture_events(Some(CaptureEventKind::Lidar));
         assert_eq!(lidar_events.len(), 1);
         assert!(lidar_events[0].summary.contains("2 points"));
+    }
+
+    #[test]
+    fn system_alert_panel_sorts_by_severity_then_recency_and_falls_back_to_warn() {
+        let mut state = MessageDispatchState::default();
+        state.dispatch_message_at(
+            &WebSocketMessage::SystemStatus {
+                status: "info".to_string(),
+                message: "link nominal".to_string(),
+            },
+            timestamp_at("2026-01-01T00:00:01Z"),
+        );
+        state.dispatch_message_at(
+            &WebSocketMessage::SystemStatus {
+                status: "mystery".to_string(),
+                message: "unknown status value".to_string(),
+            },
+            timestamp_at("2026-01-01T00:00:03Z"),
+        );
+        state.dispatch_message_at(
+            &WebSocketMessage::SystemStatus {
+                status: "critical".to_string(),
+                message: "battery failsafe".to_string(),
+            },
+            timestamp_at("2026-01-01T00:00:02Z"),
+        );
+
+        let panel = state.system_alert_panel();
+
+        assert_eq!(panel.len(), 3);
+        assert_eq!(panel[0].severity, SystemAlertSeverity::Critical);
+        assert_eq!(panel[0].message, "battery failsafe");
+        assert!(panel[0].visually_distinct);
+        assert_eq!(panel[1].severity, SystemAlertSeverity::Warn);
+        assert_eq!(panel[1].status, "mystery");
+        assert_eq!(panel[2].severity, SystemAlertSeverity::Info);
     }
 
     fn sample_telemetry(mode: &str, battery_percentage: u8) -> Telemetry {
